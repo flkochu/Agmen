@@ -19,6 +19,15 @@ pub fn arg<T: std::str::FromStr>(name: &str, default: T) -> T {
     }
 }
 
+/// ¿Este error de socket solo significa "nadie está escuchando del otro lado"?
+/// Cada sistema operativo lo reporta distinto; aquí se unifica.
+pub fn is_no_listener(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+    )
+}
+
 pub fn wants_help() -> bool {
     std::env::args().any(|a| a == "-h" || a == "--help")
 }

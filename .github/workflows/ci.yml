@@ -1,0 +1,41 @@
+# Compila y prueba en Windows, Linux y macOS en cada push y pull request.
+# Si algo deja de funcionar en un sistema, GitHub te avisa.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Formato
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --release -- -D warnings
+
+      - name: Pruebas de Rust
+        run: cargo test --release
+
+      - name: Pruebas de Python
+        run: python -m unittest discover -s python -v
+
+      - name: Interoperabilidad Rust <-> Python
+        run: python scripts/interop.py

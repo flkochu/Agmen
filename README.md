@@ -19,20 +19,45 @@ framework/
 ├── python/
 │   ├── rfw.py               el mismo formato en Python (solo librería estándar)
 │   ├── publisher.py
-│   └── subscriber.py
+│   ├── subscriber.py
+│   └── test_rfw.py          pruebas del formato en Python
+├── scripts/interop.py       prueba automática Rust <-> Python
+├── .github/workflows/ci.yml CI en Windows, Linux y macOS
 └── docs/PROTOCOLO.md        la especificación: el contrato entre lenguajes
 ```
 
+## Sistemas soportados
+
+Funciona en **Windows, Linux y macOS**. Solo usa la librería estándar de Rust
+y de Python, sin nada específico de un sistema operativo. El CI de GitHub
+(`.github/workflows/ci.yml`) lo compila y prueba en los tres en cada push.
+
 ## Requisitos
 
-- Rust (instálalo con `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
+**Linux / macOS**
+- Rust: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - Python 3.10 o más reciente
+
+**Windows**
+- Rust: descarga y corre `rustup-init.exe` desde <https://rustup.rs>.
+  Si te lo pide, instala las *Visual Studio Build Tools* con la carga de
+  trabajo "Desarrollo para el escritorio con C++" (Rust las usa para enlazar).
+- Python 3.10 o más reciente desde python.org. En Windows el comando es
+  `python` (o `py`), no `python3`.
+- La primera vez que un subscriber escuche en `0.0.0.0` (para recibir desde
+  otra computadora), el Firewall de Windows te preguntará si permites la
+  conexión: acepta para redes privadas.
 
 ## Cómo correrlo
 
+Los comandos son iguales en PowerShell y en una terminal de Linux/macOS.
+Solo cambia `python3` por `python` en Windows.
+
 ```bash
-cargo test                         # pruebas del formato
+cargo test                         # pruebas del formato (Rust)
+python3 -m unittest discover -s python   # pruebas del formato (Python)
 cargo build --release
+python3 scripts/interop.py         # prueba Rust <-> Python automática
 
 # Terminal 1
 cargo run --release --bin subscriber
@@ -121,3 +146,4 @@ python3 python/publisher.py
 5. El tiempo como algo de primera clase.
 6. Los microcontroladores son nodos de primera clase.
 7. Introspección desde el día 1.
+8. Multiplataforma: Windows, Linux y macOS son de primera clase, verificados por CI.

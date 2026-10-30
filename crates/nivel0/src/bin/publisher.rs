@@ -55,9 +55,11 @@ fn main() -> std::io::Result<()> {
         // El timestamp se toma justo antes de enviar.
         let packet = encode(&msg, seq, now_ns());
         if let Err(e) = socket.send(&packet) {
-            // Con UDP "conectado", si nadie escucha el SO puede devolver
-            // "connection refused". No es fatal: seguimos publicando.
-            if e.kind() != std::io::ErrorKind::ConnectionRefused {
+            // Con UDP "conectado", si nadie escucha el SO avisa con un error
+            // en el siguiente envío. Linux/macOS lo reportan como
+            // ConnectionRefused y Windows como ConnectionReset (WSAECONNRESET).
+            // No es fatal: seguimos publicando hasta que alguien escuche.
+            if !nivel0::is_no_listener(&e) {
                 return Err(e);
             }
         }

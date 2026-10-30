@@ -72,9 +72,13 @@ fn main() -> std::io::Result<()> {
                     }
                 }
             }
+            // Timeout de lectura: Linux/macOS devuelven WouldBlock y Windows
+            // TimedOut. En Windows, recv también puede devolver
+            // ConnectionReset por un ICMP perdido; tampoco es fatal.
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                    || nivel0::is_no_listener(&e) => {}
             Err(e) => return Err(e),
         }
 
