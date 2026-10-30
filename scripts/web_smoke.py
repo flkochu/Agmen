@@ -18,14 +18,14 @@ BIN = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "build" / "bi
 
 
 def main() -> None:
-    bridge = subprocess.Popen([sys.executable, str(ROOT / "tools" / "motio-web" / "bridge.py"),
+    bridge = subprocess.Popen([sys.executable, str(ROOT / "tools" / "agmen-web" / "bridge.py"),
                                "--listen", "127.0.0.1:7801", "--http", "127.0.0.1:8181"],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     pub = None
     try:
         time.sleep(1.5)
         page = urllib.request.urlopen("http://127.0.0.1:8181/", timeout=5).read().decode("utf-8")
-        assert "Motio" in page, "la página no cargó"
+        assert "Agmen" in page, "la página no cargó"
 
         pub = subprocess.Popen([str(BIN / f"publisher{EXE}"), "--to", "127.0.0.1:7801",
                                 "--rate", "100", "--count", "400"], stdout=subprocess.DEVNULL)

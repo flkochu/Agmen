@@ -1,4 +1,4 @@
-// motio/wire.hpp — formato de cable v0 de Motio
+// agmen/wire.hpp — formato de cable v0 de Agmen
 //
 // Este archivo define el contrato entre lenguajes. Cualquier nodo (C++,
 // Python, un ESP32...) que escriba y lea exactamente estos bytes puede hablar
@@ -25,10 +25,10 @@
 #include <utility>
 #include <vector>
 
-namespace motio::wire {
+namespace agmen::wire {
 
-/// Bytes mágicos al inicio de cada paquete: "MOT".
-inline constexpr std::array<std::uint8_t, 3> kMagic{'M', 'O', 'T'};
+/// Bytes mágicos al inicio de cada paquete: "AGM".
+inline constexpr std::array<std::uint8_t, 3> kMagic{'A', 'G', 'M'};
 /// Versión del formato de cable.
 inline constexpr std::uint8_t kVersion = 0;
 /// Tamaño del header en bytes.
@@ -47,7 +47,7 @@ class WireError : public std::runtime_error {
 public:
     enum class Kind {
         TooShort,            ///< el paquete es más corto que el header
-        BadMagic,            ///< no empieza con "MOT": no es de Motio
+        BadMagic,            ///< no empieza con "AGM": no es de Agmen
         UnsupportedVersion,  ///< otra versión del protocolo
         TypeMismatch,        ///< el tipo no es el que espera el receptor
         PayloadLenMismatch,  ///< payload_len no coincide con los bytes recibidos
@@ -68,7 +68,7 @@ private:
 // ---------------------------------------------------------------------------
 
 /// FNV-1a de 64 bits. Es trivial de implementar en cualquier lenguaje (ver
-/// python/motio/wire.py), por eso lo usamos. Se calcula en compilación.
+/// python/agmen/wire.py), por eso lo usamos. Se calcula en compilación.
 constexpr std::uint64_t fnv1a64(std::string_view data) noexcept {
     std::uint64_t hash = 0xcbf29ce484222325ULL;
     for (char c : data) {
@@ -114,7 +114,7 @@ inline void put_f32(Bytes& out, float v) { put_le(out, std::bit_cast<std::uint32
 ///
 /// | offset | tamaño | campo       |
 /// |--------|--------|-------------|
-/// | 0      | 3      | magic "MOT" |
+/// | 0      | 3      | magic "AGM" |
 /// | 3      | 1      | version     |
 /// | 4      | 8      | type_id     |
 /// | 12     | 8      | seq         |
@@ -225,4 +225,4 @@ template <Message M>
 /// máquinas los relojes no están sincronizados (se resuelve más adelante).
 [[nodiscard]] std::uint64_t now_ns();
 
-}  // namespace motio::wire
+}  // namespace agmen::wire

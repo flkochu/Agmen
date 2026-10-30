@@ -1,4 +1,4 @@
-#include "motio/platform.hpp"
+#include "agmen/platform.hpp"
 
 #include <thread>
 
@@ -10,7 +10,7 @@
 #  endif
 #endif
 
-namespace motio::platform {
+namespace agmen::platform {
 
 #ifdef _WIN32
 
@@ -72,4 +72,4 @@ void init_console() {}
 
 #endif
 
-}  // namespace motio::platform
+}  // namespace agmen::platform

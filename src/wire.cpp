@@ -1,9 +1,9 @@
-#include "motio/wire.hpp"
+#include "agmen/wire.hpp"
 
 #include <chrono>
 #include <cstdio>
 
-namespace motio::wire {
+namespace agmen::wire {
 
 namespace {
 
@@ -47,7 +47,7 @@ std::pair<Header, ByteView> Header::read_from(ByteView buf) {
     if (buf[0] != kMagic[0] || buf[1] != kMagic[1] || buf[2] != kMagic[2]) {
         throw WireError(WireError::Kind::BadMagic,
                         "magic inválido \"" + printable(buf.first(3)) +
-                            "\": el paquete no viene de un nodo de Motio");
+                            "\": el paquete no viene de un nodo de Agmen");
     }
     if (buf[3] != kVersion) {
         throw WireError(WireError::Kind::UnsupportedVersion,
@@ -101,4 +101,4 @@ std::uint64_t now_ns() {
         duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count());
 }
 
-}  // namespace motio::wire
+}  // namespace agmen::wire

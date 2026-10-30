@@ -4,7 +4,7 @@
 //
 //   ./build/bin/publisher --rate 100 --to 127.0.0.1:7400
 
-#include <motio/motio.hpp>
+#include <agmen/agmen.hpp>
 
 #include <chrono>
 #include <cmath>
@@ -16,8 +16,8 @@
 
 int main(int argc, char** argv) try {
     using namespace std::chrono;
-    namespace wire = motio::wire;
-    motio::platform::init_console();
+    namespace wire = agmen::wire;
+    agmen::platform::init_console();
 
     if (nivel0::wants_help(argc, argv)) {
         std::puts(
@@ -32,12 +32,12 @@ int main(int argc, char** argv) try {
     const auto count = nivel0::arg<std::uint64_t>(argc, argv, "count", 0);
 
     // Puerto 0 = el sistema operativo elige un puerto libre para enviar.
-    auto socket = motio::net::UdpSocket::bind("0.0.0.0:0");
+    auto socket = agmen::net::UdpSocket::bind("0.0.0.0:0");
     socket.connect(to);
 
     const auto period = duration_cast<steady_clock::duration>(duration<double>(1.0 / rate));
-    std::printf("[publisher] %s (type_id 0x%016llx) → %s a %g Hz\n",
-                std::string(wire::ImuSample::kName).c_str(),
+    std::printf("[publisher] Agmen %s · %s (type_id 0x%016llx) → %s a %g Hz\n",
+                std::string(agmen::kVersion).c_str(), std::string(wire::ImuSample::kName).c_str(),
                 static_cast<unsigned long long>(wire::type_id_v<wire::ImuSample>), to.c_str(),
                 rate);
     std::fflush(stdout);
@@ -75,7 +75,7 @@ int main(int argc, char** argv) try {
         // acumularía y la frecuencia real sería menor que la pedida.
         const auto deadline = start + period * static_cast<std::int64_t>(seq);
         if (deadline > steady_clock::now()) {
-            motio::platform::sleep_until(deadline);
+            agmen::platform::sleep_until(deadline);
         } else {
             ++overruns;  // vamos tarde: no dormimos
         }

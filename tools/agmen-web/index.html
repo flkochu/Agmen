@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Motio · interfaz web</title>
+<title>Agmen · interfaz web</title>
 <style>
   :root {
     --bg: #0f1216; --panel: #171b21; --line: #262c35; --text: #e6e9ee; --muted: #8b95a3;
@@ -36,6 +36,8 @@
   .legend { margin-left: auto; display: flex; gap: 12px; font-weight: 400; color: var(--muted); font-size: 12px; }
   .legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
   canvas { width: 100%; height: 220px; display: block; }
+  .warn { display: none; border-color: color-mix(in srgb, var(--warn) 50%, var(--line));
+          font: 12px/1.5 var(--mono); color: var(--warn); }
   .error { display: none; border-color: color-mix(in srgb, var(--bad) 50%, var(--line));
            font: 12px/1.5 var(--mono); color: var(--bad); }
   footer { color: var(--muted); font-size: 12px; text-align: center; padding: 8px 0 24px; }
@@ -44,7 +46,7 @@
 </head>
 <body>
 <header>
-  <div class="logo">Motio <span>· interfaz web (prototipo)</span></div>
+  <div class="logo">Agmen <span>· interfaz web (prototipo)</span></div>
   <div class="pill"><span class="dot" id="dot"></span><span id="status">conectando…</span></div>
 </header>
 
@@ -71,18 +73,21 @@
     <canvas id="gyro"></canvas>
   </section>
 
+  <section class="panel warn" id="warnbox"></section>
   <section class="panel error" id="errbox"></section>
 </main>
 
 <footer>
-  Todo el dibujo ocurre en este navegador. El robot solo publica mensajes Motio;
-  el puente (<code>tools/motio-web/bridge.py</code>) los reenvía.
+  Todo el dibujo ocurre en este navegador. El robot solo publica mensajes Agmen;
+  el puente (<code>tools/agmen-web/bridge.py</code>) los reenvía.
 </footer>
 
 <script>
 "use strict";
 const WINDOW_S = 10;          // segundos visibles en las gráficas
-const buf = [];               // {t, accel:[3], gyro:[3]}
+const buf = [];               // {src, t, accel:[3], gyro:[3]} del emisor que se grafica
+let followSrc = null;         // emisor que se está graficando
+const lastSeen = {};          // emisor -> última vez que mandó algo (ms)
 let lastData = 0;
 
 const $ = (id) => document.getElementById(id);
@@ -99,6 +104,13 @@ function updateStats(s) {
   $("lost").textContent = s.lost;
   $("errors").textContent = s.errors;
   $("source").textContent = s.type ? `${s.type} · ${s.source}` : `esperando en ${s.listening}`;
+  const many = (s.sources || []).length > 1;
+  const warn = $("warnbox");
+  warn.style.display = many ? "block" : "none";
+  warn.textContent = many
+    ? `⚠ ${s.sources.length} emisores mandan al mismo puerto (${s.sources.join(", ")}). ` +
+      `Las gráficas muestran solo ${followSrc}. ¿Hay dos publishers corriendo?`
+    : "";
   const box = $("errbox");
   box.style.display = s.last_error ? "block" : "none";
   box.textContent = s.last_error ? "Último error: " + s.last_error : "";
@@ -170,7 +182,15 @@ function connect() {
   es.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
     if (msg.samples.length) {
-      for (const s of msg.samples) buf.push(s);
+      // Graficar un solo emisor para no mezclar datos de dos sensores. Se
+      // sigue al mismo hasta que lleve 0.5 s callado (p. ej. se reinició).
+      const now = performance.now();
+      for (const s of msg.samples) lastSeen[s.src] = now;
+      if (followSrc === null || now - (lastSeen[followSrc] || 0) > 500) {
+        followSrc = msg.samples[msg.samples.length - 1].src;
+        buf.length = 0;
+      }
+      for (const s of msg.samples) if (s.src === followSrc) buf.push(s);
       const tEnd = buf[buf.length - 1].t;
       while (buf.length && buf[0].t < tEnd - WINDOW_S - 1) buf.shift();
       lastData = performance.now();

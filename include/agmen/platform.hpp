@@ -1,10 +1,10 @@
-// motio/platform.hpp — utilidades que se comportan distinto en cada sistema
-// operativo y que Motio unifica.
+// agmen/platform.hpp — utilidades que se comportan distinto en cada sistema
+// operativo y que Agmen unifica.
 #pragma once
 
 #include <chrono>
 
-namespace motio::platform {
+namespace agmen::platform {
 
 /// Duerme hasta `deadline` con precisión de ~1 ms o mejor en los tres sistemas.
 ///
@@ -17,4 +17,4 @@ void sleep_until(std::chrono::steady_clock::time_point deadline);
 /// En Linux/macOS no hace nada; en Windows cambia la página de códigos.
 void init_console();
 
-}  // namespace motio::platform
+}  // namespace agmen::platform

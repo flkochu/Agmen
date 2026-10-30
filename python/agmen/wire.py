@@ -1,7 +1,7 @@
-"""motio.wire — implementación de referencia en Python del formato de cable v0.
+"""agmen.wire — implementación de referencia en Python del formato de cable v0.
 
 Solo usa la librería estándar. Debe producir y leer EXACTAMENTE los mismos
-bytes que `motio::wire` en C++ (include/motio/wire.hpp) (ver docs/PROTOCOLO.md).
+bytes que `agmen::wire` en C++ (include/agmen/wire.hpp) (ver docs/PROTOCOLO.md).
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import struct
 import time
 from dataclasses import dataclass
 
-MAGIC = b"MOT"
+MAGIC = b"AGM"
 WIRE_VERSION = 0
 HEADER_LEN = 32
 
@@ -44,8 +44,42 @@ class Header:
     payload_len: int
 
 
+class Message:
+    """Base de todos los tipos de mensaje (equivale al `concept Message` de C++).
+
+    Una subclase define NAME, SCHEMA, encode_payload() y decode_payload().
+    TYPE_ID se calcula solo a partir de SCHEMA: si cambias el esquema, cambia
+    el TYPE_ID y los nodos con la versión vieja lo detectan.
+    """
+
+    NAME: str = ""
+    SCHEMA: str = ""
+    TYPE_ID: int = 0
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if "SCHEMA" in cls.__dict__:
+            cls.TYPE_ID = fnv1a64(cls.SCHEMA.encode())
+
+    @classmethod
+    def check_payload_size(cls, payload: bytes, expected: int) -> None:
+        if len(payload) != expected:
+            raise WireError(
+                f"payload de '{cls.NAME}' debe medir {expected} bytes, llegaron {len(payload)}"
+            )
+
+    def encode_payload(self) -> bytes:
+        raise NotImplementedError
+
+    @classmethod
+    def decode_payload(cls, payload: bytes):
+        raise NotImplementedError
+
+
 @dataclass
-class ImuSample:
+class ImuSample(Message):
+    """Lectura de una IMU: acelerómetro (m/s²) y giroscopio (rad/s)."""
+
     accel: tuple[float, float, float]
     gyro: tuple[float, float, float]
 
@@ -58,15 +92,9 @@ class ImuSample:
 
     @classmethod
     def decode_payload(cls, payload: bytes) -> "ImuSample":
-        if len(payload) != cls._FMT.size:
-            raise WireError(
-                f"payload de '{cls.NAME}' debe medir {cls._FMT.size} bytes, llegaron {len(payload)}"
-            )
+        cls.check_payload_size(payload, cls._FMT.size)
         v = cls._FMT.unpack(payload)
         return cls(accel=v[0:3], gyro=v[3:6])
-
-
-ImuSample.TYPE_ID = fnv1a64(ImuSample.SCHEMA.encode())
 
 
 def encode(msg, seq: int, stamp_ns: int) -> bytes:
@@ -80,7 +108,7 @@ def decode(cls, buf: bytes):
         raise WireError(f"paquete demasiado corto: {len(buf)} bytes, se necesitan al menos {HEADER_LEN}")
     magic, version, type_id, seq, stamp_ns, payload_len = HEADER_FMT.unpack_from(buf)
     if magic != MAGIC:
-        raise WireError(f"magic inválido {magic!r}: el paquete no viene de un nodo de Motio")
+        raise WireError(f"magic inválido {magic!r}: el paquete no viene de un nodo de Agmen")
     if version != WIRE_VERSION:
         raise WireError(f"versión de protocolo {version} no soportada (este nodo habla la versión {WIRE_VERSION})")
     payload = buf[HEADER_LEN:]

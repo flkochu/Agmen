@@ -1,11 +1,11 @@
-"""Pruebas de motio.wire. Deben dar los mismos valores que C++ (tests/test_wire.cpp).
+"""Pruebas de agmen.wire. Deben dar los mismos valores que C++ (tests/test_wire.cpp).
 
     python -m unittest discover -s python
 """
 
 import unittest
 
-from motio import wire
+from agmen import wire
 
 
 class TestRfw(unittest.TestCase):
@@ -26,7 +26,7 @@ class TestRfw(unittest.TestCase):
 
     def test_layout_del_header(self):
         data = wire.encode(self.sample(), 1, 2)
-        self.assertEqual(data[0:3], b"MOT")
+        self.assertEqual(data[0:3], b"AGM")
         self.assertEqual(data[3], 0)
         self.assertEqual(data[4:12], wire.ImuSample.TYPE_ID.to_bytes(8, "little"))
         self.assertEqual(data[12:20], (1).to_bytes(8, "little"))

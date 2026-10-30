@@ -1,0 +1,43 @@
+# Paquete de Python `agmen` (pip install agmen).
+#
+# Hoy contiene la implementación de referencia del formato en Python puro.
+# En el nivel 6 este mismo paquete se compilará desde el núcleo de C++
+# (nanobind + scikit-build-core) sin cambiar de nombre.
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agmen"
+dynamic = ["version"]
+description = "Agmen: el sistema nervioso para robótica, IA e IoT"
+readme = "python/README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Adán López Lozano" }]
+keywords = ["robotics", "robotica", "middleware", "pubsub", "ros", "ai", "iot"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Natural Language :: Spanish",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Repository = "https://github.com/flkochu/agmen"
+Changelog = "https://github.com/flkochu/agmen/blob/main/CHANGELOG.md"
+
+[tool.hatch.version]
+path = "python/agmen/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["python/agmen"]
+
+[tool.hatch.build.targets.sdist]
+include = ["python/agmen", "python/README.md", "LICENSE", "VERSION", "CHANGELOG.md"]

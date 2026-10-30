@@ -1,0 +1,82 @@
+# Publica una versión nueva cuando haces push de un tag vX.Y.Z:
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# 1. Verifica que el tag coincida con VERSION, Python y CHANGELOG.
+# 2. Corre todas las pruebas en Windows, Linux y macOS.
+# 3. Construye el paquete de Python y lo sube a PyPI (pip install agmen).
+# 4. Crea el Release en GitHub con los archivos.
+#
+# Usa "Trusted Publishing" de PyPI: no hay contraseñas ni tokens guardados.
+# Configuración única: docs/PUBLICAR.md.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+jobs:
+  verificar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Versión consistente con el tag
+        run: python scripts/check_version.py "${{ github.ref_name }}"
+
+  pruebas:
+    needs: verificar
+    uses: ./.github/workflows/ci.yml
+
+  construir:
+    needs: pruebas
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Construir sdist y wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  pypi:
+    needs: construir
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/agmen/
+    permissions:
+      id-token: write   # necesario para Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Crear Release con las notas del CHANGELOG
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v v="$VERSION" '$0 ~ "^## \\[" v "\\]" {f=1; next} /^## \[/ {f=0} f' CHANGELOG.md > notas.md
+          gh release create "$GITHUB_REF_NAME" dist/* --title "Agmen $VERSION" --notes-file notas.md

@@ -1,17 +1,17 @@
-# RFC 0001 — Formato de mensajes de Motio (v1)
+# RFC 0001 — Formato de mensajes de Agmen (v1)
 
 | | |
 |---|---|
-| **Estado** | Propuesta, pendiente de aprobación |
+| **Estado** | ✅ **Aceptado** (2026-10-30). Se implementa en el nivel 1 (versión 0.2.0) |
 | **Reemplaza a** | Protocolo v0 (`docs/PROTOCOLO.md`) |
 | **Fecha** | 2026-10-30 |
-| **Nota** | El núcleo pasó de Rust a C++ el mismo día. El formato no depende del lenguaje, así que esta propuesta no cambia |
+| **Notas** | El núcleo pasó de Rust a C++ y el proyecto se renombró a Agmen (magic `"AGM"`) el mismo día. El formato no depende del lenguaje |
 
 ## 1. Resumen
 
-Cada mensaje de Motio tiene dos partes:
+Cada mensaje de Agmen tiene dos partes:
 
-1. **Sobre (envelope):** 64 bytes con formato fijo, propio de Motio. Lleva
+1. **Sobre (envelope):** 64 bytes con formato fijo, propio de Agmen. Lleva
    identidad, orden y tiempo: qué tipo es, de qué topic viene, quién lo
    publicó, número de secuencia y dos marcas de tiempo.
 2. **Carga (payload):** los datos, en una de dos codificaciones elegidas
@@ -25,7 +25,7 @@ Cada mensaje de Motio tiene dos partes:
      directo a Parquet para datasets.
 
 Las dos codificaciones describen **el mismo modelo lógico**: todo esquema de
-Motio se mapea a un esquema de Arrow. Así, cualquier mensaje, sea compacto o
+Agmen se mapea a un esquema de Arrow. Así, cualquier mensaje, sea compacto o
 Arrow, se puede ver, grabar y exportar como una fila de una tabla Arrow.
 
 ## 2. Por qué no "Arrow para todo"
@@ -58,7 +58,7 @@ alineado a 64 bytes (lo que Arrow recomienda y lo que necesitan SIMD y la GPU).
 
 | Offset | Tamaño | Tipo | Campo | Descripción |
 |---:|---:|---|---|---|
-| 0 | 3 | bytes | `magic` | Siempre `"MOT"` |
+| 0 | 3 | bytes | `magic` | Siempre `"AGM"` |
 | 3 | 1 | u8 | `version` | `1` |
 | 4 | 2 | u16 | `header_len` | Tamaño del sobre. `64` en v1. El receptor salta los bytes extra que no conozca: así se pueden agregar campos sin romper nodos viejos |
 | 6 | 1 | u8 | `encoding` | `0` = sin payload, `1` = `compact`, `2` = `arrow`. Del 3 al 255 están reservados |
@@ -68,7 +68,7 @@ alineado a 64 bytes (lo que Arrow recomienda y lo que necesitan SIMD y la GPU).
 | 24 | 8 | u64 | `source_id` | Identificador aleatorio de la instancia que publica; cambia si el nodo se reinicia |
 | 32 | 8 | u64 | `seq` | Contador por (`source_id`, `topic_id`); empieza en 0 |
 | 40 | 8 | i64 | `t_data` | Instante al que **corresponden los datos** (captura del sensor, instante del comando), en ns |
-| 48 | 8 | i64 | `t_pub` | Instante en que **se publicó**, en ns. Lo pone Motio |
+| 48 | 8 | i64 | `t_pub` | Instante en que **se publicó**, en ns. Lo pone Agmen |
 | 56 | 4 | u32 | `payload_len` | Bytes del payload que siguen al sobre |
 | 60 | 1 | u8 | `clock` | Dominio del reloj: `0` = real (Unix, UTC), `1` = simulación, `2` = reproducción |
 | 61 | 3 | — | reservado | Debe ir en 0 |
@@ -84,7 +84,7 @@ alineado a 64 bytes (lo que Arrow recomienda y lo que necesitan SIMD y la GPU).
 - **Tiempos `i64` en ns**: se mapean directo al tipo `timestamp[ns]` de Arrow
   y Parquet.
 - **`clock` en cada mensaje.** Los nodos nunca leen el reloj del sistema
-  operativo, sino el reloj de Motio. En simulación lo maneja el simulador y
+  operativo, sino el reloj de Agmen. En simulación lo maneja el simulador y
   en reproducción la grabación. El nodo no se entera de la diferencia
   (requisito d), y si alguien mezcla datos de dominios distintos, se detecta.
 - **`source_id` + `seq`**: detectan pérdidas, duplicados, reinicios y varios
@@ -149,16 +149,16 @@ JointCommand7 { u8 mode; f64 position[7]; }  → 64 bytes
 ## 5. Esquemas y `schema_id`
 
 - Cada topic tiene **exactamente un esquema**. No hay topics sin tipo.
-- El esquema se escribe en el lenguaje de esquemas de Motio, que se define en
+- El esquema se escribe en el lenguaje de esquemas de Agmen, que se define en
   el nivel 4. Hasta entonces, la forma canónica es texto:
-  `motio/1 Nombre{tipo campo;tipo campo;...}`. Los tipos anidados se
+  `agmen/1 Nombre{tipo campo;tipo campo;...}`. Los tipos anidados se
   **expanden dentro** del texto, para que el hash cubra todo el árbol de
   tipos.
 - `schema_id = FNV-1a 64(texto canónico)`. Con 10 000 tipos distintos, la
   probabilidad de que dos colisionen es de ~3×10⁻¹².
 - **El texto completo del esquema se distribuye una vez**: al anunciar el
   topic y al inicio de cada grabación. Por eso cualquier herramienta
-  (`motio topic echo`, un visualizador, un exportador a Parquet) puede
+  (`agmen topic echo`, un visualizador, un exportador a Parquet) puede
   decodificar cualquier mensaje **sin código compilado** para ese tipo. En
   ROS 2, para hacer `echo` necesitas el paquete del mensaje instalado.
 - **Compatibilidad estricta**: si cambia cualquier campo, cambia el
@@ -168,7 +168,7 @@ JointCommand7 { u8 mode; f64 position[7]; }  → 64 bytes
 
 ### Mapeo canónico a Arrow
 
-| Motio | Arrow |
+| Agmen | Arrow |
 |---|---|
 | `bool`, `iN`, `uN`, `f32`, `f64` | tipo primitivo equivalente |
 | `time` | `timestamp[ns]` |
@@ -184,7 +184,7 @@ JointCommand7 { u8 mode; f64 position[7]; }  → 64 bytes
 
 Los tensores usan las **extensiones canónicas de Arrow**
 (`arrow.fixed_shape_tensor`, `arrow.variable_shape_tensor`). Así PyTorch,
-numpy y otras herramientas las entienden sin código especial de Motio.
+numpy y otras herramientas las entienden sin código especial de Agmen.
 
 ## 6. Codificación `arrow` (encoding = 2)
 
@@ -192,12 +192,12 @@ numpy y otras herramientas las entienden sin código especial de Motio.
   el marcador de continuación, la longitud de los metadatos, los metadatos
   (flatbuffer) y el cuerpo.
 - **El esquema de Arrow no viaja en cada mensaje.** Se deriva del esquema de
-  Motio (sección 5), que el receptor ya conoce por su `schema_id`.
+  Agmen (sección 5), que el receptor ya conoce por su `schema_id`.
 - Un RecordBatch puede tener **N filas**. Arrow es columnar, así que agrupar
   (por ejemplo, 10 lecturas de un LiDAR por mensaje) es natural.
-- **Python**: Motio entrega los datos por la *Arrow PyCapsule Interface*, el
+- **Python**: Agmen entrega los datos por la *Arrow PyCapsule Interface*, el
   protocolo estándar para pasar datos Arrow entre librerías sin copiar. Así
-  funcionan pyarrow, Polars, DuckDB y nanoarrow sin que Motio dependa de
+  funcionan pyarrow, Polars, DuckDB y nanoarrow sin que Agmen dependa de
   ninguna. Los tensores pasan a numpy sin copia (verificado) y de ahí a
   PyTorch con `torch.from_numpy`.
 - **C++**: por la *Arrow C Data Interface*, que es compatible con Arrow C++ o
@@ -219,7 +219,7 @@ que una cámara escriba directo en memoria compartida) se define en el nivel 8.
 El receptor rechaza el mensaje **y reporta el motivo** si:
 
 1. tiene menos de 64 bytes, o menos de `header_len`;
-2. `magic` ≠ `"MOT"` o `version` no es soportada;
+2. `magic` ≠ `"AGM"` o `version` no es soportada;
 3. `encoding` o algún bit de `flags` es desconocido;
 4. `payload_len` ≠ bytes restantes;
 5. `schema_id` ≠ el que espera el suscriptor;
@@ -235,7 +235,7 @@ El receptor rechaza el mensaje **y reporta el motivo** si:
 | a) Datos grandes sin copias | `arrow` + tensores canónicos + bandera de memoria compartida; payload alineado a 64 |
 | b) Python de primera clase, C++ también | `compact` = dtype de numpy; `arrow` = PyCapsule. En C++, structs y Arrow C Data Interface |
 | c) Todo con marca de tiempo; grabaciones = datasets | `t_data`/`t_pub` obligatorios; esquemas autodescritos; mapeo canónico a Arrow, así que exportar a Parquet es directo |
-| d) Misma interfaz sim/real | campo `clock` + reloj de Motio; el nodo nunca lee el reloj del sistema operativo |
+| d) Misma interfaz sim/real | campo `clock` + reloj de Agmen; el nodo nunca lee el reloj del sistema operativo |
 | e) Frecuencias distintas sin bloquearse | `compact` mantiene barato el control a 1 kHz; el no bloqueo se resuelve en el executor (nivel 5), no en el formato |
 | f) IoT por puentes; versión para microcontroladores | esquemas en texto, así que un puente MQTT convierte a JSON automáticamente. `compact` se implementa en C sin dependencias |
 | g) Núcleo nativo (C++), Windows/Linux/macOS | formato sin nada específico del sistema operativo, little-endian, verificado por CI |
@@ -264,7 +264,7 @@ espacio para todo, así que cada nivel agrega sin romper:
 
 | Nivel | Qué parte del formato |
 |---|---|
-| 1 | Sobre v1 completo + `compact` + esquema en texto + decodificación dinámica (`motio topic echo` genérico). Sigue sobre UDP |
+| 1 | Sobre v1 completo + `compact` + esquema en texto + decodificación dinámica (`agmen topic echo` genérico). Sigue sobre UDP |
 | 3 | El navegador decodifica el formato (implementación en JavaScript, RFC 0002) |
 | 4 | Lenguaje de esquemas + generación de código (C++/Python) para `compact` |
 | 7 | Codificación `arrow`: variables, imágenes, tensores |
@@ -275,12 +275,28 @@ espacio para todo, así que cada nivel agrega sin romper:
 ## 13. Preguntas abiertas
 
 1. **Formato del archivo de grabación**: ¿MCAP (formato abierto con
-   herramientas como Foxglove) con mensajes de Motio adentro, o un formato
+   herramientas como Foxglove) con mensajes de Agmen adentro, o un formato
    propio basado en Arrow IPC? Se decide en el nivel 9. El sobre funciona con
    ambos.
 2. **Hash de 64 bits vs 128 bits** para `schema_id`. 64 es suficiente para
-   uso personal; si Motio crece a un ecosistema público, se puede pasar a 128
+   uso personal; si Agmen crece a un ecosistema público, se puede pasar a 128
    usando `header_len`.
 3. **Sincronización de relojes entre máquinas** (NTP/PTP, o un reloj lógico
    híbrido como el que usa dora-rs). Se decide en el nivel 11. No cambia el
    formato.
+
+## 14. Las partes más difíciles (y cómo se van a enfrentar)
+
+Ordenadas de más a menos difícil. Ninguna obliga a cambiar el formato: son
+retos de la **implementación** que el formato ya deja resolver.
+
+| # | Reto | Por qué es difícil | Mitigación | Nivel |
+|---|---|---|---|---|
+| 1 | **Memoria compartida sin copias** | ¿Quién libera un buffer que leen 3 suscriptores a distinta velocidad? Un suscriptor lento retiene buffers y el publicador se queda sin memoria. Si un proceso muere con un buffer prestado, se pierde. Windows (`CreateFileMapping`) y POSIX (`shm_open`) son distintos, y macOS limita los nombres a ~31 caracteres | Pool de buffers con contador de referencias, campo `generación` en el descriptor (ya está en la sección 7), latidos para detectar procesos muertos. Política explícita cuando se llena: descartar, bloquear o copiar. Evaluar **iceoryx2** por debajo antes de escribir uno propio | 8 |
+| 2 | **Datos grandes por la red** | Un datagrama UDP lleva como máximo ~64 KB, y en WiFi lo seguro son ~1.4 KB por paquete. Una imagen de 900 KB son ~650 paquetes, y si se pierde **uno**, se pierde la imagen | Capa de fragmentación con reensamblado y tiempo límite, o TCP/QUIC para topics confiables. Imágenes comprimidas (JPEG/H.264) al salir de la máquina. Alternativa: Zenoh como transporte de red | 11 |
+| 3 | **Que C++, Python y JavaScript calculen el mismo `schema_id`** | Basta un espacio de más, `float` en vez de `f32` o un orden distinto al expandir tipos anidados para que el hash cambie. Entonces **todo** falla con "TIPO INCOMPATIBLE" aunque los tipos sean iguales | Un solo programa (el compilador de esquemas) genera el texto canónico. Un archivo compartido de **vectores de prueba** (esquema → texto → hash → bytes) que todas las implementaciones deben pasar en el CI | 1, 4 |
+| 4 | **Layout `compact` idéntico en todos los compiladores y micros** | x86 de 32 bits alinea `f64` a 4 dentro de structs, no a 8. Algunos micros fallan al leer un `f32` desalineado. El relleno sin inicializar filtra basura de memoria y rompe el determinismo | Código generado con offsets explícitos y `static_assert`. Leer con `memcpy` si el buffer no está alineado. Structs siempre inicializados en cero. Pruebas en el CI para ARM32 y ESP32 | 4, 12 |
+| 5 | **Arrow en C++ sin una dependencia gigante** | Arrow C++ es enorme y difícil de compilar en Windows. Eso choca con la regla de "fácil de compilar para la comunidad" | Evaluar **nanoarrow** (ligero). Si no cubre escribir IPC, generar nosotros los metadatos flatbuffer (el formato está documentado). Arrow C++ completo solo como opción | 7 |
+| 6 | **El tiempo** | El reloj de pared puede **saltar hacia atrás** (NTP, cambio de hora). Entre máquinas sin sincronizar, la latencia no tiene sentido. En simulación el tiempo se pausa o acelera, y los timers lo tienen que seguir | Reloj de Agmen anclado a un reloj monótono. Sincronización NTP/PTP con el desfase medido y reportado. Todos los timers del executor usan el reloj de Agmen | 5, 11 |
+| 7 | **Compatibilidad estricta de esquemas** (reto social) | Cambiar un campo rompe a todos los nodos que usan ese tipo. En una comunidad eso genera fricción | Es una decisión consciente: preferimos un error claro a datos corruptos. Ayudas: `agmen schema diff`, nombres de versión explícitos (`ImuSample2`), mensajes de error que dicen qué campo cambió | 4 |
+| 8 | **Seguridad** | El formato no tiene autenticación: en una red abierta, cualquiera podría mandar comandos de motor | Se resuelve en el transporte (TLS/DTLS, permisos por topic) y en la interfaz web (RFC 0002). Hay bits libres en `flags` para marcar mensajes firmados si hace falta | 11 |

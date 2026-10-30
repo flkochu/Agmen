@@ -8,7 +8,7 @@ import math
 import socket
 import time
 
-from motio import wire
+from agmen import wire
 
 
 def main() -> None:

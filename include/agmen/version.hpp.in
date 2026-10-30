@@ -1,0 +1,14 @@
+// agmen/version.hpp — GENERADO por CMake desde el archivo VERSION. No editar.
+#pragma once
+
+#include <string_view>
+
+namespace agmen {
+
+inline constexpr int kVersionMajor = @PROJECT_VERSION_MAJOR@;
+inline constexpr int kVersionMinor = @PROJECT_VERSION_MINOR@;
+inline constexpr int kVersionPatch = @PROJECT_VERSION_PATCH@;
+/// Versión del paquete, ej. "0.1.0" (SemVer).
+inline constexpr std::string_view kVersion = "@PROJECT_VERSION@";
+
+}  // namespace agmen

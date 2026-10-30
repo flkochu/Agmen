@@ -1,8 +1,8 @@
-# RFC 0002 — Interfaz web de Motio (`motio-web`)
+# RFC 0002 — Interfaz web de Agmen (`agmen-web`)
 
 | | |
 |---|---|
-| **Estado** | Propuesta. Prototipo funcionando en `tools/motio-web/` |
+| **Estado** | Propuesta. Prototipo funcionando en `tools/agmen-web/` |
 | **Fecha** | 2026-10-30 |
 
 ## 1. Problema
@@ -15,14 +15,14 @@ verla necesitas instalar ROS en la máquina desde donde miras.
 
 ## 2. Idea
 
-**El robot no dibuja nada.** Solo publica mensajes de Motio, como siempre. Un
+**El robot no dibuja nada.** Solo publica mensajes de Agmen, como siempre. Un
 **puente** reenvía esos mensajes a un **navegador web**, y el navegador hace
 todo el trabajo visual: gráficas, video, 3D.
 
 ```
  ROBOT (Raspberry, Jetson, PC)                         CUALQUIER PANTALLA
 ┌──────────────────────────────┐                     ┌─────────────────────┐
-│ nodos ──► Motio ──► puente   │ ── WebSocket ─────► │ navegador (laptop,  │
+│ nodos ──► Agmen ──► puente   │ ── WebSocket ─────► │ navegador (laptop,  │
 │ (ESP32 vía agente)           │    (solo datos)     │ celular, tablet)    │
 └──────────────────────────────┘                     │  · gráficas         │
                                                      │  · cámara           │
@@ -70,11 +70,11 @@ Versión definitiva (C++, nivel 3): **WebSocket**, bidireccional.
 | Dirección | Contenido |
 |---|---|
 | navegador → puente | JSON de control: `subscribe {topic, max_hz}`, `unsubscribe`, `publish` (teleoperación), `list_topics` |
-| puente → navegador | **Frames binarios con el formato de Motio sin modificar** (sobre + payload), más JSON para eventos (topics nuevos, errores) |
+| puente → navegador | **Frames binarios con el formato de Agmen sin modificar** (sobre + payload), más JSON para eventos (topics nuevos, errores) |
 
 Decisiones:
 
-- **El navegador decodifica el formato de Motio** con una implementación en
+- **El navegador decodifica el formato de Agmen** con una implementación en
   JavaScript, la tercera junto a C++ y Python. Es la regla "el formato es el
   contrato": el puente no traduce a JSON, solo reenvía bytes. Eso es más
   barato para el robot.
@@ -84,7 +84,7 @@ Decisiones:
 - **Esquemas en texto** (RFC 0001): la interfaz puede mostrar **cualquier**
   topic sin código específico para su tipo.
 - **Por evaluar:** hablar también el protocolo WebSocket de Foxglove, para
-  que la app de Foxglove funcione con Motio sin cambios.
+  que la app de Foxglove funcione con Agmen sin cambios.
 
 ## 5. Paneles, por niveles
 
@@ -106,14 +106,16 @@ Decisiones:
   "alto".
 - Límites de frecuencia para que un navegador no pueda saturar al robot.
 
-## 7. Qué hay hoy (`tools/motio-web/`)
+## 7. Qué hay hoy (`tools/agmen-web/`)
 
-![Prototipo de motio-web](../img/motio-web.png)
+![Prototipo de agmen-web](../img/agmen-web.png)
 
-- `bridge.py`: recibe Motio por UDP y sirve la página y los datos (SSE). Solo
+- `bridge.py`: recibe Agmen por UDP y sirve la página y los datos (SSE). Solo
   usa la librería estándar.
 - `index.html`: gráficas de acelerómetro y giroscopio, Hz, latencia,
   pérdidas, errores y el último error con su texto. Sin librerías externas:
   funciona sin internet (útil en competencias). Tema claro/oscuro y vista para
   celular.
+- Si **varios emisores** mandan al mismo puerto, no mezcla sus datos:
+  grafica uno solo y muestra un aviso (regla "nunca fallar en silencio").
 - `scripts/web_smoke.py`: prueba automática que corre en el CI.

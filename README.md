@@ -1,8 +1,8 @@
-# Motio
+# Agmen
 
-> *Motio* (latín): movimiento.
+> *Agmen* (latín): multitud en movimiento; columna en marcha.
 
-Motio es un framework para **robótica + IA + IoT** que se construye desde cero
+Agmen es un framework para **robótica + IA + IoT** que se construye desde cero
 como alternativa a ROS 2. Su núcleo es el **sistema nervioso** del robot:
 mueve mensajes entre nodos de forma rápida, confiable y con marca de tiempo.
 La IA, la visión y el IoT **no viven dentro del núcleo**: se conectan a él
@@ -14,34 +14,41 @@ como paquetes opcionales.
 - **Interfaz web**: el robot solo publica datos y el navegador (laptop,
   celular o nube) hace todo el trabajo visual.
 
-📄 **Lee primero:** [`docs/VISION.md`](docs/VISION.md) (visión, decisión de
-C++, comparación con dora-rs, roadmap),
-[`docs/rfc/0001-formato-de-mensajes.md`](docs/rfc/0001-formato-de-mensajes.md)
-(formato v1 propuesto) y
-[`docs/rfc/0002-interfaz-web.md`](docs/rfc/0002-interfaz-web.md) (interfaz web).
+**Versión actual: 0.1.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
 
-## Estado: Nivel 0 ✅
-
-| Nivel | Tema |
+| Para… | Lee |
 |---|---|
-| **0 ✅** | **Fundamentos: serialización, UDP, seq, latencia, CI + prototipo de interfaz web** |
-| 1 ⏭ | Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica |
-| 2–13 | Ver [`docs/VISION.md`](docs/VISION.md#7-roadmap-por-niveles) |
+| **Empezar a usarlo** | 📘 [**Tutorial**](docs/tutorial/README.md): de la instalación a un robot con cerebro en Python e interfaz web |
+| Entender el proyecto | [`docs/VISION.md`](docs/VISION.md): visión, decisión de C++, comparación con dora-rs, roadmap |
+| El formato de mensajes | [RFC 0001](docs/rfc/0001-formato-de-mensajes.md) (v1, **aceptado**) · [PROTOCOLO v0](docs/PROTOCOLO.md) (implementado) |
+| La interfaz web | [RFC 0002](docs/rfc/0002-interfaz-web.md) (propuesta) |
+| Publicar versiones | [`docs/PUBLICAR.md`](docs/PUBLICAR.md) |
+
+## Estado
+
+| Versión | Nivel | Tema |
+|---|---|---|
+| **0.1.0 ✅** | 0 | **Fundamentos: serialización, UDP, seq, latencia, CI, prototipo de interfaz web, tutorial** |
+| 0.2.0 ⏭ | 1 | Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica |
+| … | 2–13 | Ver [`docs/VISION.md`](docs/VISION.md#7-roadmap-por-niveles) |
 
 ## Estructura
 
 ```
-motio/
-├── include/motio/           API pública: motio.hpp, wire.hpp, net.hpp, platform.hpp
+agmen/
+├── VERSION                  la versión (fuente única de verdad)
+├── CHANGELOG.md · LICENSE · pyproject.toml (pip install agmen)
+├── include/agmen/           API pública: agmen.hpp, wire.hpp, net.hpp, platform.hpp
 ├── src/                     implementación del núcleo
 ├── examples/nivel0/         publisher y subscriber
+├── examples/tutorial/       código del tutorial (motor, controlador, cerebro.py)
 ├── tests/                   pruebas (ctest)
-├── tools/motio-web/         interfaz web (prototipo): bridge.py + index.html
-├── python/motio/            implementación de referencia en Python (import motio)
-├── scripts/                 interop.py (C++ <-> Python), web_smoke.py
+├── tools/agmen-web/         interfaz web (prototipo): bridge.py + index.html
+├── python/agmen/            paquete de Python (import agmen)
+├── scripts/                 interop, web, tutorial y check_version (todos corren en el CI)
 ├── bench/                   mediciones que respaldan decisiones de diseño
-├── docs/                    VISION, PROTOCOLO (v0), rfc/
-└── .github/workflows/ci.yml CI: Windows (MSVC), Linux (GCC + sanitizers), macOS (Clang)
+├── docs/                    tutorial/, VISION, PROTOCOLO, VERSIONES, PUBLICAR, rfc/
+└── .github/workflows/       ci.yml (3 sistemas + sanitizers) · release.yml (PyPI + GitHub Release)
 ```
 
 ## Requisitos
@@ -68,7 +75,7 @@ python3 scripts/interop.py                  # C++ <-> Python
 ```
 
 > Con Visual Studio también puedes usar **Archivo → Abrir → Carpeta** y elegir
-> `motio/`: detecta el `CMakeLists.txt` solo.
+> `agmen/`: detecta el `CMakeLists.txt` solo.
 
 Los ejecutables quedan en `build/bin/` (en Windows, `build\bin\publisher.exe`).
 
@@ -97,44 +104,44 @@ Mezclando lenguajes:
 ## Interfaz web (prototipo)
 
 ```bash
-python3 tools/motio-web/bridge.py           # Terminal 1: el puente
+python3 tools/agmen-web/bridge.py           # Terminal 1: el puente
 ./build/bin/publisher --rate 100            # Terminal 2: el "robot"
 # Abre http://127.0.0.1:8080
 ```
 
-![Interfaz web de Motio](docs/img/motio-web.png)
+![Interfaz web de Agmen](docs/img/agmen-web.png)
 
 Muestra en vivo el acelerómetro y el giroscopio, la frecuencia, la latencia,
 las pérdidas y los errores. Para verla **desde el celular** en la misma red WiFi:
 
 ```bash
-python3 tools/motio-web/bridge.py --http 0.0.0.0:8080   # luego abre http://IP-DE-TU-PC:8080
+python3 tools/agmen-web/bridge.py --http 0.0.0.0:8080   # luego abre http://IP-DE-TU-PC:8080
 ```
 
 ⚠ El prototipo no tiene contraseña: úsalo solo en tu red local. El diseño
 completo (WebSocket, teleoperación, modo nube con autenticación) está en el
 RFC 0002.
 
-## Usar Motio en tu propio proyecto CMake
+## Usar Agmen en tu propio proyecto CMake
 
 ```cmake
-add_subdirectory(ruta/a/motio)
-target_link_libraries(mi_nodo PRIVATE motio::core)
+add_subdirectory(ruta/a/agmen)
+target_link_libraries(mi_nodo PRIVATE agmen::core)
 ```
 
 ```cpp
-#include <motio/motio.hpp>
+#include <agmen/agmen.hpp>
 
-auto bytes = motio::wire::encode(motio::wire::ImuSample{...}, seq, motio::wire::now_ns());
+auto bytes = agmen::wire::encode(agmen::wire::ImuSample{...}, seq, agmen::wire::now_ns());
 ```
 
 ## Qué aprendes en el Nivel 0
 
 | Concepto | Dónde verlo |
 |---|---|
-| Serialización little-endian portable | `include/motio/wire.hpp` → `put_le` / `get_le` |
+| Serialización little-endian portable | `include/agmen/wire.hpp` → `put_le` / `get_le` |
 | Hash del esquema calculado en compilación | `fnv1a64` (`constexpr`) y `static_assert` en `tests/test_wire.cpp` |
-| Errores claros en vez de fallas silenciosas | `motio::wire::WireError` |
+| Errores claros en vez de fallas silenciosas | `agmen::wire::WireError` |
 | Sockets en Windows vs Linux/macOS | `src/net.cpp` (Winsock vs BSD) |
 | Por qué el sleep en Windows es impreciso y cómo arreglarlo | `src/platform.cpp` |
 | Lazo a frecuencia fija sin acumular error | `examples/nivel0/publisher.cpp` (programación por *deadline*) |
@@ -143,13 +150,13 @@ auto bytes = motio::wire::encode(motio::wire::ImuSample{...}, seq, motio::wire::
 ## Ejercicios
 
 1. Dibuja a mano los 56 bytes de un `ImuSample` y compáralos con la prueba `layout_del_header_es_estable`.
-2. **Provoca un error de tipo:** agrega `;f32 temp` al `SCHEMA` en `python/motio/wire.py`, corre `python/publisher.py` contra el subscriber de C++ y mira el error en la terminal **y en la interfaz web**.
+2. **Provoca un error de tipo:** agrega `;f32 temp` al `SCHEMA` en `python/agmen/wire.py`, corre `python/publisher.py` contra el subscriber de C++ y mira el error en la terminal **y en la interfaz web**.
 3. **Satura el sistema:** sube `--rate` (1000, 10000, 50000) y observa la latencia, los `perdidos` y los `retrasos`.
 4. **Pruébalo en red:** subscriber o puente web en otra PC con `--listen 0.0.0.0:7400`, publisher con `--to IP:7400`.
 5. Corre `python3 bench/arrow_vs_compact.py` (`pip install pyarrow numpy`) y relaciónalo con la sección 2 del RFC 0001.
 
 ## Contribuir
 
-- Antes de abrir un PR: compila con `-DMOTIO_WERROR=ON` y corre las pruebas.
+- Antes de abrir un PR: compila con `-DAGMEN_WERROR=ON` y corre las pruebas.
 - Las decisiones de diseño grandes se proponen como RFC en `docs/rfc/`.
 - La regla número uno: **nunca fallar en silencio**.

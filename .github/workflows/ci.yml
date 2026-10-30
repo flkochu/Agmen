@@ -5,7 +5,9 @@ name: CI
 
 on:
   push:
+    branches: ["**"]   # los tags los maneja release.yml
   pull_request:
+  workflow_call:      # release.yml reutiliza estas pruebas
 
 jobs:
   test:
@@ -22,8 +24,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Versión consistente
+        run: python scripts/check_version.py
+
       - name: Configurar (advertencias = errores)
-        run: cmake -S . -B build -DMOTIO_WERROR=ON -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -DAGMEN_WERROR=ON -DCMAKE_BUILD_TYPE=Release
 
       - name: Compilar
         run: cmake --build build --config Release --parallel
@@ -40,6 +45,9 @@ jobs:
       - name: Interfaz web
         run: python scripts/web_smoke.py
 
+      - name: Tutorial (el código del tutorial funciona)
+        run: python scripts/tutorial_check.py
+
   sanitizers:
     name: ubuntu + ASan/UBSan
     runs-on: ubuntu-latest
@@ -47,7 +55,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Compilar con sanitizers
         run: |
-          cmake -S . -B build -DMOTIO_WERROR=ON -DMOTIO_SANITIZE=ON -DCMAKE_BUILD_TYPE=Debug
+          cmake -S . -B build -DAGMEN_WERROR=ON -DAGMEN_SANITIZE=ON -DCMAKE_BUILD_TYPE=Debug
           cmake --build build --parallel
       - name: Pruebas
         run: ctest --test-dir build --output-on-failure

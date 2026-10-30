@@ -1,11 +1,11 @@
-"""motio-web — puente entre Motio y el navegador (PROTOTIPO, nivel 0).
+"""agmen-web — puente entre Agmen y el navegador (PROTOTIPO, nivel 0).
 
-Recibe mensajes de Motio por UDP y los transmite a cualquier navegador que
+Recibe mensajes de Agmen por UDP y los transmite a cualquier navegador que
 abra la página. El navegador hace todo el trabajo pesado (gráficas, y más
 adelante cámara y 3D). El robot no dibuja nada: solo publica mensajes.
 
-    python tools/motio-web/bridge.py                          # http://127.0.0.1:8080
-    python tools/motio-web/bridge.py --http 0.0.0.0:8080      # verlo desde el celular en la misma red
+    python tools/agmen-web/bridge.py                          # http://127.0.0.1:8080
+    python tools/agmen-web/bridge.py --http 0.0.0.0:8080      # verlo desde el celular en la misma red
 
 Solo usa la librería estándar de Python (corre igual en Windows, Linux y
 macOS). El puente definitivo será parte del núcleo en C++ y usará
@@ -29,7 +29,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent.parent / "python"))
-from motio import wire  # noqa: E402
+from agmen import wire  # noqa: E402
 
 INDEX_HTML = (HERE / "index.html").read_bytes()
 
@@ -50,6 +50,7 @@ class Hub:
         self.stats = {
             "rate_hz": 0.0, "lost": 0, "errors": 0, "last_error": "",
             "source": "", "latency_ms": None, "type": "", "listening": "",
+            "sources": [],  # emisores activos (últimos 2 s)
         }
 
     def push(self, item: dict) -> None:
@@ -81,6 +82,7 @@ def udp_receiver(hub: Hub, listen: str) -> None:
     hub.update_stats(listening=listen)
 
     expected: dict[str, int] = {}  # seq esperado por emisor
+    last_seen: dict[str, float] = {}  # cuándo habló cada emisor por última vez
     window_start, window_rx = time.monotonic(), 0
     lost_total = errors_total = 0
 
@@ -109,7 +111,9 @@ def udp_receiver(hub: Hub, listen: str) -> None:
                     lost_total += h.seq - exp
                 if exp is None or h.seq >= exp or h.seq == 0:
                     expected[source] = h.seq + 1
+                last_seen[source] = time.monotonic()
                 hub.push({
+                    "src": source,
                     "seq": h.seq,
                     "t": h.stamp_ns / 1e9,
                     "accel": [round(v, 5) for v in msg.accel],
@@ -122,13 +126,16 @@ def udp_receiver(hub: Hub, listen: str) -> None:
 
         now = time.monotonic()
         if now - window_start >= 1.0:
-            hub.update_stats(rate_hz=round(window_rx / (now - window_start), 1))
+            # Varios emisores en el mismo puerto es casi siempre un error de
+            # configuración: se reporta en vez de mezclar sus datos en silencio.
+            active = sorted(s for s, t in last_seen.items() if now - t < 2.0)
+            hub.update_stats(rate_hz=round(window_rx / (now - window_start), 1), sources=active)
             window_start, window_rx = now, 0
 
 
 def make_handler(hub: Hub):
     class Handler(BaseHTTPRequestHandler):
-        server_version = "motio-web/0.0.1"
+        server_version = "agmen-web/0.0.1"
 
         def log_message(self, fmt, *args):  # silencio: no ensuciar la consola
             pass
@@ -175,8 +182,8 @@ def make_handler(hub: Hub):
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Puente Motio -> navegador (prototipo)")
-    ap.add_argument("--listen", default="127.0.0.1:7400", help="dónde recibir mensajes Motio (UDP)")
+    ap = argparse.ArgumentParser(description="Puente Agmen -> navegador (prototipo)")
+    ap.add_argument("--listen", default="127.0.0.1:7400", help="dónde recibir mensajes Agmen (UDP)")
     ap.add_argument("--http", default="127.0.0.1:8080", help="dónde servir la página web")
     args = ap.parse_args()
 
@@ -187,10 +194,10 @@ def main() -> None:
     server = ThreadingHTTPServer((host, int(port)), make_handler(hub))
     server.daemon_threads = True
     shown = "127.0.0.1" if host in ("0.0.0.0", "") else host
-    print(f"[motio-web] recibiendo Motio en udp://{args.listen}")
-    print(f"[motio-web] abre http://{shown}:{port} en tu navegador")
+    print(f"[agmen-web] recibiendo Agmen en udp://{args.listen}")
+    print(f"[agmen-web] abre http://{shown}:{port} en tu navegador")
     if host in ("0.0.0.0", ""):
-        print("[motio-web] también accesible desde otros equipos de tu red (sin contraseña)")
+        print("[agmen-web] también accesible desde otros equipos de tu red (sin contraseña)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

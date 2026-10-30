@@ -4,7 +4,7 @@
 // suficiente y no agrega dependencias. Si alguna falla, rompiste la
 // compatibilidad con Python u otros lenguajes.
 
-#include <motio/wire.hpp>
+#include <agmen/wire.hpp>
 
 #include <cstdio>
 #include <functional>
@@ -25,18 +25,18 @@ int g_failures = 0;
     } while (0)
 
 template <class F>
-void expect_error(F&& f, motio::wire::WireError::Kind kind, std::string_view must_contain = {}) {
+void expect_error(F&& f, agmen::wire::WireError::Kind kind, std::string_view must_contain = {}) {
     try {
         f();
         std::fprintf(stderr, "  FALLA: se esperaba WireError y no se lanzó\n");
         ++g_failures;
-    } catch (const motio::wire::WireError& e) {
+    } catch (const agmen::wire::WireError& e) {
         CHECK(e.kind() == kind);
         CHECK(std::string_view(e.what()).find(must_contain) != std::string_view::npos);
     }
 }
 
-using namespace motio::wire;
+using namespace agmen::wire;
 
 ImuSample sample() {
     return ImuSample{.accel = {0.1f, -9.81f, 0.0f}, .gyro = {0.01f, 0.02f, -0.03f}};
@@ -59,7 +59,7 @@ void ida_y_vuelta() {
 void layout_del_header_es_estable() {
     // Bytes exactos esperados: si esto cambia, se rompe la compatibilidad.
     const auto b = encode(sample(), 1, 2);
-    CHECK(b[0] == 'M' && b[1] == 'O' && b[2] == 'T');
+    CHECK(b[0] == 'A' && b[1] == 'G' && b[2] == 'M');
     CHECK(b[3] == 0);
     CHECK(get_le<std::uint64_t>(b, 4) == type_id_v<ImuSample>);
     CHECK(b[4] == 0x09 && b[11] == 0x14);  // little-endian de verdad
@@ -73,7 +73,7 @@ void layout_del_header_es_estable() {
 void rechaza_magic_invalido() {
     auto b = encode(sample(), 0, 0);
     b[0] = 'X';
-    expect_error([&] { (void)decode<ImuSample>(b); }, WireError::Kind::BadMagic, "Motio");
+    expect_error([&] { (void)decode<ImuSample>(b); }, WireError::Kind::BadMagic, "Agmen");
 }
 
 void rechaza_tipo_incorrecto() {

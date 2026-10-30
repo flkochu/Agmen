@@ -5,7 +5,7 @@
 //
 //   ./build/bin/subscriber --listen 127.0.0.1:7400
 
-#include <motio/motio.hpp>
+#include <agmen/agmen.hpp>
 
 #include <chrono>
 #include <cstdio>
@@ -44,8 +44,8 @@ void report(nivel0::Window& win,
 
 int main(int argc, char** argv) try {
     using namespace std::chrono;
-    namespace wire = motio::wire;
-    motio::platform::init_console();
+    namespace wire = agmen::wire;
+    agmen::platform::init_console();
 
     if (nivel0::wants_help(argc, argv)) {
         std::puts(
@@ -57,9 +57,9 @@ int main(int argc, char** argv) try {
     const auto listen = nivel0::arg<std::string>(argc, argv, "listen", "127.0.0.1:7400");
     const auto verbose = nivel0::arg<int>(argc, argv, "verbose", 0);
 
-    auto socket = motio::net::UdpSocket::bind(listen);
-    std::printf("[subscriber] escuchando %s (type_id 0x%016llx) en %s\n",
-                std::string(wire::ImuSample::kName).c_str(),
+    auto socket = agmen::net::UdpSocket::bind(listen);
+    std::printf("[subscriber] Agmen %s · escuchando %s (type_id 0x%016llx) en %s\n",
+                std::string(agmen::kVersion).c_str(), std::string(wire::ImuSample::kName).c_str(),
                 static_cast<unsigned long long>(wire::type_id_v<wire::ImuSample>),
                 listen.c_str());
     std::fflush(stdout);

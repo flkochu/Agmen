@@ -1,38 +1,38 @@
-# Motio — Visión, estado y roadmap
+# Agmen — Visión, estado y roadmap
 
-> *Motio* (latín): movimiento.
+> *Agmen* (latín): multitud en movimiento; columna en marcha.
 
-## 1. Qué es Motio
+## 1. Qué es Agmen
 
-Motio es el **sistema nervioso** de un robot. Mueve mensajes entre nodos de
+Agmen es el **sistema nervioso** de un robot. Mueve mensajes entre nodos de
 forma rápida, confiable y con marca de tiempo, y no hace nada más. Sirve para
 robótica, IA (visión por computadora, aprendizaje por refuerzo, políticas que
 mueven un robot) e IoT. Está pensado para que lo use **una comunidad**, no
 solo su autor.
 
-**Principio central: Motio no lleva la IA adentro.** El núcleo no sabe qué es
+**Principio central: Agmen no lleva la IA adentro.** El núcleo no sabe qué es
 una imagen, una red neuronal o un broker MQTT. Todo eso vive en paquetes
 opcionales que se conectan al núcleo:
 
 ```
-  motio-web        motio-vision   motio-learn   motio-iot   (simuladores, drivers, tus nodos)
+  agmen-web        agmen-vision   agmen-learn   agmen-iot   (simuladores, drivers, tus nodos)
   (navegador)            │              │            │              │
        │     ┌───────────┴──────────────┴────────────┴──────────────┴──────────┐
-       └─────┤ motio-core (C++20): mensajes, esquemas, transporte, tiempo,     │
+       └─────┤ agmen-core (C++20): mensajes, esquemas, transporte, tiempo,     │
              │ grabación                                                       │
              └─────────────────────────────────────────────────────────────────┘
-                 C++ · Python (de primera clase) · JavaScript · motio-micro (MCU)
+                 C++ · Python (de primera clase) · JavaScript · agmen-micro (MCU)
 ```
 
 | Paquete | Qué es | Cuándo |
 |---|---|---|
-| `motio-core` | Núcleo en C++20: `#include <motio/motio.hpp>`, `namespace motio::` | Desde ya |
-| `motio-web` | Interfaz web: el navegador dibuja, el robot solo publica (RFC 0002) | Prototipo ya; versión C++ en el nivel 3 |
-| `motio` (CLI) | `motio run`, `motio node list`, `motio topic echo /imu` | Nivel 2 |
-| `motio` (Python) | `import motio`, compilado desde el núcleo de C++ con nanobind | Nivel 6 |
-| `motio-micro` | Cliente ligero para microcontroladores | Nivel 12 |
-| `motio-iot` | Puentes MQTT y similares | Nivel 12 |
-| `motio-vision`, `motio-learn` | Nodos y utilidades de IA | Nivel 13 |
+| `agmen-core` | Núcleo en C++20: `#include <agmen/agmen.hpp>`, `namespace agmen::` | Desde ya |
+| `agmen-web` | Interfaz web: el navegador dibuja, el robot solo publica (RFC 0002) | Prototipo ya; versión C++ en el nivel 3 |
+| `agmen` (CLI) | `agmen run`, `agmen node list`, `agmen topic echo /imu` | Nivel 2 |
+| `agmen` (Python, PyPI) | `pip install agmen` / `import agmen`. Hoy: referencia en Python puro; nivel 6: compilado desde C++ con nanobind | 0.1.0 |
+| `agmen-micro` | Cliente ligero para microcontroladores | Nivel 12 |
+| `agmen-iot` | Puentes MQTT y similares | Nivel 12 |
+| `agmen-vision`, `agmen-learn` | Nodos y utilidades de IA | Nivel 13 |
 
 ## 2. Requisitos del núcleo
 
@@ -55,17 +55,25 @@ No se implementan todos ya, pero ninguna decisión debe impedirlos.
 2. **El núcleo solo mueve mensajes.** Si algo puede vivir en un paquete aparte, vive aparte.
 3. **El formato es el contrato.** Cualquier lenguaje que lo implemente es un nodo válido.
 4. **Esquema obligatorio.** No hay topics sin tipo.
-5. **El tiempo es de primera clase.** Los nodos usan el reloj de Motio, nunca el del sistema operativo.
+5. **El tiempo es de primera clase.** Los nodos usan el reloj de Agmen, nunca el del sistema operativo.
 6. **Sin copias para datos grandes; sin sobrecosto para datos chicos.**
 7. **El robot no dibuja.** La interfaz vive en el navegador.
 8. **Discovery que funcione en cualquier red**, sin depender de multicast.
 9. **Cero boilerplate y fácil de compilar**, para que la comunidad pueda contribuir.
 10. **Multiplataforma verificada por CI**, con advertencias tratadas como errores.
 
-## 4. Decisión: núcleo en C++ (2026-10-30)
+## 4. Decisiones del 2026-10-30
+
+**Nombre: Agmen** (antes Motio). *Agmen* en latín es "multitud en movimiento,
+columna en marcha": muchos nodos moviéndose juntos. Estado del nombre en
+registros: `docs/PUBLICAR.md`.
+
+**Versiones:** SemVer; cada nivel es una versión menor (`docs/VERSIONES.md`).
+
+### Núcleo en C++
 
 El nivel 0 se escribió primero en Rust y se migró a C++20 por indicación del
-profesor asesor. El objetivo es que Motio lo use una comunidad.
+profesor asesor. El objetivo es que Agmen lo use una comunidad.
 
 **Por qué C++:**
 - Es el lenguaje que la comunidad de robótica ya conoce: ROS 2, Arduino,
@@ -76,10 +84,10 @@ profesor asesor. El objetivo es que Motio lo use una comunidad.
 
 **Lo que cuesta, y cómo se mitiga:**
 
-| Costo | Mitigación en Motio |
+| Costo | Mitigación en Agmen |
 |---|---|
 | Errores de memoria que el compilador no atrapa | AddressSanitizer + UBSan en el CI; `-Wall -Wextra -Wconversion` como errores; pruebas |
-| Cada sistema operativo se comporta distinto | `motio/net.hpp` y `motio/platform.hpp` concentran las diferencias. Ya aparecieron tres: la longitud en `send` (`int` en Windows, `size_t` en POSIX), la resolución del sleep en Windows (~15.6 ms por defecto) y el `ConnectionReset` de UDP en Windows |
+| Cada sistema operativo se comporta distinto | `agmen/net.hpp` y `agmen/platform.hpp` concentran las diferencias. Ya aparecieron tres: la longitud en `send` (`int` en Windows, `size_t` en POSIX), la resolución del sleep en Windows (~15.6 ms por defecto) y el `ConnectionReset` de UDP en Windows |
 | Compilar y empaquetar es más difícil que en Rust | CMake estándar; sin dependencias externas en el núcleo por ahora; vcpkg/Conan cuando haga falta |
 
 **Lo que no cambió:** el formato de mensajes. Los nodos de Python funcionaron
@@ -115,20 +123,20 @@ que llegó a la versión 1.0 en septiembre de 2026.
 - Grabar y reproducir con sustitución de nodos (pruebas de regresión).
 - Multi-máquina con Zenoh, políticas de reinicio y monitoreo de salud.
 
-### Dónde Motio puede ser distinto
+### Dónde Agmen puede ser distinto
 
-| Tema | dora-rs | Motio |
+| Tema | dora-rs | Agmen |
 |---|---|---|
 | Lenguaje del núcleo | Rust | C++, el lenguaje que ya usa la comunidad de robótica |
 | Tipos | Anotaciones opcionales; hash de esquema agregado en 1.0 | Esquema obligatorio desde el día 0 y decodificación dinámica |
 | Mensajes chicos | Arrow siempre; debajo de 4 KB pasan por el daemon | Codificación `compact` sin sobrecosto (meta: control a 1 kHz; hay que medirlo) |
 | Windows | "Best effort" | De primera clase, verificado por CI |
 | Interfaz | Herramientas de terminal | Interfaz web integrada (local, red, nube); el robot no dibuja |
-| Microcontroladores | Su README no los menciona | `compact` + sobre ligero (`motio-micro`) |
+| Microcontroladores | Su README no los menciona | `compact` + sobre ligero (`agmen-micro`) |
 | Tiempo | Su README no describe la semántica | `t_data` vs `t_pub` y reloj real/sim/replay explícitos |
 | Datasets | Grabaciones `.drec` | Mapeo canónico a Arrow → exportar a Parquet (formato de LeRobot) |
 
-Siendo realistas: dora tiene un equipo y años de trabajo. La ventaja de Motio
+Siendo realistas: dora tiene un equipo y años de trabajo. La ventaja de Agmen
 tiene que venir de **enfocarse** (formato eficiente en ambos extremos, tiempo
 bien definido, interfaz web, microcontroladores, C++ accesible) y de
 apoyarse en piezas existentes donde no aporte nada reinventarlas (Zenoh,
@@ -138,26 +146,26 @@ iceoryx2).
 
 | Nivel | Tema | Requisitos |
 |---|---|---|
-| 0 ✅ | Fundamentos en C++: serialización, UDP, seq, latencia, CI + **prototipo de interfaz web** | g, h |
-| **1** | **Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica** | c, f |
-| 2 | Pub/sub local: topics, discovery, CLI `motio node list`, `motio topic list/echo/hz` | — |
-| 3 | `motio-web` en C++: puente WebSocket, cualquier topic, inspector, teleoperación segura, modo red local | h |
-| 4 | Lenguaje de esquemas `.motio` + generador de código C++/Python | b |
-| 5 | Executor y tiempo: nodos multi-frecuencia, colas por suscripción, reloj de Motio (real/sim) | d, e |
-| 6 | Python de primera clase: paquete `motio` compilado (nanobind); numpy sin copias | b |
+| 0 ✅ (0.1.0) | Fundamentos en C++: serialización, UDP, seq, latencia, CI + **prototipo de interfaz web** | g, h |
+| **1** (0.2.0) | **Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica** | c, f |
+| 2 | Pub/sub local: topics, discovery, CLI `agmen node list`, `agmen topic list/echo/hz` | — |
+| 3 | `agmen-web` en C++: puente WebSocket, cualquier topic, inspector, teleoperación segura, modo red local | h |
+| 4 | Lenguaje de esquemas `.agmen` + generador de código C++/Python | b |
+| 5 | Executor y tiempo: nodos multi-frecuencia, colas por suscripción, reloj de Agmen (real/sim) | d, e |
+| 6 | Python de primera clase: paquete `agmen` compilado (nanobind); numpy sin copias | b |
 | 7 | Codificación `arrow`: imágenes, tensores; panel de cámara en la web | a, b, h |
 | 8 | Memoria compartida para mensajes grandes | a |
 | 9 | Grabación y reproducción; exportar a Parquet; reproducir en la web | c |
 | 10 | Launch/config con un solo archivo; abstracción sim/real | d |
-| 11 | Red multi-máquina, sincronización de relojes y **`motio-web` en la nube** (relay con autenticación) | c, h |
-| 12 | Puentes (`motio-iot` MQTT, ROS 2) y `motio-micro` | f |
-| 13 | Paquetes de IA: `motio-vision`, `motio-learn` | — |
+| 11 | Red multi-máquina, sincronización de relojes y **`agmen-web` en la nube** (relay con autenticación) | c, h |
+| 12 | Puentes (`agmen-iot` MQTT, ROS 2) y `agmen-micro` | f |
+| 13 | Paquetes de IA: `agmen-vision`, `agmen-learn` | — |
 
 ## 8. Decisiones pendientes
 
 | Decisión | Cuándo |
 |---|---|
-| ¿Aprobar el formato del RFC 0001? | **Ahora** |
+| ~~¿Aprobar el formato del RFC 0001?~~ | ✅ Aceptado el 2026-10-30 |
 | ¿Aprobar el diseño de la interfaz web (RFC 0002)? | **Ahora** |
 | Grafo estático declarado (como dora) o pub/sub dinámico (como ROS) | Nivel 2 |
 | Daemon local obligatorio o sin daemon | Nivel 2 |

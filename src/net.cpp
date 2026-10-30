@@ -1,4 +1,4 @@
-#include "motio/net.hpp"
+#include "agmen/net.hpp"
 
 #include <cstring>
 #include <string>
@@ -17,7 +17,7 @@
 #  include <unistd.h>
 #endif
 
-namespace motio::net {
+namespace agmen::net {
 
 namespace {
 
@@ -202,4 +202,4 @@ std::optional<Received> UdpSocket::recv_from(std::span<std::uint8_t> buffer,
     return Received{static_cast<std::size_t>(n), to_string(from)};
 }
 
-}  // namespace motio::net
+}  // namespace agmen::net

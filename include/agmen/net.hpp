@@ -1,7 +1,7 @@
-// motio/net.hpp — socket UDP multiplataforma (Windows, Linux, macOS)
+// agmen/net.hpp — socket UDP multiplataforma (Windows, Linux, macOS)
 //
 // Esconde las diferencias entre Winsock (Windows) y los sockets BSD
-// (Linux/macOS) detrás de una sola clase, para que el resto de Motio no tenga
+// (Linux/macOS) detrás de una sola clase, para que el resto de Agmen no tenga
 // un solo #ifdef.
 #pragma once
 
@@ -14,7 +14,7 @@
 #include <string_view>
 #include <system_error>
 
-namespace motio::net {
+namespace agmen::net {
 
 /// Error de red con un mensaje claro y el código del sistema operativo.
 class NetError : public std::system_error {
@@ -66,4 +66,4 @@ private:
     std::intptr_t handle_ = -1;  // SOCKET en Windows, int en POSIX
 };
 
-}  // namespace motio::net
+}  // namespace agmen::net

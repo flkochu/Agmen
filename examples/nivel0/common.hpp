@@ -14,7 +14,7 @@
 namespace nivel0 {
 
 /// Lee `--nombre valor` de la línea de comandos. (Sin dependencias a
-/// propósito; más adelante el CLI `motio` tendrá un parser de verdad.)
+/// propósito; más adelante el CLI `agmen` tendrá un parser de verdad.)
 template <class T>
 T arg(int argc, char** argv, std::string_view name, T fallback) {
     const std::string flag = "--" + std::string(name);

@@ -1,12 +1,13 @@
-# Protocolo de cable de Motio — versión 0
+# Protocolo de cable de Agmen — versión 0
 
-> **Estado:** implementado (Nivel 0). La versión 1 está propuesta en
-> [`rfc/0001-formato-de-mensajes.md`](rfc/0001-formato-de-mensajes.md) y la reemplazará.
+> **Estado:** implementado en Agmen 0.1.x (nivel 0). La versión 1 está
+> **aceptada** en [`rfc/0001-formato-de-mensajes.md`](rfc/0001-formato-de-mensajes.md)
+> y la reemplazará en Agmen 0.2.0.
 
 Este documento es **el contrato entre lenguajes**. Un nodo escrito en C++,
 Python, JavaScript o en un microcontrolador es compatible si escribe y lee
-exactamente estos bytes. El código de C++ (`include/motio/wire.hpp` + `src/wire.cpp`) es la
-implementación de referencia y `python/motio/wire.py` es la segunda.
+exactamente estos bytes. El código de C++ (`include/agmen/wire.hpp` + `src/wire.cpp`) es la
+implementación de referencia y `python/agmen/wire.py` es la segunda.
 
 ## Reglas generales
 
@@ -19,7 +20,7 @@ implementación de referencia y `python/motio/wire.py` es la segunda.
 
 | Offset | Tamaño | Tipo     | Campo         | Descripción                                      |
 |-------:|-------:|----------|---------------|--------------------------------------------------|
-| 0      | 3      | bytes    | `magic`       | Siempre `"MOT"` (0x4D 0x4F 0x54)                 |
+| 0      | 3      | bytes    | `magic`       | Siempre `"AGM"` (0x41 0x47 0x4D)                 |
 | 3      | 1      | u8       | `version`     | Versión del protocolo. Actualmente `0`           |
 | 4      | 8      | u64      | `type_id`     | Hash FNV-1a 64 del esquema del mensaje           |
 | 12     | 8      | u64      | `seq`         | Contador del publisher, empieza en 0, +1 por mensaje |
@@ -50,7 +51,7 @@ emisor usa otra versión del mensaje en lugar de leer basura en silencio.
 Un receptor debe rechazar el paquete y **reportar el motivo** si:
 
 1. mide menos de 32 bytes;
-2. `magic` ≠ `"MOT"`;
+2. `magic` ≠ `"AGM"`;
 3. `version` no es soportada;
 4. `payload_len` ≠ bytes restantes del datagrama;
 5. `type_id` ≠ el tipo esperado;
@@ -73,20 +74,20 @@ Un receptor debe rechazar el paquete y **reportar el motivo** si:
 | 16     | f32  | gy    | rad/s  |
 | 20     | f32  | gz    | rad/s  |
 
-## Ejemplo mínimo de lectura en C++ sin Motio (ej. un microcontrolador)
+## Ejemplo mínimo de lectura en C++ sin Agmen (ej. un microcontrolador)
 
 ```cpp
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 
-namespace motio_micro {  // independiente de la librería motio
+namespace agmen_micro {  // independiente de la librería agmen
 
 // Válido en máquinas little-endian (x86, ARM, ESP32).
 struct Header { uint64_t type_id, seq, stamp_ns; uint32_t payload_len; };
 
 inline bool read_header(const uint8_t* buf, size_t n, Header& h) {
-    if (n < 32 || std::memcmp(buf, "MOT", 3) != 0 || buf[3] != 0) return false;
+    if (n < 32 || std::memcmp(buf, "AGM", 3) != 0 || buf[3] != 0) return false;
     std::memcpy(&h.type_id,     buf + 4,  8);
     std::memcpy(&h.seq,         buf + 12, 8);
     std::memcpy(&h.stamp_ns,    buf + 20, 8);
@@ -94,7 +95,7 @@ inline bool read_header(const uint8_t* buf, size_t n, Header& h) {
     return h.payload_len == n - 32;
 }
 
-}  // namespace motio_micro
+}  // namespace agmen_micro
 ```
 
 (Se usa `memcpy` campo por campo y no un `reinterpret_cast` a un struct,
