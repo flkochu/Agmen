@@ -1,0 +1,9 @@
+[package]
+name = "nivel0"
+description = "Nivel 0: publisher y subscriber por UDP con header, seq, timestamp y latencia"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+wire = { path = "../wire" }

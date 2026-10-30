@@ -1,0 +1,10 @@
+[package]
+name = "wire"
+description = "Formato binario de mensajes del framework (el contrato entre lenguajes)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+# Nivel 0: sin dependencias externas a propósito.
+# Serializamos a mano para entender endianness, offsets y framing.
+[dependencies]

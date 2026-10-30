@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crates/wire", "crates/nivel0"]
+
+[workspace.package]
+edition = "2021"
+version = "0.0.1"
+license = "MIT"
