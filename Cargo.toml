@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/wire", "crates/nivel0"]
+members = ["crates/motio-core", "examples/nivel0"]
 
 [workspace.package]
 edition = "2021"

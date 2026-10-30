@@ -1,7 +1,7 @@
-"""rfw — implementación en Python del formato de cable v0.
+"""motio.wire — implementación de referencia en Python del formato de cable v0.
 
 Solo usa la librería estándar. Debe producir y leer EXACTAMENTE los mismos
-bytes que el crate `wire` de Rust (ver docs/PROTOCOLO.md).
+bytes que `motio_core::wire` en Rust (ver docs/PROTOCOLO.md).
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import struct
 import time
 from dataclasses import dataclass
 
-MAGIC = b"RFW"
+MAGIC = b"MOT"
 WIRE_VERSION = 0
 HEADER_LEN = 32
 
@@ -80,7 +80,7 @@ def decode(cls, buf: bytes):
         raise WireError(f"paquete demasiado corto: {len(buf)} bytes, se necesitan al menos {HEADER_LEN}")
     magic, version, type_id, seq, stamp_ns, payload_len = HEADER_FMT.unpack_from(buf)
     if magic != MAGIC:
-        raise WireError(f"magic inválido {magic!r}: el paquete no viene de un nodo del framework")
+        raise WireError(f"magic inválido {magic!r}: el paquete no viene de un nodo de Motio")
     if version != WIRE_VERSION:
         raise WireError(f"versión de protocolo {version} no soportada (este nodo habla la versión {WIRE_VERSION})")
     payload = buf[HEADER_LEN:]

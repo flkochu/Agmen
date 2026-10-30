@@ -7,7 +7,7 @@ import argparse
 import socket
 import time
 
-import rfw
+from motio import wire
 
 
 def main() -> None:
@@ -20,23 +20,28 @@ def main() -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((host, int(port)))
     sock.settimeout(0.2)
-    print(f"[py-subscriber] escuchando {rfw.ImuSample.NAME} "
-          f"(type_id {rfw.ImuSample.TYPE_ID:#018x}) en {args.listen}")
+    print(f"[py-subscriber] escuchando {wire.ImuSample.NAME} "
+          f"(type_id {wire.ImuSample.TYPE_ID:#018x}) en {args.listen}")
 
     expected = None
     rx = lost = errors = 0
     lat_us: list[float] = []
+    last_error = ""
     window = time.monotonic()
 
     while True:
         try:
             data, sender = sock.recvfrom(65536)
-            recv_ns = rfw.now_ns()
+            recv_ns = wire.now_ns()
             try:
-                h, msg = rfw.decode(rfw.ImuSample, data)
-            except rfw.WireError as e:
+                h, msg = wire.decode(wire.ImuSample, data)
+            except wire.WireError as e:
                 errors += 1
-                print(f"[py-subscriber] ERROR: {e} (desde {sender[0]}:{sender[1]})")
+                # Cada error distinto se muestra una vez, con su origen.
+                text = f"{e} (desde {sender[0]}:{sender[1]})"
+                if text != last_error:
+                    print(f"[py-subscriber] ERROR: {text}")
+                    last_error = text
             else:
                 rx += 1
                 lat_us.append((recv_ns - h.stamp_ns) / 1000)

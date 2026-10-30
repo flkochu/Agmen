@@ -37,5 +37,8 @@ jobs:
       - name: Pruebas de Python
         run: python -m unittest discover -s python -v
 
+      - name: Compilar binarios
+        run: cargo build --release
+
       - name: Interoperabilidad Rust <-> Python
         run: python scripts/interop.py

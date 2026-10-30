@@ -1,6 +1,7 @@
 """Prueba de interoperabilidad Rust <-> Python. Funciona en Windows, Linux y macOS.
 
-Requiere haber corrido antes `cargo build --release`.
+Requiere haber corrido antes `cargo build --release` (si los binarios están
+desactualizados, la prueba falla con errores de formato).
 
     python scripts/interop.py
 """

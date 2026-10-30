@@ -8,8 +8,8 @@
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
+use motio_core::wire::{decode, now_ns, ImuSample, Message};
 use nivel0::{arg, fmt_duration, wants_help, SeqEvent, SeqTracker, Window};
-use wire::{decode, now_ns, ImuSample, Message};
 
 fn main() -> std::io::Result<()> {
     if wants_help() {

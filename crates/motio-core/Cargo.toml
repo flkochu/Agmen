@@ -1,6 +1,6 @@
 [package]
-name = "wire"
-description = "Formato binario de mensajes del framework (el contrato entre lenguajes)"
+name = "motio-core"
+description = "Núcleo de Motio: formato de mensajes y transporte"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

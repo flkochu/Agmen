@@ -8,7 +8,7 @@ import math
 import socket
 import time
 
-import rfw
+from motio import wire
 
 
 def main() -> None:
@@ -22,17 +22,17 @@ def main() -> None:
     dest = (host, int(port))
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     period = 1.0 / args.rate
-    print(f"[py-publisher] {rfw.ImuSample.NAME} → {args.to} a {args.rate} Hz")
+    print(f"[py-publisher] {wire.ImuSample.NAME} → {args.to} a {args.rate} Hz")
 
     start = time.monotonic()
     seq = 0
     while args.count == 0 or seq < args.count:
         t = time.monotonic() - start
-        msg = rfw.ImuSample(
+        msg = wire.ImuSample(
             accel=(0.5 * math.sin(2 * t), 0.5 * math.cos(2 * t), 9.81),
             gyro=(0.0, 0.0, 0.3 * math.sin(0.5 * t)),
         )
-        sock.sendto(rfw.encode(msg, seq, rfw.now_ns()), dest)
+        sock.sendto(wire.encode(msg, seq, wire.now_ns()), dest)
         seq += 1
         # Misma programación por deadline que en Rust.
         delay = start + seq * period - time.monotonic()

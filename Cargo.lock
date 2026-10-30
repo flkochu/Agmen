@@ -3,12 +3,12 @@
 version = 4
 
 [[package]]
+name = "motio-core"
+version = "0.0.1"
+
+[[package]]
 name = "nivel0"
 version = "0.0.1"
 dependencies = [
- "wire",
+ "motio-core",
 ]
-
-[[package]]
-name = "wire"
-version = "0.0.1"

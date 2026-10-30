@@ -1,4 +1,4 @@
-//! # wire — formato binario v0 del framework
+//! # motio_core::wire — formato de cable v0 de Motio
 //!
 //! Este crate define **el contrato entre lenguajes**. Cualquier nodo (Rust,
 //! Python, C++, un ESP32...) que escriba y lea exactamente estos bytes puede
@@ -15,8 +15,8 @@
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Bytes mágicos al inicio de cada paquete: "RFW" (Robot FrameWork).
-pub const MAGIC: [u8; 3] = *b"RFW";
+/// Bytes mágicos al inicio de cada paquete: "MOT" (Motio).
+pub const MAGIC: [u8; 3] = *b"MOT";
 /// Versión del formato de cable.
 pub const WIRE_VERSION: u8 = 0;
 /// Tamaño del header en bytes.
@@ -32,7 +32,7 @@ pub const HEADER_LEN: usize = 32;
 pub enum WireError {
     /// El paquete es más corto que el header.
     TooShort { got: usize, need: usize },
-    /// No empieza con "RFW": no es un paquete nuestro.
+    /// No empieza con "MOT": no es un paquete nuestro.
     BadMagic([u8; 3]),
     /// Versión del protocolo distinta.
     UnsupportedVersion { got: u8, expected: u8 },
@@ -63,7 +63,7 @@ impl fmt::Display for WireError {
             }
             WireError::BadMagic(m) => write!(
                 f,
-                "magic inválido {:?}: el paquete no viene de un nodo del framework",
+                "magic inválido {:?}: el paquete no viene de un nodo de Motio",
                 String::from_utf8_lossy(m)
             ),
             WireError::UnsupportedVersion { got, expected } => write!(
@@ -105,7 +105,7 @@ impl std::error::Error for WireError {}
 // ---------------------------------------------------------------------------
 
 /// FNV-1a de 64 bits. Es trivial de implementar en cualquier lenguaje
-/// (ver `python/rfw.py`), por eso lo usamos en vez de algo más sofisticado.
+/// (ver `python/motio/wire.py`), por eso lo usamos en vez de algo más sofisticado.
 pub const fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut i = 0;
@@ -125,7 +125,7 @@ pub const fn fnv1a64(bytes: &[u8]) -> u64 {
 ///
 /// | offset | tamaño | campo         |
 /// |--------|--------|---------------|
-/// | 0      | 3      | magic "RFW"   |
+/// | 0      | 3      | magic "MOT"   |
 /// | 3      | 1      | version       |
 /// | 4      | 8      | type_id       |
 /// | 12     | 8      | seq           |
@@ -331,7 +331,7 @@ mod tests {
     fn layout_del_header_es_estable() {
         // Si este test falla, rompiste la compatibilidad con Python/C++.
         let bytes = encode(&sample(), 1, 2);
-        assert_eq!(&bytes[0..3], b"RFW");
+        assert_eq!(&bytes[0..3], b"MOT");
         assert_eq!(bytes[3], 0);
         assert_eq!(&bytes[4..12], &ImuSample::TYPE_ID.to_le_bytes());
         assert_eq!(&bytes[12..20], &1u64.to_le_bytes());
