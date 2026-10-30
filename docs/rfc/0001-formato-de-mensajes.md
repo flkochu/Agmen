@@ -5,6 +5,7 @@
 | **Estado** | Propuesta, pendiente de aprobación |
 | **Reemplaza a** | Protocolo v0 (`docs/PROTOCOLO.md`) |
 | **Fecha** | 2026-10-30 |
+| **Nota** | El núcleo pasó de Rust a C++ el mismo día. El formato no depende del lenguaje, así que esta propuesta no cambia |
 
 ## 1. Resumen
 
@@ -17,7 +18,7 @@ Cada mensaje de Motio tiene dos partes:
    **automáticamente según el esquema**:
    - **`compact`**: para mensajes de tamaño fijo (IMU, comandos de motor,
      estados de articulaciones). Es el layout de un struct de C. Es diminuto,
-     se lee sin copiar desde Rust, C++ y numpy, y cabe en un microcontrolador.
+     se lee sin copiar desde C++, numpy y cualquier lenguaje con structs, y cabe en un microcontrolador.
    - **`arrow`**: para datos de tamaño variable o grandes (imágenes,
      tensores, nubes de puntos, texto, listas). Es un RecordBatch de Apache
      Arrow. Se lee sin copiar desde pyarrow, numpy y PyTorch, y se convierte
@@ -119,9 +120,9 @@ esquema usa `arrow`.
 5. Un payload puede llevar **N filas**: N structs contiguos, con
    `N = payload_len / tamaño_del_struct`. Normalmente N = 1.
 
-Esto coincide con `#[repr(C)]` en Rust, con un `struct` de C/C++ en x86-64,
-ARM64 y ARM32, y con `numpy.dtype(..., align=True)`. El código generado (nivel
-3) incluye `static_assert` de offsets para detectar ABIs raros.
+Esto coincide con un `struct` de C/C++ en x86-64,
+ARM64 y ARM32, con `numpy.dtype(..., align=True)` y con `#[repr(C)]` en Rust. El código generado (nivel
+4) incluye `static_assert` de offsets para detectar ABIs raros.
 
 ### Ejemplos
 
@@ -141,8 +142,7 @@ JointCommand7 { u8 mode; f64 position[7]; }  → 64 bytes
 
 | Lenguaje | Cómo |
 |---|---|
-| Rust | `bytemuck::from_bytes::<ImuSample>(payload)` sobre un struct `#[repr(C)]` |
-| C++ | `reinterpret_cast` a un struct generado, con offsets verificados en compilación |
+| C++ | struct generado con `static_assert` de offsets; se lee con `std::memcpy`/`std::bit_cast` (o vista directa si el buffer está alineado) |
 | Python | `np.frombuffer(payload, dtype)`; 0.29 µs medido |
 | Arrow | con 1 fila, cada campo es un buffer de Arrow apuntando a su offset; con N filas, convertir a columnas es una copia barata (los mensajes son chicos por definición) |
 
@@ -150,12 +150,12 @@ JointCommand7 { u8 mode; f64 position[7]; }  → 64 bytes
 
 - Cada topic tiene **exactamente un esquema**. No hay topics sin tipo.
 - El esquema se escribe en el lenguaje de esquemas de Motio, que se define en
-  el nivel 3. Hasta entonces, la forma canónica es texto:
+  el nivel 4. Hasta entonces, la forma canónica es texto:
   `motio/1 Nombre{tipo campo;tipo campo;...}`. Los tipos anidados se
   **expanden dentro** del texto, para que el hash cubra todo el árbol de
   tipos.
 - `schema_id = FNV-1a 64(texto canónico)`. Con 10 000 tipos distintos, la
-  probabilidad de que dos colisionen es de ~10⁻¹¹.
+  probabilidad de que dos colisionen es de ~3×10⁻¹².
 - **El texto completo del esquema se distribuye una vez**: al anunciar el
   topic y al inicio de cada grabación. Por eso cualquier herramienta
   (`motio topic echo`, un visualizador, un exportador a Parquet) puede
@@ -211,7 +211,7 @@ longitud y generación). Los datos dentro del bloque siguen las mismas reglas
 de `compact` o `arrow`, alineados a 64 bytes.
 
 La semántica exacta (quién reserva, cómo se libera, préstamo de buffers para
-que una cámara escriba directo en memoria compartida) se define en el nivel 7.
+que una cámara escriba directo en memoria compartida) se define en el nivel 8.
 **Este RFC solo garantiza que el formato no lo impide.**
 
 ## 8. Validación obligatoria al recibir
@@ -236,9 +236,9 @@ El receptor rechaza el mensaje **y reporta el motivo** si:
 | b) Python de primera clase, C++ también | `compact` = dtype de numpy; `arrow` = PyCapsule. En C++, structs y Arrow C Data Interface |
 | c) Todo con marca de tiempo; grabaciones = datasets | `t_data`/`t_pub` obligatorios; esquemas autodescritos; mapeo canónico a Arrow, así que exportar a Parquet es directo |
 | d) Misma interfaz sim/real | campo `clock` + reloj de Motio; el nodo nunca lee el reloj del sistema operativo |
-| e) Frecuencias distintas sin bloquearse | `compact` mantiene barato el control a 1 kHz; el no bloqueo se resuelve en el executor (nivel 4), no en el formato |
+| e) Frecuencias distintas sin bloquearse | `compact` mantiene barato el control a 1 kHz; el no bloqueo se resuelve en el executor (nivel 5), no en el formato |
 | f) IoT por puentes; versión para microcontroladores | esquemas en texto, así que un puente MQTT convierte a JSON automáticamente. `compact` se implementa en C sin dependencias |
-| g) Rust, Windows/Linux/macOS | formato sin nada específico del sistema operativo, little-endian, verificado por CI |
+| g) Núcleo nativo (C++), Windows/Linux/macOS | formato sin nada específico del sistema operativo, little-endian, verificado por CI |
 
 ## 10. Alternativas consideradas
 
@@ -265,21 +265,22 @@ espacio para todo, así que cada nivel agrega sin romper:
 | Nivel | Qué parte del formato |
 |---|---|
 | 1 | Sobre v1 completo + `compact` + esquema en texto + decodificación dinámica (`motio topic echo` genérico). Sigue sobre UDP |
-| 3 | Lenguaje de esquemas + generación de código (Rust/Python/C++) para `compact` |
-| 6 | Codificación `arrow`: variables, imágenes, tensores |
-| 7 | Memoria compartida (`PAYLOAD_EN_SHM`) |
-| 8 | Archivo de grabación + exportar a Parquet |
+| 3 | El navegador decodifica el formato (implementación en JavaScript, RFC 0002) |
+| 4 | Lenguaje de esquemas + generación de código (C++/Python) para `compact` |
+| 7 | Codificación `arrow`: variables, imágenes, tensores |
+| 8 | Memoria compartida (`PAYLOAD_EN_SHM`) |
+| 9 | Archivo de grabación + exportar a Parquet |
 | 12 | Sobre ligero para microcontroladores |
 
 ## 13. Preguntas abiertas
 
 1. **Formato del archivo de grabación**: ¿MCAP (formato abierto con
    herramientas como Foxglove) con mensajes de Motio adentro, o un formato
-   propio basado en Arrow IPC? Se decide en el nivel 8. El sobre funciona con
+   propio basado en Arrow IPC? Se decide en el nivel 9. El sobre funciona con
    ambos.
 2. **Hash de 64 bits vs 128 bits** para `schema_id`. 64 es suficiente para
    uso personal; si Motio crece a un ecosistema público, se puede pasar a 128
    usando `header_len`.
 3. **Sincronización de relojes entre máquinas** (NTP/PTP, o un reloj lógico
-   híbrido como el que usa dora-rs). Se decide en el nivel 10. No cambia el
+   híbrido como el que usa dora-rs). Se decide en el nivel 11. No cambia el
    formato.

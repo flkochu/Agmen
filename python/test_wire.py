@@ -1,4 +1,4 @@
-"""Pruebas de motio.wire. Deben dar los mismos valores que Rust.
+"""Pruebas de motio.wire. Deben dar los mismos valores que C++ (tests/test_wire.cpp).
 
     python -m unittest discover -s python
 """
@@ -12,7 +12,7 @@ class TestRfw(unittest.TestCase):
     def sample(self):
         return wire.ImuSample(accel=(0.5, -9.75, 0.0), gyro=(0.25, 0.5, -0.125))
 
-    def test_type_id_igual_que_rust(self):
+    def test_type_id_igual_que_cpp(self):
         self.assertEqual(wire.fnv1a64(b""), 0xCBF29CE484222325)
         self.assertEqual(wire.fnv1a64(b"a"), 0xAF63DC4C8601EC8C)
         self.assertEqual(wire.ImuSample.TYPE_ID, 0x14626BEE23E54E09)

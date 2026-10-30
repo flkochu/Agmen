@@ -1,4 +1,4 @@
-"""Subscriber en Python: recibe lo que publica el nodo de Rust (o cualquiera).
+"""Subscriber en Python: recibe lo que publica el nodo de C++ (o cualquiera).
 
     python3 python/subscriber.py --listen 127.0.0.1:7400
 """

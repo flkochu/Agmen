@@ -1,9 +1,11 @@
-"""Prueba de interoperabilidad Rust <-> Python. Funciona en Windows, Linux y macOS.
+"""Prueba de interoperabilidad C++ <-> Python. Funciona en Windows, Linux y macOS.
 
-Requiere haber corrido antes `cargo build --release` (si los binarios están
-desactualizados, la prueba falla con errores de formato).
+Requiere haber compilado antes (si los binarios están desactualizados, la
+prueba falla con errores de formato):
 
-    python scripts/interop.py
+    cmake -S . -B build && cmake --build build --config Release
+    python scripts/interop.py            # usa build/bin
+    python scripts/interop.py otro/bin   # o la carpeta que indiques
 """
 
 import re
@@ -14,7 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 EXE = ".exe" if sys.platform == "win32" else ""
-BIN = ROOT / "target" / "release"
+BIN = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "build" / "bin"
 PY = [sys.executable, "-u"]  # -u: sin buffer, para leer la salida al momento
 COUNT = 200
 
@@ -39,13 +41,13 @@ def run_case(name, sub_cmd, pub_cmd):
 
 def main():
     cases = [
-        ("Rust   -> Rust",
+        ("C++    -> C++",
          [str(BIN / f"subscriber{EXE}"), "--listen", "127.0.0.1:7501"],
          [str(BIN / f"publisher{EXE}"), "--to", "127.0.0.1:7501", "--rate", "200", "--count", str(COUNT)]),
-        ("Rust   -> Python",
+        ("C++    -> Python",
          PY + [str(ROOT / "python" / "subscriber.py"), "--listen", "127.0.0.1:7502"],
          [str(BIN / f"publisher{EXE}"), "--to", "127.0.0.1:7502", "--rate", "200", "--count", str(COUNT)]),
-        ("Python -> Rust",
+        ("Python -> C++",
          [str(BIN / f"subscriber{EXE}"), "--listen", "127.0.0.1:7503"],
          PY + [str(ROOT / "python" / "publisher.py"), "--to", "127.0.0.1:7503", "--rate", "200",
                "--count", str(COUNT)]),

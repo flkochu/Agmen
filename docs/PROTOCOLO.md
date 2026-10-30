@@ -3,9 +3,9 @@
 > **Estado:** implementado (Nivel 0). La versión 1 está propuesta en
 > [`rfc/0001-formato-de-mensajes.md`](rfc/0001-formato-de-mensajes.md) y la reemplazará.
 
-Este documento es **el contrato entre lenguajes**. Un nodo escrito en Rust,
-Python, C++ o en un microcontrolador es compatible si escribe y lee
-exactamente estos bytes. El código de Rust (`crates/motio-core/src/wire.rs`) es la
+Este documento es **el contrato entre lenguajes**. Un nodo escrito en C++,
+Python, JavaScript o en un microcontrolador es compatible si escribe y lee
+exactamente estos bytes. El código de C++ (`include/motio/wire.hpp` + `src/wire.cpp`) es la
 implementación de referencia y `python/motio/wire.py` es la segunda.
 
 ## Reglas generales
@@ -73,14 +73,14 @@ Un receptor debe rechazar el paquete y **reportar el motivo** si:
 | 16     | f32  | gy    | rad/s  |
 | 20     | f32  | gz    | rad/s  |
 
-## Ejemplo de lectura en C++ (futuro `#include <motio/motio.hpp>`)
+## Ejemplo mínimo de lectura en C++ sin Motio (ej. un microcontrolador)
 
 ```cpp
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 
-namespace motio::wire {
+namespace motio_micro {  // independiente de la librería motio
 
 // Válido en máquinas little-endian (x86, ARM, ESP32).
 struct Header { uint64_t type_id, seq, stamp_ns; uint32_t payload_len; };
@@ -94,7 +94,7 @@ inline bool read_header(const uint8_t* buf, size_t n, Header& h) {
     return h.payload_len == n - 32;
 }
 
-}  // namespace motio::wire
+}  // namespace motio_micro
 ```
 
 (Se usa `memcpy` campo por campo y no un `reinterpret_cast` a un struct,

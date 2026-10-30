@@ -1,4 +1,4 @@
-"""Publisher en Python: lo puede escuchar el subscriber de Rust.
+"""Publisher en Python: lo puede escuchar el subscriber de C++.
 
     python3 python/publisher.py --to 127.0.0.1:7400 --rate 100
 """
@@ -34,7 +34,7 @@ def main() -> None:
         )
         sock.sendto(wire.encode(msg, seq, wire.now_ns()), dest)
         seq += 1
-        # Misma programación por deadline que en Rust.
+        # Misma programación por deadline que en C++.
         delay = start + seq * period - time.monotonic()
         if delay > 0:
             time.sleep(delay)

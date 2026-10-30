@@ -1,5 +1,6 @@
-# Compila y prueba en Windows, Linux y macOS en cada push y pull request.
-# Si algo deja de funcionar en un sistema, GitHub te avisa.
+# Compila y prueba en Windows (MSVC), Linux (GCC) y macOS (Apple Clang) en
+# cada push y pull request. Si algo deja de funcionar en un sistema, GitHub
+# te avisa.
 name: CI
 
 on:
@@ -17,28 +18,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Formato
-        run: cargo fmt --check
+      - name: Configurar (advertencias = errores)
+        run: cmake -S . -B build -DMOTIO_WERROR=ON -DCMAKE_BUILD_TYPE=Release
 
-      - name: Clippy
-        run: cargo clippy --release -- -D warnings
+      - name: Compilar
+        run: cmake --build build --config Release --parallel
 
-      - name: Pruebas de Rust
-        run: cargo test --release
+      - name: Pruebas de C++
+        run: ctest --test-dir build -C Release --output-on-failure
 
       - name: Pruebas de Python
         run: python -m unittest discover -s python -v
 
-      - name: Compilar binarios
-        run: cargo build --release
-
-      - name: Interoperabilidad Rust <-> Python
+      - name: Interoperabilidad C++ <-> Python
         run: python scripts/interop.py
+
+      - name: Interfaz web
+        run: python scripts/web_smoke.py
+
+  sanitizers:
+    name: ubuntu + ASan/UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compilar con sanitizers
+        run: |
+          cmake -S . -B build -DMOTIO_WERROR=ON -DMOTIO_SANITIZE=ON -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build --parallel
+      - name: Pruebas
+        run: ctest --test-dir build --output-on-failure

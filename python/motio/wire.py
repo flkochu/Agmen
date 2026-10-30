@@ -1,7 +1,7 @@
 """motio.wire — implementación de referencia en Python del formato de cable v0.
 
 Solo usa la librería estándar. Debe producir y leer EXACTAMENTE los mismos
-bytes que `motio_core::wire` en Rust (ver docs/PROTOCOLO.md).
+bytes que `motio::wire` en C++ (include/motio/wire.hpp) (ver docs/PROTOCOLO.md).
 """
 
 from __future__ import annotations

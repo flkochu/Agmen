@@ -1,8 +1,0 @@
-[workspace]
-resolver = "2"
-members = ["crates/motio-core", "examples/nivel0"]
-
-[workspace.package]
-edition = "2021"
-version = "0.0.1"
-license = "MIT"
