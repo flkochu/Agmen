@@ -8,11 +8,16 @@ prueba falla con errores de formato):
     python scripts/interop.py otro/bin   # o la carpeta que indiques
 """
 
+import os
 import re
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+# En Windows, la salida a un archivo/CI usa cp1252 y truena con acentos o "→".
+for _stream in (sys.stdout, sys.stderr):
+    _stream.reconfigure(encoding="utf-8", errors="replace")
 
 ROOT = Path(__file__).resolve().parent.parent
 EXE = ".exe" if sys.platform == "win32" else ""
@@ -21,11 +26,14 @@ PY = [sys.executable, "-u"]  # -u: sin buffer, para leer la salida al momento
 COUNT = 200
 
 
+ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+
 def run_case(name, sub_cmd, pub_cmd):
     sub = subprocess.Popen(sub_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                           encoding="utf-8", errors="replace")
+                           encoding="utf-8", errors="replace", env=ENV)
     time.sleep(1.0)  # que el subscriber alcance a abrir el puerto
-    subprocess.run(pub_cmd, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(pub_cmd, check=True, stdout=subprocess.DEVNULL, env=ENV)
     time.sleep(2.0)  # que imprima la última ventana de estadísticas
     sub.terminate()
     out, _ = sub.communicate(timeout=5)

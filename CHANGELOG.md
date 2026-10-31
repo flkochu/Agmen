@@ -33,6 +33,11 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 ### Cambiado
 - `tools/agmen-web/bridge.py` se reemplaza por `agmen web`, incluido en el paquete.
 
+### Corregido (encontrado por el primer CI en GitHub)
+- Windows: los nodos de Python ya no truenan al imprimir acentos o "→" cuando
+  su salida va a un archivo u otro programa (`agmen.ensure_utf8_output()`).
+- macOS: el panel ya no tarda en arrancar por una consulta DNS lenta.
+
 ### Seguridad
 - El panel rechaza peticiones de otros sitios (protección CSRF), recorta los
   comandos de manejo a la velocidad máxima y limita su frecuencia.
@@ -56,6 +61,6 @@ Primera versión pública: **Nivel 0**.
   propuesta).
 - CI en Windows (MSVC), Linux (GCC + sanitizers) y macOS (Clang).
 
-[Sin publicar]: https://github.com/flkochu/agmen/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/flkochu/agmen/releases/tag/v0.2.0
-[0.1.0]: https://github.com/flkochu/agmen/releases/tag/v0.1.0
+[Sin publicar]: https://github.com/flkochu/Agmen/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/flkochu/Agmen/releases/tag/v0.2.0
+[0.1.0]: https://github.com/flkochu/Agmen/releases/tag/v0.1.0

@@ -31,6 +31,23 @@ from .._version import __version__
 INDEX_HTML = (Path(__file__).resolve().parent / "index.html").read_bytes()
 
 
+class _HTTPServer(ThreadingHTTPServer):
+    """Igual que ThreadingHTTPServer, pero sin la consulta de DNS al arrancar.
+
+    HTTPServer.server_bind() llama socket.getfqdn(), que en macOS puede tardar
+    varios segundos esperando al DNS. Mientras tanto el puerto todavía no
+    escucha y el navegador no se puede conectar.
+    """
+
+    def server_bind(self):
+        import socketserver
+
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = port
+
+
 @dataclass
 class MotorCommand(wire.Message):
     """Mismo esquema que examples/tutorial/motor_command.hpp."""
@@ -178,7 +195,7 @@ class Panel:
             from ..run import LogBook
             self.logs = LogBook()
         host, port = http.rsplit(":", 1)
-        self.server = ThreadingHTTPServer((host, int(port)), self._handler())
+        self.server = _HTTPServer((host, int(port)), self._handler())
         self.server.daemon_threads = True
 
     @property

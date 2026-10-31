@@ -19,7 +19,7 @@ versión 0.1.0 de Agmen ya funciona, así que es el momento de publicarla.
 
 1. Revisa si `https://github.com/agmen` está libre. Si lo está, crea una
    **organización** gratuita llamada `agmen` (*Your organizations → New
-   organization*). Si no, usa tu usuario (`github.com/flkochu/agmen`).
+   organization*). Si no, usa tu usuario (`github.com/flkochu/Agmen`).
 2. Crea el repositorio `agmen` (público) y sube el código:
    ```bash
    cd agmen

@@ -7,10 +7,12 @@ import argparse
 import socket
 import time
 
+import agmen
 from agmen import wire
 
 
 def main() -> None:
+    agmen.ensure_utf8_output()  # sin errores de acentos en Windows
     ap = argparse.ArgumentParser()
     ap.add_argument("--listen", default="127.0.0.1:7400")
     ap.add_argument("--verbose", action="store_true")

@@ -36,8 +36,8 @@ classifiers = [
 agmen = "agmen.cli:main"
 
 [project.urls]
-Repository = "https://github.com/flkochu/agmen"
-Changelog = "https://github.com/flkochu/agmen/blob/main/CHANGELOG.md"
+Repository = "https://github.com/flkochu/Agmen"
+Changelog = "https://github.com/flkochu/Agmen/blob/main/CHANGELOG.md"
 
 [tool.hatch.version]
 path = "python/agmen/_version.py"

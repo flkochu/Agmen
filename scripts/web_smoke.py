@@ -13,6 +13,10 @@ import time
 import urllib.request
 from pathlib import Path
 
+# En Windows, la salida a un archivo/CI usa cp1252 y truena con acentos o "→".
+for _stream in (sys.stdout, sys.stderr):
+    _stream.reconfigure(encoding="utf-8", errors="replace")
+
 ROOT = Path(__file__).resolve().parent.parent
 EXE = ".exe" if sys.platform == "win32" else ""
 BIN = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "build" / "bin"
@@ -25,8 +29,13 @@ def main() -> None:
                               env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     pub = None
     try:
-        time.sleep(1.5)
-        page = urllib.request.urlopen("http://127.0.0.1:8181/", timeout=5).read().decode("utf-8")
+        page = ""
+        for _ in range(40):  # hasta ~20 s: en el CI algunas máquinas tardan en arrancar
+            try:
+                page = urllib.request.urlopen("http://127.0.0.1:8181/", timeout=2).read().decode("utf-8")
+                break
+            except OSError:
+                time.sleep(0.5)
         assert "Agmen" in page, "la página no cargó"
 
         pub = subprocess.Popen([str(BIN / f"publisher{EXE}"), "--to", "127.0.0.1:7801",

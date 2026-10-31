@@ -110,6 +110,9 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("version", help="muestra la versión")
     p.set_defaults(func=lambda a: print(f"agmen {__version__}") or 0)
 
+    from . import ensure_utf8_output
+
+    ensure_utf8_output()
     args = ap.parse_args(argv)
     return args.func(args)
 

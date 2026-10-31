@@ -30,4 +30,4 @@ agmen web                # solo el panel
 
 > ⚠ Versión 0.x: la API todavía va a cambiar entre versiones menores.
 
-Documentación, tutorial y código: <https://github.com/flkochu/agmen>
+Documentación, tutorial y código: <https://github.com/flkochu/Agmen>

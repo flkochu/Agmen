@@ -16,6 +16,10 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# En Windows, la salida a un archivo/CI usa cp1252 y truena con acentos o "→".
+for _stream in (sys.stdout, sys.stderr):
+    _stream.reconfigure(encoding="utf-8", errors="replace")
+
 ROOT = Path(__file__).resolve().parent.parent
 URL = "http://127.0.0.1:8180"
 H = {"X-Agmen": "1", "Content-Type": "application/json"}

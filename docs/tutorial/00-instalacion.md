@@ -27,7 +27,7 @@ en el menú Inicio): ya trae el compilador configurado.
 ## 2. Descarga Agmen
 
 ```bash
-git clone https://github.com/flkochu/agmen.git
+git clone https://github.com/flkochu/Agmen.git
 cd agmen
 ```
 

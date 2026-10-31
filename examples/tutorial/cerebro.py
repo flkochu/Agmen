@@ -54,6 +54,7 @@ def decidir(distancia: float) -> tuple[MotorCommand, str]:
 
 
 def main() -> None:
+    agmen.ensure_utf8_output()  # sin errores de acentos en Windows
     count = int(sys.argv[1]) if len(sys.argv) > 1 else 0
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     print(f"[cerebro] Agmen {agmen.__version__} · decidiendo a 20 Hz → 127.0.0.1:7500")

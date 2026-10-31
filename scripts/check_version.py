@@ -13,6 +13,10 @@ import re
 import sys
 from pathlib import Path
 
+# En Windows, la salida a un archivo/CI usa cp1252 y truena con acentos o "→".
+for _stream in (sys.stdout, sys.stderr):
+    _stream.reconfigure(encoding="utf-8", errors="replace")
+
 ROOT = Path(__file__).resolve().parent.parent
 SEMVER = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$")
 
