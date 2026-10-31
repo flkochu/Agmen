@@ -5,15 +5,16 @@
 | Parte | Cuándo sube | Ejemplo |
 |---|---|---|
 | **MAYOR** | Cambios que rompen la API o el formato *después* de la 1.0 | 1.4.2 → 2.0.0 |
-| **MENOR** | Cosas nuevas. **Mientras estemos en 0.x, cada nivel del roadmap es una versión menor** y puede romper la API | 0.1.0 → 0.2.0 |
+| **MENOR** | Cosas nuevas. **Mientras estemos en 0.x, cada entrega con funciones nuevas (normalmente un nivel del roadmap) es una versión menor** y puede romper la API | 0.1.0 → 0.2.0 |
 | **PARCHE** | Correcciones de bugs sin cambiar la API | 0.1.0 → 0.1.1 |
 
 | Versión | Nivel | Contenido |
 |---|---|---|
 | **0.1.0** | 0 | Núcleo C++, formato v0, UDP, interfaz web (prototipo), tutorial 0–4 |
-| 0.2.0 | 1 | Sobre v1 + `compact` + esquema en texto (RFC 0001) |
-| 0.3.0 | 2 | Pub/sub local, topics, CLI `agmen` |
-| 0.4.0 | 3 | `agmen-web` en C++ (WebSocket) |
+| **0.2.0** | — | `agmen run robot.toml` + panel web de control (RFC 0003) |
+| 0.3.0 | 1 | Sobre v1 + `compact` + esquema en texto (RFC 0001) |
+| 0.4.0 | 2 | Pub/sub local, topics, `agmen topic list/echo/hz` |
+| 0.5.0 | 3 | Panel en C++ (WebSocket): cualquier topic |
 | … | … | Un nivel por versión menor |
 | 1.0.0 | — | API estable: a partir de aquí romper la API exige subir MAYOR |
 

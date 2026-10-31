@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Estado** | Propuesta. Prototipo funcionando en `tools/agmen-web/` |
+| **Estado** | Propuesta. Prototipo funcionando en Agmen 0.2.0: `agmen web` y `agmen run` (`python/agmen/panel/`, ver RFC 0003) |
 | **Fecha** | 2026-10-30 |
 
 ## 1. Problema
@@ -90,9 +90,10 @@ Decisiones:
 
 | Panel | Necesita | Nivel |
 |---|---|---|
-| Gráficas en vivo + estadísticas (Hz, latencia, pérdidas, errores) | Nivel 0 | **Prototipo hecho** |
-| Lista de nodos y topics; inspector de cualquier mensaje | Pub/sub + esquemas en texto | 3 |
-| Teleoperación (joystick virtual) con *deadman* y timeout | Publicar desde el navegador | 3 |
+| Gráficas en vivo + estadísticas (Hz, latencia, pérdidas, errores) | Nivel 0 | **Hecho (0.1.0)** |
+| Lista de nodos con iniciar/detener/reiniciar + logs de todos | `agmen run` (RFC 0003) | **Hecho (0.2.0)** |
+| Teleoperación (teclado y táctil) con *deadman* y límite de velocidad | Publicar desde el navegador | **Hecho (0.2.0)**, a un destino fijo |
+| Lista de topics; inspector de cualquier mensaje | Pub/sub + esquemas en texto | 0.4.0 |
 | Cámara | Codificación `arrow` / bytes comprimidos (JPEG/H.264) | 7 |
 | Vista 3D (robot, TF, nube de puntos) | Transformadas + Arrow | 9+ |
 | Reproducir grabaciones en el navegador | Grabación | 9 |
@@ -106,16 +107,18 @@ Decisiones:
   "alto".
 - Límites de frecuencia para que un navegador no pueda saturar al robot.
 
-## 7. Qué hay hoy (`tools/agmen-web/`)
+## 7. Qué hay hoy (Agmen 0.2.0, `python/agmen/panel/`)
 
-![Prototipo de agmen-web](../img/agmen-web.png)
+![Panel de control de Agmen](../img/agmen-panel.png)
 
-- `bridge.py`: recibe Agmen por UDP y sirve la página y los datos (SSE). Solo
-  usa la librería estándar.
-- `index.html`: gráficas de acelerómetro y giroscopio, Hz, latencia,
-  pérdidas, errores y el último error con su texto. Sin librerías externas:
-  funciona sin internet (útil en competencias). Tema claro/oscuro y vista para
-  celular.
+- `server.py`: recibe Agmen por UDP y sirve la página, los datos (SSE) y la
+  API de control. Solo usa la librería estándar de Python.
+- `index.html`: nodos (con `agmen run`), manejo con teclado o táctil, gráficas
+  de acelerómetro y giroscopio, Hz, latencia, pérdidas, errores y logs de todos
+  los nodos. Sin librerías externas: funciona sin internet (útil en
+  competencias). Tema claro/oscuro y vista para celular.
+- La teleoperación del nivel 3 se adelantó: ya existe, con *deadman*, límite
+  de velocidad y protección CSRF (RFC 0003, sección 6).
 - Si **varios emisores** mandan al mismo puerto, no mezcla sus datos:
   grafica uno solo y muestra un aviso (regla "nunca fallar en silencio").
 - `scripts/web_smoke.py`: prueba automática que corre en el CI.

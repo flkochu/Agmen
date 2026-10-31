@@ -14,6 +14,9 @@ dynamic = ["version"]
 description = "Agmen: el sistema nervioso para robótica, IA e IoT"
 readme = "python/README.md"
 requires-python = ">=3.10"
+dependencies = [
+    "tomli>=1.1; python_version < '3.11'",   # robot.toml en Python 3.10
+]
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Adán López Lozano" }]
@@ -28,6 +31,9 @@ classifiers = [
     "Topic :: Scientific/Engineering",
     "Topic :: Software Development :: Libraries",
 ]
+
+[project.scripts]
+agmen = "agmen.cli:main"
 
 [project.urls]
 Repository = "https://github.com/flkochu/agmen"

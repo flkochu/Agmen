@@ -1,26 +1,29 @@
 # Capítulo 4 — La interfaz web
 
-*Disponible desde Agmen 0.1.0 (prototipo) · ⏱ 10 minutos*
+*Disponible desde Agmen 0.1.0 · actualizado para 0.2.0 · ⏱ 10 minutos*
 
 En ROS, la interfaz gráfica (RViz) es un programa pesado que normalmente
 corre en la misma computadora del robot. En Agmen, **el robot no dibuja
-nada**: un **puente** reenvía los mensajes al **navegador**, y el navegador
+nada**: el **panel** reenvía los mensajes al **navegador**, y el navegador
 (en tu laptop o en tu celular) hace todo el trabajo visual.
 
 ```
  robot / tu PC                                  cualquier pantalla
- publisher ──► puente (agmen-web) ── http ──► navegador: gráficas, estadísticas
+ publisher ──► panel (agmen web) ── http ──► navegador: gráficas, estadísticas
 ```
+
+Necesitas el comando `agmen`, que se instala con el paquete de Python del
+capítulo 3 (`pip install .` desde la carpeta del repo).
 
 ## 1. Córrelo
 
-Terminal 1, el puente:
+Terminal 1, el panel:
 ```bash
-python3 tools/agmen-web/bridge.py
+agmen web
 ```
 ```
-[agmen-web] recibiendo Agmen en udp://127.0.0.1:7400
-[agmen-web] abre http://127.0.0.1:8080 en tu navegador
+[agmen web] recibiendo Agmen en udp://127.0.0.1:7400
+[agmen web] abre http://127.0.0.1:8080 en tu navegador
 ```
 
 Terminal 2, el sensor del capítulo 1:
@@ -28,7 +31,7 @@ Terminal 2, el sensor del capítulo 1:
 ./build/bin/publisher --rate 100
 ```
 
-Abre **http://127.0.0.1:8080**:
+Se abre solo **http://127.0.0.1:8080**:
 
 ![Interfaz web de Agmen](../img/agmen-web.png)
 
@@ -44,7 +47,7 @@ Abre **http://127.0.0.1:8080**:
 Con la PC y el celular **en la misma red WiFi**:
 
 ```bash
-python3 tools/agmen-web/bridge.py --http 0.0.0.0:8080
+agmen web --http 0.0.0.0:8080
 ```
 
 En el celular abre `http://IP-DE-TU-PC:8080`. Para saber la IP de tu PC:
@@ -60,8 +63,8 @@ con usuarios, cifrado y modo nube está diseñada en el
 🧪 **Detén el publisher.** El indicador de arriba a la derecha cambia a
 "sin datos del robot".
 
-🧪 **Detén el puente** y recarga la página: "sin conexión con el puente ·
-reintentando…". Vuelve a correrlo: se reconecta solo.
+🧪 **Detén el panel** (Ctrl+C en la terminal 1): la página dice "sin
+conexión con Agmen · reintentando…". Vuelve a correrlo: se reconecta solo.
 
 🧪 **Corre dos publishers a la vez** (dos terminales con `./build/bin/publisher`).
 La interfaz no mezcla sus datos: grafica uno solo y muestra un aviso
@@ -75,10 +78,10 @@ mensaje claro que en la terminal.
 
 ## Limitaciones de esta versión
 
-- Solo grafica `ImuSample`. Desde **Agmen 0.2.0** los mensajes llevan su
-  esquema y la interfaz podrá mostrar **cualquier** tipo.
-- Solo muestra datos; todavía no manda comandos. La teleoperación (joystick
-  virtual con freno de seguridad) llega en **0.4.0**.
+- Solo grafica `ImuSample`. Desde **Agmen 0.3.0** los mensajes llevan su
+  esquema y el panel podrá mostrar **cualquier** tipo.
+- Con `agmen web` el panel solo **muestra**. En el capítulo 5 lo usas con
+  `agmen run` para además **controlar los nodos y manejar el robot**.
 
 ## Lo que aprendiste
 
@@ -87,5 +90,4 @@ mensaje claro que en la terminal.
 
 ---
 
-🎉 **Terminaste el tutorial de Agmen 0.1.** Con la próxima versión llegan
-capítulos nuevos ([índice](README.md#próximamente)).
+**Siguiente:** [Capítulo 5 — Todo el robot con un solo comando](05-un-solo-comando.md)

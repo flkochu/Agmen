@@ -27,8 +27,8 @@ opcionales que se conectan al núcleo:
 | Paquete | Qué es | Cuándo |
 |---|---|---|
 | `agmen-core` | Núcleo en C++20: `#include <agmen/agmen.hpp>`, `namespace agmen::` | Desde ya |
-| `agmen-web` | Interfaz web: el navegador dibuja, el robot solo publica (RFC 0002) | Prototipo ya; versión C++ en el nivel 3 |
-| `agmen` (CLI) | `agmen run`, `agmen node list`, `agmen topic echo /imu` | Nivel 2 |
+| `agmen` (comando) | `agmen run robot.toml` (todo el robot + panel), `agmen web`; luego `agmen topic echo /imu`, `agmen node list` | 0.2.0 (run, web); topics en 0.4.0 |
+| Panel web | Nodos, logs, sensores y manejo desde el navegador; el robot no dibuja (RFC 0002, 0003) | 0.2.0 (Python); versión C++/WebSocket en 0.5.0 |
 | `agmen` (Python, PyPI) | `pip install agmen` / `import agmen`. Hoy: referencia en Python puro; nivel 6: compilado desde C++ con nanobind | 0.1.0 |
 | `agmen-micro` | Cliente ligero para microcontroladores | Nivel 12 |
 | `agmen-iot` | Puentes MQTT y similares | Nivel 12 |
@@ -48,6 +48,7 @@ No se implementan todos ya, pero ninguna decisión debe impedirlos.
 | f | IoT por puentes, fuera del núcleo; a futuro, versión para microcontroladores |
 | g | Núcleo en C++; Windows, Linux y macOS |
 | h | **Interfaz gráfica que no le cueste recursos al robot**: web, local, red o nube (RFC 0002) |
+| i | **Un solo comando** levanta todo el robot; se monitorea y se controla desde el navegador, sin abrir una terminal por nodo (RFC 0003) |
 
 ## 3. Reglas de diseño
 
@@ -61,6 +62,7 @@ No se implementan todos ya, pero ninguna decisión debe impedirlos.
 8. **Discovery que funcione en cualquier red**, sin depender de multicast.
 9. **Cero boilerplate y fácil de compilar**, para que la comunidad pueda contribuir.
 10. **Multiplataforma verificada por CI**, con advertencias tratadas como errores.
+11. **Un comando, una pantalla.** Si para usar algo hay que abrir otra terminal, es un bug de experiencia.
 
 ## 4. Decisiones del 2026-10-30
 
@@ -68,7 +70,7 @@ No se implementan todos ya, pero ninguna decisión debe impedirlos.
 columna en marcha": muchos nodos moviéndose juntos. Estado del nombre en
 registros: `docs/PUBLICAR.md`.
 
-**Versiones:** SemVer; cada nivel es una versión menor (`docs/VERSIONES.md`).
+**Versiones:** SemVer; cada entrega con funciones nuevas (normalmente un nivel) es una versión menor (`docs/VERSIONES.md`).
 
 ### Núcleo en C++
 
@@ -89,6 +91,11 @@ profesor asesor. El objetivo es que Agmen lo use una comunidad.
 | Errores de memoria que el compilador no atrapa | AddressSanitizer + UBSan en el CI; `-Wall -Wextra -Wconversion` como errores; pruebas |
 | Cada sistema operativo se comporta distinto | `agmen/net.hpp` y `agmen/platform.hpp` concentran las diferencias. Ya aparecieron tres: la longitud en `send` (`int` en Windows, `size_t` en POSIX), la resolución del sleep en Windows (~15.6 ms por defecto) y el `ConnectionReset` de UDP en Windows |
 | Compilar y empaquetar es más difícil que en Rust | CMake estándar; sin dependencias externas en el núcleo por ahora; vcpkg/Conan cuando haga falta |
+
+**Herramientas en Python, núcleo en C++.** El comando `agmen` (lanzador y
+panel) está en Python, igual que el comando `ros2`: orquestar procesos no es
+el camino crítico, y así es más fácil de instalar (`pip install agmen`) y de
+contribuir. Lo que mueve mensajes rápido sigue en C++.
 
 **Lo que no cambió:** el formato de mensajes. Los nodos de Python funcionaron
 igual antes y después de la migración, sin tocarlos. Es la regla 3 en acción.
@@ -146,17 +153,18 @@ iceoryx2).
 
 | Nivel | Tema | Requisitos |
 |---|---|---|
-| 0 ✅ (0.1.0) | Fundamentos en C++: serialización, UDP, seq, latencia, CI + **prototipo de interfaz web** | g, h |
-| **1** (0.2.0) | **Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica** | c, f |
-| 2 | Pub/sub local: topics, discovery, CLI `agmen node list`, `agmen topic list/echo/hz` | — |
-| 3 | `agmen-web` en C++: puente WebSocket, cualquier topic, inspector, teleoperación segura, modo red local | h |
+| 0 ✅ (0.1.0) | Fundamentos en C++: serialización, UDP, seq, latencia, CI + prototipo de interfaz web | g, h |
+| ✅ (0.2.0) | **`agmen run robot.toml` + panel web de control** (adelanto de los niveles 3 y 10, RFC 0003) | h, i |
+| **1** (0.3.0) | **Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica** | c, f |
+| 2 (0.4.0) | Pub/sub local: topics, discovery, `agmen node list`, `agmen topic list/echo/hz`; el panel muestra cualquier topic | i |
+| 3 (0.5.0) | Panel en C++: puente WebSocket, inspector de mensajes, teleoperación a topics, modo red local | h |
 | 4 | Lenguaje de esquemas `.agmen` + generador de código C++/Python | b |
 | 5 | Executor y tiempo: nodos multi-frecuencia, colas por suscripción, reloj de Agmen (real/sim) | d, e |
 | 6 | Python de primera clase: paquete `agmen` compilado (nanobind); numpy sin copias | b |
 | 7 | Codificación `arrow`: imágenes, tensores; panel de cámara en la web | a, b, h |
 | 8 | Memoria compartida para mensajes grandes | a |
 | 9 | Grabación y reproducción; exportar a Parquet; reproducir en la web | c |
-| 10 | Launch/config con un solo archivo; abstracción sim/real | d |
+| 10 | Abstracción sim/real; `robot.toml` con nodos en varias máquinas (el lanzador básico ya existe desde 0.2.0) | d, i |
 | 11 | Red multi-máquina, sincronización de relojes y **`agmen-web` en la nube** (relay con autenticación) | c, h |
 | 12 | Puentes (`agmen-iot` MQTT, ROS 2) y `agmen-micro` | f |
 | 13 | Paquetes de IA: `agmen-vision`, `agmen-learn` | — |
@@ -167,6 +175,7 @@ iceoryx2).
 |---|---|
 | ~~¿Aprobar el formato del RFC 0001?~~ | ✅ Aceptado el 2026-10-30 |
 | ¿Aprobar el diseño de la interfaz web (RFC 0002)? | **Ahora** |
+| ¿Aprobar el lanzador y el panel (RFC 0003)? | Ya implementado como prototipo; se puede ajustar |
 | Grafo estático declarado (como dora) o pub/sub dinámico (como ROS) | Nivel 2 |
 | Daemon local obligatorio o sin daemon | Nivel 2 |
 | Compatibilidad con el protocolo WebSocket de Foxglove | Nivel 3 |

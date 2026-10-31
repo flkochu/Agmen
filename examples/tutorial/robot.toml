@@ -1,0 +1,34 @@
+# robot.toml — todo el robot del tutorial con UN solo comando:
+#
+#   agmen run examples/tutorial/robot.toml
+#
+# Las rutas son relativas a este archivo. "python" se reemplaza por el mismo
+# Python que corre agmen (funciona igual en Windows, Linux y macOS).
+
+[robot]
+name = "robot del tutorial"
+# Antes de arrancar los nodos: compilar (si ya está compilado, tarda 1 s).
+before = ["cmake --build ../../build --config Release"]
+
+[[node]]
+name = "imu"                                   # el sensor del capítulo 1
+cmd = "../../build/bin/publisher --rate 100"   # manda ImuSample al panel (127.0.0.1:7400)
+restart = "on-failure"                         # si se cae, se vuelve a levantar solo
+
+[[node]]
+name = "motor"                                 # el motor con freno de seguridad (capítulo 2)
+cmd = "../../build/bin/tutorial_motor"
+restart = "on-failure"
+
+[[node]]
+name = "cerebro"                               # la "IA" en Python (capítulo 3)
+cmd = "python cerebro.py"
+autostart = false                              # empieza apagado: lo prendes desde el panel
+
+[web]
+http = "127.0.0.1:8080"                        # usa "0.0.0.0:8080" para abrirlo desde el celular
+listen = "127.0.0.1:7400"                      # aquí llegan los datos que se grafican
+
+[web.teleop]
+target = "127.0.0.1:7500"                      # a quién mandar los comandos de manejo (el motor)
+max_speed = 1.0

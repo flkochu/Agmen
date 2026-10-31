@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agmen · panel</title>
+<style>
+  :root {
+    --bg: #0e1115; --panel: #161a20; --panel2: #1c2129; --line: #272e38; --text: #e6e9ee; --muted: #8b95a3;
+    --x: #ef5a5a; --y: #4cc38a; --z: #4f8ff7; --ok: #4cc38a; --warn: #e9b949; --bad: #ef5a5a; --accent: #4f8ff7;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #f4f5f7; --panel: #ffffff; --panel2: #f6f7f9; --line: #e2e5ea; --text: #1b1f24; --muted: #66707d; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 20px; border-bottom: 1px solid var(--line);
+           position: sticky; top: 0; background: var(--bg); z-index: 5; }
+  .logo { font-weight: 700; font-size: 16px; letter-spacing: .02em; }
+  .logo .robot { font-weight: 500; }
+  .logo span.dim { color: var(--muted); font-weight: 400; }
+  .pill { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; padding: 4px 10px;
+          border: 1px solid var(--line); border-radius: 999px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+  main { padding: 16px 20px 28px; display: grid; gap: 16px; max-width: 1400px; margin: 0 auto;
+         grid-template-columns: 360px minmax(0, 1fr); grid-template-areas: "side data"; }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; grid-template-areas: "side" "data"; padding: 12px; } }
+  .side { grid-area: side; display: grid; gap: 16px; align-content: start; }
+  .data { grid-area: data; display: grid; gap: 16px; align-content: start; min-width: 0; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; min-width: 0; }
+  .panel h2 { margin: 0 0 10px; font-size: 13px; font-weight: 650; display: flex; gap: 10px; align-items: center; }
+  .panel h2 .unit, .panel h2 .hint { color: var(--muted); font-weight: 400; }
+  .panel h2 .right { margin-left: auto; display: flex; gap: 10px; align-items: center; font-weight: 400; color: var(--muted); font-size: 12px; }
+  .note { color: var(--muted); font-size: 12px; }
+  code { font-family: var(--mono); font-size: 12px; }
+  button { font: inherit; color: var(--text); background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+           padding: 4px 9px; cursor: pointer; }
+  button:hover { border-color: var(--muted); }
+  button:disabled { opacity: .35; cursor: default; }
+
+  /* nodos */
+  .node { display: grid; grid-template-columns: auto 1fr auto; gap: 4px 10px; align-items: center; padding: 8px 6px;
+          border-radius: 8px; cursor: pointer; }
+  .node + .node { border-top: 1px solid var(--line); }
+  .node:hover, .node.sel { background: var(--panel2); }
+  .node .name { font-weight: 600; font-family: var(--mono); }
+  .node .meta { grid-column: 2; color: var(--muted); font-size: 12px; }
+  .node .acts { grid-row: 1 / span 2; grid-column: 3; display: flex; gap: 6px; }
+  .node .acts button { width: 32px; padding: 4px 0; }
+  .tag { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+
+  /* manejar */
+  .drive { display: grid; grid-template-columns: auto 1fr; gap: 14px; align-items: center; }
+  .pad { display: grid; grid-template-columns: repeat(3, 54px); grid-template-rows: repeat(3, 54px); gap: 6px;
+         touch-action: none; user-select: none; -webkit-user-select: none; }
+  .pad button { font-size: 20px; border-radius: 10px; padding: 0; }
+  .pad button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .pad .stop { color: #fff; background: var(--bad); border-color: var(--bad); font-size: 12px; font-weight: 700; }
+  .pad .up { grid-area: 1 / 2; } .pad .left { grid-area: 2 / 1; } .pad .stop { grid-area: 2 / 2; }
+  .pad .right { grid-area: 2 / 3; } .pad .down { grid-area: 3 / 2; }
+  .wheels { display: flex; gap: 14px; align-items: flex-end; height: 120px; }
+  .wheel { display: grid; gap: 4px; justify-items: center; font-size: 11px; color: var(--muted); }
+  .bar { width: 22px; height: 96px; background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; position: relative; overflow: hidden; }
+  .bar i { position: absolute; left: 0; right: 0; background: var(--accent); }
+  .bar::after { content: ""; position: absolute; left: 0; right: 0; top: 50%; border-top: 1px solid var(--line); }
+  .speed { display: flex; gap: 8px; align-items: center; margin-top: 10px; font-size: 12px; color: var(--muted); }
+  .speed input { flex: 1; }
+  .drive-state { margin-top: 8px; font-size: 12px; }
+  .drive-state.on { color: var(--accent); font-weight: 600; }
+
+  /* sensores */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-width: 0; }
+  .card .k { color: var(--muted); font-size: 12px; }
+  .card .v { font: 600 20px/1.3 var(--mono); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .v.small { font-size: 13px; padding-top: 5px; }
+  .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 1250px) { .charts { grid-template-columns: 1fr; } }
+  .legend { display: flex; gap: 10px; }
+  .legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+  canvas { width: 100%; height: 190px; display: block; }
+  .banner { display: none; border-radius: 10px; padding: 10px 12px; font: 12px/1.5 var(--mono); }
+  .banner.warn { border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--line)); color: var(--warn); }
+  .banner.error { border: 1px solid color-mix(in srgb, var(--bad) 50%, var(--line)); color: var(--bad); }
+  .empty { color: var(--muted); font-size: 12px; padding: 4px 0 0; }
+
+  /* logs */
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+  .chip { border-radius: 999px; padding: 3px 10px; font-size: 12px; }
+  .chip.on { border-color: var(--text); }
+  .loglist { height: 320px; overflow: auto; background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+             padding: 8px 10px; font: 12px/1.55 var(--mono); }
+  .ln { white-space: pre-wrap; word-break: break-word; }
+  .ln .ts { color: var(--muted); }
+  .ln .who { font-weight: 600; }
+  .ln.k-agmen .txt { color: var(--muted); }
+  .ln.k-error .txt, .ln.err .txt { color: var(--bad); }
+  .ln.wrn .txt { color: var(--warn); }
+  .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--bad); color: #fff;
+           padding: 8px 14px; border-radius: 8px; font-size: 13px; display: none; z-index: 10; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">Agmen <span class="robot" id="robot"></span> <span class="dim" id="ver"></span></div>
+  <div class="pill"><span class="dot" id="dot"></span><span id="status">conectando…</span></div>
+</header>
+
+<main>
+  <div class="side">
+    <section class="panel">
+      <h2>Nodos <span class="right" id="nodesum"></span></h2>
+      <div id="nodes"><div class="empty">cargando…</div></div>
+    </section>
+
+    <section class="panel" id="drivepanel">
+      <h2>Manejar <span class="hint" id="drivetarget"></span></h2>
+      <div id="drive"></div>
+    </section>
+  </div>
+
+  <div class="data">
+    <section class="cards">
+      <div class="card"><div class="k">Sensor IMU</div><div class="v" id="rate">—</div></div>
+      <div class="card"><div class="k">Latencia</div><div class="v" id="lat">—</div></div>
+      <div class="card"><div class="k">Perdidos</div><div class="v" id="lost">—</div></div>
+      <div class="card"><div class="k">Errores</div><div class="v" id="errors">—</div></div>
+      <div class="card"><div class="k">Origen</div><div class="v small" id="source">—</div></div>
+    </section>
+    <div class="banner warn" id="warnbox"></div>
+    <div class="banner error" id="errbox"></div>
+    <section class="charts">
+      <div class="panel">
+        <h2>Acelerómetro <span class="unit">m/s²</span>
+          <span class="right legend"><span><i style="background:var(--x)"></i>x</span><span><i style="background:var(--y)"></i>y</span><span><i style="background:var(--z)"></i>z</span></span></h2>
+        <canvas id="accel"></canvas>
+      </div>
+      <div class="panel">
+        <h2>Giroscopio <span class="unit">rad/s</span>
+          <span class="right legend"><span><i style="background:var(--x)"></i>x</span><span><i style="background:var(--y)"></i>y</span><span><i style="background:var(--z)"></i>z</span></span></h2>
+        <canvas id="gyro"></canvas>
+      </div>
+    </section>
+
+  <section class="panel logs">
+    <h2>Logs <span class="hint">de todos los nodos</span>
+      <span class="right">
+        <label><input type="checkbox" id="follow" checked> seguir</label>
+        <button id="clear">limpiar</button>
+      </span>
+    </h2>
+    <div class="chips" id="chips"></div>
+    <div class="loglist" id="loglist"></div>
+  </section>
+  </div>
+</main>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const PALETTE = ["#4f8ff7", "#c678dd", "#e9b949", "#4cc38a", "#56b6c2", "#ef8a5a", "#e06c9f", "#9aa5ce"];
+const nodeColor = {};
+let state = { nodes: [], teleop: null, managed: false };
+let filter = null;                      // nodo seleccionado en los logs (null = todos)
+
+// ---------- utilidades ----------
+function toast(msg) {
+  const t = $("toast"); t.textContent = msg; t.style.display = "block";
+  clearTimeout(toast.h); toast.h = setTimeout(() => (t.style.display = "none"), 3500);
+}
+async function post(url, body) {
+  try {
+    const r = await fetch(url, { method: "POST", headers: { "X-Agmen": "1", "Content-Type": "application/json" },
+                                 body: JSON.stringify(body || {}) });
+    const j = await r.json();
+    if (!r.ok) toast(j.error || "error");
+    return j;
+  } catch (e) { toast("sin conexión con el panel"); }
+}
+function fmtUptime(s) {
+  if (s == null) return "";
+  s = Math.floor(s);
+  if (s < 60) return s + " s";
+  if (s < 3600) return Math.floor(s / 60) + " min " + (s % 60) + " s";
+  return Math.floor(s / 3600) + " h " + Math.floor((s % 3600) / 60) + " min";
+}
+function colorOf(name) {
+  if (name === "agmen") return css("--muted");
+  if (!(name in nodeColor)) nodeColor[name] = PALETTE[Object.keys(nodeColor).length % PALETTE.length];
+  return nodeColor[name];
+}
+
+// ---------- nodos ----------
+const STATE_DOT = { "corriendo": "ok", "reiniciando": "warn", "falló": "bad", "detenido": "", "terminó": "" };
+function renderNodes() {
+  const box = $("nodes");
+  if (!state.managed) {
+    box.innerHTML = '<div class="empty">Panel abierto con <code>agmen web</code>. Para ver y controlar los nodos, ' +
+                    'lanza tu robot con <code>agmen run robot.toml</code>.</div>';
+    $("nodesum").textContent = "";
+    return;
+  }
+  const running = state.nodes.filter((n) => n.state === "corriendo").length;
+  $("nodesum").textContent = `${running}/${state.nodes.length} corriendo`;
+  box.innerHTML = "";
+  for (const n of state.nodes) {
+    const row = document.createElement("div");
+    row.className = "node" + (filter === n.name ? " sel" : "");
+    row.title = n.cmd;
+    const alive = n.state === "corriendo" || n.state === "reiniciando";
+    let meta = n.state;
+    if (n.state === "corriendo") meta += ` · ${fmtUptime(n.uptime)} · pid ${n.pid}`;
+    if (n.exit_code != null && (n.state === "falló" || n.state === "terminó")) meta += ` (código ${n.exit_code})`;
+    if (n.restarts) meta += ` · reinicios ${n.restarts}`;
+    row.innerHTML = `<span class="dot ${STATE_DOT[n.state] || ""}"></span>
+      <span class="name"><span class="tag" style="background:${colorOf(n.name)}"></span>${n.name}</span>
+      <span class="acts"></span><span class="meta"></span>`;
+    row.querySelector(".meta").textContent = meta;
+    const acts = row.querySelector(".acts");
+    const mk = (label, title, action, enabled) => {
+      const b = document.createElement("button");
+      b.textContent = label; b.title = title; b.disabled = !enabled;
+      b.onclick = (ev) => { ev.stopPropagation(); post(`/api/node/${encodeURIComponent(n.name)}/${action}`); };
+      acts.appendChild(b);
+    };
+    mk("↻", "reiniciar", "restart", alive);
+    mk(alive ? "■" : "▶", alive ? "detener" : "iniciar", alive ? "stop" : "start", true);
+    row.onclick = () => { filter = filter === n.name ? null : n.name; renderChips(); rerenderLogs(); renderNodes(); };
+    box.appendChild(row);
+  }
+}
+
+// ---------- manejar (teleoperación) ----------
+const keys = new Set();               // direcciones activas: up/down/left/right
+let speed = 0.5, driveTimer = null, lastCmd = [0, 0];
+function renderDrive() {
+  const box = $("drive");
+  if (!state.teleop) {
+    $("drivetarget").textContent = "";
+    box.innerHTML = state.managed
+      ? '<div class="empty">Para manejar el robot desde aquí agrega a tu <code>robot.toml</code>:<br>' +
+        '<code>[web.teleop]<br>target = "127.0.0.1:7500"</code></div>'
+      : '<div class="empty">Para manejar el robot desde aquí abre el panel con<br>' +
+        '<code>agmen web --teleop 127.0.0.1:7500</code></div>';
+    return;
+  }
+  if (box.dataset.ready) return;
+  box.dataset.ready = "1";
+  $("drivetarget").textContent = "→ " + state.teleop.target;
+  box.innerHTML = `
+    <div class="drive">
+      <div class="pad" id="pad">
+        <button class="up" data-d="up" aria-label="adelante">↑</button>
+        <button class="left" data-d="left" aria-label="izquierda">←</button>
+        <button class="stop" id="stopbtn" aria-label="alto">ALTO</button>
+        <button class="right" data-d="right" aria-label="derecha">→</button>
+        <button class="down" data-d="down" aria-label="atrás">↓</button>
+      </div>
+      <div class="wheels">
+        <div class="wheel"><div class="bar"><i id="barL"></i></div>izq <span id="valL">0.00</span></div>
+        <div class="wheel"><div class="bar"><i id="barR"></i></div>der <span id="valR">0.00</span></div>
+      </div>
+    </div>
+    <div class="speed">velocidad <input type="range" id="spd" min="10" max="100" value="50"> <span id="spdv">50%</span></div>
+    <div class="drive-state" id="dstate">Mantén presionado: <b>W A S D</b> o flechas (o los botones). Suelta = el robot frena.</div>
+    <div class="note" style="margin-top:6px">Si otro nodo también manda comandos (ej. <code>cerebro</code>), detenlo primero con ■.</div>`;
+  for (const b of box.querySelectorAll("[data-d]")) {
+    const d = b.dataset.d;
+    b.addEventListener("pointerdown", (e) => { e.preventDefault(); b.setPointerCapture(e.pointerId); press(d, true); });
+    for (const ev of ["pointerup", "pointercancel", "lostpointercapture"]) b.addEventListener(ev, () => press(d, false));
+  }
+  $("stopbtn").addEventListener("pointerdown", (e) => { e.preventDefault(); allStop(); });
+  $("spd").addEventListener("input", (e) => { speed = e.target.value / 100; $("spdv").textContent = e.target.value + "%"; });
+}
+function command() {
+  const s = speed * (state.teleop ? state.teleop.max_speed : 1);
+  const f = (keys.has("up") ? 1 : 0) - (keys.has("down") ? 1 : 0);      // adelante/atrás
+  const t = (keys.has("right") ? 1 : 0) - (keys.has("left") ? 1 : 0);   // derecha/izquierda
+  if (f === 0) return [t * s * 0.6, -t * s * 0.6];                      // girar en su lugar
+  const clamp = (v) => Math.max(-s, Math.min(s, v));
+  return [clamp(f * s + 0.5 * s * t), clamp(f * s - 0.5 * s * t)];      // avanzar y doblar
+}
+function showCmd([l, r], active) {
+  for (const [id, v] of [["L", l], ["R", r]]) {
+    const bar = $("bar" + id); if (!bar) return;
+    const h = Math.abs(v) * 50;
+    bar.style.height = h + "%"; bar.style.top = v >= 0 ? (50 - h) + "%" : "50%";
+    $("val" + id).textContent = (v >= 0 ? "+" : "") + v.toFixed(2);
+  }
+  const st = $("dstate");
+  st.className = "drive-state" + (active ? " on" : "");
+  st.innerHTML = active ? "● Control manual ACTIVO"
+                        : "Mantén presionado: <b>W A S D</b> o flechas (o los botones). Suelta = el robot frena.";
+  for (const b of document.querySelectorAll("#pad [data-d]")) b.classList.toggle("on", keys.has(b.dataset.d));
+}
+function press(dir, down) {
+  if (!state.teleop) return;
+  if (down) keys.add(dir); else keys.delete(dir);
+  if (keys.size && !driveTimer) {
+    tick(); driveTimer = setInterval(tick, 50);            // 20 Hz mientras se presiona
+  } else if (!keys.size) {
+    allStop();
+  } else { tick(); }
+}
+function tick() { lastCmd = command(); post("/api/teleop", { left: lastCmd[0], right: lastCmd[1] }); showCmd(lastCmd, true); }
+function allStop() {
+  keys.clear();
+  if (driveTimer) { clearInterval(driveTimer); driveTimer = null; }
+  if (state.teleop) post("/api/teleop", { left: 0, right: 0 });
+  showCmd([0, 0], false);
+}
+const KEYMAP = { w: "up", arrowup: "up", s: "down", arrowdown: "down", a: "left", arrowleft: "left", d: "right", arrowright: "right" };
+addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT" && e.target.type !== "range") return;
+  const k = e.key.toLowerCase();
+  if (k === " ") { e.preventDefault(); allStop(); return; }
+  if (KEYMAP[k] && !e.repeat) { e.preventDefault(); press(KEYMAP[k], true); }
+  else if (KEYMAP[k]) e.preventDefault();
+});
+addEventListener("keyup", (e) => { const k = KEYMAP[e.key.toLowerCase()]; if (k) press(k, false); });
+addEventListener("blur", allStop);                        // si cambias de ventana, se frena
+document.addEventListener("visibilitychange", () => { if (document.hidden) allStop(); });
+
+// ---------- sensores ----------
+const WINDOW_S = 10, buf = [], lastSeen = {};
+let followSrc = null, lastData = 0;
+function updateStats(s) {
+  $("rate").textContent = s.rate_hz ? s.rate_hz.toFixed(0) + " Hz" : "0 Hz";
+  $("lat").textContent = s.latency_ms == null ? "—" : s.latency_ms.toFixed(2) + " ms";
+  $("lost").textContent = s.lost; $("errors").textContent = s.errors;
+  $("source").textContent = s.type ? `${s.type} · ${s.source}` : `esperando en ${s.listening}`;
+  const many = (s.sources || []).length > 1;
+  $("warnbox").style.display = many ? "block" : "none";
+  $("warnbox").textContent = many ? `⚠ ${s.sources.length} emisores mandan al mismo puerto (${s.sources.join(", ")}). ` +
+    `Las gráficas muestran solo ${followSrc}. ¿Hay dos publishers corriendo?` : "";
+  $("errbox").style.display = s.last_error ? "block" : "none";
+  $("errbox").textContent = s.last_error ? "Último error: " + s.last_error : "";
+}
+function draw(canvas, key) {
+  const dpr = devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) { canvas.width = w * dpr; canvas.height = h * dpr; }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, h);
+  const padL = 48, padR = 8, padT = 8, padB = 22, pw = w - padL - padR, ph = h - padT - padB;
+  if (!buf.length) {
+    ctx.fillStyle = css("--muted"); ctx.font = "12px system-ui"; ctx.textAlign = "center";
+    ctx.fillText("sin datos de sensores todavía", w / 2, h / 2); return;
+  }
+  const tEnd = buf[buf.length - 1].t, tStart = tEnd - WINDOW_S;
+  let lo = Infinity, hi = -Infinity;
+  for (const s of buf) for (const v of s[key]) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  const span = Math.max(hi - lo, 0.5), mid = (hi + lo) / 2; lo = mid - span * 0.6; hi = mid + span * 0.6;
+  const X = (t) => padL + ((t - tStart) / WINDOW_S) * pw, Y = (v) => padT + (1 - (v - lo) / (hi - lo)) * ph;
+  ctx.strokeStyle = css("--line"); ctx.fillStyle = css("--muted"); ctx.lineWidth = 1;
+  ctx.font = "11px " + css("--mono"); ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (let i = 0; i <= 4; i++) { const v = lo + (hi - lo) * i / 4, y = Y(v);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke(); ctx.fillText(v.toFixed(2), padL - 6, y); }
+  ctx.textBaseline = "top";
+  for (let s = 0; s <= WINDOW_S; s += 2) {
+    ctx.textAlign = s === 0 ? "left" : s === WINDOW_S ? "right" : "center";
+    ctx.fillText(s === WINDOW_S ? "ahora" : `-${WINDOW_S - s}s`, X(tStart + s), h - padB + 6);
+  }
+  ["--x", "--y", "--z"].forEach((c, axis) => {
+    ctx.strokeStyle = css(c); ctx.lineWidth = 1.6; ctx.beginPath(); let started = false;
+    for (const s of buf) { if (s.t < tStart) continue; const px = X(s.t), py = Y(s[key][axis]);
+      if (!started) { ctx.moveTo(px, py); started = true; } else ctx.lineTo(px, py); }
+    ctx.stroke();
+  });
+}
+function addSamples(samples) {
+  if (!samples.length) return;
+  const now = performance.now();
+  for (const s of samples) lastSeen[s.src] = now;
+  if (followSrc === null || now - (lastSeen[followSrc] || 0) > 500) { followSrc = samples[samples.length - 1].src; buf.length = 0; }
+  for (const s of samples) if (s.src === followSrc) buf.push(s);
+  const tEnd = buf.length ? buf[buf.length - 1].t : 0;
+  while (buf.length && buf[0].t < tEnd - WINDOW_S - 1) buf.shift();
+  lastData = now;
+}
+
+// ---------- logs ----------
+const logLines = [];                  // todas las líneas recibidas (máx 3000)
+function renderChips() {
+  const box = $("chips"); box.innerHTML = "";
+  const names = ["todos", ...state.nodes.map((n) => n.name), "agmen"];
+  for (const name of names) {
+    const b = document.createElement("button");
+    const isAll = name === "todos";
+    b.className = "chip" + ((isAll && filter === null) || filter === name ? " on" : "");
+    b.innerHTML = isAll ? "todos" : `<span class="tag" style="background:${colorOf(name)}"></span>${name}`;
+    b.onclick = () => { filter = isAll ? null : name; renderChips(); rerenderLogs(); renderNodes(); };
+    box.appendChild(b);
+  }
+}
+function lineEl(l) {
+  const d = document.createElement("div");
+  const err = /ERROR|✖|falló/.test(l.text), wrn = /⛔|⚠|ALTO|reiniciando/.test(l.text);
+  d.className = `ln k-${l.kind}` + (err ? " err" : wrn ? " wrn" : "");
+  const ts = new Date(l.t * 1000).toLocaleTimeString("es-MX", { hour12: false });
+  d.innerHTML = `<span class="ts">${ts}</span> <span class="who"></span> <span class="txt"></span>`;
+  const who = d.querySelector(".who"); who.textContent = l.node; who.style.color = colorOf(l.node);
+  d.querySelector(".txt").textContent = l.text;
+  return d;
+}
+function appendLogs(lines) {
+  if (!lines.length) return;
+  const list = $("loglist");
+  for (const l of lines) {
+    logLines.push(l);
+    if (filter === null || filter === l.node) list.appendChild(lineEl(l));
+  }
+  if (logLines.length > 3000) { logLines.splice(0, logLines.length - 3000); }
+  while (list.childElementCount > 1500) list.firstElementChild.remove();
+  if ($("follow").checked) list.scrollTop = list.scrollHeight;
+}
+function rerenderLogs() {
+  const list = $("loglist"); list.innerHTML = "";
+  const shown = logLines.filter((l) => filter === null || filter === l.node).slice(-1500);
+  const frag = document.createDocumentFragment(); for (const l of shown) frag.appendChild(lineEl(l));
+  list.appendChild(frag); list.scrollTop = list.scrollHeight;
+}
+$("clear").onclick = () => { logLines.length = 0; $("loglist").innerHTML = ""; };
+
+// ---------- conexión ----------
+let lastNodesKey = "", connected = false;
+function setStatus(kind, text) { $("dot").className = "dot " + kind; $("status").textContent = text; }
+function connect() {
+  const es = new EventSource("/api/stream");
+  es.onopen = () => { connected = true; };
+  es.onerror = () => { connected = false; setStatus("bad", "sin conexión con Agmen · reintentando…"); allStop(); };
+  es.onmessage = (ev) => {
+    const m = JSON.parse(ev.data);
+    $("robot").textContent = m.robot ? "· " + m.robot : "";
+    $("ver").textContent = "v" + m.version;
+    document.title = `Agmen · ${m.robot || "panel"}`;
+    const prevTeleop = !!state.teleop;
+    state = { nodes: m.nodes, teleop: m.teleop, managed: m.managed };
+    document.querySelector(".logs").style.display = m.managed ? "" : "none";  // agmen web: no hay nodos que mostrar
+    const key = JSON.stringify(m.nodes.map((n) => [n.name, n.state, n.restarts, n.pid, Math.floor((n.uptime || 0))]));
+    if (key !== lastNodesKey) {
+      const namesChanged = lastNodesKey === "" || JSON.stringify(m.nodes.map((n) => n.name)) !== JSON.stringify(JSON.parse(lastNodesKey || "[]").map((x) => x[0]));
+      lastNodesKey = key; renderNodes(); if (namesChanged) renderChips();
+    }
+    if (!!state.teleop !== prevTeleop || !$("drive").dataset.ready) renderDrive();
+    addSamples(m.samples); updateStats(m.stats); appendLogs(m.logs);
+    const bad = m.nodes.filter((n) => n.state === "falló").length;
+    if (bad) setStatus("bad", `${bad} nodo${bad > 1 ? "s" : ""} con falla`);
+    else if (lastData && performance.now() - lastData < 1500) setStatus("ok", "conectado · recibiendo datos");
+    else setStatus("warn", "conectado · sin datos de sensores");
+  };
+}
+function frame() { draw($("accel"), "accel"); draw($("gyro"), "gyro"); requestAnimationFrame(frame); }
+renderChips(); connect(); requestAnimationFrame(frame);
+</script>
+</body>
+</html>

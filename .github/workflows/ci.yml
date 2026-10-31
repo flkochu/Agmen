@@ -48,6 +48,14 @@ jobs:
       - name: Tutorial (el código del tutorial funciona)
         run: python scripts/tutorial_check.py
 
+      - name: agmen run (un comando para todo el robot + panel)
+        run: python scripts/run_smoke.py
+
+      - name: Instalar el paquete y probar el comando agmen
+        run: |
+          python -m pip install .
+          agmen --version
+
   sanitizers:
     name: ubuntu + ASan/UBSan
     runs-on: ubuntu-latest

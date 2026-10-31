@@ -1,8 +1,8 @@
 # Protocolo de cable de Agmen — versión 0
 
-> **Estado:** implementado en Agmen 0.1.x (nivel 0). La versión 1 está
+> **Estado:** implementado en Agmen 0.1.x y 0.2.x (nivel 0). La versión 1 está
 > **aceptada** en [`rfc/0001-formato-de-mensajes.md`](rfc/0001-formato-de-mensajes.md)
-> y la reemplazará en Agmen 0.2.0.
+> y la reemplazará en Agmen 0.3.0.
 
 Este documento es **el contrato entre lenguajes**. Un nodo escrito en C++,
 Python, JavaScript o en un microcontrolador es compatible si escribe y lee

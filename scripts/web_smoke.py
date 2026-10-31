@@ -1,4 +1,4 @@
-"""Prueba rápida de la interfaz web: puente + publisher de C++ + consulta HTTP.
+"""Prueba rápida de `agmen web`: panel + publisher de C++ + consulta HTTP.
 
 Funciona en Windows, Linux y macOS. Requiere haber compilado antes.
 
@@ -6,6 +6,7 @@ Funciona en Windows, Linux y macOS. Requiere haber compilado antes.
 """
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -18,9 +19,10 @@ BIN = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "build" / "bi
 
 
 def main() -> None:
-    bridge = subprocess.Popen([sys.executable, str(ROOT / "tools" / "agmen-web" / "bridge.py"),
+    env = {**os.environ, "PYTHONPATH": str(ROOT / "python")}
+    bridge = subprocess.Popen([sys.executable, "-m", "agmen", "web", "--no-browser",
                                "--listen", "127.0.0.1:7801", "--http", "127.0.0.1:8181"],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                              env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     pub = None
     try:
         time.sleep(1.5)
@@ -30,7 +32,7 @@ def main() -> None:
         pub = subprocess.Popen([str(BIN / f"publisher{EXE}"), "--to", "127.0.0.1:7801",
                                 "--rate", "100", "--count", "400"], stdout=subprocess.DEVNULL)
         time.sleep(2.5)
-        stats = json.loads(urllib.request.urlopen("http://127.0.0.1:8181/api/stats", timeout=5).read())
+        stats = json.loads(urllib.request.urlopen("http://127.0.0.1:8181/api/state", timeout=5).read())["stats"]
         print("stats:", stats)
         ok = stats["rate_hz"] > 50 and stats["errors"] == 0 and stats["type"] == "ImuSample"
         print("OK   interfaz web recibe datos" if ok else "FALLA interfaz web")

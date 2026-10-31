@@ -20,6 +20,14 @@ packet = wire.encode(msg, seq=0, stamp_ns=wire.now_ns())
 header, back = wire.decode(wire.ImuSample, packet)
 ```
 
+También instala el comando `agmen`, que levanta todo tu robot con un solo
+comando y abre un panel web para controlarlo:
+
+```bash
+agmen run robot.toml     # todos los nodos + panel web (nodos, logs, sensores, manejar)
+agmen web                # solo el panel
+```
+
 > ⚠ Versión 0.x: la API todavía va a cambiar entre versiones menores.
 
 Documentación, tutorial y código: <https://github.com/flkochu/agmen>

@@ -11,25 +11,27 @@ como paquetes opcionales.
 - Núcleo en **C++20**; corre en **Windows, Linux y macOS** (verificado por CI).
 - **Python de primera clase** y la compatibilidad vive en el formato de
   mensajes, no en un lenguaje.
-- **Interfaz web**: el robot solo publica datos y el navegador (laptop,
-  celular o nube) hace todo el trabajo visual.
+- **Un solo comando** levanta todo el robot (`agmen run robot.toml`) y un
+  **panel web** lo controla: nodos, logs, sensores y manejo. El robot solo
+  publica datos; el navegador (laptop o celular) hace todo el trabajo visual.
 
-**Versión actual: 0.1.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
+**Versión actual: 0.2.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
 
 | Para… | Lee |
 |---|---|
-| **Empezar a usarlo** | 📘 [**Tutorial**](docs/tutorial/README.md): de la instalación a un robot con cerebro en Python e interfaz web |
+| **Empezar a usarlo** | 📘 [**Tutorial**](docs/tutorial/README.md): de la instalación a un robot completo con un solo comando y panel web |
 | Entender el proyecto | [`docs/VISION.md`](docs/VISION.md): visión, decisión de C++, comparación con dora-rs, roadmap |
 | El formato de mensajes | [RFC 0001](docs/rfc/0001-formato-de-mensajes.md) (v1, **aceptado**) · [PROTOCOLO v0](docs/PROTOCOLO.md) (implementado) |
-| La interfaz web | [RFC 0002](docs/rfc/0002-interfaz-web.md) (propuesta) |
+| La interfaz web | [RFC 0002](docs/rfc/0002-interfaz-web.md) (propuesta) · [RFC 0003](docs/rfc/0003-lanzador-y-panel.md) (`agmen run` y panel, implementado) |
 | Publicar versiones | [`docs/PUBLICAR.md`](docs/PUBLICAR.md) |
 
 ## Estado
 
 | Versión | Nivel | Tema |
 |---|---|---|
-| **0.1.0 ✅** | 0 | **Fundamentos: serialización, UDP, seq, latencia, CI, prototipo de interfaz web, tutorial** |
-| 0.2.0 ⏭ | 1 | Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica |
+| 0.1.0 ✅ | 0 | Fundamentos: serialización, UDP, seq, latencia, CI, tutorial |
+| **0.2.0 ✅** | — | **`agmen run robot.toml` + panel web de control (nodos, logs, sensores, manejar)** |
+| 0.3.0 ⏭ | 1 | Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica |
 | … | 2–13 | Ver [`docs/VISION.md`](docs/VISION.md#7-roadmap-por-niveles) |
 
 ## Estructura
@@ -43,9 +45,11 @@ agmen/
 ├── examples/nivel0/         publisher y subscriber
 ├── examples/tutorial/       código del tutorial (motor, controlador, cerebro.py)
 ├── tests/                   pruebas (ctest)
-├── tools/agmen-web/         interfaz web (prototipo): bridge.py + index.html
-├── python/agmen/            paquete de Python (import agmen)
-├── scripts/                 interop, web, tutorial y check_version (todos corren en el CI)
+├── examples/tutorial/robot.toml  el robot del tutorial completo, para `agmen run`
+├── python/agmen/            paquete de Python: import agmen + el comando `agmen`
+│   ├── run.py               agmen run: lanzador y supervisor de nodos
+│   └── panel/               panel web (servidor + página)
+├── scripts/                 interop, web, run, tutorial y check_version (todos corren en el CI)
 ├── bench/                   mediciones que respaldan decisiones de diseño
 ├── docs/                    tutorial/, VISION, PROTOCOLO, VERSIONES, PUBLICAR, rfc/
 └── .github/workflows/       ci.yml (3 sistemas + sanitizers) · release.yml (PyPI + GitHub Release)
@@ -72,6 +76,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release           # pruebas de C++
 python3 -m unittest discover -s python      # pruebas de Python
 python3 scripts/interop.py                  # C++ <-> Python
+pip install .                               # el paquete de Python y el comando `agmen`
 ```
 
 > Con Visual Studio también puedes usar **Archivo → Abrir → Carpeta** y elegir
@@ -101,26 +106,48 @@ Mezclando lenguajes:
 | `python3 python/subscriber.py` | `./build/bin/publisher` | C++ publica, Python escucha |
 | `./build/bin/subscriber` | `python3 python/publisher.py` | Python publica, C++ escucha |
 
-## Interfaz web (prototipo)
+## Todo el robot con un solo comando
 
-```bash
-python3 tools/agmen-web/bridge.py           # Terminal 1: el puente
-./build/bin/publisher --rate 100            # Terminal 2: el "robot"
-# Abre http://127.0.0.1:8080
+En vez de abrir una terminal por nodo, describe tu robot en un archivo:
+
+```toml
+[robot]
+name = "mi robot"
+before = ["cmake --build build"]          # compila antes de arrancar
+
+[[node]]
+name = "motor"
+cmd = "./build/bin/motor"
+restart = "on-failure"                    # si se cae, se levanta solo
+
+[[node]]
+name = "cerebro"
+cmd = "python cerebro.py"
+
+[web.teleop]
+target = "127.0.0.1:7500"                 # manejar el robot desde el panel
 ```
 
-![Interfaz web de Agmen](docs/img/agmen-web.png)
-
-Muestra en vivo el acelerómetro y el giroscopio, la frecuencia, la latencia,
-las pérdidas y los errores. Para verla **desde el celular** en la misma red WiFi:
-
 ```bash
-python3 tools/agmen-web/bridge.py --http 0.0.0.0:8080   # luego abre http://IP-DE-TU-PC:8080
+agmen run robot.toml        # prueba: agmen run examples/tutorial/robot.toml
 ```
 
-⚠ El prototipo no tiene contraseña: úsalo solo en tu red local. El diseño
-completo (WebSocket, teleoperación, modo nube con autenticación) está en el
-RFC 0002.
+Arranca todos los nodos, junta sus logs en una terminal (un color por nodo),
+los reinicia si fallan y abre el **panel web**:
+
+![Panel de control de Agmen](docs/img/agmen-panel.png)
+
+- **Nodos:** estado de cada uno, con botones ▶ iniciar, ■ detener y ↻ reiniciar.
+- **Manejar:** W A S D, flechas o botones táctiles. Al soltar, el robot frena.
+- **Sensores:** gráficas en vivo, Hz, latencia, pérdidas y errores.
+- **Logs:** todos los nodos en un lugar, con filtros.
+
+Ctrl+C detiene todo de forma ordenada. Para abrirlo **desde el celular**:
+`agmen run robot.toml --http 0.0.0.0:8080`.
+
+⚠ El panel no tiene contraseña: úsalo solo en redes de confianza. Detalles y
+referencia completa de `robot.toml` en el [RFC 0003](docs/rfc/0003-lanzador-y-panel.md)
+y en el [capítulo 5 del tutorial](docs/tutorial/05-un-solo-comando.md).
 
 ## Usar Agmen en tu propio proyecto CMake
 

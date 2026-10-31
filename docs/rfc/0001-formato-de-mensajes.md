@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Estado** | ✅ **Aceptado** (2026-10-30). Se implementa en el nivel 1 (versión 0.2.0) |
+| **Estado** | ✅ **Aceptado** (2026-10-30). Se implementa en el nivel 1 (versión 0.3.0) |
 | **Reemplaza a** | Protocolo v0 (`docs/PROTOCOLO.md`) |
 | **Fecha** | 2026-10-30 |
 | **Notas** | El núcleo pasó de Rust a C++ y el proyecto se renombró a Agmen (magic `"AGM"`) el mismo día. El formato no depende del lenguaje |
