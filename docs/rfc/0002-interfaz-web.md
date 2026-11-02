@@ -93,7 +93,7 @@ Decisiones:
 | Gráficas en vivo + estadísticas (Hz, latencia, pérdidas, errores) | Nivel 0 | **Hecho (0.1.0)** |
 | Lista de nodos con iniciar/detener/reiniciar + logs de todos | `agmen run` (RFC 0003) | **Hecho (0.2.0)** |
 | Teleoperación (teclado y táctil) con *deadman* y límite de velocidad | Publicar desde el navegador | **Hecho (0.2.0)**, a un destino fijo |
-| Lista de topics; inspector de cualquier mensaje | Pub/sub + esquemas en texto | 0.4.0 |
+| Lista de topics; inspector de cualquier mensaje | Pub/sub + esquemas en texto | 0.5.0 |
 | Cámara | Codificación `arrow` / bytes comprimidos (JPEG/H.264) | 7 |
 | Vista 3D (robot, TF, nube de puntos) | Transformadas + Arrow | 9+ |
 | Reproducir grabaciones en el navegador | Grabación | 9 |

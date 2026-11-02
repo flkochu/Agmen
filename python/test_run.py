@@ -3,12 +3,15 @@
     python -m unittest discover -s python
 """
 
+import io
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
-from agmen.run import ConfigError, load_config
+from agmen.run import ConfigError, Printer, load_config
 
 MINIMO = '[robot]\nname = "r"\n\n[[node]]\nname = "motor"\ncmd = "./build/bin/motor --rate 10"\n'
 
@@ -71,6 +74,51 @@ class TestConfig(unittest.TestCase):
 
     def test_teleop_sin_target(self):
         self.assertConfigError(MINIMO + '\n[web.teleop]\nmax_speed = 1.0\n', "falta 'target'")
+
+
+class TerminalBloqueada(io.StringIO):
+    """Una terminal que no deja escribir hasta que se le diga."""
+
+    def __init__(self):
+        super().__init__()
+        self.abierta = threading.Event()
+
+    def write(self, text):
+        self.abierta.wait(5)
+        return super().write(text)
+
+
+class TestPrinter(unittest.TestCase):
+    def test_una_terminal_atorada_no_frena_a_quien_escribe(self):
+        term = TerminalBloqueada()
+        p = Printer(["a"], stream=term, max_queue=10)
+        t0 = time.perf_counter()
+        for i in range(1000):
+            p("a", f"línea {i}")
+        self.assertLess(time.perf_counter() - t0, 0.5)   # nunca esperó a la terminal
+        term.abierta.set()
+        p.close()
+        salida = term.getvalue()
+        self.assertIn("líneas no cupieron en la terminal", salida)
+
+    def test_close_escribe_lo_pendiente(self):
+        term = io.StringIO()
+        p = Printer(["motor"], stream=term)
+        p("motor", "hola")
+        p("agmen", "listo. ¡Hasta luego!", "agmen")
+        p.close()
+        self.assertIn("motor │ hola", term.getvalue())
+        self.assertTrue(term.getvalue().rstrip().endswith("listo. ¡Hasta luego!"))
+
+    def test_los_avisos_de_agmen_nunca_se_descartan(self):
+        term = TerminalBloqueada()
+        p = Printer(["a"], stream=term, max_queue=5)
+        for i in range(50):
+            p("a", f"línea {i}")
+        p("agmen", "aviso importante", "agmen")
+        term.abierta.set()
+        p.close()
+        self.assertIn("aviso importante", term.getvalue())
 
 
 if __name__ == "__main__":

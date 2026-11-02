@@ -78,7 +78,7 @@ mensaje claro que en la terminal.
 
 ## Limitaciones de esta versión
 
-- Solo grafica `ImuSample`. Desde **Agmen 0.3.0** los mensajes llevan su
+- Solo grafica `ImuSample`. Desde **Agmen 0.4.0** los mensajes llevan su
   esquema y el panel podrá mostrar **cualquier** tipo.
 - Con `agmen web` el panel solo **muestra**. En el capítulo 5 lo usas con
   `agmen run` para además **controlar los nodos y manejar el robot**.

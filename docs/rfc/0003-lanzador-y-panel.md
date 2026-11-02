@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Estado** | Implementado como prototipo en Agmen 0.2.0 (`python/agmen/run.py`, `python/agmen/panel/`) |
+| **Estado** | Implementado como prototipo en Agmen 0.2.0 (`python/agmen/run.py`, `python/agmen/panel/`); paralelismo y `[[mux]]` en 0.3.0 (§4.1, §4.2) |
 | **Fecha** | 2026-10-30 |
 | **Relacionado** | RFC 0002 (interfaz web) |
 
@@ -53,6 +53,21 @@ autostart = true                          # false = empieza apagado; se prende d
 cwd = "."                                 # opcional; default: la carpeta de robot.toml
 env = { NIVEL_LOG = "2" }                 # opcional
 
+[[mux]]                                   # opcional (0.3.0): ¿quién manda? Ver §4.2
+name = "ruedas"                           # aparece como un nodo más
+output = "127.0.0.1:7500"                 # a dónde reenviar (el motor)
+hold_ms = 300                             # sin mensajes en 300 ms → la entrada suelta el mando
+
+[[mux.input]]                             # una por fuente; priority más alta = manda más
+name = "teleop"
+listen = "127.0.0.1:7510"
+priority = 10
+
+[[mux.input]]
+name = "cerebro"
+listen = "127.0.0.1:7511"
+priority = 1
+
 [web]
 enabled = true
 http = "127.0.0.1:8080"                   # "0.0.0.0:8080" = visible en tu red (celular)
@@ -93,6 +108,51 @@ max_speed = 1.0                           # límite que el panel nunca excede
 - Variables que reciben los nodos: `PYTHONUNBUFFERED=1` (para que los logs
   de Python salgan al momento), `PYTHONIOENCODING=utf-8` y `AGMEN_NODE=<nombre>`.
 
+### 4.1 Paralelismo (0.3.0)
+
+Cada nodo es un **proceso del sistema operativo**, así que los nodos corren
+en paralelo en núcleos distintos y uno atorado no detiene a los demás. Lo
+único que comparten es la **terminal**, y ahí estaba el único punto en serie
+de 0.2.0: si la terminal era lenta (la consola de Windows lo es) y un nodo
+imprimía sin parar, los demás se bloqueaban en su propio `print()` y su
+ciclo de control se atrasaba (medido: un nodo de 50 Hz con 1.5 s de atraso).
+Desde 0.3.0:
+
+- Un hilo por nodo lee su salida y **nunca espera** a la terminal ni al panel.
+- Un hilo aparte escribe en la terminal desde una cola acotada (500 líneas).
+  Si la terminal no da abasto, descarta líneas de la terminal (no del panel)
+  y lo avisa: `… N líneas no cupieron en la terminal`.
+- Cada nodo muestra hasta **200 líneas/s**. El excedente se resume en
+  `… N líneas omitidas`. Los avisos de Agmen y los errores nunca se descartan.
+- El apagado detiene a todos los nodos a la vez (4 nodos que tardan 1 s en
+  cerrar → 1 s, no 4 s).
+
+`scripts/paralelo_check.py` mide todo esto en el CI y en tu computadora.
+Dentro de cada nodo el código sí corre en orden (un ciclo): si una parte de
+un nodo no debe esperar a otra, sepáralas en dos nodos (o, desde el nivel 5,
+usa varios temporizadores en un mismo nodo).
+
+### 4.2 Prioridad de comandos: `[[mux]]` (0.3.0)
+
+Si dos fuentes (el panel y un cerebro autónomo) mandan al mismo receptor, el
+receptor obedece a las dos alternadamente y el robot se mueve a tirones. Un
+`[[mux]]` es un nodo intermedio (`agmen mux`, se lanza solo) con una entrada
+UDP por fuente:
+
+- Manda la entrada de **prioridad más alta que haya hablado en los últimos
+  `hold_ms`**; los mensajes de las demás se descartan. Cuando se calla, el
+  mando pasa sola a la siguiente.
+- **Nunca inventa comandos:** si nadie habla, no reenvía nada y el freno de
+  seguridad del receptor actúa igual que sin mux.
+- Todas las entradas deben mandar el mismo tipo (`type_id`); lo demás se
+  descarta con aviso. La `seq` se renumera para que el receptor vea una sola
+  fuente continua.
+- Avisa en los logs cada cambio: `manda 'teleop' (prioridad 10)`.
+- Las prioridades deben ser distintas y los puertos no se pueden repetir; si
+  no, `robot.toml` no carga.
+
+Equivale a `twist_mux` de ROS, pero sirve para **cualquier** tipo de mensaje.
+
 ## 5. El panel
 
 | Sección | Qué hace |
@@ -109,7 +169,7 @@ max_speed = 1.0                           # límite que el panel nunca excede
 | GET | `/api/state` | Robot, versión, nodos, estadísticas, teleoperación |
 | GET | `/api/stream` | Server-Sent Events: lo mismo + muestras + logs nuevos, cada 100 ms |
 | POST | `/api/node/<nombre>/start\|stop\|restart` | Controlar un nodo |
-| POST | `/api/teleop` `{"left": x, "right": y}` | Mandar un `MotorCommand` |
+| POST | `/api/teleop` `{"left": x, "right": y}` | Mandar un `MotorCommand` (a `[web.teleop] target`; con mux, a su entrada `teleop`) |
 
 ## 6. Seguridad
 
@@ -132,9 +192,10 @@ siguen en C++ (o en el lenguaje que quieras).
 
 ## 8. Limitaciones del prototipo y siguientes pasos
 
-| Hoy (0.2.0) | Siguiente |
+| Hoy (0.3.0) | Siguiente |
 |---|---|
-| Grafica solo `ImuSample` en un puerto | Con pub/sub y topics (0.4.0) el panel ve **cualquier** topic y los nodos se registran solos |
+| El mux está en Python (sobra para comandos de 20–100 Hz como los del tutorial; agrega un salto local de UDP) | Pasarlo al núcleo C++ si se usa en lazos de control más rápidos |
+| Grafica solo `ImuSample` en un puerto | Con pub/sub y topics (0.5.0) el panel ve **cualquier** topic y los nodos se registran solos |
 | La teleoperación manda `MotorCommand` a un destino fijo | Publicar a un topic; cualquier tipo de comando con esquema |
 | Un solo robot y una sola máquina | Nodos en varias máquinas (`host = "raspberry"`); varios robots en un panel (modo nube, RFC 0002) |
 | Sin contraseña | Autenticación antes de permitir el acceso remoto |

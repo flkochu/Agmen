@@ -4,7 +4,8 @@
 
 Un solo comando en vez de una terminal por nodo:
   - arranca todos los nodos declarados en robot.toml;
-  - junta su salida en una sola terminal, con el nombre de cada nodo en color;
+  - junta su salida en una sola terminal, con el nombre de cada nodo en color
+    (sin que un nodo que escribe mucho frene a los demás: ver Printer);
   - los reinicia si fallan (si así se pide);
   - con Ctrl+C los detiene a todos de forma ordenada;
   - y expone todo al panel web (agmen.panel).
@@ -40,6 +41,11 @@ class ConfigError(Exception):
 # ---------------------------------------------------------------------------
 
 RESTART_POLICIES = ("never", "on-failure", "always")
+
+# Líneas por segundo que se muestran de cada nodo (terminal y panel). Lo que
+# pase de ahí se resume en "… N líneas omitidas" en vez de frenar a nadie.
+LOG_RATE = 200
+LOG_BURST = 400
 
 
 @dataclass
@@ -108,7 +114,7 @@ def load_config(path: str | Path) -> RobotConfig:
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{path.name} no es TOML válido: {e}") from None
 
-    _check_keys(data, {"robot", "node", "web"}, path.name)
+    _check_keys(data, {"robot", "node", "mux", "web"}, path.name)
     robot = data.get("robot", {})
     _check_keys(robot, {"name", "before"}, "[robot]")
     base_dir = path.parent
@@ -145,6 +151,61 @@ def load_config(path: str | Path) -> RobotConfig:
             cwd=(base_dir / raw["cwd"]).resolve() if "cwd" in raw else None,
             env={str(k): str(v) for k, v in env.items()},
         ))
+
+    # [[mux]]: prioridad de comandos. Cada mux es un nodo más (python -m agmen mux).
+    raw_muxes = data.get("mux", [])
+    if not isinstance(raw_muxes, list):
+        raise ConfigError("'mux' se declara como [[mux]] (puede haber varios)")
+    muxes: list[NodeConfig] = []
+    for i, raw in enumerate(raw_muxes, start=1):
+        where = f"[[mux]] #{i}"
+        _check_keys(raw, {"name", "output", "hold_ms", "input"}, where)
+        name = raw.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigError(f"{where}: falta 'name', ej. name = \"ruedas\"")
+        where = f"[[mux]] '{name}'"
+        if name in seen:
+            raise ConfigError(f"el mux '{name}' se llama igual que otro nodo: los nombres deben ser únicos")
+        seen.add(name)
+        if "output" not in raw:
+            raise ConfigError(f"{where}: falta 'output' (a dónde reenviar), ej. output = \"127.0.0.1:7500\"")
+        hold_ms = raw.get("hold_ms", 300)
+        if not isinstance(hold_ms, (int, float)) or hold_ms <= 0:
+            raise ConfigError(f"{where}: hold_ms debe ser un número de milisegundos mayor que 0")
+        inputs = raw.get("input", [])
+        if not isinstance(inputs, list) or not inputs:
+            raise ConfigError(f"{where}: no tiene entradas. Agrega al menos una:\n\n"
+                              "  [[mux.input]]\n  name = \"teleop\"\n  listen = \"127.0.0.1:7510\"\n"
+                              "  priority = 10")
+        args = ["--out", str(raw["output"]), "--hold-ms", str(hold_ms)]
+        names, prios, listens = set(), set(), {str(raw["output"])}
+        for inp in inputs:
+            _check_keys(inp, {"name", "listen", "priority"}, f"{where} [[mux.input]]")
+            for key in ("name", "listen", "priority"):
+                if key not in inp:
+                    raise ConfigError(f"{where}: a una entrada le falta '{key}'")
+            if not isinstance(inp["priority"], int):
+                raise ConfigError(f"{where}: priority debe ser un entero (más alto = manda más)")
+            if inp["name"] in names:
+                raise ConfigError(f"{where}: hay dos entradas llamadas '{inp['name']}'")
+            if inp["priority"] in prios:
+                raise ConfigError(f"{where}: dos entradas con priority = {inp['priority']}: "
+                                  f"así no se sabe quién manda")
+            if inp["listen"] in listens:
+                raise ConfigError(f"{where}: {inp['listen']} se usa dos veces (entradas y salida "
+                                  f"deben ser puertos distintos)")
+            names.add(inp["name"])
+            prios.add(inp["priority"])
+            listens.add(inp["listen"])
+            args += ["--in", f"{inp['name']}={inp['listen']}@{inp['priority']}"]
+        muxes.append(NodeConfig(
+            name=name,
+            cmd=[sys.executable, "-m", "agmen", "mux", *args],
+            restart="always",
+            env={"PYTHONPATH": os.pathsep.join(
+                [str(Path(__file__).resolve().parent.parent), *filter(None, [os.environ.get("PYTHONPATH")])])},
+        ))
+    nodes = muxes + nodes   # los mux arrancan primero: ya escuchan cuando llegan comandos
 
     web_raw = data.get("web", {})
     _check_keys(web_raw, {"enabled", "http", "listen", "open_browser", "teleop"}, "[web]")
@@ -284,9 +345,28 @@ class Node:
         threading.Thread(target=self._pump, args=(self.proc, self._generation), daemon=True).start()
 
     def _pump(self, proc: subprocess.Popen, generation: int) -> None:
+        """Lee la salida del nodo SIN esperar nunca a la terminal ni al panel.
+
+        Si el nodo deja de ser leído, su pipe se llena y el nodo se bloquea en
+        su propio print(): su ciclo de control se atrasa. Por eso aquí solo se
+        lee y se encola. Si escribe más de LOG_RATE líneas/s, el excedente se
+        cuenta y se resume en una sola línea (nadie lee 10 000 líneas/s)."""
         assert proc.stdout is not None
+        tokens, last, skipped = float(LOG_BURST), time.monotonic(), 0
         for line in proc.stdout:
+            now = time.monotonic()
+            tokens = min(float(LOG_BURST), tokens + (now - last) * LOG_RATE)
+            last = now
+            if tokens < 1.0:
+                skipped += 1
+                continue
+            tokens -= 1.0
+            if skipped:
+                self._log(f"… {skipped} líneas omitidas (escribe más de {LOG_RATE} líneas/s)", "agmen")
+                skipped = 0
             self._log(line.rstrip("\r\n"))
+        if skipped:
+            self._log(f"… {skipped} líneas omitidas (escribe más de {LOG_RATE} líneas/s)", "agmen")
         code = proc.wait()
         with self.lock:
             if generation != self._generation:
@@ -359,28 +439,94 @@ _COLORS = ["36", "35", "33", "32", "34", "96", "95", "93", "92", "94"]
 
 
 class Printer:
-    """Imprime 'nombre │ línea' con un color por nodo (como docker compose)."""
+    """Imprime 'nombre │ línea' con un color por nodo (como docker compose).
 
-    def __init__(self, names: list[str]) -> None:
+    La terminal es un recurso compartido y puede ser lenta (la consola de
+    Windows lo es). Si cada nodo escribiera directo en ella, un nodo que
+    imprime mucho haría esperar a todos los demás: el sistema dejaría de ser
+    paralelo. Por eso los nodos solo encolan y un hilo propio escribe. Si la
+    terminal no da abasto, se descartan líneas de la terminal (no del panel) y
+    se avisa cuántas, en vez de frenar a los nodos.
+    """
+
+    def __init__(self, names: list[str], stream=None, max_queue: int = 500) -> None:
+        self.stream = stream if stream is not None else sys.stdout
         self.width = max([len(n) for n in names] + [5])
         self.color = {n: _COLORS[i % len(_COLORS)] for i, n in enumerate(names)}
-        self.use_color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+        isatty = getattr(self.stream, "isatty", lambda: False)
+        self.use_color = isatty() and "NO_COLOR" not in os.environ
         if self.use_color and os.name == "nt":
             os.system("")  # activa los colores ANSI en la consola de Windows
-        self.lock = threading.Lock()
+        self.max_queue = max_queue
+        self.queue: deque[str] = deque()
+        self.dropped = 0
+        self.cond = threading.Condition()
+        self._closed = False
+        self._writing = False
+        self._writer = threading.Thread(target=self._write_loop, name="agmen-printer", daemon=True)
+        self._writer.start()
 
-    def __call__(self, node: str, text: str, kind: str = "out") -> None:
+    def _format(self, node: str, text: str, kind: str) -> str:
         tag = node.ljust(self.width)
         if self.use_color:
             c = "31" if kind == "error" else self.color.get(node, "37")
             tag = f"\x1b[{c}m{tag}\x1b[0m"
             if kind in ("agmen", "error"):
                 text = f"\x1b[2m{text}\x1b[0m" if kind == "agmen" else f"\x1b[31m{text}\x1b[0m"
-        with self.lock:
+        return f"{tag} │ {text}"
+
+    def __call__(self, node: str, text: str, kind: str = "out") -> None:
+        line = self._format(node, text, kind)
+        with self.cond:
+            if len(self.queue) >= self.max_queue and kind == "out":
+                self.dropped += 1   # los avisos de agmen y los errores nunca se descartan
+                return
+            self.queue.append(line)
+            self.cond.notify()
+
+    def _emit(self, line: str) -> None:
+        try:
+            self.stream.write(line + "\n")
+        except UnicodeEncodeError:
+            self.stream.write(line.replace("│", "|").encode("ascii", "replace").decode() + "\n")
+
+    def _write_loop(self) -> None:
+        while True:
+            with self.cond:
+                while not self.queue and not self.dropped and not self._closed:
+                    self.cond.wait()
+                if self._closed and not self.queue and not self.dropped:
+                    self.cond.notify_all()
+                    return
+                lines, self.queue = list(self.queue), deque()
+                dropped, self.dropped = self.dropped, 0
+                self._writing = True
             try:
-                print(f"{tag} │ {text}", flush=True)
-            except UnicodeEncodeError:
-                print(f"{tag} | {text}".encode("ascii", "replace").decode(), flush=True)
+                if dropped:
+                    self._emit(self._format("agmen", f"… {dropped} líneas no cupieron en la terminal "
+                                                     f"(están en el panel web)", "agmen"))
+                for line in lines:
+                    self._emit(line)
+                self.stream.flush()
+            except (OSError, ValueError):
+                pass  # terminal cerrada: no tumbar a agmen por eso
+            with self.cond:
+                self._writing = False
+                self.cond.notify_all()   # despierta a flush()/close() si esperan
+
+    def flush(self, timeout: float = 3.0) -> None:
+        """Espera a que la cola se vacíe (antes de que otro escriba directo)."""
+        end = time.monotonic() + timeout
+        with self.cond:
+            while (self.queue or self.dropped or self._writing) and time.monotonic() < end:
+                self.cond.wait(0.05)
+
+    def close(self, timeout: float = 3.0) -> None:
+        """Termina de escribir lo pendiente (para que el último mensaje se vea)."""
+        with self.cond:
+            self._closed = True
+            self.cond.notify_all()
+        self._writer.join(timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -388,10 +534,10 @@ class Printer:
 # ---------------------------------------------------------------------------
 
 class Launcher:
-    def __init__(self, config: RobotConfig) -> None:
+    def __init__(self, config: RobotConfig, stream=None) -> None:
         self.config = config
         self.logs = LogBook()
-        self.printer = Printer([n.name for n in config.nodes] + ["agmen"])
+        self.printer = Printer([n.name for n in config.nodes] + ["agmen"], stream=stream)
         self.nodes = {n.name: Node(n, config.base_dir, self.logs, self.printer) for n in config.nodes}
         self.stopping = threading.Event()
 
@@ -402,6 +548,7 @@ class Launcher:
     def run_before(self) -> bool:
         for cmd in self.config.before:
             self.say(f"antes de arrancar: {' '.join(cmd)}")
+            self.printer.flush()  # este comando escribe directo en la terminal
             result = subprocess.run(cmd, cwd=self.config.base_dir)
             if result.returncode != 0:
                 self.say(f"✖ '{' '.join(cmd)}' falló (código {result.returncode}); no se arrancan los nodos", "error")
@@ -426,6 +573,7 @@ class Launcher:
         for t in threads:
             t.join()
         self.say("listo. ¡Hasta luego!")
+        self.printer.close()
 
     def action(self, name: str, what: str) -> str | None:
         """Acción desde el panel. Devuelve un error en texto, o None si salió bien."""

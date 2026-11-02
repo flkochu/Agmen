@@ -2,6 +2,7 @@
 
     agmen run [robot.toml]     lanza todo el robot + panel web, con un solo comando
     agmen web                  solo el panel web (sin administrar nodos)
+    agmen mux --out ... --in   prioridad de comandos: ¿quién manda al motor?
     agmen version              muestra la versión
 """
 
@@ -40,6 +41,7 @@ def cmd_run(args) -> int:
     launcher = Launcher(config)
     launcher.say(f"Agmen {__version__} · robot '{config.name}' · {len(config.nodes)} nodos")
     if not launcher.run_before():
+        launcher.printer.close()
         return 1
 
     panel = None
@@ -48,6 +50,7 @@ def cmd_run(args) -> int:
         try:
             panel = Panel(args.http or config.web.http, config.web.listen, config.name, launcher, teleop)
         except OSError as e:
+            launcher.printer.close()
             print(f"no se pudo abrir el panel web en {args.http or config.web.http}: {e}. "
                   f"¿Ya hay otro 'agmen run' corriendo? Usa --http 127.0.0.1:8081", file=sys.stderr)
             return 1
@@ -88,6 +91,12 @@ def cmd_web(args) -> int:
     return 0
 
 
+def cmd_mux(args) -> int:
+    from .mux import main as mux_main
+
+    return mux_main(args)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="agmen", description="Agmen: el sistema nervioso para robótica, IA e IoT")
     ap.add_argument("--version", action="version", version=f"agmen {__version__}")
@@ -106,6 +115,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--teleop", metavar="IP:PUERTO", help="habilita manejar el robot: destino de MotorCommand")
     p.add_argument("--no-browser", action="store_true", help="no abrir el navegador automáticamente")
     p.set_defaults(func=cmd_web)
+
+    p = sub.add_parser("mux", help="prioridad de comandos: reenvía la fuente más importante que esté hablando")
+    p.add_argument("--out", required=True, metavar="IP:PUERTO", help="a dónde reenviar (ej. el motor)")
+    p.add_argument("--in", dest="inputs", action="append", required=True, metavar="NOMBRE=IP:PUERTO@PRIORIDAD",
+                   help="una entrada; repítelo por cada fuente (más alto = manda más)")
+    p.add_argument("--hold-ms", type=float, default=300.0,
+                   help="tras cuántos ms sin mensajes una fuente suelta el mando (default 300)")
+    p.set_defaults(func=cmd_mux)
 
     p = sub.add_parser("version", help="muestra la versión")
     p.set_defaults(func=lambda a: print(f"agmen {__version__}") or 0)

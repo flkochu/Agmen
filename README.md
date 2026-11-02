@@ -8,14 +8,18 @@ mueve mensajes entre nodos de forma rápida, confiable y con marca de tiempo.
 La IA, la visión y el IoT **no viven dentro del núcleo**: se conectan a él
 como paquetes opcionales.
 
-- Núcleo en **C++20**; corre en **Windows, Linux y macOS** (verificado por CI).
+- Núcleo en **C++20**; corre en **Windows, Linux, macOS y Linux ARM64** como la Raspberry Pi (verificado por CI).
 - **Python de primera clase** y la compatibilidad vive en el formato de
   mensajes, no en un lenguaje.
 - **Un solo comando** levanta todo el robot (`agmen run robot.toml`) y un
   **panel web** lo controla: nodos, logs, sensores y manejo. El robot solo
   publica datos; el navegador (laptop o celular) hace todo el trabajo visual.
+- Los nodos corren **en paralelo** (un proceso cada uno) y se mide en cada
+  cambio (`scripts/paralelo_check.py`). Si el panel y un cerebro autónomo
+  mandan al mismo motor, **un `[[mux]]` decide quién manda**: tú le ganas al
+  modo autónomo y al soltar lo retoma solo.
 
-**Versión actual: 0.2.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
+**Versión actual: 0.3.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
 
 | Para… | Lee |
 |---|---|
@@ -30,8 +34,9 @@ como paquetes opcionales.
 | Versión | Nivel | Tema |
 |---|---|---|
 | 0.1.0 ✅ | 0 | Fundamentos: serialización, UDP, seq, latencia, CI, tutorial |
-| **0.2.0 ✅** | — | **`agmen run robot.toml` + panel web de control (nodos, logs, sensores, manejar)** |
-| 0.3.0 ⏭ | 1 | Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica |
+| 0.2.0 ✅ | — | `agmen run robot.toml` + panel web de control (nodos, logs, sensores, manejar) |
+| **0.3.0 ✅** | — | **¿Quién manda? Prioridad de comandos (teleop > autónomo) y paralelismo medido** |
+| 0.4.0 ⏭ | 1 | Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica |
 | … | 2–13 | Ver [`docs/VISION.md`](docs/VISION.md#7-roadmap-por-niveles) |
 
 ## Estructura
@@ -48,11 +53,12 @@ agmen/
 ├── examples/tutorial/robot.toml  el robot del tutorial completo, para `agmen run`
 ├── python/agmen/            paquete de Python: import agmen + el comando `agmen`
 │   ├── run.py               agmen run: lanzador y supervisor de nodos
+│   ├── mux.py               agmen mux: prioridad de comandos (¿quién manda?)
 │   └── panel/               panel web (servidor + página)
-├── scripts/                 interop, web, run, tutorial y check_version (todos corren en el CI)
+├── scripts/                 interop, web, run, paralelo, tutorial y check_version (todos corren en el CI)
 ├── bench/                   mediciones que respaldan decisiones de diseño
 ├── docs/                    tutorial/, VISION, PROTOCOLO, VERSIONES, PUBLICAR, rfc/
-└── .github/workflows/       ci.yml (3 sistemas + sanitizers) · release.yml (PyPI + GitHub Release)
+└── .github/workflows/       ci.yml (4 sistemas, ARM incluido, + sanitizers) · release.yml (PyPI + GitHub Release)
 ```
 
 ## Requisitos
@@ -141,6 +147,8 @@ los reinicia si fallan y abre el **panel web**:
 - **Manejar:** W A S D, flechas o botones táctiles. Al soltar, el robot frena.
 - **Sensores:** gráficas en vivo, Hz, latencia, pérdidas y errores.
 - **Logs:** todos los nodos en un lugar, con filtros.
+- **¿Quién manda?** Con `[[mux]]`, lo que mandas desde el panel le gana al
+  cerebro autónomo ([capítulo 6](docs/tutorial/06-quien-manda.md)).
 
 Ctrl+C detiene todo de forma ordenada. Para abrirlo **desde el celular**:
 `agmen run robot.toml --http 0.0.0.0:8080`.

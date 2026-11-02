@@ -39,6 +39,10 @@ http = "127.0.0.1:8080"
 target = "127.0.0.1:7500"        # a quién mandar los comandos de manejo (el motor)
 ```
 
+💡 El `robot.toml` del repo trae además un bloque `[[mux]]` (por eso ahí el
+cerebro y el panel apuntan a los puertos 7511 y 7510). Es la prioridad de
+comandos del [capítulo 6](06-quien-manda.md); por ahora puedes ignorarlo.
+
 - Cada `[[node]]` es un programa: C++, Python o lo que sea.
 - Las rutas son **relativas al archivo**, así que funciona desde cualquier carpeta.
 - `python` se reemplaza por tu Python, así que el mismo archivo funciona en
@@ -60,14 +64,15 @@ agmen run examples/tutorial/robot.toml
 ```
 
 ```
-agmen   │ Agmen 0.2.0 · robot 'robot del tutorial' · 3 nodos
+agmen   │ Agmen 0.3.0 · robot 'robot del tutorial' · 4 nodos
 agmen   │ antes de arrancar: cmake --build ../../build --config Release
 agmen   │ panel web: http://127.0.0.1:8080
+ruedas  │ ▶ iniciado (pid 706)
 imu     │ ▶ iniciado (pid 708)
 motor   │ ▶ iniciado (pid 710)
 agmen   │ 'cerebro' no arranca solo (autostart = false); inícialo desde el panel
 agmen   │ todo arrancado. Ctrl+C para detener todo.
-motor   │ [motor] Agmen 0.2.0 · esperando MotorCommand en 127.0.0.1:7500
+motor   │ [motor] Agmen 0.3.0 · esperando MotorCommand en 127.0.0.1:7500
 imu     │ [publisher] enviados=101 retrasos=0
 ```
 
@@ -89,8 +94,9 @@ El navegador se abre solo en el panel:
 🧪 **Prende el cerebro:** botón ▶ de `cerebro`. En los logs verás sus
 decisiones y, en las líneas del `motor`, cómo las obedece.
 
-🧪 **Toma el control:** detén el cerebro (■) y maneja con **W A S D**.
-Suelta las teclas y en medio segundo el motor dice
+🧪 **Toma el control:** maneja con **W A S D** (aunque el cerebro esté
+prendido: el [capítulo 6](06-quien-manda.md) explica por qué tú ganas).
+Detén el cerebro (■), suelta las teclas y en medio segundo el motor dice
 `⛔ ALTO: sin comandos desde hace 0.5 s`. El freno de seguridad del capítulo
 2 también te protege aquí.
 
@@ -155,5 +161,4 @@ La referencia completa de `robot.toml` está en el
 
 ---
 
-🎉 **Terminaste el tutorial de Agmen 0.2.** Con la próxima versión llegan
-capítulos nuevos ([índice](README.md#próximamente)).
+➡ Siguiente: [Capítulo 6 — ¿Quién manda?](06-quien-manda.md)

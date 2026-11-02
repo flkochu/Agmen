@@ -71,7 +71,7 @@ static_assert(agmen::wire::Message<MotorCommand>);
 | `decode_payload` | Lo inverso; valida el tamaño |
 | `static_assert(...)` | El compilador revisa que tu struct cumpla todo lo que Agmen necesita. Si te falta algo, no compila (mejor eso que un error en el robot) |
 
-💡 En Agmen 0.5 una herramienta generará este archivo por ti a partir del
+💡 En Agmen 0.7 una herramienta generará este archivo por ti a partir del
 esquema. Hacerlo a mano una vez te enseña qué pasa por dentro.
 
 ## 3. El nodo `motor`

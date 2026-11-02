@@ -12,9 +12,10 @@
 |---|---|---|
 | **0.1.0** | 0 | Núcleo C++, formato v0, UDP, interfaz web (prototipo), tutorial 0–4 |
 | **0.2.0** | — | `agmen run robot.toml` + panel web de control (RFC 0003) |
-| 0.3.0 | 1 | Sobre v1 + `compact` + esquema en texto (RFC 0001) |
-| 0.4.0 | 2 | Pub/sub local, topics, `agmen topic list/echo/hz` |
-| 0.5.0 | 3 | Panel en C++ (WebSocket): cualquier topic |
+| **0.3.0** | — | Prioridad de comandos (`agmen mux`), paralelismo medido, CI en ARM64 |
+| 0.4.0 | 1 | Sobre v1 + `compact` + esquema en texto (RFC 0001) |
+| 0.5.0 | 2 | Pub/sub local, topics, `agmen topic list/echo/hz` |
+| 0.6.0 | 3 | Panel en C++ (WebSocket): cualquier topic |
 | … | … | Un nivel por versión menor |
 | 1.0.0 | — | API estable: a partir de aquí romper la API exige subir MAYOR |
 

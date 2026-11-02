@@ -7,8 +7,43 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 
 ## [Sin publicar]
 
-### Planeado (nivel 1, versión 0.3.0)
+### Planeado (nivel 1, versión 0.4.0)
 - Sobre v1 de 64 bytes + codificación `compact` + esquema en texto (RFC 0001).
+
+## [0.3.0] — 2026-11-02
+
+**¿Quién manda?** Prioridad de comandos entre el panel y el modo autónomo, y
+la prueba de que Agmen trabaja en paralelo y no en serie.
+
+### Agregado
+- `[[mux]]` en `robot.toml` y el comando `agmen mux`: varias fuentes le
+  mandan al mismo actuador y manda la de prioridad más alta que esté
+  hablando (`hold_ms`); al callarse, el mando pasa sola a la siguiente.
+  Nunca inventa comandos, rechaza tipos distintos y renumera `seq`. Avisa en
+  los logs cada cambio de mando y al final cuánto pasó de cada fuente.
+- El robot del tutorial usa un mux: manejar desde el panel le gana al
+  cerebro, sin apagarlo. `cerebro.py --destino`.
+- `scripts/paralelo_check.py`: mide en tu computadora (y en el CI) que los
+  nodos usan varios núcleos, que un nodo atorado o que imprime sin parar no
+  frena a los demás, que Ctrl+C los detiene a todos a la vez y que el panel
+  atiende a varios navegadores al mismo tiempo.
+- CI en **Linux ARM64** (`ubuntu-24.04-arm`, el procesador de una Raspberry Pi
+  con sistema de 64 bits).
+- Tutorial: capítulos 6 (¿Quién manda?) y 7 (¿En paralelo o en serie?).
+
+### Corregido
+- Un punto en serie escondido: si un nodo imprimía sin parar en una terminal
+  lenta (como la de Windows), los demás nodos se bloqueaban en su `print()` y
+  su ciclo se atrasaba (un nodo de 50 Hz llegó a 1.5 s de atraso). Ahora
+  la salida de cada nodo se lee sin esperar nunca a la terminal; un hilo
+  aparte escribe desde una cola acotada y avisa si se saltó líneas, y cada
+  nodo muestra hasta 200 líneas/s (el resto se resume).
+
+### Cambiado
+- Roadmap: el formato v1 (nivel 1, RFC 0001) pasa a la versión 0.4.0; los
+  topics a 0.5.0 y el panel en C++ a 0.6.0.
+- GitHub Actions actualizadas a versiones con Node 24 (adiós a los avisos de
+  Node 20).
 
 ## [0.2.0] — 2026-10-30
 

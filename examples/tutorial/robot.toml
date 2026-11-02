@@ -22,13 +22,31 @@ restart = "on-failure"
 
 [[node]]
 name = "cerebro"                               # la "IA" en Python (capítulo 3)
-cmd = "python cerebro.py"
+cmd = "python cerebro.py --destino 127.0.0.1:7511"   # le habla al mux, no directo al motor
 autostart = false                              # empieza apagado: lo prendes desde el panel
+
+# ¿Quién manda al motor? (capítulo 6). Cerebro y panel le hablan al mux, cada
+# uno por su puerto; el mux reenvía al motor solo al de prioridad más alta que
+# esté hablando. Si sueltas el teclado, en 0.3 s el mando regresa al cerebro.
+[[mux]]
+name = "ruedas"
+output = "127.0.0.1:7500"                      # el motor
+hold_ms = 300
+
+[[mux.input]]
+name = "teleop"                                # tú, desde el panel: manda más
+listen = "127.0.0.1:7510"
+priority = 10
+
+[[mux.input]]
+name = "cerebro"                               # el modo autónomo
+listen = "127.0.0.1:7511"
+priority = 1
 
 [web]
 http = "127.0.0.1:8080"                        # usa "0.0.0.0:8080" para abrirlo desde el celular
 listen = "127.0.0.1:7400"                      # aquí llegan los datos que se grafican
 
 [web.teleop]
-target = "127.0.0.1:7500"                      # a quién mandar los comandos de manejo (el motor)
+target = "127.0.0.1:7510"                      # la entrada "teleop" del mux (que reenvía al motor)
 max_speed = 1.0

@@ -68,21 +68,26 @@ def main():
                              text=True, encoding="utf-8", errors="replace", **kwargs)
     pids = []
     try:
-        check("un comando levanta imu y motor; cerebro espera (autostart = false)",
+        check("un comando levanta imu, motor y el mux; cerebro espera (autostart = false)",
               wait_for(lambda: (s := get_state()) and node(s, "imu")["state"] == "corriendo"
-                       and node(s, "motor")["state"] == "corriendo" and node(s, "cerebro")["state"] == "detenido"))
+                       and node(s, "motor")["state"] == "corriendo" and node(s, "ruedas")["state"] == "corriendo"
+                       and node(s, "cerebro")["state"] == "detenido"))
         pids = [n["pid"] for n in get_state()["nodes"] if n["pid"]]
         check("el panel recibe el IMU a ~100 Hz", wait_for(lambda: get_state()["stats"]["rate_hz"] > 50))
 
         post("/api/node/cerebro/start")
         check("iniciar 'cerebro' desde el panel", wait_for(lambda: node(get_state(), "cerebro")["state"] == "corriendo", 8))
-        post("/api/node/cerebro/stop")
-        check("detener 'cerebro' desde el panel", wait_for(lambda: node(get_state(), "cerebro")["state"] == "detenido", 8))
+        time.sleep(1.2)  # el cerebro maneja solo un rato
 
-        for _ in range(15):
+        # Prioridad: mientras el humano maneja, el cerebro NO debe colarse.
+        for _ in range(30):
             post("/api/teleop", {"left": 0.8, "right": 0.3})
             time.sleep(0.05)
         check("teleoperación aceptada", post("/api/teleop", {"left": 0, "right": 0}) == 200)
+        time.sleep(1.5)  # al soltar, el mando regresa al cerebro
+
+        post("/api/node/cerebro/stop")
+        check("detener 'cerebro' desde el panel", wait_for(lambda: node(get_state(), "cerebro")["state"] == "detenido", 8))
         check("protección CSRF: sin encabezado → 403",
               post("/api/node/motor/stop", headers={"Content-Type": "application/json"}) == 403)
         check("protección CSRF: otro sitio → 403",
@@ -100,6 +105,16 @@ def main():
             out, _ = agmen.communicate()
 
     check("el motor recibió el manejo manual (izq=+0.80 der=+0.30)", "izq=+0.80  der=+0.30" in out)
+    motor = [line.split("izq=")[1].strip() for line in out.splitlines() if "[motor] rueda izq=" in line]
+    manual = [i for i, v in enumerate(motor) if v.startswith("+0.80")]
+    cerebro = {"+0.60  der=+0.60", "+0.40  der=-0.40"}
+    check("prioridad: el cerebro manejaba antes del humano", bool(manual) and any(v in cerebro for v in motor[:manual[0]]),
+          f"motor: {motor}")
+    check("prioridad: mientras el humano maneja, el cerebro no se cuela",
+          bool(manual) and not any(v in cerebro for v in motor[manual[0]:manual[-1] + 1]), f"motor: {motor}")
+    check("prioridad: al soltar, el mando regresa al cerebro",
+          bool(manual) and any(v in cerebro for v in motor[manual[-1] + 1:]), f"motor: {motor}")
+    check("el mux avisa quién manda", "manda 'teleop'" in out and "manda 'cerebro'" in out)
     check("el motor frenó solo al soltar", "ALTO" in out)
     check("Ctrl+C detiene todo de forma ordenada", agmen.returncode == 0 and "listo" in out,
           f"código {agmen.returncode}")

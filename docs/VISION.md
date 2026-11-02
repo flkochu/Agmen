@@ -27,8 +27,8 @@ opcionales que se conectan al núcleo:
 | Paquete | Qué es | Cuándo |
 |---|---|---|
 | `agmen-core` | Núcleo en C++20: `#include <agmen/agmen.hpp>`, `namespace agmen::` | Desde ya |
-| `agmen` (comando) | `agmen run robot.toml` (todo el robot + panel), `agmen web`; luego `agmen topic echo /imu`, `agmen node list` | 0.2.0 (run, web); topics en 0.4.0 |
-| Panel web | Nodos, logs, sensores y manejo desde el navegador; el robot no dibuja (RFC 0002, 0003) | 0.2.0 (Python); versión C++/WebSocket en 0.5.0 |
+| `agmen` (comando) | `agmen run robot.toml` (todo el robot + panel), `agmen web`; luego `agmen topic echo /imu`, `agmen node list` | 0.2.0 (run, web); `mux` en 0.3.0; topics en 0.5.0 |
+| Panel web | Nodos, logs, sensores y manejo desde el navegador; el robot no dibuja (RFC 0002, 0003) | 0.2.0 (Python); versión C++/WebSocket en 0.6.0 |
 | `agmen` (Python, PyPI) | `pip install agmen` / `import agmen`. Hoy: referencia en Python puro; nivel 6: compilado desde C++ con nanobind | 0.1.0 |
 | `agmen-micro` | Cliente ligero para microcontroladores | Nivel 12 |
 | `agmen-iot` | Puentes MQTT y similares | Nivel 12 |
@@ -63,6 +63,8 @@ No se implementan todos ya, pero ninguna decisión debe impedirlos.
 9. **Cero boilerplate y fácil de compilar**, para que la comunidad pueda contribuir.
 10. **Multiplataforma verificada por CI**, con advertencias tratadas como errores.
 11. **Un comando, una pantalla.** Si para usar algo hay que abrir otra terminal, es un bug de experiencia.
+12. **Paralelo entre nodos, y medido.** Ningún recurso compartido (terminal, panel, red) puede hacer que un nodo espere a otro. `scripts/paralelo_check.py` lo comprueba en el CI.
+13. **Un actuador, un dueño a la vez.** Si varias fuentes mandan al mismo actuador, un árbitro con prioridades (`[[mux]]`) decide, y nunca inventa comandos.
 
 ## 4. Decisiones del 2026-10-30
 
@@ -155,9 +157,10 @@ iceoryx2).
 |---|---|---|
 | 0 ✅ (0.1.0) | Fundamentos en C++: serialización, UDP, seq, latencia, CI + prototipo de interfaz web | g, h |
 | ✅ (0.2.0) | **`agmen run robot.toml` + panel web de control** (adelanto de los niveles 3 y 10, RFC 0003) | h, i |
-| **1** (0.3.0) | **Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica** | c, f |
-| 2 (0.4.0) | Pub/sub local: topics, discovery, `agmen node list`, `agmen topic list/echo/hz`; el panel muestra cualquier topic | i |
-| 3 (0.5.0) | Panel en C++: puente WebSocket, inspector de mensajes, teleoperación a topics, modo red local | h |
+| ✅ (0.3.0) | **¿Quién manda?** Prioridad de comandos (`[[mux]]`), paralelismo medido (`scripts/paralelo_check.py`), CI en ARM64 | d, i |
+| **1** (0.4.0) | **Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica** | c, f |
+| 2 (0.5.0) | Pub/sub local: topics, discovery, `agmen node list`, `agmen topic list/echo/hz`; el panel muestra cualquier topic | i |
+| 3 (0.6.0) | Panel en C++: puente WebSocket, inspector de mensajes, teleoperación a topics, modo red local | h |
 | 4 | Lenguaje de esquemas `.agmen` + generador de código C++/Python | b |
 | 5 | Executor y tiempo: nodos multi-frecuencia, colas por suscripción, reloj de Agmen (real/sim) | d, e |
 | 6 | Python de primera clase: paquete `agmen` compilado (nanobind); numpy sin copias | b |

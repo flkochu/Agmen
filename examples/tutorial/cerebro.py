@@ -8,12 +8,14 @@ decide, C++ ejecuta.
     pip install agmen        # o, desde la carpeta del repo: pip install .
     python examples/tutorial/cerebro.py          # para siempre
     python examples/tutorial/cerebro.py 40       # 40 decisiones y termina
+    python examples/tutorial/cerebro.py --destino 127.0.0.1:7511   # a otro puerto
+                                                 # (el mux del capítulo 6)
 """
 
+import argparse
 import math
 import socket
 import struct
-import sys
 import time
 from dataclasses import dataclass
 
@@ -55,9 +57,15 @@ def decidir(distancia: float) -> tuple[MotorCommand, str]:
 
 def main() -> None:
     agmen.ensure_utf8_output()  # sin errores de acentos en Windows
-    count = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+    ap = argparse.ArgumentParser(description="cerebro del tutorial")
+    ap.add_argument("count", nargs="?", type=int, default=0, help="cuántas decisiones (0 = para siempre)")
+    ap.add_argument("--destino", default="127.0.0.1:7500", help="a quién mandar MotorCommand")
+    args = ap.parse_args()
+    count = args.count
+    host, port = args.destino.rsplit(":", 1)
+    destino = (host, int(port))
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    print(f"[cerebro] Agmen {agmen.__version__} · decidiendo a 20 Hz → 127.0.0.1:7500")
+    print(f"[cerebro] Agmen {agmen.__version__} · decidiendo a 20 Hz → {args.destino}")
     print(f"[cerebro] type_id de MotorCommand = {MotorCommand.TYPE_ID:#018x} (igual que en C++)")
 
     start = time.monotonic()
@@ -67,7 +75,7 @@ def main() -> None:
         t = time.monotonic() - start
         distancia = leer_distancia(t)
         cmd, razon = decidir(distancia)
-        sock.sendto(wire.encode(cmd, seq, wire.now_ns()), ("127.0.0.1", 7500))
+        sock.sendto(wire.encode(cmd, seq, wire.now_ns()), destino)
         if razon != ultima:
             print(f"[cerebro] distancia={distancia:4.2f} m → {razon}")
             ultima = razon
