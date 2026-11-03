@@ -42,6 +42,7 @@ como paquetes opcionales.
 | La interfaz web | [RFC 0002](docs/rfc/0002-interfaz-web.md) (aceptado, implementado en 0.6.0: WebSocket, red con clave, Foxglove) · [RFC 0003](docs/rfc/0003-lanzador-y-panel.md) (`agmen run` y panel) |
 | Topics y el hub | [RFC 0004](docs/rfc/0004-topics-y-descubrimiento.md) (aceptado, implementado en 0.5.0) |
 | Mensajes en archivos `.agmen` | [RFC 0005](docs/rfc/0005-esquemas-agmen.md) (aceptado, implementado en 0.7.0) |
+| Varias frecuencias en un nodo y el reloj de Agmen | [RFC 0006](docs/rfc/0006-executor-y-reloj.md) (propuesta para 0.8.0) |
 | Publicar versiones | [`docs/PUBLICAR.md`](docs/PUBLICAR.md) |
 
 ## Estado
