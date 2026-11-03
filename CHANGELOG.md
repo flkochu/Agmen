@@ -7,8 +7,58 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 
 ## [Sin publicar]
 
-### Planeado (nivel 3, versión 0.6.0)
-- Panel en C++ con WebSocket: inspector de mensajes y teleoperación a topics.
+### Planeado (nivel 4, versión 0.7.0)
+- Lenguaje de esquemas `.agmen` y generador de código C++/Python.
+
+## [0.6.0] — 2026-11-03
+
+**Nivel 3: el panel por WebSocket** (RFC 0002, aceptado). El robot le manda al
+navegador los mismos bytes de Agmen que se mandan los nodos, y el navegador
+los decodifica.
+
+### Agregado
+- **WebSocket** en el puerto del panel (`/ws`, protocolo `agmen.ws.v1`):
+  datos en vivo, estado, logs, manejo y control de nodos por una sola
+  conexión. `agmen.ws`: WebSocket (RFC 6455) con solo la librería estándar.
+- **El navegador decodifica el formato v1** con `agmen.js`, la tercera
+  implementación (C++, Python, JavaScript). `python/test_panel_js.py` la
+  compara contra Python con los vectores de `tests/vectors/v1.txt`.
+- **Submuestreo por cliente** (`max_hz`): cada pestaña pide lo suyo. Colas
+  acotadas por conexión: un navegador lento pierde datos, nunca frena al
+  robot (se cuentan en `state.bridge.dropped`).
+- Panel: **varios topics graficados a la vez**, **inspector** del último
+  mensaje (campo por campo, con `seq`, emisor, hora y tamaño; se puede
+  congelar) y la tarjeta **"CPU del panel"**.
+- **Modo red local con clave:** `agmen run --red` / `agmen web --red`
+  imprime el link `http://IP:8080/?t=…`; sin la clave, 401. Clave fija con
+  `[web] token` o `--token`.
+- **Hombre muerto en el puente:** si el navegador estaba manejando y deja de
+  mandar comandos 300 ms (se cortó la señal) o se cierra la conexión, el
+  panel manda ALTO y lo dice en los logs.
+- **Compatible con Foxglove** (`foxglove.websocket.v1`, solo lectura): cada
+  topic es un canal JSON con su JSON Schema (`schema.Layout.json_schema()`).
+  Probado con el cliente oficial `@foxglove/ws-protocol`
+  (`scripts/foxglove_check.py`, en el CI). `[web] allow_origins` para otros
+  visores.
+- `examples/tutorial/mirar_panel.py` y el capítulo 10 del tutorial.
+- `scripts/web_smoke.py` mide el costo del puente: ~20 % de un núcleo
+  reenviando 1000 mensajes/s a 3 navegadores; unos pocos % a 100 Hz.
+
+### Cambiado
+- El panel ya no decodifica en Python: solo revisa el sobre y reenvía los
+  bytes.
+- `/api/state`: las estadísticas van por topic (`stats.topics`) y agrega
+  `cpu_s` y `bridge`.
+
+### Quitado
+- `/api/stream` (Server-Sent Events): lo reemplaza el WebSocket. `/api/state`
+  y los `POST` siguen para scripts.
+
+### Decidido
+- RFC 0002 aceptado: bytes al navegador, puente en Python (en C++ en el
+  nivel 7, con las cámaras), clave en red, Foxglove en solo lectura. Nivel
+  14 nuevo en el roadmap: un visualizador propio, para cuando Agmen esté
+  completo.
 
 ## [0.5.0] — 2026-11-03
 

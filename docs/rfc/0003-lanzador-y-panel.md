@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Estado** | Implementado como prototipo en Agmen 0.2.0 (`python/agmen/run.py`, `python/agmen/panel/`); paralelismo y `[[mux]]` en 0.3.0 (§4.1, §4.2) |
+| **Estado** | Implementado en Agmen 0.2.0 (`python/agmen/run.py`, `python/agmen/panel/`); paralelismo y `[[mux]]` en 0.3.0 (§4.1, §4.2); topics en 0.5.0; panel por WebSocket, modo red con clave y Foxglove en 0.6.0 (RFC 0002) |
 | **Fecha** | 2026-10-30 |
 | **Relacionado** | RFC 0002 (interfaz web) |
 
@@ -78,9 +78,11 @@ enabled = true                            # false = no arrancar el agmen hub (si
 
 [web]
 enabled = true
-http = "127.0.0.1:8080"                   # "0.0.0.0:8080" = visible en tu red (celular)
+http = "127.0.0.1:8080"                   # "0.0.0.0:8080" (o agmen run --red) = visible en tu red, con clave
 listen = "127.0.0.1:7400"                 # además de todos los topics: para nodos sin hub
 open_browser = true
+token = "una-clave-larga"                 # opcional (0.6.0): clave fija del modo red; si no, una nueva cada vez
+allow_origins = []                        # opcional (0.6.0): otros visores que pueden abrir el WebSocket (solo lectura)
 
 [web.teleop]                              # opcional: manejar el robot desde el panel
 target = "/cmd/teleop"                    # topic o "ip:puerto" de quien recibe MotorCommand
@@ -171,26 +173,35 @@ Equivale a `twist_mux` de ROS, pero sirve para **cualquier** tipo de mensaje.
 |---|---|
 | **Nodos** | Estado, tiempo encendido, pid y reinicios de cada nodo, con botones ▶ ■ ↻. Clic en un nodo = filtrar sus logs |
 | **Manejar** | Botones ↑ ↓ ← → (táctiles) y teclado **W A S D** o flechas, con velocidad ajustable y barras de cada rueda. **Solo manda mientras presionas**: al soltar, cambiar de pestaña o perder la conexión, manda alto, y el freno de seguridad del motor hace el resto |
-| **Datos** | Hz, latencia, pérdidas, errores, topic y esquema, y una gráfica por grupo de campos (armadas solas a partir del esquema, desde 0.4.0). Si dos emisores usan el mismo puerto, lo avisa en vez de mezclar datos |
+| **Datos** | Los topics con su tipo y frecuencia: clic para graficar (varios a la vez, 0.6.0). Hz, latencia, pérdidas, errores, esquema, y una gráfica por grupo de campos (armadas solas a partir del esquema). Si dos emisores mandan al mismo topic, lo avisa en vez de mezclar datos |
+| **Mensaje** (0.6.0) | Inspector: el último mensaje del topic elegido, campo por campo, con su `seq`, emisor, hora y tamaño. Se puede congelar |
+| **CPU del panel** (0.6.0) | Cuánto CPU usa el puente en el robot |
 | **Logs** | Todos los nodos, con color por nodo, filtros, "seguir" y "limpiar". Errores en rojo y alertas en amarillo |
 
-### API (la usa el panel, y sirve para scripts y pruebas)
+### API
+
+El panel usa un **WebSocket** (`/ws`, protocolo `agmen.ws.v1`, RFC 0002 §5):
+datos en vivo (los bytes de Agmen tal cual), estado, logs, manejo y control
+de nodos. Para scripts y pruebas sigue habiendo HTTP:
 
 | Método | Ruta | Qué hace |
 |---|---|---|
-| GET | `/api/state` | Robot, versión, nodos, estadísticas, teleoperación |
-| GET | `/api/stream` | Server-Sent Events: lo mismo + muestras + logs nuevos, cada 100 ms |
+| GET | `/ws` | WebSocket del panel (`agmen.ws.v1`) y de Foxglove (`foxglove.websocket.v1`) |
+| GET | `/api/state` | Robot, versión, nodos, estadísticas por topic, teleoperación, `cpu_s` del puente |
+| GET | `/agmen.js` | El decodificador del formato en JavaScript |
 | POST | `/api/node/<nombre>/start\|stop\|restart` | Controlar un nodo |
 | POST | `/api/teleop` `{"left": x, "right": y}` | Mandar un `MotorCommand` (a `[web.teleop] target`; con mux, a su entrada `teleop`) |
+
+`/api/stream` (Server-Sent Events, 0.2–0.5) se quitó en 0.6.0: lo reemplaza el WebSocket.
 
 ## 6. Seguridad
 
 | Riesgo | Mitigación |
 |---|---|
 | Una página maliciosa abierta en tu navegador manda comandos a `127.0.0.1:8080` (CSRF) | Todo POST exige el encabezado `X-Agmen: 1`, que un sitio ajeno no puede mandar sin permiso, y si viene `Origin`, debe ser el mismo panel |
-| Alguien en tu red maneja el robot | Por defecto el panel solo escucha en `127.0.0.1`. Abrirlo a la red (`0.0.0.0`) es explícito, y la terminal avisa que no tiene contraseña |
+| Alguien en tu red maneja el robot | Por defecto el panel solo escucha en `127.0.0.1`. En la red (`--red`) exige una clave que la terminal imprime en el link (0.6.0, RFC 0002 §6) |
 | Un bug del navegador manda velocidades absurdas o satura al robot | El panel recorta a `max_speed` y limita a ~60 comandos/s |
-| Se pierde la conexión mientras manejas | El navegador deja de mandar y el motor frena por su timeout de seguridad |
+| Se pierde la conexión mientras manejas | El puente manda ALTO si no llegan comandos en 300 ms (0.6.0); además el motor frena por su timeout de seguridad |
 
 **Antes del modo nube** (RFC 0002): usuarios, contraseñas y TLS.
 
@@ -204,11 +215,11 @@ siguen en C++ (o en el lenguaje que quieras).
 
 ## 8. Limitaciones del prototipo y siguientes pasos
 
-| Hoy (0.5.0) | Siguiente |
+| Hoy (0.6.0) | Siguiente |
 |---|---|
 | El mux está en Python (sobra para comandos de 20–100 Hz como los del tutorial; agrega un salto local de UDP) | Pasarlo al núcleo C++ si se usa en lazos de control más rápidos |
-| Grafica cualquier tipo (0.4.0) de todos los topics (0.5.0), uno a la vez | Varias gráficas de topics distintos al mismo tiempo; topics de otras máquinas (nivel 11) |
-| La teleoperación manda `MotorCommand` a un destino fijo | Publicar a un topic; cualquier tipo de comando con esquema |
+| Grafica cualquier tipo de varios topics a la vez, con inspector (0.6.0) | Cámara (nivel 7), 3D y grabaciones (nivel 9); topics de otras máquinas (nivel 11) |
+| La teleoperación manda `MotorCommand` a un topic | Cualquier tipo de comando con esquema; publicar desde Foxglove |
 | Un solo robot y una sola máquina | Nodos en varias máquinas (`host = "raspberry"`); varios robots en un panel (modo nube, RFC 0002) |
-| Sin contraseña | Autenticación antes de permitir el acceso remoto |
+| Clave para la red local (sin cifrar) | Usuarios, permisos y TLS para el modo nube (nivel 11) |
 | CPU y memoria por nodo: no se muestran | Agregarlos sin dependencias externas |

@@ -72,6 +72,8 @@ class WebConfig:
     listen: str = "127.0.0.1:7400"   # dónde recibe mensajes Agmen para graficar
     open_browser: bool = True
     teleop: TeleopConfig | None = None
+    token: str | None = None         # clave del modo red (si no, se genera una al arrancar)
+    allow_origins: list[str] = field(default_factory=list)   # visores en otra página (Foxglove propio, etc.)
 
 
 @dataclass
@@ -246,7 +248,13 @@ def load_config(path: str | Path) -> RobotConfig:
     _check_keys(hub_raw, {"enabled"}, "[hub]")
 
     web_raw = data.get("web", {})
-    _check_keys(web_raw, {"enabled", "http", "listen", "open_browser", "teleop"}, "[web]")
+    _check_keys(web_raw, {"enabled", "http", "listen", "open_browser", "teleop", "token", "allow_origins"}, "[web]")
+    token = web_raw.get("token")
+    if token is not None and (not isinstance(token, str) or len(token) < 8):
+        raise ConfigError("[web] token: debe ser un texto de al menos 8 caracteres (o quítalo y se genera uno solo)")
+    origins = web_raw.get("allow_origins", [])
+    if not isinstance(origins, list) or not all(isinstance(o, str) for o in origins):
+        raise ConfigError('[web] allow_origins: una lista de textos, ej. ["https://mi-visor.local"]')
     teleop = None
     if "teleop" in web_raw:
         t = web_raw["teleop"]
@@ -262,6 +270,8 @@ def load_config(path: str | Path) -> RobotConfig:
         listen=web_raw.get("listen", "127.0.0.1:7400"),
         open_browser=bool(web_raw.get("open_browser", True)),
         teleop=teleop,
+        token=token,
+        allow_origins=origins,
     )
 
     before = [_parse_cmd(c, "[robot] before") for c in robot.get("before", [])]

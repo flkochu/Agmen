@@ -48,15 +48,15 @@ Se abre solo **http://127.0.0.1:8080**:
 Con la PC y el celular **en la misma red WiFi**:
 
 ```bash
-agmen web --http 0.0.0.0:8080
+agmen web --red
 ```
 
-En el celular abre `http://IP-DE-TU-PC:8080`. Para saber la IP de tu PC:
-`ipconfig` en Windows, `ip addr` en Linux, o *Configuración → Red* en macOS.
+La terminal imprime un link como `http://192.168.1.20:8080/?t=5qb9IHV2pAIk`:
+ábrelo en el celular. El final (`?t=…`) es la **clave** del panel: sin ella
+nadie más en tu red puede verlo (Agmen 0.6, capítulo 10).
 
-⚠ El prototipo **no tiene contraseña**: cualquiera en tu red puede ver los
-datos. No lo uses en redes públicas ni lo expongas a internet. La versión
-con usuarios, cifrado y modo nube está diseñada en el
+⚠ La clave viaja sin cifrar: úsalo en la red del laboratorio, no lo expongas
+a internet. La versión con usuarios, cifrado y modo nube está diseñada en el
 [RFC 0002](../rfc/0002-interfaz-web.md).
 
 ## 3. Experimentos
@@ -86,8 +86,8 @@ con cualquier mensaje que inventes.
 
 ## Limitaciones de esta versión
 
-- Grafica un emisor a la vez (si hay varios en el mismo puerto, sigue a uno
-  y te avisa). Con topics (Agmen 0.5) podrás elegir cuál ver.
+- Si hay varios emisores en el mismo topic, sigue a uno y te avisa. Desde
+  Agmen 0.6 puedes graficar varios topics a la vez (capítulo 10).
 - Con `agmen web` el panel solo **muestra**. En el capítulo 5 lo usas con
   `agmen run` para además **controlar los nodos y manejar el robot**.
 

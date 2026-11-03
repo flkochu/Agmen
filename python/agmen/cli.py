@@ -56,15 +56,18 @@ def cmd_run(args) -> int:
     panel = None
     if config.web.enabled and not args.no_web:
         teleop = Teleop(config.web.teleop.target, config.web.teleop.max_speed) if config.web.teleop else None
+        http = _http_for(args.http or config.web.http, args.red)
         try:
-            panel = Panel(args.http or config.web.http, config.web.listen, config.name, launcher, teleop)
+            panel = Panel(http, config.web.listen, config.name, launcher, teleop,
+                          token=config.web.token, allow_origins=config.web.allow_origins)
         except OSError as e:
             launcher.printer.close()
-            print(f"no se pudo abrir el panel web en {args.http or config.web.http}: {e}. "
+            print(f"no se pudo abrir el panel web en {http}: {e}. "
                   f"¿Ya hay otro 'agmen run' corriendo? Usa --http 127.0.0.1:8081", file=sys.stderr)
             return 1
         panel.start(open_browser=config.web.open_browser and not args.no_browser)
-        launcher.say(f"panel web: {panel.url}")
+        for line in _panel_lines(panel):
+            launcher.say(line)
 
     launcher.start_all()
     launcher.say("todo arrancado. Ctrl+C para detener todo.")
@@ -76,6 +79,25 @@ def cmd_run(args) -> int:
         if panel:
             panel.shutdown()
     return 0
+
+
+def _http_for(http: str, red: bool) -> str:
+    """--red = el mismo puerto, pero visible en la red local (celular, otra laptop)."""
+    return "0.0.0.0:" + http.rsplit(":", 1)[1] if red else http
+
+
+def _panel_lines(panel) -> list[str]:
+    host = panel.url.split("/")[2]
+    lines = [f"panel web: {panel.url}"]
+    if panel.lan:
+        links = panel.lan_urls()
+        if links:
+            lines += [f"panel en tu red (celular, otra laptop): {u}" for u in links]
+        else:
+            lines.append("panel abierto a la red, pero no encontré la IP de esta computadora en ella")
+        lines.append("  ⚠ el link lleva la clave: compártelo solo con quien deba ver y manejar el robot")
+    lines.append(f"Foxglove (solo ver): conéctate a ws://{host}/ws" + (f"?t={panel.token}" if panel.token else ""))
+    return lines
 
 
 def cmd_web(args) -> int:
@@ -94,17 +116,20 @@ def cmd_web(args) -> int:
         else:
             threading.Thread(target=own_hub.serve, args=(hub_stop,), daemon=True).start()
             print(f"[agmen web] agmen hub en {hub_address()} (dentro de este proceso)")
+    if args.token is not None and len(args.token) < 8:
+        print("[agmen web] --token: usa al menos 8 caracteres (o quítalo y se genera uno solo)", file=sys.stderr)
+        return 2
     teleop = Teleop(args.teleop, 1.0) if args.teleop else None
+    http = _http_for(args.http, args.red)
     try:
-        panel = Panel(args.http, args.listen, "", None, teleop)
+        panel = Panel(http, args.listen, "", None, teleop, token=args.token, allow_origins=args.allow_origin)
     except OSError as e:
-        print(f"no se pudo abrir el panel en {args.http}: {e}", file=sys.stderr)
+        print(f"no se pudo abrir el panel en {http}: {e}", file=sys.stderr)
         return 1
     panel.start(open_browser=not args.no_browser)
     print(f"[agmen web] recibiendo Agmen de todos los topics y de udp://{args.listen}")
-    print(f"[agmen web] abre {panel.url} en tu navegador")
-    if args.http.startswith("0.0.0.0"):
-        print("[agmen web] también accesible desde otros equipos de tu red (sin contraseña)")
+    for line in _panel_lines(panel):
+        print(f"[agmen web] {line}")
     stop = threading.Event()
     try:
         _wait_for_ctrl_c(stop)
@@ -141,7 +166,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("archivo", nargs="?", default="robot.toml", help="archivo del robot (default: robot.toml)")
     p.add_argument("--no-web", action="store_true", help="no abrir el panel web")
     p.add_argument("--no-browser", action="store_true", help="no abrir el navegador automáticamente")
-    p.add_argument("--http", help="dónde servir el panel (ej. 0.0.0.0:8080 para verlo desde el celular)")
+    p.add_argument("--http", help="dónde servir el panel (default: el de robot.toml, 127.0.0.1:8080)")
+    p.add_argument("--red", action="store_true",
+                   help="abrir el panel a tu red local (celular, otra laptop), con clave")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("web", help="solo el panel web (sin administrar nodos)")
@@ -150,6 +177,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--teleop", metavar="TOPIC|IP:PUERTO",
                    help="habilita manejar el robot: a dónde mandar MotorCommand (ej. /cmd/teleop)")
     p.add_argument("--no-browser", action="store_true", help="no abrir el navegador automáticamente")
+    p.add_argument("--red", action="store_true",
+                   help="abrir el panel a tu red local (celular, otra laptop), con clave")
+    p.add_argument("--token", help="clave fija para el modo red (default: una nueva cada vez)")
+    p.add_argument("--allow-origin", action="append", default=[], metavar="URL",
+                   help="otra página que puede abrir el WebSocket en solo lectura (ej. tu propio visor)")
     p.set_defaults(func=cmd_web)
 
     p = sub.add_parser("mux", help="prioridad de comandos: reenvía la fuente más importante que esté hablando")

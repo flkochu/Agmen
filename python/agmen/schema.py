@@ -347,12 +347,34 @@ class Layout:
         """bytes compact (1 fila) → dict con los campos (arreglos como listas)."""
         return self._build(self.root, iter(self._struct.unpack_from(payload, offset)))
 
+    def json_schema(self) -> dict:
+        """El esquema como JSON Schema: así lo entienden visores como Foxglove,
+        que reciben los mensajes de Agmen convertidos a JSON (RFC 0002 §4.3)."""
+        return {"$schema": "https://json-schema.org/draft/2020-12/schema", "title": self.name,
+                "description": self.text, **_json_type(self.root)}
+
     def unpack_rows(self, payload: bytes) -> list[dict]:
         """Un payload puede traer N filas seguidas (RFC 0001 §4)."""
         if len(payload) % self.size:
             raise SchemaError(f"payload de {len(payload)} bytes: no es múltiplo de {self.size} "
                               f"(el tamaño de '{self.name}')")
         return [self.unpack(payload, k * self.size) for k in range(len(payload) // self.size)]
+
+
+_JSON_PRIMS = {"bool": "boolean", "f32": "number", "f64": "number"}
+
+
+def _json_type(t: Type) -> dict:
+    if isinstance(t, Prim):
+        kind = _JSON_PRIMS.get(t.name, "integer")
+        out: dict = {"type": kind}
+        if t.name in ("time", "duration"):
+            out["description"] = f"{t.name}: nanosegundos"
+        return out
+    if isinstance(t, Array):
+        return {"type": "array", "items": _json_type(t.elem), "minItems": t.n, "maxItems": t.n}
+    return {"type": "object", "properties": {f.name: _json_type(f.type) for f in t.fields},
+            "required": [f.name for f in t.fields]}
 
 
 def flatten_numbers(value, prefix: str = "") -> dict[str, float]:

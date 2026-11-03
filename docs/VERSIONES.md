@@ -15,7 +15,8 @@
 | **0.3.0** | — | Prioridad de comandos (`agmen mux`), paralelismo medido, CI en ARM64 |
 | **0.4.0** | 1 | Sobre v1 + `compact` + esquema en texto (RFC 0001): `Publisher`/`Subscriber`, `agmen echo`, panel para cualquier tipo |
 | **0.5.0** | 2 | Topics con `agmen hub` (RFC 0004), `agmen topic list/info/echo/hz`, `agmen node list` |
-| 0.6.0 | 3 | Panel en C++ (WebSocket): cualquier topic |
+| **0.6.0** | 3 | Panel por WebSocket (RFC 0002): bytes de Agmen al navegador, inspector, varias gráficas, modo red con clave, Foxglove |
+| 0.7.0 | 4 | Lenguaje de esquemas `.agmen` + generador de código |
 | … | … | Un nivel por versión menor |
 | 1.0.0 | — | API estable: a partir de aquí romper la API exige subir MAYOR |
 

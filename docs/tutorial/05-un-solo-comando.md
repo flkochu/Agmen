@@ -67,9 +67,10 @@ agmen run examples/tutorial/robot.toml
 ```
 
 ```
-agmen   │ Agmen 0.5.0 · robot 'robot del tutorial' · 5 nodos · agmen hub en 127.0.0.1:7390
+agmen   │ Agmen 0.6.0 · robot 'robot del tutorial' · 5 nodos · agmen hub en 127.0.0.1:7390
 agmen   │ antes de arrancar: cmake --build ../../build --config Release
-agmen   │ panel web: http://127.0.0.1:8080
+agmen   │ panel web: http://127.0.0.1:8080/
+agmen   │ Foxglove (solo ver): conéctate a ws://127.0.0.1:8080/ws
 hub     │ ▶ iniciado (pid 704)
 ruedas  │ ▶ iniciado (pid 706)
 imu     │ ▶ iniciado (pid 708)
@@ -78,7 +79,7 @@ agmen   │ 'cerebro' no arranca solo (autostart = false); inícialo desde el pa
 agmen   │ todo arrancado. Ctrl+C para detener todo.
 hub     │ [hub] ▶ 'imu' publica /imu (ImuSample)
 hub     │ [hub] ▶ 'motor' escucha /cmd (MotorCommand)
-motor   │ [motor] Agmen 0.5.0 · esperando MotorCommand en /cmd
+motor   │ [motor] Agmen 0.6.0 · esperando MotorCommand en /cmd
 imu     │ [publisher] enviados=101 retrasos=0
 ```
 
@@ -122,12 +123,11 @@ arrancar… ¿Compilaste el proyecto y la ruta es correcta?".
 
 🧪 **Desde el celular:** misma red WiFi y
 ```bash
-agmen run examples/tutorial/robot.toml --http 0.0.0.0:8080
+agmen run examples/tutorial/robot.toml --red
 ```
-Abre `http://IP-DE-TU-PC:8080` en el celular y maneja con los botones.
-
-⚠ El panel **no tiene contraseña**: cualquiera en tu red podría manejar el
-robot. Úsalo solo en redes de confianza y nunca lo expongas a internet.
+Abre en el celular el link que imprime la terminal (`http://IP-DE-TU-PC:8080/?t=…`)
+y maneja con los botones. El `?t=…` es la clave: sin ella nadie más en tu red
+puede manejar el robot (capítulo 10). Nunca lo expongas a internet.
 
 🧪 **Termina todo:** Ctrl+C en la terminal. Agmen detiene cada nodo en orden:
 ```

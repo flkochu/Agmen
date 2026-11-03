@@ -19,21 +19,23 @@ como paquetes opcionales.
   escuela) y sin que los datos pasen por él. `agmen topic list/info/echo/hz`
   y `agmen node list` te dejan ver el robot por dentro.
 - **Un solo comando** levanta todo el robot (`agmen run robot.toml`) y un
-  **panel web** lo controla: nodos, logs, sensores y manejo. El robot solo
-  publica datos; el navegador (laptop o celular) hace todo el trabajo visual.
+  **panel web** lo controla: nodos, logs, varias gráficas a la vez, un
+  inspector de mensajes y manejo. El robot **no dibuja ni convierte nada**: le
+  manda al navegador los mismos bytes de Agmen y el navegador los decodifica.
+  Ábrelo desde el celular con `--red` (con clave) o conéctate con **Foxglove**.
 - Los nodos corren **en paralelo** (un proceso cada uno) y se mide en cada
   cambio (`scripts/paralelo_check.py`). Si el panel y un cerebro autónomo
   mandan al mismo motor, **un `[[mux]]` decide quién manda**: tú le ganas al
   modo autónomo y al soltar lo retoma solo.
 
-**Versión actual: 0.5.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
+**Versión actual: 0.6.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
 
 | Para… | Lee |
 |---|---|
 | **Empezar a usarlo** | 📘 [**Tutorial**](docs/tutorial/README.md): de la instalación a un robot completo con un solo comando y panel web |
 | Entender el proyecto | [`docs/VISION.md`](docs/VISION.md): visión, decisión de C++, comparación con dora-rs, roadmap |
 | El formato de mensajes | [PROTOCOLO v1](docs/PROTOCOLO.md) (implementado) · [RFC 0001](docs/rfc/0001-formato-de-mensajes.md) (diseño y razones) · [vectores de prueba](tests/vectors/v1.txt) |
-| La interfaz web | [RFC 0002](docs/rfc/0002-interfaz-web.md) (propuesta) · [RFC 0003](docs/rfc/0003-lanzador-y-panel.md) (`agmen run` y panel, implementado) |
+| La interfaz web | [RFC 0002](docs/rfc/0002-interfaz-web.md) (aceptado, implementado en 0.6.0: WebSocket, red con clave, Foxglove) · [RFC 0003](docs/rfc/0003-lanzador-y-panel.md) (`agmen run` y panel) |
 | Topics y el hub | [RFC 0004](docs/rfc/0004-topics-y-descubrimiento.md) (aceptado, implementado en 0.5.0) |
 | Publicar versiones | [`docs/PUBLICAR.md`](docs/PUBLICAR.md) |
 
@@ -45,8 +47,9 @@ como paquetes opcionales.
 | 0.2.0 ✅ | — | `agmen run robot.toml` + panel web de control (nodos, logs, sensores, manejar) |
 | 0.3.0 ✅ | — | ¿Quién manda? Prioridad de comandos (teleop > autónomo) y paralelismo medido |
 | 0.4.0 ✅ | 1 | Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica |
-| **0.5.0 ✅** | **2** | **Topics: los nodos se encuentran solos (`agmen hub`), `agmen topic list/info/echo/hz`, `agmen node list`** |
-| … | 3–13 | Ver [`docs/VISION.md`](docs/VISION.md#7-roadmap-por-niveles) |
+| 0.5.0 ✅ | 2 | Topics: los nodos se encuentran solos (`agmen hub`), `agmen topic list/info/echo/hz`, `agmen node list` |
+| **0.6.0 ✅** | **3** | **Panel por WebSocket: el navegador decodifica los bytes de Agmen, varias gráficas, inspector, celular con clave, compatible con Foxglove** |
+| … | 4–14 | Ver [`docs/VISION.md`](docs/VISION.md#7-roadmap-por-niveles) |
 
 ## Estructura
 
@@ -65,8 +68,9 @@ agmen/
 │   ├── mux.py               agmen mux: prioridad de comandos (¿quién manda?)
 │   ├── hub.py · hubproto.py agmen hub: el directorio de topics (RFC 0004)
 │   ├── topic.py             agmen topic list/info/echo/hz, agmen node list
-│   └── panel/               panel web (servidor + página)
-├── scripts/                 interop, web, run, paralelo, topics, tutorial y check_version (todos corren en el CI)
+│   ├── ws.py                WebSocket con la librería estándar
+│   └── panel/               panel web: servidor, puente (bridge.py), agmen.js y la página
+├── scripts/                 interop, web, foxglove, run, paralelo, topics, tutorial y check_version (todos corren en el CI)
 ├── bench/                   mediciones que respaldan decisiones de diseño
 ├── docs/                    tutorial/, VISION, PROTOCOLO, VERSIONES, PUBLICAR, rfc/
 └── .github/workflows/       ci.yml (4 sistemas, ARM incluido, + sanitizers) · release.yml (PyPI + GitHub Release)
@@ -134,7 +138,7 @@ before = ["cmake --build build"]          # compila antes de arrancar
 
 [[node]]
 name = "motor"
-cmd = "./build/bin/motor"
+cmd = "./build/bin/motor"                 # escucha el topic /cmd
 restart = "on-failure"                    # si se cae, se levanta solo
 
 [[node]]
@@ -142,7 +146,7 @@ name = "cerebro"
 cmd = "python cerebro.py"
 
 [web.teleop]
-target = "127.0.0.1:7500"                 # manejar el robot desde el panel
+target = "/cmd"                           # manejar el robot desde el panel
 ```
 
 ```bash
@@ -156,17 +160,21 @@ los reinicia si fallan y abre el **panel web**:
 
 - **Nodos:** estado de cada uno, con botones ▶ iniciar, ■ detener y ↻ reiniciar.
 - **Manejar:** W A S D, flechas o botones táctiles. Al soltar, el robot frena.
-- **Datos:** gráficas en vivo de **cualquier** mensaje (se arman solas a partir de su esquema), Hz, latencia, pérdidas y errores.
+- **Datos:** gráficas en vivo de **cualquier** mensaje (se arman solas a partir de su esquema), de varios topics a la vez; Hz, latencia, pérdidas y errores.
+- **Mensaje:** el inspector muestra el último mensaje del topic elegido, campo por campo.
 - **Logs:** todos los nodos en un lugar, con filtros.
 - **¿Quién manda?** Con `[[mux]]`, lo que mandas desde el panel le gana al
   cerebro autónomo ([capítulo 6](docs/tutorial/06-quien-manda.md)).
 
 Ctrl+C detiene todo de forma ordenada. Para abrirlo **desde el celular**:
-`agmen run robot.toml --http 0.0.0.0:8080`.
+`agmen run robot.toml --red` e imprime un link con clave. Si se corta la señal
+mientras manejas, el panel manda ALTO. **Foxglove** se conecta a
+`ws://127.0.0.1:8080/ws` (solo lectura).
 
-⚠ El panel no tiene contraseña: úsalo solo en redes de confianza. Detalles y
-referencia completa de `robot.toml` en el [RFC 0003](docs/rfc/0003-lanzador-y-panel.md)
-y en el [capítulo 5 del tutorial](docs/tutorial/05-un-solo-comando.md).
+⚠ La clave del modo red viaja sin cifrar: no lo expongas a internet. Detalles
+y referencia completa de `robot.toml` en el [RFC 0003](docs/rfc/0003-lanzador-y-panel.md)
+y en los capítulos [5](docs/tutorial/05-un-solo-comando.md) y
+[10](docs/tutorial/10-panel-celular-y-foxglove.md) del tutorial.
 
 ## Usar Agmen en tu propio proyecto CMake
 
@@ -201,7 +209,7 @@ Para tus propios tipos de mensaje, ve el
 | Detección de pérdidas con números de secuencia | `examples/nivel0/common.hpp` → `SeqTracker` |
 | Un parser que corre **al compilar** (valida el esquema y calcula su tamaño) | `agmen::wire::schema::check` en `include/agmen/wire.hpp` |
 | Layout de un struct de C: alineación y relleno | `python/agmen/schema.py` → `Layout` |
-| Decodificar cualquier tipo sin código compilado | `agmen echo` (`python/agmen/echo.py`) y el panel |
+| Decodificar cualquier tipo sin código compilado | `agmen echo` (`python/agmen/echo.py`) y el panel (`python/agmen/panel/agmen.js`, en el navegador) |
 | Dos implementaciones, los mismos bytes | `tests/vectors/v1.txt`, revisado por C++ y por Python |
 
 ## Ejercicios

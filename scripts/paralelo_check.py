@@ -287,25 +287,29 @@ def prueba_panel() -> None:
     panel = Panel("127.0.0.1:8190", "127.0.0.1:7490", "prueba", lan, None, topics=False)
     panel.start()
     lan.start_all()
+    from agmen import ws
+
     streams = []
     try:
-        # 3 "navegadores" con la transmisión en vivo abierta (nunca termina).
+        # 3 "navegadores" con el WebSocket abierto (nunca termina).
         for _ in range(3):
-            r = urllib.request.urlopen("http://127.0.0.1:8190/api/stream", timeout=5)
-            assert r.readline().startswith(b"data:")
-            streams.append(r)
+            c = ws.connect("ws://127.0.0.1:8190/ws", protocols=["agmen.ws.v1"])
+            c.sock.settimeout(5)
+            assert json.loads(c.recv())["op"] == "hello"
+            streams.append(c)
         worst = 0.0
         for _ in range(10):
             t0 = time.perf_counter()
             urllib.request.urlopen("http://127.0.0.1:8190/api/state", timeout=5).read()
             worst = max(worst, time.perf_counter() - t0)
-        # Y los 3 siguen recibiendo datos al mismo tiempo.
-        def next_event(r):
-            return any(r.readline().startswith(b"data:") for _ in range(4))
-        alive = all(next_event(r) for r in streams)
+
+        # Y los 3 siguen recibiendo el estado al mismo tiempo (cada 0.5 s).
+        def next_state(c):
+            return any(isinstance(m, str) and json.loads(m)["op"] == "state" for m in (c.recv() for _ in range(6)))
+        alive = all(next_state(c) for c in streams)
     finally:
-        for r in streams:
-            r.close()
+        for c in streams:
+            c.close()
         lan.stop_all()
         panel.shutdown()
     row("panel con 3 navegadores conectados + consultas",

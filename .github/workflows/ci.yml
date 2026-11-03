@@ -43,8 +43,12 @@ jobs:
       - name: Interoperabilidad C++ <-> Python
         run: python scripts/interop.py
 
-      - name: Interfaz web
+      - name: Interfaz web (WebSocket, costo del puente, Foxglove)
         run: python scripts/web_smoke.py
+
+      - name: Compatible con el cliente oficial de Foxglove
+        if: matrix.os == 'ubuntu-latest'
+        run: python scripts/foxglove_check.py --required
 
       - name: Tutorial (el código del tutorial funciona)
         run: python scripts/tutorial_check.py

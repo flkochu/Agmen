@@ -27,8 +27,8 @@ opcionales que se conectan al núcleo:
 | Paquete | Qué es | Cuándo |
 |---|---|---|
 | `agmen-core` | Núcleo en C++20: `#include <agmen/agmen.hpp>`, `namespace agmen::` | Desde ya |
-| `agmen` (comando) | `agmen run robot.toml` (todo el robot + panel), `agmen web`, `agmen mux`, `agmen echo`, `agmen hub`, `agmen topic list/info/echo/hz`, `agmen node list` | 0.2.0 (run, web); `mux` en 0.3.0; `echo` en 0.4.0; hub y topics en 0.5.0 |
-| Panel web | Nodos, logs, sensores y manejo desde el navegador; el robot no dibuja (RFC 0002, 0003) | 0.2.0 (Python); versión C++/WebSocket en 0.6.0 |
+| `agmen` (comando) | `agmen run robot.toml` (todo el robot + panel), `agmen web`, `agmen mux`, `agmen echo`, `agmen hub`, `agmen topic list/info/echo/hz`, `agmen node list` | 0.2.0 (run, web); `mux` en 0.3.0; `echo` en 0.4.0; hub y topics en 0.5.0; `--red` en 0.6.0 |
+| Panel web | Nodos, logs, sensores, inspector y manejo desde el navegador; el robot no dibuja (RFC 0002, 0003) | 0.2.0; WebSocket, red con clave y Foxglove en 0.6.0; puente en C++ en el nivel 7 |
 | `agmen` (Python, PyPI) | `pip install agmen` / `import agmen`. Hoy: referencia en Python puro; nivel 6: compilado desde C++ con nanobind | 0.1.0 |
 | `agmen-micro` | Cliente ligero para microcontroladores | Nivel 12 |
 | `agmen-iot` | Puentes MQTT y similares | Nivel 12 |
@@ -115,6 +115,10 @@ igual antes y después de la migración, sin tocarlos. Es la regla 3 en acción.
 - ✅ Payload `compact` (struct de C) definido por un esquema en texto; en Python el layout sale solo del esquema.
 - ✅ Decodificación dinámica: `agmen echo` y el panel leen cualquier tipo gracias al anuncio de esquema.
 
+### Cambió en 0.6.0 (RFC 0002, nivel 3)
+- ✅ El panel habla por WebSocket y recibe los **bytes de Agmen sin convertir**: el navegador los decodifica con `agmen.js`, la tercera implementación del formato (C++, Python, JavaScript), probada con los mismos vectores.
+- ✅ Modo red local con clave; hombre muerto en el puente; compatible con Foxglove (solo lectura).
+
 ### Falta (siguientes niveles)
 - Payload `arrow` para datos variables y grandes (nivel 7).
 - Mensajes de C++ generados desde el esquema en vez de escritos a mano (nivel 4).
@@ -164,28 +168,30 @@ iceoryx2).
 | ✅ (0.3.0) | ¿Quién manda? Prioridad de comandos (`[[mux]]`), paralelismo medido (`scripts/paralelo_check.py`), CI en ARM64 | d, i |
 | **1 ✅** (0.4.0) | **Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica**: `Publisher`/`Subscriber`, anuncio de esquema, `agmen echo`, panel que grafica cualquier tipo, vectores de prueba compartidos C++/Python | c, f |
 | **2 ✅** (0.5.0) | **Pub/sub local: topics con `agmen hub` (RFC 0004), `agmen node list`, `agmen topic list/info/echo/hz`, topics esperados en robot.toml; el panel muestra cualquier topic** | i |
-| 3 (0.6.0) | Panel en C++: puente WebSocket, inspector de mensajes, teleoperación a topics, modo red local | h |
+| **3 ✅** (0.6.0) | **Panel por WebSocket (RFC 0002): el navegador decodifica los bytes de Agmen, varias gráficas a la vez, inspector de mensajes, modo red local con clave, hombre muerto en el puente, compatible con Foxglove** | h |
 | 4 | Lenguaje de esquemas `.agmen` + generador de código C++/Python | b |
 | 5 | Executor y tiempo: nodos multi-frecuencia, colas por suscripción, reloj de Agmen (real/sim) | d, e |
 | 6 | Python de primera clase: paquete `agmen` compilado (nanobind); numpy sin copias | b |
-| 7 | Codificación `arrow`: imágenes, tensores; panel de cámara en la web | a, b, h |
+| 7 | Codificación `arrow`: imágenes, tensores; panel de cámara en la web; puente del panel en C++ | a, b, h |
 | 8 | Memoria compartida para mensajes grandes | a |
 | 9 | Grabación y reproducción; exportar a Parquet; reproducir en la web | c |
 | 10 | Abstracción sim/real; `robot.toml` con nodos en varias máquinas (el lanzador básico ya existe desde 0.2.0) | d, i |
 | 11 | Red multi-máquina, sincronización de relojes y **`agmen-web` en la nube** (relay con autenticación) | c, h |
 | 12 | Puentes (`agmen-iot` MQTT, ROS 2) y `agmen-micro` | f |
 | 13 | Paquetes de IA: `agmen-vision`, `agmen-learn` | — |
+| 14 | **Visualizador propio** ("nuestro Foxglove", pedido por Adán para cuando Agmen esté completo): 3D, URDF, nubes de puntos, layouts guardados, reproducir grabaciones; sobre `agmen.ws` y `agmen.js` | h |
 
 ## 8. Decisiones pendientes
 
 | Decisión | Cuándo |
 |---|---|
 | ~~¿Aprobar el formato del RFC 0001?~~ | ✅ Aceptado el 2026-10-30 |
-| ¿Aprobar el diseño de la interfaz web (RFC 0002)? | **Ahora** |
+| ~~¿Aprobar el diseño de la interfaz web (RFC 0002)?~~ | ✅ Aceptado el 2026-11-03: bytes de Agmen al navegador, puente en Python (C++ en el nivel 7), clave en red, Foxglove solo lectura |
 | ¿Aprobar el lanzador y el panel (RFC 0003)? | Ya implementado como prototipo; se puede ajustar |
 | ~~Grafo estático declarado (como dora) o pub/sub dinámico (como ROS)~~ | ✅ Dinámico + topics esperados en robot.toml ([RFC 0004](rfc/0004-topics-y-descubrimiento.md), 2026-11-02) |
 | ~~Daemon local obligatorio o sin daemon~~ | ✅ Hub local de control, datos directos ([RFC 0004](rfc/0004-topics-y-descubrimiento.md), 2026-11-02) |
-| Compatibilidad con el protocolo WebSocket de Foxglove | Nivel 3 |
+| ~~Compatibilidad con el protocolo WebSocket de Foxglove~~ | ✅ Solo lectura en 0.6.0 (RFC 0002 §5.3). Publicar desde Foxglove: después |
+| Nombre y alcance del visualizador propio | Nivel 14 |
 | Memoria compartida propia o con iceoryx2 por debajo | Nivel 8 |
 | Formato de grabación: MCAP o propio sobre Arrow IPC | Nivel 9 |
 

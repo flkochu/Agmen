@@ -41,12 +41,16 @@ También instala el comando `agmen`, que levanta todo tu robot con un solo
 comando y abre un panel web para controlarlo:
 
 ```bash
-agmen run robot.toml     # todos los nodos + panel web (nodos, logs, gráficas, manejar)
+agmen run robot.toml     # todos los nodos + panel web (nodos, logs, gráficas, inspector, manejar)
+agmen run robot.toml --red   # el panel en tu red local (celular), con clave
 agmen web                # solo el panel: grafica cualquier mensaje que le llegue
 agmen echo 127.0.0.1:7400   # muestra cualquier mensaje en la terminal
 agmen topic list            # qué topics hay, de qué tipo, quién manda y quién escucha
 agmen topic echo /imu       # los mensajes de un topic, sin quitarle el puerto a nadie
 ```
+
+El panel también acepta a [Foxglove](https://foxglove.dev) (solo lectura):
+conéctate a `ws://127.0.0.1:8080/ws`.
 
 > ⚠ Versión 0.x: la API todavía va a cambiar entre versiones menores.
 

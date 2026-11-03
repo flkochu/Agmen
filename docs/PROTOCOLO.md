@@ -10,8 +10,9 @@ Este documento es **el contrato entre lenguajes**. Un nodo escrito en C++,
 Python, JavaScript o en un microcontrolador es compatible si escribe y lee
 exactamente estos bytes. Hay dos implementaciones de referencia, C++
 (`include/agmen/wire.hpp` + `src/wire.cpp`) y Python (`python/agmen/wire.py` +
-`python/agmen/schema.py`), y las dos se revisan contra los mismos
-**vectores de prueba**: [`tests/vectors/v1.txt`](../tests/vectors/v1.txt).
+`python/agmen/schema.py`), y una tercera que solo lee, en JavaScript
+(`python/agmen/panel/agmen.js`, la del panel web, desde 0.6.0). Las tres se
+revisan contra los mismos **vectores de prueba**: [`tests/vectors/v1.txt`](../tests/vectors/v1.txt).
 
 ## Reglas generales
 
