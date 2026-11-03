@@ -11,14 +11,14 @@ soltar, el modo autónomo retoma solo.
 ## 1. La idea: un nodo que decide quién pasa
 
 ```
-cerebro ──► :7511  (prioridad 1)  ┐
-                                  ├──► mux "ruedas" ──► motor :7500
-teleop  ──► :7510  (prioridad 10) ┘
+cerebro ──► /cmd/cerebro  (prioridad 1)  ┐
+                                         ├──► mux "ruedas" ──► /cmd ──► motor
+teleop  ──► /cmd/teleop   (prioridad 10) ┘
 ```
 
-El **mux** (multiplexor) recibe a cada fuente por su propio puerto y reenvía
-al motor solo los mensajes de la fuente con **prioridad más alta que esté
-hablando**. "Hablando" = mandó algo en los últimos `hold_ms`. Los mensajes
+El **mux** (multiplexor) escucha a cada fuente en su propio topic y pasa a
+`/cmd` (lo que escucha el motor) solo los mensajes de la fuente con
+**prioridad más alta que esté hablando**. "Hablando" = mandó algo en los últimos `hold_ms`. Los mensajes
 de las demás se descartan.
 
 Tres reglas de seguridad que vale la pena entender:
@@ -36,31 +36,35 @@ El [`robot.toml`](../../examples/tutorial/robot.toml) del tutorial ya lo trae:
 ```toml
 [[node]]
 name = "cerebro"
-cmd = "python cerebro.py --destino 127.0.0.1:7511"   # al mux, no al motor
+cmd = "python cerebro.py --destino /cmd/cerebro"   # a su entrada del mux, no al motor
 autostart = false
 
 [[mux]]
 name = "ruedas"
-output = "127.0.0.1:7500"        # el motor
+output = "/cmd"                  # lo que escucha el motor
 hold_ms = 300                    # 0.3 s sin mensajes = suelta el mando
 
 [[mux.input]]
 name = "teleop"
-listen = "127.0.0.1:7510"
+topic = "/cmd/teleop"
 priority = 10                    # más alto = manda más
 
 [[mux.input]]
 name = "cerebro"
-listen = "127.0.0.1:7511"
+topic = "/cmd/cerebro"
 priority = 1
 
 [web.teleop]
-target = "127.0.0.1:7510"        # el panel le habla a la entrada "teleop"
+target = "/cmd/teleop"           # el panel publica en la entrada "teleop"
 ```
 
 Lo único que cambió: **el cerebro y el panel ya no le hablan directo al
 motor**, sino a su entrada del mux. El motor no se enteró de nada: sigue
-escuchando en 7500 como siempre.
+escuchando `/cmd` como siempre.
+
+💡 El mux también funciona con direcciones fijas en vez de topics
+(`listen = "127.0.0.1:7510"`, `output = "127.0.0.1:7500"`), por ejemplo si
+un nodo no usa el hub.
 
 ## 3. Pruébalo
 
@@ -116,7 +120,7 @@ error en robot.toml: [[mux]] 'ruedas': dos entradas con priority = 10: así no s
 
 🧪 **Sin `agmen run`:** el mux también es un comando normal:
 ```bash
-agmen mux --out 127.0.0.1:7500 --in teleop=127.0.0.1:7510@10 --in cerebro=127.0.0.1:7511@1
+agmen mux --out /cmd --in teleop=/cmd/teleop@10 --in cerebro=/cmd/cerebro@1
 ```
 
 ## Lo que aprendiste

@@ -27,7 +27,7 @@ opcionales que se conectan al núcleo:
 | Paquete | Qué es | Cuándo |
 |---|---|---|
 | `agmen-core` | Núcleo en C++20: `#include <agmen/agmen.hpp>`, `namespace agmen::` | Desde ya |
-| `agmen` (comando) | `agmen run robot.toml` (todo el robot + panel), `agmen web`, `agmen mux`, `agmen echo`; luego `agmen topic echo /imu`, `agmen node list` | 0.2.0 (run, web); `mux` en 0.3.0; `echo` en 0.4.0; topics en 0.5.0 |
+| `agmen` (comando) | `agmen run robot.toml` (todo el robot + panel), `agmen web`, `agmen mux`, `agmen echo`, `agmen hub`, `agmen topic list/info/echo/hz`, `agmen node list` | 0.2.0 (run, web); `mux` en 0.3.0; `echo` en 0.4.0; hub y topics en 0.5.0 |
 | Panel web | Nodos, logs, sensores y manejo desde el navegador; el robot no dibuja (RFC 0002, 0003) | 0.2.0 (Python); versión C++/WebSocket en 0.6.0 |
 | `agmen` (Python, PyPI) | `pip install agmen` / `import agmen`. Hoy: referencia en Python puro; nivel 6: compilado desde C++ con nanobind | 0.1.0 |
 | `agmen-micro` | Cliente ligero para microcontroladores | Nivel 12 |
@@ -108,7 +108,7 @@ igual antes y después de la migración, sin tocarlos. Es la regla 3 en acción.
 - La prueba de interoperabilidad (C++ ↔ Python), ahora también con vectores de prueba byte por byte.
 - El hash del esquema con errores claros, los números de secuencia y el lazo por *deadline*.
 - El payload de `ImuSample`: el de v0 ya era layout `compact` válido y no cambió.
-- CI en Windows, Linux y macOS.
+- CI en Windows, Linux, macOS y Linux ARM64.
 
 ### Cambió en 0.4.0 (RFC 0001, nivel 1)
 - ✅ Header de 32 B → sobre de 64 B con `header_len`, `encoding`, `flags`, `topic_id`, `source_id`, `t_data`/`t_pub` y reloj.
@@ -121,7 +121,7 @@ igual antes y después de la migración, sin tocarlos. Es la regla 3 en acción.
 
 ### Se rehace
 - **Python**: de reimplementación en Python puro a paquete compilado desde el núcleo de C++ (nanobind). La versión pura se queda como referencia y para pruebas.
-- **Transporte**: UDP punto a punto era didáctico → pub/sub con topics; memoria compartida local; red después.
+- **Transporte**: ✅ de UDP punto a punto a pub/sub con topics (0.5.0, el hub es solo de control). Falta: memoria compartida local (nivel 8) y red entre máquinas (nivel 11).
 
 ## 6. dora-rs como referencia
 
@@ -163,7 +163,7 @@ iceoryx2).
 | ✅ (0.2.0) | **`agmen run robot.toml` + panel web de control** (adelanto de los niveles 3 y 10, RFC 0003) | h, i |
 | ✅ (0.3.0) | ¿Quién manda? Prioridad de comandos (`[[mux]]`), paralelismo medido (`scripts/paralelo_check.py`), CI en ARM64 | d, i |
 | **1 ✅** (0.4.0) | **Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica**: `Publisher`/`Subscriber`, anuncio de esquema, `agmen echo`, panel que grafica cualquier tipo, vectores de prueba compartidos C++/Python | c, f |
-| 2 (0.5.0) | Pub/sub local: topics, discovery, `agmen node list`, `agmen topic list/echo/hz`; el panel muestra cualquier topic | i |
+| **2 ✅** (0.5.0) | **Pub/sub local: topics con `agmen hub` (RFC 0004), `agmen node list`, `agmen topic list/info/echo/hz`, topics esperados en robot.toml; el panel muestra cualquier topic** | i |
 | 3 (0.6.0) | Panel en C++: puente WebSocket, inspector de mensajes, teleoperación a topics, modo red local | h |
 | 4 | Lenguaje de esquemas `.agmen` + generador de código C++/Python | b |
 | 5 | Executor y tiempo: nodos multi-frecuencia, colas por suscripción, reloj de Agmen (real/sim) | d, e |
@@ -183,8 +183,8 @@ iceoryx2).
 | ~~¿Aprobar el formato del RFC 0001?~~ | ✅ Aceptado el 2026-10-30 |
 | ¿Aprobar el diseño de la interfaz web (RFC 0002)? | **Ahora** |
 | ¿Aprobar el lanzador y el panel (RFC 0003)? | Ya implementado como prototipo; se puede ajustar |
-| Grafo estático declarado (como dora) o pub/sub dinámico (como ROS) | Nivel 2: propuesta en el [RFC 0004](rfc/0004-topics-y-descubrimiento.md) (dinámico) |
-| Daemon local obligatorio o sin daemon | Nivel 2: propuesta en el [RFC 0004](rfc/0004-topics-y-descubrimiento.md) (hub local de control, datos directos) |
+| ~~Grafo estático declarado (como dora) o pub/sub dinámico (como ROS)~~ | ✅ Dinámico + topics esperados en robot.toml ([RFC 0004](rfc/0004-topics-y-descubrimiento.md), 2026-11-02) |
+| ~~Daemon local obligatorio o sin daemon~~ | ✅ Hub local de control, datos directos ([RFC 0004](rfc/0004-topics-y-descubrimiento.md), 2026-11-02) |
 | Compatibilidad con el protocolo WebSocket de Foxglove | Nivel 3 |
 | Memoria compartida propia o con iceoryx2 por debajo | Nivel 8 |
 | Formato de grabación: MCAP o propio sobre Arrow IPC | Nivel 9 |

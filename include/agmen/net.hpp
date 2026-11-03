@@ -5,6 +5,7 @@
 // un solo #ifdef.
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -30,6 +31,21 @@ enum class SendStatus {
     NoListener,
 };
 
+/// Dirección IPv4 ya resuelta ("ip:puerto"), para mandar muchas veces sin
+/// resolverla de nuevo.
+class Address {
+public:
+    /// Acepta nombres ("localhost:7500"). Lanza NetError si no se puede resolver.
+    [[nodiscard]] static Address resolve(std::string_view address);
+
+    [[nodiscard]] std::string to_string() const;
+    friend bool operator==(const Address&, const Address&) = default;
+
+private:
+    friend class UdpSocket;
+    std::array<std::uint8_t, 16> raw_{};  // un sockaddr_in
+};
+
 /// Datagrama recibido.
 struct Received {
     std::size_t size = 0;
@@ -53,6 +69,15 @@ public:
 
     /// Envía un datagrama al destino fijado con connect().
     SendStatus send(std::span<const std::uint8_t> data);
+
+    /// Envía un datagrama a `to` (sin necesidad de connect()).
+    SendStatus send_to(std::span<const std::uint8_t> data, const Address& to);
+
+    /// false si el socket fue movido a otro objeto.
+    [[nodiscard]] bool valid() const { return handle_ != -1; }
+
+    /// Puerto local en el que quedó el socket (útil si se abrió con puerto 0).
+    [[nodiscard]] std::uint16_t local_port() const;
 
     /// Espera un datagrama hasta `timeout`. Devuelve std::nullopt si no llegó
     /// nada a tiempo.

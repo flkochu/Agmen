@@ -97,6 +97,21 @@ std::string to_string(const sockaddr_in& addr) {
 
 }  // namespace
 
+Address Address::resolve(std::string_view address) {
+    ensure_winsock();
+    const sockaddr_in addr = net::resolve(address);
+    static_assert(sizeof(sockaddr_in) == 16);
+    Address a;
+    std::memcpy(a.raw_.data(), &addr, sizeof addr);
+    return a;
+}
+
+std::string Address::to_string() const {
+    sockaddr_in addr{};
+    std::memcpy(&addr, raw_.data(), sizeof addr);
+    return net::to_string(addr);
+}
+
 NetError::NetError(int os_code, const std::string& what)
     : std::system_error(os_code, std::system_category(),
                         os_code != 0 ? what + " (" + os_message(os_code) + ")" : what) {}
@@ -168,6 +183,29 @@ SendStatus UdpSocket::send(std::span<const std::uint8_t> data) {
         throw NetError(code, "falló el envío UDP");
     }
     return SendStatus::Ok;
+}
+
+SendStatus UdpSocket::send_to(std::span<const std::uint8_t> data, const Address& to) {
+    sockaddr_in addr{};
+    std::memcpy(&addr, to.raw_.data(), sizeof addr);
+    const auto n = ::sendto(native(handle_), reinterpret_cast<const char*>(data.data()),
+                            static_cast<LenType>(data.size()), 0,
+                            reinterpret_cast<const sockaddr*>(&addr), sizeof addr);
+    if (n < 0) {
+        const int code = last_error();
+        if (is_no_listener(code) || is_would_block(code)) return SendStatus::NoListener;
+        throw NetError(code, "falló el envío UDP a " + to.to_string());
+    }
+    return SendStatus::Ok;
+}
+
+std::uint16_t UdpSocket::local_port() const {
+    sockaddr_in addr{};
+    socklen_t len = sizeof addr;
+    if (::getsockname(native(handle_), reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+        throw NetError(last_error(), "no se pudo leer el puerto local");
+    }
+    return ntohs(addr.sin_port);
 }
 
 std::optional<Received> UdpSocket::recv_from(std::span<std::uint8_t> buffer,

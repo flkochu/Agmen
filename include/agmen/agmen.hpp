@@ -7,6 +7,7 @@
 // drivers; eso vive en paquetes opcionales.
 #pragma once
 
+#include "agmen/hubproto.hpp"
 #include "agmen/net.hpp"
 #include "agmen/platform.hpp"
 #include "agmen/pubsub.hpp"

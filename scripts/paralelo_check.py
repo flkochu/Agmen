@@ -284,7 +284,7 @@ def prueba_apagado() -> None:
 
 def prueba_panel() -> None:
     lan = launcher([("atorado", [str(TMP / "atorado.py")])])
-    panel = Panel("127.0.0.1:8190", "127.0.0.1:7490", "prueba", lan, None)
+    panel = Panel("127.0.0.1:8190", "127.0.0.1:7490", "prueba", lan, None, topics=False)
     panel.start()
     lan.start_all()
     streams = []

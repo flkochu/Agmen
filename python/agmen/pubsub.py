@@ -1,29 +1,35 @@
 """agmen.Publisher y agmen.Subscriber: mandar y recibir un tipo de mensaje.
 
-    pub = agmen.Publisher(MotorCommand, "127.0.0.1:7500", topic="/cmd")
-    pub.publish(MotorCommand(0.5, 0.5))
+Por topic (desde Agmen 0.5, RFC 0004) — los nodos se encuentran solos con el
+`agmen hub` de la máquina (lo arranca `agmen run`):
 
+    pub = agmen.Publisher(MotorCommand, "/cmd")
+    sub = agmen.Subscriber(MotorCommand, "/cmd")      # cuantos quieras
+
+Por dirección fija (como en 0.4; sin hub, para microcontroladores y puentes):
+
+    pub = agmen.Publisher(MotorCommand, "127.0.0.1:7500")
     sub = agmen.Subscriber(MotorCommand, "127.0.0.1:7500")
+
     sample = sub.receive(timeout=0.05)    # None si no llegó nada
     if sample:
         print(sample.message, sample.envelope.seq)
 
-Se encargan de lo que antes se hacía a mano: número de secuencia, marcas de
-tiempo, `source_id` y los **anuncios de esquema** (RFC 0001, anexo A): el
-Publisher manda uno antes del primer dato y luego uno por segundo, para que
-el panel y `agmen echo` puedan leer cualquier mensaje. El Subscriber los usa
-para dar mejores errores y nunca te los entrega como datos.
-
-En el nivel 2 (Agmen 0.5) estas clases recibirán un topic en vez de una
-dirección; el resto de tu código no cambia.
+Se encargan de: número de secuencia, marcas de tiempo, `source_id`, anuncios
+de esquema (uno por segundo, y uno directo a cada receptor nuevo), y en modo
+topic, de registrarse con el hub y latir cada segundo.
 """
 
 from __future__ import annotations
 
+import os
 import socket
+import sys
+import threading
 import time
 from dataclasses import dataclass
 
+from . import hubproto as hp
 from . import wire
 
 ANNOUNCE_EVERY_S = 1.0
@@ -34,39 +40,190 @@ def _addr(text: str) -> tuple[str, int]:
     return host, int(port)
 
 
+def hub_address() -> str:
+    return os.environ.get("AGMEN_HUB", hp.DEFAULT_HUB)
+
+
+def node_name() -> str:
+    """Nombre del nodo: el de robot.toml (agmen run pone AGMEN_NODE) o el del script."""
+    name = os.environ.get("AGMEN_NODE")
+    if name:
+        return name
+    base = os.path.basename(sys.argv[0] or "") if sys.argv else ""
+    base = os.path.splitext(base)[0]
+    return base if base and base not in ("-", "-c", "__main__") else f"python-{os.getpid()}"
+
+
+class _HubLink:
+    """Registro y latido con el hub para un endpoint (un Publisher o Subscriber).
+
+    El latido sale de un hilo propio, para que un Publisher que publica poco
+    (el panel, que solo manda mientras manejas) no desaparezca de la lista.
+    Las respuestas del hub llegan al mismo socket que los datos y las procesa
+    quien lee el socket (publish() o receive())."""
+
+    def __init__(self, sock: socket.socket, beat: dict, on_warn=None, on_tick=None) -> None:
+        self.sock = sock
+        self._on_tick = on_tick
+        self.hub = _addr(hub_address())
+        self.beat_msg = hp.encode(**beat)
+        self.id = beat["id"]
+        self.last_reply: float | None = None
+        self.started = time.monotonic()
+        self.error: str | None = None
+        self._warned = False
+        self._on_warn = on_warn or (lambda t: print(f"[agmen] ⚠ {t}", file=sys.stderr, flush=True))
+        self._stop = threading.Event()
+        self.beat()
+        self._thread = threading.Thread(target=self._loop, name=f"agmen-latido-{self.id[:6]}", daemon=True)
+        self._thread.start()
+
+    def beat(self) -> None:
+        try:
+            self.sock.sendto(self.beat_msg, self.hub)
+        except OSError:
+            pass
+
+    def _loop(self) -> None:
+        while not self._stop.wait(hp.BEAT_S):
+            self.beat()
+            if self._on_tick is not None:
+                time.sleep(0.05)          # que llegue la respuesta a este latido
+                try:
+                    self._on_tick()       # un Publisher lee aquí sus respuestas aunque no publique
+                except OSError:
+                    pass
+            if self.last_reply is None and not self._warned and time.monotonic() - self.started > 2.0:
+                self._warned = True
+                self._on_warn(f"no hay un agmen hub en esta máquina ({hub_address()}): corre tu robot con "
+                              f"'agmen run' o abre 'agmen hub' en otra terminal. Sigo intentando cada segundo.")
+
+    def got_reply(self) -> None:
+        self.last_reply = time.monotonic()
+
+    def close(self) -> None:
+        self._stop.set()
+        try:
+            self.sock.sendto(hp.encode("bye", id=self.id), self.hub)
+        except OSError:
+            pass
+
+
 class Publisher:
     def __init__(self, msg_type, to: str, topic: str | None = None) -> None:
+        """`to` = topic ("/cmd") o dirección ("127.0.0.1:7500"). Con dirección,
+        `topic` es solo una etiqueta (default "/" + nombre del tipo)."""
         self.type = msg_type
         self.to = to
-        self.dest = _addr(to)
-        self.topic = topic if topic is not None else "/" + msg_type.NAME
         self.source_id = wire.new_source_id()
         self.seq = 0
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._announced_at: float | None = None
+        if hp.is_topic(to):
+            hp.check_topic(to)
+            self.topic = to
+            self.dests: list[tuple[str, int]] = []
+            self._sock.bind(("127.0.0.1", 0))   # local (nivel 2): Windows no pregunta por el firewall
+            self._sock.setblocking(False)
+            self._lock = threading.Lock()
+            self._link = None
+            self._link = _HubLink(self._sock, dict(
+                op="pub", id=f"{self.source_id:016x}", node=node_name(), pid=os.getpid(), topic=to,
+                schema=f"{msg_type.SCHEMA_ID:016x}", type=msg_type.NAME, text=msg_type.SCHEMA_TEXT),
+                on_tick=self._drain_locked)
+            # Espera breve a la primera respuesta del hub: si ya hay receptores,
+            # el primer mensaje no se pierde por no saber a quién mandarlo.
+            end = time.monotonic() + 0.1
+            while self._link.last_reply is None and time.monotonic() < end:
+                time.sleep(0.005)
+                self._drain()
+        else:
+            self.topic = topic if topic is not None else "/" + msg_type.NAME
+            self.dests = [_addr(to)]
+            self._link = None
 
-    def _send(self, data: bytes) -> bool:
+    # --- envío ---
+    def _send(self, data: bytes, dest) -> bool:
         try:
-            self._sock.sendto(data, self.dest)
+            self._sock.sendto(data, dest)
             return True
-        except ConnectionResetError:   # Windows: nadie escuchaba el envío anterior
+        except (ConnectionResetError, BlockingIOError):   # Windows: nadie escuchaba el envío anterior
+            return False
+        except OSError:
             return False
 
+    def _announcement(self) -> bytes:
+        return wire.encode_announcement(self.type.SCHEMA_TEXT, self.topic, source_id=self.source_id, seq=self.seq)
+
     def announce(self) -> None:
-        self._send(wire.encode_announcement(self.type.SCHEMA_TEXT, self.topic,
-                                            source_id=self.source_id, seq=self.seq))
+        ann = self._announcement()
+        for d in list(self.dests):
+            self._send(ann, d)
         self._announced_at = time.monotonic()
+
+    def _drain_locked(self) -> None:
+        with self._lock:
+            self._drain()
+
+    def _drain(self) -> None:
+        """Lee las respuestas del hub (a quién mandarle los datos)."""
+        if self._link is None:
+            return
+        while True:
+            try:
+                data, _ = self._sock.recvfrom(65536)
+            except (BlockingIOError, InterruptedError, socket.timeout):
+                return
+            except ConnectionResetError:
+                continue
+            if not hp.is_control(data):
+                continue
+            try:
+                msgs = hp.parse(data)
+            except hp.ProtocolError:
+                continue
+            for op, f in msgs:
+                if f.get("id") != self._link.id:
+                    continue
+                self._link.got_reply()
+                if op == "subs":
+                    new = [_addr(a) for a in f.get("to", "").split(",") if a]
+                    ann = self._announcement()
+                    for d in new:
+                        if d not in self.dests:   # recién llegado: que sepa el esquema desde ya
+                            self._send(ann, d)
+                    self.dests = new
+                    self._link.error = None
+                elif op == "error":
+                    self._link.error = f.get("msg", "error del hub")
 
     def publish(self, msg, t_data: int | None = None) -> bool:
         """Manda `msg`. t_data = instante al que corresponden los datos (default: ahora).
-        Devuelve False si el sistema avisó que nadie escucha (no es un error)."""
+        Devuelve False si no se pudo entregar a nadie (no es un error)."""
+        if self._link is not None:
+            with self._lock:
+                self._drain()
+                dests = list(self.dests)
+            if self._link.error:
+                raise wire.WireError(f"el hub rechazó publicar en '{self.topic}': {self._link.error}")
+        else:
+            dests = self.dests
         if self._announced_at is None or time.monotonic() - self._announced_at >= ANNOUNCE_EVERY_S:
             self.announce()
         data = wire.encode(msg, self.seq, t_data, topic=self.topic, source_id=self.source_id)
         self.seq += 1
-        return self._send(data)
+        ok = False
+        for d in dests:
+            ok = self._send(data, d) or ok
+        return ok
+
+    @property
+    def subscribers(self) -> int:
+        return len(self.dests)
 
     def close(self) -> None:
+        if self._link is not None:
+            self._link.close()
         self._sock.close()
 
 
@@ -77,18 +234,30 @@ class Sample:
     sender: str        # "ip:puerto" de quien lo mandó
 
 
-class Subscriber:
-    def __init__(self, msg_type, listen: str) -> None:
-        self.type = msg_type
-        self.listen = listen
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.bind(_addr(listen))
-        self.announced: dict[int, tuple[str, str]] = {}   # schema_id → (topic, esquema)
+class _Receiver:
+    """Lo común de Subscriber y RawSubscriber: un socket propio, y en modo
+    topic, el registro con el hub."""
 
-    def receive(self, timeout: float | None = None):
-        """Espera hasta `timeout` s un mensaje. Devuelve Sample, o None si no llegó.
-        Lanza wire.WireError si llega algo inválido o de otro tipo."""
-        deadline = None if timeout is None else time.monotonic() + timeout
+    def __init__(self, where: str, schema: str, type_name: str = "") -> None:
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.announced: dict[int, tuple[str, str]] = {}   # schema_id → (topic, esquema)
+        self._link = None
+        if hp.is_topic(where) or where == "*":
+            hp.check_topic(where, allow_wildcard=True)
+            self.topic = where
+            self._sock.bind(("127.0.0.1", 0))
+            port = self._sock.getsockname()[1]
+            self.listen = f"127.0.0.1:{port}"
+            self._link = _HubLink(self._sock, dict(
+                op="sub", id=f"{wire.new_source_id():016x}", node=node_name(), pid=os.getpid(),
+                topic=where, schema=schema, type=type_name, port=port))
+        else:
+            self.topic = ""
+            self.listen = where
+            self._sock.bind(_addr(where))
+
+    def _recv(self, deadline: float | None):
+        """Siguiente datagrama de DATOS (los de control se procesan aquí)."""
         while True:
             left = None if deadline is None else max(0.0, deadline - time.monotonic())
             self._sock.settimeout(left)
@@ -98,7 +267,40 @@ class Subscriber:
                 return None
             except ConnectionResetError:
                 continue
-            src = f"{sender[0]}:{sender[1]}"
+            if self._link is not None and hp.is_control(data):
+                try:
+                    for op, f in hp.parse(data):
+                        if f.get("id") == self._link.id:
+                            self._link.got_reply()
+                            self._link.error = f.get("msg", "error del hub") if op == "error" else None
+                except hp.ProtocolError:
+                    pass
+                if self._link.error:
+                    raise wire.WireError(f"el hub rechazó escuchar '{self.topic}': {self._link.error}")
+                continue
+            return data, f"{sender[0]}:{sender[1]}"
+
+    def close(self) -> None:
+        if self._link is not None:
+            self._link.close()
+        self._sock.close()
+
+
+class Subscriber(_Receiver):
+    def __init__(self, msg_type, where: str) -> None:
+        """`where` = topic ("/cmd") o dirección donde escuchar ("127.0.0.1:7500")."""
+        self.type = msg_type
+        super().__init__(where, f"{msg_type.SCHEMA_ID:016x}", msg_type.NAME)
+
+    def receive(self, timeout: float | None = None):
+        """Espera hasta `timeout` s un mensaje. Devuelve Sample, o None si no llegó.
+        Lanza wire.WireError si llega algo inválido o de otro tipo."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            got = self._recv(deadline)
+            if got is None:
+                return None
+            data, src = got
             env, payload = wire.parse(data)
             if env.encoding == wire.ENC_SCHEMA:
                 self.announced[env.schema_id] = wire.read_announcement(env, payload)
@@ -110,5 +312,105 @@ class Subscriber:
             _, msg = wire.decode(self.type, data)
             return Sample(env, msg, src)
 
+
+class RawSubscriber(_Receiver):
+    """Recibe paquetes de CUALQUIER tipo (para herramientas: echo, hz, panel, mux).
+
+    `where` = un topic, "*" (todos los topics) o una dirección."""
+
+    def __init__(self, where: str) -> None:
+        super().__init__(where, "*")
+
+    def receive_raw(self, timeout: float | None = None):
+        """(bytes, "ip:puerto") del siguiente paquete Agmen, o None."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        return self._recv(deadline)
+
+
+class RawPublisher:
+    """Reenvía paquetes ya armados a un topic (para el mux). Se registra con el
+    hub cuando conoce el esquema (por el primer anuncio que reenvía)."""
+
+    def __init__(self, topic: str) -> None:
+        hp.check_topic(topic)
+        self.topic = topic
+        self.topic_id = wire.topic_id(topic)
+        self.source_id = wire.new_source_id()
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.setblocking(False)
+        self.dests: list[tuple[str, int]] = []
+        self.schema_text: str | None = None
+        self._link: _HubLink | None = None
+        self._announced_at: float | None = None
+        self._lock = threading.Lock()
+
+    def _drain_locked(self) -> None:
+        with self._lock:
+            self._drain()
+
+    def set_schema(self, text: str, name: str, schema_id: int) -> None:
+        if self._link is not None:
+            return
+        self.schema_text = text
+        self._link = _HubLink(self._sock, dict(
+            op="pub", id=f"{self.source_id:016x}", node=node_name(), pid=os.getpid(), topic=self.topic,
+            schema=f"{schema_id:016x}", type=name, text=text), on_tick=self._drain_locked)
+
+    def _drain(self) -> None:
+        if self._link is None:
+            return
+        while True:
+            try:
+                data, _ = self._sock.recvfrom(65536)
+            except (BlockingIOError, InterruptedError, socket.timeout):
+                return
+            except ConnectionResetError:
+                continue
+            if not hp.is_control(data):
+                continue
+            try:
+                for op, f in hp.parse(data):
+                    if f.get("id") == self._link.id:
+                        self._link.got_reply()
+                        if op == "subs":
+                            new = [_addr(a) for a in f.get("to", "").split(",") if a]
+                            for d in new:
+                                if d not in self.dests and self.schema_text:
+                                    self._sendto(self._announcement(), d)
+                            self.dests = new
+                        elif op == "error":
+                            self._link.error = f.get("msg")
+            except hp.ProtocolError:
+                pass
+
+    def _announcement(self) -> bytes:
+        return wire.encode_announcement(self.schema_text, self.topic, source_id=self.source_id)
+
+    def _sendto(self, data: bytes, d) -> None:
+        try:
+            self._sock.sendto(data, d)
+        except OSError:
+            pass
+
+    def send(self, packet: bytes | bytearray) -> None:
+        """Manda un paquete de datos ya armado (topic_id y source_id se reescriben aquí)."""
+        with self._lock:
+            self._drain()
+            dests = list(self.dests)
+        now = time.monotonic()
+        if self.schema_text and (self._announced_at is None or now - self._announced_at >= ANNOUNCE_EVERY_S):
+            ann = self._announcement()
+            for d in dests:
+                self._sendto(ann, d)
+            self._announced_at = now
+        out = bytearray(packet)
+        out[16:24] = self.topic_id.to_bytes(8, "little")
+        out[wire.SOURCE_OFFSET:wire.SOURCE_OFFSET + 8] = self.source_id.to_bytes(8, "little")
+        for d in dests:
+            self._sendto(out, d)
+
     def close(self) -> None:
+        if self._link is not None:
+            self._link.close()
         self._sock.close()

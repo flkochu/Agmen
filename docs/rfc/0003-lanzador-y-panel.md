@@ -55,29 +55,41 @@ env = { NIVEL_LOG = "2" }                 # opcional
 
 [[mux]]                                   # opcional (0.3.0): ¿quién manda? Ver §4.2
 name = "ruedas"                           # aparece como un nodo más
-output = "127.0.0.1:7500"                 # a dónde reenviar (el motor)
+output = "/cmd"                           # a dónde reenviar: un topic (0.5.0) o "ip:puerto"
 hold_ms = 300                             # sin mensajes en 300 ms → la entrada suelta el mando
 
 [[mux.input]]                             # una por fuente; priority más alta = manda más
 name = "teleop"
-listen = "127.0.0.1:7510"
+topic = "/cmd/teleop"                     # un topic (0.5.0)… o listen = "127.0.0.1:7510"
 priority = 10
 
 [[mux.input]]
 name = "cerebro"
-listen = "127.0.0.1:7511"
+topic = "/cmd/cerebro"
 priority = 1
+
+[[topic]]                                 # opcional (0.5.0): los topics que esperas (RFC 0004 §4.1)
+name = "/imu"
+type = "ImuSample"                        # opcional: avisa si llega con otro tipo
+required = true                           # opcional: avisa si nadie lo publica
+
+[hub]
+enabled = true                            # false = no arrancar el agmen hub (sin topics)
 
 [web]
 enabled = true
 http = "127.0.0.1:8080"                   # "0.0.0.0:8080" = visible en tu red (celular)
-listen = "127.0.0.1:7400"                 # dónde recibe los mensajes que grafica
+listen = "127.0.0.1:7400"                 # además de todos los topics: para nodos sin hub
 open_browser = true
 
 [web.teleop]                              # opcional: manejar el robot desde el panel
-target = "127.0.0.1:7500"                 # nodo que recibe MotorCommand
+target = "/cmd/teleop"                    # topic o "ip:puerto" de quien recibe MotorCommand
 max_speed = 1.0                           # límite que el panel nunca excede
 ```
+
+Desde 0.5.0, `agmen run` agrega un nodo **`hub`** (el directorio de topics,
+RFC 0004) antes que los demás, o reutiliza uno que ya esté vivo en la
+máquina. Le pasa los `[[topic]]` para que avise de errores.
 
 **Reglas:**
 - Las rutas son relativas a `robot.toml` en todos los sistemas operativos.
@@ -192,10 +204,10 @@ siguen en C++ (o en el lenguaje que quieras).
 
 ## 8. Limitaciones del prototipo y siguientes pasos
 
-| Hoy (0.3.0) | Siguiente |
+| Hoy (0.5.0) | Siguiente |
 |---|---|
 | El mux está en Python (sobra para comandos de 20–100 Hz como los del tutorial; agrega un salto local de UDP) | Pasarlo al núcleo C++ si se usa en lazos de control más rápidos |
-| Grafica cualquier tipo (desde 0.4.0, por el anuncio de esquema), pero de un solo puerto y un emisor a la vez | Con pub/sub y topics (0.5.0) el panel ve **todos** los topics y eliges cuál graficar |
+| Grafica cualquier tipo (0.4.0) de todos los topics (0.5.0), uno a la vez | Varias gráficas de topics distintos al mismo tiempo; topics de otras máquinas (nivel 11) |
 | La teleoperación manda `MotorCommand` a un destino fijo | Publicar a un topic; cualquier tipo de comando con esquema |
 | Un solo robot y una sola máquina | Nodos en varias máquinas (`host = "raspberry"`); varios robots en un panel (modo nube, RFC 0002) |
 | Sin contraseña | Autenticación antes de permitir el acceso remoto |

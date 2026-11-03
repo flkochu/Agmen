@@ -14,7 +14,7 @@
 | **0.2.0** | — | `agmen run robot.toml` + panel web de control (RFC 0003) |
 | **0.3.0** | — | Prioridad de comandos (`agmen mux`), paralelismo medido, CI en ARM64 |
 | **0.4.0** | 1 | Sobre v1 + `compact` + esquema en texto (RFC 0001): `Publisher`/`Subscriber`, `agmen echo`, panel para cualquier tipo |
-| 0.5.0 | 2 | Pub/sub local, topics, `agmen topic list/echo/hz` |
+| **0.5.0** | 2 | Topics con `agmen hub` (RFC 0004), `agmen topic list/info/echo/hz`, `agmen node list` |
 | 0.6.0 | 3 | Panel en C++ (WebSocket): cualquier topic |
 | … | … | Un nivel por versión menor |
 | 1.0.0 | — | API estable: a partir de aquí romper la API exige subir MAYOR |

@@ -7,9 +7,48 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 
 ## [Sin publicar]
 
-### Planeado (nivel 2, versión 0.5.0)
-- Pub/sub local con topics y descubrimiento: varios receptores por topic,
-  `agmen topic list/echo/hz`.
+### Planeado (nivel 3, versión 0.6.0)
+- Panel en C++ con WebSocket: inspector de mensajes y teleoperación a topics.
+
+## [0.5.0] — 2026-11-03
+
+**Nivel 2: topics.** Los nodos se encuentran solos: `Publisher("/imu")`, sin
+IPs ni puertos, con cuantos receptores quieras (RFC 0004, aceptado).
+
+### Agregado
+- **`agmen hub`**: el directorio de topics de la máquina. Sabe quién publica
+  y quién escucha cada topic, pero **los datos van directo** de nodo a nodo:
+  si el hub se cae, siguen fluyendo, y al volver los latidos le reconstruyen
+  la tabla en ~1 s. Sin multicast. Protocolo de control `agmen-hub/1`, en
+  texto simple.
+- **Topics en `Publisher`/`Subscriber`** (C++ y Python): si el texto empieza
+  con `/`, es un topic; si no, una dirección (como en 0.4). Registro y
+  latido automáticos; el primer mensaje no se pierde; cada receptor nuevo
+  recibe el anuncio de esquema directo. En C++, sin hilos (`heartbeat()`
+  para ciclos lentos).
+- **Un topic, un tipo**: publicar otro tipo en un topic existente falla con
+  un error claro que dice qué choca con qué.
+- **`agmen topic list | info | echo | hz`** y **`agmen node list`**. `topic
+  echo` es un receptor más: no le quita el puerto a nadie.
+- **Topics esperados** en `robot.toml` (`[[topic]]` con `type` y `required`):
+  el hub avisa de errores de dedo ("¿Quisiste decir '/cmd'?"), de tipos
+  equivocados y de topics obligatorios sin emisor. Son avisos: el grafo
+  sigue siendo dinámico.
+- `agmen run` arranca el hub como el nodo `hub` (o reutiliza uno vivo);
+  `agmen web` abre uno dentro de su proceso si no hay. `[hub] enabled`.
+- El **panel** escucha todos los topics y deja elegir cuál graficar (por
+  defecto, el de más mensajes por segundo), con estadísticas por topic.
+- El **mux** acepta topics: entradas `topic = "/cmd/teleop"` y `output = "/cmd"`.
+- `tutorial_motor --escuchar /cmd`; el robot del tutorial usa topics.
+- `net::Address`, `UdpSocket::send_to()` y `local_port()` en C++.
+- Pruebas: `python/test_hub.py` (incluye reiniciar el hub sin cortar los
+  datos) y `scripts/topics_smoke.py` en el CI (C++ ↔ Python en el mismo
+  topic, choque de tipos, 1000 Hz a 1 y a 5 receptores sin pérdidas).
+- Tutorial: capítulo 9 (topics); capítulos 5, 6 y 8 actualizados.
+
+### Sin cambios
+- El formato de los datos (v1) es el mismo de 0.4.0: un nodo 0.4 en modo
+  dirección habla con uno 0.5.
 
 ## [0.4.0] — 2026-11-02
 

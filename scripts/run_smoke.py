@@ -68,11 +68,21 @@ def main():
                              text=True, encoding="utf-8", errors="replace", **kwargs)
     pids = []
     try:
-        check("un comando levanta imu, motor y el mux; cerebro espera (autostart = false)",
+        check("un comando levanta hub, imu, motor y el mux; cerebro espera (autostart = false)",
               wait_for(lambda: (s := get_state()) and node(s, "imu")["state"] == "corriendo"
                        and node(s, "motor")["state"] == "corriendo" and node(s, "ruedas")["state"] == "corriendo"
                        and node(s, "cerebro")["state"] == "detenido"))
         pids = [n["pid"] for n in get_state()["nodes"] if n["pid"]]
+        check("agmen run arrancó el hub", node(get_state(), "hub")["state"] == "corriendo")
+        listing = ""
+        for _ in range(10):   # hasta ~5 s: que todos se registren
+            listing = subprocess.run([sys.executable, "-m", "agmen", "topic", "list"], capture_output=True,
+                                     text=True, encoding="utf-8", errors="replace", env=env).stdout
+            if all(t in listing for t in ("/imu", "/cmd ", "/cmd/teleop", "/cmd/cerebro")):
+                break
+            time.sleep(0.5)
+        check("agmen topic list ve los topics del robot (sin IPs ni puertos)",
+              all(t in listing for t in ("/imu", "/cmd ", "/cmd/teleop", "/cmd/cerebro")), listing)
         check("el panel recibe el IMU a ~100 Hz", wait_for(lambda: get_state()["stats"]["rate_hz"] > 50))
 
         post("/api/node/cerebro/start")

@@ -77,6 +77,7 @@ public:
         BadPayloadSize,      ///< el payload no mide lo que el tipo requiere
         NotData,             ///< es un anuncio de esquema, no datos
         BadAnnouncement,     ///< anuncio de esquema mal formado
+        HubRejected,         ///< el hub rechazó el registro (ej. choque de tipos en un topic)
     };
 
     WireError(Kind kind, std::string message)

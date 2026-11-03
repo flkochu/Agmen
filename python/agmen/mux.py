@@ -39,7 +39,9 @@ import threading
 import time
 from dataclasses import dataclass
 
-from . import wire
+from . import hubproto as hp
+from . import schema, wire
+from .pubsub import RawPublisher, RawSubscriber
 
 
 @dataclass
@@ -50,16 +52,20 @@ class MuxInput:
 
 
 def parse_input(text: str) -> MuxInput:
-    """'teleop=127.0.0.1:7510@10' → MuxInput('teleop', '127.0.0.1:7510', 10)."""
+    """'teleop=/cmd/teleop@10' o 'teleop=127.0.0.1:7510@10' → MuxInput."""
     try:
         name, rest = text.split("=", 1)
         listen, prio = rest.rsplit("@", 1)
-        host, port = listen.rsplit(":", 1)
-        int(port)
-        return MuxInput(name.strip(), listen.strip(), int(prio))
+        listen = listen.strip()
+        if hp.is_topic(listen):
+            hp.check_topic(listen)
+        else:
+            host, port = listen.rsplit(":", 1)
+            int(port)
+        return MuxInput(name.strip(), listen, int(prio))
     except ValueError:
-        raise ValueError(f"entrada inválida '{text}': usa nombre=ip:puerto@prioridad, "
-                         f"ej. teleop=127.0.0.1:7510@10") from None
+        raise ValueError(f"entrada inválida '{text}': usa nombre=topic@prioridad o nombre=ip:puerto@prioridad, "
+                         f"ej. teleop=/cmd/teleop@10") from None
 
 
 def _addr(text: str) -> tuple[str, int]:
@@ -79,20 +85,21 @@ class Mux:
             raise ValueError("dos entradas del mux tienen la misma prioridad: así no se sabe quién manda")
         self.inputs = sorted(inputs, key=lambda i: -i.priority)   # la más importante primero
         self.output = output
-        self.dest = _addr(output)
         self.hold = hold_ms / 1000.0
         self.log = log
         self.sel = selectors.DefaultSelector()
-        self.socks: list[socket.socket] = []
+        self.rx: dict[str, RawSubscriber] = {}
         for inp in self.inputs:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
-                s.bind(_addr(inp.listen))
+                rx = RawSubscriber(inp.listen)    # un topic ("/cmd/teleop") o una dirección
             except OSError as e:
+                self.close()
                 raise OSError(f"no se pudo escuchar la entrada '{inp.name}' en {inp.listen}: {e}") from None
-            s.setblocking(False)
-            self.sel.register(s, selectors.EVENT_READ, inp)
-            self.socks.append(s)
+            self.sel.register(rx._sock, selectors.EVENT_READ, inp)
+            self.rx[inp.name] = rx
+        # Salida: a un topic (se registra en el hub al conocer el tipo) o a una dirección.
+        self.pub = RawPublisher(output) if hp.is_topic(output) else None
+        self.dest = None if self.pub else _addr(output)
         self.out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.source_id = wire.new_source_id()
         self.last_rx: dict[str, float] = {}
@@ -138,6 +145,9 @@ class Mux:
         struct.pack_into("<Q", out, wire.SOURCE_OFFSET, self.source_id)
         if seq is not None:
             struct.pack_into("<Q", out, wire.SEQ_OFFSET, seq)
+        if self.pub is not None:
+            self.pub.send(out)            # pone el topic de salida y su source_id
+            return
         try:
             self.out.sendto(out, self.dest)
         except ConnectionResetError:   # Windows: nadie escuchaba el envío anterior
@@ -164,7 +174,9 @@ class Mux:
         if text is not None:
             # No cuenta como hablar: un anuncio no le quita el mando a nadie.
             self.schema_text = text
-            if self._announced_at is None or now - self._announced_at >= 1.0:
+            if self.pub is not None:      # con topic, el RawPublisher anuncia por su cuenta
+                self.pub.set_schema(text, schema.parse(text).name, env.schema_id)
+            elif self._announced_at is None or now - self._announced_at >= 1.0:
                 self._forward(data, None)
                 self._announced_at = now
             return False
@@ -185,14 +197,18 @@ class Mux:
         while not stop.is_set():
             for key, _ in self.sel.select(timeout=0.05):
                 inp: MuxInput = key.data
-                while True:   # vaciar todo lo que haya llegado
+                rx = self.rx[inp.name]
+                while True:   # vaciar todo lo que haya llegado (el control del hub lo procesa rx)
                     try:
-                        data = key.fileobj.recv(65536)
-                    except (BlockingIOError, InterruptedError):
+                        got = rx.receive_raw(0)
+                    except wire.WireError as e:
+                        self._error(inp, str(e))
                         break
-                    except ConnectionResetError:   # Windows: ICMP de un envío anterior
-                        continue
-                    self.handle(inp, data, time.monotonic())
+                    if got is None:
+                        break
+                    self.handle(inp, got[0], time.monotonic())
+            if self.pub is not None:
+                self.pub._drain()                     # receptores nuevos de la salida
             self._update_active(time.monotonic())   # detecta cuando la fuente activa se calla
 
     def summary(self) -> str:
@@ -201,10 +217,16 @@ class Mux:
         return "resumen · " + " · ".join(parts)
 
     def close(self) -> None:
-        for s in self.socks:
-            self.sel.unregister(s)
-            s.close()
-        self.out.close()
+        for rx in getattr(self, "rx", {}).values():
+            try:
+                self.sel.unregister(rx._sock)
+            except (KeyError, ValueError):
+                pass
+            rx.close()
+        if getattr(self, "pub", None) is not None:
+            self.pub.close()
+        if hasattr(self, "out"):
+            self.out.close()
         self.sel.close()
 
 

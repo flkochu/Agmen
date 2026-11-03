@@ -125,10 +125,11 @@ abriste `echo`, no desde el primer mensaje):
 # 149 mensajes de Arca9Articulaciones /arca9/articulaciones (36.4/s)
 ```
 
-⚠ **Limitación del nivel 1:** los mensajes van a una dirección fija, así que
-`echo` necesita el puerto **para él solo**. Si el panel o un nodo ya escucha
-en `7400`, ciérralo o manda a otro puerto. Con topics (Agmen 0.5) podrás
-escuchar sin quitarle el puerto a nadie.
+⚠ Con una **dirección fija** (`127.0.0.1:7400`), `echo` necesita el puerto
+**para él solo**: si el panel o un nodo ya escucha ahí, ciérralo o manda a
+otro puerto. Con un **topic** no pasa: publica en
+`"/arca9/articulaciones"` y usa `agmen topic echo /arca9/articulaciones`,
+que es un receptor más ([capítulo 9](09-topics.md)).
 
 ## 4. Míralo en el panel
 
@@ -235,5 +236,4 @@ capítulo 1 sabe que es otra instancia, aunque `seq` vuelva a empezar en 0.
 
 ---
 
-🎉 **Terminaste el tutorial de Agmen 0.4.** Con la próxima versión llegan
-capítulos nuevos ([índice](README.md#próximamente)).
+➡ Siguiente: [Capítulo 9 — Topics: los nodos se encuentran solos](09-topics.md)

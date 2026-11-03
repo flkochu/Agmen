@@ -17,8 +17,10 @@ exactamente estos bytes. Hay dos implementaciones de referencia, C++
 
 - Todos los enteros y flotantes van en **little-endian**.
 - Los flotantes son IEEE-754 (`f32` = 4 bytes, `f64` = 8 bytes).
-- Transporte en el nivel 1: **un mensaje = un datagrama UDP**, a una dirección
-  fija (los topics con descubrimiento llegan en el nivel 2).
+- Transporte: **un mensaje = un datagrama UDP**. Desde Agmen 0.5 (nivel 2)
+  los emisores averiguan a quién mandar con el `agmen hub`
+  ([RFC 0004](rfc/0004-topics-y-descubrimiento.md), protocolo de control
+  `agmen-hub/1`); el formato de los datos no cambió.
 - Los hashes son **FNV-1a de 64 bits**: `h = 0xcbf29ce484222325`; por cada
   byte, `h ^= byte; h *= 0x100000001b3` (mod 2⁶⁴). `fnv1a64("") =
   0xcbf29ce484222325`, `fnv1a64("a") = 0xaf63dc4c8601ec8c`.

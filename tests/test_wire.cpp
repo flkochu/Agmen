@@ -5,6 +5,7 @@
 // byte contra tests/vectors/v1.txt, los MISMOS vectores que revisa Python.
 // Si alguna falla, rompiste la compatibilidad con Python u otros lenguajes.
 
+#include <agmen/hubproto.hpp>
 #include <agmen/wire.hpp>
 
 #include <cstdio>
@@ -282,6 +283,47 @@ void anuncio_alterado_se_rechaza() {
     expect_error([&] { (void)read_announcement(env, payload); }, WireError::Kind::BadAnnouncement);
 }
 
+// --- Protocolo del hub: los mismos casos que python/test_hub.py ---------------
+
+void hub_protocolo() {
+    using namespace agmen;
+    CHECK(hub::quote("a b=c%") == "a%20b%3Dc%25");
+    CHECK(hub::quote("/cmd,1.5:*-_") == "/cmd,1.5:*-_");
+    CHECK(hub::quote("ñ") == "%C3%B1");
+    const std::string text = "agmen/1 Pose{Vec3{f64 x;f64 y} p;f32[3] q}";
+    CHECK(hub::unquote(hub::quote(text)) == text);
+    const auto ln = hub::line("pub", {{"id", "ab"}, {"topic", "/imu"}, {"text", "X{f32 a}"}});
+    CHECK(ln == "agmen-hub/1 pub id=ab topic=/imu text=X%7Bf32%20a%7D");  // igual que Python
+    const auto parsed =
+        hub::parse(ByteView(reinterpret_cast<const std::uint8_t*>(ln.data()), ln.size()));
+    CHECK(parsed.size() == 1 && parsed[0].op == "pub" && parsed[0].get("text") == "X{f32 a}");
+    const std::string two = "agmen-hub/1 subs id=1 to=127.0.0.1:5,127.0.0.1:6\nagmen-hub/1 ok id=2";
+    const auto many =
+        hub::parse(ByteView(reinterpret_cast<const std::uint8_t*>(two.data()), two.size()));
+    CHECK(many.size() == 2 && many[0].get("to") == "127.0.0.1:5,127.0.0.1:6");
+    for (const char* ok : {"/imu", "/arca9/articulaciones", "/cmd/teleop", "/A_1"}) {
+        try {
+            hub::check_topic(ok);
+        } catch (const std::invalid_argument&) {
+            std::fprintf(stderr, "  FALLA: '%s' debería ser válido\n", ok);
+            ++g_failures;
+        }
+    }
+    for (const char* bad : {"imu", "/", "/imu/", "//imu", "/i mu", "/imu-1", ""}) {
+        bool threw = false;
+        try {
+            hub::check_topic(bad);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        if (!threw) {
+            std::fprintf(stderr, "  FALLA: '%s' debería ser inválido\n", bad);
+            ++g_failures;
+        }
+    }
+    CHECK(hub::is_topic("/imu") && !hub::is_topic("127.0.0.1:7500"));
+}
+
 void source_id_aleatorio() {
     CHECK(random_source_id() != 0);
     CHECK(random_source_id() != random_source_id());
@@ -300,6 +342,7 @@ int main() {
         {"sobre_mas_largo_se_salta", sobre_mas_largo_se_salta},
         {"anuncio_alterado_se_rechaza", anuncio_alterado_se_rechaza},
         {"source_id_aleatorio", source_id_aleatorio},
+        {"hub_protocolo", hub_protocolo},
     };
     for (const auto& [name, fn] : tests) {
         const int before = g_failures;

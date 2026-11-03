@@ -4,8 +4,9 @@
 // regla de seguridad más importante de un robot: si deja de recibir órdenes,
 // se detiene solo.
 //
-//   ./build/bin/tutorial_motor          # corre para siempre (Ctrl+C para salir)
-//   ./build/bin/tutorial_motor 5        # corre 5 segundos y muestra un resumen
+//   ./build/bin/tutorial_motor                   # para siempre (Ctrl+C para salir)
+//   ./build/bin/tutorial_motor 5                 # 5 segundos y muestra un resumen
+//   ./build/bin/tutorial_motor --escuchar /cmd   # por topic (capítulo 9)
 
 #include <agmen/agmen.hpp>
 
@@ -22,12 +23,21 @@ int main(int argc, char** argv) {
     namespace wire = agmen::wire;
     agmen::platform::init_console();
 
-    const double duration_s = argc > 1 ? std::atof(argv[1]) : 0.0;  // 0 = sin límite
+    double duration_s = 0.0;                // 0 = sin límite
+    std::string where = "127.0.0.1:7500";   // una dirección fija o un topic ("/cmd")
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--escuchar" && i + 1 < argc) {
+            where = argv[++i];
+        } else {
+            duration_s = std::atof(argv[i]);
+        }
+    }
     constexpr auto kSafetyTimeout = milliseconds(500);
 
-    agmen::Subscriber<MotorCommand> sub("127.0.0.1:7500");
-    std::printf("[motor] Agmen %s · esperando MotorCommand en 127.0.0.1:7500\n",
-                std::string(agmen::kVersion).c_str());
+    agmen::Subscriber<MotorCommand> sub(where);
+    std::printf("[motor] Agmen %s · esperando MotorCommand en %s\n",
+                std::string(agmen::kVersion).c_str(), where.c_str());
 
     MotorCommand current{};  // empieza detenido
     bool stopped = true;

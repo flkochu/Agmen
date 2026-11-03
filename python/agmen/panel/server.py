@@ -26,7 +26,7 @@ from urllib.parse import urlsplit
 
 from .. import schema, wire
 from .._version import __version__
-from ..pubsub import Publisher
+from ..pubsub import Publisher, RawSubscriber
 
 INDEX_HTML = (Path(__file__).resolve().parent / "index.html").read_bytes()
 
@@ -66,7 +66,7 @@ class SensorHub:
         self.next_idx = 0
         self.stats = {"rate_hz": 0.0, "lost": 0, "errors": 0, "last_error": "", "source": "",
                       "latency_ms": None, "type": "", "schema": "", "topic": "", "listening": "",
-                      "sources": []}
+                      "sources": [], "topics": {}}
 
     def push(self, item: dict) -> None:
         with self.lock:
@@ -101,59 +101,102 @@ class SchemaBook:
         self.topics[(source, env.topic_id)] = topic
 
 
-def udp_receiver(hub: SensorHub, listen: str, stop: threading.Event) -> None:
-    host, port = listen.rsplit(":", 1)
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((host, int(port)))
-    sock.settimeout(0.25)
-    hub.update(listening=listen)
+def udp_receiver(hub: SensorHub, listen: str | None, stop: threading.Event, topics: bool = True) -> None:
+    """Recibe para graficar: de su dirección fija (`listen`, para nodos sin hub
+    como un puente de microcontrolador) y de TODOS los topics, como un
+    receptor más registrado en el hub ("*")."""
+    import os
+    import selectors
+
+    os.environ.setdefault("AGMEN_NODE", "panel")
+    sel = selectors.DefaultSelector()
+    receivers: list[RawSubscriber] = []
+    if listen:
+        rx = RawSubscriber(listen)
+        receivers.append(rx)
+        sel.register(rx._sock, selectors.EVENT_READ, rx)
+    if topics:
+        rx = RawSubscriber("*")
+        receivers.append(rx)
+        sel.register(rx._sock, selectors.EVENT_READ, rx)
+    hub.update(listening=", ".join(filter(None, [listen, "todos los topics" if topics else None])))
     book = SchemaBook()
     expected: dict[tuple[str, int], int] = {}     # (emisor, source_id) → seq esperado
+    per_topic: dict[str, dict] = {}               # estadísticas por topic
     last_seen: dict[str, float] = {}
     window_start, window_rx = time.monotonic(), 0
     lost_total = errors_total = 0
 
-    while not stop.is_set():
+    def handle(data: bytes, source: str) -> None:
+        nonlocal window_rx, lost_total, errors_total
+        recv_ns = wire.now_ns()
         try:
-            data, sender = sock.recvfrom(65536)
-        except (socket.timeout, ConnectionResetError):
-            data = None
-        if data is not None:
-            recv_ns = wire.now_ns()
-            source = f"{sender[0]}:{sender[1]}"
-            try:
-                env, payload = wire.parse(data)
-                if env.encoding == wire.ENC_SCHEMA:
-                    book.learn(source, env, payload)
-                    continue
-                layout = book.layouts.get(env.schema_id)
-                if layout is None:
-                    raise wire.WireError(f"llega schema_id {env.schema_id:#018x} sin anuncio de esquema "
-                                         f"todavía (cada Publisher lo anuncia una vez por segundo)")
-                values = schema.flatten_numbers(layout.unpack_rows(payload)[-1])
-            except (wire.WireError, schema.SchemaError) as e:
-                errors_total += 1
-                hub.update(errors=errors_total, last_error=f"{e} (desde {source})")
-            else:
-                window_rx += 1
-                last_seen[source] = time.monotonic()
-                key = (source, env.source_id)
-                exp = expected.get(key)
-                if exp is not None and env.seq > exp:
-                    lost_total += env.seq - exp
-                if exp is None or env.seq >= exp:
-                    expected[key] = env.seq + 1
-                topic = book.topics.get((source, env.topic_id), "")
-                hub.push({"src": source, "seq": env.seq, "t": env.t_data / 1e9, "type": layout.name,
-                          "topic": topic, "v": {k: round(v, 5) for k, v in values.items()}})
-                hub.update(source=source, type=layout.name, schema=layout.text, topic=topic,
-                           lost=lost_total, latency_ms=round((recv_ns - env.t_pub) / 1e6, 3))
+            env, payload = wire.parse(data)
+            if env.encoding == wire.ENC_SCHEMA:
+                book.learn(source, env, payload)
+                return
+            layout = book.layouts.get(env.schema_id)
+            if layout is None:
+                raise wire.WireError(f"llega schema_id {env.schema_id:#018x} sin anuncio de esquema "
+                                     f"todavía (cada Publisher lo anuncia una vez por segundo)")
+            values = schema.flatten_numbers(layout.unpack_rows(payload)[-1])
+        except (wire.WireError, schema.SchemaError) as e:
+            errors_total += 1
+            hub.update(errors=errors_total, last_error=f"{e} (desde {source})")
+            return
         now = time.monotonic()
-        if now - window_start >= 1.0:
-            active = sorted(s for s, t in last_seen.items() if now - t < 2.0)
-            hub.update(rate_hz=round(window_rx / (now - window_start), 1), sources=active)
-            window_start, window_rx = now, 0
-    sock.close()
+        window_rx += 1
+        last_seen[source] = now
+        topic = book.topics.get((source, env.topic_id), "")
+        key = topic or source
+        st = per_topic.setdefault(key, {"count": 0, "rate_hz": 0.0, "lost": 0, "sources": {}})
+        st["count"] += 1
+        st["sources"][source] = now
+        exp = expected.get((source, env.source_id))
+        if exp is not None and env.seq > exp:
+            lost_total += env.seq - exp
+            st["lost"] += env.seq - exp
+        if exp is None or env.seq >= exp:
+            expected[(source, env.source_id)] = env.seq + 1
+        lat = round((recv_ns - env.t_pub) / 1e6, 3)
+        st.update(type=layout.name, schema=layout.text, source=source, topic=topic, latency_ms=lat)
+        hub.push({"src": source, "seq": env.seq, "t": env.t_data / 1e9, "type": layout.name,
+                  "topic": topic, "key": key, "v": {k: round(v, 5) for k, v in values.items()}})
+        hub.update(source=source, type=layout.name, schema=layout.text, topic=topic,
+                   lost=lost_total, latency_ms=lat)
+
+    try:
+        while not stop.is_set():
+            for k, _ in sel.select(timeout=0.25):
+                rx: RawSubscriber = k.data
+                while True:
+                    try:
+                        got = rx.receive_raw(0)
+                    except wire.WireError as e:
+                        errors_total += 1
+                        hub.update(errors=errors_total, last_error=str(e))
+                        break
+                    if got is None:
+                        break
+                    handle(*got)
+            now = time.monotonic()
+            if now - window_start >= 1.0:
+                dt = now - window_start
+                active = sorted(s for s, t in last_seen.items() if now - t < 2.0)
+                topics_out = {}
+                for key, st in per_topic.items():
+                    st["rate_hz"] = round(st.pop("count") / dt, 1)
+                    st["count"] = 0
+                    srcs = sorted(s for s, t in st["sources"].items() if now - t < 2.0)
+                    if srcs or st["rate_hz"]:
+                        topics_out[key] = {k2: v for k2, v in st.items() if k2 not in ("count", "sources")}
+                        topics_out[key]["sources"] = srcs
+                hub.update(rate_hz=round(window_rx / dt, 1), sources=active, topics=topics_out)
+                window_start, window_rx = now, 0
+    finally:
+        for rx in receivers:
+            rx.close()
+        sel.close()
 
 
 class Teleop:
@@ -162,6 +205,9 @@ class Teleop:
     seguridad del motor lo detiene."""
 
     def __init__(self, target: str, max_speed: float) -> None:
+        import os
+
+        os.environ.setdefault("AGMEN_NODE", "panel")   # así aparece en 'agmen node list'
         self.target = target
         self.max_speed = max(0.0, min(1.0, max_speed))
         self.pub = Publisher(MotorCommand, target, topic="/teleop")
@@ -188,9 +234,10 @@ class Teleop:
 
 class Panel:
     def __init__(self, http: str, listen: str | None, robot_name: str = "",
-                 launcher=None, teleop: Teleop | None = None) -> None:
+                 launcher=None, teleop: Teleop | None = None, topics: bool = True) -> None:
         self.http = http
         self.listen = listen
+        self.topics = topics
         self.robot_name = robot_name
         self.launcher = launcher
         self.teleop = teleop
@@ -211,8 +258,9 @@ class Panel:
         return f"http://{'127.0.0.1' if host in ('0.0.0.0', '') else host}:{port}"
 
     def start(self, open_browser: bool = False) -> None:
-        if self.listen:
-            threading.Thread(target=udp_receiver, args=(self.hub, self.listen, self.stop), daemon=True).start()
+        if self.listen or self.topics:
+            threading.Thread(target=udp_receiver, args=(self.hub, self.listen, self.stop, self.topics),
+                             daemon=True).start()
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         if open_browser:
             threading.Timer(0.8, webbrowser.open, args=(self.url,)).start()

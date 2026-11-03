@@ -13,6 +13,11 @@ como paquetes opcionales.
   mensajes, no en un lenguaje. Un mensaje se describe con **una línea**
   (`Arca9Articulaciones{f32[12] q}`) y cualquier herramienta lo entiende sin
   código extra: `agmen echo` lo muestra en la terminal y el panel lo grafica.
+- **Topics sin configurar nada:** `Publisher("/imu")` y `Subscriber("/imu")`,
+  sin IPs ni puertos, y con cuantos receptores quieras. Un pequeño `agmen hub`
+  por máquina hace de directorio, sin multicast (funciona en el WiFi de la
+  escuela) y sin que los datos pasen por él. `agmen topic list/info/echo/hz`
+  y `agmen node list` te dejan ver el robot por dentro.
 - **Un solo comando** levanta todo el robot (`agmen run robot.toml`) y un
   **panel web** lo controla: nodos, logs, sensores y manejo. El robot solo
   publica datos; el navegador (laptop o celular) hace todo el trabajo visual.
@@ -21,7 +26,7 @@ como paquetes opcionales.
   mandan al mismo motor, **un `[[mux]]` decide quién manda**: tú le ganas al
   modo autónomo y al soltar lo retoma solo.
 
-**Versión actual: 0.4.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
+**Versión actual: 0.5.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
 
 | Para… | Lee |
 |---|---|
@@ -29,7 +34,7 @@ como paquetes opcionales.
 | Entender el proyecto | [`docs/VISION.md`](docs/VISION.md): visión, decisión de C++, comparación con dora-rs, roadmap |
 | El formato de mensajes | [PROTOCOLO v1](docs/PROTOCOLO.md) (implementado) · [RFC 0001](docs/rfc/0001-formato-de-mensajes.md) (diseño y razones) · [vectores de prueba](tests/vectors/v1.txt) |
 | La interfaz web | [RFC 0002](docs/rfc/0002-interfaz-web.md) (propuesta) · [RFC 0003](docs/rfc/0003-lanzador-y-panel.md) (`agmen run` y panel, implementado) |
-| Lo que sigue: topics | [RFC 0004](docs/rfc/0004-topics-y-descubrimiento.md) (propuesta para 0.5.0) |
+| Topics y el hub | [RFC 0004](docs/rfc/0004-topics-y-descubrimiento.md) (aceptado, implementado en 0.5.0) |
 | Publicar versiones | [`docs/PUBLICAR.md`](docs/PUBLICAR.md) |
 
 ## Estado
@@ -39,8 +44,9 @@ como paquetes opcionales.
 | 0.1.0 ✅ | 0 | Fundamentos: serialización, UDP, seq, latencia, CI, tutorial |
 | 0.2.0 ✅ | — | `agmen run robot.toml` + panel web de control (nodos, logs, sensores, manejar) |
 | 0.3.0 ✅ | — | ¿Quién manda? Prioridad de comandos (teleop > autónomo) y paralelismo medido |
-| **0.4.0 ✅** | **1** | Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica |
-| … | 2–13 | Ver [`docs/VISION.md`](docs/VISION.md#7-roadmap-por-niveles) |
+| 0.4.0 ✅ | 1 | Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica |
+| **0.5.0 ✅** | **2** | **Topics: los nodos se encuentran solos (`agmen hub`), `agmen topic list/info/echo/hz`, `agmen node list`** |
+| … | 3–13 | Ver [`docs/VISION.md`](docs/VISION.md#7-roadmap-por-niveles) |
 
 ## Estructura
 
@@ -57,8 +63,10 @@ agmen/
 ├── python/agmen/            paquete de Python: import agmen + el comando `agmen`
 │   ├── run.py               agmen run: lanzador y supervisor de nodos
 │   ├── mux.py               agmen mux: prioridad de comandos (¿quién manda?)
+│   ├── hub.py · hubproto.py agmen hub: el directorio de topics (RFC 0004)
+│   ├── topic.py             agmen topic list/info/echo/hz, agmen node list
 │   └── panel/               panel web (servidor + página)
-├── scripts/                 interop, web, run, paralelo, tutorial y check_version (todos corren en el CI)
+├── scripts/                 interop, web, run, paralelo, topics, tutorial y check_version (todos corren en el CI)
 ├── bench/                   mediciones que respaldan decisiones de diseño
 ├── docs/                    tutorial/, VISION, PROTOCOLO, VERSIONES, PUBLICAR, rfc/
 └── .github/workflows/       ci.yml (4 sistemas, ARM incluido, + sanitizers) · release.yml (PyPI + GitHub Release)
@@ -170,10 +178,10 @@ target_link_libraries(mi_nodo PRIVATE agmen::core)
 ```cpp
 #include <agmen/agmen.hpp>
 
-agmen::Publisher<agmen::wire::ImuSample> pub("127.0.0.1:7400", "/imu");
+agmen::Publisher<agmen::wire::ImuSample> pub("/imu");     // un topic (o "127.0.0.1:7400")
 pub.publish(agmen::wire::ImuSample{.accel = {0, 0, 9.81f}});
 
-agmen::Subscriber<agmen::wire::ImuSample> sub("127.0.0.1:7400");
+agmen::Subscriber<agmen::wire::ImuSample> sub("/imu");
 if (auto s = sub.receive(std::chrono::milliseconds(50))) { /* s->message, s->envelope */ }
 ```
 

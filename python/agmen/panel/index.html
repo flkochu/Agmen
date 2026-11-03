@@ -84,6 +84,9 @@
   .legend b { font: 11px var(--mono); color: var(--muted); font-weight: 400; }
   .card.wide { grid-column: span 2; }
   .schema { font: 11px/1.4 var(--mono); color: var(--muted); word-break: break-all; }
+  .chips.topics { margin: 0; }
+  .chips.topics .chip { font: 12px var(--mono); }
+  .chips.topics .chip small { color: var(--muted); }
   .legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
   canvas { width: 100%; height: 190px; display: block; }
   .banner { display: none; border-radius: 10px; padding: 10px 12px; font: 12px/1.5 var(--mono); }
@@ -136,6 +139,7 @@
     </section>
     <div class="banner warn" id="warnbox"></div>
     <div class="banner error" id="errbox"></div>
+    <div class="chips topics" id="topicchips"></div>
     <div class="schema" id="schema"></div>
     <section class="charts" id="charts">
       <div class="panel"><h2>Datos</h2><div class="empty">Sin datos todavía. Las gráficas se arman solas con los campos del primer mensaje que llegue a este panel.</div></div>
@@ -324,19 +328,42 @@ document.addEventListener("visibilitychange", () => { if (document.hidden) allSt
 
 // ---------- sensores ----------
 const WINDOW_S = 10, buf = [], lastSeen = {};
-let followSrc = null, lastData = 0;
-function updateStats(s) {
+let followSrc = null, lastData = 0, selTopic = null, lastTopicsKey = "";
+function pickTopic(key) { selTopic = key; buf.length = 0; followSrc = null; groupsKey = ""; lastTopicsKey = ""; }
+function renderTopics(topics) {
+  const keys = Object.keys(topics).sort();
+  // Por defecto, el topic con más mensajes por segundo (normalmente un sensor).
+  if (keys.length && (selTopic === null || !(selTopic in topics)))
+    pickTopic(keys.reduce((a, b) => (topics[b].rate_hz > topics[a].rate_hz ? b : a)));
+  const k = JSON.stringify(keys.map((t) => [t, topics[t].rate_hz])) + selTopic;
+  if (k === lastTopicsKey) return;
+  lastTopicsKey = k;
+  const box = $("topicchips"); box.innerHTML = "";
+  if (keys.length < 2) return;   // con un solo topic no hace falta elegir
+  for (const t of keys) {
+    const b = document.createElement("button");
+    b.className = "chip" + (t === selTopic ? " on" : "");
+    b.innerHTML = `${t} <small>${topics[t].type} · ${topics[t].rate_hz.toFixed(0)} Hz</small>`;
+    b.onclick = () => pickTopic(t);
+    box.appendChild(b);
+  }
+}
+function updateStats(g) {
+  const topics = g.topics || {};
+  renderTopics(topics);
+  const s = topics[selTopic] || g;    // las tarjetas muestran el topic elegido
   $("rate").textContent = s.rate_hz ? s.rate_hz.toFixed(0) + " Hz" : "0 Hz";
   $("lat").textContent = s.latency_ms == null ? "—" : s.latency_ms.toFixed(2) + " ms";
-  $("lost").textContent = s.lost; $("errors").textContent = s.errors;
-  $("source").textContent = s.type ? `${s.topic || "(sin topic)"} · ${s.type} · ${s.source}` : `esperando en ${s.listening}`;
+  $("lost").textContent = s.lost; $("errors").textContent = g.errors;
+  $("source").textContent = s.type ? `${s.topic || "(sin topic)"} · ${s.type} · ${s.source}` : `esperando en ${g.listening}`;
   $("schema").textContent = s.schema || "";
   const many = (s.sources || []).length > 1;
   $("warnbox").style.display = many ? "block" : "none";
-  $("warnbox").textContent = many ? `⚠ ${s.sources.length} emisores mandan al mismo puerto (${s.sources.join(", ")}). ` +
+  $("warnbox").textContent = many ? `⚠ ${s.sources.length} emisores mandan a ${s.topic || "el mismo puerto"} (${s.sources.join(", ")}). ` +
     `Las gráficas muestran solo ${followSrc}. ¿Hay dos publishers corriendo?` : "";
-  $("errbox").style.display = s.last_error ? "block" : "none";
-  $("errbox").textContent = s.last_error ? "Último error: " + s.last_error : "";
+  const s_ = g;
+  $("errbox").style.display = s_.last_error ? "block" : "none";
+  $("errbox").textContent = s_.last_error ? "Último error: " + s_.last_error : "";
 }
 // Las gráficas se arman solas a partir de los campos del mensaje (formato v1:
 // el panel conoce el esquema de cada tipo por su anuncio). Se agrupan los
@@ -414,9 +441,11 @@ function draw(g) {
 function addSamples(samples) {
   if (!samples.length) return;
   const now = performance.now();
-  for (const s of samples) lastSeen[s.src] = now;
-  if (followSrc === null || now - (lastSeen[followSrc] || 0) > 500) { followSrc = samples[samples.length - 1].src; buf.length = 0; }
-  for (const s of samples) if (s.src === followSrc) {
+  const mine = samples.filter((s) => selTopic === null || (s.key || s.topic || s.src) === selTopic);
+  if (!mine.length) return;
+  for (const s of mine) lastSeen[s.src] = now;
+  if (followSrc === null || now - (lastSeen[followSrc] || 0) > 500) { followSrc = mine[mine.length - 1].src; buf.length = 0; }
+  for (const s of mine) if (s.src === followSrc) {
     if (buf.length && buf[buf.length - 1].type !== s.type) buf.length = 0;   // cambió el tipo
     buf.push(s);
   }

@@ -60,7 +60,7 @@ class NodeConfig:
 
 @dataclass
 class TeleopConfig:
-    target: str            # "ip:puerto" del nodo que recibe los comandos
+    target: str            # topic ("/cmd/teleop") o "ip:puerto" de quien recibe los comandos
     type: str = "MotorCommand"
     max_speed: float = 1.0
 
@@ -75,12 +75,24 @@ class WebConfig:
 
 
 @dataclass
+class TopicConfig:
+    """Un topic esperado ([[topic]] en robot.toml). El hub avisa si alguien usa
+    otro parecido ("¿Quisiste decir...?"), si llega con otro tipo, y si uno
+    obligatorio se queda sin nadie que lo publique."""
+    name: str
+    type: str = ""
+    required: bool = False
+
+
+@dataclass
 class RobotConfig:
     name: str
     base_dir: Path
     nodes: list[NodeConfig]
     web: WebConfig
     before: list[list[str]] = field(default_factory=list)
+    topics: list[TopicConfig] = field(default_factory=list)
+    hub: bool = True                    # ¿arrancar un agmen hub? ([hub] enabled)
 
 
 def _check_keys(table: dict, allowed: set[str], where: str) -> None:
@@ -114,7 +126,7 @@ def load_config(path: str | Path) -> RobotConfig:
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{path.name} no es TOML válido: {e}") from None
 
-    _check_keys(data, {"robot", "node", "mux", "web"}, path.name)
+    _check_keys(data, {"robot", "node", "mux", "topic", "hub", "web"}, path.name)
     robot = data.get("robot", {})
     _check_keys(robot, {"name", "before"}, "[robot]")
     base_dir = path.parent
@@ -180,7 +192,12 @@ def load_config(path: str | Path) -> RobotConfig:
         args = ["--out", str(raw["output"]), "--hold-ms", str(hold_ms)]
         names, prios, listens = set(), set(), {str(raw["output"])}
         for inp in inputs:
-            _check_keys(inp, {"name", "listen", "priority"}, f"{where} [[mux.input]]")
+            _check_keys(inp, {"name", "listen", "topic", "priority"}, f"{where} [[mux.input]]")
+            if ("listen" in inp) == ("topic" in inp):
+                raise ConfigError(f"{where}: cada entrada lleva 'topic' (ej. \"/cmd/teleop\") o 'listen' "
+                                  f"(una dirección, ej. \"127.0.0.1:7510\"), una de las dos")
+            if "topic" in inp:
+                inp = {**inp, "listen": inp["topic"]}
             for key in ("name", "listen", "priority"):
                 if key not in inp:
                     raise ConfigError(f"{where}: a una entrada le falta '{key}'")
@@ -207,6 +224,27 @@ def load_config(path: str | Path) -> RobotConfig:
         ))
     nodes = muxes + nodes   # los mux arrancan primero: ya escuchan cuando llegan comandos
 
+    # [[topic]]: los topics que esperas (RFC 0004, D3).
+    from . import hubproto as hp
+    raw_topics = data.get("topic", [])
+    if not isinstance(raw_topics, list):
+        raise ConfigError("'topic' se declara como [[topic]] (uno por topic)")
+    topics: list[TopicConfig] = []
+    for i, raw in enumerate(raw_topics, start=1):
+        where = f"[[topic]] #{i}"
+        _check_keys(raw, {"name", "type", "required"}, where)
+        if "name" not in raw:
+            raise ConfigError(f"{where}: falta 'name', ej. name = \"/imu\"")
+        try:
+            hp.check_topic(str(raw["name"]))
+        except hp.ProtocolError as e:
+            raise ConfigError(f"{where}: {e}") from None
+        if any(t.name == raw["name"] for t in topics):
+            raise ConfigError(f"el topic '{raw['name']}' está declarado dos veces")
+        topics.append(TopicConfig(raw["name"], str(raw.get("type", "")), bool(raw.get("required", False))))
+    hub_raw = data.get("hub", {})
+    _check_keys(hub_raw, {"enabled"}, "[hub]")
+
     web_raw = data.get("web", {})
     _check_keys(web_raw, {"enabled", "http", "listen", "open_browser", "teleop"}, "[web]")
     teleop = None
@@ -214,7 +252,7 @@ def load_config(path: str | Path) -> RobotConfig:
         t = web_raw["teleop"]
         _check_keys(t, {"target", "type", "max_speed"}, "[web.teleop]")
         if "target" not in t:
-            raise ConfigError("[web.teleop]: falta 'target', ej. target = \"127.0.0.1:7500\"")
+            raise ConfigError("[web.teleop]: falta 'target', ej. target = \"/cmd/teleop\"")
         if t.get("type", "MotorCommand") != "MotorCommand":
             raise ConfigError("[web.teleop]: por ahora el único tipo soportado es 'MotorCommand'")
         teleop = TeleopConfig(target=t["target"], max_speed=float(t.get("max_speed", 1.0)))
@@ -228,7 +266,35 @@ def load_config(path: str | Path) -> RobotConfig:
 
     before = [_parse_cmd(c, "[robot] before") for c in robot.get("before", [])]
     return RobotConfig(name=robot.get("name", path.stem), base_dir=base_dir,
-                       nodes=nodes, web=web, before=before)
+                       nodes=nodes, web=web, before=before, topics=topics,
+                       hub=bool(hub_raw.get("enabled", True)))
+
+
+def prepare_hub(config: RobotConfig, ping=None) -> tuple[RobotConfig, str]:
+    """Agrega el nodo 'hub' al robot, salvo que ya haya un agmen hub vivo en
+    esta máquina (entonces se reutiliza). Devuelve la config y qué se hizo."""
+    if not config.hub:
+        return config, "sin agmen hub ([hub] enabled = false): los topics no funcionarán"
+    if ping is None:
+        from .hub import ping
+    from .pubsub import hub_address
+    alive = ping(hub_address())
+    if alive is not None:
+        note = " (los [[topic]] de este robot.toml no se revisan)" if config.topics else ""
+        return config, f"usando el agmen hub {alive} que ya corre en {hub_address()}{note}"
+    args = ["-m", "agmen", "hub", "--listen", hub_address()]
+    for t in config.topics:
+        args += ["--expect", f"{t.name}={t.type}" if t.type else t.name]
+        if t.required:
+            args += ["--require", t.name]
+    hub_node = NodeConfig(name="hub", cmd=[sys.executable, *args], restart="always",
+                          env={"PYTHONPATH": os.pathsep.join(
+                              [str(Path(__file__).resolve().parent.parent),
+                               *filter(None, [os.environ.get("PYTHONPATH")])])})
+    if any(n.name == "hub" for n in config.nodes):
+        raise ConfigError("hay un nodo llamado 'hub': ese nombre lo usa Agmen para el directorio de topics")
+    from dataclasses import replace
+    return replace(config, nodes=[hub_node, *config.nodes]), f"agmen hub en {hub_address()}"
 
 
 # ---------------------------------------------------------------------------

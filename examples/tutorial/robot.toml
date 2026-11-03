@@ -4,6 +4,10 @@
 #
 # Las rutas son relativas a este archivo. "python" se reemplaza por el mismo
 # Python que corre agmen (funciona igual en Windows, Linux y macOS).
+#
+# Desde Agmen 0.5 los nodos se hablan por TOPICS ("/imu", "/cmd"): nadie
+# escribe IPs ni puertos. `agmen run` arranca solo el `agmen hub`, el
+# directorio donde cada nodo se anota (capítulo 9).
 
 [robot]
 name = "robot del tutorial"
@@ -12,41 +16,61 @@ before = ["cmake --build ../../build --config Release"]
 
 [[node]]
 name = "imu"                                   # el sensor del capítulo 1
-cmd = "../../build/bin/publisher --rate 100"   # manda ImuSample al panel (127.0.0.1:7400)
+cmd = "../../build/bin/publisher --rate 100 --to /imu"
 restart = "on-failure"                         # si se cae, se vuelve a levantar solo
 
 [[node]]
 name = "motor"                                 # el motor con freno de seguridad (capítulo 2)
-cmd = "../../build/bin/tutorial_motor"
+cmd = "../../build/bin/tutorial_motor --escuchar /cmd"
 restart = "on-failure"
 
 [[node]]
 name = "cerebro"                               # la "IA" en Python (capítulo 3)
-cmd = "python cerebro.py --destino 127.0.0.1:7511"   # le habla al mux, no directo al motor
+cmd = "python cerebro.py --destino /cmd/cerebro"   # le habla al mux, no directo al motor
 autostart = false                              # empieza apagado: lo prendes desde el panel
 
-# ¿Quién manda al motor? (capítulo 6). Cerebro y panel le hablan al mux, cada
-# uno por su puerto; el mux reenvía al motor solo al de prioridad más alta que
-# esté hablando. Si sueltas el teclado, en 0.3 s el mando regresa al cerebro.
+# ¿Quién manda al motor? (capítulo 6). Cerebro y panel publican cada uno en su
+# topic; el mux pasa a /cmd solo al de prioridad más alta que esté hablando.
+# Si sueltas el teclado, en 0.3 s el mando regresa al cerebro.
 [[mux]]
 name = "ruedas"
-output = "127.0.0.1:7500"                      # el motor
+output = "/cmd"                                # lo que escucha el motor
 hold_ms = 300
 
 [[mux.input]]
 name = "teleop"                                # tú, desde el panel: manda más
-listen = "127.0.0.1:7510"
+topic = "/cmd/teleop"
 priority = 10
 
 [[mux.input]]
 name = "cerebro"                               # el modo autónomo
-listen = "127.0.0.1:7511"
+topic = "/cmd/cerebro"
 priority = 1
+
+# Los topics que esperas (opcional). El hub te avisa si alguien publica uno
+# que no está aquí ("¿Quisiste decir '/imu'?"), si llega con otro tipo, o si
+# uno obligatorio se queda sin nadie que lo publique.
+[[topic]]
+name = "/imu"
+type = "ImuSample"
+required = true
+
+[[topic]]
+name = "/cmd"
+type = "MotorCommand"
+
+[[topic]]
+name = "/cmd/teleop"
+type = "MotorCommand"
+
+[[topic]]
+name = "/cmd/cerebro"
+type = "MotorCommand"
 
 [web]
 http = "127.0.0.1:8080"                        # usa "0.0.0.0:8080" para abrirlo desde el celular
-listen = "127.0.0.1:7400"                      # aquí llegan los datos que se grafican
+listen = "127.0.0.1:7400"                      # además de los topics: para nodos sin hub (ej. un ESP32)
 
 [web.teleop]
-target = "127.0.0.1:7510"                      # la entrada "teleop" del mux (que reenvía al motor)
+target = "/cmd/teleop"                         # tus teclas W A S D van a la entrada "teleop" del mux
 max_speed = 1.0

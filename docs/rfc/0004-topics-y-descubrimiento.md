@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Estado** | 📝 **Propuesta** (2026-11-02). Para revisar antes de implementar Agmen 0.5.0 |
+| **Estado** | ✅ **Aceptado** (2026-11-02) e **implementado en Agmen 0.5.0**. Decisiones en la [sección 4](#4-decisiones-aprobadas) |
 | **Depende de** | RFC 0001 (formato v1 y anuncio de esquema), RFC 0003 (`agmen run`) |
 | **Decide** | Las dos "decisiones pendientes" del nivel 2 en `docs/VISION.md`: ¿con daemon o sin daemon? ¿grafo estático o dinámico? |
 
@@ -173,17 +173,78 @@ peers = ["192.168.1.20"]      # la IP del hub de la otra máquina
 
 En el nivel 2 entra **lo local** (una máquina). Lo de varias máquinas se
 diseña aquí para no cerrarle la puerta, pero se implementa y se prueba en
-el nivel 11, junto con la sincronización de relojes.
+el nivel 11, junto con la sincronización de relojes. Hasta entonces, para
+mandar a otra máquina se usa el modo dirección (`"192.168.1.20:7500"`).
 
-## 4. Decisiones que necesito que apruebes
+## 4. Decisiones aprobadas
 
-| # | Pregunta | Opciones | Recomiendo | Por qué |
+Aprobadas por Adán el 2026-11-02: la opción recomendada en las cinco. En D3,
+además, se agregó **desde 0.5.0** la ventaja de la opción declarada: los
+topics esperados en `robot.toml` (sección 4.1).
+
+| # | Pregunta | Opciones | Elegida | Por qué |
 |---|---|---|---|---|
 | **D1** | ¿Con un coordinador o sin él? | (a) **Hub local por máquina**, (b) sin hub, con multicast como DDS, (c) un broker central por donde pasa todo | **(a)** | Funciona en cualquier red (regla 8), sin el salto extra del broker. Es el patrón de Zenoh y dora |
 | **D2** | ¿Los datos pasan por el hub? | (a) **No, directo de nodo a nodo**, (b) sí, el hub reenvía | **(a)** | Sin salto extra en el control, y si el hub se cae, los datos siguen |
-| **D3** | ¿Grafo dinámico o declarado? | (a) **Dinámico**: los nodos se registran solos, como en ROS, (b) declarado antes de arrancar, como el YAML de dora | **(a)** | Permite que `echo`, el panel o un nodo de prueba entren y salgan cuando quieras. Más adelante `robot.toml` podrá declarar los topics *esperados* para avisarte si falta uno, pero sin obligarte |
+| **D3** | ¿Grafo dinámico o declarado? | (a) **Dinámico**: los nodos se registran solos, como en ROS, (b) declarado antes de arrancar, como el YAML de dora | **(a) + topics esperados** | Permite que `echo`, el panel o un nodo de prueba entren y salgan cuando quieras. Y `robot.toml` puede declarar los topics *esperados* para avisarte de errores de dedo, tipos equivocados o topics sin emisor, sin obligarte (4.1) |
 | **D4** | ¿Quién arranca el hub? | (a) **`agmen run`, `agmen web` o `agmen hub` a mano**, (b) cada nodo lleva un hub adentro y el primero que arranca se queda con el puesto | **(a)** | Una sola implementación (en Python, como las otras herramientas). (b) evita el hub manual pero duplica la lógica en C++ y en Python, con elecciones y relevos. Si el hub manual resulta molesto, se cambia sin romper los nodos |
-| **D5** | ¿Qué se habla con el hub? | (a) **Texto simple, una línea por mensaje** (`agmen-hub/1 subscribe topic=/imu ...`), (b) JSON, (c) mensajes Agmen | **(a)** | Se lee con los ojos, se depura con cualquier herramienta y se parsea en C++ sin dependencias |
+| **D5** | ¿Qué se habla con el hub? | (a) **Texto simple, una línea por mensaje** (`agmen-hub/1 sub topic=/imu ...`), (b) JSON, (c) mensajes Agmen | **(a)** | Se lee con los ojos, se depura con cualquier herramienta y se parsea en C++ sin dependencias |
+
+### 4.1 Topics esperados en `robot.toml` (D3)
+
+```toml
+[[topic]]
+name = "/imu"
+type = "ImuSample"     # opcional: el tipo que debe tener
+required = true        # opcional: avisar si nadie lo publica
+```
+
+`agmen run` se los pasa al hub, y el hub avisa en los logs:
+
+| Situación | Aviso |
+|---|---|
+| Un nodo usa un topic que no está declarado | `⚠ 'cerebro' publica '/cmdd', que no está declarado en robot.toml. ¿Quisiste decir '/cmd'?` |
+| Llega con otro tipo | `⚠ '/cmd' debería ser MotorCommand (robot.toml) y 'x' usa ImuSample` |
+| Uno obligatorio se queda sin emisor (después de 5 s) | `⚠ nadie publica '/imu' y robot.toml dice que es obligatorio` |
+
+Son **avisos**, no bloqueos: el grafo sigue siendo dinámico (puedes conectar
+`agmen topic echo` o un nodo de prueba cuando quieras). Si no declaras
+ningún `[[topic]]`, el hub no revisa nada.
+
+### 4.2 El protocolo `agmen-hub/1`
+
+Un datagrama UDP = una línea de texto UTF-8:
+`agmen-hub/1 <op> clave=valor ...`. Los valores se escriben con `%XX` para
+cualquier byte que no sea letra, dígito o `_ . / : , * -`. La implementación de
+referencia es `python/agmen/hubproto.py`; C++ usa `agmen/hubproto.hpp`, y
+las dos pasan los mismos casos de prueba.
+
+| De → a | Operación | Campos | Para qué |
+|---|---|---|---|
+| nodo → hub | `pub` | `id node pid topic schema type text` | Registrar o latir un Publisher (cada 1 s) |
+| nodo → hub | `sub` | `id node pid topic schema type port` | Registrar o latir un Subscriber. `topic=*` = todos; `schema=*` = cualquier tipo |
+| nodo → hub | `bye` | `id` | El endpoint se va (cortesía: si no llega, expira a los 3 s) |
+| hub → Publisher | `subs` | `id topic to=ip:puerto,ip:puerto` | A quién mandarle los datos. Se repite en cada latido |
+| hub → Subscriber | `ok` | `id` | Latido recibido |
+| hub → nodo | `error` | `id msg` | Registro rechazado (nombre inválido, un topic con dos tipos) |
+| herramienta → hub | `query` / `ping` | — | Estado completo (`state`, varias líneas) / `pong version=...` |
+
+- El hub escucha en `127.0.0.1:7390` (o `$AGMEN_HUB`).
+- Los mensajes de control llegan al mismo socket que los datos. Se distinguen
+  por los primeros bytes: `agmen-hub/1` o `AGM`.
+- `id` = `source_id` del Publisher en hexadecimal (16 dígitos); un número
+  aleatorio para un Subscriber.
+- Un Publisher que recibe un receptor nuevo en `subs` le manda **directo** su
+  anuncio de esquema antes del siguiente dato.
+
+### 4.3 Lo que se implementó en 0.5.0
+
+| Parte | Dónde |
+|---|---|
+| Hub | `python/agmen/hub.py` (`agmen hub`); `agmen run` lo agrega como nodo `hub` (o reutiliza uno vivo) y `agmen web` lo abre dentro de su proceso si no hay |
+| Clientes | `agmen::Publisher/Subscriber` (C++, sin hilos: laten dentro de `publish()`/`receive()`, o con `heartbeat()`) y `agmen.Publisher/Subscriber` (Python, latido en un hilo) |
+| Herramientas | `agmen topic list/info/echo/hz`, `agmen node list`; el panel escucha `*` y deja elegir el topic; el mux acepta topics |
+| Pruebas | `python/test_hub.py` (incluye "el hub se reinicia y los datos no se detienen"), `scripts/topics_smoke.py` (C++ ↔ Python, choque de tipos, 1000 Hz a 1 y a 5 receptores sin pérdidas) |
 
 ## 5. Lo que NO entra en el nivel 2
 
@@ -210,7 +271,7 @@ el nivel 11, junto con la sincronización de relojes.
 | 7 | **WiFi con aislamiento de clientes** (varias máquinas) | Muchas redes escolares no dejan que dos laptops se hablen directo | Fuera del nivel 2. Para el nivel 11: un modo en el que el hub reenvía los datos (más lento, pero funciona) |
 | 8 | **¿Qué IP anunciar?** (varias máquinas) | Una laptop tiene WiFi, Ethernet y VPN | Fuera del nivel 2. En el nivel 11 el hub aprende la IP que ve el otro hub, en vez de adivinarla |
 
-## 7. Plan para Agmen 0.5.0
+## 7. Plan para Agmen 0.5.0 (hecho)
 
 1. Protocolo de control `agmen-hub/1` y el hub en Python (`agmen hub`), con
    pruebas: registro, latido, expiración, reinicio del hub y choque de tipos.

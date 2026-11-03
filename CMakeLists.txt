@@ -72,7 +72,8 @@ endfunction()
 add_library(agmen_core
     src/wire.cpp
     src/net.cpp
-    src/platform.cpp)
+    src/platform.cpp
+    src/hubproto.cpp)
 add_library(agmen::core ALIAS agmen_core)
 
 # agmen/version.hpp se genera desde VERSION.

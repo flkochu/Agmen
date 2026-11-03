@@ -19,29 +19,32 @@ before = ["cmake --build ../../build --config Release"]   # compila antes de arr
 
 [[node]]
 name = "imu"
-cmd = "../../build/bin/publisher --rate 100"
+cmd = "../../build/bin/publisher --rate 100 --to /imu"
 restart = "on-failure"           # si se cae, se vuelve a levantar solo
 
 [[node]]
 name = "motor"
-cmd = "../../build/bin/tutorial_motor"
+cmd = "../../build/bin/tutorial_motor --escuchar /cmd"
 restart = "on-failure"
 
 [[node]]
 name = "cerebro"
-cmd = "python cerebro.py"
+cmd = "python cerebro.py --destino /cmd/cerebro"
 autostart = false                # empieza apagado: lo prendes desde el panel
 
 [web]
 http = "127.0.0.1:8080"
 
 [web.teleop]
-target = "127.0.0.1:7500"        # a quién mandar los comandos de manejo (el motor)
+target = "/cmd/teleop"           # a dónde mandar los comandos de manejo
 ```
 
-💡 El `robot.toml` del repo trae además un bloque `[[mux]]` (por eso ahí el
-cerebro y el panel apuntan a los puertos 7511 y 7510). Es la prioridad de
-comandos del [capítulo 6](06-quien-manda.md); por ahora puedes ignorarlo.
+💡 `/imu`, `/cmd` y `/cmd/teleop` son **topics**: nombres de flujos de datos.
+Nadie escribe IPs ni puertos; los nodos se encuentran solos con el
+`agmen hub` que arranca `agmen run` ([capítulo 9](09-topics.md)). El
+`robot.toml` del repo trae además un `[[mux]]`, la prioridad de comandos del
+[capítulo 6](06-quien-manda.md), y una lista de `[[topic]]` esperados; por
+ahora puedes ignorarlos.
 
 - Cada `[[node]]` es un programa: C++, Python o lo que sea.
 - Las rutas son **relativas al archivo**, así que funciona desde cualquier carpeta.
@@ -64,15 +67,18 @@ agmen run examples/tutorial/robot.toml
 ```
 
 ```
-agmen   │ Agmen 0.4.0 · robot 'robot del tutorial' · 4 nodos
+agmen   │ Agmen 0.5.0 · robot 'robot del tutorial' · 5 nodos · agmen hub en 127.0.0.1:7390
 agmen   │ antes de arrancar: cmake --build ../../build --config Release
 agmen   │ panel web: http://127.0.0.1:8080
+hub     │ ▶ iniciado (pid 704)
 ruedas  │ ▶ iniciado (pid 706)
 imu     │ ▶ iniciado (pid 708)
 motor   │ ▶ iniciado (pid 710)
 agmen   │ 'cerebro' no arranca solo (autostart = false); inícialo desde el panel
 agmen   │ todo arrancado. Ctrl+C para detener todo.
-motor   │ [motor] Agmen 0.4.0 · esperando MotorCommand en 127.0.0.1:7500
+hub     │ [hub] ▶ 'imu' publica /imu (ImuSample)
+hub     │ [hub] ▶ 'motor' escucha /cmd (MotorCommand)
+motor   │ [motor] Agmen 0.5.0 · esperando MotorCommand en /cmd
 imu     │ [publisher] enviados=101 retrasos=0
 ```
 

@@ -4,6 +4,9 @@
     agmen web                  solo el panel web (sin administrar nodos)
     agmen mux --out ... --in   prioridad de comandos: ¿quién manda al motor?
     agmen echo IP:PUERTO       muestra cualquier mensaje que llegue (sin código del tipo)
+    agmen hub                  el directorio de topics (agmen run lo arranca solo)
+    agmen topic list|info|echo|hz      ver los topics por dentro
+    agmen node list            los nodos registrados
     agmen version              muestra la versión
 """
 
@@ -31,7 +34,7 @@ def _wait_for_ctrl_c(stop: threading.Event) -> None:
 
 def cmd_run(args) -> int:
     from .panel import Panel, Teleop
-    from .run import ConfigError, Launcher, load_config
+    from .run import ConfigError, Launcher, load_config, prepare_hub
 
     try:
         config = load_config(args.archivo)
@@ -39,8 +42,13 @@ def cmd_run(args) -> int:
         print(f"error en {args.archivo}: {e}", file=sys.stderr)
         return 2
 
+    try:
+        config, hub_note = prepare_hub(config)
+    except ConfigError as e:
+        print(f"error en {args.archivo}: {e}", file=sys.stderr)
+        return 2
     launcher = Launcher(config)
-    launcher.say(f"Agmen {__version__} · robot '{config.name}' · {len(config.nodes)} nodos")
+    launcher.say(f"Agmen {__version__} · robot '{config.name}' · {len(config.nodes)} nodos · {hub_note}")
     if not launcher.run_before():
         launcher.printer.close()
         return 1
@@ -73,6 +81,19 @@ def cmd_run(args) -> int:
 def cmd_web(args) -> int:
     from .panel import Panel, Teleop
 
+    # El panel escucha todos los topics: necesita un hub. Si no hay, abre uno aquí mismo.
+    from .hub import Hub, ping
+    from .pubsub import hub_address
+
+    hub_stop = threading.Event()
+    if ping(hub_address()) is None:
+        try:
+            own_hub = Hub(hub_address(), log=lambda t: print(f"[agmen web] hub: {t}", flush=True))
+        except OSError as e:
+            print(f"[agmen web] {e}", file=sys.stderr)
+        else:
+            threading.Thread(target=own_hub.serve, args=(hub_stop,), daemon=True).start()
+            print(f"[agmen web] agmen hub en {hub_address()} (dentro de este proceso)")
     teleop = Teleop(args.teleop, 1.0) if args.teleop else None
     try:
         panel = Panel(args.http, args.listen, "", None, teleop)
@@ -80,7 +101,7 @@ def cmd_web(args) -> int:
         print(f"no se pudo abrir el panel en {args.http}: {e}", file=sys.stderr)
         return 1
     panel.start(open_browser=not args.no_browser)
-    print(f"[agmen web] recibiendo Agmen en udp://{args.listen}")
+    print(f"[agmen web] recibiendo Agmen de todos los topics y de udp://{args.listen}")
     print(f"[agmen web] abre {panel.url} en tu navegador")
     if args.http.startswith("0.0.0.0"):
         print("[agmen web] también accesible desde otros equipos de tu red (sin contraseña)")
@@ -89,7 +110,14 @@ def cmd_web(args) -> int:
         _wait_for_ctrl_c(stop)
     finally:
         panel.shutdown()
+        hub_stop.set()
     return 0
+
+
+def cmd_hub(args) -> int:
+    from .hub import main as hub_main
+
+    return hub_main(args)
 
 
 def cmd_echo(args) -> int:
@@ -119,7 +147,8 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("web", help="solo el panel web (sin administrar nodos)")
     p.add_argument("--listen", default="127.0.0.1:7400", help="dónde recibir mensajes Agmen (UDP)")
     p.add_argument("--http", default="127.0.0.1:8080", help="dónde servir el panel")
-    p.add_argument("--teleop", metavar="IP:PUERTO", help="habilita manejar el robot: destino de MotorCommand")
+    p.add_argument("--teleop", metavar="TOPIC|IP:PUERTO",
+                   help="habilita manejar el robot: a dónde mandar MotorCommand (ej. /cmd/teleop)")
     p.add_argument("--no-browser", action="store_true", help="no abrir el navegador automáticamente")
     p.set_defaults(func=cmd_web)
 
@@ -141,6 +170,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--count", type=int, default=0, help="salir después de N mensajes")
     p.add_argument("--json", action="store_true", help="una línea JSON por mensaje (para scripts)")
     p.set_defaults(func=cmd_echo)
+
+    p = sub.add_parser("hub", help="el directorio de topics de esta máquina (agmen run lo arranca solo)")
+    p.add_argument("--listen", default="127.0.0.1:7390", help="dónde escuchar (default 127.0.0.1:7390)")
+    p.add_argument("--expect", action="append", metavar="TOPIC[=TIPO]",
+                   help="topic esperado (de robot.toml); avisa si alguien usa otro parecido o de otro tipo")
+    p.add_argument("--require", action="append", metavar="TOPIC",
+                   help="topic obligatorio: avisa si nadie lo publica")
+    p.set_defaults(func=cmd_hub)
+
+    from .topic import add_parsers as add_topic_parsers
+
+    add_topic_parsers(sub)
 
     p = sub.add_parser("version", help="muestra la versión")
     p.set_defaults(func=lambda a: print(f"agmen {__version__}") or 0)

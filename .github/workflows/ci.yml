@@ -55,6 +55,9 @@ jobs:
       - name: ¿Paralelo o en serie? (nodos, terminal, apagado y panel)
         run: python scripts/paralelo_check.py
 
+      - name: Topics y hub (C++ <-> Python, topic list/echo/hz, un topic un tipo)
+        run: python scripts/topics_smoke.py
+
       - name: Instalar el paquete y probar el comando agmen
         run: |
           python -m pip install .

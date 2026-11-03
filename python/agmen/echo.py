@@ -1,6 +1,8 @@
-"""agmen echo — muestra cualquier mensaje de Agmen que llegue a un puerto.
+"""agmen echo / agmen topic echo — muestra cualquier mensaje de Agmen.
 
-    agmen echo 127.0.0.1:7400
+    agmen topic echo /imu                      # un topic, como un receptor más (0.5+)
+    agmen topic echo '*'                       # todos los topics
+    agmen echo 127.0.0.1:7400                  # una dirección fija
     agmen echo 127.0.0.1:7400 --max-hz 0       # todos los mensajes
     agmen echo 127.0.0.1:7400 --json           # una línea JSON por mensaje
     agmen echo 0.0.0.0:7400 --schema "Mio{f32 x}"   # sin esperar el anuncio
@@ -9,22 +11,20 @@ A diferencia de `ros2 topic echo`, no hace falta tener instalado el código del
 mensaje: cada Publisher anuncia el texto de su esquema (RFC 0001, anexo A) y
 con eso se decodifica cualquier tipo.
 
-⚠ En el nivel 1 los mensajes van a una dirección fija: echo tiene que
-escuchar en el MISMO puerto al que manda el emisor (y ese puerto no puede
-estar ocupado por otro nodo). Con topics (Agmen 0.5) podrás escuchar sin
-quitarle el puerto a nadie.
+Con una dirección fija, echo necesita el puerto para él solo (y no puede
+estar ocupado por otro nodo). Con un topic no: es un receptor más.
 """
 
 from __future__ import annotations
 
 import json
-import socket
 import sys
 import threading
 import time
 from datetime import datetime
 
 from . import schema, wire
+from .pubsub import RawSubscriber
 
 
 def _fmt_value(v) -> str:
@@ -67,15 +67,12 @@ class Echo:
         self._warned: set = set()
         self._last_shown = 0.0
         self._started = time.monotonic()
-        host, port = listen.rsplit(":", 1)
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            self.sock.bind((host, int(port)))
+            self.rx = RawSubscriber(listen)
         except OSError as e:
-            raise OSError(f"no se pudo escuchar en {listen}: {e}. ¿Otro nodo ya usa ese puerto? En el "
-                          f"nivel 1, echo necesita el puerto para él solo (ej. detén el panel o el nodo que "
-                          f"lo usa, o haz que el emisor mande a otro puerto)") from None
-        self.sock.settimeout(0.25)
+            raise OSError(f"no se pudo escuchar en {listen}: {e}. ¿Otro nodo ya usa ese puerto? Con una "
+                          f"dirección fija, echo necesita el puerto para él solo. Si el emisor usa un topic, "
+                          f"mejor: agmen topic echo /el_topic") from None
 
     def _warn_once(self, key, text: str) -> None:
         if key not in self._warned:
@@ -125,13 +122,18 @@ class Echo:
     def run(self, stop: threading.Event, count: int = 0) -> None:
         if not self.as_json:
             limit = f", máx. {self.max_hz:g} por segundo (--max-hz 0 = todos)" if self.max_hz > 0 else ""
-            self.out(f"# agmen echo · escuchando {self.listen}{limit} · Ctrl+C para salir")
+            where = "todos los topics" if self.listen == "*" else self.listen
+            self.out(f"# agmen echo · escuchando {where}{limit} · Ctrl+C para salir")
         while not stop.is_set():
             try:
-                data, sender = self.sock.recvfrom(65536)
-            except (socket.timeout, ConnectionResetError):
+                got = self.rx.receive_raw(0.25)
+            except wire.WireError as e:
+                self.out(f"⚠ {e}")
+                return
+            if got is None:
                 continue
-            self.handle(data, f"{sender[0]}:{sender[1]}", wire.now_ns())
+            data, sender = got
+            self.handle(data, sender, wire.now_ns())
             if count and sum(self.counts.values()) >= count:
                 break
 
@@ -149,10 +151,12 @@ def main(args) -> int:
     from .cli import _wait_for_ctrl_c
 
     ensure_utf8_output()
+    import os
+    os.environ.setdefault("AGMEN_NODE", "agmen echo")
     try:
         echo = Echo(args.listen, args.schema or [], args.max_hz, args.json,
                     out=lambda s: print(s, flush=True))
-    except (OSError, schema.SchemaError) as e:
+    except (OSError, schema.SchemaError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
     stop = threading.Event()
@@ -166,6 +170,7 @@ def main(args) -> int:
         finally:
             stop.set()
             worker.join(1)
+    echo.rx.close()
     if not args.json:
         for line in echo.summary():
             print(line)
