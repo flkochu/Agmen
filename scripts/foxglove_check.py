@@ -69,7 +69,7 @@ def main() -> None:
     try:
         (work / "package.json").write_text('{"name":"agmen-foxglove-check","private":true}', encoding="utf-8")
         r = subprocess.run([npm, "install", "--silent", "--no-audit", "--no-fund", f"@foxglove/ws-protocol@{VERSION}", "ws@8"],
-                           cwd=work, capture_output=True, text=True, shell=sys.platform == "win32")
+                           cwd=work, capture_output=True, text=True, encoding="utf-8", errors="replace", shell=sys.platform == "win32")
         if r.returncode != 0:
             skip(f"no se pudo instalar @foxglove/ws-protocol (¿sin internet?): {r.stderr.strip()[:300]}")
         (work / "check.js").write_text(CLIENT, encoding="utf-8")
@@ -89,7 +89,7 @@ def main() -> None:
                                    env=ENV, stdout=subprocess.DEVNULL)
             time.sleep(1.5)
             r = subprocess.run([node, str(work / "check.js"), f"ws://{HTTP}/ws"], cwd=work,
-                               capture_output=True, text=True, timeout=30)
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
         finally:
             if pub and pub.poll() is None:
                 pub.kill()

@@ -61,6 +61,17 @@ class _HTTPServer(ThreadingHTTPServer):
 
     daemon_threads = True
 
+    def handle_error(self, request, client_address):
+        """Un navegador que cierra la conexión (recargar, cerrar la pestaña, un
+        cliente que se va mientras esperamos su siguiente petición) no es un
+        error del panel. En Windows llega como ConnectionAbortedError (10053) y
+        http.server imprimiría el traceback completo."""
+        import sys
+
+        if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
     def server_bind(self):
         import socketserver
 

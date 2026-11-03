@@ -33,7 +33,8 @@ from agmen import wire, ws  # noqa: E402
 EXE = ".exe" if sys.platform == "win32" else ""
 BIN = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "build" / "bin"
 HTTP = "127.0.0.1:8181"
-ENV = {**os.environ, "PYTHONPATH": str(ROOT / "python"), "AGMEN_HUB": "127.0.0.1:7391"}
+# PYTHONIOENCODING: en Windows, la salida de un proceso hijo a un pipe va en cp1252.
+ENV = {**os.environ, "PYTHONPATH": str(ROOT / "python"), "AGMEN_HUB": "127.0.0.1:7391", "PYTHONIOENCODING": "utf-8"}
 
 CUSTOM = """
 import math, time
@@ -158,7 +159,7 @@ def main() -> None:
         procs.append(pub)
         r = subprocess.run([sys.executable, str(ROOT / "examples" / "tutorial" / "mirar_panel.py"),
                             "--panel", f"ws://{HTTP}/ws", "--topic", "/imu", "--hz", "5", "--count", "3"],
-                           env=ENV, capture_output=True, text=True, encoding="utf-8", timeout=20)
+                           env=ENV, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
         check("tutorial cap. 10: mirar_panel.py decodifica lo que manda el puente",
               r.returncode == 0 and "anuncio: /imu es agmen/1 ImuSample" in r.stdout and r.stdout.count("seq ") == 3,
               r.stdout + r.stderr)

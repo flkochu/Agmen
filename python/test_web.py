@@ -221,6 +221,24 @@ class TestPuente(PanelCase):
         js = urllib.request.urlopen(f"http://{self.base}/agmen.js", timeout=5).read()
         self.assertIn(b"Decoder", js)
 
+    def test_navegador_que_corta_no_ensucia_la_terminal(self):
+        """Recargar la página o cerrar la pestaña corta la conexión de golpe (en
+        Windows: ConnectionAbortedError 10053). No es un error: no debe imprimir
+        un traceback."""
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for _ in range(3):
+                s = socket.create_connection(("127.0.0.1", self.panel.port))
+                s.sendall(b"GET /api/state HTTP/1.1\r\nHost: x\r\n\r\n")     # keep-alive
+                s.recv(65536)
+                time.sleep(0.05)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))   # cierre con RST
+                s.close()
+            time.sleep(0.5)
+        self.assertNotIn("Traceback", err.getvalue())
+
     def test_origin_ajeno_rechazado(self):
         with self.assertRaises(ws.WebSocketError):
             self.connect(headers={"Origin": "http://pagina-mala.com"})
