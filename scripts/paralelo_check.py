@@ -54,11 +54,12 @@ n = int(sys.argv[1]); x = 0
 for i in range(n):
     x = (x * 31 + i) % 1000003
 """,
-    # Un nodo de control a 50 Hz: anota su peor atraso y cuántos ciclos dio.
+    # Un nodo de control a 50 Hz: anota cuántos ciclos dio, cuántos llegaron
+    # tarde (> 20 ms, un periodo completo) y su peor atraso.
     "latido.py": """
 import sys, time
 dur, out = float(sys.argv[1]), sys.argv[2]
-period = 0.02; t0 = time.perf_counter(); nxt = t0; worst = 0.0; n = 0
+period = 0.02; t0 = time.perf_counter(); nxt = t0; worst = 0.0; n = 0; late = 0
 while time.perf_counter() - t0 < dur:
     nxt += period
     print("latido " + "x" * 1000, flush=True)   # 1 KB por ciclo: llena el pipe rápido
@@ -66,9 +67,11 @@ while time.perf_counter() - t0 < dur:
     now = time.perf_counter()
     if now > nxt:
         worst = max(worst, now - nxt)
+        if now - nxt > period:
+            late += 1
     else:
         time.sleep(nxt - now)
-open(out, "w").write(f"{n} {worst}")
+open(out, "w").write(f"{n} {worst} {late}")
 """,
     "ruidoso.py": """
 line = "ruido " + "y" * 200
@@ -148,9 +151,25 @@ def row(name, serial, measured, ok, note=""):
           flush=True)
 
 
-def read_latido(path: Path) -> tuple[int, float]:
-    n, worst = path.read_text().split()
-    return int(n), float(worst) * 1000
+def read_latido(path: Path) -> tuple[int, float, int]:
+    n, worst, late = path.read_text().split()
+    return int(n), float(worst) * 1000, int(late)
+
+
+def juzgar_latido(n: int, expected: int, worst: float, late: int) -> tuple[bool, str, str]:
+    """¿El nodo de control trabajó en paralelo con los demás?
+
+    En serie, el nodo espera a otro: pierde ciclos y llega tarde una y otra
+    vez (antes de la corrección de 0.3.0: 132/200 ciclos y 1.5 s de atraso).
+    Un pico aislado no es eso: en máquinas virtuales compartidas (como los
+    runners de macOS del CI) el sistema operativo a veces pausa un proceso
+    ~100 ms. Por eso se juzga por los ciclos y por cuántos llegaron tarde, y
+    al peor atraso solo se le pide estar lejos del segundo y medio de antes.
+    """
+    ok = n >= 0.95 * expected and late <= 0.05 * expected and worst < 500
+    measured = f"{n}/{expected} ciclos, {late} tarde (> 20 ms), peor atraso {worst:.1f} ms"
+    note = "" if late == 0 else "picos aislados del sistema operativo, no espera a otro nodo" if ok else ""
+    return ok, measured, note
 
 
 # --- 1. cálculo ------------------------------------------------------------
@@ -199,10 +218,10 @@ def prueba_bloqueo() -> None:
     lan.start_all()
     lan.nodes["latido"].proc.wait(30)
     lan.stop_all()
-    n, worst = read_latido(out)
-    ok = n >= 145 and worst < 50
+    n, worst, late = read_latido(out)
+    ok, measured, note = juzgar_latido(n, 150, worst, late)
     row("control a 50 Hz junto a un nodo atorado y otro al 100 % de CPU",
-        "no avanza (espera al atorado)", f"{n}/150 ciclos, peor atraso {worst:.1f} ms", ok)
+        "no avanza (espera al atorado)", measured, ok, note)
 
 
 # --- 3. terminal lenta ------------------------------------------------------
@@ -217,11 +236,11 @@ def prueba_terminal() -> None:
     lan.start_all()
     lan.nodes["latido"].proc.wait(60)
     lan.stop_all()
-    n, worst = read_latido(out)
-    ok = n >= 195 and worst < 100
+    n, worst, late = read_latido(out)
+    ok, measured, note = juzgar_latido(n, 200, worst, late)
     row("control a 50 Hz junto a un nodo que imprime sin parar (terminal lenta)",
-        "se atrasa al ritmo de la terminal", f"{n}/200 ciclos, peor atraso {worst:.1f} ms", ok,
-        f"la terminal mostró {term.lines} líneas; el panel guardó {lan.logs.next_idx}")
+        "se atrasa al ritmo de la terminal", measured, ok,
+        "; ".join(filter(None, [note, f"la terminal mostró {term.lines} líneas; el panel guardó {lan.logs.next_idx}"])))
 
 
 # --- 4. apagado -------------------------------------------------------------

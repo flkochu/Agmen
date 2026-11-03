@@ -37,12 +37,19 @@ python scripts/paralelo_check.py
 ```
 Agmen · prueba de paralelismo · 2 núcleos · Python 3.13.18 · linux
 
-OK    2 nodos de cálculo al 100 %: en serie 2.24 s, medido 1.19 s — ×1.9 más rápido que en serie (2 nodos, 2 núcleos)
-OK    control a 50 Hz junto a un nodo atorado y otro al 100 % de CPU: en serie no avanza (espera al atorado), medido 150/150 ciclos, peor atraso 6.7 ms
-OK    control a 50 Hz junto a un nodo que imprime sin parar (terminal lenta): en serie se atrasa al ritmo de la terminal, medido 200/200 ciclos, peor atraso 0.0 ms — la terminal mostró 234 líneas; el panel guardó 2211
+OK    2 nodos de cálculo al 100 %: en serie 2.34 s, medido 1.22 s — ×1.9 más rápido que en serie (2 nodos, 2 núcleos)
+OK    control a 50 Hz junto a un nodo atorado y otro al 100 % de CPU: en serie no avanza (espera al atorado), medido 150/150 ciclos, 0 tarde (> 20 ms), peor atraso 0.0 ms
+OK    control a 50 Hz junto a un nodo que imprime sin parar (terminal lenta): en serie se atrasa al ritmo de la terminal, medido 200/200 ciclos, 0 tarde (> 20 ms), peor atraso 0.0 ms — la terminal mostró 234 líneas; el panel guardó 2222
 OK    Ctrl+C con 4 nodos que tardan 1 s en cerrar: en serie 4.0 s, medido 1.02 s
 OK    panel con 3 navegadores conectados + consultas: en serie las consultas esperan a que cierre un navegador, medido peor respuesta 1 ms
 ```
+
+💡 **¿Y si sale un "peor atraso" de 100 ms?** Puede pasar en máquinas
+virtuales compartidas (como las del CI de GitHub en macOS): el sistema
+operativo pausa un proceso un instante. Eso no es trabajar en serie. En
+serie, el nodo pierde ciclos y llega tarde una y otra vez (en Agmen 0.2.0:
+132/200 ciclos, 33 tarde y 1.5 s de atraso). Por eso la prueba juzga por los
+ciclos y por cuántos llegaron tarde, no por un pico aislado.
 
 (Esto es en una máquina de 2 núcleos. Tus números cambian según tu
 procesador: con 4 núcleos, la primera prueba usa 4 nodos y la aceleración
@@ -51,7 +58,7 @@ se acerca a ×4.)
 | Prueba | Qué demuestra |
 |---|---|
 | Cálculo | Varios nodos usan varios núcleos: no se turnan un solo núcleo |
-| Nodo atorado | Un nodo que no responde no frena al de control |
+| Nodo atorado | Un nodo que no responde no frena al de control: no pierde ciclos ni llega tarde |
 | Terminal lenta | Un nodo que imprime mucho no frena a los demás (ver abajo) |
 | Apagado | Ctrl+C detiene a todos **a la vez**, no uno por uno |
 | Panel | Varios navegadores conectados no se hacen esperar entre sí |
