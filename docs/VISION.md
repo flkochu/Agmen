@@ -183,8 +183,8 @@ iceoryx2).
 | ~~¿Aprobar el formato del RFC 0001?~~ | ✅ Aceptado el 2026-10-30 |
 | ¿Aprobar el diseño de la interfaz web (RFC 0002)? | **Ahora** |
 | ¿Aprobar el lanzador y el panel (RFC 0003)? | Ya implementado como prototipo; se puede ajustar |
-| Grafo estático declarado (como dora) o pub/sub dinámico (como ROS) | Nivel 2 |
-| Daemon local obligatorio o sin daemon | Nivel 2 |
+| Grafo estático declarado (como dora) o pub/sub dinámico (como ROS) | Nivel 2: propuesta en el [RFC 0004](rfc/0004-topics-y-descubrimiento.md) (dinámico) |
+| Daemon local obligatorio o sin daemon | Nivel 2: propuesta en el [RFC 0004](rfc/0004-topics-y-descubrimiento.md) (hub local de control, datos directos) |
 | Compatibilidad con el protocolo WebSocket de Foxglove | Nivel 3 |
 | Memoria compartida propia o con iceoryx2 por debajo | Nivel 8 |
 | Formato de grabación: MCAP o propio sobre Arrow IPC | Nivel 9 |
