@@ -37,19 +37,21 @@ python scripts/paralelo_check.py
 ```
 Agmen · prueba de paralelismo · 2 núcleos · Python 3.13.18 · linux
 
-OK    2 nodos de cálculo al 100 %: en serie 2.34 s, medido 1.22 s — ×1.9 más rápido que en serie (2 nodos, 2 núcleos)
-OK    control a 50 Hz junto a un nodo atorado y otro al 100 % de CPU: en serie no avanza (espera al atorado), medido 150/150 ciclos, 0 tarde (> 20 ms), peor atraso 0.0 ms
-OK    control a 50 Hz junto a un nodo que imprime sin parar (terminal lenta): en serie se atrasa al ritmo de la terminal, medido 200/200 ciclos, 0 tarde (> 20 ms), peor atraso 0.0 ms — la terminal mostró 234 líneas; el panel guardó 2222
+OK    2 nodos de cálculo al 100 %: en serie 2.34 s, medido 1.27 s — ×1.8 más rápido que en serie (2 nodos, 2 núcleos)
+OK    control a 50 Hz junto a un nodo atorado y otro al 100 % de CPU: en serie no avanza (espera al atorado), medido 150/150 ciclos, peor atraso 0.0 ms, 0 ciclos tarde (> 20 ms) — referencia, el mismo nodo solo en esta máquina: peor atraso 0.0 ms, 0/150 tarde
+OK    control a 50 Hz junto a un nodo que imprime sin parar (terminal lenta): en serie se atrasa al ritmo de la terminal, medido 200/200 ciclos, peor atraso 0.0 ms, 0 ciclos tarde (> 20 ms) — referencia, el mismo nodo solo en esta máquina: peor atraso 0.0 ms, 0/150 tarde; la terminal mostró 235 líneas; el panel guardó 2222
 OK    Ctrl+C con 4 nodos que tardan 1 s en cerrar: en serie 4.0 s, medido 1.02 s
 OK    panel con 3 navegadores conectados + consultas: en serie las consultas esperan a que cierre un navegador, medido peor respuesta 1 ms
 ```
 
-💡 **¿Y si sale un "peor atraso" de 100 ms?** Puede pasar en máquinas
-virtuales compartidas (como las del CI de GitHub en macOS): el sistema
-operativo pausa un proceso un instante. Eso no es trabajar en serie. En
-serie, el nodo pierde ciclos y llega tarde una y otra vez (en Agmen 0.2.0:
-132/200 ciclos, 33 tarde y 1.5 s de atraso). Por eso la prueba juzga por los
-ciclos y por cuántos llegaron tarde, no por un pico aislado.
+💡 **¿Y si salen ciclos tarde?** En máquinas virtuales compartidas (como
+las del CI de GitHub en macOS), `sleep(20 ms)` a veces despierta 50 ms
+después. Eso no es trabajar en serie: el nodo recupera el ritmo en el
+siguiente ciclo y no pierde ninguno. En serie, el atraso **se acumula**: el
+nodo se queda esperando y pierde ciclos (en Agmen 0.2.0: 132/200 ciclos y
+1.5 s de atraso). Por eso la prueba pasa si el nodo da al menos el 95 % de
+sus ciclos y ningún atraso llega a 500 ms. Para que compares, también mide
+el mismo nodo **solo**, en tu misma máquina (la "referencia").
 
 (Esto es en una máquina de 2 núcleos. Tus números cambian según tu
 procesador: con 4 núcleos, la primera prueba usa 4 nodos y la aceleración

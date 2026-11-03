@@ -156,19 +156,38 @@ def read_latido(path: Path) -> tuple[int, float, int]:
     return int(n), float(worst) * 1000, int(late)
 
 
+BASE: dict[str, tuple[int, float, int]] = {}
+
+
+def latido_solo() -> tuple[int, float, int]:
+    """El mismo nodo de 50 Hz, SOLO, en esta misma máquina: la referencia.
+
+    Muestra cuánto se atrasa la máquina por sí sola (en las máquinas virtuales
+    del CI, `sleep(20 ms)` a veces despierta 50 ms después), para no culpar de
+    eso a los demás nodos."""
+    if "solo" not in BASE:
+        out = TMP / "latido-solo.txt"
+        lan = launcher([("latido", [str(TMP / "latido.py"), "3", str(out)])])
+        lan.start_all()
+        lan.nodes["latido"].proc.wait(30)
+        lan.stop_all()
+        BASE["solo"] = read_latido(out)
+    return BASE["solo"]
+
+
 def juzgar_latido(n: int, expected: int, worst: float, late: int) -> tuple[bool, str, str]:
     """¿El nodo de control trabajó en paralelo con los demás?
 
-    En serie, el nodo espera a otro: pierde ciclos y llega tarde una y otra
-    vez (antes de la corrección de 0.3.0: 132/200 ciclos y 1.5 s de atraso).
-    Un pico aislado no es eso: en máquinas virtuales compartidas (como los
-    runners de macOS del CI) el sistema operativo a veces pausa un proceso
-    ~100 ms. Por eso se juzga por los ciclos y por cuántos llegaron tarde, y
-    al peor atraso solo se le pide estar lejos del segundo y medio de antes.
+    En serie, el nodo ESPERA a otro y el atraso SE ACUMULA: pierde ciclos
+    (antes de la corrección de 0.3.0: 132/200 ciclos y 1.5 s de atraso; con un
+    nodo atorado, 0 ciclos). Un atraso que se recupera en el siguiente ciclo no
+    es eso: es la máquina (las virtuales del CI despiertan tarde de un sleep).
+    Por eso pasa si da >= 95 % de sus ciclos y ningún atraso llega a 500 ms.
     """
-    ok = n >= 0.95 * expected and late <= 0.05 * expected and worst < 500
-    measured = f"{n}/{expected} ciclos, {late} tarde (> 20 ms), peor atraso {worst:.1f} ms"
-    note = "" if late == 0 else "picos aislados del sistema operativo, no espera a otro nodo" if ok else ""
+    ok = n >= 0.95 * expected and worst < 500
+    measured = f"{n}/{expected} ciclos, peor atraso {worst:.1f} ms, {late} ciclos tarde (> 20 ms)"
+    n0, worst0, late0 = latido_solo()
+    note = f"referencia, el mismo nodo solo en esta máquina: peor atraso {worst0:.1f} ms, {late0}/{n0} tarde"
     return ok, measured, note
 
 
