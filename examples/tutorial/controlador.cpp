@@ -16,14 +16,14 @@
 
 int main(int argc, char** argv) {
     using namespace std::chrono;
-    namespace wire = agmen::wire;
     agmen::platform::init_console();
 
     const long count = argc > 1 ? std::atol(argv[1]) : 0;  // 0 = sin límite
     constexpr auto kPeriod = milliseconds(20);                // 50 Hz
 
-    auto socket = agmen::net::UdpSocket::bind("0.0.0.0:0");
-    socket.connect("127.0.0.1:7500");
+    // El Publisher lleva la cuenta de seq, las marcas de tiempo y anuncia el
+    // esquema, para que el panel y `agmen echo` entiendan el mensaje.
+    agmen::Publisher<MotorCommand> pub("127.0.0.1:7500", "/cmd");
     std::puts("[controlador] mandando MotorCommand a 127.0.0.1:7500 (50 Hz)");
 
     const auto start = steady_clock::now();
@@ -33,7 +33,7 @@ int main(int argc, char** argv) {
             .left = 0.5f + 0.3f * std::sin(t),
             .right = 0.5f - 0.3f * std::sin(t),
         };
-        (void)socket.send(wire::encode(cmd, static_cast<std::uint64_t>(seq), wire::now_ns()));
+        (void)pub.publish(cmd);
 
         if (seq % 50 == 0) {
             std::printf("[controlador] t=%4.1fs  izq=%+.2f der=%+.2f\n", t, cmd.left, cmd.right);

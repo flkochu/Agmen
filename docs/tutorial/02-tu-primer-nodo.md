@@ -61,13 +61,14 @@ struct MotorCommand {
 };
 
 static_assert(agmen::wire::Message<MotorCommand>);
+static_assert(agmen::wire::compact_size_v<MotorCommand> == 8);   // el esquema mide 8 bytes
 ```
 
 | Parte | Para qué |
 |---|---|
 | `kName` | Nombre legible del tipo (aparece en los errores) |
-| `kSchema` | La "receta" del mensaje. Agmen calcula su `type_id` **al compilar**. Si cambias un campo, cambia el `type_id` y los nodos con la versión vieja lo detectan |
-| `encode_payload` | Convierte tus datos a bytes (little-endian, el formato de Agmen) |
+| `kSchema` | La "receta" del mensaje. Agmen calcula su `schema_id` y su tamaño **al compilar**. Si cambias un campo, cambia el `schema_id` y los nodos con la versión vieja lo detectan. Si lo escribes mal (`float` en vez de `f32`, un `;` de más), **no compila** y el error te dice cómo se escribe |
+| `encode_payload` | Convierte tus datos a bytes (little-endian, el layout de un struct de C) |
 | `decode_payload` | Lo inverso; valida el tamaño |
 | `static_assert(...)` | El compilador revisa que tu struct cumpla todo lo que Agmen necesita. Si te falta algo, no compila (mejor eso que un error en el robot) |
 
@@ -79,11 +80,11 @@ esquema. Hacerlo a mano una vez te enseña qué pasa por dentro.
 Las partes clave de `motor.cpp`:
 
 ```cpp
-auto socket = agmen::net::UdpSocket::bind("127.0.0.1:7500");    // 1. escuchar
+agmen::Subscriber<MotorCommand> sub("127.0.0.1:7500");     // 1. escuchar
 
-if (const auto rx = socket.recv_from(buf, milliseconds(50))) {   // 2. esperar (máx 50 ms)
-    auto [header, cmd] = wire::decode<MotorCommand>(...);        // 3. decodificar y validar
-    cmd.left = std::clamp(cmd.left, -1.0f, 1.0f);                // 4. nunca confiar a ciegas
+if (auto sample = sub.receive(milliseconds(50))) {         // 2. esperar (máx 50 ms) y validar
+    MotorCommand cmd = sample->message;                    // 3. el mensaje ya decodificado
+    cmd.left = std::clamp(cmd.left, -1.0f, 1.0f);          // 4. nunca confiar a ciegas
     ...
 }
 
@@ -95,8 +96,9 @@ if (!stopped && steady_clock::now() - last_cmd > kSafetyTimeout) {  // 5. freno 
 1. **Escuchar** en un puerto.
 2. **Esperar** un mensaje, pero máximo 50 ms. Así el nodo nunca se congela y
    puede revisar el freno de seguridad aunque no llegue nada.
-3. **Decodificar.** Si llega basura o un mensaje de otro tipo, `decode` lanza
-   `WireError` con una explicación clara.
+3. **Decodificar.** `receive` ya lo hizo. Si llega basura o un mensaje de
+   otro tipo, lanza `WireError` con una explicación clara. En
+   `sample->envelope` tienes el sobre: `seq`, `t_data`, `t_pub`, `source_id`.
 4. **Recortar** los valores a un rango válido. Un bug en otro nodo no debe
    poder mandar tu motor al 300 %.
 5. **Freno de seguridad** (*deadman*): si pasan 0.5 s sin órdenes, alto
@@ -105,16 +107,21 @@ if (!stopped && steady_clock::now() - last_cmd > kSafetyTimeout) {  // 5. freno 
 ## 4. El nodo `controlador`
 
 ```cpp
-auto socket = agmen::net::UdpSocket::bind("0.0.0.0:0");   // puerto libre cualquiera
-socket.connect("127.0.0.1:7500");                          // destino: el motor
+agmen::Publisher<MotorCommand> pub("127.0.0.1:7500", "/cmd");   // destino y topic
 
 for (long seq = 0; ...; ++seq) {
     const MotorCommand cmd{.left = 0.5f + 0.3f * std::sin(t),
                            .right = 0.5f - 0.3f * std::sin(t)};
-    socket.send(wire::encode(cmd, seq, wire::now_ns()));
+    pub.publish(cmd);
     agmen::platform::sleep_until(start + kPeriod * (seq + 1));   // 50 Hz exactos
 }
 ```
+
+El `Publisher` lleva la cuenta de `seq`, pone las marcas de tiempo y una vez
+por segundo **anuncia** el esquema, para que el panel y `agmen echo` puedan
+mostrar tus comandos sin saber qué es un `MotorCommand`. Si los datos
+corresponden a otro instante (por ejemplo, cuándo leyó el sensor), pásalo:
+`pub.publish(cmd, t_lectura_ns)`.
 
 💡 **¿Por qué `sleep_until` y no `sleep(20 ms)`?** Si duermes 20 ms *después*
 de trabajar, el tiempo de trabajo se va sumando y terminas a 48 Hz en vez de

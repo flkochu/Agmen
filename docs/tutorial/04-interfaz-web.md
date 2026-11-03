@@ -1,6 +1,6 @@
 # Capítulo 4 — La interfaz web
 
-*Disponible desde Agmen 0.1.0 · actualizado para 0.2.0 · ⏱ 10 minutos*
+*Disponible desde Agmen 0.1.0 · actualizado para 0.4.0 · ⏱ 10 minutos*
 
 En ROS, la interfaz gráfica (RViz) es un programa pesado que normalmente
 corre en la misma computadora del robot. En Agmen, **el robot no dibuja
@@ -40,7 +40,8 @@ Se abre solo **http://127.0.0.1:8080**:
 | Frecuencia | Mensajes por segundo que están llegando |
 | Latencia | Cuánto tarda cada mensaje (válido si todo corre en la misma PC) |
 | Perdidos / Errores | Lo mismo que el subscriber del capítulo 1, pero visual |
-| Gráficas | Acelerómetro y giroscopio de los últimos 10 segundos (x rojo, y verde, z azul, como en robótica) |
+| Origen | Topic, tipo y quién manda (`/imu · ImuSample · 127.0.0.1:51234`), y abajo el esquema completo |
+| Gráficas | Los últimos 10 segundos de **cada campo** del mensaje, con su valor actual. El panel arma las gráficas solo, a partir del esquema: junta `ax ay az`, `gx gy gz`, los arreglos (`q[0…11]`) y los structs anidados |
 
 ## 2. Velo desde tu celular
 
@@ -61,7 +62,7 @@ con usuarios, cifrado y modo nube está diseñada en el
 ## 3. Experimentos
 
 🧪 **Detén el publisher.** El indicador de arriba a la derecha cambia a
-"sin datos del robot".
+"sin datos".
 
 🧪 **Detén el panel** (Ctrl+C en la terminal 1): la página dice "sin
 conexión con Agmen · reintentando…". Vuelve a correrlo: se reconecta solo.
@@ -71,15 +72,22 @@ La interfaz no mezcla sus datos: grafica uno solo y muestra un aviso
 amarillo, "⚠ 2 emisores mandan al mismo puerto". En un robot real eso suele
 ser un error de configuración, y Agmen no lo esconde.
 
-🧪 **Manda un mensaje equivocado.** Con todo corriendo, corre el cerebro del
-capítulo 3 apuntando al puente (cambia el puerto a 7400 en `cerebro.py`).
-La interfaz muestra el error **TIPO INCOMPATIBLE** en rojo: es el mismo
-mensaje claro que en la terminal.
+🧪 **Manda un tipo que el panel nunca ha visto.** Detén el publisher y corre
+el cerebro del capítulo 3 apuntando al panel:
+```bash
+python3 examples/tutorial/cerebro.py --destino 127.0.0.1:7400
+```
+Sin cambiar nada del panel, aparece una gráfica nueva con `left` y `right`
+del `MotorCommand`. Funciona porque el cerebro **anuncia** su esquema una vez
+por segundo (capítulo 8). Lo mismo pasará con los 12 ángulos de tu robot o
+con cualquier mensaje que inventes.
+
+![El panel grafica un tipo nuevo, sin código para él](../img/agmen-panel-tipo-nuevo.png)
 
 ## Limitaciones de esta versión
 
-- Solo grafica `ImuSample`. Desde **Agmen 0.4.0** los mensajes llevan su
-  esquema y el panel podrá mostrar **cualquier** tipo.
+- Grafica un emisor a la vez (si hay varios en el mismo puerto, sigue a uno
+  y te avisa). Con topics (Agmen 0.5) podrás elegir cuál ver.
 - Con `agmen web` el panel solo **muestra**. En el capítulo 5 lo usas con
   `agmen run` para además **controlar los nodos y manejar el robot**.
 

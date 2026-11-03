@@ -10,7 +10,9 @@ como paquetes opcionales.
 
 - Núcleo en **C++20**; corre en **Windows, Linux, macOS y Linux ARM64** como la Raspberry Pi (verificado por CI).
 - **Python de primera clase** y la compatibilidad vive en el formato de
-  mensajes, no en un lenguaje.
+  mensajes, no en un lenguaje. Un mensaje se describe con **una línea**
+  (`Arca9Articulaciones{f32[12] q}`) y cualquier herramienta lo entiende sin
+  código extra: `agmen echo` lo muestra en la terminal y el panel lo grafica.
 - **Un solo comando** levanta todo el robot (`agmen run robot.toml`) y un
   **panel web** lo controla: nodos, logs, sensores y manejo. El robot solo
   publica datos; el navegador (laptop o celular) hace todo el trabajo visual.
@@ -19,13 +21,13 @@ como paquetes opcionales.
   mandan al mismo motor, **un `[[mux]]` decide quién manda**: tú le ganas al
   modo autónomo y al soltar lo retoma solo.
 
-**Versión actual: 0.3.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
+**Versión actual: 0.4.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
 
 | Para… | Lee |
 |---|---|
 | **Empezar a usarlo** | 📘 [**Tutorial**](docs/tutorial/README.md): de la instalación a un robot completo con un solo comando y panel web |
 | Entender el proyecto | [`docs/VISION.md`](docs/VISION.md): visión, decisión de C++, comparación con dora-rs, roadmap |
-| El formato de mensajes | [RFC 0001](docs/rfc/0001-formato-de-mensajes.md) (v1, **aceptado**) · [PROTOCOLO v0](docs/PROTOCOLO.md) (implementado) |
+| El formato de mensajes | [PROTOCOLO v1](docs/PROTOCOLO.md) (implementado) · [RFC 0001](docs/rfc/0001-formato-de-mensajes.md) (diseño y razones) · [vectores de prueba](tests/vectors/v1.txt) |
 | La interfaz web | [RFC 0002](docs/rfc/0002-interfaz-web.md) (propuesta) · [RFC 0003](docs/rfc/0003-lanzador-y-panel.md) (`agmen run` y panel, implementado) |
 | Publicar versiones | [`docs/PUBLICAR.md`](docs/PUBLICAR.md) |
 
@@ -35,8 +37,8 @@ como paquetes opcionales.
 |---|---|---|
 | 0.1.0 ✅ | 0 | Fundamentos: serialización, UDP, seq, latencia, CI, tutorial |
 | 0.2.0 ✅ | — | `agmen run robot.toml` + panel web de control (nodos, logs, sensores, manejar) |
-| **0.3.0 ✅** | — | **¿Quién manda? Prioridad de comandos (teleop > autónomo) y paralelismo medido** |
-| 0.4.0 ⏭ | 1 | Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica |
+| 0.3.0 ✅ | — | ¿Quién manda? Prioridad de comandos (teleop > autónomo) y paralelismo medido |
+| **0.4.0 ✅** | **1** | Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica |
 | … | 2–13 | Ver [`docs/VISION.md`](docs/VISION.md#7-roadmap-por-niveles) |
 
 ## Estructura
@@ -145,7 +147,7 @@ los reinicia si fallan y abre el **panel web**:
 
 - **Nodos:** estado de cada uno, con botones ▶ iniciar, ■ detener y ↻ reiniciar.
 - **Manejar:** W A S D, flechas o botones táctiles. Al soltar, el robot frena.
-- **Sensores:** gráficas en vivo, Hz, latencia, pérdidas y errores.
+- **Datos:** gráficas en vivo de **cualquier** mensaje (se arman solas a partir de su esquema), Hz, latencia, pérdidas y errores.
 - **Logs:** todos los nodos en un lugar, con filtros.
 - **¿Quién manda?** Con `[[mux]]`, lo que mandas desde el panel le gana al
   cerebro autónomo ([capítulo 6](docs/tutorial/06-quien-manda.md)).
@@ -167,10 +169,17 @@ target_link_libraries(mi_nodo PRIVATE agmen::core)
 ```cpp
 #include <agmen/agmen.hpp>
 
-auto bytes = agmen::wire::encode(agmen::wire::ImuSample{...}, seq, agmen::wire::now_ns());
+agmen::Publisher<agmen::wire::ImuSample> pub("127.0.0.1:7400", "/imu");
+pub.publish(agmen::wire::ImuSample{.accel = {0, 0, 9.81f}});
+
+agmen::Subscriber<agmen::wire::ImuSample> sub("127.0.0.1:7400");
+if (auto s = sub.receive(std::chrono::milliseconds(50))) { /* s->message, s->envelope */ }
 ```
 
-## Qué aprendes en el Nivel 0
+Para tus propios tipos de mensaje, ve el
+[capítulo 8 del tutorial](docs/tutorial/08-mensajes-v1-y-echo.md).
+
+## Qué aprendes en los niveles 0 y 1
 
 | Concepto | Dónde verlo |
 |---|---|
@@ -181,11 +190,15 @@ auto bytes = agmen::wire::encode(agmen::wire::ImuSample{...}, seq, agmen::wire::
 | Por qué el sleep en Windows es impreciso y cómo arreglarlo | `src/platform.cpp` |
 | Lazo a frecuencia fija sin acumular error | `examples/nivel0/publisher.cpp` (programación por *deadline*) |
 | Detección de pérdidas con números de secuencia | `examples/nivel0/common.hpp` → `SeqTracker` |
+| Un parser que corre **al compilar** (valida el esquema y calcula su tamaño) | `agmen::wire::schema::check` en `include/agmen/wire.hpp` |
+| Layout de un struct de C: alineación y relleno | `python/agmen/schema.py` → `Layout` |
+| Decodificar cualquier tipo sin código compilado | `agmen echo` (`python/agmen/echo.py`) y el panel |
+| Dos implementaciones, los mismos bytes | `tests/vectors/v1.txt`, revisado por C++ y por Python |
 
 ## Ejercicios
 
-1. Dibuja a mano los 56 bytes de un `ImuSample` y compáralos con la prueba `layout_del_header_es_estable`.
-2. **Provoca un error de tipo:** agrega `;f32 temp` al `SCHEMA` en `python/agmen/wire.py`, corre `python/publisher.py` contra el subscriber de C++ y mira el error en la terminal **y en la interfaz web**.
+1. Dibuja a mano los 88 bytes de un `ImuSample` y compáralos con la prueba `layout_del_sobre_es_estable`.
+2. **Provoca un error de tipo:** agrega `;f32 temp` al `SCHEMA` de `ImuSample` en `python/agmen/wire.py`, corre `python/publisher.py` contra el subscriber de C++ y mira cómo el error te dice qué esquema llegó.
 3. **Satura el sistema:** sube `--rate` (1000, 10000, 50000) y observa la latencia, los `perdidos` y los `retrasos`.
 4. **Pruébalo en red:** subscriber o puente web en otra PC con `--listen 0.0.0.0:7400`, publisher con `--to IP:7400`.
 5. Corre `python3 bench/arrow_vs_compact.py` (`pip install pyarrow numpy`) y relaciónalo con la sección 2 del RFC 0001.

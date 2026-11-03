@@ -7,8 +7,61 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 
 ## [Sin publicar]
 
-### Planeado (nivel 1, versión 0.4.0)
-- Sobre v1 de 64 bytes + codificación `compact` + esquema en texto (RFC 0001).
+### Planeado (nivel 2, versión 0.5.0)
+- Pub/sub local con topics y descubrimiento: varios receptores por topic,
+  `agmen topic list/echo/hz`.
+
+## [0.4.0] — 2026-11-02
+
+**Nivel 1: el formato de mensajes v1** (RFC 0001). Un mensaje se describe
+con una línea de texto y cualquier herramienta lo entiende sin código extra.
+
+### ⚠ Rompe compatibilidad
+- El formato de cable pasa de v0 (cabecera de 32 bytes) a **v1 (sobre de 64
+  bytes)**. Los nodos de Agmen 0.1–0.3 y 0.4 no se entienden: un nodo 0.4
+  que recibe un mensaje v0 lo rechaza diciendo que el emisor se actualice.
+  Recompila tus nodos de C++ y actualiza el paquete de Python.
+- `type_id` → `schema_id` (= FNV-1a 64 de `"agmen/1 " + kSchema`); los
+  nombres viejos (`type_id_v`, `TYPE_ID`, `Header`) siguen como alias.
+  `Header.stamp_ns` → `Envelope.t_data` y `Envelope.t_pub`.
+
+### Agregado
+- **Sobre v1** en C++ y Python: `header_len` para crecer sin romper,
+  `encoding`, `flags`, `topic_id`, `source_id` aleatorio por instancia, dos
+  marcas de tiempo (`t_data`: cuándo pasó; `t_pub`: cuándo se publicó) y
+  `clock`. Validación completa del RFC 0001 §8 con errores claros.
+- **Esquemas en texto** (`agmen.schema`): forma canónica, `schema_id`,
+  layout `compact` como un struct de C (alineación y relleno en 0), arreglos
+  `T[N]`/`T[N][M]`, structs anidados, `time`/`duration`, N filas por mensaje.
+  Errores con sugerencia (`tipo 'float' no existe en Agmen: usa 'f32'`).
+- En **C++**, el esquema se valida **al compilar** (`AGMEN_CHECK_SCHEMA`,
+  `agmen::wire::schema::check`) y `compact_size_v<M>` da su tamaño. Si
+  `encode_payload` no produce lo que mide el esquema, se detecta.
+- En **Python**, basta con `SCHEMA` y los campos de un `@dataclass`:
+  `encode_payload`/`decode_payload` salen solos del esquema.
+- **`agmen::Publisher<M>` / `agmen::Subscriber<M>`** (C++) y
+  **`agmen.Publisher` / `agmen.Subscriber`** (Python): llevan `seq`, marcas de
+  tiempo, `source_id` y los anuncios de esquema por ti.
+- **Anuncio de esquema** (`encoding = 3`, RFC 0001 anexo A): cada emisor
+  manda el texto de su esquema antes del primer dato y una vez por segundo.
+  Gracias a eso, `TIPO INCOMPATIBLE` dice exactamente qué esquema llegó.
+- **`agmen echo IP:PUERTO`**: muestra cualquier mensaje en la terminal (estilo
+  YAML o `--json`), sin código para ese tipo.
+- **El panel grafica cualquier tipo**: arma solo una gráfica por grupo de
+  campos (`ax ay az`, `q[0…11]`, structs anidados) con el valor actual, y
+  muestra topic y esquema.
+- **Vectores de prueba compartidos** (`tests/vectors/v1.txt`): C++ y Python
+  comparan byte por byte en el CI (reto #3 del RFC 0001).
+- Prueba de sintaxis del JavaScript del panel (con Node).
+- Tutorial: capítulo 8 (tus propios mensajes y `agmen echo`); capítulos 1–5
+  actualizados al formato v1.
+
+### Cambiado
+- El mux usa el formato v1: a la salida pone su propio `source_id`, y los
+  anuncios de esquema no le quitan el mando a nadie.
+- El nodo `motor` del tutorial muestra cada error distinto una sola vez.
+- CMake se reconfigura solo cuando cambia `VERSION`.
+- `docs/PROTOCOLO.md` describe ahora el formato v1.
 
 ## [0.3.0] — 2026-11-02
 

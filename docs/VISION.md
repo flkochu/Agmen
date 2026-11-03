@@ -27,7 +27,7 @@ opcionales que se conectan al núcleo:
 | Paquete | Qué es | Cuándo |
 |---|---|---|
 | `agmen-core` | Núcleo en C++20: `#include <agmen/agmen.hpp>`, `namespace agmen::` | Desde ya |
-| `agmen` (comando) | `agmen run robot.toml` (todo el robot + panel), `agmen web`; luego `agmen topic echo /imu`, `agmen node list` | 0.2.0 (run, web); `mux` en 0.3.0; topics en 0.5.0 |
+| `agmen` (comando) | `agmen run robot.toml` (todo el robot + panel), `agmen web`, `agmen mux`, `agmen echo`; luego `agmen topic echo /imu`, `agmen node list` | 0.2.0 (run, web); `mux` en 0.3.0; `echo` en 0.4.0; topics en 0.5.0 |
 | Panel web | Nodos, logs, sensores y manejo desde el navegador; el robot no dibuja (RFC 0002, 0003) | 0.2.0 (Python); versión C++/WebSocket en 0.6.0 |
 | `agmen` (Python, PyPI) | `pip install agmen` / `import agmen`. Hoy: referencia en Python puro; nivel 6: compilado desde C++ con nanobind | 0.1.0 |
 | `agmen-micro` | Cliente ligero para microcontroladores | Nivel 12 |
@@ -105,15 +105,19 @@ igual antes y después de la migración, sin tocarlos. Es la regla 3 en acción.
 ## 5. Estado contra la visión
 
 ### Se queda igual
-- El formato v0 y su prueba de interoperabilidad (C++ ↔ Python).
+- La prueba de interoperabilidad (C++ ↔ Python), ahora también con vectores de prueba byte por byte.
 - El hash del esquema con errores claros, los números de secuencia y el lazo por *deadline*.
-- El payload de `ImuSample`, que ya es layout `compact` válido (RFC 0001).
+- El payload de `ImuSample`: el de v0 ya era layout `compact` válido y no cambió.
 - CI en Windows, Linux y macOS.
 
-### Cambia (RFC 0001, nivel 1)
-- Header de 32 B → sobre de 64 B con `header_len`, `encoding`, `flags`, `topic_id`, `source_id`, `t_data`/`t_pub` y reloj.
-- Payload a mano → `compact` (struct de C) + `arrow` (datos variables y grandes).
-- Mensajes a mano → generados desde un esquema (nivel 4).
+### Cambió en 0.4.0 (RFC 0001, nivel 1)
+- ✅ Header de 32 B → sobre de 64 B con `header_len`, `encoding`, `flags`, `topic_id`, `source_id`, `t_data`/`t_pub` y reloj.
+- ✅ Payload `compact` (struct de C) definido por un esquema en texto; en Python el layout sale solo del esquema.
+- ✅ Decodificación dinámica: `agmen echo` y el panel leen cualquier tipo gracias al anuncio de esquema.
+
+### Falta (siguientes niveles)
+- Payload `arrow` para datos variables y grandes (nivel 7).
+- Mensajes de C++ generados desde el esquema en vez de escritos a mano (nivel 4).
 
 ### Se rehace
 - **Python**: de reimplementación en Python puro a paquete compilado desde el núcleo de C++ (nanobind). La versión pura se queda como referencia y para pruebas.
@@ -157,8 +161,8 @@ iceoryx2).
 |---|---|---|
 | 0 ✅ (0.1.0) | Fundamentos en C++: serialización, UDP, seq, latencia, CI + prototipo de interfaz web | g, h |
 | ✅ (0.2.0) | **`agmen run robot.toml` + panel web de control** (adelanto de los niveles 3 y 10, RFC 0003) | h, i |
-| ✅ (0.3.0) | **¿Quién manda?** Prioridad de comandos (`[[mux]]`), paralelismo medido (`scripts/paralelo_check.py`), CI en ARM64 | d, i |
-| **1** (0.4.0) | **Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica** | c, f |
+| ✅ (0.3.0) | ¿Quién manda? Prioridad de comandos (`[[mux]]`), paralelismo medido (`scripts/paralelo_check.py`), CI en ARM64 | d, i |
+| **1 ✅** (0.4.0) | **Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica**: `Publisher`/`Subscriber`, anuncio de esquema, `agmen echo`, panel que grafica cualquier tipo, vectores de prueba compartidos C++/Python | c, f |
 | 2 (0.5.0) | Pub/sub local: topics, discovery, `agmen node list`, `agmen topic list/echo/hz`; el panel muestra cualquier topic | i |
 | 3 (0.6.0) | Panel en C++: puente WebSocket, inspector de mensajes, teleoperación a topics, modo red local | h |
 | 4 | Lenguaje de esquemas `.agmen` + generador de código C++/Python | b |

@@ -159,7 +159,7 @@ Equivale a `twist_mux` de ROS, pero sirve para **cualquier** tipo de mensaje.
 |---|---|
 | **Nodos** | Estado, tiempo encendido, pid y reinicios de cada nodo, con botones ▶ ■ ↻. Clic en un nodo = filtrar sus logs |
 | **Manejar** | Botones ↑ ↓ ← → (táctiles) y teclado **W A S D** o flechas, con velocidad ajustable y barras de cada rueda. **Solo manda mientras presionas**: al soltar, cambiar de pestaña o perder la conexión, manda alto, y el freno de seguridad del motor hace el resto |
-| **Sensores** | Hz, latencia, pérdidas, errores y gráficas. Si dos emisores usan el mismo puerto, lo avisa en vez de mezclar datos |
+| **Datos** | Hz, latencia, pérdidas, errores, topic y esquema, y una gráfica por grupo de campos (armadas solas a partir del esquema, desde 0.4.0). Si dos emisores usan el mismo puerto, lo avisa en vez de mezclar datos |
 | **Logs** | Todos los nodos, con color por nodo, filtros, "seguir" y "limpiar". Errores en rojo y alertas en amarillo |
 
 ### API (la usa el panel, y sirve para scripts y pruebas)
@@ -195,7 +195,7 @@ siguen en C++ (o en el lenguaje que quieras).
 | Hoy (0.3.0) | Siguiente |
 |---|---|
 | El mux está en Python (sobra para comandos de 20–100 Hz como los del tutorial; agrega un salto local de UDP) | Pasarlo al núcleo C++ si se usa en lazos de control más rápidos |
-| Grafica solo `ImuSample` en un puerto | Con pub/sub y topics (0.5.0) el panel ve **cualquier** topic y los nodos se registran solos |
+| Grafica cualquier tipo (desde 0.4.0, por el anuncio de esquema), pero de un solo puerto y un emisor a la vez | Con pub/sub y topics (0.5.0) el panel ve **todos** los topics y eliges cuál graficar |
 | La teleoperación manda `MotorCommand` a un destino fijo | Publicar a un topic; cualquier tipo de comando con esquema |
 | Un solo robot y una sola máquina | Nodos en varias máquinas (`host = "raspberry"`); varios robots en un panel (modo nube, RFC 0002) |
 | Sin contraseña | Autenticación antes de permitir el acceso remoto |

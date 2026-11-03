@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import socket
-import struct
 import threading
 import time
 import webbrowser
@@ -25,8 +24,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .. import wire
+from .. import schema, wire
 from .._version import __version__
+from ..pubsub import Publisher
 
 INDEX_HTML = (Path(__file__).resolve().parent / "index.html").read_bytes()
 
@@ -52,25 +52,9 @@ class _HTTPServer(ThreadingHTTPServer):
 class MotorCommand(wire.Message):
     """Mismo esquema que examples/tutorial/motor_command.hpp."""
 
+    SCHEMA = "MotorCommand{f32 left;f32 right}"
     left: float
     right: float
-
-    NAME = "MotorCommand"
-    SCHEMA = "MotorCommand{f32 left;f32 right}"
-    _FMT = struct.Struct("<2f")
-
-    def encode_payload(self) -> bytes:
-        return self._FMT.pack(self.left, self.right)
-
-    @classmethod
-    def decode_payload(cls, payload: bytes) -> "MotorCommand":
-        cls.check_payload_size(payload, cls._FMT.size)
-        return cls(*cls._FMT.unpack(payload))
-
-
-# Tipos que el panel sabe graficar (en Agmen 0.3 el esquema viajará en el
-# mensaje y el panel podrá mostrar cualquier tipo sin esta tabla).
-DECODERS = {wire.ImuSample.TYPE_ID: wire.ImuSample}
 
 
 class SensorHub:
@@ -81,7 +65,8 @@ class SensorHub:
         self.samples: deque[tuple[int, dict]] = deque(maxlen=maxlen)
         self.next_idx = 0
         self.stats = {"rate_hz": 0.0, "lost": 0, "errors": 0, "last_error": "", "source": "",
-                      "latency_ms": None, "type": "", "listening": "", "sources": []}
+                      "latency_ms": None, "type": "", "schema": "", "topic": "", "listening": "",
+                      "sources": []}
 
     def push(self, item: dict) -> None:
         with self.lock:
@@ -98,13 +83,32 @@ class SensorHub:
             return items, self.next_idx, dict(self.stats)
 
 
+class SchemaBook:
+    """Esquemas conocidos (schema_id → Layout), aprendidos de los anuncios.
+
+    Con el formato v1 el panel puede graficar CUALQUIER mensaje sin código
+    para ese tipo: le basta el texto del esquema, que cada Publisher anuncia
+    al empezar y luego una vez por segundo."""
+
+    def __init__(self) -> None:
+        self.layouts: dict[int, schema.Layout] = {wire.ImuSample.SCHEMA_ID: wire.ImuSample.LAYOUT}
+        self.topics: dict[tuple[str, int], str] = {}   # (emisor, topic_id) → nombre
+
+    def learn(self, source: str, env: wire.Envelope, payload: bytes) -> None:
+        topic, text = wire.read_announcement(env, payload)
+        if env.schema_id not in self.layouts:
+            self.layouts[env.schema_id] = schema.Layout(text)
+        self.topics[(source, env.topic_id)] = topic
+
+
 def udp_receiver(hub: SensorHub, listen: str, stop: threading.Event) -> None:
     host, port = listen.rsplit(":", 1)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((host, int(port)))
     sock.settimeout(0.25)
     hub.update(listening=listen)
-    expected: dict[str, int] = {}
+    book = SchemaBook()
+    expected: dict[tuple[str, int], int] = {}     # (emisor, source_id) → seq esperado
     last_seen: dict[str, float] = {}
     window_start, window_rx = time.monotonic(), 0
     lost_total = errors_total = 0
@@ -118,25 +122,32 @@ def udp_receiver(hub: SensorHub, listen: str, stop: threading.Event) -> None:
             recv_ns = wire.now_ns()
             source = f"{sender[0]}:{sender[1]}"
             try:
-                type_id = int.from_bytes(data[4:12], "little") if len(data) >= 12 else None
-                cls = DECODERS.get(type_id, wire.ImuSample)
-                h, msg = wire.decode(cls, data)
-            except wire.WireError as e:
+                env, payload = wire.parse(data)
+                if env.encoding == wire.ENC_SCHEMA:
+                    book.learn(source, env, payload)
+                    continue
+                layout = book.layouts.get(env.schema_id)
+                if layout is None:
+                    raise wire.WireError(f"llega schema_id {env.schema_id:#018x} sin anuncio de esquema "
+                                         f"todavía (cada Publisher lo anuncia una vez por segundo)")
+                values = schema.flatten_numbers(layout.unpack_rows(payload)[-1])
+            except (wire.WireError, schema.SchemaError) as e:
                 errors_total += 1
                 hub.update(errors=errors_total, last_error=f"{e} (desde {source})")
             else:
                 window_rx += 1
                 last_seen[source] = time.monotonic()
-                exp = expected.get(source)
-                if exp is not None and h.seq > exp:
-                    lost_total += h.seq - exp
-                if exp is None or h.seq >= exp or h.seq == 0:
-                    expected[source] = h.seq + 1
-                hub.push({"src": source, "seq": h.seq, "t": h.stamp_ns / 1e9,
-                          "accel": [round(v, 5) for v in msg.accel],
-                          "gyro": [round(v, 5) for v in msg.gyro]})
-                hub.update(source=source, type=cls.NAME, lost=lost_total,
-                           latency_ms=round((recv_ns - h.stamp_ns) / 1e6, 3))
+                key = (source, env.source_id)
+                exp = expected.get(key)
+                if exp is not None and env.seq > exp:
+                    lost_total += env.seq - exp
+                if exp is None or env.seq >= exp:
+                    expected[key] = env.seq + 1
+                topic = book.topics.get((source, env.topic_id), "")
+                hub.push({"src": source, "seq": env.seq, "t": env.t_data / 1e9, "type": layout.name,
+                          "topic": topic, "v": {k: round(v, 5) for k, v in values.items()}})
+                hub.update(source=source, type=layout.name, schema=layout.text, topic=topic,
+                           lost=lost_total, latency_ms=round((recv_ns - env.t_pub) / 1e6, 3))
         now = time.monotonic()
         if now - window_start >= 1.0:
             active = sorted(s for s, t in last_seen.items() if now - t < 2.0)
@@ -151,12 +162,9 @@ class Teleop:
     seguridad del motor lo detiene."""
 
     def __init__(self, target: str, max_speed: float) -> None:
-        host, port = target.rsplit(":", 1)
-        self.dest = (host, int(port))
         self.target = target
         self.max_speed = max(0.0, min(1.0, max_speed))
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.seq = 0
+        self.pub = Publisher(MotorCommand, target, topic="/teleop")
         self.lock = threading.Lock()
         self.last_sent = 0.0
         self.last_cmd = (0.0, 0.0)
@@ -168,8 +176,7 @@ class Teleop:
             now = time.monotonic()
             if now - self.last_sent < 0.015 and (left, right) != (0.0, 0.0):
                 return self.last_cmd  # máx. ~60 Hz: un navegador no puede saturar al robot
-            self.sock.sendto(wire.encode(MotorCommand(left, right), self.seq, wire.now_ns()), self.dest)
-            self.seq += 1
+            self.pub.publish(MotorCommand(left, right))
             self.last_sent, self.last_cmd = now, (left, right)
         return left, right
 

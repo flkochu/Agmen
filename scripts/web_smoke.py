@@ -21,6 +21,23 @@ ROOT = Path(__file__).resolve().parent.parent
 EXE = ".exe" if sys.platform == "win32" else ""
 BIN = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "build" / "bin"
 
+CUSTOM = """
+import math, time
+from dataclasses import dataclass
+import agmen
+from agmen import wire
+
+@dataclass
+class Articulaciones(wire.Message):
+    SCHEMA = "Articulaciones{f32[12] q}"
+    q: list
+
+pub = agmen.Publisher(Articulaciones, "127.0.0.1:7801", topic="/arca9/q")
+for k in range(150):
+    pub.publish(Articulaciones([90 + 20 * math.sin(k / 10 + j) for j in range(12)]))
+    time.sleep(0.01)
+"""
+
 
 def main() -> None:
     env = {**os.environ, "PYTHONPATH": str(ROOT / "python")}
@@ -45,7 +62,17 @@ def main() -> None:
         print("stats:", stats)
         ok = stats["rate_hz"] > 50 and stats["errors"] == 0 and stats["type"] == "ImuSample"
         print("OK   interfaz web recibe datos" if ok else "FALLA interfaz web")
-        sys.exit(0 if ok else 1)
+        pub.wait(10)
+
+        # Un tipo que el panel NO conoce: lo grafica gracias al anuncio del esquema.
+        custom = subprocess.Popen([sys.executable, "-c", CUSTOM], env=env)
+        time.sleep(2.0)
+        stats = json.loads(urllib.request.urlopen("http://127.0.0.1:8181/api/state", timeout=5).read())["stats"]
+        custom.wait(10)
+        ok2 = stats["type"] == "Articulaciones" and stats["topic"] == "/arca9/q" and stats["errors"] == 0
+        print("OK   el panel lee un tipo nuevo sin código para él (Articulaciones{f32[12] q})"
+              if ok2 else f"FALLA tipo nuevo: {stats}")
+        sys.exit(0 if ok and ok2 else 1)
     finally:
         if pub:
             pub.kill()

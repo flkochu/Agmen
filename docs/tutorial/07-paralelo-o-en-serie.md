@@ -110,5 +110,4 @@ temporizadores por nodo, para hacerlo sin escribir el ciclo a mano.
 
 ---
 
-🎉 **Terminaste el tutorial de Agmen 0.3.** Con la próxima versión llegan
-capítulos nuevos ([índice](README.md#próximamente)).
+➡ Siguiente: [Capítulo 8 — Tus propios mensajes y `agmen echo`](08-mensajes-v1-y-echo.md)

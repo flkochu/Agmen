@@ -5,7 +5,6 @@
 
 import argparse
 import math
-import socket
 import time
 
 import agmen
@@ -20,27 +19,22 @@ def main() -> None:
     ap.add_argument("--count", type=int, default=0, help="0 = infinito")
     args = ap.parse_args()
 
-    host, port = args.to.rsplit(":", 1)
-    dest = (host, int(port))
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    pub = agmen.Publisher(wire.ImuSample, args.to, topic="/imu")
     period = 1.0 / args.rate
-    print(f"[py-publisher] {wire.ImuSample.NAME} → {args.to} a {args.rate} Hz")
+    print(f"[py-publisher] {wire.ImuSample.SCHEMA_TEXT} → {args.to} a {args.rate} Hz")
 
     start = time.monotonic()
-    seq = 0
-    while args.count == 0 or seq < args.count:
+    while args.count == 0 or pub.seq < args.count:
         t = time.monotonic() - start
-        msg = wire.ImuSample(
+        pub.publish(wire.ImuSample(
             accel=(0.5 * math.sin(2 * t), 0.5 * math.cos(2 * t), 9.81),
             gyro=(0.0, 0.0, 0.3 * math.sin(0.5 * t)),
-        )
-        sock.sendto(wire.encode(msg, seq, wire.now_ns()), dest)
-        seq += 1
+        ))
         # Misma programación por deadline que en C++.
-        delay = start + seq * period - time.monotonic()
+        delay = start + pub.seq * period - time.monotonic()
         if delay > 0:
             time.sleep(delay)
-    print(f"[py-publisher] terminado: {seq} mensajes")
+    print(f"[py-publisher] terminado: {pub.seq} mensajes")
 
 
 if __name__ == "__main__":

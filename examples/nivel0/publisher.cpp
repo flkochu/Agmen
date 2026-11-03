@@ -1,6 +1,6 @@
 // Nivel 0 — publisher.
 //
-// Manda ImuSample simulados por UDP a frecuencia fija.
+// Manda ImuSample simulados por UDP a frecuencia fija, en el topic "/imu".
 //
 //   ./build/bin/publisher --rate 100 --to 127.0.0.1:7400
 
@@ -31,14 +31,13 @@ int main(int argc, char** argv) try {
     const auto rate = nivel0::arg<double>(argc, argv, "rate", 100.0);
     const auto count = nivel0::arg<std::uint64_t>(argc, argv, "count", 0);
 
-    // Puerto 0 = el sistema operativo elige un puerto libre para enviar.
-    auto socket = agmen::net::UdpSocket::bind("0.0.0.0:0");
-    socket.connect(to);
+    // El Publisher lleva seq, marcas de tiempo y anuncia el esquema.
+    agmen::Publisher<wire::ImuSample> pub(to, "/imu");
 
     const auto period = duration_cast<steady_clock::duration>(duration<double>(1.0 / rate));
-    std::printf("[publisher] Agmen %s · %s (type_id 0x%016llx) → %s a %g Hz\n",
-                std::string(agmen::kVersion).c_str(), std::string(wire::ImuSample::kName).c_str(),
-                static_cast<unsigned long long>(wire::type_id_v<wire::ImuSample>), to.c_str(),
+    std::printf("[publisher] Agmen %s · %s (schema_id 0x%016llx) → %s a %g Hz\n",
+                std::string(agmen::kVersion).c_str(), wire::schema_text<wire::ImuSample>().c_str(),
+                static_cast<unsigned long long>(wire::schema_id_v<wire::ImuSample>), to.c_str(),
                 rate);
     std::fflush(stdout);
 
@@ -55,10 +54,9 @@ int main(int argc, char** argv) try {
             .gyro = {0.0f, 0.0f, 0.3f * std::sin(0.5f * t)},
         };
 
-        // El timestamp se toma justo antes de enviar. Si nadie escucha,
-        // send() devuelve NoListener y seguimos publicando.
-        const auto packet = wire::encode(msg, seq, wire::now_ns());
-        (void)socket.send(packet);
+        // t_data = ahora (el instante de la "lectura"). Si nadie escucha,
+        // publish() devuelve NoListener y seguimos publicando.
+        (void)pub.publish(msg);
         ++seq;
 
         const auto now = steady_clock::now();

@@ -98,6 +98,22 @@ class TestMux(unittest.TestCase):
         self.assertEqual(self.mux.errors["teleop"], 2)
         self.assertIsNone(self.mux.active)
 
+    def test_un_anuncio_no_roba_el_mando(self):
+        self.assertTrue(self.send(self.cerebro, 0.6, 0.6, 0.00))
+        ann = wire.encode_announcement(Cmd.SCHEMA_TEXT, "/cmd")
+        self.assertFalse(self.mux.handle(self.teleop, ann, 0.05))   # el panel solo anunció
+        self.assertTrue(self.send(self.cerebro, 0.6, 0.6, 0.10))    # el cerebro sigue mandando
+        self.assertEqual(self.mux.active, "cerebro")
+        self.assertEqual(self.mux.schema_text, Cmd.SCHEMA_TEXT)
+
+    def test_la_salida_es_una_sola_fuente(self):
+        self.send(self.cerebro, 0.6, 0.6, 0.0)
+        self.send(self.teleop, 0.8, 0.3, 0.05)
+        e1, _ = wire.decode(Cmd, self.rx.recv(65536))
+        e2, _ = wire.decode(Cmd, self.rx.recv(65536))
+        self.assertEqual(e1.source_id, self.mux.source_id)
+        self.assertEqual(e2.source_id, self.mux.source_id)
+
     def test_prioridades_repetidas(self):
         with self.assertRaises(ValueError):
             Mux([MuxInput("a", "127.0.0.1:0", 1), MuxInput("b", "127.0.0.1:0", 1)], "127.0.0.1:9")

@@ -23,7 +23,7 @@ pip install agmen
 
 Revisa:
 ```bash
-python3 -c "import agmen; print(agmen.__version__)"     # 0.1.0
+python3 -c "import agmen; print(agmen.__version__)"     # 0.4.0
 ```
 
 ## 2. El mismo mensaje, ahora en Python
@@ -32,30 +32,29 @@ En [`examples/tutorial/cerebro.py`](../../examples/tutorial/cerebro.py):
 
 ```python
 from dataclasses import dataclass
-import struct
+import agmen
 from agmen import wire
 
 @dataclass
 class MotorCommand(wire.Message):
+    SCHEMA = "MotorCommand{f32 left;f32 right}"   # ← el mismo esquema que en C++
     left: float
     right: float
 
-    NAME = "MotorCommand"
-    SCHEMA = "MotorCommand{f32 left;f32 right}"   # ← EXACTAMENTE el mismo que en C++
-    _FMT = struct.Struct("<2f")                    # 2 floats de 32 bits, little-endian
-
-    def encode_payload(self) -> bytes:
-        return self._FMT.pack(self.left, self.right)
-
-    @classmethod
-    def decode_payload(cls, payload: bytes) -> "MotorCommand":
-        cls.check_payload_size(payload, cls._FMT.size)
-        return cls(*cls._FMT.unpack(payload))
+pub = agmen.Publisher(MotorCommand, "127.0.0.1:7500", topic="/cmd")
+pub.publish(MotorCommand(left=0.6, right=0.6))
 ```
 
-Como el `SCHEMA` es idéntico, el `type_id` es idéntico: C++ y Python están
+En Python **no escribes cómo se convierte a bytes**: Agmen lo saca del
+esquema (el mismo layout que el struct de C++). Solo los nombres de los
+atributos deben coincidir con los del esquema.
+
+Como el `SCHEMA` es idéntico, el `schema_id` es idéntico: C++ y Python están
 hablando del mismo tipo. **No hay "bindings" ni código generado: el
 formato es el contrato.**
+
+💡 Para recibir, `agmen.Subscriber(MotorCommand, "127.0.0.1:7500")` y
+`sample = sub.receive(timeout=0.05)` (igual que en C++).
 
 ## 3. La "IA"
 
@@ -83,8 +82,8 @@ python3 examples/tutorial/cerebro.py
 ```
 
 ```
-[cerebro] Agmen 0.1.0 · decidiendo a 20 Hz → 127.0.0.1:7500
-[cerebro] type_id de MotorCommand = 0x... (igual que en C++)
+[cerebro] Agmen 0.4.0 · decidiendo a 20 Hz → 127.0.0.1:7500
+[cerebro] schema_id de MotorCommand = 0x7b89fa708491f5dd (igual que en C++)
 [cerebro] distancia=1.10 m → camino libre → adelante
 [cerebro] distancia=0.49 m → obstáculo cerca → giro
 ```
@@ -98,12 +97,16 @@ Y en el motor:
 ## 5. Experimentos
 
 🧪 **Rompe el contrato a propósito:** en `cerebro.py`, cambia el esquema a
-`"MotorCommand{f32 left;f32 right;f32 extra}"` y vuelve a correr. El motor
-de C++ dirá:
+`"MotorCommand{f32 left;f32 right;f32 extra}"`, agrega el campo
+`extra: float = 0.0` y vuelve a correr. El motor de C++ dirá:
 ```
-[motor] ERROR: TIPO INCOMPATIBLE: se esperaba 'MotorCommand' (type_id 0x...) pero llegó
-type_id 0x.... ¿El publisher usa otra versión del mensaje?
+[motor] ERROR: TIPO INCOMPATIBLE: se esperaba 'agmen/1 MotorCommand{f32 left;f32 right}'
+(schema_id 0x7b89fa708491f5dd) pero llegó schema_id 0xf80302aaa879d41b
+(agmen/1 MotorCommand{f32 left;f32 right;f32 extra}, topic /cmd).
+¿El emisor usa otra versión del mensaje? (desde 127.0.0.1:58861)
 ```
+Fíjate que dice **exactamente** qué esquema llegó: el motor lo sabe por el
+anuncio del cerebro.
 y **no se mueve**: es mejor eso que interpretar mal los bytes y mandar el
 robot a cualquier lado. Regresa el esquema como estaba.
 

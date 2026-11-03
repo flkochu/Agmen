@@ -13,7 +13,7 @@
 | **0.1.0** | 0 | Núcleo C++, formato v0, UDP, interfaz web (prototipo), tutorial 0–4 |
 | **0.2.0** | — | `agmen run robot.toml` + panel web de control (RFC 0003) |
 | **0.3.0** | — | Prioridad de comandos (`agmen mux`), paralelismo medido, CI en ARM64 |
-| 0.4.0 | 1 | Sobre v1 + `compact` + esquema en texto (RFC 0001) |
+| **0.4.0** | 1 | Sobre v1 + `compact` + esquema en texto (RFC 0001): `Publisher`/`Subscriber`, `agmen echo`, panel para cualquier tipo |
 | 0.5.0 | 2 | Pub/sub local, topics, `agmen topic list/echo/hz` |
 | 0.6.0 | 3 | Panel en C++ (WebSocket): cualquier topic |
 | … | … | Un nivel por versión menor |
@@ -22,8 +22,8 @@
 ## Dos números distintos
 
 - **Versión del paquete** (0.1.0): la del software. Está en `VERSION`.
-- **Versión del protocolo** (`version` en el header, hoy `0`): la del formato
-  de bytes. Cambia solo cuando cambia el formato (el nivel 1 la sube a `1`).
+- **Versión del protocolo** (`version` en el sobre, hoy `1`): la del formato
+  de bytes. Cambia solo cuando cambia el formato (de `0` a `1` en Agmen 0.4.0).
   Así, un nodo de Agmen 0.5.0 y uno de 0.7.0 pueden hablar si usan el mismo
   protocolo.
 

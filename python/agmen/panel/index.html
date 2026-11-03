@@ -79,7 +79,11 @@
   .card .v.small { font-size: 13px; padding-top: 5px; }
   .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   @media (max-width: 1250px) { .charts { grid-template-columns: 1fr; } }
-  .legend { display: flex; gap: 10px; }
+  .legend { display: flex; gap: 4px 12px; flex-wrap: wrap; font-size: 12px; margin: -4px 0 8px; }
+  .charts .panel.wide { grid-column: 1 / -1; }
+  .legend b { font: 11px var(--mono); color: var(--muted); font-weight: 400; }
+  .card.wide { grid-column: span 2; }
+  .schema { font: 11px/1.4 var(--mono); color: var(--muted); word-break: break-all; }
   .legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
   canvas { width: 100%; height: 190px; display: block; }
   .banner { display: none; border-radius: 10px; padding: 10px 12px; font: 12px/1.5 var(--mono); }
@@ -124,25 +128,17 @@
 
   <div class="data">
     <section class="cards">
-      <div class="card"><div class="k">Sensor IMU</div><div class="v" id="rate">—</div></div>
+      <div class="card"><div class="k">Mensajes</div><div class="v" id="rate">—</div></div>
       <div class="card"><div class="k">Latencia</div><div class="v" id="lat">—</div></div>
       <div class="card"><div class="k">Perdidos</div><div class="v" id="lost">—</div></div>
       <div class="card"><div class="k">Errores</div><div class="v" id="errors">—</div></div>
-      <div class="card"><div class="k">Origen</div><div class="v small" id="source">—</div></div>
+      <div class="card wide"><div class="k">Origen</div><div class="v small" id="source">—</div></div>
     </section>
     <div class="banner warn" id="warnbox"></div>
     <div class="banner error" id="errbox"></div>
-    <section class="charts">
-      <div class="panel">
-        <h2>Acelerómetro <span class="unit">m/s²</span>
-          <span class="right legend"><span><i style="background:var(--x)"></i>x</span><span><i style="background:var(--y)"></i>y</span><span><i style="background:var(--z)"></i>z</span></span></h2>
-        <canvas id="accel"></canvas>
-      </div>
-      <div class="panel">
-        <h2>Giroscopio <span class="unit">rad/s</span>
-          <span class="right legend"><span><i style="background:var(--x)"></i>x</span><span><i style="background:var(--y)"></i>y</span><span><i style="background:var(--z)"></i>z</span></span></h2>
-        <canvas id="gyro"></canvas>
-      </div>
+    <div class="schema" id="schema"></div>
+    <section class="charts" id="charts">
+      <div class="panel"><h2>Datos</h2><div class="empty">Sin datos todavía. Las gráficas se arman solas con los campos del primer mensaje que llegue a este panel.</div></div>
     </section>
 
   <section class="panel logs">
@@ -268,7 +264,7 @@ function renderDrive() {
     </div>
     <div class="speed">velocidad <input type="range" id="spd" min="10" max="100" value="50"> <span id="spdv">50%</span></div>
     <div class="drive-state" id="dstate">Mantén presionado: <b>W A S D</b> o flechas (o los botones). Suelta = el robot frena.</div>
-    <div class="note" style="margin-top:6px">Si otro nodo también manda comandos (ej. <code>cerebro</code>), detenlo primero con ■.</div>`;
+    <div class="note" style="margin-top:6px">Con un <code>[[mux]]</code> en robot.toml tú le ganas al modo autónomo; sin mux, detén primero (■) al otro nodo que mande comandos.</div>`;
   for (const b of box.querySelectorAll("[data-d]")) {
     const d = b.dataset.d;
     b.addEventListener("pointerdown", (e) => { e.preventDefault(); b.setPointerCapture(e.pointerId); press(d, true); });
@@ -333,7 +329,8 @@ function updateStats(s) {
   $("rate").textContent = s.rate_hz ? s.rate_hz.toFixed(0) + " Hz" : "0 Hz";
   $("lat").textContent = s.latency_ms == null ? "—" : s.latency_ms.toFixed(2) + " ms";
   $("lost").textContent = s.lost; $("errors").textContent = s.errors;
-  $("source").textContent = s.type ? `${s.type} · ${s.source}` : `esperando en ${s.listening}`;
+  $("source").textContent = s.type ? `${s.topic || "(sin topic)"} · ${s.type} · ${s.source}` : `esperando en ${s.listening}`;
+  $("schema").textContent = s.schema || "";
   const many = (s.sources || []).length > 1;
   $("warnbox").style.display = many ? "block" : "none";
   $("warnbox").textContent = many ? `⚠ ${s.sources.length} emisores mandan al mismo puerto (${s.sources.join(", ")}). ` +
@@ -341,7 +338,47 @@ function updateStats(s) {
   $("errbox").style.display = s.last_error ? "block" : "none";
   $("errbox").textContent = s.last_error ? "Último error: " + s.last_error : "";
 }
-function draw(canvas, key) {
+// Las gráficas se arman solas a partir de los campos del mensaje (formato v1:
+// el panel conoce el esquema de cada tipo por su anuncio). Se agrupan los
+// campos que van juntos: ax ay az → "a", q[0]…q[11] → "q", p.x p.y → "p".
+const LINE_COLORS = ["#4f8ff7", "#e06c75", "#4cc38a", "#e9b949", "#c678dd", "#56b6c2",
+                     "#ef8a5a", "#e06c9f", "#9aa5ce", "#98c379", "#d19a66", "#61afef"];
+let groups = [], groupsKey = "";
+function groupOf(name) {
+  const dot = name.lastIndexOf(".");
+  if (dot > 0) return name.slice(0, dot);
+  const br = name.indexOf("[");
+  if (br > 0) return name.slice(0, br);
+  if (/^[a-z_]+[xyzw]$/i.test(name) && name.length > 1) return name.slice(0, -1);
+  return "";
+}
+function buildCharts(sample) {
+  const fields = Object.keys(sample.v);
+  const key = sample.type + "|" + fields.join(",");
+  if (key === groupsKey) return;
+  groupsKey = key;
+  const byName = new Map();
+  for (const f of fields) { const g = groupOf(f); if (!byName.has(g)) byName.set(g, []); byName.get(g).push(f); }
+  // Los campos sueltos se juntan en una sola gráfica (en grupos de hasta 8).
+  groups = [];
+  const loose = [];
+  for (const [g, fs] of byName) {
+    if (g === "" || fs.length === 1) { loose.push(...fs); continue; }
+    const isArray = fs.every((f) => f.startsWith(g + "["));
+    groups.push({ title: isArray ? `${g}[0…${fs.length - 1}]` : fs.length <= 4 ? fs.join(" · ") : g, fields: fs });
+  }
+  for (let i = 0; i < loose.length; i += 8) groups.push({ title: loose.slice(i, i + 8).join(" · "), fields: loose.slice(i, i + 8) });
+  const box = $("charts"); box.innerHTML = "";
+  for (const g of groups) {
+    const el = document.createElement("div"); el.className = "panel" + (g.fields.length > 6 ? " wide" : "");
+    el.innerHTML = `<h2>${sample.type} <span class="unit">${g.title}</span></h2><div class="legend"></div><canvas></canvas>`;
+    g.canvas = el.querySelector("canvas"); g.legend = el.querySelector(".legend");
+    g.legend.innerHTML = g.fields.map((f, i) => `<span><i style="background:${LINE_COLORS[i % LINE_COLORS.length]}"></i>${f} <b data-f="${f}"></b></span>`).join("");
+    box.appendChild(el);
+  }
+}
+function draw(g) {
+  const canvas = g.canvas;
   const dpr = devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
   if (canvas.width !== w * dpr || canvas.height !== h * dpr) { canvas.width = w * dpr; canvas.height = h * dpr; }
   const ctx = canvas.getContext("2d");
@@ -349,11 +386,11 @@ function draw(canvas, key) {
   const padL = 48, padR = 8, padT = 8, padB = 22, pw = w - padL - padR, ph = h - padT - padB;
   if (!buf.length) {
     ctx.fillStyle = css("--muted"); ctx.font = "12px system-ui"; ctx.textAlign = "center";
-    ctx.fillText("sin datos de sensores todavía", w / 2, h / 2); return;
+    ctx.fillText("sin datos todavía", w / 2, h / 2); return;
   }
   const tEnd = buf[buf.length - 1].t, tStart = tEnd - WINDOW_S;
   let lo = Infinity, hi = -Infinity;
-  for (const s of buf) for (const v of s[key]) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  for (const s of buf) for (const f of g.fields) { const v = s.v[f]; if (v < lo) lo = v; if (v > hi) hi = v; }
   const span = Math.max(hi - lo, 0.5), mid = (hi + lo) / 2; lo = mid - span * 0.6; hi = mid + span * 0.6;
   const X = (t) => padL + ((t - tStart) / WINDOW_S) * pw, Y = (v) => padT + (1 - (v - lo) / (hi - lo)) * ph;
   ctx.strokeStyle = css("--line"); ctx.fillStyle = css("--muted"); ctx.lineWidth = 1;
@@ -365,19 +402,25 @@ function draw(canvas, key) {
     ctx.textAlign = s === 0 ? "left" : s === WINDOW_S ? "right" : "center";
     ctx.fillText(s === WINDOW_S ? "ahora" : `-${WINDOW_S - s}s`, X(tStart + s), h - padB + 6);
   }
-  ["--x", "--y", "--z"].forEach((c, axis) => {
-    ctx.strokeStyle = css(c); ctx.lineWidth = 1.6; ctx.beginPath(); let started = false;
-    for (const s of buf) { if (s.t < tStart) continue; const px = X(s.t), py = Y(s[key][axis]);
+  g.fields.forEach((f, i) => {
+    ctx.strokeStyle = LINE_COLORS[i % LINE_COLORS.length]; ctx.lineWidth = 1.6; ctx.beginPath(); let started = false;
+    for (const s of buf) { if (s.t < tStart) continue; const px = X(s.t), py = Y(s.v[f]);
       if (!started) { ctx.moveTo(px, py); started = true; } else ctx.lineTo(px, py); }
     ctx.stroke();
   });
+  const last = buf[buf.length - 1].v;   // valor actual junto al nombre de cada campo
+  for (const b of g.legend.querySelectorAll("b")) b.textContent = (+last[b.dataset.f]).toFixed(2);
 }
 function addSamples(samples) {
   if (!samples.length) return;
   const now = performance.now();
   for (const s of samples) lastSeen[s.src] = now;
   if (followSrc === null || now - (lastSeen[followSrc] || 0) > 500) { followSrc = samples[samples.length - 1].src; buf.length = 0; }
-  for (const s of samples) if (s.src === followSrc) buf.push(s);
+  for (const s of samples) if (s.src === followSrc) {
+    if (buf.length && buf[buf.length - 1].type !== s.type) buf.length = 0;   // cambió el tipo
+    buf.push(s);
+  }
+  if (buf.length) buildCharts(buf[buf.length - 1]);
   const tEnd = buf.length ? buf[buf.length - 1].t : 0;
   while (buf.length && buf[0].t < tEnd - WINDOW_S - 1) buf.shift();
   lastData = now;
@@ -451,10 +494,10 @@ function connect() {
     const bad = m.nodes.filter((n) => n.state === "falló").length;
     if (bad) setStatus("bad", `${bad} nodo${bad > 1 ? "s" : ""} con falla`);
     else if (lastData && performance.now() - lastData < 1500) setStatus("ok", "conectado · recibiendo datos");
-    else setStatus("warn", "conectado · sin datos de sensores");
+    else setStatus("warn", "conectado · sin datos");
   };
 }
-function frame() { draw($("accel"), "accel"); draw($("gyro"), "gyro"); requestAnimationFrame(frame); }
+function frame() { for (const g of groups) draw(g); requestAnimationFrame(frame); }
 renderChips(); connect(); requestAnimationFrame(frame);
 </script>
 </body>

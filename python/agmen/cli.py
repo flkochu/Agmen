@@ -3,6 +3,7 @@
     agmen run [robot.toml]     lanza todo el robot + panel web, con un solo comando
     agmen web                  solo el panel web (sin administrar nodos)
     agmen mux --out ... --in   prioridad de comandos: ¿quién manda al motor?
+    agmen echo IP:PUERTO       muestra cualquier mensaje que llegue (sin código del tipo)
     agmen version              muestra la versión
 """
 
@@ -91,6 +92,12 @@ def cmd_web(args) -> int:
     return 0
 
 
+def cmd_echo(args) -> int:
+    from .echo import main as echo_main
+
+    return echo_main(args)
+
+
 def cmd_mux(args) -> int:
     from .mux import main as mux_main
 
@@ -123,6 +130,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--hold-ms", type=float, default=300.0,
                    help="tras cuántos ms sin mensajes una fuente suelta el mando (default 300)")
     p.set_defaults(func=cmd_mux)
+
+    p = sub.add_parser("echo", help="muestra cualquier mensaje que llegue a un puerto")
+    p.add_argument("listen", nargs="?", default="127.0.0.1:7400", metavar="IP:PUERTO",
+                   help="dónde escuchar (el puerto al que manda el emisor; default 127.0.0.1:7400)")
+    p.add_argument("--schema", action="append", metavar="ESQUEMA",
+                   help='esquema conocido de antemano, ej. "Mio{f32 x;f32 y}" (se puede repetir)')
+    p.add_argument("--max-hz", type=float, default=10.0,
+                   help="cuántos mensajes mostrar por segundo como máximo (0 = todos; default 10)")
+    p.add_argument("--count", type=int, default=0, help="salir después de N mensajes")
+    p.add_argument("--json", action="store_true", help="una línea JSON por mensaje (para scripts)")
+    p.set_defaults(func=cmd_echo)
 
     p = sub.add_parser("version", help="muestra la versión")
     p.set_defaults(func=lambda a: print(f"agmen {__version__}") or 0)

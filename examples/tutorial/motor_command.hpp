@@ -2,10 +2,13 @@
 //
 // Un mensaje de Agmen es un struct que dice:
 //   1. cómo se llama           (kName)
-//   2. qué campos tiene        (kSchema: de aquí sale su type_id)
+//   2. qué campos tiene        (kSchema: de aquí sale su schema_id)
 //   3. cómo se convierte a bytes y de regreso (encode/decode_payload)
 //
-// En el nivel 4 (Agmen 0.5) este archivo lo generará una herramienta a partir
+// kSchema se escribe en forma canónica: tipos f32/u8/..., un espacio entre
+// tipo y nombre, ';' entre campos. Si te equivocas, el compilador te avisa.
+//
+// En el nivel 4 (Agmen 0.7) este archivo lo generará una herramienta a partir
 // de un esquema; por ahora lo escribimos a mano para entender qué hace.
 #pragma once
 
@@ -38,5 +41,7 @@ struct MotorCommand {
     }
 };
 
-// El compilador revisa que MotorCommand cumpla todo lo que Agmen necesita.
+// El compilador revisa que MotorCommand cumpla todo lo que Agmen necesita y
+// que el esquema mida lo mismo que el payload.
 static_assert(agmen::wire::Message<MotorCommand>);
+static_assert(agmen::wire::compact_size_v<MotorCommand> == MotorCommand::kPayloadLen);

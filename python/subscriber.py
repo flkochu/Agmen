@@ -4,7 +4,6 @@
 """
 
 import argparse
-import socket
 import time
 
 import agmen
@@ -18,14 +17,12 @@ def main() -> None:
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
-    host, port = args.listen.rsplit(":", 1)
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((host, int(port)))
-    sock.settimeout(0.2)
+    sub = agmen.Subscriber(wire.ImuSample, args.listen)
     print(f"[py-subscriber] escuchando {wire.ImuSample.NAME} "
-          f"(type_id {wire.ImuSample.TYPE_ID:#018x}) en {args.listen}")
+          f"(schema_id {wire.ImuSample.SCHEMA_ID:#018x}) en {args.listen}")
 
     expected = None
+    source = None
     rx = lost = errors = 0
     lat_us: list[float] = []
     last_error = ""
@@ -33,28 +30,26 @@ def main() -> None:
 
     while True:
         try:
-            data, sender = sock.recvfrom(65536)
-            recv_ns = wire.now_ns()
-            try:
-                h, msg = wire.decode(wire.ImuSample, data)
-            except wire.WireError as e:
-                errors += 1
-                # Cada error distinto se muestra una vez, con su origen.
-                text = f"{e} (desde {sender[0]}:{sender[1]})"
-                if text != last_error:
-                    print(f"[py-subscriber] ERROR: {text}")
-                    last_error = text
-            else:
-                rx += 1
-                lat_us.append((recv_ns - h.stamp_ns) / 1000)
-                if expected is not None and h.seq > expected:
-                    lost += h.seq - expected
-                if expected is None or h.seq >= expected or h.seq == 0:
-                    expected = h.seq + 1
-                if args.verbose:
-                    print(f"  seq={h.seq} accel={msg.accel} gyro={msg.gyro}")
-        except socket.timeout:
-            pass
+            s = sub.receive(timeout=0.2)
+        except wire.WireError as e:
+            errors += 1
+            # Cada error distinto se muestra una vez.
+            if str(e) != last_error:
+                print(f"[py-subscriber] ERROR: {e}")
+                last_error = str(e)
+            s = None
+        if s is not None:
+            h, msg = s.envelope, s.message
+            rx += 1
+            lat_us.append((wire.now_ns() - h.t_pub) / 1000)
+            if h.source_id != source:   # otro publisher (o se reinició): empezamos de nuevo
+                expected, source = None, h.source_id
+            if expected is not None and h.seq > expected:
+                lost += h.seq - expected
+            if expected is None or h.seq >= expected:
+                expected = h.seq + 1
+            if args.verbose:
+                print(f"  seq={h.seq} accel={msg.accel} gyro={msg.gyro}")
 
         if time.monotonic() - window >= 1.0:
             if lat_us:

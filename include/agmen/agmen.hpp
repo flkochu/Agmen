@@ -9,5 +9,6 @@
 
 #include "agmen/net.hpp"
 #include "agmen/platform.hpp"
+#include "agmen/pubsub.hpp"
 #include "agmen/version.hpp"
 #include "agmen/wire.hpp"

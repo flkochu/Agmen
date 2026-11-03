@@ -60,7 +60,10 @@ Si todo va bien, verás algo así:
 ...
 OK   C++    -> C++: recibidos=200/200 perdidos=0
 OK   C++    -> Python: recibidos=200/200 perdidos=0
+OK   Python -> Python: recibidos=200/200 perdidos=0
 OK   Python -> C++: recibidos=200/200 perdidos=0
+OK   C++ -> agmen echo (sin código de ImuSample): 50/50 mensajes decodificados
+OK   Python, tipo nuevo -> agmen echo: 30/30 mensajes decodificados
 ```
 
 ✅ **Listo.** Agmen funciona en tu computadora, y C++ y Python ya se entienden.

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Estado** | ✅ **Aceptado** (2026-10-30). Se implementa en el nivel 1 (versión 0.4.0) |
+| **Estado** | ✅ **Aceptado** (2026-10-30). Nivel 1 **implementado en Agmen 0.4.0** (sobre v1, `compact`, esquema en texto, decodificación dinámica); ver el [anexo A](#anexo-a--nivel-1-texto-canónico-y-anuncio-de-esquema) |
 | **Reemplaza a** | Protocolo v0 (`docs/PROTOCOLO.md`) |
 | **Fecha** | 2026-10-30 |
 | **Notas** | El núcleo pasó de Rust a C++ y el proyecto se renombró a Agmen (magic `"AGM"`) el mismo día. El formato no depende del lenguaje |
@@ -61,7 +61,7 @@ alineado a 64 bytes (lo que Arrow recomienda y lo que necesitan SIMD y la GPU).
 | 0 | 3 | bytes | `magic` | Siempre `"AGM"` |
 | 3 | 1 | u8 | `version` | `1` |
 | 4 | 2 | u16 | `header_len` | Tamaño del sobre. `64` en v1. El receptor salta los bytes extra que no conozca: así se pueden agregar campos sin romper nodos viejos |
-| 6 | 1 | u8 | `encoding` | `0` = sin payload, `1` = `compact`, `2` = `arrow`. Del 3 al 255 están reservados |
+| 6 | 1 | u8 | `encoding` | `0` = sin payload, `1` = `compact`, `2` = `arrow`, `3` = anuncio de esquema (anexo A). Del 4 al 255 están reservados |
 | 7 | 1 | u8 | `flags` | bit 0 `PAYLOAD_EN_SHM`: el payload es un descriptor de memoria compartida (sección 7). bit 1 `FIN`: último mensaje del stream o episodio. El resto debe ir en 0 |
 | 8 | 8 | u64 | `schema_id` | Hash del esquema canónico (sección 5) |
 | 16 | 8 | u64 | `topic_id` | FNV-1a 64 del nombre del topic, ej. `"/imu"` |
@@ -300,3 +300,80 @@ retos de la **implementación** que el formato ya deja resolver.
 | 6 | **El tiempo** | El reloj de pared puede **saltar hacia atrás** (NTP, cambio de hora). Entre máquinas sin sincronizar, la latencia no tiene sentido. En simulación el tiempo se pausa o acelera, y los timers lo tienen que seguir | Reloj de Agmen anclado a un reloj monótono. Sincronización NTP/PTP con el desfase medido y reportado. Todos los timers del executor usan el reloj de Agmen | 5, 11 |
 | 7 | **Compatibilidad estricta de esquemas** (reto social) | Cambiar un campo rompe a todos los nodos que usan ese tipo. En una comunidad eso genera fricción | Es una decisión consciente: preferimos un error claro a datos corruptos. Ayudas: `agmen schema diff`, nombres de versión explícitos (`ImuSample2`), mensajes de error que dicen qué campo cambió | 4 |
 | 8 | **Seguridad** | El formato no tiene autenticación: en una red abierta, cualquiera podría mandar comandos de motor | Se resuelve en el transporte (TLS/DTLS, permisos por topic) y en la interfaz web (RFC 0002). Hay bits libres en `flags` para marcar mensajes firmados si hace falta | 11 |
+
+## Anexo A — Nivel 1: texto canónico y anuncio de esquema
+
+*Agregado el 2026-11-02, al implementar el nivel 1 (Agmen 0.4.0).*
+
+La sección 5 dice que el esquema "se distribuye una vez, al anunciar el
+topic", pero los topics llegan en el nivel 2. Para que desde el nivel 1
+cualquier herramienta pueda decodificar cualquier mensaje, este anexo define
+dos cosas que la sección 5 dejaba abiertas.
+
+### A.1 Gramática del texto canónico
+
+```
+canónico  = "agmen/1 " struct
+struct    = NOMBRE "{" campo *( ";" campo ) "}"
+campo     = tipo " " NOMBRE
+tipo      = ( PRIMITIVO / struct ) *( "[" N "]" )
+PRIMITIVO = "bool" / "i8" / "u8" / "i16" / "u16" / "i32" / "u32" / "i64" / "u64"
+          / "f32" / "f64" / "time" / "duration"
+NOMBRE    = [A-Za-z_][A-Za-z0-9_]*
+N         = 1..1048576, sin ceros a la izquierda
+```
+
+- Un solo espacio entre tipo y nombre, sin espacios en ningún otro lugar,
+  sin `;` final. Los nombres de campo no se repiten dentro de un struct.
+- Los structs anidados se escriben completos donde se usan (no hay
+  referencias por nombre): así el hash cubre todo el árbol de tipos.
+- `T[N][M]` es como en C: N arreglos de M elementos.
+- Las herramientas aceptan una forma relajada (espacios, `;` final, con o sin
+  el prefijo) y la convierten a canónica. En C++, `kSchema` se escribe ya
+  canónico, sin el prefijo, y `agmen::wire::schema::check` lo valida **al
+  compilar**.
+- Los tipos de tamaño variable (`string`, `bytes`, `T[]`, `tensor`,
+  `optional`) se rechazan con un error que remite al nivel 7.
+
+Esto resuelve el reto #3 de la sección 14 con lo que ahí se proponía: una
+sola definición del texto canónico y un archivo de **vectores de prueba**
+compartido (`tests/vectors/v1.txt`, generado por la implementación de
+Python) contra el que C++ y Python comparan byte por byte en el CI.
+
+### A.2 Anuncio de esquema (`encoding = 3`)
+
+Un mensaje con `encoding = 3` no lleva datos sino la descripción del emisor:
+
+| Campo | Valor |
+|---|---|
+| `schema_id` | FNV-1a 64 del texto canónico (igual que en los datos) |
+| `topic_id` | FNV-1a 64 del topic |
+| `source_id`, `seq` | Los del emisor (`seq` = el del próximo dato; informativo) |
+| `t_data`, `t_pub` | Ahora |
+| payload | UTF-8 de `"<topic>\n<texto canónico>"` |
+
+Reglas:
+
+1. El emisor manda un anuncio **antes de su primer dato** y luego **uno por
+   segundo** mientras publique, al mismo destino que sus datos. Cuesta
+   ~60–100 bytes por segundo.
+2. El receptor valida que el texto y el topic coincidan con sus hashes y que
+   el texto sea canónico; si no, lo rechaza.
+3. Un anuncio **nunca se entrega como dato**. `Subscriber` (C++ y Python) los
+   consume solo y los usa para que `TIPO INCOMPATIBLE` diga qué esquema llegó.
+   `decode<M>()` sobre un anuncio lanza `WireError::NotData`.
+4. Un anuncio **no cuenta como "hablar"** para la prioridad de comandos
+   (`agmen mux`): un panel abierto no le quita el mando a nadie solo por
+   anunciarse. El mux reenvía como máximo un anuncio por segundo, con su
+   propio `source_id`.
+5. En el nivel 2 el anuncio pasa a ser parte del anuncio del topic
+   (discovery). El formato del payload se mantiene.
+
+### A.3 Lo que el nivel 1 todavía no hace
+
+| Regla del RFC | Estado en 0.4.0 |
+|---|---|
+| §8.8 advertir si `clock` no coincide con la sesión | Todos los nodos usan reloj real; se implementa con el reloj de Agmen (nivel 5) |
+| `arrow`, `SHM` | Se rechazan con un mensaje claro (niveles 7 y 8) |
+| N filas por mensaje | Las herramientas genéricas (`echo`, panel) las leen; `Subscriber<M>` espera 1 |
+| Topics | `topic_id` viaja en el sobre y en el anuncio, pero no hay ruteo por topic (nivel 2) |

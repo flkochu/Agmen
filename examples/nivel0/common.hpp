@@ -69,6 +69,9 @@ public:
         return {ev, lost};
     }
 
+    /// Olvida lo visto (otra instancia del publisher empezó a mandar).
+    void reset() { expected_.reset(); }
+
 private:
     std::optional<std::uint64_t> expected_;
 };

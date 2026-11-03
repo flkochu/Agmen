@@ -13,7 +13,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <vector>
+#include <string>
 
 #include "motor_command.hpp"
 
@@ -25,14 +25,14 @@ int main(int argc, char** argv) {
     const double duration_s = argc > 1 ? std::atof(argv[1]) : 0.0;  // 0 = sin límite
     constexpr auto kSafetyTimeout = milliseconds(500);
 
-    auto socket = agmen::net::UdpSocket::bind("127.0.0.1:7500");
+    agmen::Subscriber<MotorCommand> sub("127.0.0.1:7500");
     std::printf("[motor] Agmen %s · esperando MotorCommand en 127.0.0.1:7500\n",
                 std::string(agmen::kVersion).c_str());
 
-    std::vector<std::uint8_t> buf(65536);
     MotorCommand current{};  // empieza detenido
     bool stopped = true;
     long received = 0, errors = 0;
+    std::string last_error;
     const auto start = steady_clock::now();
     auto last_cmd = start;
     auto last_print = start;
@@ -41,10 +41,9 @@ int main(int argc, char** argv) {
         const auto now = steady_clock::now();
         if (duration_s > 0 && now - start >= duration<double>(duration_s)) break;
 
-        if (const auto rx = socket.recv_from(buf, milliseconds(50))) {
-            try {
-                auto [header, cmd] =
-                    wire::decode<MotorCommand>(wire::ByteView(buf.data(), rx->size));
+        try {
+            if (auto sample = sub.receive(milliseconds(50))) {
+                MotorCommand cmd = sample->message;
                 // Nunca confíes ciegamente en un comando: recórtalo al rango válido.
                 cmd.left = std::clamp(cmd.left, -1.0f, 1.0f);
                 cmd.right = std::clamp(cmd.right, -1.0f, 1.0f);
@@ -55,9 +54,14 @@ int main(int argc, char** argv) {
                     std::puts("[motor] ✅ recibiendo comandos, ruedas activas");
                     stopped = false;
                 }
-            } catch (const wire::WireError& e) {
-                ++errors;
-                std::fprintf(stderr, "[motor] ERROR: %s (desde %s)\n", e.what(), rx->from.c_str());
+            }
+        } catch (const wire::WireError& e) {
+            ++errors;
+            // Cada error distinto se muestra una vez (no llenar la terminal).
+            std::string text = std::string(e.what()) + " (desde " + sub.last_from() + ")";
+            if (text != last_error) {
+                std::fprintf(stderr, "[motor] ERROR: %s\n", text.c_str());
+                last_error = std::move(text);
             }
         }
 

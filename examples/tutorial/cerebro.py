@@ -14,8 +14,6 @@ decide, C++ ejecuta.
 
 import argparse
 import math
-import socket
-import struct
 import time
 from dataclasses import dataclass
 
@@ -25,22 +23,14 @@ from agmen import wire
 
 @dataclass
 class MotorCommand(wire.Message):
-    """El MISMO mensaje que motor_command.hpp: mismo SCHEMA → mismo type_id."""
+    """El MISMO mensaje que motor_command.hpp: mismo SCHEMA → mismo schema_id.
 
+    En Python basta con el esquema y los campos: Agmen arma solo cómo se
+    convierte a bytes (el layout compact, igual que el struct de C++)."""
+
+    SCHEMA = "MotorCommand{f32 left;f32 right}"
     left: float
     right: float
-
-    NAME = "MotorCommand"
-    SCHEMA = "MotorCommand{f32 left;f32 right}"
-    _FMT = struct.Struct("<2f")
-
-    def encode_payload(self) -> bytes:
-        return self._FMT.pack(self.left, self.right)
-
-    @classmethod
-    def decode_payload(cls, payload: bytes) -> "MotorCommand":
-        cls.check_payload_size(payload, cls._FMT.size)
-        return cls(*cls._FMT.unpack(payload))
 
 
 def leer_distancia(t: float) -> float:
@@ -62,11 +52,9 @@ def main() -> None:
     ap.add_argument("--destino", default="127.0.0.1:7500", help="a quién mandar MotorCommand")
     args = ap.parse_args()
     count = args.count
-    host, port = args.destino.rsplit(":", 1)
-    destino = (host, int(port))
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    pub = agmen.Publisher(MotorCommand, args.destino, topic="/cmd")
     print(f"[cerebro] Agmen {agmen.__version__} · decidiendo a 20 Hz → {args.destino}")
-    print(f"[cerebro] type_id de MotorCommand = {MotorCommand.TYPE_ID:#018x} (igual que en C++)")
+    print(f"[cerebro] schema_id de MotorCommand = {MotorCommand.SCHEMA_ID:#018x} (igual que en C++)")
 
     start = time.monotonic()
     seq = 0
@@ -75,7 +63,7 @@ def main() -> None:
         t = time.monotonic() - start
         distancia = leer_distancia(t)
         cmd, razon = decidir(distancia)
-        sock.sendto(wire.encode(cmd, seq, wire.now_ns()), destino)
+        pub.publish(cmd)
         if razon != ultima:
             print(f"[cerebro] distancia={distancia:4.2f} m → {razon}")
             ultima = razon

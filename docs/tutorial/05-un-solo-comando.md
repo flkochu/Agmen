@@ -64,7 +64,7 @@ agmen run examples/tutorial/robot.toml
 ```
 
 ```
-agmen   │ Agmen 0.3.0 · robot 'robot del tutorial' · 4 nodos
+agmen   │ Agmen 0.4.0 · robot 'robot del tutorial' · 4 nodos
 agmen   │ antes de arrancar: cmake --build ../../build --config Release
 agmen   │ panel web: http://127.0.0.1:8080
 ruedas  │ ▶ iniciado (pid 706)
@@ -72,7 +72,7 @@ imu     │ ▶ iniciado (pid 708)
 motor   │ ▶ iniciado (pid 710)
 agmen   │ 'cerebro' no arranca solo (autostart = false); inícialo desde el panel
 agmen   │ todo arrancado. Ctrl+C para detener todo.
-motor   │ [motor] Agmen 0.3.0 · esperando MotorCommand en 127.0.0.1:7500
+motor   │ [motor] Agmen 0.4.0 · esperando MotorCommand en 127.0.0.1:7500
 imu     │ [publisher] enviados=101 retrasos=0
 ```
 
@@ -86,7 +86,7 @@ El navegador se abre solo en el panel:
 |---|---|
 | **Nodos** | Ver si cada nodo está corriendo, desde cuándo y cuántas veces se ha reiniciado. Botones **▶** iniciar, **■** detener y **↻** reiniciar. Clic en el nombre = ver solo sus logs |
 | **Manejar** | Mover el robot con **W A S D** o las flechas del teclado, o con los botones (también en el celular). Las barras muestran la velocidad de cada rueda |
-| **Sensores** | Lo mismo del capítulo 4: Hz, latencia, pérdidas y gráficas |
+| **Datos** | Lo mismo del capítulo 4: Hz, latencia, pérdidas y una gráfica por grupo de campos del mensaje que llegue |
 | **Logs** | Lo que imprimen **todos** los nodos, en un solo lugar, con un color por nodo |
 
 ## 4. Experimentos
@@ -101,7 +101,7 @@ Detén el cerebro (■), suelta las teclas y en medio segundo el motor dice
 2 también te protege aquí.
 
 🧪 **Tumba un nodo:** detén el `imu` con ■. Las gráficas se congelan y el
-indicador de arriba dice "sin datos de sensores". Préndelo con ▶.
+indicador de arriba dice "sin datos". Préndelo con ▶.
 
 🧪 **Rompe el archivo a propósito:** cambia `name` por `nmae` en un nodo y
 corre otra vez:

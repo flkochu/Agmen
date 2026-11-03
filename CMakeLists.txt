@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.20)
 
 # La versión vive en un solo lugar: el archivo VERSION (ver docs/VERSIONES.md).
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" AGMEN_VERSION LIMIT_COUNT 1)
+# Si cambia VERSION, CMake se vuelve a configurar solo (y agmen::kVersion se actualiza).
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
 
 project(agmen
     VERSION ${AGMEN_VERSION}
@@ -110,6 +112,9 @@ if(AGMEN_BUILD_TESTS)
     enable_testing()
     add_executable(test_wire tests/test_wire.cpp)
     target_link_libraries(test_wire PRIVATE agmen::core)
+    # Los mismos vectores de prueba que revisa Python (python/test_vectores.py).
+    target_compile_definitions(test_wire PRIVATE
+        AGMEN_VECTORS_FILE="${CMAKE_CURRENT_SOURCE_DIR}/tests/vectors/v1.txt")
     agmen_set_warnings(test_wire)
     add_test(NAME wire COMMAND test_wire)
 endif()

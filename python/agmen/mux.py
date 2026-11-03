@@ -16,10 +16,12 @@ arriba se calla, el mando regresa sola a la siguiente.
 Reglas de seguridad:
   - El mux NUNCA inventa comandos: si nadie habla, no manda nada y el freno de
     seguridad del motor actúa igual que sin mux.
-  - Todas las entradas deben mandar el MISMO tipo de mensaje (type_id); si una
-    manda otro, se descarta y se avisa.
-  - El número de secuencia se renumera a la salida para que el receptor vea
-    una sola fuente continua (sus pérdidas se siguen pudiendo medir).
+  - Todas las entradas deben mandar el MISMO tipo de mensaje (schema_id); si
+    una manda otro, se descarta y se avisa.
+  - A la salida, el mux es UNA sola fuente: pone su propio source_id y
+    renumera seq, así el receptor sigue pudiendo medir pérdidas.
+  - Los anuncios de esquema no cuentan como "hablar" (no roban el mando); el
+    mux reenvía uno por segundo para que el receptor siga sabiendo el tipo.
 
 Uso directo (agmen run lo arma solo desde [[mux]] en robot.toml):
 
@@ -92,8 +94,11 @@ class Mux:
             self.sel.register(s, selectors.EVENT_READ, inp)
             self.socks.append(s)
         self.out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.source_id = wire.new_source_id()
         self.last_rx: dict[str, float] = {}
-        self.type_id: int | None = None
+        self.type_id: int | None = None         # schema_id que se aceptó primero
+        self.schema_text: str | None = None
+        self._announced_at: float | None = None
         self.out_seq = 0
         self.active: str | None = None
         self.forwarded = {i.name: 0 for i in self.inputs}
@@ -128,23 +133,40 @@ class Mux:
             self.log(f"⚠ '{inp.name}': {text} (descartado; {self.errors[inp.name]} en total)")
             self._last_error_log = now
 
+    def _forward(self, data: bytes, seq: int | None) -> None:
+        out = bytearray(data)
+        struct.pack_into("<Q", out, wire.SOURCE_OFFSET, self.source_id)
+        if seq is not None:
+            struct.pack_into("<Q", out, wire.SEQ_OFFSET, seq)
+        try:
+            self.out.sendto(out, self.dest)
+        except ConnectionResetError:   # Windows: nadie escuchaba el envío anterior
+            pass
+
     def handle(self, inp: MuxInput, data: bytes, now: float) -> bool:
         """Procesa un paquete de la entrada `inp`. Devuelve True si se reenvió."""
-        if len(data) < wire.HEADER_LEN:
-            self._error(inp, f"paquete de {len(data)} bytes, demasiado corto")
-            return False
-        magic, version, type_id, _seq, _stamp, payload_len = wire.HEADER_FMT.unpack_from(data)
-        if magic != wire.MAGIC or version != wire.WIRE_VERSION:
-            self._error(inp, "no es un mensaje Agmen v0")
-            return False
-        if payload_len != len(data) - wire.HEADER_LEN:
-            self._error(inp, "el tamaño no coincide con la cabecera")
+        text = None
+        try:
+            env, payload = wire.parse(data)
+            if env.encoding == wire.ENC_SCHEMA:
+                _, text = wire.read_announcement(env, payload)
+        except wire.WireError as e:
+            self._error(inp, str(e))
             return False
         if self.type_id is None:
-            self.type_id = type_id
-        elif type_id != self.type_id:
-            self._error(inp, f"manda otro tipo de mensaje (type_id {type_id:#018x}, "
-                             f"se esperaba {self.type_id:#018x})")
+            self.type_id = env.schema_id
+        elif env.schema_id != self.type_id:
+            what = f" ({text})" if text else ""
+            self._error(inp, f"manda otro tipo de mensaje (schema_id {env.schema_id:#018x}{what}; "
+                             f"se esperaba {self.schema_text or f'{self.type_id:#018x}'})")
+            return False
+
+        if text is not None:
+            # No cuenta como hablar: un anuncio no le quita el mando a nadie.
+            self.schema_text = text
+            if self._announced_at is None or now - self._announced_at >= 1.0:
+                self._forward(data, None)
+                self._announced_at = now
             return False
 
         self.last_rx[inp.name] = now
@@ -152,10 +174,8 @@ class Mux:
         if who is None or who.name != inp.name:
             self.dropped[inp.name] += 1
             return False
-        out = bytearray(data)
-        struct.pack_into("<Q", out, 12, self.out_seq)   # seq: bytes 12..20 de la cabecera
+        self._forward(data, self.out_seq)
         self.out_seq += 1
-        self.out.sendto(out, self.dest)
         self.forwarded[inp.name] += 1
         return True
 
