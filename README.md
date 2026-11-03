@@ -37,6 +37,7 @@ como paquetes opcionales.
 | El formato de mensajes | [PROTOCOLO v1](docs/PROTOCOLO.md) (implementado) · [RFC 0001](docs/rfc/0001-formato-de-mensajes.md) (diseño y razones) · [vectores de prueba](tests/vectors/v1.txt) |
 | La interfaz web | [RFC 0002](docs/rfc/0002-interfaz-web.md) (aceptado, implementado en 0.6.0: WebSocket, red con clave, Foxglove) · [RFC 0003](docs/rfc/0003-lanzador-y-panel.md) (`agmen run` y panel) |
 | Topics y el hub | [RFC 0004](docs/rfc/0004-topics-y-descubrimiento.md) (aceptado, implementado en 0.5.0) |
+| Mensajes en archivos `.agmen` | [RFC 0005](docs/rfc/0005-esquemas-agmen.md) (propuesta para 0.7.0) |
 | Publicar versiones | [`docs/PUBLICAR.md`](docs/PUBLICAR.md) |
 
 ## Estado
