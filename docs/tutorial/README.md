@@ -1,6 +1,6 @@
 # Tutorial de Agmen
 
-> **Versión del tutorial: Agmen 0.6.x.** El tutorial crece con cada versión:
+> **Versión del tutorial: Agmen 0.7.x.** El tutorial crece con cada versión:
 > cada nivel del roadmap agrega capítulos. Todo su código se compila y se
 > prueba en el CI (`scripts/tutorial_check.py`), así que lo que lees aquí
 > funciona con la versión indicada.
@@ -23,12 +23,13 @@ de C++ **o** de Python. No necesitas saber de redes ni de ROS.
 | 8 | [Tus propios mensajes y `agmen echo`](08-mensajes-v1-y-echo.md) | Inventas un tipo (los 12 ángulos de un perro robot) y lo ves en la terminal y en el panel sin código extra | 0.4.0 |
 | 9 | [Topics: los nodos se encuentran solos](09-topics.md) | `Publisher("/imu")` sin IPs ni puertos; `agmen topic list/info/echo/hz` y `node list` | 0.5.0 |
 | 10 | [El panel: varias gráficas, inspector, celular y Foxglove](10-panel-celular-y-foxglove.md) | Ves varios topics a la vez, cualquier mensaje campo por campo, manejas desde el celular con clave y te conectas con Foxglove | 0.6.0 |
+| 11 | [Tus mensajes en un archivo `.agmen`](11-mensajes-agmen.md) | Escribes los mensajes de un perro robot una sola vez y Agmen genera el código de C++ y de Python (con enums y valores por defecto) | 0.7.0 |
 
 ### Próximamente
 
 | # | Capítulo | Versión |
 |---|---|---|
-| 11 | Define tus mensajes en un archivo `.agmen` (sin escribir código a mano) | 0.7.0 |
+| 12 | Nodos con varias frecuencias y el reloj de Agmen (simulación) | 0.8.0 |
 
 ## Convenciones
 

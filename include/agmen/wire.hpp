@@ -78,6 +78,7 @@ public:
         NotData,             ///< es un anuncio de esquema, no datos
         BadAnnouncement,     ///< anuncio de esquema mal formado
         HubRejected,         ///< el hub rechazó el registro (ej. choque de tipos en un topic)
+        BadValue,            ///< un campo trae un valor inválido (ej. un enum que no existe)
     };
 
     WireError(Kind kind, std::string message)
@@ -287,6 +288,15 @@ inline void put_f32(Bytes& out, float v) { put_le(out, std::bit_cast<std::uint32
 inline void put_f64(Bytes& out, double v) { put_le(out, std::bit_cast<std::uint64_t>(v)); }
 /// Relleno del layout compact: siempre ceros (grabaciones y hashes deterministas).
 inline void put_padding(Bytes& out, std::size_t n) { out.insert(out.end(), n, std::uint8_t{0}); }
+
+/// Un std::array con todos sus elementos iguales a `v` (lo usa el código que
+/// genera `agmen gen` para los valores por defecto de los arreglos).
+template <class T, std::size_t N>
+[[nodiscard]] constexpr std::array<T, N> filled(const T& v) {
+    std::array<T, N> a{};
+    a.fill(v);
+    return a;
+}
 
 [[nodiscard]] inline float get_f32(ByteView buf, std::size_t at) {
     return std::bit_cast<float>(get_le<std::uint32_t>(buf, at));

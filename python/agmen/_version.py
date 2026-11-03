@@ -1,2 +1,2 @@
 # Debe coincidir con el archivo VERSION de la raíz (lo verifica scripts/check_version.py).
-__version__ = "0.6.0"
+__version__ = "0.7.0"

@@ -16,14 +16,13 @@ Y vas a definir **tu propio tipo de mensaje**: `MotorCommand`.
 mi_robot/
 ├── agmen/               ← copia aquí la carpeta de Agmen (o: git clone ... agmen)
 ├── CMakeLists.txt
-├── motor_command.hpp
+├── motor_command.agmen  ← tu mensaje (desde Agmen 0.7)
 ├── motor.cpp
 └── controlador.cpp
 ```
 
-Los tres archivos `.hpp`/`.cpp` están completos en
-[`examples/tutorial/`](../../examples/tutorial/). Cópialos de ahí; abajo se
-explican las partes importantes.
+Los archivos están completos en [`examples/tutorial/`](../../examples/tutorial/).
+Cópialos de ahí; abajo se explican las partes importantes.
 
 `CMakeLists.txt`:
 
@@ -33,47 +32,65 @@ project(mi_robot LANGUAGES CXX)
 
 add_subdirectory(agmen)          # la carpeta donde está Agmen
 
+# Tu mensaje: de motor_command.agmen sale motor_command.hpp (capítulo 11)
+agmen_add_messages(mi_robot_msgs motor_command.agmen)
+
 add_executable(motor motor.cpp)
-target_link_libraries(motor PRIVATE agmen::core)
+target_link_libraries(motor PRIVATE mi_robot_msgs)
 
 add_executable(controlador controlador.cpp)
-target_link_libraries(controlador PRIVATE agmen::core)
+target_link_libraries(controlador PRIVATE mi_robot_msgs)
 ```
 
-`target_link_libraries(... agmen::core)` es todo lo que hace falta para usar
-Agmen. Así de simple.
+`mi_robot_msgs` trae tus mensajes y `agmen::core`: es todo lo que hace falta
+para usar Agmen. (Si no tienes mensajes propios, enlaza directo con
+`agmen::core`.)
 
-## 2. Tu tipo de mensaje: `motor_command.hpp`
+## 2. Tu tipo de mensaje: `motor_command.agmen`
+
+```text
+# Velocidad deseada de cada rueda, de -1 (reversa total) a +1 (adelante total).
+message MotorCommand {
+    f32 left     # rueda izquierda
+    f32 right    # rueda derecha
+}
+```
+
+Eso es todo lo que escribes. Al compilar, CMake corre `agmen gen` y crea
+`motor_command.hpp`, que tus nodos incluyen con `#include "motor_command.hpp"`.
+Vale la pena ver una vez qué hay adentro (está en
+`build/agmen_gen/mi_robot_msgs/`), porque eso es lo que hace funcionar a
+cualquier mensaje de Agmen:
 
 ```cpp
 struct MotorCommand {
     static constexpr std::string_view kName = "MotorCommand";
     static constexpr std::string_view kSchema = "MotorCommand{f32 left;f32 right}";
+    static constexpr std::size_t kPayloadLen = 8;
 
-    float left = 0.0f;    // -1 (reversa) ... +1 (adelante)
-    float right = 0.0f;
+    float left{};   ///< rueda izquierda
+    float right{};  ///< rueda derecha
 
-    void encode_payload(agmen::wire::Bytes& out) const {
-        agmen::wire::put_f32(out, left);
-        agmen::wire::put_f32(out, right);
-    }
-    static MotorCommand decode_payload(agmen::wire::ByteView p) { /* lo inverso */ }
+    void encode_payload(agmen::wire::Bytes& out) const;          // left y luego right, 4 bytes cada uno
+    static MotorCommand decode_payload(agmen::wire::ByteView p); // lo inverso; valida que midan 8 bytes
 };
 
 static_assert(agmen::wire::Message<MotorCommand>);
-static_assert(agmen::wire::compact_size_v<MotorCommand> == 8);   // el esquema mide 8 bytes
+static_assert(agmen::wire::compact_size_v<MotorCommand> == MotorCommand::kPayloadLen);
 ```
 
 | Parte | Para qué |
 |---|---|
 | `kName` | Nombre legible del tipo (aparece en los errores) |
-| `kSchema` | La "receta" del mensaje. Agmen calcula su `schema_id` y su tamaño **al compilar**. Si cambias un campo, cambia el `schema_id` y los nodos con la versión vieja lo detectan. Si lo escribes mal (`float` en vez de `f32`, un `;` de más), **no compila** y el error te dice cómo se escribe |
+| `kSchema` | La "receta" del mensaje. Agmen calcula su `schema_id` y su tamaño **al compilar**. Si cambias un campo, cambia el `schema_id` y los nodos con la versión vieja lo detectan |
 | `encode_payload` | Convierte tus datos a bytes (little-endian, el layout de un struct de C) |
 | `decode_payload` | Lo inverso; valida el tamaño |
-| `static_assert(...)` | El compilador revisa que tu struct cumpla todo lo que Agmen necesita. Si te falta algo, no compila (mejor eso que un error en el robot) |
+| `static_assert(...)` | El compilador revisa que el struct cumpla todo lo que Agmen necesita. Si algo no cuadra, no compila (mejor eso que un error en el robot) |
 
-💡 En Agmen 0.7 una herramienta generará este archivo por ti a partir del
-esquema. Hacerlo a mano una vez te enseña qué pasa por dentro.
+💡 Hasta Agmen 0.6 este struct se escribía a mano, y todavía se puede (así
+está `ImuSample` en `include/agmen/wire.hpp`). Con el `.agmen` no te puedes
+equivocar en el orden de los bytes, y el mismo archivo sirve para Python
+(capítulo 3) y para tipos mucho más grandes (capítulo 11).
 
 ## 3. El nodo `motor`
 
@@ -176,7 +193,7 @@ en su lugar (`left = 0.5`, `right = -0.5`). Recompila con
 
 ## Lo que aprendiste
 
-- A usar Agmen en **tu propio proyecto** con `add_subdirectory` + `agmen::core`.
+- A usar Agmen en **tu propio proyecto** con `add_subdirectory`, y a definir tu mensaje en un `.agmen`.
 - A definir **tu propio tipo de mensaje** y que el compilador lo valide.
 - Dos reglas de oro: **no confíes en los datos que llegan** y **frena si te
   quedas sin órdenes**.

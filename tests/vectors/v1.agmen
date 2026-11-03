@@ -1,0 +1,57 @@
+# Los tipos de los vectores de prueba (v1.txt), escritos como archivo .agmen.
+# test_gen.cpp revisa que el C++ que genera agmen gen ponga exactamente los
+# mismos bytes; python/test_idl.py hace lo mismo con agmen.load.
+package vectores
+
+message MotorCommand {
+    f32 left
+    f32 right
+}
+
+message ImuSample {
+    f32 ax; f32 ay; f32 az
+    f32 gx; f32 gy; f32 gz
+}
+
+message JointCommand7 {
+    u8 mode                # con relleno: 7 bytes de ceros antes de los f64
+    f64[7] position
+}
+
+struct Vec3 {
+    f64 x
+    f64 y
+    f64 z
+}
+
+message Pose {
+    Vec3 p
+    f32 yaw
+}
+
+message Flags {
+    bool a
+    u16 b
+    u8 c
+}
+
+message Matriz {
+    f32[2][3] m
+}
+
+message Tiempos {
+    time t
+    duration d
+    i8 x
+}
+
+message Enteros {
+    i8 a
+    i16 b
+    i32 c
+    i64 d
+    u8 e
+    u16 f
+    u32 g
+    u64 h
+}

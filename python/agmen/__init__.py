@@ -24,7 +24,19 @@ from . import schema, wire
 from ._version import __version__
 from .pubsub import Publisher, Sample, Subscriber
 
-__all__ = ["wire", "schema", "Publisher", "Subscriber", "Sample", "__version__", "ensure_utf8_output"]
+__all__ = ["wire", "schema", "Publisher", "Subscriber", "Sample", "__version__", "ensure_utf8_output", "load"]
+
+
+def load(path):
+    """Carga tus mensajes de un archivo .agmen, sin compilar nada (RFC 0005):
+
+        msgs = agmen.load("arca9.agmen")
+        pub = agmen.Publisher(msgs.Articulaciones, "/arca9/q")
+        pub.publish(msgs.Articulaciones(modo=msgs.Modo.TROTAR))
+    """
+    from .gen import load as _load
+
+    return _load(path)
 
 
 def ensure_utf8_output() -> None:

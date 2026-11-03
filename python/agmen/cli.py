@@ -184,6 +184,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="otra página que puede abrir el WebSocket en solo lectura (ej. tu propio visor)")
     p.set_defaults(func=cmd_web)
 
+    from .gen import add_parser as add_gen
+    add_gen(sub)
+
     p = sub.add_parser("mux", help="prioridad de comandos: reenvía la fuente más importante que esté hablando")
     p.add_argument("--out", required=True, metavar="IP:PUERTO", help="a dónde reenviar (ej. el motor)")
     p.add_argument("--in", dest="inputs", action="append", required=True, metavar="NOMBRE=IP:PUERTO@PRIORIDAD",

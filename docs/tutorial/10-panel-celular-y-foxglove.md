@@ -156,5 +156,5 @@ seq   5253 · 88 bytes · {'ax': -0.46, 'ay': -0.19, 'az': 9.81, 'gx': 0.0, 'gy'
   mientras manejas, el panel manda ALTO.
 - Foxglove (y Lichtblick) se conectan al mismo panel, en solo lectura.
 
-**Siguiente (Agmen 0.7.0):** defines tus mensajes en un archivo `.agmen` y
-Agmen escribe el código de C++ y de Python por ti.
+**Siguiente:** [capítulo 11](11-mensajes-agmen.md), tus mensajes en un archivo `.agmen`: Agmen escribe el
+código de C++ y de Python por ti.

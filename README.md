@@ -13,6 +13,10 @@ como paquetes opcionales.
   mensajes, no en un lenguaje. Un mensaje se describe con **una línea**
   (`Arca9Articulaciones{f32[12] q}`) y cualquier herramienta lo entiende sin
   código extra: `agmen echo` lo muestra en la terminal y el panel lo grafica.
+- **Tus mensajes, una sola vez:** los escribes en un archivo `.agmen` (con
+  enums, constantes y valores por defecto) y Agmen genera el código de C++
+  (`agmen_add_messages` en CMake) y de Python (`agmen.load`), sin cambiar los
+  bytes.
 - **Topics sin configurar nada:** `Publisher("/imu")` y `Subscriber("/imu")`,
   sin IPs ni puertos, y con cuantos receptores quieras. Un pequeño `agmen hub`
   por máquina hace de directorio, sin multicast (funciona en el WiFi de la
@@ -28,7 +32,7 @@ como paquetes opcionales.
   mandan al mismo motor, **un `[[mux]]` decide quién manda**: tú le ganas al
   modo autónomo y al soltar lo retoma solo.
 
-**Versión actual: 0.6.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
+**Versión actual: 0.7.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
 
 | Para… | Lee |
 |---|---|
@@ -37,7 +41,7 @@ como paquetes opcionales.
 | El formato de mensajes | [PROTOCOLO v1](docs/PROTOCOLO.md) (implementado) · [RFC 0001](docs/rfc/0001-formato-de-mensajes.md) (diseño y razones) · [vectores de prueba](tests/vectors/v1.txt) |
 | La interfaz web | [RFC 0002](docs/rfc/0002-interfaz-web.md) (aceptado, implementado en 0.6.0: WebSocket, red con clave, Foxglove) · [RFC 0003](docs/rfc/0003-lanzador-y-panel.md) (`agmen run` y panel) |
 | Topics y el hub | [RFC 0004](docs/rfc/0004-topics-y-descubrimiento.md) (aceptado, implementado en 0.5.0) |
-| Mensajes en archivos `.agmen` | [RFC 0005](docs/rfc/0005-esquemas-agmen.md) (propuesta para 0.7.0) |
+| Mensajes en archivos `.agmen` | [RFC 0005](docs/rfc/0005-esquemas-agmen.md) (aceptado, implementado en 0.7.0) |
 | Publicar versiones | [`docs/PUBLICAR.md`](docs/PUBLICAR.md) |
 
 ## Estado
@@ -49,8 +53,9 @@ como paquetes opcionales.
 | 0.3.0 ✅ | — | ¿Quién manda? Prioridad de comandos (teleop > autónomo) y paralelismo medido |
 | 0.4.0 ✅ | 1 | Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica |
 | 0.5.0 ✅ | 2 | Topics: los nodos se encuentran solos (`agmen hub`), `agmen topic list/info/echo/hz`, `agmen node list` |
-| **0.6.0 ✅** | **3** | **Panel por WebSocket: el navegador decodifica los bytes de Agmen, varias gráficas, inspector, celular con clave, compatible con Foxglove** |
-| … | 4–14 | Ver [`docs/VISION.md`](docs/VISION.md#7-roadmap-por-niveles) |
+| 0.6.0 ✅ | 3 | Panel por WebSocket: el navegador decodifica los bytes de Agmen, varias gráficas, inspector, celular con clave, compatible con Foxglove |
+| **0.7.0 ✅** | **4** | **Archivos `.agmen`: escribes tus mensajes una vez y se genera el código de C++ y de Python** |
+| … | 5–14 | Ver [`docs/VISION.md`](docs/VISION.md#7-roadmap-por-niveles) |
 
 ## Estructura
 
@@ -69,9 +74,11 @@ agmen/
 │   ├── mux.py               agmen mux: prioridad de comandos (¿quién manda?)
 │   ├── hub.py · hubproto.py agmen hub: el directorio de topics (RFC 0004)
 │   ├── topic.py             agmen topic list/info/echo/hz, agmen node list
+│   ├── idl.py · gen.py      archivos .agmen y agmen gen (RFC 0005)
 │   ├── ws.py                WebSocket con la librería estándar
 │   └── panel/               panel web: servidor, puente (bridge.py), agmen.js y la página
-├── scripts/                 interop, web, foxglove, run, paralelo, topics, tutorial y check_version (todos corren en el CI)
+├── cmake/                   AgmenMessages.cmake: agmen_add_messages()
+├── scripts/                 interop, web, foxglove, run, paralelo, topics, gen, tutorial y check_version (todos corren en el CI)
 ├── bench/                   mediciones que respaldan decisiones de diseño
 ├── docs/                    tutorial/, VISION, PROTOCOLO, VERSIONES, PUBLICAR, rfc/
 └── .github/workflows/       ci.yml (4 sistemas, ARM incluido, + sanitizers) · release.yml (PyPI + GitHub Release)
@@ -194,8 +201,16 @@ agmen::Subscriber<agmen::wire::ImuSample> sub("/imu");
 if (auto s = sub.receive(std::chrono::milliseconds(50))) { /* s->message, s->envelope */ }
 ```
 
-Para tus propios tipos de mensaje, ve el
-[capítulo 8 del tutorial](docs/tutorial/08-mensajes-v1-y-echo.md).
+Para tus propios tipos de mensaje, escríbelos en un archivo `.agmen` y CMake
+genera el header:
+
+```cmake
+agmen_add_messages(mi_robot_msgs mensajes/arca9.agmen)
+target_link_libraries(mi_nodo PRIVATE mi_robot_msgs)      # #include "arca9.hpp"
+```
+
+En Python, `msgs = agmen.load("mensajes/arca9.agmen")`. Todo en el
+[capítulo 11 del tutorial](docs/tutorial/11-mensajes-agmen.md).
 
 ## Qué aprendes en los niveles 0 y 1
 

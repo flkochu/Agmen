@@ -1,0 +1,10 @@
+# motor_command.agmen — el mensaje del tutorial (capítulos 2, 3 y 11).
+#
+# De aquí salen motor_command.hpp (C++, lo genera CMake con agmen_add_messages)
+# y la clase de Python (agmen.load en cerebro.py). Un solo lugar para el tipo.
+
+# Velocidad deseada de cada rueda, de -1 (reversa total) a +1 (adelante total).
+message MotorCommand {
+    f32 left     # rueda izquierda
+    f32 right    # rueda derecha
+}

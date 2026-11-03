@@ -7,8 +7,50 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 
 ## [Sin publicar]
 
-### Planeado (nivel 4, versión 0.7.0)
-- Lenguaje de esquemas `.agmen` y generador de código C++/Python.
+### Planeado (nivel 5, versión 0.8.0)
+- Executor y tiempo: varios temporizadores y frecuencias en un nodo, colas
+  por suscripción y el reloj de Agmen (real y simulación).
+
+## [0.7.0] — 2026-11-03
+
+**Nivel 4: tus mensajes en un archivo `.agmen`** (RFC 0005, aceptado). Escribes
+un mensaje una sola vez y Agmen genera el código de C++ y de Python. Los bytes
+no cambian.
+
+### Agregado
+- **Archivos `.agmen`**: `package`, `import`, `const`, `enum` (con base
+  entera), `struct`, `message`, arreglos fijos y valores por defecto. Los
+  comentarios pasan al código como documentación. Errores con
+  archivo:línea:columna y sugerencias (`'float' no existe en Agmen: usa
+  'f32'`, `¿quisiste decir 'TROTAR'?`).
+- **`agmen gen`**: escribe el `.hpp` de C++ (`--cpp`) y el `.py` de Python
+  (`--python`); `--check` muestra cada tipo con su esquema, `schema_id` y
+  tamaño; `--check-files` falla si los archivos generados están viejos.
+- **`agmen_add_messages(<target> <archivos>...)` en CMake**: genera los
+  headers al compilar y los regenera solo cuando cambias el `.agmen`. Funciona
+  también desde tu propio proyecto con `add_subdirectory(agmen)`. Necesita
+  Python ≥ 3.10, no `pip install`.
+- **`agmen.load("arca9.agmen")`**: los tipos en Python sin compilar nada;
+  ejecuta el mismo código que `agmen gen --python`.
+- C++ generado: los bytes exactos del layout `compact` (relleno en 0),
+  `to_string()` para los enums, un error claro si llega un valor de enum que
+  no existe, y `static_assert` de que su `schema_id` es el que calculó
+  `agmen gen`. En el núcleo: `agmen::wire::filled<T, N>()` y
+  `WireError::Kind::BadValue`.
+- `examples/mensajes/arca9.agmen` y `arca9_eco` (un perro robot de 12 servos);
+  capítulo 11 del tutorial.
+- Pruebas: `tests/test_gen.cpp` (el C++ generado contra los vectores),
+  `python/test_idl.py` y `scripts/gen_smoke.py` (C++ generado ↔ Python) en el
+  CI.
+
+### Cambiado
+- El `MotorCommand` del tutorial sale de `examples/tutorial/motor_command.agmen`
+  (antes `motor_command.hpp` escrito a mano) y `cerebro.py` usa `agmen.load`.
+  Capítulos 2 y 3 actualizados.
+
+### Sin cambios
+- El formato de los datos: un tipo generado y uno escrito a mano con el mismo
+  esquema son el mismo tipo.
 
 ## [0.6.0] — 2026-11-03
 

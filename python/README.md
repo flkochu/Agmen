@@ -49,6 +49,18 @@ agmen topic list            # qué topics hay, de qué tipo, quién manda y qui�
 agmen topic echo /imu       # los mensajes de un topic, sin quitarle el puerto a nadie
 ```
 
+Tus mensajes también pueden vivir en un archivo `.agmen`, el mismo que usa
+C++ para generar su código:
+
+```python
+msgs = agmen.load("arca9.agmen")
+pub = agmen.Publisher(msgs.Articulaciones, "/arca9/q")
+pub.publish(msgs.Articulaciones(q=[90.0] * 12, modo=msgs.Modo.TROTAR))
+```
+
+`agmen gen arca9.agmen --python .` escribe el `.py` (para el autocompletado
+de tu editor) y `agmen gen arca9.agmen` muestra cada tipo con su esquema.
+
 El panel también acepta a [Foxglove](https://foxglove.dev) (solo lectura):
 conéctate a `ws://127.0.0.1:8080/ws`.
 

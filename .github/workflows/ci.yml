@@ -62,6 +62,9 @@ jobs:
       - name: Topics y hub (C++ <-> Python, topic list/echo/hz, un topic un tipo)
         run: python scripts/topics_smoke.py
 
+      - name: Mensajes .agmen (C++ generado <-> Python con agmen.load)
+        run: python scripts/gen_smoke.py
+
       - name: Instalar el paquete y probar el comando agmen
         run: |
           python -m pip install .

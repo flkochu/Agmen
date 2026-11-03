@@ -92,6 +92,9 @@ if(WIN32)
     target_link_libraries(agmen_core PUBLIC ws2_32 winmm)
 endif()
 
+# Mensajes en archivos .agmen → código de C++ (RFC 0005): agmen_add_messages().
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/AgmenMessages.cmake)
+
 # ---------------------------------------------------------------------------
 # Ejemplos y pruebas
 # ---------------------------------------------------------------------------
@@ -102,11 +105,18 @@ if(AGMEN_BUILD_EXAMPLES)
         agmen_set_warnings(${name})
     endforeach()
     # Código del tutorial (docs/tutorial). Se compila y se prueba en el CI.
+    # motor_command.hpp sale de motor_command.agmen (capítulo 11).
+    agmen_add_messages(tutorial_msgs examples/tutorial/motor_command.agmen)
     foreach(name motor controlador)
         add_executable(tutorial_${name} examples/tutorial/${name}.cpp)
-        target_link_libraries(tutorial_${name} PRIVATE agmen::core)
+        target_link_libraries(tutorial_${name} PRIVATE tutorial_msgs)
         agmen_set_warnings(tutorial_${name})
     endforeach()
+    # Los mensajes de un perro robot de 12 servos (capítulo 11, scripts/gen_smoke.py).
+    agmen_add_messages(arca9_msgs examples/mensajes/arca9.agmen)
+    add_executable(arca9_eco examples/mensajes/arca9_eco.cpp)
+    target_link_libraries(arca9_eco PRIVATE arca9_msgs)
+    agmen_set_warnings(arca9_eco)
 endif()
 
 if(AGMEN_BUILD_TESTS)
@@ -118,4 +128,13 @@ if(AGMEN_BUILD_TESTS)
         AGMEN_VECTORS_FILE="${CMAKE_CURRENT_SOURCE_DIR}/tests/vectors/v1.txt")
     agmen_set_warnings(test_wire)
     add_test(NAME wire COMMAND test_wire)
+
+    # El C++ que genera agmen gen pone los mismos bytes que los vectores.
+    agmen_add_messages(vectores_msgs tests/vectors/v1.agmen)
+    add_executable(test_gen tests/test_gen.cpp)
+    target_link_libraries(test_gen PRIVATE vectores_msgs)
+    target_compile_definitions(test_gen PRIVATE
+        AGMEN_VECTORS_FILE="${CMAKE_CURRENT_SOURCE_DIR}/tests/vectors/v1.txt")
+    agmen_set_warnings(test_gen)
+    add_test(NAME gen COMMAND test_gen)
 endif()

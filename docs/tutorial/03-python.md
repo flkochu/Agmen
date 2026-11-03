@@ -23,7 +23,7 @@ pip install agmen
 
 Revisa:
 ```bash
-python3 -c "import agmen; print(agmen.__version__)"     # 0.4.0
+python3 -c "import agmen; print(agmen.__version__)"     # 0.7.0
 ```
 
 ## 2. El mismo mensaje, ahora en Python
@@ -31,8 +31,26 @@ python3 -c "import agmen; print(agmen.__version__)"     # 0.4.0
 En [`examples/tutorial/cerebro.py`](../../examples/tutorial/cerebro.py):
 
 ```python
-from dataclasses import dataclass
+from pathlib import Path
 import agmen
+
+# El MISMO archivo del que sale motor_command.hpp en C++ (capítulo 2)
+MotorCommand = agmen.load(Path(__file__).with_name("motor_command.agmen")).MotorCommand
+
+pub = agmen.Publisher(MotorCommand, "127.0.0.1:7500", topic="/cmd")
+pub.publish(MotorCommand(left=0.6, right=0.6))
+```
+
+`agmen.load` lee el `.agmen` y te da los tipos listos para usar, **sin
+compilar nada**: si cambias el archivo, vuelves a correr y ya. C++ y Python
+salen del mismo archivo, así que tienen el mismo esquema y el mismo
+`schema_id`: están hablando del mismo tipo.
+
+También lo puedes declarar directo en Python, sin archivo (así se hacía
+hasta Agmen 0.6, y sigue funcionando):
+
+```python
+from dataclasses import dataclass
 from agmen import wire
 
 @dataclass
@@ -40,18 +58,11 @@ class MotorCommand(wire.Message):
     SCHEMA = "MotorCommand{f32 left;f32 right}"   # ← el mismo esquema que en C++
     left: float
     right: float
-
-pub = agmen.Publisher(MotorCommand, "127.0.0.1:7500", topic="/cmd")
-pub.publish(MotorCommand(left=0.6, right=0.6))
 ```
 
-En Python **no escribes cómo se convierte a bytes**: Agmen lo saca del
-esquema (el mismo layout que el struct de C++). Solo los nombres de los
-atributos deben coincidir con los del esquema.
-
-Como el `SCHEMA` es idéntico, el `schema_id` es idéntico: C++ y Python están
-hablando del mismo tipo. **No hay "bindings" ni código generado: el
-formato es el contrato.**
+En Python **nunca escribes cómo se convierte a bytes**: Agmen lo saca del
+esquema (el mismo layout que el struct de C++). **El formato es el
+contrato.**
 
 💡 Para recibir, `agmen.Subscriber(MotorCommand, "127.0.0.1:7500")` y
 `sample = sub.receive(timeout=0.05)` (igual que en C++).
@@ -82,7 +93,7 @@ python3 examples/tutorial/cerebro.py
 ```
 
 ```
-[cerebro] Agmen 0.4.0 · decidiendo a 20 Hz → 127.0.0.1:7500
+[cerebro] Agmen 0.7.0 · decidiendo a 20 Hz → 127.0.0.1:7500
 [cerebro] schema_id de MotorCommand = 0x7b89fa708491f5dd (igual que en C++)
 [cerebro] distancia=1.10 m → camino libre → adelante
 [cerebro] distancia=0.49 m → obstáculo cerca → giro

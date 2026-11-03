@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Estado** | 📝 **Propuesta** (2026-11-03). Decisiones abiertas en la [sección 5](#5-decisiones) |
+| **Estado** | ✅ **Aceptado** (2026-11-03) e **implementado en Agmen 0.7.0**. Decisiones en la [sección 5](#5-decisiones); lo implementado, en la [sección 8](#8-lo-que-se-implementó-en-070) |
 | **Depende de** | RFC 0001 (esquemas en texto, texto canónico, `schema_id`, layout `compact`) |
 | **Versión** | Agmen 0.7.0 |
 
@@ -132,7 +132,7 @@ struct Articulaciones {
     static constexpr std::string_view kName = "Articulaciones";
     static constexpr std::string_view kSchema = "Articulaciones{f32[12] q;f32[12] kp;u8 modo}";
     std::array<float, 12> q{};
-    std::array<float, 12> kp = agmen::filled<float, 12>(1.0f);
+    std::array<float, 12> kp = agmen::wire::filled<float, 12>(1.0f);
     Modo modo = Modo::CAMINAR;
     void encode_payload(agmen::wire::Bytes& out) const;          // generado: alineación y relleno exactos
     static Articulaciones decode_payload(agmen::wire::ByteView);  // generado: revisa tamaño y enums
@@ -187,7 +187,9 @@ target_link_libraries(mi_nodo PRIVATE arca9_msgs)   # #include "arca9.hpp"
 
 ## 5. Decisiones
 
-| # | Pregunta | Opciones | Recomendada | Por qué |
+Aprobadas por Adán el 2026-11-03: la opción recomendada (a) en las cinco.
+
+| # | Pregunta | Opciones | Elegida | Por qué |
 |---|---|---|---|---|
 | **D1** | ¿Cómo se escribe el archivo? | (a) **Bloques `message Nombre { tipo nombre }`, varios por archivo** (§3.1), (b) estilo ROS `.msg`: un archivo por mensaje, sin llaves, (c) el texto del esquema tal cual, uno por línea | **(a)** | Se lee como C y como Protobuf; reusa tipos (`Vec3`) y agrupa los de un robot en un archivo. (b) es familiar para quien viene de ROS, pero cada tipo anidado es otro archivo y no hay enums. (c) no se lee en tipos grandes |
 | **D2** | ¿Quién genera el código de C++? | (a) **`agmen gen` en Python, llamado por CMake (`agmen_add_messages`)**, (b) un generador en C++ compilado por CMake, (c) nadie: generas a mano y subes los archivos a git | **(a)** | Una sola implementación: el lector de esquemas de Python ya existe y pasa los vectores. CMake regenera solo cuando cambia el `.agmen`. Pide Python al compilar, pero Agmen ya lo pide para `agmen run`, y ROS 2 hace lo mismo. (b) evita Python, pero sería un segundo lector que mantener igual al primero. (c) funciona sin nada extra, pero los archivos se quedan viejos sin que nadie lo note (para eso está `--check-files`) |
@@ -201,19 +203,49 @@ target_link_libraries(mi_nodo PRIVATE arca9_msgs)   # #include "arca9.hpp"
 |---|---|---|
 | 1 | El C++ generado debe poner los bytes **exactos** (alineación, relleno en 0) | El generador usa el mismo layout de `schema.py`; los tipos de los vectores de prueba se generan y su `encode` en C++ debe dar los mismos bytes que el vector |
 | 2 | Que CMake regenere solo cuando cambia el `.agmen` (y los `import`) | `add_custom_command` con `DEPENDS` en el `.agmen` y en lo que importa, como `protobuf_generate` |
-| 3 | Encontrar el Python correcto desde CMake (venv, Windows) | `find_package(Python3)` con un mensaje claro si falta: *"agmen_add_messages necesita Python con agmen instalado: pip install agmen"* |
+| 3 | Encontrar el Python correcto desde CMake (venv, Windows) | `find_package(Python3 3.10)` (si hay un venv activo, lo usa) con un mensaje claro si falta. Corre el paquete de la copia de Agmen (`PYTHONPATH`), así que no hace falta `pip install` |
 | 4 | Nombres que chocan con palabras reservadas de C++ o Python | Lista de palabras reservadas de los dos lenguajes; error con línea y columna |
 | 5 | Enums al decodificar: un nodo más nuevo manda un valor que este no conoce | Error claro con el valor y los nombres válidos (agregar un valor no cambia el `schema_id`, porque el enum viaja como su entero) |
-| 6 | Que el ejemplo del tutorial siga funcionando | `motor_command.hpp` pasa a generarse desde `examples/tutorial/tutorial.agmen`; `ImuSample` del núcleo se queda como está |
+| 6 | Que el ejemplo del tutorial siga funcionando | `motor_command.hpp` pasa a generarse desde `examples/tutorial/motor_command.agmen` (mismo nombre de header: el código no cambió); `ImuSample` del núcleo se queda como está |
 
-## 7. Plan para Agmen 0.7.0
+## 7. Plan para Agmen 0.7.0 (hecho)
 
 1. Lector del archivo `.agmen` (con errores de línea y columna) sobre `schema.py`.
 2. `agmen gen` para C++ y Python, y `agmen.load()`.
 3. `agmen_add_messages()` en CMake.
 4. Pruebas: los tipos de los vectores generados en C++ dan los mismos bytes;
    C++ generado ↔ Python con `agmen.load` (interop); errores.
-5. El tutorial pasa a `tutorial.agmen`; capítulo 11.
+5. El tutorial pasa a `motor_command.agmen`; capítulo 11.
+
+## 8. Lo que se implementó en 0.7.0
+
+| Parte | Dónde |
+|---|---|
+| Lector del `.agmen` (errores con archivo:línea:columna y sugerencias) | `python/agmen/idl.py`. Resuelve a los tipos de `schema.py` y revisa que el lector de siempre dé el mismo texto canónico |
+| Generador de C++ y Python, `agmen gen` y `agmen.load` | `python/agmen/gen.py`. `agmen.load` ejecuta exactamente el `.py` que escribe `agmen gen --python` (solo cambian las líneas de `import`) |
+| `agmen_add_messages(<target> <archivos>...)` | `cmake/AgmenMessages.cmake`: una biblioteca INTERFACE con los headers en `build/.../agmen_gen/<target>/`; `add_custom_command` que regenera al cambiar el `.agmen` o el generador; corre con el Python que encuentre `find_package(Python3 3.10)` y el paquete de esa copia de Agmen (no hace falta `pip install`) |
+| En el núcleo de C++ | `agmen::wire::filled<T, N>()` (arreglos con valor por defecto) y `WireError::Kind::BadValue` (un enum que no existe) |
+| Ejemplos | `examples/tutorial/motor_command.agmen` (el `motor_command.hpp` del tutorial ya no se escribe a mano), `examples/mensajes/arca9.agmen` y `arca9_eco.cpp` |
+| Pruebas | `tests/test_gen.cpp` (C++ generado desde `tests/vectors/v1.agmen` contra los vectores: texto, `schema_id`, valores y los mismos bytes al volver a codificar), `python/test_idl.py` (lector, errores, `agmen.load`, `--check-files`), `scripts/gen_smoke.py` (C++ generado ↔ Python entre procesos) |
+
+### Reglas que se fijaron al implementarlo
+
+- Las constantes y los valores de un enum van en MAYÚSCULAS (como las
+  constantes de ROS 2); los nombres no pueden empezar con `_` (el código
+  generado usa esos nombres por dentro) ni ser palabras de C++ o Python.
+- Los valores de un enum no se repiten; sin `= N`, siguen al anterior (como
+  en C). Un campo de tipo enum sin valor por defecto empieza con el primero.
+- Valores por defecto: números, `true`/`false`, el nombre de un valor del
+  enum, o `[...]` para un arreglo de una dimensión (un solo valor llena todo
+  el arreglo). En arreglos de varias dimensiones y en campos de tipo struct,
+  todavía no.
+- Un comentario al final de un campo, de una constante o de un valor del
+  enum pasa al código como su documentación (`///<` en C++, `#` en Python);
+  los comentarios justo arriba de un tipo, como su descripción.
+- `agmen gen` también genera lo que importa cada archivo. En
+  `agmen_add_messages` se listan todos los `.agmen` que se usan (también los
+  importados), para que CMake sepa cuáles vigilar.
+- `agmen gen` no reescribe un archivo que no cambió, para no recompilar de más.
 
 ## Fuentes
 

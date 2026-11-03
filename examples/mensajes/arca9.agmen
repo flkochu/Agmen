@@ -1,0 +1,44 @@
+# arca9.agmen — los mensajes de un perro robot de 12 servos (capítulo 11).
+#
+#   C++:    agmen_add_messages(arca9_msgs arca9.agmen)  → #include "arca9.hpp"
+#   Python: msgs = agmen.load("arca9.agmen")
+package arca9
+
+const u8 PATAS = 4
+const u8 SERVOS = 12              # 3 por pata
+
+# Qué está haciendo el robot. En los bytes viaja como un u8.
+enum Modo : u8 {
+    QUIETO = 0
+    CAMINAR = 1                   # paso lento, siempre 3 patas en el suelo
+    TROTAR = 2                    # patas diagonales a la vez
+}
+
+# Un punto o una dirección en 3D, en metros.
+struct Vec3 {
+    f32 x
+    f32 y
+    f32 z
+}
+
+# Lo que el cerebro le pide a los servos.
+message Articulaciones {
+    f32[12] q                     # ángulo de cada servo, en grados
+    f32[12] kp = 1.0              # ganancia de cada servo
+    Modo modo = QUIETO
+}
+
+# Lo que reporta el robot.
+message Estado {
+    u32 ciclo                     # cuántos ciclos de control lleva
+    f32[12] q_medida              # lo que miden los servos, en grados
+    f32 voltaje = 7.4             # batería, en volts
+    bool[4] apoyo                 # qué patas tocan el suelo
+    Modo modo
+}
+
+# Dónde está el cuerpo y hacia dónde mira.
+message Pose {
+    Vec3 p
+    f32 yaw                       # en radianes
+}

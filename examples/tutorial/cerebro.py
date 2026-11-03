@@ -15,22 +15,13 @@ decide, C++ ejecuta.
 import argparse
 import math
 import time
-from dataclasses import dataclass
+from pathlib import Path
 
 import agmen
-from agmen import wire
 
-
-@dataclass
-class MotorCommand(wire.Message):
-    """El MISMO mensaje que motor_command.hpp: mismo SCHEMA → mismo schema_id.
-
-    En Python basta con el esquema y los campos: Agmen arma solo cómo se
-    convierte a bytes (el layout compact, igual que el struct de C++)."""
-
-    SCHEMA = "MotorCommand{f32 left;f32 right}"
-    left: float
-    right: float
+# El MISMO mensaje que usa el motor en C++: los dos salen de motor_command.agmen
+# (capítulo 11). agmen.load lo lee sin compilar nada; mismo esquema → mismo schema_id.
+MotorCommand = agmen.load(Path(__file__).with_name("motor_command.agmen")).MotorCommand
 
 
 def leer_distancia(t: float) -> float:
