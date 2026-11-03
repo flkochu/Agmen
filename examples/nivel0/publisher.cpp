@@ -44,7 +44,8 @@ int main(int argc, char** argv) try {
     const auto start = steady_clock::now();
     auto last_report = start;
     std::uint64_t seq = 0;
-    std::uint64_t overruns = 0;
+    std::uint64_t overruns = 0;   // ciclos en los que despertamos tarde (aunque sea 1 µs)
+    nanoseconds worst_lag{0};     // el peor atraso contra el horario: si crece, nos estamos quedando atrás
 
     while (count == 0 || seq < count) {
         // IMU simulada: el robot oscila suavemente.
@@ -76,11 +77,13 @@ int main(int argc, char** argv) try {
             agmen::platform::sleep_until(deadline);
         } else {
             ++overruns;  // vamos tarde: no dormimos
+            worst_lag = std::max(worst_lag, duration_cast<nanoseconds>(steady_clock::now() - deadline));
         }
     }
 
-    std::printf("[publisher] terminado: %llu mensajes, %llu retrasos\n",
-                static_cast<unsigned long long>(seq), static_cast<unsigned long long>(overruns));
+    std::printf("[publisher] terminado: %llu mensajes, %llu retrasos, atraso_max=%.1f ms\n",
+                static_cast<unsigned long long>(seq), static_cast<unsigned long long>(overruns),
+                duration<double, std::milli>(worst_lag).count());
     return 0;
 } catch (const std::exception& e) {
     std::fprintf(stderr, "[publisher] error: %s\n", e.what());

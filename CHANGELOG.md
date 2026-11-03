@@ -45,6 +45,10 @@ IPs ni puertos, con cuantos receptores quieras (RFC 0004, aceptado).
   datos) y `scripts/topics_smoke.py` en el CI (C++ ↔ Python en el mismo
   topic, choque de tipos, 1000 Hz a 1 y a 5 receptores sin pérdidas).
 - Tutorial: capítulo 9 (topics); capítulos 5, 6 y 8 actualizados.
+- El publisher de ejemplo reporta al final su peor atraso contra el horario
+  (`atraso_max=… ms`). `topics_smoke` revisa ese número (< 500 ms) en vez de
+  exigir `retrasos=0`, que en las máquinas virtuales de macOS del CI es
+  imposible: su `sleep` despierta tarde seguido aunque nada se atrase.
 
 ### Sin cambios
 - El formato de los datos (v1) es el mismo de 0.4.0: un nodo 0.4 en modo
