@@ -56,7 +56,7 @@ class TestVectores(unittest.TestCase):
         for _, canon, topic, src, seq, t_data, t_pub, payload, packet in vectors("message"):
             with self.subTest(esquema=canon):
                 layout = schema.Layout(canon)
-                env = wire.Envelope(wire.ENC_COMPACT, 0, layout.schema_id, wire.topic_id(topic),
+                env = wire.Envelope(layout.encoding, 0, layout.schema_id, wire.topic_id(topic),
                                     int(src, 16), int(seq), int(t_data), int(t_pub),
                                     len(payload) // 2, wire.CLOCK_REAL)
                 self.assertEqual((env.pack() + bytes.fromhex(payload)).hex(), packet)
@@ -163,11 +163,31 @@ class TestPubSub(unittest.TestCase):
         for x in (sub, pub, imu):
             x.close()
 
+    def test_mensaje_compact_de_60_kb(self):
+        # macOS limita los datagramas a 9 KB si el socket no pide más (RFC 0008 §1.2):
+        # un mensaje compact grande debe salir igual en los tres sistemas.
+        @dataclass
+        class Grande(wire.Message):
+            SCHEMA = "Grande{f32[15000] x}"
+            x: list
+
+        sub = agmen.Subscriber(Grande, "127.0.0.1:0")
+        pub = agmen.Publisher(Grande, f"127.0.0.1:{sub.port}", topic="/grande")
+        try:
+            pub.publish(Grande(x=[float(k % 100) for k in range(15000)]))
+            s = sub.receive(1)
+            self.assertIsNotNone(s, "no llegó el mensaje de 60 KB")
+            self.assertEqual(len(s.message.x), 15000)
+            self.assertEqual(s.message.x[14999], 99.0)
+        finally:
+            sub.close()
+            pub.close()
+
 
 class TestSchema(unittest.TestCase):
     def test_errores_claros(self):
         casos = {
-            "A{float x}": "usa 'f32'", "A{string s}": "arrow", "A{f32[] x}": "arrow",
+            "A{float x}": "usa 'f32'", "A{str s}": "usa 'string'", "A{optional f32 x}": "todavía no",
             "A{}": "no tiene campos", "A{f32 x;f32 x}": "repetido", "A{f32 x} y": "sobra",
             "A{f32[0] x}": "tamaño de arreglo", "agmen/2 A{f32 x}": "agmen/2", "A{Vec3 p}": "desconocido",
         }

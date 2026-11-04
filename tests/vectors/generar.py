@@ -30,6 +30,24 @@ SCHEMAS = [
       "h": 18446744073709551615}),
 ]
 
+# Codificación arrow (RFC 0008): (entrada, valores). Los valores se escriben
+# como los acepta Python: bytes como b'...', un tensor como {'shape', 'data'}.
+ARROW = [
+    ("Texto{string s;u8 n}", {"s": "hola, ñandú", "n": 7}),
+    ("Blob{bytes b;u16 k}", {"b": bytes(range(10)), "k": 513}),
+    ("Grande { bytes b }", {"b": bytes(i % 251 for i in range(100))}),
+    ("Lista{f32[] x;i64[] y;bool[] z}", {"x": [1.5, -2.0, 0.25], "y": [], "z": [True, False, True, True]}),
+    ("Tensor{tensor<f32,2> m;tensor<u8,1> v}", {"m": {"shape": (2, 3), "data": [1, 2, 3, 4, 5, 6]},
+                                                "v": {"shape": (0,), "data": []}}),
+    ("Imagen{time timestamp;string frame_id;u32 width;u32 height;string encoding;u32 step;bytes data}",
+     {"timestamp": 1700000000123456789, "frame_id": "camara", "width": 2, "height": 2, "encoding": "rgb8",
+      "step": 6, "data": bytes([255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255])}),
+    ("Mixto{Vec3{f64 x;f64 y;f64 z}[] pts;string[] tags;f32[2][2] m;u8[3] c;Par{u8 a;string b}[2] pares;"
+     "duration d}",
+     {"pts": [{"x": 1.0, "y": 2.0, "z": 3.0}, {"x": -1.0, "y": 0.5, "z": 0.0}], "tags": ["a", "", "ñ"],
+      "m": [[1, 2], [3, 4]], "c": [7, 8, 9], "pares": [{"a": 1, "b": "uno"}, {"a": 2, "b": "dos"}], "d": -5}),
+]
+
 SOURCE = 0x0123456789ABCDEF
 T_DATA = 1_700_000_000_000_000_000
 T_PUB = T_DATA + 250_000
@@ -52,6 +70,24 @@ for (text, values), (topic, seq) in zip(SCHEMAS[:3], [("/cmd", 7), ("/imu", 0), 
                         T_DATA, T_PUB, len(payload), wire.CLOCK_REAL)
     print("\t".join(["message", layout.text, topic, f"{SOURCE:#018x}", str(seq), str(T_DATA), str(T_PUB),
                      payload.hex(), (env.pack() + payload).hex()]))
+
+print("#")
+print("# arrow  entrada  texto_canónico  schema_id  valores(python)  payload_hex   (RFC 0008)")
+for text, values in ARROW:
+    layout = schema.Layout(text)
+    assert layout.encoding == wire.ENC_ARROW
+    print("\t".join(["arrow", text, layout.text, f"{layout.schema_id:#018x}", repr(values),
+                     layout.pack(values).hex()]))
+
+print("#")
+print("# message  (arrow)  texto_canónico  topic  source_id  seq  t_data  t_pub  payload_hex  paquete_hex")
+text, values = ARROW[5]
+layout = schema.Layout(text)
+payload = layout.pack(values)
+env = wire.Envelope(wire.ENC_ARROW, 0, layout.schema_id, wire.topic_id("/camara"), SOURCE, 42,
+                    T_DATA, T_PUB, len(payload), wire.CLOCK_REAL)
+print("\t".join(["message", layout.text, "/camara", f"{SOURCE:#018x}", "42", str(T_DATA), str(T_PUB),
+                 payload.hex(), (env.pack() + payload).hex()]))
 
 print("#")
 print("# announcement  texto_canónico  topic  source_id  seq  t  paquete_hex")

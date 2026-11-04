@@ -121,6 +121,9 @@ struct Where {
 class PyLayout {
 public:
     explicit PyLayout(const std::string& text) : l_(text) {
+        if (!l_.fixed()) {   // arrow: lo codifica agmen.arrow (Python), no este Layout
+            throw agmen::schema::SchemaError("'" + l_.name() + "' tiene campos de tamaño variable: va en arrow");
+        }
         // Nombres de los campos como objetos de Python, una sola vez.
         keys_.resize(l_.types().size());
         for (std::uint32_t i = 0; i < l_.types().size(); ++i) {
@@ -172,6 +175,11 @@ private:
     void write(std::uint32_t ti, PyObject* v, std::uint8_t* at, const Where& where) const {
         const Type& t = l_.type(ti);
         switch (t.kind) {
+            case Type::Kind::String:
+            case Type::Kind::Bytes:
+            case Type::Kind::List:
+            case Type::Kind::Tensor:
+                return;  // no llega aquí: el constructor solo acepta esquemas de tamaño fijo
             case Type::Kind::Prim:
                 write_prim(t.prim, v, at, where);
                 return;
@@ -285,6 +293,11 @@ private:
     PyObject* read(std::uint32_t ti, const std::uint8_t* at) const {
         const Type& t = l_.type(ti);
         switch (t.kind) {
+            case Type::Kind::String:
+            case Type::Kind::Bytes:
+            case Type::Kind::List:
+            case Type::Kind::Tensor:
+                Py_RETURN_NONE;  // no llega aquí: el constructor solo acepta esquemas de tamaño fijo
             case Type::Kind::Prim:
                 return read_prim(t.prim, at);
             case Type::Kind::Array: {
@@ -687,8 +700,18 @@ NB_MODULE(_core, m) {
             const agmen::wire::ByteView data(static_cast<const std::uint8_t*>(view.buf),
                                              static_cast<std::size_t>(view.len));
             const auto [env, payload] = agmen::wire::Envelope::read_from(data);
-            auto out = nb::make_tuple(env_tuple(env), nb::bytes(reinterpret_cast<const char*>(payload.data()),
-                                                                  payload.size()));
+            nb::object body;
+            if (env.encoding == agmen::wire::Encoding::Arrow) {
+                // Datos grandes: una vista (memoryview) del paquete, sin copiar (RFC 0008).
+                nb::object mv = nb::steal(PyMemoryView_FromObject(buf.ptr()));
+                if (!mv.is_valid()) throw nb::python_error();
+                body = nb::steal(PySequence_GetSlice(mv.ptr(), static_cast<Py_ssize_t>(env.header_len),
+                                                     static_cast<Py_ssize_t>(view.len)));
+                if (!body.is_valid()) throw nb::python_error();
+            } else {
+                body = nb::bytes(reinterpret_cast<const char*>(payload.data()), payload.size());
+            }
+            auto out = nb::make_tuple(env_tuple(env), body);
             PyBuffer_Release(&view);
             return out;
         } catch (...) {

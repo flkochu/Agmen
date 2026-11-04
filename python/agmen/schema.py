@@ -16,12 +16,21 @@ De aquí sale todo lo demás:
     panel) lee cualquier mensaje con solo conocer su texto, sin código
     compilado para ese tipo.
 
-En el nivel 1 todos los tipos son de tamaño fijo:
+Tipos de tamaño fijo (codificación `compact`, RFC 0001 §4):
 
     bool i8 u8 i16 u16 i32 u32 i64 u64 f32 f64 time duration
     T[N]   T[N][M]   Nombre{...} (struct anidado)
 
-`T[N][M]` es como en C: N arreglos de M elementos.
+Tipos de tamaño variable (codificación `arrow`, RFC 0008, desde Agmen 0.10):
+
+    string        texto UTF-8
+    bytes         bytes sin interpretar (una imagen, un JPEG)
+    T[]           arreglo de tamaño variable
+    tensor<T,N>   arreglo de N dimensiones con su forma (T numérico)
+
+`T[N][M]` es como en C: N arreglos de M elementos; `f32[][3]` es una lista de
+f32[3]. Si un esquema tiene un solo campo variable, todo el mensaje va en
+`arrow` (agmen.arrow); si no, en `compact`, como siempre.
 """
 
 from __future__ import annotations
@@ -51,7 +60,10 @@ _ALIASES = {
     "int64": "i64", "int64_t": "i64", "uint64": "u64", "uint64_t": "u64", "long": "i64",
     "boolean": "bool",
 }
-_VARIABLE = {"string", "bytes", "tensor", "optional"}
+_VARIABLE = {"string", "bytes", "tensor", "optional"}   # (los que no son de tamaño fijo)
+VARLEN = ("string", "bytes")
+TENSOR_ELEMS = ("i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64")
+MAX_TENSOR_DIMS = 32
 
 MAX_ARRAY = 1 << 20
 
@@ -99,19 +111,57 @@ class Array:
     n: int
 
     @property
-    def size(self) -> int:
-        return self.elem.size * self.n
+    def size(self) -> int | None:
+        return None if self.elem.size is None else self.elem.size * self.n
 
     @property
-    def align(self) -> int:
+    def align(self) -> int | None:
         return self.elem.align
 
     def canonical(self) -> str:
-        dims, base = [], self
-        while isinstance(base, Array):
-            dims.append(base.n)
-            base = base.elem
-        return base.canonical() + "".join(f"[{d}]" for d in dims)
+        return _canonical_dims(self)
+
+
+@dataclass(frozen=True)
+class Var:
+    """`string` (texto UTF-8) o `bytes`: tamaño variable."""
+    name: str
+    size = None
+    align = None
+
+    def canonical(self) -> str:
+        return self.name
+
+
+@dataclass(frozen=True)
+class Seq:
+    """`T[]`: arreglo de tamaño variable."""
+    elem: "Type"
+    size = None
+    align = None
+
+    def canonical(self) -> str:
+        return _canonical_dims(self)
+
+
+@dataclass(frozen=True)
+class Tensor:
+    """`tensor<T,N>`: arreglo de N dimensiones con su forma, que viaja con él."""
+    elem: "Prim"
+    ndim: int
+    size = None
+    align = None
+
+    def canonical(self) -> str:
+        return f"tensor<{self.elem.name},{self.ndim}>"
+
+
+def _canonical_dims(t) -> str:
+    dims, base = [], t
+    while isinstance(base, (Array, Seq)):
+        dims.append(f"[{base.n}]" if isinstance(base, Array) else "[]")
+        base = base.elem
+    return base.canonical() + "".join(dims)
 
 
 @dataclass(frozen=True)
@@ -125,17 +175,24 @@ class Field:
 class Struct:
     name: str
     fields: tuple[Field, ...]
-    size: int
-    align: int
+    size: int | None          # None: tiene algún campo de tamaño variable
+    align: int | None
 
     def canonical(self) -> str:
         return self.name + "{" + ";".join(f"{f.type.canonical()} {f.name}" for f in self.fields) + "}"
 
 
-Type = Prim | Array | Struct
+Type = Prim | Array | Struct | Var | Seq | Tensor
+
+
+def is_fixed(t: Type) -> bool:
+    """¿Tamaño fijo (cabe en compact)?"""
+    return t.size is not None
 
 
 def _make_struct(name: str, fields: list[tuple[str, Type]]) -> Struct:
+    if any(ft.size is None for _, ft in fields):     # variable: sin offsets (va en arrow)
+        return Struct(name, tuple(Field(fname, ftype, 0) for fname, ftype in fields), None, None)
     offset, align, out = 0, 1, []
     for fname, ftype in fields:
         offset = -(-offset // ftype.align) * ftype.align    # alinear hacia arriba
@@ -221,31 +278,53 @@ class _Parser:
             name = tok[1]
             if name in PRIMITIVES:
                 base = Prim(name)
+            elif name in VARLEN:
+                base = Var(name)
+            elif name == "tensor":
+                base = self.parse_tensor(tok[2])
             elif name in _ALIASES:
                 raise self.error(f"tipo '{name}' no existe en Agmen: usa '{_ALIASES[name]}'", tok[2])
-            elif name in _VARIABLE:
-                raise self.error(f"'{name}' es de tamaño variable: llega con la codificación arrow "
-                                 f"(nivel 7). En el nivel 1 solo hay tipos de tamaño fijo", tok[2])
+            elif name == "optional":
+                raise self.error("'optional' todavía no existe en Agmen: usa un valor que signifique "
+                                 "'no hay' (ej. -1) o un bool al lado", tok[2])
+            elif name == "str":
+                raise self.error("tipo 'str' no existe en Agmen: usa 'string'", tok[2])
             else:
-                raise self.error(f"tipo desconocido '{name}'. Usa {', '.join(PRIMITIVES)} "
-                                 f"o un struct anidado Nombre{{...}}", tok[2])
-        dims: list[int] = []
+                raise self.error(f"tipo desconocido '{name}'. Usa {', '.join(PRIMITIVES)}, string, bytes, "
+                                 f"tensor<T,N> o un struct anidado Nombre{{...}}", tok[2])
+        dims: list[int | None] = []
         while (t := self.peek()) is not None and t[0] == "sym" and t[1] == "[":
             self.i += 1
             t = self.peek()
             if t is not None and t[0] == "sym" and t[1] == "]":
-                raise self.error("los arreglos de tamaño variable (T[]) llegan con la codificación "
-                                 "arrow (nivel 7). Usa un tamaño fijo, ej. f32[3]")
-            n_tok = self.take("num", what="el tamaño del arreglo")
+                self.i += 1
+                dims.append(None)          # T[]: tamaño variable
+                continue
+            n_tok = self.take("num", what="el tamaño del arreglo o ']'")
             n = int(n_tok[1])
             if n < 1 or n > MAX_ARRAY or (len(n_tok[1]) > 1 and n_tok[1][0] == "0"):
                 raise self.error(f"tamaño de arreglo inválido '{n_tok[1]}' (de 1 a {MAX_ARRAY}, sin ceros "
                                  f"a la izquierda)", n_tok[2])
             self.take("sym", "]")
             dims.append(n)
-        for n in reversed(dims):   # f32[2][3] = 2 arreglos de f32[3]
-            base = Array(base, n)
+        for n in reversed(dims):   # f32[2][3] = 2 arreglos de f32[3]; f32[][3] = lista de f32[3]
+            base = Seq(base) if n is None else Array(base, n)
         return base
+
+    def parse_tensor(self, at: int) -> Tensor:
+        """tensor<T,N> (ya se leyó 'tensor')."""
+        self.take("sym", "<", "'<' (se escribe tensor<f32,2>)")
+        t = self.take("id", what="el tipo de los elementos (ej. tensor<f32,2>)")
+        if t[1] not in TENSOR_ELEMS:
+            raise self.error(f"un tensor solo puede ser de números ({', '.join(TENSOR_ELEMS)}), no de "
+                             f"'{t[1]}'", t[2])
+        self.take("sym", ",", "',' y el número de dimensiones (ej. tensor<f32,2>)")
+        n = self.take("num", what="el número de dimensiones (de 1 a 32)")
+        ndim = int(n[1])
+        if ndim < 1 or ndim > MAX_TENSOR_DIMS or n[1][0] == "0":
+            raise self.error(f"número de dimensiones inválido '{n[1]}' (de 1 a {MAX_TENSOR_DIMS})", n[2])
+        self.take("sym", ">", "'>'")
+        return Tensor(Prim(t[1]), ndim)
 
 
 def parse(text: str) -> Struct:
@@ -276,17 +355,26 @@ def schema_id(text: str) -> int:
 # ---------------------------------------------------------------------------
 
 class Layout:
-    """Layout compact de un esquema: codifica y decodifica sin código generado.
+    """El codificador de un esquema, sin código generado.
 
-    Por dentro arma un `struct.Struct` con el relleno explícito ('x'), así que
-    es tan rápido como escribir el formato a mano."""
+    Con tamaño fijo usa `compact` (un `struct.Struct` con el relleno explícito,
+    tan rápido como escribir el formato a mano). Con algún campo variable
+    (string, bytes, T[], tensor) usa `arrow` (agmen.arrow, RFC 0008)."""
 
     def __init__(self, text: str) -> None:
         self.root = parse(text)
         self.text = PREFIX + self.root.canonical()
         self.schema_id = fnv1a64(self.text.encode())
         self.name = self.root.name
-        self.size = self.root.size
+        self.size = self.root.size            # None si es de tamaño variable
+        self.fixed = self.size is not None
+        self.encoding = 1 if self.fixed else 2    # wire.ENC_COMPACT / wire.ENC_ARROW
+        self._native = None
+        if not self.fixed:
+            from . import arrow
+
+            self._arrow = arrow.Codec(self.root)
+            return
         fmt: list[str] = []
         self._emit(self.root, 0, fmt)
         self._struct = struct.Struct("<" + "".join(fmt))
@@ -347,7 +435,9 @@ class Layout:
         return {f.name: Layout._build(f.type, it) for f in t.fields}
 
     def pack(self, value) -> bytes:
-        """dict u objeto con los campos del esquema → bytes compact (1 fila)."""
+        """dict u objeto con los campos del esquema → payload (1 fila)."""
+        if not self.fixed:
+            return self._arrow.encode(value)
         flat: list = []
         try:
             self._flatten(self.root, value, flat, "")
@@ -358,8 +448,18 @@ class Layout:
         return self._struct.pack(*flat)
 
     def unpack(self, payload: bytes, offset: int = 0) -> dict:
-        """bytes compact (1 fila) → dict con los campos (arreglos como listas)."""
+        """payload (1 fila) → dict con los campos (arreglos como listas)."""
+        if not self.fixed:
+            return self._arrow.decode(payload)
         return self._build(self.root, iter(self._struct.unpack_from(payload, offset)))
+
+    def decode(self, payload, numpy: bool = False) -> dict:
+        """Como unpack; con numpy=True los arreglos de números son numpy.ndarray
+        de solo lectura que apuntan a `payload`, sin copiar."""
+        if not self.fixed:
+            return self._arrow.decode(payload, numpy=numpy)
+        d = self.unpack(payload)
+        return self.numpy_fields(payload, d) if numpy else d
 
     def numpy_fields(self, payload, d: dict) -> dict:
         """Cambia los arreglos de números de `d` (lo que dio unpack) por
@@ -392,7 +492,9 @@ class Layout:
                 "description": self.text, **_json_type(self.root)}
 
     def unpack_rows(self, payload: bytes) -> list[dict]:
-        """Un payload puede traer N filas seguidas (RFC 0001 §4)."""
+        """Un payload puede traer N filas (RFC 0001 §4 y §6)."""
+        if not self.fixed:
+            return self._arrow.decode_rows(payload)
         if len(payload) % self.size:
             raise SchemaError(f"payload de {len(payload)} bytes: no es múltiplo de {self.size} "
                               f"(el tamaño de '{self.name}')")
@@ -405,6 +507,18 @@ _NP_DTYPES = {"bool": "?", "i8": "<i1", "u8": "<u1", "i16": "<i2", "u16": "<u2",
 
 
 def _json_type(t: Type) -> dict:
+    if isinstance(t, Var):
+        if t.name == "string":
+            return {"type": "string"}
+        return {"type": "string", "contentEncoding": "base64"}
+    if isinstance(t, Seq):
+        return {"type": "array", "items": _json_type(t.elem)}
+    if isinstance(t, Tensor):
+        return {"type": "object", "description": f"tensor<{t.elem.name},{t.ndim}>",
+                "properties": {"shape": {"type": "array", "items": {"type": "integer"},
+                                         "minItems": t.ndim, "maxItems": t.ndim},
+                               "data": {"type": "array", "items": _json_type(t.elem)}},
+                "required": ["shape", "data"]}
     if isinstance(t, Prim):
         kind = _JSON_PRIMS.get(t.name, "integer")
         out: dict = {"type": kind}
@@ -417,15 +531,21 @@ def _json_type(t: Type) -> dict:
             "required": [f.name for f in t.fields]}
 
 
+FLATTEN_MAX = 64     # un arreglo más largo no se grafica número por número
+
+
 def flatten_numbers(value, prefix: str = "") -> dict[str, float]:
-    """{'pos': {'x': 1}, 'q': [1, 2]} → {'pos.x': 1, 'q[0]': 1, 'q[1]': 2}. Para graficar."""
+    """{'pos': {'x': 1}, 'q': [1, 2]} → {'pos.x': 1, 'q[0]': 1, 'q[1]': 2}. Para graficar.
+
+    Texto, bytes, tensores y arreglos de más de FLATTEN_MAX números se saltan."""
     out: dict[str, float] = {}
     if isinstance(value, dict):
         for k, v in value.items():
             out.update(flatten_numbers(v, f"{prefix}.{k}" if prefix else k))
-    elif isinstance(value, list):
-        for k, v in enumerate(value):
-            out.update(flatten_numbers(v, f"{prefix}[{k}]"))
-    else:
+    elif isinstance(value, (list, tuple)):
+        if len(value) <= FLATTEN_MAX:
+            for k, v in enumerate(value):
+                out.update(flatten_numbers(v, f"{prefix}[{k}]"))
+    elif isinstance(value, (bool, int, float)):
         out[prefix] = float(value)
     return out

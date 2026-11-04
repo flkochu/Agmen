@@ -10,6 +10,10 @@
 //   // m.kind === "announcement" → aprendió un esquema
 //   // m.kind === "data"         → m.topic, m.layout.name, m.rows[0] = { ax: 0.1, ... }
 //
+// Desde Agmen 0.10 también lee la codificación arrow (RFC 0008): string → texto,
+// bytes → Uint8Array (sin copiar), T[] → arreglo, tensor<T,N> → { shape, data }
+// con data en un TypedArray.
+//
 // Sin dependencias. Funciona en el navegador (global `Agmen`) y en Node (require).
 (function (root, factory) {
   const api = factory();
@@ -31,7 +35,7 @@
     uint: "u32", uint32: "u32", int8: "i8", uint8: "u8", byte: "u8", char: "i8", int16: "i16",
     uint16: "u16", int64: "i64", uint64: "u64", long: "i64", boolean: "bool",
   };
-  const VARIABLE = new Set(["string", "bytes", "tensor", "optional"]);
+  const TENSOR_ELEMS = new Set(["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64"]);
   const MAX_ARRAY = 1 << 20;
 
   class AgmenError extends Error {}
@@ -66,6 +70,9 @@
   function alignUp(n, a) { return Math.ceil(n / a) * a; }
 
   function makeStruct(name, fields) {
+    if (fields.some(([, t]) => t.size == null)) {   // tamaño variable: va en arrow
+      return { kind: "struct", name, fields: fields.map(([fname, type]) => ({ name: fname, type, offset: 0 })), size: null, align: null };
+    }
     let offset = 0, align = 1;
     const out = [];
     for (const [fname, type] of fields) {
@@ -78,12 +85,13 @@
   }
 
   function canonicalOf(t) {
-    if (t.kind === "prim") return t.name;
-    if (t.kind === "array") {
+    if (t.kind === "prim" || t.kind === "var") return t.name;
+    if (t.kind === "tensor") return `tensor<${t.elem.name},${t.ndim}>`;
+    if (t.kind === "array" || t.kind === "list") {
       const dims = [];
       let base = t;
-      while (base.kind === "array") { dims.push(base.n); base = base.elem; }
-      return canonicalOf(base) + dims.map((d) => `[${d}]`).join("");
+      while (base.kind === "array" || base.kind === "list") { dims.push(base.kind === "array" ? `[${base.n}]` : "[]"); base = base.elem; }
+      return canonicalOf(base) + dims.join("");
     }
     return t.name + "{" + t.fields.map((f) => `${canonicalOf(f.type)} ${f.name}`).join(";") + "}";
   }
@@ -116,13 +124,25 @@
         i++;
         const name = t[1];
         if (name in PRIMS) base = { kind: "prim", name, size: PRIMS[name], align: PRIMS[name] };
-        else if (name in ALIASES) fail(`tipo '${name}' no existe en Agmen: usa '${ALIASES[name]}'`);
-        else if (VARIABLE.has(name)) fail(`'${name}' es de tamaño variable (llega con arrow, nivel 7)`);
+        else if (name === "string" || name === "bytes") base = { kind: "var", name, size: null, align: null };
+        else if (name === "tensor") {
+          take("sym", "<");
+          const e = take("id", undefined, "el tipo de los elementos")[1];
+          if (!TENSOR_ELEMS.has(e)) fail(`un tensor solo puede ser de números, no de '${e}'`);
+          take("sym", ",");
+          const n = take("num", undefined, "el número de dimensiones");
+          const nd = parseInt(n[1], 10);
+          if (nd < 1 || nd > 32 || n[1][0] === "0") fail(`número de dimensiones inválido '${n[1]}' (de 1 a 32)`);
+          take("sym", ">");
+          base = { kind: "tensor", elem: { kind: "prim", name: e, size: PRIMS[e], align: PRIMS[e] }, ndim: nd, size: null, align: null };
+        } else if (name in ALIASES) fail(`tipo '${name}' no existe en Agmen: usa '${ALIASES[name]}'`);
+        else if (name === "optional") fail("'optional' todavía no existe en Agmen");
         else fail(`tipo desconocido '${name}'`);
       }
       const dims = [];
       while (peek() && peek()[0] === "sym" && peek()[1] === "[") {
         i++;
+        if (peek() && peek()[0] === "sym" && peek()[1] === "]") { i++; dims.push(null); continue; }
         const n = take("num", undefined, "el tamaño del arreglo");
         const v = parseInt(n[1], 10);
         if (v < 1 || v > MAX_ARRAY || (n[1].length > 1 && n[1][0] === "0")) fail(`tamaño de arreglo inválido '${n[1]}'`);
@@ -130,7 +150,8 @@
         dims.push(v);
       }
       for (let k = dims.length - 1; k >= 0; k--) {
-        base = { kind: "array", elem: base, n: dims[k], size: base.size * dims[k], align: base.align };
+        base = dims[k] === null ? { kind: "list", elem: base, size: null, align: null }
+          : { kind: "array", elem: base, n: dims[k], size: base.size == null ? null : base.size * dims[k], align: base.align };
       }
       return base;
     }
@@ -167,7 +188,9 @@
       this.text = PREFIX + canonicalOf(this.root);
       this.schemaId = fnv1a64(this.text);
       this.name = this.root.name;
-      this.size = this.root.size;
+      this.size = this.root.size;          // null: tamaño variable (arrow)
+      this.encoding = this.size == null ? ENC.ARROW : ENC.COMPACT;
+      this._arrow = this.size == null ? arrowNode(this.root) : null;
     }
     _read(t, view, at) {
       if (t.kind === "prim") {
@@ -194,8 +217,9 @@
       for (const f of t.fields) obj[f.name] = this._read(f.type, view, at + f.offset);
       return obj;
     }
-    /** bytes compact (Uint8Array) → filas (normalmente 1). */
+    /** payload (Uint8Array) → filas (normalmente 1). */
     decodeRows(payload) {
+      if (this._arrow) return readArrow(this, payload);
       if (payload.length % this.size) {
         throw new AgmenError(`payload de ${payload.length} bytes: no es múltiplo de ${this.size} (el tamaño de '${this.name}')`);
       }
@@ -204,6 +228,189 @@
       for (let at = 0; at < payload.length; at += this.size) rows.push(this._read(this.root, view, at));
       return rows;
     }
+  }
+
+
+  // ---------------- arrow (RFC 0008; la referencia es python/agmen/arrow.py) ----------------
+  const NUM_KINDS = { i8: Int8Array, u8: Uint8Array, i16: Int16Array, u16: Uint16Array, i32: Int32Array, u32: Uint32Array,
+                      i64: BigInt64Array, u64: BigUint64Array, f32: Float32Array, f64: Float64Array,
+                      time: BigInt64Array, duration: BigInt64Array };
+
+  function arrowNode(t) {
+    if (t.kind === "prim") return t.name === "bool" ? { kind: "bool" } : { kind: "prim", prim: t.name, size: t.size };
+    if (t.kind === "var") return { kind: t.name === "string" ? "utf8" : "binary" };
+    if (t.kind === "list") return { kind: "list", child: arrowNode(t.elem) };
+    if (t.kind === "tensor") return { kind: "tensor", ndim: t.ndim, child: arrowNode(t.elem) };
+    if (t.kind === "array") {
+      const dims = [];
+      let base = t;
+      while (base.kind === "array") { dims.push(base.n); base = base.elem; }
+      if (base.kind === "prim" && base.name !== "bool") {
+        return { kind: "fsl", dims, n: dims.reduce((a, b) => a * b, 1), child: arrowNode(base) };
+      }
+      return { kind: "fsl", dims: [t.n], n: t.n, child: arrowNode(t.elem) };
+    }
+    return { kind: "struct", names: t.fields.map((f) => f.name), children: t.fields.map((f) => arrowNode(f.type)) };
+  }
+
+  function readArrow(layout, payload) {
+    const bad = (m) => { throw new AgmenError(`arrow: ${m}`); };
+    if (payload.length < 8) bad(`el payload mide ${payload.length} bytes`);
+    const pv = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+    if (pv.getUint32(0, true) !== 0xffffffff) bad("falta la marca de continuación 0xFFFFFFFF");
+    const metaLen = pv.getInt32(4, true);
+    if (metaLen <= 0 || 8 + metaLen > payload.length) bad("metadatos fuera del mensaje");
+    const fb = new DataView(payload.buffer, payload.byteOffset + 8, metaLen);
+    const need = (p, n) => { if (p < 0 || p + n > metaLen) bad("los metadatos apuntan fuera del mensaje"); };
+    const u8 = (p) => { need(p, 1); return fb.getUint8(p); };
+    const u16 = (p) => { need(p, 2); return fb.getUint16(p, true); };
+    const i16 = (p) => { need(p, 2); return fb.getInt16(p, true); };
+    const u32 = (p) => { need(p, 4); return fb.getUint32(p, true); };
+    const i32 = (p) => { need(p, 4); return fb.getInt32(p, true); };
+    const i64 = (p) => { need(p, 8); return Number(fb.getBigInt64(p, true)); };
+    const table = (pos) => {
+      const vt = pos - i32(pos), size = u16(vt);
+      if (size < 4 || size % 2) bad("vtable inválida");
+      return (k) => (4 + 2 * k + 2 > size ? 0 : u16(vt + 4 + 2 * k));
+    };
+    const deref = (p) => p + u32(p);
+    const msg = deref(0), f = table(msg);
+    const version = f(0) ? i16(msg + f(0)) : 0;
+    if (version < 3) bad(`versión de metadatos ${version + 1} no soportada`);
+    if ((f(1) ? u8(msg + f(1)) : 0) !== 3 || !f(2)) bad("se esperaba un RecordBatch");
+    const bodyLen = f(3) ? i64(msg + f(3)) : 0;
+    const rb = deref(msg + f(2)), g = table(rb);
+    const rows = g(0) ? i64(rb + g(0)) : 0;
+    if (g(3)) bad("RecordBatch comprimido (LZ4/ZSTD): todavía no se lee");
+    const vec = (k) => {
+      if (!g(k)) return [];
+      const v = deref(rb + g(k)), n = u32(v);
+      need(v + 4, 16 * n);
+      const out = [];
+      for (let j = 0; j < n; j++) out.push([i64(v + 4 + 16 * j), i64(v + 12 + 16 * j)]);
+      return out;
+    };
+    const nodes = vec(1), bufs = vec(2);
+    const bodyStart = 8 + metaLen;
+    if (bodyStart + bodyLen > payload.length) bad("el cuerpo se sale del mensaje");
+    let iNode = 0, iBuf = 0;
+    const node = (want) => {
+      if (iNode >= nodes.length) bad("faltan columnas");
+      const [len, nulls] = nodes[iNode++];
+      if (nulls) bad("llegaron valores nulos");
+      if (want !== undefined && len !== want) bad(`una columna mide ${len} y debía medir ${want}`);
+      return len;
+    };
+    const buf = (needLen = 0) => {
+      if (iBuf >= bufs.length) bad("faltan buffers");
+      const [off, len] = bufs[iBuf++];
+      if (off < 0 || len < 0 || off + len > bodyLen) bad("un buffer se sale del cuerpo");
+      if (len < needLen) bad(`un buffer mide ${len} y se necesitan ${needLen}`);
+      return payload.subarray(bodyStart + off, bodyStart + off + len);
+    };
+    const dv = (b) => new DataView(b.buffer, b.byteOffset, b.byteLength);
+    const offsets = (len) => {
+      const b = dv(buf(4 * (len + 1))), out = new Array(len + 1);
+      for (let j = 0; j <= len; j++) out[j] = b.getInt32(4 * j, true);
+      for (let j = 1; j <= len; j++) if (out[j] < out[j - 1]) bad("offsets que van hacia atrás");
+      return out;
+    };
+    const typed = (prim, b, count) => {   // sin copiar si está alineado
+      const K = NUM_KINDS[prim];
+      if (b.byteOffset % K.BYTES_PER_ELEMENT === 0) return new K(b.buffer, b.byteOffset, count);
+      return new K(b.slice(0, count * K.BYTES_PER_ELEMENT).buffer, 0, count);
+    };
+    const scalars = (prim, size, len) => {
+      const b = dv(buf(len * size)), out = new Array(len);
+      for (let j = 0; j < len; j++) {
+        const at = j * size;
+        switch (prim) {
+          case "i8": out[j] = b.getInt8(at); break;
+          case "u8": out[j] = b.getUint8(at); break;
+          case "i16": out[j] = b.getInt16(at, true); break;
+          case "u16": out[j] = b.getUint16(at, true); break;
+          case "i32": out[j] = b.getInt32(at, true); break;
+          case "u32": out[j] = b.getUint32(at, true); break;
+          case "f32": out[j] = b.getFloat32(at, true); break;
+          case "f64": out[j] = b.getFloat64(at, true); break;
+          case "u64": out[j] = b.getBigUint64(at, true); break;
+          default: out[j] = b.getBigInt64(at, true);
+        }
+      }
+      return out;
+    };
+    const nest = (flat, dims) => {
+      if (dims.length === 1) return flat;
+      const step = flat.length / dims[0], out = [];
+      for (let j = 0; j < dims[0]; j++) out.push(nest(flat.slice(j * step, (j + 1) * step), dims.slice(1)));
+      return out;
+    };
+    const read = (n, len) => {
+      buf();                                     // validez (sin nulos)
+      switch (n.kind) {
+        case "prim": return scalars(n.prim, n.size, len);
+        case "bool": {
+          const bits = buf(Math.ceil(len / 8)), out = new Array(len);
+          for (let j = 0; j < len; j++) out[j] = ((bits[j >> 3] >> (j & 7)) & 1) === 1;
+          return out;
+        }
+        case "utf8": case "binary": {
+          const offs = offsets(len), data = buf(offs[len]), out = new Array(len);
+          for (let j = 0; j < len; j++) {
+            const part = data.subarray(offs[j], offs[j + 1]);
+            if (n.kind === "binary") out[j] = part;
+            else { try { out[j] = utf8dec.decode(part); } catch (e) { bad("un campo string no es UTF-8"); } }
+          }
+          return out;
+        }
+        case "list": {
+          const offs = offsets(len), vals = read(n.child, node(offs[len])), out = new Array(len);
+          for (let j = 0; j < len; j++) out[j] = vals.slice(offs[j], offs[j + 1]);
+          return out;
+        }
+        case "fsl": {
+          const vals = read(n.child, node(len * n.n)), out = new Array(len);
+          for (let j = 0; j < len; j++) out[j] = nest(vals.slice(j * n.n, (j + 1) * n.n), n.dims);
+          return out;
+        }
+        case "struct": {
+          const cols = n.children.map((c) => read(c, node(len))), out = new Array(len);
+          for (let j = 0; j < len; j++) {
+            const o = {};
+            n.names.forEach((name, k) => { o[name] = cols[k][j]; });
+            out[j] = o;
+          }
+          return out;
+        }
+        case "tensor": {
+          node(len); buf();                       // data: List<T>
+          const offs = offsets(len), total = node(offs[len]);
+          buf();
+          const c = n.child, raw = buf(total * c.size);
+          node(len); buf(); node(len * n.ndim); buf();
+          const sh = dv(buf(4 * len * n.ndim)), out = new Array(len);
+          for (let j = 0; j < len; j++) {
+            const shape = [];
+            for (let k = 0; k < n.ndim; k++) shape.push(sh.getInt32(4 * (j * n.ndim + k), true));
+            const count = offs[j + 1] - offs[j];
+            if (shape.reduce((a, b) => a * b, 1) !== count) bad(`un tensor de forma [${shape}] trae ${count} datos`);
+            out[j] = { shape, data: typed(c.prim, raw.subarray(offs[j] * c.size, offs[j + 1] * c.size), count) };
+          }
+          return out;
+        }
+        default: bad(`tipo ${n.kind}`);
+      }
+      return [];
+    };
+    const tree = layout._arrow, cols = tree.children.map((c) => read(c, node(rows)));
+    if (iNode !== nodes.length || iBuf !== bufs.length) bad(`el RecordBatch no coincide con el esquema '${layout.name}'`);
+    const out = [];
+    for (let j = 0; j < rows; j++) {
+      const o = {};
+      tree.names.forEach((name, k) => { o[name] = cols[k][j]; });
+      out.push(o);
+    }
+    return out;
   }
 
   // ---------------- sobre ----------------
@@ -225,7 +432,6 @@
     if (env.encoding > ENC.SCHEMA) throw new AgmenError(`encoding desconocido: ${env.encoding}`);
     if (env.flags & ~KNOWN_FLAGS) throw new AgmenError(`flags desconocidos: 0x${env.flags.toString(16)}`);
     if (env.flags & FLAG_SHM) throw new AgmenError("payload en memoria compartida: llega en el nivel 8");
-    if (env.encoding === ENC.ARROW) throw new AgmenError("codificación arrow: llega en el nivel 7");
     env.payload = b.subarray(env.headerLen);
     if (env.payload.length !== env.payloadLen) {
       throw new AgmenError(`el sobre dice payload de ${env.payloadLen} bytes pero llegaron ${env.payload.length}`);
@@ -260,22 +466,45 @@
         this.topics.set(hex64(env.topicId), a.topic);
         return { kind: "announcement", env, topic: a.topic, layout: a.layout };
       }
-      if (env.encoding !== ENC.COMPACT) throw new AgmenError(`encoding ${env.encoding} sin decodificador en el panel`);
+      if (env.encoding !== ENC.COMPACT && env.encoding !== ENC.ARROW) throw new AgmenError(`encoding ${env.encoding} sin decodificador en el panel`);
       const layout = this.layouts.get(hex64(env.schemaId));
       if (!layout) throw new AgmenError(`llega schema_id ${hex64(env.schemaId)} sin anuncio de esquema todavía`);
       return { kind: "data", env, topic: this.topics.get(hex64(env.topicId)) || "", layout, rows: layout.decodeRows(env.payload) };
     }
   }
 
-  /** {p:{x:1}, q:[1,2]} → {"p.x":1, "q[0]":1, "q[1]":2}, todo como Number. Para graficar. */
+  const FLATTEN_MAX = 64;   // un arreglo más largo no se grafica número por número
+  const isTensor = (v) => v !== null && typeof v === "object" && Array.isArray(v.shape) && ArrayBuffer.isView(v.data);
+
+  /** {p:{x:1}, q:[1,2]} → {"p.x":1, "q[0]":1, "q[1]":2}, todo como Number. Para graficar.
+   *  Texto, bytes, tensores y arreglos de más de FLATTEN_MAX números se saltan. */
   function flatten(value, prefix = "", out = {}) {
-    if (Array.isArray(value)) value.forEach((v, k) => flatten(v, `${prefix}[${k}]`, out));
-    else if (value !== null && typeof value === "object") {
+    if (Array.isArray(value)) {
+      if (value.length <= FLATTEN_MAX) value.forEach((v, k) => flatten(v, `${prefix}[${k}]`, out));
+    } else if (ArrayBuffer.isView(value) || isTensor(value) || typeof value === "string") {
+      // no se grafica
+    } else if (value !== null && typeof value === "object") {
       for (const [k, v] of Object.entries(value)) flatten(v, prefix ? `${prefix}.${k}` : k, out);
     } else out[prefix] = typeof value === "boolean" ? (value ? 1 : 0) : Number(value);
     return out;
   }
 
+  /** Un valor para mostrarlo (inspector, echo): los datos grandes se resumen. */
+  function summarize(value) {
+    if (value instanceof Uint8Array) return `<${value.length.toLocaleString("es")} bytes>`;
+    if (isTensor(value)) return `tensor [${value.shape.join(", ")}]`;
+    if (Array.isArray(value)) {
+      if (value.length > FLATTEN_MAX && value.every((v) => typeof v === "number")) return `[${value.length.toLocaleString("es")} números]`;
+      return value.map(summarize);
+    }
+    if (value !== null && typeof value === "object") {
+      const o = {};
+      for (const [k, v] of Object.entries(value)) o[k] = summarize(v);
+      return o;
+    }
+    return value;
+  }
+
   return { PREFIX, ENC, AgmenError, fnv1a64, topicId, hex64, parseSchema, canonical: (t) => PREFIX + canonicalOf(parseSchema(t)),
-           Layout, parseEnvelope, readAnnouncement, Decoder, flatten };
+           Layout, parseEnvelope, readAnnouncement, Decoder, flatten, summarize, isTensor };
 });

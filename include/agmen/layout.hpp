@@ -10,6 +10,10 @@
 //   l.text();        // "agmen/1 Pose{Vec3{f64 x;f64 y;f64 z} p;f32 yaw}"
 //   l.size();        // 32
 //   l.schema_id();   // 0xdea73a0a8e3d8e97
+//
+// Desde Agmen 0.10 (RFC 0008) también lee los tipos de tamaño variable:
+// string, bytes, T[] y tensor<T,N>. Un esquema con alguno de ellos no es
+// `fixed()` y viaja en la codificación arrow (agmen/arrow.hpp).
 #pragma once
 
 #include <cstddef>
@@ -35,7 +39,8 @@ enum class Prim : std::uint8_t { Bool, I8, U8, I16, U16, I32, U32, I64, U64, F32
 /// Un tipo del árbol. Los tipos viven en Layout::types(); se refieren entre
 /// sí por índice.
 struct Type {
-    enum class Kind : std::uint8_t { Prim, Array, Struct };
+    /// String y Bytes: tamaño variable. List = T[]. Tensor = tensor<T,N>.
+    enum class Kind : std::uint8_t { Prim, Array, Struct, String, Bytes, List, Tensor };
     struct Field {
         std::string name;
         std::uint32_t type = 0;
@@ -43,11 +48,12 @@ struct Type {
     };
 
     Kind kind = Kind::Prim;
-    Prim prim = Prim::U8;          ///< Kind::Prim
-    std::uint32_t count = 0;       ///< Kind::Array: número de elementos
-    std::uint32_t elem = 0;        ///< Kind::Array: índice del tipo de cada elemento
+    Prim prim = Prim::U8;          ///< Kind::Prim; Kind::Tensor: el tipo de los elementos
+    std::uint32_t count = 0;       ///< Kind::Array: número de elementos; Kind::Tensor: dimensiones
+    std::uint32_t elem = 0;        ///< Kind::Array y Kind::List: índice del tipo de cada elemento
     std::string name;              ///< Kind::Struct
     std::vector<Field> fields;     ///< Kind::Struct
+    bool fixed = true;             ///< tamaño fijo (si no, size y align no aplican)
     std::size_t size = 0;
     std::size_t align = 1;
 };
@@ -62,8 +68,10 @@ public:
     [[nodiscard]] const std::string& text() const { return text_; }
     [[nodiscard]] std::uint64_t schema_id() const { return schema_id_; }
     [[nodiscard]] const std::string& name() const { return types_[root_].name; }
-    /// Tamaño del payload compact (una fila).
-    [[nodiscard]] std::size_t size() const { return types_[root_].size; }
+    /// Tamaño del payload compact (una fila). 0 si el esquema no es fixed().
+    [[nodiscard]] std::size_t size() const { return types_[root_].fixed ? types_[root_].size : 0; }
+    /// ¿Todos los campos son de tamaño fijo? Entonces viaja en compact; si no, en arrow.
+    [[nodiscard]] bool fixed() const { return types_[root_].fixed; }
 
     [[nodiscard]] std::uint32_t root() const { return root_; }
     [[nodiscard]] const Type& type(std::uint32_t i) const { return types_[i]; }

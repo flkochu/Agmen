@@ -7,6 +7,7 @@
 // drivers; eso vive en paquetes opcionales.
 #pragma once
 
+#include "agmen/arrow.hpp"
 #include "agmen/clock.hpp"
 #include "agmen/hubproto.hpp"
 #include "agmen/layout.hpp"

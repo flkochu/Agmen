@@ -132,7 +132,7 @@ class _PurePublisher:
         self.to = to
         self.source_id = wire.new_source_id()
         self.seq = 0
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock = wire.udp_socket()
         self._announced_at: float | None = None
         self._pub_lock = threading.Lock()   # se puede publicar desde varios grupos de un Node
         if hp.is_topic(to):
@@ -256,7 +256,7 @@ class _Receiver:
     topic, el registro con el hub."""
 
     def __init__(self, where: str, schema: str, type_name: str = "") -> None:
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock = wire.udp_socket()
         self.announced: dict[int, tuple[str, str]] = {}   # schema_id → (topic, esquema)
         self._link = None
         if hp.is_topic(where) or where == "*":
@@ -375,7 +375,7 @@ class RawPublisher:
         self.topic = topic
         self.topic_id = wire.topic_id(topic)
         self.source_id = wire.new_source_id()
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock = wire.udp_socket()
         self._sock.bind(("127.0.0.1", 0))
         self._sock.setblocking(False)
         self.dests: list[tuple[str, int]] = []

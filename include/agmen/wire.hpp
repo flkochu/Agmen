@@ -47,7 +47,7 @@ using ByteView = std::span<const std::uint8_t>;
 enum class Encoding : std::uint8_t {
     None = 0,          ///< sin payload
     Compact = 1,       ///< struct de C (RFC 0001 §4)
-    Arrow = 2,         ///< RecordBatch de Arrow (nivel 7; todavía no soportado)
+    Arrow = 2,         ///< RecordBatch de Arrow IPC (RFC 0008; agmen/arrow.hpp)
     Announcement = 3,  ///< anuncio de esquema: "topic\nesquema" (RFC 0001, anexo A)
 };
 
@@ -71,7 +71,9 @@ public:
         UnsupportedVersion,  ///< otra versión del protocolo (ej. v0 de Agmen ≤ 0.3)
         BadHeader,           ///< header_len inválido
         UnknownEncoding,     ///< encoding o flags desconocidos
-        Unsupported,         ///< arrow o memoria compartida: todavía no
+        Unsupported,         ///< memoria compartida (nivel 8) o una parte de Arrow que Agmen no lee
+        BadArrow,            ///< payload arrow mal formado o que no coincide con el esquema
+        TooBig,              ///< el mensaje pasa del máximo (64 MiB o AGMEN_MAX_MESSAGE_MB)
         TypeMismatch,        ///< el tipo no es el que espera el receptor
         PayloadLenMismatch,  ///< payload_len no coincide con los bytes recibidos
         BadPayloadSize,      ///< el payload no mide lo que el tipo requiere
@@ -120,9 +122,10 @@ namespace schema {
 /// Resultado de revisar un esquema: si es canónico y cuánto mide en compact.
 struct Check {
     bool ok = false;
-    std::size_t size = 0;      ///< tamaño del struct compact
+    std::size_t size = 0;      ///< tamaño del struct compact (si !variable)
     std::size_t align = 1;     ///< alineación del struct
     std::size_t error_at = 0;  ///< posición del primer error (si !ok)
+    bool variable = false;     ///< tiene string, bytes, T[] o tensor: viaja en arrow (RFC 0008)
 };
 
 namespace detail {
@@ -163,6 +166,7 @@ struct Parser {
 struct SizeAlign {
     std::size_t size = 0;
     std::size_t align = 1;
+    bool variable = false;
 };
 
 constexpr std::size_t primitive_size(std::string_view n) {
@@ -183,6 +187,28 @@ constexpr SizeAlign parse_type(Parser& p) {
     if (p.peek() == '{') {  // struct anidado
         p.i = start;
         t = parse_struct(p);
+    } else if (name == "string" || name == "bytes") {
+        t = {0, 1, true};
+    } else if (name == "tensor") {  // tensor<T,N>, T numérico, N de 1 a 32
+        p.expect('<');
+        const std::string_view e = p.ident();
+        if (!p.ok || primitive_size(e) == 0 || e == "bool" || e == "time" || e == "duration") {
+            p.fail();
+            return {};
+        }
+        p.expect(',');
+        if (p.peek() < '1' || p.peek() > '9') {
+            p.fail();
+            return {};
+        }
+        std::size_t n = 0;
+        while (p.peek() >= '0' && p.peek() <= '9') {
+            n = n * 10 + static_cast<std::size_t>(p.peek() - '0');
+            ++p.i;
+        }
+        if (n > 32) p.fail();
+        p.expect('>');
+        t = {0, 1, true};
     } else {
         const std::size_t sz = primitive_size(name);
         if (sz == 0) {
@@ -190,10 +216,15 @@ constexpr SizeAlign parse_type(Parser& p) {
             p.fail();
             return {};
         }
-        t = {sz, sz};
+        t = {sz, sz, false};
     }
-    while (p.ok && p.peek() == '[') {  // T[N], T[N][M]...
+    while (p.ok && p.peek() == '[') {  // T[N], T[N][M], T[]...
         ++p.i;
+        if (p.peek() == ']') {  // T[]: tamaño variable
+            ++p.i;
+            t.variable = true;
+            continue;
+        }
         if (p.peek() == '0' || p.peek() < '0' || p.peek() > '9') {
             p.fail();
             return {};
@@ -218,7 +249,7 @@ constexpr SizeAlign parse_struct(Parser& p) {
     p.expect('{');
     std::array<std::string_view, 256> names{};
     std::size_t count = 0;
-    SizeAlign st{0, 1};
+    SizeAlign st{0, 1, false};
     while (p.ok) {
         const SizeAlign f = parse_type(p);
         p.expect(' ');
@@ -234,6 +265,7 @@ constexpr SizeAlign parse_struct(Parser& p) {
         if (count == names.size()) p.fail();
         if (!p.ok) break;
         names[count++] = fname;
+        if (f.variable) st.variable = true;
         st.size = (st.size + f.align - 1) / f.align * f.align + f.size;
         st.align = f.align > st.align ? f.align : st.align;
         if (p.peek() == ';') {
@@ -256,8 +288,9 @@ constexpr Check check(std::string_view body) {
     detail::Parser p{body};
     const detail::SizeAlign st = detail::parse_struct(p);
     if (p.ok && p.i != body.size()) p.fail();  // sobra texto
-    if (!p.ok) return Check{false, 0, 1, p.err};
-    return Check{true, st.size, st.align, 0};
+    if (!p.ok) return Check{false, 0, 1, p.err, false};
+    if (st.variable) return Check{true, 0, 1, 0, true};
+    return Check{true, st.size, st.align, 0, false};
 }
 
 }  // namespace schema
@@ -366,9 +399,23 @@ concept Message = requires(const M& msg, Bytes& out, ByteView payload) {
 template <Message M>
 inline constexpr schema::Check schema_check_v = schema::check(M::kSchema);
 
-/// Tamaño del payload compact de M, calculado de su esquema.
+/// Tamaño del payload compact de M, calculado de su esquema (0 si es arrow).
 template <Message M>
 inline constexpr std::size_t compact_size_v = schema_check_v<M>.size;
+
+/// ¿M tiene campos de tamaño variable? Entonces viaja en arrow (RFC 0008).
+template <Message M>
+inline constexpr bool is_arrow_v = schema_check_v<M>.variable;
+
+/// Codificación de M en el sobre.
+template <Message M>
+inline constexpr Encoding encoding_v = is_arrow_v<M> ? Encoding::Arrow : Encoding::Compact;
+
+/// Máximo de un mensaje: 64 MiB, o AGMEN_MAX_MESSAGE_MB (RFC 0008 §3.5).
+[[nodiscard]] std::size_t max_message();
+
+/// Texto del error de un mensaje demasiado grande.
+[[nodiscard]] std::string too_big_text(std::string_view what, std::size_t bytes);
 
 /// schema_id de M = FNV-1a 64 de "agmen/1 " + kSchema. Cambia si cambia
 /// cualquier campo.
@@ -389,7 +436,8 @@ template <Message M>
     static_assert(::agmen::wire::schema_check_v<M>.ok,                                     \
                   "kSchema no es un esquema canónico de Agmen. Ejemplo válido: "            \
                   "\"MotorCommand{f32 left;f32 right}\" (tipos bool i8 u8 i16 u16 i32 u32 " \
-                  "i64 u64 f32 f64 time duration, arreglos T[N], structs anidados "         \
+                  "i64 u64 f32 f64 time duration string bytes tensor<T,N>, arreglos "     \
+                  "T[N] y T[], structs anidados "                                          \
                   "Nombre{...}; un espacio entre tipo y nombre; ';' entre campos, sin "     \
                   "';' final)")
 
@@ -431,14 +479,16 @@ template <Message M>
     out.resize(kEnvelopeLen);
     msg.encode_payload(out);
     const std::size_t payload = out.size() - kEnvelopeLen;
-    if (payload != compact_size_v<M>) {
+    if (is_arrow_v<M>) {
+        if (payload > max_message()) throw WireError(WireError::Kind::TooBig, too_big_text(M::kName, payload));
+    } else if (payload != compact_size_v<M>) {
         // Un error de programación: el encode_payload no sigue al esquema.
         throw std::logic_error("encode_payload de '" + std::string(M::kName) + "' produjo " +
                                std::to_string(payload) + " bytes, pero su esquema mide " +
                                std::to_string(compact_size_v<M>));
     }
     env.header_len = kEnvelopeLen;
-    env.encoding = Encoding::Compact;
+    env.encoding = encoding_v<M>;
     env.schema_id = schema_id_v<M>;
     env.payload_len = static_cast<std::uint32_t>(payload);
     Bytes header;
@@ -474,16 +524,16 @@ template <Message M>
         throw WireError(WireError::Kind::NotData,
                         "es un anuncio de esquema, no datos (agmen::Subscriber los maneja solo)");
     }
-    if (env.encoding != Encoding::Compact) {
+    if (env.encoding != encoding_v<M>) {
         throw WireError(WireError::Kind::UnknownEncoding,
-                        "se esperaba un mensaje compact y llegó encoding=" +
-                            std::to_string(static_cast<int>(env.encoding)));
+                        std::string("se esperaba un mensaje ") + (is_arrow_v<M> ? "arrow" : "compact") +
+                            " y llegó encoding=" + std::to_string(static_cast<int>(env.encoding)));
     }
     if (env.schema_id != schema_id_v<M>) {
         throw WireError(WireError::Kind::TypeMismatch,
                         type_mismatch_text(schema_text<M>(), schema_id_v<M>, env.schema_id));
     }
-    if (payload.size() != compact_size_v<M>) {
+    if (!is_arrow_v<M> && payload.size() != compact_size_v<M>) {
         throw WireError(WireError::Kind::BadPayloadSize,
                         payload_size_text(M::kName, compact_size_v<M>, payload.size()));
     }

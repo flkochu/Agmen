@@ -100,7 +100,7 @@ class Mux:
         # Salida: a un topic (se registra en el hub al conocer el tipo) o a una dirección.
         self.pub = RawPublisher(output) if hp.is_topic(output) else None
         self.dest = None if self.pub else _addr(output)
-        self.out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.out = wire.udp_socket()
         self.source_id = wire.new_source_id()
         self.last_rx: dict[str, float] = {}
         self.type_id: int | None = None         # schema_id que se aceptó primero

@@ -1,5 +1,9 @@
 #include "agmen/wire.hpp"
 
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+
 #include "agmen/clock.hpp"
 
 #include <chrono>
@@ -107,10 +111,6 @@ std::pair<Envelope, ByteView> Envelope::read_from(ByteView buf) {
         throw WireError(WireError::Kind::Unsupported,
                         "payload en memoria compartida: llega en el nivel 8, este nodo no lo soporta");
     }
-    if (env.encoding == Encoding::Arrow) {
-        throw WireError(WireError::Kind::Unsupported,
-                        "codificación arrow: llega en el nivel 7, este nodo no la soporta");
-    }
     // header_len > 64: un sobre más nuevo; saltamos los campos que no conocemos.
     const ByteView payload = buf.subspan(env.header_len);
     if (payload.size() != env.payload_len) {
@@ -127,6 +127,29 @@ std::string type_mismatch_text(std::string_view expected_text, std::uint64_t exp
                        "' (schema_id " + hex64(expected) + ") pero llegó schema_id " + hex64(got);
     if (!got_detail.empty()) text += " (" + std::string(got_detail) + ")";
     return text + ". ¿El emisor usa otra versión del mensaje?";
+}
+
+std::size_t max_message() {
+    static const std::size_t value = [] {
+        constexpr std::size_t kDefault = std::size_t{64} << 20;
+        const char* raw = std::getenv("AGMEN_MAX_MESSAGE_MB");
+        if (raw == nullptr || *raw == '\0') return kDefault;
+        char* end = nullptr;
+        const double mb = std::strtod(raw, &end);
+        if (end == raw || mb <= 0) return kDefault;
+        return std::max<std::size_t>(1, static_cast<std::size_t>(mb * static_cast<double>(1 << 20)));
+    }();
+    return value;
+}
+
+std::string too_big_text(std::string_view what, std::size_t bytes) {
+    char buf[256];
+    std::snprintf(buf, sizeof buf,
+                  "'%.*s' mide %.1f MiB y el máximo de un mensaje es %.0f MiB: si de verdad lo necesitas, sube "
+                  "AGMEN_MAX_MESSAGE_MB",
+                  static_cast<int>(what.size()), what.data(), static_cast<double>(bytes) / (1 << 20),
+                  static_cast<double>(max_message()) / (1 << 20));
+    return buf;
 }
 
 std::string payload_size_text(std::string_view name, std::size_t expected, std::size_t got) {

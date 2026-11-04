@@ -38,8 +38,21 @@ const A = require(process.argv[2]);
 const cases = JSON.parse(require("fs").readFileSync(0, "utf8"));
 const big = (k, v) => typeof v === "bigint" ? (v >= -9007199254740991n && v <= 9007199254740991n ? Number(v) : v.toString()) : v;
 const hex = (s) => Uint8Array.from(s.match(/../g) || [], (h) => parseInt(h, 16));
+const tohex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+const norm = (v) => {
+  if (v instanceof Uint8Array) return { $bytes: tohex(v) };
+  if (A.isTensor(v)) return { shape: v.shape, data: Array.from(v.data) };
+  if (ArrayBuffer.isView(v)) return Array.from(v);
+  if (Array.isArray(v)) return v.map(norm);
+  if (v !== null && typeof v === "object") { const o = {}; for (const k of Object.keys(v)) o[k] = norm(v[k]); return o; }
+  return v;
+};
 const out = cases.map((c) => {
   try {
+    if (c.kind === "arrow") {
+      const L = new A.Layout(c.input);
+      return { text: L.text, id: A.hex64(L.schemaId), encoding: L.encoding, rows: norm(L.decodeRows(hex(c.payload))) };
+    }
     if (c.kind === "schema") {
       const L = new A.Layout(c.input);
       return { text: L.text, id: A.hex64(L.schemaId), size: L.size, rows: L.decodeRows(hex(c.payload)) };
@@ -48,7 +61,7 @@ const out = cases.map((c) => {
       const env = A.parseEnvelope(hex(c.packet));
       const L = new A.Layout(c.text);
       return { schema: A.hex64(env.schemaId), topic: A.hex64(env.topicId), source: A.hex64(env.sourceId),
-               seq: env.seq, t_data: env.tData, t_pub: env.tPub, rows: L.decodeRows(env.payload) };
+               seq: env.seq, t_data: env.tData, t_pub: env.tPub, rows: norm(L.decodeRows(env.payload)) };
     }
     if (c.kind === "announcement") {
       const d = new A.Decoder();
@@ -64,9 +77,14 @@ process.stdout.write(JSON.stringify(out, big));
 
 
 def _norm(v):
-    """Como lo devuelve el script de Node: enteros de 64 bits fuera del rango exacto de JS, como texto."""
+    """Como lo devuelve el script de Node: enteros de 64 bits fuera del rango exacto de JS, como texto;
+    bytes como {"$bytes": hex}; tensores como {"shape", "data"}."""
     if isinstance(v, bool):
         return v
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        return {"$bytes": bytes(v).hex()}
+    if hasattr(v, "shape") and hasattr(v, "tolist"):
+        return {"shape": list(v.shape), "data": _norm(v.reshape(-1).tolist())}
     if isinstance(v, int):
         return v if -SAFE <= v <= SAFE else str(v)
     if isinstance(v, list):
@@ -96,6 +114,11 @@ def _cases():
             expected.append({"schema": f"0x{schema.schema_id(canon):016x}", "topic": f"0x{wire.topic_id(topic):016x}",
                              "source": f"0x{int(src, 16):016x}", "seq": _norm(int(seq)), "t_data": _norm(int(t_data)),
                              "t_pub": _norm(int(t_pub)), "rows": _norm(schema.Layout(canon).unpack_rows(body))})
+        elif kind == "arrow":
+            _, entrada, canon, sid, _valores, payload = cols
+            cases.append({"kind": "arrow", "input": entrada, "payload": payload})
+            expected.append({"text": canon, "id": sid, "encoding": 2,
+                             "rows": _norm(schema.Layout(canon).unpack_rows(bytes.fromhex(payload)))})
         elif kind == "announcement":
             _, canon, topic, src, _seq, _t, packet = cols
             cases.append({"kind": "announcement", "packet": packet})
@@ -140,7 +163,7 @@ class TestPanelJs(unittest.TestCase):
                 self.assertEqual(res, exp)
 
     def test_errores_claros(self):
-        bad = ["Foo{float x}", "Foo{string s}", "Foo{f32 a;f32 a}", "Foo{f32[0] a}", "Foo{}", "Foo{f32 x} extra"]
+        bad = ["Foo{float x}", "Foo{optional f32 s}", "Foo{tensor<bool,2> t}", "Foo{f32 a;f32 a}", "Foo{f32[0] a}", "Foo{}", "Foo{f32 x} extra"]
         got = self._run([{"kind": "bad", "input": b} for b in bad])
         for text, res in zip(bad, got, strict=True):
             with self.subTest(text):

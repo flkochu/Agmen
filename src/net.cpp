@@ -136,6 +136,19 @@ UdpSocket UdpSocket::bind(std::string_view address) {
              nullptr);
 #endif
 
+    // macOS no deja mandar un datagrama de más de 9216 bytes (net.inet.udp.maxdgram)
+    // si el socket no pide más espacio de envío; un f32[3000] fallaría con "Message
+    // too long" (RFC 0008 §1.2). Se pide lo que cabe en un datagrama en todos los
+    // sistemas: así un mensaje compact de 64 KB sale igual en Windows, Linux y macOS.
+    {
+        const int want = 65507;
+        int have = 0;
+        socklen_t len = sizeof have;
+        if (::getsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char*>(&have), &len) != 0 || have < want) {
+            ::setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&want), sizeof want);
+        }
+    }
+
     if (::bind(s, reinterpret_cast<const sockaddr*>(&addr), sizeof addr) != 0) {
         const int code = last_error();
         throw NetError(code, "no se pudo escuchar en " + std::string(address) +

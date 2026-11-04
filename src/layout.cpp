@@ -96,10 +96,15 @@ struct LayoutParser {
             const std::string fname(ident("el nombre del campo"));
             if (!seen.insert(fname).second) fail("el campo '" + fname + "' está repetido en '" + st.name + "'", name_at);
             const Type& f = types[ft];
-            offset = (offset + f.align - 1) / f.align * f.align;
-            st.fields.push_back(Type::Field{fname, ft, offset});
-            offset += f.size;
-            st.align = std::max(st.align, f.align);
+            if (!f.fixed) st.fixed = false;
+            if (st.fixed) {
+                offset = (offset + f.align - 1) / f.align * f.align;
+                st.fields.push_back(Type::Field{fname, ft, offset});
+                offset += f.size;
+                st.align = std::max(st.align, f.align);
+            } else {
+                st.fields.push_back(Type::Field{fname, ft, 0});
+            }
             const char c = peek();
             if (c == ';') {
                 ++i;
@@ -107,8 +112,49 @@ struct LayoutParser {
                 fail("se esperaba ';' o '}' después del campo", i);
             }
         }
-        st.size = (offset + st.align - 1) / st.align * st.align;
+        if (st.fixed) {
+            st.size = (offset + st.align - 1) / st.align * st.align;
+        } else {  // variable: sin offsets (va en arrow)
+            st.size = 0;
+            st.align = 1;
+            for (auto& fl : st.fields) fl.offset = 0;
+        }
         return add(std::move(st));
+    }
+
+    static bool is_number(Prim p) { return p != Prim::Bool && p != Prim::Time && p != Prim::Duration; }
+
+    std::uint32_t parse_tensor() {  // ya se leyó "tensor"
+        if (peek() != '<') fail("se esperaba '<' (se escribe tensor<f32,2>)", i);
+        ++i;
+        skip();
+        const std::size_t at = i;
+        const std::string_view e = ident("el tipo de los elementos (ej. tensor<f32,2>)");
+        const auto* info = std::find_if(std::begin(kPrims), std::end(kPrims),
+                                        [&](const PrimInfo& p) { return p.name == e; });
+        if (info == std::end(kPrims) || !is_number(info->prim)) {
+            fail("un tensor solo puede ser de números (i8, u8, i16, u16, i32, u32, i64, u64, f32, f64), no de '" +
+                     std::string(e) + "'",
+                 at);
+        }
+        if (peek() != ',') fail("se esperaba ',' y el número de dimensiones (ej. tensor<f32,2>)", i);
+        ++i;
+        skip();
+        const std::size_t nat = i;
+        std::uint32_t n = 0;
+        if (i >= s.size() || !digit(s[i]) || s[i] == '0') fail("número de dimensiones inválido (de 1 a 32)", nat);
+        while (i < s.size() && digit(s[i])) {
+            n = n * 10 + static_cast<std::uint32_t>(s[i] - '0');
+            ++i;
+            if (n > 32) fail("número de dimensiones inválido (de 1 a 32)", nat);
+        }
+        expect('>', "'>'");
+        Type t;
+        t.kind = Type::Kind::Tensor;
+        t.prim = info->prim;
+        t.count = n;
+        t.fixed = false;
+        return add(std::move(t));
     }
 
     std::uint32_t parse_type() {
@@ -119,13 +165,26 @@ struct LayoutParser {
         if (peek() == '{') {
             i = start;
             base = parse_struct();
+        } else if (name == "string" || name == "bytes") {
+            Type t;
+            t.kind = name == "string" ? Type::Kind::String : Type::Kind::Bytes;
+            t.fixed = false;
+            base = add(std::move(t));
+        } else if (name == "tensor") {
+            base = parse_tensor();
+        } else if (name == "optional") {
+            fail("'optional' todavía no existe en Agmen: usa un valor que signifique 'no hay' (ej. -1) o un "
+                 "bool al lado",
+                 start);
+        } else if (name == "str") {
+            fail("tipo 'str' no existe en Agmen: usa 'string'", start);
         } else {
             const auto* info = std::find_if(std::begin(kPrims), std::end(kPrims),
                                             [&](const PrimInfo& p) { return p.name == name; });
             if (info == std::end(kPrims)) {
                 fail("tipo desconocido '" + std::string(name) +
-                         "'. Usa bool, i8, u8, i16, u16, i32, u32, i64, u64, f32, f64, time, duration "
-                         "o un struct anidado Nombre{...}",
+                         "'. Usa bool, i8, u8, i16, u16, i32, u32, i64, u64, f32, f64, time, duration, "
+                         "string, bytes, tensor<T,N> o un struct anidado Nombre{...}",
                      start);
             }
             Type t;
@@ -134,9 +193,14 @@ struct LayoutParser {
             t.size = t.align = info->size;
             base = add(std::move(t));
         }
-        std::vector<std::uint32_t> dims;
+        std::vector<std::uint32_t> dims;  // 0 = T[] (tamaño variable)
         while (peek() == '[') {
             ++i;
+            if (peek() == ']') {
+                ++i;
+                dims.push_back(0);
+                continue;
+            }
             skip();
             const std::size_t at = i;
             if (i >= s.size() || !digit(s[i]) || (s[i] == '0' && i + 1 < s.size() && digit(s[i + 1]))) {
@@ -152,14 +216,20 @@ struct LayoutParser {
             expect(']', "']'");
             dims.push_back(static_cast<std::uint32_t>(n));
         }
-        // f32[2][3] = 2 arreglos de f32[3]
+        // f32[2][3] = 2 arreglos de f32[3]; f32[][3] = lista de f32[3]
         for (auto it = dims.rbegin(); it != dims.rend(); ++it) {
             Type a;
-            a.kind = Type::Kind::Array;
-            a.count = *it;
             a.elem = base;
-            a.size = types[base].size * *it;
-            a.align = types[base].align;
+            if (*it == 0) {
+                a.kind = Type::Kind::List;
+                a.fixed = false;
+            } else {
+                a.kind = Type::Kind::Array;
+                a.count = *it;
+                a.fixed = types[base].fixed;
+                a.size = a.fixed ? types[base].size * *it : 0;
+                a.align = a.fixed ? types[base].align : 1;
+            }
             base = add(std::move(a));
         }
         return base;
@@ -192,11 +262,18 @@ std::string Layout::canonical(std::uint32_t idx) const {
     switch (t.kind) {
         case Type::Kind::Prim:
             return std::string(prim_name(t.prim));
-        case Type::Kind::Array: {
+        case Type::Kind::String:
+            return "string";
+        case Type::Kind::Bytes:
+            return "bytes";
+        case Type::Kind::Tensor:
+            return "tensor<" + std::string(prim_name(t.prim)) + "," + std::to_string(t.count) + ">";
+        case Type::Kind::Array:
+        case Type::Kind::List: {
             std::string dims;
             std::uint32_t base = idx;
-            while (types_[base].kind == Type::Kind::Array) {
-                dims += "[" + std::to_string(types_[base].count) + "]";
+            while (types_[base].kind == Type::Kind::Array || types_[base].kind == Type::Kind::List) {
+                dims += types_[base].kind == Type::Kind::Array ? "[" + std::to_string(types_[base].count) + "]" : "[]";
                 base = types_[base].elem;
             }
             return canonical(base) + dims;

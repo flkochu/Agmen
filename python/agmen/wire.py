@@ -81,6 +81,27 @@ def new_source_id() -> int:
     return int.from_bytes(os.urandom(8), "little") or 1
 
 
+MAX_DATAGRAM = 65_507        # lo que cabe en un datagrama UDP (IPv4)
+
+
+def udp_socket():
+    """Un socket UDP listo para mandar mensajes de Agmen.
+
+    macOS no deja mandar un datagrama de más de 9216 bytes (net.inet.udp.maxdgram)
+    si el socket no pide más espacio de envío: un f32[3000] fallaría con
+    "Message too long" (RFC 0008 §1.2). Se pide lo que cabe en un datagrama,
+    en todos los sistemas, para que un mensaje compact de 64 KB salga igual."""
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        if s.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF) < MAX_DATAGRAM:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, MAX_DATAGRAM)
+    except OSError:
+        pass
+    return s
+
+
 class WireError(Exception):
     """El paquete no se puede usar. El texto explica por qué."""
 
@@ -142,9 +163,9 @@ def _parse_py(buf: bytes) -> tuple[Envelope, bytes]:
         raise WireError(f"flags desconocidos: {flags:#04x}")
     if flags & FLAG_SHM:
         raise WireError("payload en memoria compartida: llega en el nivel 8, este nodo no lo soporta")
-    if encoding == ENC_ARROW:
-        raise WireError("codificación arrow: llega en el nivel 7, este nodo no la soporta")
-    payload = bytes(buf[header_len:])   # header_len > 64: saltamos campos que no conocemos
+    # header_len > 64: saltamos campos que no conocemos. En arrow los datos
+    # grandes no se copian: el payload es una vista (memoryview) del paquete.
+    payload = memoryview(buf)[header_len:] if encoding == ENC_ARROW else bytes(buf[header_len:])
     if len(payload) != payload_len:
         raise WireError(f"el sobre dice payload de {payload_len} bytes pero llegaron {len(payload)}")
     env = Envelope(encoding, flags, sid, tid, src, seq, t_data, t_pub, payload_len, clock, header_len)
@@ -192,8 +213,8 @@ class Message:
                 raise _schema.SchemaError(f"NAME = '{cls.NAME}' pero el esquema se llama '{layout.name}'")
 
     @classmethod
-    def check_payload_size(cls, payload: bytes, expected: int) -> None:
-        if len(payload) != expected:
+    def check_payload_size(cls, payload: bytes, expected: int | None) -> None:
+        if expected is not None and len(payload) != expected:
             raise WireError(f"payload de '{cls.NAME}' debe medir {expected} bytes, llegaron {len(payload)}")
 
     def encode_payload(self) -> bytes:
@@ -227,18 +248,50 @@ class ImuSample(Message):
 
 def encode(msg, seq: int, t_data: int | None = None, t_pub: int | None = None, *,
            topic: str = "", source_id: int = 0, clock: int | None = None, flags: int = 0) -> bytes:
-    """Sobre + payload compact listos para mandar. Si no das t_pub, es "ahora";
-    si no das t_data, es igual a t_pub."""
-    payload = msg.encode_payload()
-    expected = type(msg).LAYOUT.size
-    if len(payload) != expected:
-        raise WireError(f"encode_payload de '{type(msg).NAME}' produjo {len(payload)} bytes, "
-                        f"pero su esquema mide {expected}")
+    """Sobre + payload listos para mandar (compact o arrow, según el esquema).
+    Si no das t_pub, es "ahora"; si no das t_data, es igual a t_pub."""
+    return encode_payload(type(msg), msg.encode_payload(), seq, t_data, t_pub, topic=topic,
+                          source_id=source_id, clock=clock, flags=flags)
+
+
+def encode_payload(cls, payload, seq: int, t_data: int | None = None, t_pub: int | None = None, *,
+                   topic: str = "", source_id: int = 0, clock: int | None = None, flags: int = 0) -> bytes:
+    """Como encode(), con el payload ya codificado."""
+    layout = cls.LAYOUT
+    if layout.fixed and len(payload) != layout.size:
+        raise WireError(f"encode_payload de '{cls.NAME}' produjo {len(payload)} bytes, "
+                        f"pero su esquema mide {layout.size}")
+    n = len(payload) if not isinstance(payload, memoryview) else payload.nbytes
+    if n > max_message():
+        raise WireError(too_big_text(topic or cls.NAME, n))
     t_pub = now_ns() if t_pub is None else t_pub
     clock = _domain() if clock is None else clock
-    env = Envelope(ENC_COMPACT, flags, type(msg).SCHEMA_ID, topic_id(topic), source_id, seq,
-                   t_pub if t_data is None else t_data, t_pub, len(payload), clock)
-    return env.pack() + payload
+    env = Envelope(layout.encoding, flags, cls.SCHEMA_ID, topic_id(topic), source_id, seq,
+                   t_pub if t_data is None else t_data, t_pub, n, clock)
+    out = bytearray(ENVELOPE_LEN + n)
+    ENVELOPE_FMT.pack_into(out, 0, MAGIC, WIRE_VERSION, ENVELOPE_LEN, env.encoding, env.flags, env.schema_id,
+                           env.topic_id, env.source_id, env.seq, env.t_data, env.t_pub, n, env.clock)
+    out[ENVELOPE_LEN:] = payload
+    return bytes(out) if n < 65536 else out
+
+
+MAX_MESSAGE_DEFAULT = 64 << 20
+
+
+def max_message() -> int:
+    """El tamaño máximo de un mensaje (RFC 0008 §3.5): 64 MiB, o AGMEN_MAX_MESSAGE_MB."""
+    raw = os.environ.get("AGMEN_MAX_MESSAGE_MB")
+    if raw:
+        try:
+            return max(1, int(float(raw) * (1 << 20)))
+        except ValueError:
+            pass
+    return MAX_MESSAGE_DEFAULT
+
+
+def too_big_text(what: str, n: int) -> str:
+    return (f"'{what}' mide {n / (1 << 20):.1f} MiB y el máximo de un mensaje es "
+            f"{max_message() / (1 << 20):.0f} MiB: si de verdad lo necesitas, sube AGMEN_MAX_MESSAGE_MB")
 
 
 def type_mismatch_text(cls, got: int, got_text: str | None = None) -> str:
@@ -252,8 +305,9 @@ def decode(cls, buf: bytes):
     env, payload = parse(buf)
     if env.encoding == ENC_SCHEMA:
         raise WireError("es un anuncio de esquema, no datos (usa agmen.Subscriber, que los maneja solo)")
-    if env.encoding != ENC_COMPACT:
-        raise WireError(f"se esperaba un mensaje compact y llegó encoding={ENCODINGS[env.encoding]}")
+    if env.encoding != cls.LAYOUT.encoding:
+        raise WireError(f"se esperaba un mensaje {ENCODINGS[cls.LAYOUT.encoding]} y llegó "
+                        f"encoding={ENCODINGS[env.encoding]}")
     if env.schema_id != cls.SCHEMA_ID:
         raise WireError(type_mismatch_text(cls, env.schema_id))
     return env, cls.decode_payload(payload)

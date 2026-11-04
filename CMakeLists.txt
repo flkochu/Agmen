@@ -83,6 +83,7 @@ add_library(agmen_core
     src/hubproto.cpp
     src/clock.cpp
     src/node.cpp
+    src/arrow.cpp
     src/layout.cpp
     src/log.cpp
     src/pubsub.cpp)
@@ -202,6 +203,13 @@ if(AGMEN_BUILD_TESTS)
         AGMEN_VECTORS_FILE="${CMAKE_CURRENT_SOURCE_DIR}/tests/vectors/v1.txt")
     agmen_set_warnings(test_layout)
     add_test(NAME layout COMMAND test_layout)
+
+    add_executable(test_arrow tests/test_arrow.cpp)
+    target_link_libraries(test_arrow PRIVATE agmen::core)
+    target_compile_definitions(test_arrow PRIVATE
+        AGMEN_VECTORS_FILE="${CMAKE_CURRENT_SOURCE_DIR}/tests/vectors/v1.txt")
+    agmen_set_warnings(test_arrow)
+    add_test(NAME arrow COMMAND test_arrow)
 
     # Node y el reloj de Agmen (RFC 0006).
     add_executable(test_node tests/test_node.cpp)

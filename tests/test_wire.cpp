@@ -5,6 +5,7 @@
 // byte contra tests/vectors/v1.txt, los MISMOS vectores que revisa Python.
 // Si alguna falla, rompiste la compatibilidad con Python u otros lenguajes.
 
+#include <agmen/arrow.hpp>
 #include <agmen/hubproto.hpp>
 #include <agmen/wire.hpp>
 
@@ -70,6 +71,7 @@ struct JointCommand7 {
     static constexpr std::string_view kSchema = "JointCommand7{u8 mode;f64[7] position}";
     std::uint8_t mode = 0;
     std::array<double, 7> position{};
+
     void encode_payload(Bytes& out) const {
         out.push_back(mode);
         put_padding(out, 7);
@@ -82,7 +84,48 @@ struct JointCommand7 {
     }
 };
 
-static_assert(Message<MotorCommand> && Message<JointCommand7>);
+// Un tipo con campos variables, escrito a mano (lo que genera agmen gen): va en arrow (RFC 0008).
+struct Imagen {
+    static constexpr std::string_view kName = "Imagen";
+    static constexpr std::string_view kSchema =
+        "Imagen{time timestamp;string frame_id;u32 width;u32 height;string encoding;u32 step;bytes data}";
+    std::int64_t timestamp = 0;
+    std::string frame_id;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::string encoding;
+    std::uint32_t step = 0;
+    std::vector<std::uint8_t> data;
+
+    static const agmen::arrow::Codec& codec() {
+        static const agmen::schema::Layout l(kSchema);
+        static const agmen::arrow::Codec c(l);
+        return c;
+    }
+    void encode_payload(Bytes& out) const {
+        using V = agmen::arrow::Value;
+        codec().encode(V::structure({V::integer(timestamp), V::text(frame_id), V::uinteger(width), V::uinteger(height),
+                                     V::text(encoding), V::uinteger(step), V::blob(data)}),
+                       out);
+    }
+    static Imagen decode_payload(ByteView p) {
+        const auto v = codec().decode(p);
+        Imagen m;
+        m.timestamp = v.items[0].as<std::int64_t>();
+        m.frame_id = std::string(v.items[1].text());
+        m.width = v.items[2].as<std::uint32_t>();
+        m.height = v.items[3].as<std::uint32_t>();
+        m.encoding = std::string(v.items[4].text());
+        m.step = v.items[5].as<std::uint32_t>();
+        m.data.assign(v.items[6].bytes().begin(), v.items[6].bytes().end());
+        return m;
+    }
+};
+static_assert(is_arrow_v<Imagen>);
+static_assert(encoding_v<Imagen> == Encoding::Arrow);
+static_assert(!is_arrow_v<JointCommand7>);
+
+static_assert(Message<MotorCommand> && Message<JointCommand7> && Message<Imagen>);
 
 // --- Esquemas: se revisan en COMPILACIÓN ---------------------------------------
 
@@ -103,7 +146,14 @@ static_assert(!schema::check("A{f32 x;f32 x}").ok);                      // camp
 static_assert(!schema::check("A{f32[0] x}").ok);
 static_assert(!schema::check("A{f32[07] x}").ok);
 static_assert(!schema::check("A{}").ok);
-static_assert(!schema::check("A{string s}").ok);                         // variable: nivel 7
+static_assert(schema::check("A{string s}").ok && schema::check("A{string s}").variable);   // arrow (RFC 0008)
+static_assert(schema::check("A{f32[] x;bytes b;tensor<u8,3> img;B{f32 c}[2] bs}").variable);
+static_assert(schema::check("A{f32[][3] x}").variable);
+static_assert(!schema::check("A{f32 x}").variable);
+static_assert(!schema::check("A{tensor<bool,2> t}").ok);                 // tensor solo de números
+static_assert(!schema::check("A{tensor<f32,0> t}").ok);
+static_assert(!schema::check("A{tensor<f32,33> t}").ok);
+static_assert(!schema::check("A{str s}").ok);
 static_assert(!schema::check("agmen/1 A{f32 x}").ok);                    // sin prefijo en kSchema
 
 // --- Vectores compartidos con Python -------------------------------------------
@@ -156,7 +206,7 @@ void vectores_de_esquemas() {
 
 void vectores_de_mensajes() {
     const auto rows = load_vectors("message");
-    CHECK(rows.size() == 3);
+    CHECK(rows.size() == 4);
     const auto envelope_of = [](const std::vector<std::string>& r) {
         // r = message, canónico, topic, source_id, seq, t_data, t_pub, payload, paquete
         return Envelope{.topic_id = topic_id(r[2]), .source_id = u64(r[3]), .seq = u64(r[4]),
@@ -175,6 +225,13 @@ void vectores_de_mensajes() {
             got = encode(JointCommand7{3, {1, 2, 3, 4, 5, 6, 7}}, envelope_of(r));
             const auto d = decode<JointCommand7>(got);
             CHECK(d.message.mode == 3 && d.message.position[6] == 7.0);
+        } else if (r[1] == schema_text<Imagen>()) {
+            got = encode(Imagen{1700000000123456789, "camara", 2, 2, "rgb8", 6,
+                                {255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255}},
+                         envelope_of(r));
+            const auto d = decode<Imagen>(got);
+            CHECK(d.envelope.encoding == Encoding::Arrow);
+            CHECK(d.message.frame_id == "camara" && d.message.data.size() == 12 && d.message.data[11] == 255);
         }
         if (hex(got) != r[8]) {
             std::fprintf(stderr, "  FALLA: bytes de '%s'\n    C++:    %s\n    Python: %s\n",
@@ -253,7 +310,7 @@ void rechaza_lo_invalido() {
     expect_error([&] { (void)decode<ImuSample>(b); }, WireError::Kind::UnknownEncoding);
     b = good;
     b[6] = 2;
-    expect_error([&] { (void)decode<ImuSample>(b); }, WireError::Kind::Unsupported, "arrow");
+    expect_error([&] { (void)decode<ImuSample>(b); }, WireError::Kind::UnknownEncoding, "compact");
     b = good;
     b[7] = 0x80;
     expect_error([&] { (void)decode<ImuSample>(b); }, WireError::Kind::UnknownEncoding, "flags");
