@@ -145,7 +145,8 @@ por esperar en Python.
 ## 4. Lo que NO entra en 0.9.0
 
 - Python sin GIL (*free-threaded*, `python3.14t`): nanobind ya lo soporta,
-  pero todavía no hay ABI estable para él. Se agrega cuando lo haya.
+  pero su ABI estable (`abi3t`) apenas llega con Python 3.15 y las
+  herramientas lo están adoptando. Se agrega cuando sea una sola *wheel*.
 - Arrow para imágenes y tensores: nivel 7.
 - Herramientas (`agmen run`, el panel) en C++: el puente del panel pasa a C++
   en el nivel 7.
