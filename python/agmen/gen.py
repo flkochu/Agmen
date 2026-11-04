@@ -79,12 +79,18 @@ class _Cpp:
     def elem_type(self, fd: FieldDef) -> str:
         if fd.kind == "prim":
             return _CPP_PRIM[fd.prim]
+        if fd.kind == "string":
+            return "std::string"
+        if fd.kind == "bytes":
+            return "std::vector<std::uint8_t>"
+        if fd.kind == "tensor":
+            return f"agmen::Tensor<{_CPP_PRIM[fd.prim]}>"
         return _cpp_name(self.f, fd.enum if fd.kind == "enum" else fd.struct)
 
-    def field_type(self, fd: FieldDef) -> str:
+    def field_type(self, fd: FieldDef, dims=None) -> str:
         t = self.elem_type(fd)
-        for n in reversed(fd.type.dims):
-            t = f"std::array<{t}, {n}>"
+        for n in reversed(fd.type.dims if dims is None else dims):
+            t = f"std::vector<{t}>" if n is None else f"std::array<{t}, {n}>"
         return t
 
     def elem_value(self, fd: FieldDef, v) -> str:
@@ -94,9 +100,15 @@ class _Cpp:
 
     def default(self, fd: FieldDef) -> str:
         """Inicializador del miembro: ' = …', '{…}' o '{}' (cero)."""
-        if fd.kind == "struct":
-            return "{}"            # los valores por defecto del struct
+        if fd.kind in ("struct", "bytes", "tensor"):
+            return "{}"            # los valores por defecto del struct; bytes y tensor empiezan vacíos
         dims = fd.type.dims
+        if fd.kind == "string":
+            return f" = {_cpp_string(fd.default)}" if fd.default and not dims else "{}"
+        if None in dims:           # T[]: vacío, o la lista dada
+            if fd.default:
+                return "{" + ", ".join(self.elem_value(fd, x) for x in fd.default) + "}"
+            return "{}"
         if fd.default is not None:
             if not dims:
                 return " = " + self.elem_value(fd, fd.default)
@@ -189,6 +201,106 @@ class _Cpp:
         lines.append("return _m;")
         return lines
 
+    # --- arrow: valores (RFC 0008) ---
+    @staticmethod
+    def _numeric(fd: FieldDef) -> bool:
+        return fd.kind == "prim" and fd.prim != "bool"
+
+    def to_value(self, fd: FieldDef, expr: str, dims: list) -> str:
+        """Expresión agmen::arrow::Value de `expr` (un campo o parte de él)."""
+        V = "agmen::arrow::Value"
+        if not dims:
+            if fd.kind == "prim":
+                if fd.prim == "bool":
+                    return f"{V}::boolean({expr})"
+                if fd.prim in ("f32", "f64"):
+                    return f"{V}::real({expr})"
+                return f"{V}::uinteger({expr})" if fd.prim.startswith("u") else f"{V}::integer({expr})"
+            if fd.kind == "enum":
+                return f"{V}::integer(static_cast<std::int64_t>({expr}))"
+            if fd.kind == "string":
+                return f"{V}::text({expr})"
+            if fd.kind == "bytes":
+                return f"{V}::blob(agmen::wire::ByteView({expr}))"
+            if fd.kind == "tensor":
+                return f"{V}::tensor<{_CPP_PRIM[fd.prim]}>({expr}.shape, std::span<const {_CPP_PRIM[fd.prim]}>({expr}.data))"
+            return f"{expr}.to_value()"
+        if self._numeric(fd) and (None not in dims or dims == [None]):
+            # Números seguidos: std::array anidado o std::vector<T>, sin copiar.
+            t = _CPP_PRIM[fd.prim]
+            span = f"std::span<const {t}>({expr})" if dims == [None] else f"agmen::arrow::flat({expr})"
+            return f"{V}::raw<{t}>({span})"
+        inner = self.to_value(fd, "_e", dims[1:])
+        return f"agmen::arrow::list_of({expr}, [&](const auto& _e) {{ return {inner}; }})"
+
+    def from_value(self, fd: FieldDef, x: str, target: str, dims: list, depth: int = 0) -> list[str]:
+        """Sentencias que dejan en `target` el valor `x` (un agmen::arrow::Value)."""
+        campo = f'"{fd.name}"'
+        if not dims:
+            if fd.kind == "prim":
+                return [f"{target} = {x}.as<{_CPP_PRIM[fd.prim]}>();"]
+            if fd.kind == "enum":
+                base = _CPP_PRIM[fd.prim]
+                return [f"{target} = {self.elem_type(fd)}_from_raw({x}.as<{base}>(), {campo});"]
+            if fd.kind == "string":
+                return [f"{target} = std::string({x}.text());"]
+            if fd.kind == "bytes":
+                return [f"{target}.assign({x}.bytes().begin(), {x}.bytes().end());"]
+            if fd.kind == "tensor":
+                t = _CPP_PRIM[fd.prim]
+                return [f"{target}.shape = {x}.shape;", f"{target}.data = {x}.numbers<{t}>();"]
+            return [f"{target} = {self.elem_type(fd)}::from_value({x});"]
+        if self._numeric(fd) and dims == [None]:
+            return [f"{target} = {x}.numbers<{_CPP_PRIM[fd.prim]}>();"]
+        if self._numeric(fd) and None not in dims:
+            return [f"agmen::arrow::numbers_into<{_CPP_PRIM[fd.prim]}>({x}, agmen::arrow::flat({target}), {campo});"]
+        if fd.kind == "enum" and None not in dims:
+            base = _CPP_PRIM[fd.prim]
+            return [f"{{ std::array<{base}, {_prod(dims)}> _raw{depth}{{}}; "
+                    f"agmen::arrow::numbers_into<{base}>({x}, std::span<{base}>(_raw{depth}), {campo}); "
+                    f"auto _f{depth} = agmen::arrow::flat({target}); "
+                    f"for (std::size_t _k = 0; _k < _f{depth}.size(); ++_k) "
+                    f"_f{depth}[_k] = {self.elem_type(fd)}_from_raw(_raw{depth}[_k], {campo}); }}"]
+        if fd.kind == "enum" and dims == [None]:
+            base = _CPP_PRIM[fd.prim]
+            return [f"{{ const auto _raw{depth} = {x}.numbers<{base}>(); {target}.clear(); "
+                    f"for (const auto _r : _raw{depth}) {target}.push_back({self.elem_type(fd)}_from_raw(_r, {campo})); }}"]
+        e = f"_e{depth}"
+        inner = self.from_value(fd, e, f"_t{depth}", dims[1:], depth + 1)
+        if dims[0] is None:
+            return [f"{target}.clear();",
+                    f"for (const auto& {e} : agmen::arrow::items_of({x}, {campo})) {{",
+                    f"    {self.field_type(fd, dims[1:])} _t{depth}{{}};",
+                    *[f"    {ln}" for ln in inner],
+                    f"    {target}.push_back(std::move(_t{depth}));",
+                    "}"]
+        return [f"for (std::size_t _i{depth} = 0; _i{depth} < {dims[0]}; ++_i{depth}) {{",
+                f"    const auto& {e} = agmen::arrow::items_of({x}, {dims[0]}, {campo})[_i{depth}];",
+                f"    auto& _t{depth} = {target}[_i{depth}];",
+                *[f"    {ln}" for ln in inner],
+                "}"]
+
+    def value_lines(self, s: StructDef) -> list[str]:
+        """to_value() y from_value(): la forma arrow de cualquier struct (RFC 0008)."""
+        items = [self.to_value(fd, fd.name, fd.type.dims) for fd in s.fields]
+        out = ["    /// El struct como valor arrow. Presta los textos, bytes y arreglos: úsalo de inmediato.",
+               "    [[nodiscard]] agmen::arrow::Value to_value() const {",
+               "        return agmen::arrow::Value::structure({",
+               *[f"            {x}," for x in items],
+               "        });",
+               "    }", "",
+               f"    /// De un valor arrow (lo que decodifica agmen::arrow::Codec) a {s.name}.",
+               f"    [[nodiscard]] static {s.name} from_value(const agmen::arrow::Value& _v) {{",
+               f"        if (_v.kind != agmen::arrow::Value::Kind::Struct || _v.items.size() != {len(s.fields)}) {{",
+               "            throw agmen::wire::WireError(agmen::wire::WireError::Kind::BadArrow,",
+               f"                                         \"'{s.name}' debía traer {len(s.fields)} campos\");",
+               "        }",
+               f"        {s.name} _m;"]
+        for k, fd in enumerate(s.fields):
+            out += [f"        {ln}" for ln in self.from_value(fd, f"_v.items[{k}]", f"_m.{fd.name}", fd.type.dims)]
+        out += ["        return _m;", "    }"]
+        return out
+
     def enum(self, e: EnumDef) -> list[str]:
         base = _CPP_PRIM[e.base]
         members = ", ".join(f"{n} = {_cpp_literal(e.base, v)}" for n, v in e.members)
@@ -225,25 +337,42 @@ class _Cpp:
 
     def struct(self, s: StructDef) -> list[str]:
         doc = "Un mensaje: se puede publicar." if s.kind == "message" else "Tipo auxiliar: va dentro de otros."
+        size = "tamaño variable (arrow, por TCP)" if s.arrow else f"{s.size} bytes"
         out = [f"/// {line}" for line in s.doc.splitlines()]
-        out += [f"/// {s.name} · {s.size} bytes · {doc}",
+        out += [f"/// {s.name} · {size} · {doc}",
                f"/// {s.text}",
                f"struct {s.name} {{",
                f"    static constexpr std::string_view kName = \"{s.name}\";",
                f"    static constexpr std::string_view kSchema = \"{s.body}\";",
-               f"    static constexpr std::size_t kPayloadLen = {s.size};",
+               f"    static constexpr std::size_t kPayloadLen = {s.size};" + ("  // arrow: no es fijo" if s.arrow else ""),
                ""]
         for fd in s.fields:
             out.append(f"    {self.field_type(fd)} {fd.name}{self.default(fd)};" + (f"  ///< {fd.doc}" if fd.doc else ""))
-        out += ["", "    /// Escribe los bytes (layout compact: alineación y relleno en 0) al final de `_out`.",
-                "    void encode_into(agmen::wire::Bytes& _out) const {"]
-        out += [f"        {x}" for x in self.encode_lines(s)]
-        out += ["    }", "",
-                f"    /// Lee un {s.name} que empieza en el byte `_at` (el tamaño ya se revisó).",
-                f"    [[nodiscard]] static {s.name} decode_at(agmen::wire::ByteView _p, std::size_t _at) {{"]
-        out += [f"        {x}" for x in self.decode_lines(s)]
-        out += ["    }"]
-        if s.kind == "message":
+        if not s.arrow:
+            out += ["", "    /// Escribe los bytes (layout compact: alineación y relleno en 0) al final de `_out`.",
+                    "    void encode_into(agmen::wire::Bytes& _out) const {"]
+            out += [f"        {x}" for x in self.encode_lines(s)]
+            out += ["    }", "",
+                    f"    /// Lee un {s.name} que empieza en el byte `_at` (el tamaño ya se revisó).",
+                    f"    [[nodiscard]] static {s.name} decode_at(agmen::wire::ByteView _p, std::size_t _at) {{"]
+            out += [f"        {x}" for x in self.decode_lines(s)]
+            out += ["    }"]
+        out += ["", *self.value_lines(s)]
+        if s.kind == "message" and s.arrow:
+            out += ["",
+                    "    /// El codificador arrow de este tipo (se arma una vez).",
+                    "    static const agmen::arrow::Codec& codec() {",
+                    "        static const agmen::schema::Layout _layout(kSchema);",
+                    "        static const agmen::arrow::Codec _codec(_layout);",
+                    "        return _codec;",
+                    "    }",
+                    "",
+                    "    void encode_payload(agmen::wire::Bytes& _out) const { codec().encode(to_value(), _out); }",
+                    "",
+                    f"    [[nodiscard]] static {s.name} decode_payload(agmen::wire::ByteView _p) {{",
+                    "        return from_value(codec().decode(_p));",
+                    "    }"]
+        elif s.kind == "message":
             out += ["",
                     "    void encode_payload(agmen::wire::Bytes& _out) const { encode_into(_out); }",
                     "",
@@ -256,9 +385,12 @@ class _Cpp:
                     "    }"]
         out += ["", f"    friend bool operator==(const {s.name}&, const {s.name}&) = default;", "};", ""]
         if s.kind == "message":
-            out += [f"static_assert(agmen::wire::Message<{s.name}>);",
-                    f"static_assert(agmen::wire::compact_size_v<{s.name}> == {s.name}::kPayloadLen);",
-                    f"static_assert(agmen::wire::schema_id_v<{s.name}> == 0x{s.schema_id:016x}ULL,",
+            out += [f"static_assert(agmen::wire::Message<{s.name}>);"]
+            if s.arrow:
+                out += [f"static_assert(agmen::wire::is_arrow_v<{s.name}>);"]
+            else:
+                out += [f"static_assert(agmen::wire::compact_size_v<{s.name}> == {s.name}::kPayloadLen);"]
+            out += [f"static_assert(agmen::wire::schema_id_v<{s.name}> == 0x{s.schema_id:016x}ULL,",
                     "              \"el schema_id de C++ no coincide con el de agmen gen\");", ""]
         return out
 
@@ -266,9 +398,11 @@ class _Cpp:
         f = self.f
         lines = ["// " + f.path.name, *_header(f, "//"), "#pragma once", "",
                  "#include <agmen/agmen.hpp>", "", "#include <array>", "#include <cstddef>", "#include <cstdint>",
-                 "#include <string>", "#include <string_view>", ""]
+                 "#include <span>", "#include <string>", "#include <string_view>", "#include <utility>",
+                 "#include <vector>", ""]
         if f.imports:
-            lines += [f"#include \"{imp.stem}.hpp\"" for imp in f.imports] + [""]
+            lines += [f"#include <agmen/{imp.stem}.hpp>" if imp.builtin else f"#include \"{imp.stem}.hpp\""
+                      for imp in f.imports] + [""]
         if f.package:
             lines += [f"namespace {_ns(f)} {{", ""]
         for c in f.consts:
@@ -292,6 +426,11 @@ def _prod(xs) -> int:
     return n
 
 
+def _cpp_string(text: str) -> str:
+    out = text.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{out}"'
+
+
 def cpp(f: AgmenFile) -> str:
     """El header de C++ (`<archivo>.hpp`)."""
     return _Cpp(f).render()
@@ -309,6 +448,12 @@ class _Py:
     def elem_ann(self, fd: FieldDef) -> str:
         if fd.kind == "prim":
             return _PY_PRIM[fd.prim]
+        if fd.kind == "string":
+            return "str"
+        if fd.kind == "bytes":
+            return "bytes"
+        if fd.kind == "tensor":
+            return "object"          # numpy.ndarray, o agmen.Tensor sin NumPy
         return (fd.enum or fd.struct).name
 
     def ann(self, fd: FieldDef) -> str:
@@ -331,6 +476,12 @@ class _Py:
             return f"{fd.enum.name}.{fd.enum.first}"
         if fd.kind == "struct":
             return f"{fd.struct.name}()"
+        if fd.kind == "string":
+            return '""'
+        if fd.kind == "bytes":
+            return 'b""'
+        if fd.kind == "tensor":
+            return f"_arrow.Tensor({(0,) * fd.type.tensor[1]!r}, [])"
         return {"bool": "False", "f32": "0.0", "f64": "0.0"}.get(fd.prim, "0")
 
     def default(self, fd: FieldDef) -> str:
@@ -338,11 +489,22 @@ class _Py:
         if not dims:
             if fd.kind == "struct":
                 return f"field(default_factory={fd.struct.name})"
+            if fd.kind == "tensor":
+                return f"field(default_factory=lambda: {self.zero(fd)})"
+            if fd.kind == "string":
+                return repr(fd.default) if fd.default is not None else '""'
             return self.elem_value(fd, fd.default) if fd.default is not None else self.zero(fd)
         if fd.default is not None:
             return f"field(default_factory=lambda: [{', '.join(self.elem_value(fd, x) for x in fd.default)}])"
+        if None in dims:
+            if dims[0] is None:
+                return "field(default_factory=list)"      # T[]: empieza vacío
+            expr = "[]"
+            for n in reversed(dims[:dims.index(None)]):
+                expr = f"[{expr} for _ in range({n})]"
+            return f"field(default_factory=lambda: {expr})"
         expr = self.zero(fd)
-        mutable = fd.kind == "struct"
+        mutable = fd.kind in ("struct", "tensor")
         for k, n in enumerate(reversed(dims)):
             if mutable or k > 0:
                 expr = f"[{expr} for _ in range({n})]"
@@ -368,11 +530,13 @@ class _Py:
         lines = ['"""' + f.path.name + f" — mensajes{' del package ' + f.package if f.package else ''}.", "",
                  *[x[2:] for x in _header(f, "#")], '"""', "",
                  "from __future__ import annotations", "", "import enum", "from dataclasses import dataclass, field",
-                 "", "from agmen import wire", ""]
+                 "", "from agmen import arrow as _arrow  # noqa: F401", "from agmen import wire", ""]
         for imp in f.imports:
             names = ", ".join(sorted(imp.types()))
             if for_load:
                 lines.append(f"# {imp.stem}: {names} (agmen.load los pone aquí)")
+            elif imp.builtin:
+                lines.append(f"from agmen.{imp.stem} import {names}  # noqa: F401")
             else:
                 lines.append(f"from {imp.stem} import {names}  # noqa: F401")
         lines += ["", "",
@@ -400,8 +564,9 @@ class _Py:
         for s in f.structs:
             base = "(wire.Message)" if s.kind == "message" else ""
             sdoc = (s.doc.replace(chr(10), " ") + " · ") if s.doc else ""
+            size = "tamaño variable (arrow, por TCP)" if s.arrow else f"{s.size} bytes"
             lines += ["", "@dataclass", f"class {s.name}{base}:",
-                      f'    """{sdoc}{s.size} bytes · {s.text}"""', ""]
+                      f'    """{sdoc}{size} · {s.text}"""', ""]
             if s.kind == "message":
                 lines += [f"    SCHEMA = {s.body!r}", ""]
             lines += [f"    {fd.name}: {self.ann(fd)} = {self.default(fd)}" + (f"  # {fd.doc}" if fd.doc else "")
@@ -414,7 +579,7 @@ class _Py:
                           "        cls.check_payload_size(payload, cls.LAYOUT.size)"]
                 if self.numpy:
                     lines += ["        # numpy=True: los arreglos de números son numpy.ndarray sin copiar",
-                              "        return cls.from_dict(cls.LAYOUT.numpy_fields(payload, cls.LAYOUT.unpack(payload)))"]
+                              "        return cls.from_dict(cls.LAYOUT.decode(payload, numpy=True))"]
                 else:
                     lines += ["        return cls.from_dict(cls.LAYOUT.unpack(payload))"]
             lines.append("")
@@ -460,6 +625,11 @@ def load(path: str | Path, numpy: bool = False) -> types.ModuleType:
     modules: dict[str, types.ModuleType] = {}
     for x in idl.all_files(f):
         key = str(x.path.resolve()) + ("#numpy" if numpy else "")
+        if x.builtin and x is not f:          # agmen.msgs ya trae estos tipos (con as_array y compañía)
+            from . import msgs
+
+            modules[key] = msgs.types(numpy)
+            continue
         mtime = x.path.stat().st_mtime
         cached = _LOADED.get(key)
         if cached and cached[0] == mtime and all(str(i.path.resolve()) + ("#numpy" if numpy else "") in modules
@@ -487,6 +657,8 @@ def outputs(f: AgmenFile, cpp_dir: Path | None, py_dir: Path | None) -> dict[Pat
     """Qué archivos salen de f (y de lo que importa) y con qué contenido."""
     out: dict[Path, str] = {}
     for x in idl.all_files(f):
+        if x.builtin and x is not f:          # viene con Agmen: <agmen/msgs.hpp> y agmen.msgs ya existen
+            continue
         if cpp_dir is not None:
             out[cpp_dir / f"{x.stem}.hpp"] = cpp(x)
         if py_dir is not None:
@@ -507,7 +679,8 @@ def summary(f: AgmenFile) -> list[str]:
         for e in x.enums:
             rows.append(f"  enum     {e.name} : {e.base}  " + ", ".join(f"{n}={v}" for n, v in e.members))
         for s in x.structs:
-            rows.append(f"  {s.kind:<8} {s.name}  {s.size} bytes  0x{s.schema_id:016x}  {s.text}")
+            size = "arrow (TCP)" if s.arrow else f"{s.size} bytes"
+            rows.append(f"  {s.kind:<8} {s.name}  {size}  0x{s.schema_id:016x}  {s.text}")
     return rows
 
 

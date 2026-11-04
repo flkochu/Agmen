@@ -12,21 +12,33 @@
     pub = agmen.Publisher(MotorCommand, "127.0.0.1:7500", topic="/cmd")
     pub.publish(MotorCommand(0.5, 0.5))
 
-Contiene la implementación de referencia del formato v1 en Python puro
-(`agmen.wire`, `agmen.schema`). Más adelante este paquete se compilará desde
-el núcleo de C++ (nanobind) y la versión pura quedará como referencia y
-oráculo de pruebas.
+Desde 0.9.0 el paquete usa el núcleo de C++ (`agmen._core`, RFC 0007) si
+está compilado para tu computadora; si no, la implementación de referencia
+en Python puro (`agmen.wire`, `agmen.schema`, `agmen.arrow`).
+
+Los mensajes grandes (imágenes, tensores, texto; RFC 0008) usan la
+codificación arrow y viajan por TCP: `agmen.msgs.Imagen`,
+`agmen.msgs.ImagenComprimida`, `agmen.Tensor` y `agmen.load(..., numpy=True)`.
 """
 
 import sys
 
 from . import clock, schema, wire
 from ._version import __version__
+from .arrow import Tensor
 from .node import Group, Node
 from .pubsub import Publisher, Sample, Subscriber
 
-__all__ = ["wire", "schema", "clock", "Publisher", "Subscriber", "Sample", "Node", "Group", "__version__",
-           "ensure_utf8_output", "load"]
+__all__ = ["wire", "schema", "clock", "Publisher", "Subscriber", "Sample", "Node", "Group", "Tensor", "__version__",
+           "ensure_utf8_output", "load", "msgs"]
+
+
+def __getattr__(name: str):
+    if name == "msgs":                      # los mensajes estándar (Imagen...), cargados al primer uso
+        import importlib
+
+        return importlib.import_module("agmen.msgs")
+    raise AttributeError(f"module 'agmen' has no attribute '{name}'")
 
 
 def load(path, numpy: bool = False):

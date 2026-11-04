@@ -55,3 +55,55 @@ message Enteros {
     u32 g
     u64 h
 }
+
+# --- Codificación arrow (RFC 0008): los vectores "arrow" de v1.txt ---
+
+message Texto {
+    string s
+    u8 n
+}
+
+message Blob {
+    bytes b
+    u16 k
+}
+
+message Grande {
+    bytes b
+}
+
+message Lista {
+    f32[] x
+    i64[] y
+    bool[] z
+}
+
+message Tensor {
+    tensor<f32,2> m
+    tensor<u8,1> v
+}
+
+# El mismo esquema que agmen.msgs.Imagen (mismo schema_id).
+message Imagen {
+    time timestamp
+    string frame_id
+    u32 width
+    u32 height
+    string encoding
+    u32 step
+    bytes data
+}
+
+struct Par {
+    u8 a
+    string b
+}
+
+message Mixto {
+    Vec3[] pts
+    string[] tags
+    f32[2][2] m
+    u8[3] c
+    Par[2] pares
+    duration d
+}

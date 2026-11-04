@@ -25,6 +25,10 @@ el mismo texto canónico de siempre (RFC 0001), así que los bytes no cambian.
 - Un enum viaja como su entero (`u8`).
 - Las constantes, los valores por defecto y el `package` no viajan: viven
   solo en el código generado.
+- Desde Agmen 0.10 (RFC 0008) hay campos de tamaño variable: `string`,
+  `bytes`, `T[]` y `tensor<T,N>`. Un message con alguno viaja en la
+  codificación arrow (por TCP) en vez de compact; su código generado sabe
+  cuál usar.
 
 Este módulo solo LEE y VALIDA el archivo, con errores de línea y columna.
 El código lo escribe `agmen.gen`.
@@ -39,7 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import schema
-from .schema import PRIMITIVES, Array, Prim, SchemaError, Struct
+from .schema import PRIMITIVES, Array, Prim, SchemaError, Seq, Struct, Tensor, Var
 
 MAX_PAYLOAD = 65_507 - 64        # lo que cabe en un datagrama UDP, menos el sobre
 INT_RANGES = {
@@ -91,9 +95,14 @@ class Pos:
 
 @dataclass
 class TypeRef:
-    name: str            # f32, Vec3, Modo...
-    dims: list[int]      # f32[2][3] → [2, 3]
+    name: str                  # f32, Vec3, Modo, string, bytes, tensor...
+    dims: list[int | None]     # f32[2][3] → [2, 3]; f32[] → [None]
     pos: Pos
+    tensor: tuple[str, int] | None = None   # tensor<f32,2> → ("f32", 2)
+
+    @property
+    def variable(self) -> bool:
+        return self.name in schema.VARLEN or self.tensor is not None or None in self.dims
 
 
 @dataclass
@@ -106,8 +115,8 @@ class FieldDef:
     raw_default: object = None
     doc: str = ""
     # Lo que se sabe al resolver:
-    kind: str = ""                  # "prim" | "enum" | "struct"
-    prim: str = ""                  # el tipo en los bytes (para enums, su base)
+    kind: str = ""                  # "prim" | "enum" | "struct" | "string" | "bytes" | "tensor"
+    prim: str = ""                  # el tipo en los bytes (para enums, su base; para tensor, el elemento)
     enum: EnumDef | None = None
     struct: StructDef | None = None
     offset: int = 0
@@ -156,7 +165,17 @@ class StructDef:
 
     @property
     def size(self) -> int:
-        return self.resolved.size if self.resolved else 0
+        """Tamaño compact (0 si tiene campos de tamaño variable: viaja en arrow)."""
+        return (self.resolved.size or 0) if self.resolved else 0
+
+    @property
+    def arrow(self) -> bool:
+        """¿Tiene campos de tamaño variable? Entonces viaja en arrow (RFC 0008)."""
+        return self.resolved is not None and self.resolved.size is None
+
+
+# Archivos que vienen con Agmen: import "agmen/msgs.agmen" (RFC 0008 D4).
+BUILTIN = {"agmen/msgs.agmen": Path(__file__).with_name("msgs.agmen")}
 
 
 @dataclass
@@ -164,6 +183,7 @@ class AgmenFile:
     path: Path
     source: str
     package: str = ""
+    builtin: bool = False            # viene con Agmen: no se genera, se importa de agmen.msgs / <agmen/msgs.hpp>
     imports: list[AgmenFile] = field(default_factory=list)
     consts: list[ConstDef] = field(default_factory=list)
     enums: list[EnumDef] = field(default_factory=list)
@@ -207,7 +227,7 @@ _TOKEN = re.compile(r"""
   | (?P<number>-?(?:0[xX][0-9A-Fa-f_]+|\d[\d_]*(?:\.\d*)?(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?))
   | (?P<ident>[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)
   | (?P<string>"[^"\n]*")
-  | (?P<sym>[{}\[\]=:;,])
+  | (?P<sym>[{}\[\]=:;,<>])
 """, re.X)
 
 
@@ -342,23 +362,43 @@ class _Parser:
             raise self.f.error(f"{what} '{name}' choca con una palabra de C++ o Python: usa otro nombre", pos)
 
     def parse_type(self) -> TypeRef:
-        t = self.ident("un tipo (f32, u8, Vec3...)")
-        dims: list[int] = []
+        t = self.ident("un tipo (f32, u8, Vec3, string, bytes, tensor<f32,2>...)")
+        tensor = None
+        if t.value == "tensor":
+            self.expect("<", "'<' (un tensor se escribe tensor<f32,2>: el tipo y el número de dimensiones)")
+            e = self.ident("el tipo de los elementos (ej. tensor<f32,2>)")
+            if e.value not in schema.TENSOR_ELEMS:
+                raise self.f.error(f"un tensor solo puede ser de números ({', '.join(schema.TENSOR_ELEMS)}), no de "
+                                   f"'{e.value}'" + _alias_hint(e.value), e.pos)
+            self.expect(",", "',' y el número de dimensiones (ej. tensor<f32,2>)")
+            n = self.peek()
+            if n.kind != "number" or not re.fullmatch(r"[1-9]\d*", n.value) or int(n.value) > schema.MAX_TENSOR_DIMS:
+                raise self.f.error(f"el número de dimensiones del tensor es un entero de 1 a {schema.MAX_TENSOR_DIMS} "
+                                   f"(ej. tensor<f32,2> para una matriz)", n.pos)
+            self.next()
+            self.expect(">", "'>'")
+            tensor = (e.value, int(n.value))
+        dims: list[int | None] = []
         while self.peek().value == "[":
             self.next()
             n = self.peek()
             if n.value == "]":
-                raise self.f.error("los arreglos de tamaño variable (T[]) llegan con la codificación arrow "
-                                   "(nivel 7). Usa un tamaño fijo, ej. f32[3]", n.pos)
+                self.next()
+                if tensor is not None:
+                    raise self.f.error("un tensor ya es de tamaño variable: no lleva []", n.pos)
+                dims.append(None)          # T[]: tamaño variable (arrow)
+                continue
             if n.kind != "number" or not re.fullmatch(r"[1-9]\d*", n.value):
                 raise self.f.error(f"tamaño de arreglo inválido {self.describe(n)}: un entero de 1 a "
-                                   f"{schema.MAX_ARRAY}", n.pos)
+                                   f"{schema.MAX_ARRAY}, o [] para tamaño variable", n.pos)
             self.next()
             if int(n.value) > schema.MAX_ARRAY:
                 raise self.f.error(f"arreglo de {n.value}: el máximo es {schema.MAX_ARRAY}", n.pos)
+            if tensor is not None:
+                raise self.f.error("un tensor ya trae su forma: no lleva [N]", n.pos)
             dims.append(int(n.value))
             self.expect("]")
-        return TypeRef(t.value, dims, t.pos)
+        return TypeRef(t.value, dims, t.pos, tensor)
 
     def parse_value(self):
         t = self.peek()
@@ -390,13 +430,16 @@ class _Parser:
             if t.value in ("true", "false"):
                 return t.value == "true"
             return _Name(t.value, t.pos)
-        raise self.f.error(f"se esperaba un valor (número, true/false, un nombre del enum o [..]) y llegó "
-                           f"{self.describe(t)}", t.pos)
+        if t.kind == "string":
+            self.next()
+            return _Text(t.value[1:-1])
+        raise self.f.error(f"se esperaba un valor (número, true/false, un nombre del enum, \"texto\" o [..]) y "
+                           f"llegó {self.describe(t)}", t.pos)
 
     def parse_const(self) -> None:
         self.next()
         ty = self.parse_type()
-        if ty.dims:
+        if ty.dims or ty.tensor:
             raise self.f.error("las constantes de arreglo todavía no existen: usa un número", ty.pos)
         if ty.name not in PRIMITIVES:
             raise self.f.error(f"una constante es de un tipo básico (u8, f32, bool...), no '{ty.name}'"
@@ -519,6 +562,11 @@ class _Name:            # un nombre como valor (el valor de un enum)
     pos: Pos
 
 
+@dataclass
+class _Text:            # "texto": el valor por defecto de un string
+    text: str
+
+
 def _alias_hint(name: str) -> str:
     alias = schema._ALIASES.get(name)
     return f": usa '{alias}'" if alias else ""
@@ -534,7 +582,7 @@ def _check_scalar(f: AgmenFile, prim: str, value, pos: Pos, enum: EnumDef | None
             raise f.error(f"'{value.name}' no es un {enum.name}"
                           + (f": ¿quisiste decir '{hint[0]}'?" if hint else f" ({', '.join(names)})"), value.pos)
         return value.name
-    if isinstance(value, (_Name, list)):
+    if isinstance(value, (_Name, list, _Text)):
         raise f.error(f"se esperaba un valor de tipo {prim}", pos)
     if prim == "bool":
         if not isinstance(value, bool):
@@ -594,7 +642,7 @@ def _resolve(f: AgmenFile) -> None:
         s.resolved = st
         s.text = schema.PREFIX + st.canonical()
         lay = schema.Layout(s.text)          # el lector de siempre debe estar de acuerdo
-        assert lay.text == s.text and lay.size == st.size
+        assert lay.text == s.text and lay.size == st.size, (lay.text, s.text, lay.size, st.size)
         s.schema_id = lay.schema_id
         state[s.name] = "listo"
         return st
@@ -604,6 +652,12 @@ def _resolve(f: AgmenFile) -> None:
         if t.name in PRIMITIVES:
             base: schema.Type = Prim(t.name)
             fd.kind, fd.prim = "prim", t.name
+        elif t.tensor is not None:
+            base = Tensor(Prim(t.tensor[0]), t.tensor[1])
+            fd.kind, fd.prim = "tensor", t.tensor[0]
+        elif t.name in schema.VARLEN:
+            base = Var(t.name)
+            fd.kind = t.name
         elif t.name in visible:
             d = visible[t.name]
             if isinstance(d, EnumDef):
@@ -617,15 +671,17 @@ def _resolve(f: AgmenFile) -> None:
                 fd.kind, fd.struct = "struct", d
         elif t.name in schema._ALIASES:
             raise f.error(f"'{t.name}' no existe en Agmen: usa '{schema._ALIASES[t.name]}'", t.pos)
-        elif t.name in schema._VARIABLE:
-            raise f.error(f"'{t.name}' es de tamaño variable: llega con la codificación arrow (nivel 7). "
-                          f"En el nivel 4 solo hay tipos de tamaño fijo", t.pos)
+        elif t.name == "str":
+            raise f.error("'str' no existe en Agmen: usa 'string'", t.pos)
+        elif t.name == "optional":
+            raise f.error("'optional' todavía no existe en Agmen: usa un valor que signifique 'no hay' (ej. -1) "
+                          "o un bool al lado", t.pos)
         else:
             hint = difflib.get_close_matches(t.name, names + list(PRIMITIVES), 1)
             raise f.error(f"tipo desconocido '{t.name}'" + (f": ¿quisiste decir '{hint[0]}'?" if hint else
-                          f". Usa {', '.join(PRIMITIVES)}, un enum o un struct"), t.pos)
+                          f". Usa {', '.join(PRIMITIVES)}, string, bytes, tensor<T,N>, un enum o un struct"), t.pos)
         for n in reversed(t.dims):
-            base = Array(base, n)
+            base = Seq(base) if n is None else Array(base, n)
         if fd.raw_default is not None:
             fd.default = check_default(fd)
         return base
@@ -634,10 +690,22 @@ def _resolve(f: AgmenFile) -> None:
         v, pos = fd.raw_default, fd.default_pos
         if fd.kind == "struct":
             raise f.error(f"'{fd.name}' es un {fd.type.name}: sus valores por defecto se ponen en {fd.type.name}", pos)
+        if fd.kind in ("bytes", "tensor"):
+            raise f.error(f"'{fd.name}' es {fd.type.name}: no lleva valor por defecto (empieza vacío)", pos)
+        if fd.kind == "string":
+            if fd.type.dims:
+                raise f.error("valores por defecto en arreglos de string: todavía no", pos)
+            if not isinstance(v, _Text):
+                raise f.error(f"el valor por defecto de '{fd.name}' va entre comillas: \"texto\"", pos)
+            return v.text
         if len(fd.type.dims) > 1:
             raise f.error("valores por defecto en arreglos de varias dimensiones: todavía no", pos)
         if fd.type.dims:
             n = fd.type.dims[0]
+            if n is None:                      # T[]: la lista que se dé (o vacía)
+                if not isinstance(v, list):
+                    raise f.error(f"'{fd.name}' es una lista: su valor por defecto va entre corchetes, [1, 2]", pos)
+                return [_check_scalar(f, fd.prim, x, pos, fd.enum) for x in v]
             if isinstance(v, list):
                 if len(v) != n:
                     raise f.error(f"'{fd.name}' tiene {n} elementos y el valor por defecto trae {len(v)}", pos)
@@ -649,9 +717,10 @@ def _resolve(f: AgmenFile) -> None:
 
     for s in f.structs:
         build(s, [])
-        if s.kind == "message" and s.size > MAX_PAYLOAD:
+        if s.kind == "message" and not s.arrow and s.size > MAX_PAYLOAD:
             raise f.error(f"'{s.name}' mide {s.size:,} bytes y en un paquete UDP caben {MAX_PAYLOAD:,}: para datos "
-                          f"grandes llegan arrow y la memoria compartida (niveles 7 y 8)", s.pos)
+                          f"grandes usa un campo de tamaño variable (bytes, T[] o tensor<T,N>), que viaja por TCP "
+                          f"(RFC 0008)", s.pos)
 
 
 def parse_text(text: str, path: str | Path = "<texto>", _loading: dict | None = None) -> AgmenFile:
@@ -662,8 +731,11 @@ def parse_text(text: str, path: str | Path = "<texto>", _loading: dict | None = 
     key = str(Path(path).resolve())
     loading[key] = None                      # "cargando": para detectar import circular
     for rel, tok in imports:
-        target = (Path(path).parent / rel).resolve()
+        builtin = rel in BUILTIN
+        target = BUILTIN[rel].resolve() if builtin else (Path(path).parent / rel).resolve()
         if not target.is_file():
+            if rel.startswith("agmen/"):
+                raise f.error(f"'{rel}' no viene con Agmen. Los archivos de Agmen son: {', '.join(BUILTIN)}", tok.pos)
             raise f.error(f"no encontré '{rel}' (lo busqué en {target.parent})", tok.pos)
         tkey = str(target)
         if tkey in loading:
@@ -671,7 +743,9 @@ def parse_text(text: str, path: str | Path = "<texto>", _loading: dict | None = 
                 raise f.error(f"import circular: '{rel}' ya está importando a este archivo", tok.pos)
             f.imports.append(loading[tkey])
             continue
-        f.imports.append(parse_text(target.read_text(encoding="utf-8"), target, loading))
+        dep = parse_text(target.read_text(encoding="utf-8"), target, loading)
+        dep.builtin = builtin
+        f.imports.append(dep)
     _resolve(f)
     loading[key] = f
     return f

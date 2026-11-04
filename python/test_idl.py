@@ -38,6 +38,14 @@ def vector_rows():
             yield canon, int(sid, 16), int(size), ast.literal_eval(valores), payload
 
 
+def arrow_rows():
+    """Los vectores arrow (RFC 0008): (canónico, schema_id, valores, payload_hex)."""
+    for line in (VECTORS / "v1.txt").read_text(encoding="utf-8").splitlines():
+        if line.startswith("arrow\t"):
+            _, _entrada, canon, sid, valores, payload = line.split("\t")
+            yield canon, int(sid, 16), ast.literal_eval(valores), payload
+
+
 class Tmp(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp(prefix="agmen-idl-"))
@@ -73,13 +81,21 @@ class TestLector(Tmp):
         f = idl.parse_file(VECTORS / "v1.agmen")
         by = {s.name: s for s in f.messages}
         rows = list(vector_rows())
-        self.assertEqual(len(rows), len(by))
+        arrows = list(arrow_rows())
+        self.assertEqual(len(rows) + len(arrows), len(by))
         for canon, sid, size, _, _ in rows:
             name = canon[8:canon.index("{")]
             with self.subTest(name):
                 self.assertEqual(by[name].text, canon)
                 self.assertEqual(by[name].schema_id, sid)
                 self.assertEqual(by[name].size, size)
+                self.assertFalse(by[name].arrow)
+        for canon, sid, _, _ in arrows:
+            name = canon[8:canon.index("{")]
+            with self.subTest(name):
+                self.assertEqual(by[name].text, canon)
+                self.assertEqual(by[name].schema_id, sid)
+                self.assertTrue(by[name].arrow)
 
     def test_enum_numera_solo_y_acepta_comas(self):
         f = idl.parse_text("enum Color : i16 { ROJO = -2, VERDE, AZUL = 10 }\nmessage M { Color c }\n", self.dir / "c.agmen")
@@ -129,6 +145,43 @@ class TestCarga(Tmp):
                 back = cls.decode_payload(bytes.fromhex(payload))
                 self.assertEqual(back.encode_payload().hex(), payload)
                 self.assertEqual(cls.SCHEMA_TEXT, canon)
+
+    def test_vectores_arrow_con_agmen_load(self):
+        # Los tipos con campos variables (RFC 0008): decodificar y volver a codificar
+        # da exactamente los mismos bytes que escribió el generador de vectores.
+        msgs = agmen.load(VECTORS / "v1.agmen")
+        for canon, sid, _values, payload in arrow_rows():
+            name = canon[8:canon.index("{")]
+            with self.subTest(name):
+                cls = getattr(msgs, name)
+                self.assertEqual((cls.SCHEMA_TEXT, cls.SCHEMA_ID), (canon, sid))
+                self.assertEqual(cls.LAYOUT.encoding, wire.ENC_ARROW)
+                back = cls.decode_payload(bytes.fromhex(payload))
+                self.assertEqual(back.encode_payload().hex(), payload)
+        mixto = msgs.Mixto.decode_payload(bytes.fromhex(next(p for c, _, _, p in arrow_rows() if "Mixto" in c)))
+        self.assertEqual(mixto.pts[1], msgs.Vec3(-1.0, 0.5, 0.0))
+        self.assertEqual(mixto.pares, [msgs.Par(1, "uno"), msgs.Par(2, "dos")])
+        self.assertEqual(mixto.tags, ["a", "", "ñ"])
+        self.assertEqual(msgs.Imagen.SCHEMA_ID, agmen.msgs.Imagen.SCHEMA_ID)
+
+    def test_imagen_estandar(self):
+        import numpy as np
+
+        from agmen.msgs import Imagen, ImagenComprimida
+
+        a = np.arange(2 * 3 * 3, dtype=np.uint8).reshape(2, 3, 3)
+        img = Imagen.from_array(a, frame_id="cam")
+        self.assertEqual((img.encoding, img.width, img.height, img.step), ("bgr8", 3, 2, 9))
+        _, back = wire.decode(Imagen, wire.encode(img, 0))
+        b = back.as_array()
+        self.assertEqual(b.shape, (2, 3, 3))
+        self.assertTrue(np.array_equal(a, b))
+        self.assertIsNotNone(b.base, "as_array no copia los píxeles")
+        mono = Imagen.from_array(np.zeros((4, 5), dtype=np.uint16))
+        self.assertEqual((mono.encoding, mono.step, mono.as_array().shape), ("mono16", 10, (4, 5)))
+        with self.assertRaisesRegex(wire.WireError, "hacen falta"):
+            Imagen(width=10, height=10, encoding="rgb8", data=b"x").as_array()
+        self.assertEqual(ImagenComprimida().format, "jpeg")
 
     def test_enums_defaults_y_anidados(self):
         msgs = agmen.load(ARCA9)
@@ -190,9 +243,15 @@ class TestErrores(Tmp):
         ("message A {\n    float x\n}\n", "x.agmen:2:5:", "'float' no existe en Agmen: usa 'f32'"),
         ("struct Vec3 { f32 x }\nmessage A {\n    Vec p\n}\n", "x.agmen:3:5:", "¿quisiste decir 'Vec3'?"),
         ("message A {\n    u8 class\n}\n", "x.agmen:2:8:", "choca con una palabra de C++ o Python"),
-        ("message A {\n    string nombre\n}\n", "x.agmen:2:5:", "tamaño variable"),
-        ("message A {\n    f32[] q\n}\n", "x.agmen:2:9:", "tamaño variable (T[])"),
+        ("message A {\n    str nombre\n}\n", "x.agmen:2:5:", "'str' no existe en Agmen: usa 'string'"),
+        ("message A {\n    tensor<bool,2> t\n}\n", "x.agmen:2:12:", "un tensor solo puede ser de números"),
+        ("message A {\n    tensor<f32> t\n}\n", "x.agmen:2:15:", "',' y el número de dimensiones"),
+        ("message A {\n    tensor<f32,2>[3] t\n}\n", "x.agmen:2:19:", "un tensor ya trae su forma"),
+        ("message A {\n    bytes b = 3\n}\n", "x.agmen:2:15:", "no lleva valor por defecto"),
+        ("message A {\n    string s = hola\n}\n", "x.agmen:2:16:", "va entre comillas"),
+        ("message A {\n    f32[] q = 3\n}\n", "x.agmen:2:15:", "va entre corchetes"),
         ("message Mapa {\n    u8[70000] celdas\n}\n", "x.agmen:1:9:", "en un paquete UDP caben 65,443"),
+        ('import "agmen/nada.agmen"\n', "x.agmen:1:8:", "no viene con Agmen"),
         ("message A {\n    f32 x\n    f32 x\n}\n", "x.agmen:3:9:", "está repetido"),
         ("struct A {\n    A otro\n}\n", "x.agmen:1:8:", "no puede contenerse a sí mismo"),
         ("enum E : u8 {\n    A = 300\n}\n", "x.agmen:2:9:", "300 no cabe en u8"),

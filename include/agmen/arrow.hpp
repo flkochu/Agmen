@@ -18,6 +18,7 @@
 // apuntan al payload, que debe vivir más que el Value.
 #pragma once
 
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -222,5 +223,80 @@ private:
     friend struct Writer;
     friend struct Reader;
 };
+
+// ---------------------------------------------------------------------------
+// Ayudas para el código que genera `agmen gen` (to_value / from_value).
+// ---------------------------------------------------------------------------
+
+namespace detail {
+
+/// Un std::array anidado de números visto como una tira contigua.
+template <class T>
+struct Flat {
+    using elem = T;
+    static constexpr std::size_t count = 1;
+    static T* ptr(T& v) { return &v; }
+    static const T* ptr(const T& v) { return &v; }
+};
+template <class T, std::size_t N>
+struct Flat<std::array<T, N>> {
+    using elem = typename Flat<T>::elem;
+    static constexpr std::size_t count = N * Flat<T>::count;
+    static elem* ptr(std::array<T, N>& a) { return Flat<T>::ptr(a[0]); }
+    static const elem* ptr(const std::array<T, N>& a) { return Flat<T>::ptr(a[0]); }
+};
+
+}  // namespace detail
+
+/// `std::array<std::array<float, 3>, 2>` → `std::span<float>` de 6 (sin copiar).
+template <class A>
+[[nodiscard]] std::span<typename detail::Flat<std::remove_cv_t<A>>::elem> flat(A& a) {
+    using F = detail::Flat<std::remove_cv_t<A>>;
+    return {F::ptr(a), F::count};
+}
+template <class A>
+[[nodiscard]] std::span<const typename detail::Flat<std::remove_cv_t<A>>::elem> flat(const A& a) {
+    using F = detail::Flat<std::remove_cv_t<A>>;
+    return {F::ptr(a), F::count};
+}
+
+/// Copia los números de un Raw/Tensor en `out`; error claro si no son tantos.
+template <class T>
+void numbers_into(const Value& v, std::span<T> out, std::string_view campo) {
+    const auto b = v.bytes();
+    if (b.size() != out.size() * sizeof(T)) {
+        throw wire::WireError(wire::WireError::Kind::BadArrow,
+                              "'" + std::string(campo) + "' debía traer " + std::to_string(out.size()) +
+                                  " números y trae " + std::to_string(b.size() / sizeof(T)));
+    }
+    if (!b.empty()) std::memcpy(out.data(), b.data(), b.size());
+}
+
+/// Los `n` elementos de una lista (error claro si no son tantos).
+[[nodiscard]] inline const std::vector<Value>& items_of(const Value& v, std::size_t n, std::string_view campo) {
+    if (v.kind != Value::Kind::List || v.items.size() != n) {
+        throw wire::WireError(wire::WireError::Kind::BadArrow,
+                              "'" + std::string(campo) + "' debía traer " + std::to_string(n) + " elementos y trae " +
+                                  std::to_string(v.kind == Value::Kind::List ? v.items.size() : 0));
+    }
+    return v.items;
+}
+
+/// Una lista a partir de un contenedor y la conversión de cada elemento.
+template <class C, class F>
+[[nodiscard]] Value list_of(const C& c, F&& f) {
+    std::vector<Value> items;
+    items.reserve(c.size());
+    for (const auto& e : c) items.push_back(f(e));
+    return Value::list(std::move(items));
+}
+
+/// Los elementos de una lista de tamaño variable.
+[[nodiscard]] inline const std::vector<Value>& items_of(const Value& v, std::string_view campo) {
+    if (v.kind != Value::Kind::List) {
+        throw wire::WireError(wire::WireError::Kind::BadArrow, "'" + std::string(campo) + "' debía ser una lista");
+    }
+    return v.items;
+}
 
 }  // namespace agmen::arrow

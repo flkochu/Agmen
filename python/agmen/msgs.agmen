@@ -1,0 +1,31 @@
+# Mensajes estándar de Agmen (RFC 0008, D4).
+#
+# Tienen los mismos campos que los tipos de Foxglove (foxglove.RawImage y
+# foxglove.CompressedImage), así una cámara, una IA, el panel, Foxglove y las
+# grabaciones hablan el mismo tipo sin ponerse de acuerdo.
+#
+#   import "agmen/msgs.agmen"          # en tu .agmen
+#   from agmen.msgs import Imagen      # en Python
+#   #include <agmen/msgs.hpp>          # en C++: agmen::msgs::Imagen
+package agmen.msgs
+
+# Una imagen sin comprimir, renglón por renglón. En Python, as_array() la da
+# como numpy.ndarray (alto, ancho, canales) sin copiar, y from_array() la arma
+# desde uno.
+message Imagen {
+    time   timestamp              # cuándo se capturó
+    string frame_id               # el marco de referencia (ej. "camara")
+    u32    width                  # ancho en píxeles
+    u32    height                 # alto en píxeles
+    string encoding = "rgb8"      # rgb8, bgr8, rgba8, bgra8, mono8, mono16, 16UC1, 32FC1, bayer_rggb8...
+    u32    step                   # bytes por renglón (0 = ancho × bytes por píxel)
+    bytes  data                   # los píxeles
+}
+
+# Una imagen comprimida (JPEG, PNG o WebP): el navegador y OpenCV la decodifican.
+message ImagenComprimida {
+    time   timestamp              # cuándo se capturó
+    string frame_id               # el marco de referencia (ej. "camara")
+    string format = "jpeg"        # jpeg, png, webp
+    bytes  data                   # el archivo comprimido, tal cual
+}

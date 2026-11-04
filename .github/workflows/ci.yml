@@ -29,8 +29,13 @@ jobs:
       - name: Versión consistente
         run: python scripts/check_version.py
 
-      - name: nanobind (para agmen._core) y NumPy
-        run: python -m pip install nanobind numpy
+      - name: nanobind (para agmen._core), NumPy y pyarrow (el juez de la codificación arrow)
+        run: python -m pip install nanobind numpy pyarrow
+
+      - name: include/agmen/msgs.hpp al día con python/agmen/msgs.agmen
+        run: python -m agmen gen python/agmen/msgs.agmen --cpp include/agmen --check-files
+        env:
+          PYTHONPATH: python
 
       - name: Configurar (advertencias = errores)
         run: cmake -S . -B build -DAGMEN_WERROR=ON -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE="${{ steps.py.outputs.python-path }}"

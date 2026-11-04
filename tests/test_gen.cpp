@@ -5,6 +5,8 @@
 //   - volver a codificar da EXACTAMENTE los mismos bytes (relleno incluido).
 #include "v1.hpp"   // generado por agmen_add_messages(vectores_msgs tests/vectors/v1.agmen)
 
+#include <agmen/msgs.hpp>
+
 #include <cstdio>
 #include <fstream>
 #include <limits>
@@ -30,6 +32,7 @@ int g_failures = 0;
 
 struct Vector {
     std::string text, id, payload_hex;
+    bool arrow = false;
 };
 
 std::map<std::string, Vector> load_vectors() {
@@ -37,15 +40,17 @@ std::map<std::string, Vector> load_vectors() {
     std::ifstream in(AGMEN_VECTORS_FILE);
     std::string line;
     while (std::getline(in, line)) {
-        if (line.rfind("schema\t", 0) != 0) continue;
+        const bool arrow = line.rfind("arrow\t", 0) == 0;
+        if (!arrow && line.rfind("schema\t", 0) != 0) continue;
         std::vector<std::string> cols;
         std::stringstream ss(line);
         std::string col;
         while (std::getline(ss, col, '\t')) cols.push_back(col);
         // schema  entrada  canónico  schema_id  tamaño  valores  payload_hex
+        // arrow   entrada  canónico  schema_id  valores  payload_hex
         const std::string& canon = cols.at(2);
         const std::string name = canon.substr(8, canon.find('{') - 8);   // "agmen/1 " + Nombre
-        out[name] = Vector{canon, cols.at(3), cols.at(6)};
+        out[name] = Vector{canon, cols.at(3), cols.at(arrow ? 5 : 6), arrow};
     }
     return out;
 }
@@ -78,7 +83,8 @@ M check_type(const std::map<std::string, Vector>& vectors) {
     CHECK(agmen::wire::schema_text<M>() == v.text);
     CHECK(hex(agmen::wire::schema_id_v<M>) == v.id);
     const auto payload = from_hex(v.payload_hex);
-    CHECK(payload.size() == M::kPayloadLen);
+    CHECK(v.arrow == agmen::wire::is_arrow_v<M>);
+    if (!v.arrow) CHECK(payload.size() == M::kPayloadLen);
     const M m = M::decode_payload(payload);
     agmen::wire::Bytes again;
     m.encode_payload(again);
@@ -86,7 +92,7 @@ M check_type(const std::map<std::string, Vector>& vectors) {
         std::fprintf(stderr, "  FALLA %s: volver a codificar no da los mismos bytes\n", name.c_str());
         ++g_failures;
     }
-    std::printf("  ok %-14s %3zu bytes  %s\n", name.c_str(), M::kPayloadLen, v.id.c_str());
+    std::printf("  ok %-14s %3zu bytes  %s%s\n", name.c_str(), payload.size(), v.id.c_str(), v.arrow ? "  (arrow)" : "");
     return m;
 }
 
@@ -122,6 +128,31 @@ int main() {
     CHECK(en.a == std::numeric_limits<std::int8_t>::min() && en.b == std::numeric_limits<std::int16_t>::min());
     CHECK(en.c == std::numeric_limits<std::int32_t>::min() && en.d == -1);
     CHECK(en.e == 255 && en.f == 65535 && en.g == 4294967295U && en.h == std::numeric_limits<std::uint64_t>::max());
+
+    // --- arrow (RFC 0008): decodificar y volver a codificar da los mismos bytes ---
+    const auto tx = check_type<Texto>(vectors);
+    CHECK(tx.s == "hola, ñandú" && tx.n == 7);
+
+    const auto bl = check_type<Blob>(vectors);
+    CHECK(bl.b.size() == 10 && bl.b[9] == 9 && bl.k == 513);
+
+    const auto gr = check_type<Grande>(vectors);
+    CHECK(gr.b.size() == 100 && gr.b[99] == 99);
+
+    const auto li = check_type<Lista>(vectors);
+    CHECK(li.x.size() == 3 && li.x[1] == -2.0f && li.y.empty() && li.z.size() == 4 && li.z[0] && !li.z[1]);
+
+    const auto te = check_type<Tensor>(vectors);
+    CHECK(te.m.shape == (std::vector<std::int32_t>{2, 3}) && te.m.data.size() == 6 && te.m.data[5] == 6.0f);
+    CHECK(te.v.shape == (std::vector<std::int32_t>{0}) && te.v.data.empty());
+
+    const auto im = check_type<Imagen>(vectors);
+    CHECK(im.frame_id == "camara" && im.width == 2 && im.encoding == "rgb8" && im.data.size() == 12);
+    CHECK(agmen::wire::schema_id_v<Imagen> == agmen::wire::schema_id_v<agmen::msgs::Imagen>);
+
+    const auto mx = check_type<Mixto>(vectors);
+    CHECK(mx.pts.size() == 2 && mx.pts[1].x == -1.0 && mx.tags.size() == 3 && mx.tags[2] == "ñ");
+    CHECK(mx.m[1][1] == 4.0f && mx.c[2] == 9 && mx.pares[1].a == 2 && mx.pares[1].b == "dos" && mx.d == -5);
 
     // Un payload de otro tamaño: error claro, no basura.
     try {
