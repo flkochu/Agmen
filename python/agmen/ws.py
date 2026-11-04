@@ -38,6 +38,11 @@ def accept_key(key: str) -> str:
     return base64.b64encode(hashlib.sha1((key + GUID).encode()).digest()).decode()
 
 
+def frame_size(n: int, mask: bool = False) -> int:
+    """Lo que mide el frame de un payload de n bytes, sin armarlo."""
+    return n + (2 if n < 126 else 4 if n < 1 << 16 else 10) + (4 if mask else 0)
+
+
 def encode_frame(opcode: int, payload: bytes, mask: bool = False) -> bytes:
     """Un frame completo (FIN=1). Los clientes enmascaran; los servidores no."""
     n = len(payload)
@@ -129,14 +134,23 @@ class WebSocket:
         """keep=True: va con los mensajes de control (nunca se descarta y sale
         antes que los datos). Para lo que el navegador NECESITA, como el
         anuncio de un esquema: sin él no podría decodificar nada de ese topic."""
-        frame = self._frame(OP_BINARY, data)
         if keep:
-            self._push_control(frame)
+            self._push_control(self._frame(OP_BINARY, data))
             return not self.closed
+        # Primero se ve si cabe: armar el frame copia el payload, y con un
+        # navegador que no lee serían ~27 MB/s de copias a la basura (cámara).
+        size = frame_size(len(data), self.client)
         with self._cv:
             if self.closed:
                 return False
-            if self._queued + len(frame) > self.max_queue_bytes:
+            if self._queued + size > self.max_queue_bytes:
+                self.dropped += 1
+                return False
+        frame = self._frame(OP_BINARY, data)
+        with self._cv:
+            if self.closed:
+                return False
+            if self._queued + len(frame) > self.max_queue_bytes:   # otro hilo la llenó mientras
                 self.dropped += 1
                 return False
             self._data.append(frame)

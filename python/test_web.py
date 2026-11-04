@@ -58,6 +58,12 @@ class TestWebSocket(unittest.TestCase):
             self.assertEqual(client.recv(), "ñ" * (n // 2))
         client.close(); server.close(); client.wait_closed(); server.wait_closed()
 
+    def test_frame_size_sin_armar_el_frame(self):
+        """send_binary ve si cabe en la cola antes de copiar el payload."""
+        for n in (0, 1, 125, 126, 65535, 65536, 921_600):
+            for mask in (False, True):
+                self.assertEqual(ws.frame_size(n, mask), len(ws.encode_frame(ws.OP_BINARY, bytes(n), mask)))
+
     def test_fragmentos_y_ping(self):
         a, b = socket.socketpair()
         self.addCleanup(a.close)

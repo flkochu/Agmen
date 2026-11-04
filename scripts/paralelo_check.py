@@ -129,6 +129,35 @@ def leer():
 node.spin_for(dur)
 print(f"RESULTADO publicadas={n[0]} descartadas={pub.dropped}", flush=True)
 """,
+    # Los navegadores de la prueba de la cámara, en su propio proceso (como los de
+    # verdad): si leyeran en el proceso del panel, competirían con el puente por el GIL.
+    "navegadores.py": """
+import json, sys, threading
+from agmen import ws, wire
+from agmen.msgs import Imagen
+url, lento = sys.argv[1], sys.argv[2] == "1"
+rapido = ws.connect(url, protocols=["agmen.ws.v1"])
+conns = [rapido]
+if lento:
+    conns.append(ws.connect(url, protocols=["agmen.ws.v1"]))   # se suscribe y nunca lee
+for c in conns:
+    c.send_text(json.dumps({"op": "subscribe", "topic": "/camara", "max_hz": 30}))
+n, ok = [0], [True]
+def leer():
+    while (m := rapido.recv()) is not None:
+        if isinstance(m, bytes):
+            env, payload = wire.parse(m)
+            if env.encoding == wire.ENC_ARROW:
+                img = Imagen.decode_payload(payload)
+                ok[0] = ok[0] and (img.width, img.height) == (640, 480) and len(img.data) == 921600
+                n[0] += 1
+threading.Thread(target=leer, daemon=True).start()
+print("listo", flush=True)
+sys.stdin.readline()          # la prueba avisa cuando la cámara terminó
+print(f"RESULTADO rapido={n[0]} ok={int(ok[0])}", flush=True)
+for c in conns:
+    c.close()
+""",
 }
 for name, code in NODOS.items():
     (TMP / name).write_text(code.lstrip(), encoding="utf-8")
@@ -402,99 +431,105 @@ def prueba_grupos() -> None:
 
 # --- 7. cámara: datos grandes hacia el panel y dos navegadores --------------
 
-def prueba_camara() -> None:
-    """Una cámara de 640×480 a 30 fps son 27 MB/s. El publicador manda por TCP
-    al panel, y el panel reenvía a cada navegador por su cola acotada: el que
-    no lee pierde imágenes, el rápido recibe casi todas. Mientras tanto, el
-    control a 1 kHz (doble_ritmo --sin-ia, si está compilado) no debe perder
-    más ciclos que solo (RFC 0008, D6)."""
-    try:
-        import numpy  # noqa: F401
-    except ImportError:
-        print("SALTO cámara: sin NumPy (pip install numpy)")
-        return
+def _camara_vuelta(port: int, lento: bool, seconds: float, exe: Path | None) -> dict:
+    """Una vuelta: hub + panel + cámara + navegadores (+ el control a 1 kHz)."""
     import subprocess
 
     from agmen import hub as hubmod
-    from agmen import ws
-    from agmen.msgs import Imagen
 
     h = hubmod.Hub("127.0.0.1:0", log=lambda t: None)
     old_hub = os.environ.get("AGMEN_HUB")
     os.environ["AGMEN_HUB"] = f"127.0.0.1:{h.sock.getsockname()[1]}"
     hub_stop = threading.Event()
     threading.Thread(target=h.serve, args=(hub_stop,), daemon=True).start()
-    panel = Panel("127.0.0.1:8191", None, "prueba", None, None, topics=True)
+    panel = Panel(f"127.0.0.1:{port}", None, "prueba", None, None, topics=True)
     panel.start()
-    seconds = 4.0
-    fast_n = [0]
-    fast_ok = [True]
-    streams = []
+    env = {**os.environ, "PYTHONPATH": str(ROOT / "python"), "PYTHONIOENCODING": "utf-8"}
+    nav = None
+    results: dict = {}
     try:
-        fast = ws.connect("ws://127.0.0.1:8191/ws", protocols=["agmen.ws.v1"])
-        slow = ws.connect("ws://127.0.0.1:8191/ws", protocols=["agmen.ws.v1"])
-        streams = [fast, slow]
-        for c in streams:
-            c.send_text(json.dumps({"op": "subscribe", "topic": "/camara", "max_hz": 30}))
-
-        def read_fast() -> None:
-            while (m := fast.recv()) is not None:
-                if isinstance(m, bytes):
-                    from agmen import wire
-
-                    env, payload = wire.parse(m)
-                    if env.encoding == wire.ENC_ARROW:
-                        img = Imagen.decode_payload(payload)
-                        fast_ok[0] = fast_ok[0] and (img.width, img.height) == (640, 480) and len(img.data) == 921600
-                        fast_n[0] += 1
-
-        threading.Thread(target=read_fast, daemon=True).start()
-        env = {**os.environ, "PYTHONPATH": str(ROOT / "python"), "PYTHONIOENCODING": "utf-8"}
+        nav = subprocess.Popen([sys.executable, str(TMP / "navegadores.py"), f"ws://127.0.0.1:{port}/ws",
+                                "1" if lento else "0"], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               text=True, encoding="utf-8", errors="replace")
+        if nav.stdout.readline().strip() != "listo":
+            raise RuntimeError("los navegadores de prueba no se conectaron al panel")
+        time.sleep(0.3)
         cam = subprocess.Popen([sys.executable, str(TMP / "camara.py"), str(seconds)], env=env,
                                stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
         time.sleep(0.5)
-        exe = _doble_ritmo()
         control = None
         if exe is not None:
             control = threading.Thread(target=lambda: results.update(ctrl=_correr_doble_ritmo(exe, "--sin-ia", 3.0)))
-            results: dict = {}
             control.start()
         t0 = time.perf_counter()
         out, _ = cam.communicate(timeout=seconds + 30)
         elapsed = time.perf_counter() - t0 + 0.5
         if control is not None:
             control.join(40)
-        line = next((ln for ln in out.splitlines() if ln.startswith("RESULTADO")), "RESULTADO publicadas=0 descartadas=0")
-        f = dict(kv.split("=") for kv in line.split()[1:])
-        published = int(f["publicadas"])
         time.sleep(0.3)
-        fps = fast_n[0] / elapsed
-        info = panel.bridge.info()
-        dropped = info["dropped"] + slow.dropped
+        nav_out, _ = nav.communicate("fin\n", timeout=20)
+        dropped = panel.bridge.info()["dropped"]
     finally:
-        for c in streams:
-            c.close()
+        if nav is not None and nav.poll() is None:
+            nav.kill()
         panel.shutdown()
         hub_stop.set()
         if old_hub is None:
             os.environ.pop("AGMEN_HUB", None)
         else:
             os.environ["AGMEN_HUB"] = old_hub
-    ok = fps >= 25 and fast_ok[0] and published >= 25 * seconds
-    note = f"la cámara publicó {published}; el navegador que no lee perdió {dropped} imágenes (y no frenó al otro)"
-    if exe is not None and "ctrl" in results:
-        n_c, sk_c, worst_c = results["ctrl"]
+
+    def fields(text: str, default: str) -> dict:
+        line = next((ln for ln in text.splitlines() if ln.startswith("RESULTADO")), default)
+        return dict(kv.split("=") for kv in line.split()[1:])
+
+    cam_f = fields(out, "RESULTADO publicadas=0 descartadas=0")
+    nav_f = fields(nav_out, "RESULTADO rapido=0 ok=0")
+    return {"fps": int(nav_f["rapido"]) / elapsed, "ok": nav_f["ok"] == "1", "published": int(cam_f["publicadas"]),
+            "dropped": dropped, "ctrl": results.get("ctrl")}
+
+
+def prueba_camara() -> None:
+    """Una cámara de 640×480 a 30 fps son 27 MB/s. El publicador manda por TCP
+    al panel, y el panel reenvía a cada navegador por su cola acotada: el que
+    no lee pierde imágenes, el rápido recibe casi todas (RFC 0008, D6).
+
+    La pregunta es la de la regla 12: ¿el navegador que no lee frena a la
+    cámara, al otro navegador o al control a 1 kHz? No todas las máquinas
+    mueven 27 MB/s por Python a 30 fps (las virtuales de macOS del CI, con 3
+    núcleos, no llegan ni sin el navegador lento). Por eso, como en la prueba
+    de grupos, se compara contra una referencia en esta misma máquina: la
+    misma cámara y el mismo control, con solo el navegador rápido."""
+    try:
+        import numpy  # noqa: F401
+    except ImportError:
+        print("SALTO cámara: sin NumPy (pip install numpy)")
+        return
+    seconds = 4.0
+    exe = _doble_ritmo()
+    ref = _camara_vuelta(8191, False, seconds, exe)
+    run = _camara_vuelta(8192, True, seconds, exe)
+    # Si el navegador que no lee frenara al puente, el rápido se quedaría casi
+    # en cero; 70 % deja margen para lo que varía una máquina virtual cargada.
+    ok = (ref["ok"] and run["ok"] and ref["published"] > 0 and run["dropped"] > 0
+          and run["fps"] >= 0.7 * ref["fps"] and run["published"] >= 0.7 * ref["published"])
+    note = (f"la cámara publicó {run['published']}; el navegador que no lee perdió {run['dropped']} imágenes — "
+            f"referencia, solo el navegador rápido en esta máquina: {ref['fps']:.0f} imágenes/s, la cámara publicó "
+            f"{ref['published']}")
+    if ref["fps"] < 25:
+        note += " (esta máquina no sostiene 30 fps ni sin el navegador que no lee)"
+    if run["ctrl"] is not None and ref["ctrl"] is not None:
+        sk_c, worst_c = run["ctrl"][1], run["ctrl"][2]
+        sk_r = ref["ctrl"][1]
+        ok = ok and sk_c <= sk_r + 0.10 * 3000
         sk_b = BASE.get("sin-ia")
-        if sk_b is None:
-            _, sk_b, _ = _correr_doble_ritmo(exe, "--sin-ia", 3.0)
-            BASE["sin-ia"] = sk_b
-        ctrl_ok = sk_c <= sk_b + 0.10 * 3000
-        ok = ok and ctrl_ok
-        note += f"; control a 1 kHz mientras tanto: {sk_c} ciclos saltados (solo: {sk_b}), peor atraso {worst_c:.1f} ms"
+        note += (f"; control a 1 kHz: {sk_c} ciclos saltados (con la cámara y solo el navegador rápido: {sk_r}"
+                 + (f"; sin cámara: {sk_b}" if sk_b is not None else "") + f"), peor atraso {worst_c:.1f} ms")
     else:
         note += "; sin build/bin/doble_ritmo: no se midió el control a 1 kHz"
     row("cámara 640×480 a 30 fps (27 MB/s) al panel y 2 navegadores, uno que no lee",
-        "el navegador que no lee frena a la cámara y al otro", f"el navegador rápido recibió {fps:.0f} imágenes/s", ok, note)
+        "el navegador que no lee frena a la cámara y al otro", f"el navegador rápido recibió {run['fps']:.0f} imágenes/s",
+        ok, note)
 
 
 def main() -> int:
