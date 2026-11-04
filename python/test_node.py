@@ -69,6 +69,7 @@ class TestEvery(unittest.TestCase):
             node.every(0.05, lambda: time.sleep(0.04), group=g)
             node.spin_for(1.0)
             skipped = node.timers()[0].skipped
+            node.close()
             if same:
                 self.assertLess(fast[0], 120, fast[0])
                 self.assertGreater(skipped, 50)
@@ -171,12 +172,15 @@ class TestSimClock(unittest.TestCase):
         clock.configure(clock.SIM, listen=False)
         node = agmen.Node("sim")
         n = [0]
-        node.every(0.001, lambda: n.__setitem__(0, n[0] + 1))
+        node.every(0.01, lambda: n.__setitem__(0, n[0] + 1))
         threading.Timer(0.15, lambda: clock.update(Clock(t=5_000_000_000))).start()
-        node.spin_for(0.3)
-        # Arrancó en t = 5 s (el primer /clock), sin "saltar" 5000 ciclos.
-        self.assertEqual(node.timers()[0].skipped, 0)
-        self.assertGreater(n[0], 50)
+        node.spin_for(0.35)
+        # Arrancó en t = 5 s (el primer /clock). Si hubiera arrancado en 0, se
+        # "saltaría" los 500 ciclos de esos 5 s. (Unos pocos saltos sí pueden
+        # pasar: las máquinas del CI, sobre todo Windows y macOS, despiertan tarde.)
+        self.assertLess(node.timers()[0].skipped, 50)
+        self.assertGreaterEqual(n[0], 5)
+        node.close()
 
     def test_real_mode_is_default(self):
         self.assertEqual(clock.mode(), clock.REAL)

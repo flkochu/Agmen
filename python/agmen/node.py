@@ -307,6 +307,9 @@ class Node:
         finally:
             self._restore_signals(old)
             self._running = False
+            if self._stats_sock is not None:   # se vuelve a abrir si hay otro spin()
+                self._stats_sock.close()
+                self._stats_sock = None
         if self._error is not None:
             raise self._error
 
