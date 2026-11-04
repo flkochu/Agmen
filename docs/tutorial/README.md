@@ -25,12 +25,13 @@ de C++ **o** de Python. No necesitas saber de redes ni de ROS.
 | 10 | [El panel: varias gráficas, inspector, celular y Foxglove](10-panel-celular-y-foxglove.md) | Ves varios topics a la vez, cualquier mensaje campo por campo, manejas desde el celular con clave y te conectas con Foxglove | 0.6.0 |
 | 11 | [Tus mensajes en un archivo `.agmen`](11-mensajes-agmen.md) | Escribes los mensajes de un perro robot una sola vez y Agmen genera el código de C++ y de Python (con enums y valores por defecto) | 0.7.0 |
 | 12 | [Un nodo con varios ritmos y el reloj de Agmen](12-nodos-y-reloj.md) | Control a 1 kHz y una IA lenta en el mismo nodo sin frenarse; simulas más rápido, más lento o en pausa desde el panel | 0.8.0 |
+| 13 | [Python rápido y NumPy](13-python-rapido-y-numpy.md) | `pip install agmen` trae el núcleo de C++: el mismo código de Python, varias veces más rápido; arreglos como NumPy sin copiar | 0.9.0 |
 
 ### Próximamente
 
 | # | Capítulo | Versión |
 |---|---|---|
-| 13 | Python de primera clase (compilado desde el núcleo de C++) | 0.9.0 |
+| 14 | Imágenes y tensores (codificación `arrow`) | 0.10.0 |
 
 ## Convenciones
 

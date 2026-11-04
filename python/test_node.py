@@ -200,17 +200,18 @@ class TestLatestDomainWarning(unittest.TestCase):
         import contextlib
         import io
 
+        import socket
+
         where = _port()
         sub = agmen.Subscriber(Clock, where)
-        pub = agmen.Publisher(Clock, where, topic="/prueba")
-        raw = wire.encode(Clock(), 0, clock=wire.CLOCK_SIM)
+        host, port = where.rsplit(":", 1)
+        raw = wire.encode(Clock(), 0, clock=wire.CLOCK_SIM)   # un emisor con reloj de simulación
         err = io.StringIO()
-        with contextlib.redirect_stderr(err):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as tx, contextlib.redirect_stderr(err):
             for _ in range(3):
-                pub._sock.sendto(raw, pub.dests[0])
+                tx.sendto(raw, (host, int(port)))
                 self.assertIsNotNone(sub.receive(1.0))
         self.assertEqual(err.getvalue().count("llega con reloj simulación"), 1)
-        pub.close()
         sub.close()
 
 

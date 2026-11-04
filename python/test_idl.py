@@ -169,7 +169,7 @@ class TestCarga(Tmp):
     def test_publicar_con_tipos_cargados(self):
         msgs = agmen.load(ARCA9)
         sub = agmen.Subscriber(msgs.Articulaciones, "127.0.0.1:0")
-        addr = f"127.0.0.1:{sub._sock.getsockname()[1]}"
+        addr = f"127.0.0.1:{sub.port}"
         pub = agmen.Publisher(msgs.Articulaciones, addr, topic="/arca9/q")
         try:
             pub.publish(msgs.Articulaciones(q=[1.0] * 12, modo=msgs.Modo.CAMINAR))

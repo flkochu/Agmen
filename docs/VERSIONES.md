@@ -18,7 +18,8 @@
 | **0.6.0** | 3 | Panel por WebSocket (RFC 0002): bytes de Agmen al navegador, inspector, varias gráficas, modo red con clave, Foxglove |
 | **0.7.0** | 4 | Archivos `.agmen` (RFC 0005): `agmen gen`, `agmen_add_messages`, `agmen.load` |
 | **0.8.0** | 5 | `Node` con varios ritmos y grupos, reloj de Agmen real/sim con `/clock` (RFC 0006) |
-| 0.9.0 | 6 | Python de primera clase: paquete compilado desde el núcleo de C++ (nanobind) |
+| **0.9.0** | 6 | Python de primera clase: `agmen._core` compilado desde el núcleo de C++ (RFC 0007), wheels para 5 sistemas, NumPy sin copias |
+| 0.10.0 | 7 | Codificación `arrow`: imágenes, tensores, cámara en el panel |
 | … | … | Un nivel por versión menor |
 | 1.0.0 | — | API estable: a partir de aquí romper la API exige subir MAYOR |
 

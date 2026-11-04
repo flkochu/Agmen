@@ -4,9 +4,15 @@
 
 Al final de este capítulo tendrás Agmen compilado y sus pruebas pasando.
 
+💡 **¿Solo quieres usar Agmen desde Python?** No hace falta compilar nada:
+`pip install agmen` (Python 3.11 o más nuevo) ya trae el núcleo de C++
+compilado para Windows, Linux, macOS y Raspberry Pi
+([capítulo 13](13-python-rapido-y-numpy.md)). Este capítulo es para tener el
+repositorio completo: el C++, los ejemplos y las pruebas.
+
 ## 1. Instala las herramientas
 
-Necesitas un compilador de C++20, CMake 3.20+ y Python 3.10+.
+Necesitas un compilador de C++20, CMake 3.20+ y Python 3.11+.
 
 | Sistema | Qué instalar |
 |---|---|
@@ -18,7 +24,7 @@ Revisa que todo esté:
 
 ```bash
 cmake --version     # 3.20 o más
-python3 --version   # 3.10 o más
+python3 --version   # 3.11 o más
 ```
 
 💡 En Windows, usa la terminal **"Developer PowerShell for VS 2022"** (búscala
@@ -36,6 +42,7 @@ cd agmen
 ## 3. Compila
 
 ```bash
+python3 -m pip install nanobind     # para compilar también el núcleo de Python (agmen._core)
 cmake -S . -B build
 cmake --build build --config Release
 ```
@@ -43,7 +50,10 @@ cmake --build build --config Release
 - `-S .` = "el código está aquí"; `-B build` = "compila en la carpeta `build`".
 - `--config Release` = optimizado. En Linux/macOS no hace falta, pero no estorba.
 
-Los programas quedan en `build/bin/`.
+Los programas quedan en `build/bin/` (en Windows, `build\bin\programa.exe`).
+El núcleo de Python queda en `python/agmen/` (`_core.abi3.so`, o `.pyd` en
+Windows). Sin nanobind todo compila igual, y Python usa la versión pura (CMake
+lo dice al configurar: `agmen._core: no`).
 
 ## 4. Corre las pruebas
 

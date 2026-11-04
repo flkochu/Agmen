@@ -185,6 +185,7 @@ struct SubscriberCore::State {
     std::map<std::uint64_t, wire::Announcement> announced;
     std::string last_from;
     bool clock_warned = false;
+    std::mutex link_mu;   // el enlace con el hub (heartbeat() puede venir de otro hilo)
 
     State(const std::string& w, TypeInfo t)
         : type(std::move(t)), where(w), socket(net::UdpSocket::bind(hub::is_topic(w) ? "127.0.0.1:0" : w)) {
@@ -230,7 +231,10 @@ std::optional<RawSample> SubscriberCore::receive_raw(std::chrono::milliseconds t
     auto& s = *s_;
     const auto deadline = steady_clock::now() + timeout;
     for (;;) {
-        if (s.link) s.link->maybe_beat(s.socket);
+        if (s.link) {
+            std::lock_guard lock(s.link_mu);
+            s.link->maybe_beat(s.socket);
+        }
         const auto left = duration_cast<milliseconds>(deadline - steady_clock::now());
         const auto rx = s.socket.recv_from(s.buf, left.count() > 0 ? left : milliseconds(0));
         if (!rx) return std::nullopt;
@@ -238,20 +242,19 @@ std::optional<RawSample> SubscriberCore::receive_raw(std::chrono::milliseconds t
         const wire::ByteView data(s.buf.data(), rx->size);
         if (s.link) {
             std::optional<std::vector<std::string>> unused;
+            std::unique_lock lock(s.link_mu);
             if (s.link->handle(data, unused)) {
                 if (!s.link->error().empty()) {
                     throw wire::WireError(wire::WireError::Kind::HubRejected,
                                           "el hub rechazó escuchar '" + s.topic + "': " + s.link->error());
                 }
-                if (steady_clock::now() >= deadline) return std::nullopt;
-                continue;
+                continue;   // si ya pasó el tiempo, la siguiente lectura no espera
             }
         }
         const auto [env, payload] = wire::Envelope::read_from(data);
         if (env.encoding == wire::Encoding::Announcement) {
             s.announced[env.schema_id] = wire::read_announcement(env, payload);
-            if (steady_clock::now() >= deadline) return std::nullopt;
-            continue;
+            continue;   // si ya pasó el tiempo, la siguiente lectura no espera
         }
         if (env.encoding != wire::Encoding::Compact) {
             throw wire::WireError(wire::WireError::Kind::UnknownEncoding,
@@ -277,8 +280,12 @@ std::optional<RawSample> SubscriberCore::receive_raw(std::chrono::milliseconds t
 }
 
 void SubscriberCore::heartbeat() {
-    if (s_->link) s_->link->maybe_beat(s_->socket);
+    if (!s_->link) return;
+    std::lock_guard lock(s_->link_mu);
+    s_->link->maybe_beat(s_->socket);
 }
+
+std::uint16_t SubscriberCore::local_port() const { return s_->socket.local_port(); }
 
 const std::string& SubscriberCore::last_from() const { return s_->last_from; }
 std::intptr_t SubscriberCore::native_handle() const { return s_->socket.native_handle(); }

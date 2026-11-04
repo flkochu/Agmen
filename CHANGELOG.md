@@ -7,9 +7,55 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 
 ## [Sin publicar]
 
-### Planeado (nivel 6, versión 0.9.0)
-- Python de primera clase: el paquete `agmen` compilado desde el núcleo de
-  C++ (nanobind), con NumPy sin copias.
+### Planeado (nivel 7, versión 0.10.0)
+- Codificación `arrow`: imágenes, tensores y nubes de puntos; cámara en el
+  panel; el puente del panel en C++.
+
+## [0.9.0] — 2026-11-04
+
+**Nivel 6: Python de primera clase** (RFC 0007, aceptado). `pip install agmen`
+trae el mismo núcleo de C++ ya compilado; tu código de Python no cambia.
+
+### Agregado
+- **`agmen._core`** (nanobind): codificar y decodificar, `Publisher` y
+  `Subscriber` (topics, hub, anuncios), el `Node` (temporizadores, colas y
+  grupos) y el reloj de Agmen corren en C++. Medido con `Articulaciones` de
+  Arca9: codificar 4.9×, decodificar 2.8×, `publish()` 4.5× y recibir 3.1×
+  más rápido que Python puro (`scripts/py_bench.py`).
+- **El `Node` de Python usa el executor de C++**: espera, temporizadores y colas
+  sin el GIL; tus funciones toman el GIL solo mientras corren.
+- **Wheels compiladas** para Windows x64, Linux x64 y ARM64, macOS Intel y
+  Apple Silicon, con Python 3.11 y una sola wheel (ABI estable) para 3.12 en
+  adelante (cibuildwheel; cada una se instala y se prueba antes de subirla).
+  En otras computadoras, una wheel de **Python puro** que funciona igual y lo
+  avisa una vez.
+- **`agmen.load(..., numpy=True)`**: los arreglos de números llegan como
+  `numpy.ndarray` de solo lectura que apuntan a los bytes recibidos, sin
+  copiar. `pip install agmen[numpy]`.
+- `agmen --version` dice qué núcleo usas: `agmen 0.9.0 (núcleo C++)` o
+  `(Python puro)`. `AGMEN_BACKEND=pure|native` para elegir.
+- En C++: `agmen::schema::Layout` (esquemas leídos en tiempo de ejecución),
+  `PublisherCore` / `SubscriberCore` (sin plantilla), `Node::subscribe_raw` y
+  `agmen::log` (a dónde van los avisos).
+- `Subscriber.port` (Python): el puerto local donde escucha.
+- Pruebas: todas las de Python corren con los dos núcleos en el CI;
+  `python/test_core.py` compara C++ contra Python puro byte por byte;
+  `tests/test_layout.cpp`; `scripts/py_bench.py` y `scripts/wheel_check.py`.
+- Tutorial, capítulo 13 (Python rápido y NumPy); el capítulo 0 explica la
+  instalación sin compilar.
+
+### Cambiado
+- **Python 3.11 o más nuevo** (3.10 dejó de recibir actualizaciones en octubre
+  de 2026).
+- El paquete se construye con scikit-build-core (antes hatchling). En el
+  repositorio, CMake compila `agmen._core` en `python/agmen/` si está nanobind
+  (`pip install nanobind`); si no, Python usa la versión pura.
+- La cola de un `Node` guarda los mensajes sin decodificar: con `queue = 1`
+  solo se decodifica el que se entrega.
+- Leer de un `Subscriber` ya no se detiene antes de tiempo por un anuncio o un
+  mensaje del hub: sigue leyendo lo que ya llegó.
+- El código que genera `agmen.load` ya no copia los arreglos de números, y
+  convierte los enums más rápido.
 
 ## [0.8.0] — 2026-11-03
 

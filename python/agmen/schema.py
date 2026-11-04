@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import re
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
+from . import _backend
 
 PREFIX = "agmen/1 "
 
@@ -64,6 +66,11 @@ def fnv1a64(data: bytes) -> int:
         h ^= b
         h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
     return h
+
+
+if _backend.NATIVE:
+    _fnv1a64_py = fnv1a64
+    fnv1a64 = _backend.core.fnv1a64   # noqa: F811 — el mismo hash, en C++
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +291,11 @@ class Layout:
         self._emit(self.root, 0, fmt)
         self._struct = struct.Struct("<" + "".join(fmt))
         assert self._struct.size == self.size, (self._struct.size, self.size)
+        # El núcleo de C++ codifica y decodifica lo mismo, ~10× más rápido (RFC 0007).
+        self._native = _backend.core.Layout(self.text) if _backend.NATIVE else None
+        if self._native is not None:
+            self.pack = self._native.pack       # type: ignore[method-assign]
+            self.unpack = self._native.unpack   # type: ignore[method-assign]
 
     # --- formato ---
     def _emit(self, t: Type, at: int, fmt: list[str]) -> int:
@@ -292,7 +304,7 @@ class Layout:
             fmt.append(PRIMITIVES[t.name][0])
             return at + t.size
         if isinstance(t, Array):
-            for k in range(t.n):
+            for _ in range(t.n):
                 at = self._emit(t.elem, at, fmt)
             return at
         start = at
@@ -339,13 +351,39 @@ class Layout:
         flat: list = []
         try:
             self._flatten(self.root, value, flat, "")
-        except (KeyError, AttributeError) as e:
-            raise SchemaError(f"falta el campo {e} para '{self.name}'") from None
+        except KeyError as e:
+            raise SchemaError(f"falta el campo '{e.args[0]}' para '{self.name}'") from None
+        except AttributeError as e:
+            raise SchemaError(f"falta el campo '{getattr(e, 'name', '') or e}' para '{self.name}'") from None
         return self._struct.pack(*flat)
 
     def unpack(self, payload: bytes, offset: int = 0) -> dict:
         """bytes compact (1 fila) → dict con los campos (arreglos como listas)."""
         return self._build(self.root, iter(self._struct.unpack_from(payload, offset)))
+
+    def numpy_fields(self, payload, d: dict) -> dict:
+        """Cambia los arreglos de números de `d` (lo que dio unpack) por
+        numpy.ndarray de solo lectura que apuntan a `payload`, sin copiar
+        (agmen.load(..., numpy=True), RFC 0007 D4)."""
+        import numpy as np
+
+        def walk(t: Struct, dd: dict, base: int) -> None:
+            for f in t.fields:
+                ft, dims = f.type, []
+                while isinstance(ft, Array):
+                    dims.append(ft.n)
+                    ft = ft.elem
+                if dims and isinstance(ft, Prim):
+                    count = 1
+                    for n in dims:
+                        count *= n
+                    a = np.frombuffer(payload, dtype=_NP_DTYPES[ft.name], count=count, offset=base + f.offset)
+                    dd[f.name] = a.reshape(dims) if len(dims) > 1 else a
+                elif not dims and isinstance(ft, Struct):
+                    walk(ft, dd[f.name], base + f.offset)
+
+        walk(self.root, d, 0)
+        return d
 
     def json_schema(self) -> dict:
         """El esquema como JSON Schema: así lo entienden visores como Foxglove,
@@ -362,6 +400,8 @@ class Layout:
 
 
 _JSON_PRIMS = {"bool": "boolean", "f32": "number", "f64": "number"}
+_NP_DTYPES = {"bool": "?", "i8": "<i1", "u8": "<u1", "i16": "<i2", "u16": "<u2", "i32": "<i4", "u32": "<u4",
+              "i64": "<i8", "u64": "<u8", "f32": "<f4", "f64": "<f8", "time": "<i8", "duration": "<i8"}
 
 
 def _json_type(t: Type) -> dict:

@@ -4,7 +4,8 @@
 #
 # 1. Verifica que el tag coincida con VERSION, Python y CHANGELOG.
 # 2. Corre todas las pruebas en Windows, Linux y macOS.
-# 3. Construye el paquete de Python y lo sube a PyPI (pip install agmen).
+# 3. Construye las wheels compiladas (5 sistemas, cibuildwheel), la de Python
+#    puro y el sdist, las prueba instaladas y las sube a PyPI (pip install agmen).
 # 4. Crea el Release en GitHub con los archivos.
 #
 # Usa "Trusted Publishing" de PyPI: no hay contraseñas ni tokens guardados.
@@ -30,7 +31,32 @@ jobs:
     needs: verificar
     uses: ./.github/workflows/ci.yml
 
-  construir:
+  # Wheels compiladas (agmen._core) para cada sistema, con cibuildwheel. Cada
+  # una se instala y se prueba (scripts/wheel_check.py) antes de subirla.
+  wheels:
+    needs: pruebas
+    name: wheels ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-15-intel, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Construir y probar las wheels
+        run: |
+          python -m pip install "cibuildwheel>=4,<5"
+          python -m cibuildwheel --output-dir wheelhouse
+      - uses: actions/upload-artifact@v6
+        with:
+          name: dist-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  # La wheel de Python puro (cualquier computadora sin wheel compilada) y el sdist.
+  puro:
     needs: pruebas
     runs-on: ubuntu-latest
     steps:
@@ -38,17 +64,23 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Construir sdist y wheel
+      - name: Construir
         run: |
           python -m pip install --upgrade build
-          python -m build
+          AGMEN_PURE=1 python -m build --wheel
+          python -m build --sdist
+      - name: Probar la wheel de Python puro
+        run: |
+          python -m venv /tmp/puro
+          /tmp/puro/bin/pip install dist/*-py3-none-any.whl
+          /tmp/puro/bin/python scripts/wheel_check.py --pure
       - uses: actions/upload-artifact@v6
         with:
-          name: dist
+          name: dist-puro
           path: dist/
 
   pypi:
-    needs: construir
+    needs: [wheels, puro]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -58,7 +90,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v7
         with:
-          name: dist
+          pattern: dist-*
+          merge-multiple: true
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
 
@@ -71,7 +104,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/download-artifact@v7
         with:
-          name: dist
+          pattern: dist-*
+          merge-multiple: true
           path: dist/
       - name: Crear Release con las notas del CHANGELOG
         env:

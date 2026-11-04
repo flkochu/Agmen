@@ -67,7 +67,11 @@ git push origin v0.1.0
 ```
 
 En la pestaña **Actions** vas a ver el workflow **Release**:
-verificar → pruebas en los 3 sistemas → construir → PyPI → Release de GitHub.
+verificar → pruebas en todos los sistemas → wheels (desde 0.9.0: una compilada
+por sistema con cibuildwheel, más la de Python puro y el sdist; cada una se
+instala y se prueba con `scripts/wheel_check.py`) → PyPI → Release de GitHub.
+Las wheels tardan más que las pruebas (~10–20 min): las de macOS y Windows
+son las más lentas.
 Al terminar:
 
 ```bash

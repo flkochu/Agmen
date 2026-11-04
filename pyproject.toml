@@ -1,22 +1,25 @@
 # Paquete de Python `agmen` (pip install agmen).
 #
-# Hoy contiene la implementación de referencia del formato en Python puro.
-# En el nivel 6 este mismo paquete se compilará desde el núcleo de C++
-# (nanobind + scikit-build-core) sin cambiar de nombre.
+# Desde 0.9.0 (RFC 0007) trae el núcleo de C++ compilado (agmen._core, con
+# nanobind): las wheels de PyPI ya vienen compiladas para Windows, Linux x64 y
+# ARM64 (Raspberry Pi) y macOS (Intel y Apple Silicon), así que pip no compila
+# nada. En otras computadoras se instala la wheel de Python puro, que funciona
+# igual pero más lento.
+#
+#   pip install .                     compila el núcleo (necesita un compilador de C++20)
+#   AGMEN_PURE=1 python -m build      la wheel de Python puro (py3-none-any)
 
 [build-system]
-requires = ["hatchling>=1.27"]
-build-backend = "hatchling.build"
+requires = ["scikit-build-core>=0.11", "nanobind>=2.4"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "agmen"
 dynamic = ["version"]
 description = "Agmen: el sistema nervioso para robótica, IA e IoT"
 readme = "python/README.md"
-requires-python = ">=3.10"
-dependencies = [
-    "tomli>=1.1; python_version < '3.11'",   # robot.toml en Python 3.10
-]
+requires-python = ">=3.11"
+dependencies = []
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Adán López Lozano" }]
@@ -27,10 +30,14 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Natural Language :: Spanish",
     "Operating System :: OS Independent",
+    "Programming Language :: C++",
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering",
     "Topic :: Software Development :: Libraries",
 ]
+
+[project.optional-dependencies]
+numpy = ["numpy>=1.24"]   # agmen.load(..., numpy=True)
 
 [project.scripts]
 agmen = "agmen.cli:main"
@@ -39,11 +46,35 @@ agmen = "agmen.cli:main"
 Repository = "https://github.com/flkochu/Agmen"
 Changelog = "https://github.com/flkochu/Agmen/blob/main/CHANGELOG.md"
 
-[tool.hatch.version]
-path = "python/agmen/_version.py"
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+cmake.version = ">=3.20"
+build.targets = ["agmen_python"]
+wheel.packages = ["python/agmen"]
+# Python ≥ 3.12: una sola wheel por sistema (ABI estable); 3.11 tiene la suya.
+wheel.py-api = "cp312"
+wheel.exclude = ["**/__pycache__/**"]
+sdist.exclude = ["build*/", "python/agmen/_core*", "**/__pycache__/", ".github/"]
 
-[tool.hatch.build.targets.wheel]
-packages = ["python/agmen"]
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "python/agmen/_version.py"
 
-[tool.hatch.build.targets.sdist]
-include = ["python/agmen", "python/README.md", "LICENSE", "VERSION", "CHANGELOG.md"]
+# La wheel de Python puro: sin CMake, para cualquier computadora (RFC 0007, D2).
+[[tool.scikit-build.overrides]]
+if.env.AGMEN_PURE = true
+wheel.cmake = false
+wheel.platlib = false
+wheel.py-api = "py3"
+# el _core que CMake deja en python/agmen al compilar el repositorio no va aquí
+wheel.exclude = ["**/__pycache__/**", "agmen/_core*"]
+
+[tool.cibuildwheel]
+# cp312 con ABI estable sirve para 3.12, 3.13, 3.14 y 3.15; cp311 aparte.
+build = ["cp311-*", "cp312-*"]
+skip = ["*-musllinux_*", "*-win32", "*_i686", "*-win_arm64"]
+test-command = "python {project}/scripts/wheel_check.py"
+build-verbosity = 1
+
+[tool.cibuildwheel.macos.environment]
+MACOSX_DEPLOYMENT_TARGET = "11.0"

@@ -20,8 +20,15 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 else()
     set(AGMEN_TOP_LEVEL OFF)
 endif()
-option(AGMEN_BUILD_EXAMPLES "Compilar los ejemplos y el tutorial" ${AGMEN_TOP_LEVEL})
-option(AGMEN_BUILD_TESTS    "Compilar las pruebas"                ${AGMEN_TOP_LEVEL})
+# pip install (scikit-build-core define SKBUILD): solo el módulo de Python.
+if(SKBUILD)
+    set(AGMEN_DEV_DEFAULT OFF)
+else()
+    set(AGMEN_DEV_DEFAULT ${AGMEN_TOP_LEVEL})
+endif()
+option(AGMEN_BUILD_EXAMPLES "Compilar los ejemplos y el tutorial" ${AGMEN_DEV_DEFAULT})
+option(AGMEN_BUILD_TESTS    "Compilar las pruebas"                ${AGMEN_DEV_DEFAULT})
+option(AGMEN_PYTHON         "Compilar agmen._core, el núcleo de C++ para Python (necesita nanobind)" ${AGMEN_TOP_LEVEL})
 option(AGMEN_WERROR         "Tratar las advertencias como errores (CI)" OFF)
 option(AGMEN_SANITIZE       "Activar AddressSanitizer + UBSan (solo GCC/Clang)" OFF)
 
@@ -80,6 +87,9 @@ add_library(agmen_core
     src/log.cpp
     src/pubsub.cpp)
 add_library(agmen::core ALIAS agmen_core)
+# El módulo de Python (agmen._core) es una biblioteca compartida: el núcleo
+# tiene que poder ir dentro de ella.
+set_target_properties(agmen_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # agmen/version.hpp se genera desde VERSION.
 configure_file(include/agmen/version.hpp.in ${CMAKE_CURRENT_BINARY_DIR}/generated/agmen/version.hpp @ONLY)
@@ -99,6 +109,53 @@ endif()
 
 # Mensajes en archivos .agmen → código de C++ (RFC 0005): agmen_add_messages().
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/AgmenMessages.cmake)
+
+# ---------------------------------------------------------------------------
+# agmen._core: el núcleo de C++ para Python (RFC 0007)
+# ---------------------------------------------------------------------------
+# En el repositorio se compila junto con todo lo demás y queda en python/agmen/,
+# así `python -m unittest discover -s python` ya usa el núcleo de C++. Con
+# `pip install` lo compila scikit-build-core y va dentro de la wheel.
+if(AGMEN_PYTHON OR SKBUILD)
+    find_package(Python 3.11 COMPONENTS Interpreter Development.Module
+                 OPTIONAL_COMPONENTS Development.SABIModule)
+    if(Python_FOUND)
+        execute_process(COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+                        OUTPUT_VARIABLE AGMEN_NANOBIND_DIR OUTPUT_STRIP_TRAILING_WHITESPACE
+                        RESULT_VARIABLE AGMEN_NANOBIND_RC ERROR_QUIET)
+        if(AGMEN_NANOBIND_RC EQUAL 0)
+            list(APPEND CMAKE_PREFIX_PATH "${AGMEN_NANOBIND_DIR}")
+            find_package(nanobind CONFIG)
+        endif()
+    endif()
+    if(nanobind_FOUND)
+        nanobind_add_module(agmen_python STABLE_ABI NB_STATIC python/src/core.cpp)
+        set_target_properties(agmen_python PROPERTIES OUTPUT_NAME _core)
+        target_link_libraries(agmen_python PRIVATE agmen_core)
+        # Las advertencias son para nuestro código, no para las de nanobind.
+        target_include_directories(agmen_python SYSTEM PRIVATE ${NB_DIR}/include ${Python_INCLUDE_DIRS})
+        if(MSVC)
+            target_compile_options(agmen_python PRIVATE /W4 /permissive- /utf-8)
+        else()
+            agmen_set_warnings(agmen_python)
+        endif()
+        if(SKBUILD)
+            install(TARGETS agmen_python LIBRARY DESTINATION agmen)
+        else()
+            set_target_properties(agmen_python PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/python/agmen)
+            foreach(cfg Debug Release RelWithDebInfo MinSizeRel)
+                string(TOUPPER ${cfg} CFG)
+                set_target_properties(agmen_python PROPERTIES
+                    LIBRARY_OUTPUT_DIRECTORY_${CFG} ${CMAKE_CURRENT_SOURCE_DIR}/python/agmen)
+            endforeach()
+        endif()
+        message(STATUS "agmen._core (Python ${Python_VERSION}, nanobind ${nanobind_VERSION}): sí")
+    elseif(SKBUILD)
+        message(FATAL_ERROR "pip install necesita nanobind para compilar agmen._core")
+    else()
+        message(STATUS "agmen._core: no (falta nanobind: pip install nanobind). Python usará la versión pura.")
+    endif()
+endif()
 
 # ---------------------------------------------------------------------------
 # Ejemplos y pruebas

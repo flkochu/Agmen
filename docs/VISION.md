@@ -31,7 +31,7 @@ opcionales que se conectan al núcleo:
 | Archivos `.agmen` | Los mensajes de un robot en un archivo; genera C++ (`agmen_add_messages`) y Python (`agmen.load`) (RFC 0005) | 0.7.0 |
 | `agmen::Node` / `agmen.Node` | Varias frecuencias en un nodo (`every`, `subscribe`/`on`, colas, grupos con su propio hilo) y el reloj de Agmen (real y simulación, `/clock`) (RFC 0006) | 0.8.0 |
 | Panel web | Nodos, logs, sensores, inspector y manejo desde el navegador; el robot no dibuja (RFC 0002, 0003) | 0.2.0; WebSocket, red con clave y Foxglove en 0.6.0; puente en C++ en el nivel 7 |
-| `agmen` (Python, PyPI) | `pip install agmen` / `import agmen`. Hoy: referencia en Python puro; nivel 6: compilado desde C++ con nanobind | 0.1.0 |
+| `agmen` (Python, PyPI) | `pip install agmen` / `import agmen`. Desde 0.9.0 trae el núcleo de C++ compilado (`agmen._core`, nanobind) para 5 sistemas; Python puro como respaldo y referencia | 0.1.0; compilado en 0.9.0 |
 | `agmen-micro` | Cliente ligero para microcontroladores | Nivel 12 |
 | `agmen-iot` | Puentes MQTT y similares | Nivel 12 |
 | `agmen-vision`, `agmen-learn` | Nodos y utilidades de IA | Nivel 13 |
@@ -128,11 +128,15 @@ igual antes y después de la migración, sin tocarlos. Es la regla 3 en acción.
 - ✅ El reloj de Agmen (regla 5): `t_data`, `t_pub` y los temporizadores usan `agmen::clock`, que en simulación sigue al topic `/clock` (más rápido, más lento, en pausa o paso a paso). El campo `clock` del sobre ya se llena, y un mensaje de otro reloj se avisa.
 - ✅ Dentro de un nodo ya hay paralelismo: cada `node.group(...)` es otro hilo (medido en `paralelo_check`: un control a 1 kHz no pierde ciclos junto a una tarea de 80 ms en otro grupo).
 
+### Cambió en 0.9.0 (RFC 0007, nivel 6)
+- ✅ El paquete de Python usa el núcleo de C++ (`agmen._core`): formato, topics, `Node` y reloj son el mismo código que en C++. Codificar ~5× y publicar ~4.5× más rápido; el `Node` de Python espera sin el GIL. NumPy sin copias con `agmen.load(..., numpy=True)`.
+- ✅ `pip install agmen` no compila nada en Windows, Linux x64 y ARM64, macOS Intel y Apple Silicon (wheels con cibuildwheel); en lo demás, Python puro.
+
 ### Falta (siguientes niveles)
 - Payload `arrow` para datos variables y grandes (nivel 7).
 
 ### Se rehace
-- **Python**: de reimplementación en Python puro a paquete compilado desde el núcleo de C++ (nanobind). La versión pura se queda como referencia y para pruebas.
+- **Python**: ✅ de reimplementación en Python puro a paquete compilado desde el núcleo de C++ (nanobind, 0.9.0). La versión pura se queda como referencia y para pruebas.
 - **Transporte**: ✅ de UDP punto a punto a pub/sub con topics (0.5.0, el hub es solo de control). Falta: memoria compartida local (nivel 8) y red entre máquinas (nivel 11).
 
 ## 6. dora-rs como referencia
@@ -179,7 +183,7 @@ iceoryx2).
 | **3 ✅** (0.6.0) | **Panel por WebSocket (RFC 0002): el navegador decodifica los bytes de Agmen, varias gráficas a la vez, inspector de mensajes, modo red local con clave, hombre muerto en el puente, compatible con Foxglove** | h |
 | **4 ✅** (0.7.0) | **Archivos `.agmen` (RFC 0005): mensajes con enums, constantes y valores por defecto; `agmen gen` genera C++ y Python, `agmen_add_messages` en CMake, `agmen.load` en Python** | b |
 | **5 ✅** (0.8.0) | **Executor y tiempo (RFC 0006): `Node` con `every`, `subscribe`/`on`, colas (`queue = 1` el más reciente), grupos con su propio hilo, ciclos saltados contados y avisados; reloj de Agmen real/sim con `/clock`, pausa, paso y velocidad desde el panel** | d, e |
-| 6 | Python de primera clase: paquete `agmen` compilado (nanobind); numpy sin copias | b |
+| **6 ✅** (0.9.0) | **Python de primera clase (RFC 0007): `agmen._core` compilado con nanobind (formato, topics, `Node`, reloj), wheels para 5 sistemas y Python puro de respaldo, NumPy sin copias** | b |
 | 7 | Codificación `arrow`: imágenes, tensores; panel de cámara en la web; puente del panel en C++ | a, b, h |
 | 8 | Memoria compartida para mensajes grandes | a |
 | 9 | Grabación y reproducción; exportar a Parquet; reproducir en la web | c |
@@ -201,6 +205,7 @@ iceoryx2).
 | ~~Compatibilidad con el protocolo WebSocket de Foxglove~~ | ✅ Solo lectura en 0.6.0 (RFC 0002 §5.3). Publicar desde Foxglove: después |
 | ~~Archivos `.agmen`: sintaxis, quién genera, qué trae~~ | ✅ RFC 0005 aceptado el 2026-11-03 (las cinco opciones recomendadas) |
 | ~~Executor: un hilo o varios; tiempo de simulación~~ | ✅ RFC 0006 aceptado el 2026-11-03: un hilo por defecto y grupos con su propio hilo; un reloj para todo el robot en robot.toml |
+| ~~Python: qué pasa a C++, wheels, NumPy~~ | ✅ RFC 0007 aceptado el 2026-11-04 (las seis opciones recomendadas) |
 | Prioridades de tiempo real (`SCHED_FIFO`, afinidad de núcleo) por grupo | Cuando un robot lo necesite |
 | Unidades y rangos en los esquemas, que muestre el panel | Cuando se diseñe (cambia el anuncio del RFC 0001) |
 | Nombre y alcance del visualizador propio | Nivel 14 |

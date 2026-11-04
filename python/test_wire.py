@@ -5,7 +5,6 @@ comparan contra los mismos vectores que C++ (tests/vectors/v1.txt).
 """
 
 import ast
-import socket
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -147,7 +146,7 @@ class TestWire(unittest.TestCase):
 class TestPubSub(unittest.TestCase):
     def test_anuncio_y_datos(self):
         sub = agmen.Subscriber(MotorCommand, "127.0.0.1:0")
-        port = sub._sock.getsockname()[1]
+        port = sub.port
         pub = agmen.Publisher(MotorCommand, f"127.0.0.1:{port}", topic="/cmd")
         pub.publish(MotorCommand(1.0, 2.0))
         pub.publish(MotorCommand(3.0, 4.0))

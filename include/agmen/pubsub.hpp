@@ -95,7 +95,8 @@ struct RawSample {
 };
 
 /// Recibe mensajes de un tipo, sin decodificar el payload. Valida el sobre, el
-/// tipo y el tamaño; procesa los anuncios y el control del hub.
+/// tipo y el tamaño; procesa los anuncios y el control del hub. heartbeat() se
+/// puede llamar desde otro hilo mientras uno espera en receive_raw().
 class SubscriberCore {
 public:
     SubscriberCore(const std::string& where, const TypeInfo& type);
@@ -112,6 +113,8 @@ public:
 
     [[nodiscard]] const std::string& last_from() const;
     [[nodiscard]] std::intptr_t native_handle() const;
+    /// Puerto local donde escucha (útil con "127.0.0.1:0").
+    [[nodiscard]] std::uint16_t local_port() const;
     [[nodiscard]] const std::string& where() const;
     [[nodiscard]] const TypeInfo& type() const;
     /// Anuncios vistos: schema_id → (topic, esquema).

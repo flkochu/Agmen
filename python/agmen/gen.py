@@ -302,8 +302,9 @@ def cpp(f: AgmenFile) -> str:
 # ---------------------------------------------------------------------------
 
 class _Py:
-    def __init__(self, f: AgmenFile) -> None:
+    def __init__(self, f: AgmenFile, numpy: bool = False) -> None:
         self.f = f
+        self.numpy = numpy
 
     def elem_ann(self, fd: FieldDef) -> str:
         if fd.kind == "prim":
@@ -351,6 +352,8 @@ class _Py:
 
     def conv(self, fd: FieldDef, expr: str, depth: int) -> str:
         """De lo que da Layout.unpack (dicts, listas, ints) a los tipos de Python."""
+        if fd.kind not in ("struct", "enum"):
+            return expr   # números y arreglos de números: tal cual (listas nuevas, o NumPy)
         if depth < len(fd.type.dims):
             var = f"x{depth}"
             return f"[{self.conv(fd, var, depth + 1)} for {var} in {expr}]"
@@ -374,11 +377,11 @@ class _Py:
                 lines.append(f"from {imp.stem} import {names}  # noqa: F401")
         lines += ["", "",
                   "def _enum(cls, value, campo):",
-                  "    try:",
-                  "        return cls(value)",
-                  "    except ValueError:",
+                  "    member = cls._value2member_map_.get(value)",
+                  "    if member is None:",
                   "        raise wire.WireError(f\"'{campo}' llegó con {value}, que no es un {cls.__name__} \"",
-                  "                             f\"({', '.join(cls.__members__)})\") from None", ""]
+                  "                             f\"({', '.join(cls.__members__)})\")",
+                  "    return member", ""]
         for c in f.consts:
             lines.append(f"{c.name} = {self.const(c)}" + (f"  # {c.doc}" if c.doc else ""))
         if f.consts:
@@ -408,8 +411,12 @@ class _Py:
                       f"        return cls({args})"]
             if s.kind == "message":
                 lines += ["", "    @classmethod", "    def decode_payload(cls, payload: bytes):",
-                          "        cls.check_payload_size(payload, cls.LAYOUT.size)",
-                          "        return cls.from_dict(cls.LAYOUT.unpack(payload))"]
+                          "        cls.check_payload_size(payload, cls.LAYOUT.size)"]
+                if self.numpy:
+                    lines += ["        # numpy=True: los arreglos de números son numpy.ndarray sin copiar",
+                              "        return cls.from_dict(cls.LAYOUT.numpy_fields(payload, cls.LAYOUT.unpack(payload)))"]
+                else:
+                    lines += ["        return cls.from_dict(cls.LAYOUT.unpack(payload))"]
             lines.append("")
         return "\n".join(lines).rstrip() + "\n"
 
@@ -420,9 +427,10 @@ class _Py:
         return repr(float(c.value)) if c.type in ("f32", "f64") else str(c.value)
 
 
-def python(f: AgmenFile, for_load: bool = False) -> str:
-    """El módulo de Python (`<archivo>.py`)."""
-    return _Py(f).render(for_load)
+def python(f: AgmenFile, for_load: bool = False, numpy: bool = False) -> str:
+    """El módulo de Python (`<archivo>.py`). numpy=True: los arreglos de números
+    llegan como numpy.ndarray de solo lectura, sin copiar (RFC 0007 D4)."""
+    return _Py(f, numpy).render(for_load)
 
 
 # ---------------------------------------------------------------------------
@@ -432,34 +440,43 @@ def python(f: AgmenFile, for_load: bool = False) -> str:
 _LOADED: dict[str, tuple[float, types.ModuleType]] = {}
 
 
-def load(path: str | Path) -> types.ModuleType:
+def load(path: str | Path, numpy: bool = False) -> types.ModuleType:
     """Carga un .agmen y devuelve sus tipos, listos para usar:
 
         msgs = agmen.load("arca9.agmen")
         pub = agmen.Publisher(msgs.Articulaciones, "/arca9/q")
         pub.publish(msgs.Articulaciones(modo=msgs.Modo.TROTAR))
 
+    numpy=True: los arreglos de números (f32[12]...) llegan como numpy.ndarray
+    de solo lectura que apuntan a los bytes recibidos, sin copiar.
+
     Si el archivo cambia, la siguiente llamada lo vuelve a leer."""
+    if numpy:
+        try:
+            import numpy as _np  # noqa: F401
+        except ImportError:
+            raise ImportError("agmen.load(..., numpy=True) necesita NumPy: pip install numpy") from None
     f = idl.parse_file(path)
     modules: dict[str, types.ModuleType] = {}
     for x in idl.all_files(f):
-        key = str(x.path.resolve())
+        key = str(x.path.resolve()) + ("#numpy" if numpy else "")
         mtime = x.path.stat().st_mtime
         cached = _LOADED.get(key)
-        if cached and cached[0] == mtime and all(str(i.path.resolve()) in modules for i in x.imports):
+        if cached and cached[0] == mtime and all(str(i.path.resolve()) + ("#numpy" if numpy else "") in modules
+                                                 for i in x.imports):
             modules[key] = cached[1]
             continue
-        mod = types.ModuleType(f"agmen_msgs.{x.stem}", f"Tipos de {x.path.name}")
+        mod = types.ModuleType(f"agmen_msgs.{x.stem}" + ("_numpy" if numpy else ""), f"Tipos de {x.path.name}")
         mod.__file__ = str(x.path)
         for imp in x.imports:
-            dep = modules[str(imp.path.resolve())]
+            dep = modules[str(imp.path.resolve()) + ("#numpy" if numpy else "")]
             for name in imp.types():
                 setattr(mod, name, getattr(dep, name))
         sys.modules[mod.__name__] = mod      # dataclasses lo necesita
-        exec(compile(python(x, for_load=True), str(x.path), "exec"), mod.__dict__)
+        exec(compile(python(x, for_load=True, numpy=numpy), str(x.path), "exec"), mod.__dict__)
         _LOADED[key] = (mtime, mod)
         modules[key] = mod
-    return modules[str(f.path.resolve())]
+    return modules[str(f.path.resolve()) + ("#numpy" if numpy else "")]
 
 
 # ---------------------------------------------------------------------------

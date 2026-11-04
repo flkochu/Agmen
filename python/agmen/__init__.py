@@ -29,16 +29,19 @@ __all__ = ["wire", "schema", "clock", "Publisher", "Subscriber", "Sample", "Node
            "ensure_utf8_output", "load"]
 
 
-def load(path):
+def load(path, numpy: bool = False):
     """Carga tus mensajes de un archivo .agmen, sin compilar nada (RFC 0005):
 
         msgs = agmen.load("arca9.agmen")
         pub = agmen.Publisher(msgs.Articulaciones, "/arca9/q")
         pub.publish(msgs.Articulaciones(modo=msgs.Modo.TROTAR))
+
+    numpy=True: los arreglos de números llegan como numpy.ndarray de solo
+    lectura, sin copiar (RFC 0007).
     """
     from .gen import load as _load
 
-    return _load(path)
+    return _load(path, numpy=numpy)
 
 
 def ensure_utf8_output() -> None:

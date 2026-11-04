@@ -201,5 +201,4 @@ siempre).
 - Con `[clock] mode = "sim"` todo el robot corre en tiempo simulado; desde el
   panel lo pausas, lo avanzas o lo aceleras, o tu simulador manda el tiempo.
 
-**Siguiente (Agmen 0.9.0):** Python de primera clase, compilado desde el
-núcleo de C++ (nivel 6).
+**Siguiente:** [capítulo 13 — Python rápido y NumPy](13-python-rapido-y-numpy.md).

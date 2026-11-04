@@ -17,6 +17,7 @@ import signal
 import sys
 import threading
 
+from . import _backend
 from ._version import __version__
 
 
@@ -187,7 +188,7 @@ def cmd_mux(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="agmen", description="Agmen: el sistema nervioso para robótica, IA e IoT")
-    ap.add_argument("--version", action="version", version=f"agmen {__version__}")
+    ap.add_argument("--version", action="version", version=_backend.describe())
     sub = ap.add_subparsers(dest="cmd", required=True, metavar="comando")
 
     p = sub.add_parser("run", help="lanza todos los nodos de robot.toml + el panel web")
@@ -247,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
     add_topic_parsers(sub)
 
     p = sub.add_parser("version", help="muestra la versión")
-    p.set_defaults(func=lambda a: print(f"agmen {__version__}") or 0)
+    p.set_defaults(func=lambda a: print(_backend.describe()) or 0)
 
     from . import ensure_utf8_output
 

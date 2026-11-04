@@ -13,6 +13,7 @@ Cada mensaje = sobre de 64 bytes + payload:
 
 from __future__ import annotations
 
+import functools
 import os
 import struct
 import time
@@ -45,9 +46,19 @@ SEQ_OFFSET, SOURCE_OFFSET = 32, 24
 def now_ns() -> int:
     """La hora de Agmen en ns (agmen.clock): en el reloj real, desde la época
     Unix; en simulación, el tiempo simulado."""
-    from . import clock   # aquí: clock importa este módulo
+    return _clock().now_ns()
 
-    return clock.now_ns()
+
+_CLOCK = None
+
+
+def _clock():
+    global _CLOCK
+    if _CLOCK is None:
+        from . import clock   # aquí: clock importa este módulo
+
+        _CLOCK = clock
+    return _CLOCK
 
 
 def wall_ns() -> int:
@@ -57,11 +68,10 @@ def wall_ns() -> int:
 
 
 def _domain() -> int:
-    from . import clock
-
-    return clock.domain()
+    return _clock().domain()
 
 
+@functools.lru_cache(maxsize=1024)
 def topic_id(topic: str) -> int:
     return fnv1a64(topic.encode()) if topic else 0
 
@@ -75,7 +85,7 @@ class WireError(Exception):
     """El paquete no se puede usar. El texto explica por qué."""
 
 
-@dataclass
+@dataclass(slots=True)
 class Envelope:
     encoding: int = ENC_COMPACT
     flags: int = 0
@@ -100,6 +110,16 @@ Header = Envelope   # nombre de Agmen ≤ 0.3, por compatibilidad
 
 def parse(buf: bytes) -> tuple[Envelope, bytes]:
     """Lee y valida el sobre (RFC 0001 §8, reglas 1–4). Devuelve (sobre, payload)."""
+    if _NATIVE_PARSE is not None:
+        try:
+            env, payload = _NATIVE_PARSE(buf)
+        except WireError:
+            return _parse_py(buf)   # el mismo error, con el texto de siempre
+        return Envelope(*env), payload
+    return _parse_py(buf)
+
+
+def _parse_py(buf: bytes) -> tuple[Envelope, bytes]:
     if len(buf) < 4:
         raise WireError(f"paquete demasiado corto: {len(buf)} bytes, se necesitan al menos {ENVELOPE_LEN}")
     if bytes(buf[:3]) != MAGIC:
@@ -277,3 +297,10 @@ def read_announcement(env: Envelope, payload: bytes) -> tuple[str, str]:
 
 def envelope_dict(env: Envelope) -> dict:
     return {f.name: getattr(env, f.name) for f in fields(env)}
+
+
+_NATIVE_PARSE = None
+if _schema._backend.NATIVE:
+    # Lo que lanza el núcleo de C++ llega como estos mismos errores de Python.
+    _schema._backend.core.set_errors(_schema.SchemaError, WireError)
+    _NATIVE_PARSE = _schema._backend.core.parse

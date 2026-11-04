@@ -36,7 +36,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from . import clock
+from . import _backend, clock, wire
 from . import hubproto as hp
 from .pubsub import (
     Publisher,
@@ -176,10 +176,11 @@ class _FineTimers:
             self._winmm.timeEndPeriod(1)
 
 
-class Node:
+class _PureNode:
     def __init__(self, name: str = "") -> None:
         """`name` aparece en los avisos. Con `agmen run`, el hub lo conoce por el
         nombre de robot.toml (AGMEN_NODE)."""
+        _backend.notice_pure_once()
         if name:
             set_default_node_name(name)   # para el hub, si no corre con agmen run
         self.name = name or node_name()
@@ -498,3 +499,144 @@ class Node:
                 self._stats_sock.recvfrom(4096)
         except (BlockingIOError, ConnectionResetError, OSError):
             pass
+
+
+# ---------------------------------------------------------------------------
+# Con el núcleo de C++ (RFC 0007, D5): el executor es el de agmen::Node. Las
+# esperas, los temporizadores, las colas y los grupos corren en C++ SIN el GIL;
+# tus funciones de Python toman el GIL solo mientras corren.
+# ---------------------------------------------------------------------------
+
+class _NativeNode:
+    def __init__(self, name: str = "") -> None:
+        """`name` aparece en los avisos. Con `agmen run`, el hub lo conoce por el
+        nombre de robot.toml (AGMEN_NODE)."""
+        if name:
+            set_default_node_name(name)   # para el hub, si no corre con agmen run
+        self.name = name or node_name()
+        self._core = _backend.core.Node(self.name)
+        self._pubs: list = []
+        self._running = False
+        self._error: BaseException | None = None
+
+    # --- armar el nodo ---
+    def publisher(self, msg_type, to: str) -> Publisher:
+        """Un publicador de este nodo (t_data = node.now() si no das otro)."""
+        p = Publisher(msg_type, to)
+        self._pubs.append(p)
+        return p
+
+    def group(self, name: str) -> Group:
+        """Un grupo nuevo, con su propio hilo."""
+        if not name:
+            raise ValueError("Node.group: el grupo necesita nombre")
+        self._check_not_running("group")
+        self._core.group(name)
+        return Group(name)
+
+    def every(self, period: float, fn=None, *, group: Group | None = None):
+        """Llama a `fn()` cada `period` segundos (tiempo de Agmen). Sirve como
+        decorador (@node.every(0.05)) o directo (node.every(0.05, f))."""
+        period_ns = round(period * 1e9)
+        if period_ns <= 0:
+            raise ValueError("Node.every: el periodo debe ser mayor que cero")
+
+        def add(f):
+            self._check_not_running("every")
+            self._core.every(period_ns, self._guard(f), (group or Group()).name)
+            return f
+
+        return add if fn is None else add(fn)
+
+    def on(self, msg_type, where: str, fn=None, *, queue: int = 1, group: Group | None = None):
+        """Llama a `fn(sample)` cuando llega un `msg_type` por `where` (topic o
+        dirección). queue = 1: el más reciente; queue = N: hasta N."""
+        def add(f):
+            self._check_not_running("on")
+            if hp.is_topic(where):
+                hp.check_topic(where)
+            decode, envelope = msg_type.decode_payload, wire.Envelope
+
+            def deliver(env, payload, sender):
+                try:
+                    f(Sample(envelope(*env), decode(payload), sender))
+                except BaseException as e:  # noqa: BLE001 — se relanza en spin()
+                    self._fail(e)
+
+            self._core.subscribe(where, msg_type.NAME, msg_type.SCHEMA_TEXT, msg_type.SCHEMA_ID,
+                                 msg_type.LAYOUT.size, deliver, max(1, int(queue)), (group or Group()).name)
+            return f
+
+        return add if fn is None else add(fn)
+
+    subscribe = on
+
+    # --- correr ---
+    def now(self) -> int:
+        """La hora de Agmen en ns (la que va en t_data)."""
+        return clock.now_ns()
+
+    def stop(self) -> None:
+        """Pide parar (desde cualquier hilo o función)."""
+        self._core.stop()
+
+    def spin(self) -> None:
+        """Corre hasta stop(), Ctrl+C o que agmen run lo detenga. Si una de tus
+        funciones lanza una excepción, el nodo se detiene y spin() la relanza."""
+        self._run(None)
+
+    def spin_for(self, seconds: float) -> None:
+        """Como spin(), pero solo `seconds` segundos (pruebas, demos)."""
+        self._run(float(seconds))
+
+    def close(self) -> None:
+        for p in self._pubs:
+            p.close()
+        self._core.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def timers(self) -> list[TimerStats]:
+        return [TimerStats(*t) for t in self._core.timers()]
+
+    def subscriptions(self) -> list[SubscriptionStats]:
+        return [SubscriptionStats(*s) for s in self._core.subscriptions()]
+
+    # --- por dentro ---
+    def _check_not_running(self, what: str) -> None:
+        if self._running:
+            raise RuntimeError(f"Node.{what}: llámalo antes de spin()")
+
+    def _fail(self, e: BaseException) -> None:
+        if self._error is None:
+            self._error = e
+        self._core.stop()
+
+    def _guard(self, f):
+        def call():
+            try:
+                f()
+            except BaseException as e:  # noqa: BLE001 — se relanza en spin()
+                self._fail(e)
+
+        return call
+
+    def _run(self, seconds: float | None) -> None:
+        if self._running:
+            raise RuntimeError("Node.spin: ya está corriendo")
+        self._running = True
+        self._error = None
+        try:
+            self._core.spin(seconds)
+        finally:
+            self._running = False
+        if self._error is not None:
+            err, self._error = self._error, None
+            raise err
+
+
+Node = _NativeNode if _backend.NATIVE else _PureNode

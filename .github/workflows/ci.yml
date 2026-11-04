@@ -22,14 +22,18 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: actions/setup-python@v6
+        id: py
         with:
           python-version: "3.12"
 
       - name: Versión consistente
         run: python scripts/check_version.py
 
+      - name: nanobind (para agmen._core) y NumPy
+        run: python -m pip install nanobind numpy
+
       - name: Configurar (advertencias = errores)
-        run: cmake -S . -B build -DAGMEN_WERROR=ON -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -DAGMEN_WERROR=ON -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE="${{ steps.py.outputs.python-path }}"
 
       - name: Compilar
         run: cmake --build build --config Release --parallel
@@ -37,8 +41,18 @@ jobs:
       - name: Pruebas de C++
         run: ctest --test-dir build -C Release --output-on-failure
 
-      - name: Pruebas de Python
+      - name: Pruebas de Python (con el núcleo de C++)
+        env:
+          AGMEN_BACKEND: native
         run: python -m unittest discover -s python -v
+
+      - name: Pruebas de Python (Python puro, las mismas)
+        env:
+          AGMEN_BACKEND: pure
+        run: python -m unittest discover -s python
+
+      - name: Python con núcleo de C++ contra Python puro, medido
+        run: python scripts/py_bench.py
 
       - name: Interoperabilidad C++ <-> Python
         run: python scripts/interop.py
@@ -68,10 +82,11 @@ jobs:
       - name: Node y reloj de Agmen (sim ×2, pausa desde el panel, simulador paso a paso)
         run: python scripts/node_check.py
 
-      - name: Instalar el paquete y probar el comando agmen
+      - name: Instalar el paquete (compila agmen._core) y probarlo
         run: |
           python -m pip install .
           agmen --version
+          python scripts/wheel_check.py
 
   sanitizers:
     name: ubuntu + ASan/UBSan

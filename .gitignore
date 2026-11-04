@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .vscode/
 .idea/
+
+# agmen._core compilado en el repositorio (CMake lo deja aquí)
+python/agmen/_core*.so
+python/agmen/_core*.pyd

@@ -26,7 +26,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from . import wire
+from . import _backend, wire
 
 REAL, SIM = "real", "sim"
 
@@ -200,6 +200,52 @@ def update(m: Clock) -> None:
         _g.st = State(int(m.t), float(m.speed), bool(m.paused), True)
         _g.at_wall = time.monotonic_ns()
         _g.changed.notify_all()
+
+
+# ---------------------------------------------------------------------------
+# Con el núcleo de C++, el reloj es UNO por proceso y lo comparten C++ y
+# Python (RFC 0007): las mismas funciones, por dentro en agmen/clock.hpp.
+# ---------------------------------------------------------------------------
+
+if _backend.NATIVE:
+    _c = _backend.core
+
+    def mode() -> str:  # noqa: F811
+        """El modo de este proceso: "real" (por defecto) o "sim"."""
+        return _c.clock_mode()
+
+    def domain() -> int:  # noqa: F811
+        """El valor del campo `clock` de los mensajes (wire.CLOCK_REAL / CLOCK_SIM)."""
+        return _c.clock_domain()
+
+    def now_ns() -> int:  # noqa: F811
+        """La hora de Agmen, en ns. Real: desde la época Unix. Sim: el tiempo de la simulación."""
+        return _c.clock_now_ns()
+
+    def mono_ns() -> int:  # noqa: F811
+        return _c.clock_mono_ns()
+
+    def wall_until(t: int) -> float | None:  # noqa: F811
+        return _c.clock_wall_until(int(t))
+
+    def state() -> State:  # noqa: F811
+        t, speed, paused, received = _c.clock_state()
+        return State(t, speed, paused, received)
+
+    def wait_change(timeout: float) -> None:  # noqa: F811
+        time.sleep(min(timeout, 0.005))
+
+    def configure(m: str, stepped: bool = False, listen: bool = True) -> None:  # noqa: F811
+        if m not in (REAL, SIM):
+            raise ValueError(f"modo de reloj '{m}': usa 'real' o 'sim'")
+        _c.clock_configure(m, bool(stepped), bool(listen))
+
+    def update(m: Clock) -> None:  # noqa: F811
+        _c.clock_update(int(m.t), float(m.speed), bool(m.paused))
+
+
+def mode_name() -> str:  # noqa: F811
+    return "simulación" if mode() == SIM else "real"
 
 
 class ClockServer:

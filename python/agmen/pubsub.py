@@ -27,8 +27,10 @@ import socket
 import sys
 import threading
 import time
+import weakref
 from dataclasses import dataclass
 
+from . import _backend
 from . import hubproto as hp
 from . import wire
 
@@ -51,6 +53,8 @@ def set_default_node_name(name: str) -> None:
     """El nombre a usar si no hay AGMEN_NODE (lo llama agmen.Node)."""
     global _default_name
     _default_name = name
+    if _backend.NATIVE:
+        _backend.core.set_default_node_name(name)
 
 
 def node_name() -> str:
@@ -119,10 +123,11 @@ class _HubLink:
             pass
 
 
-class Publisher:
+class _PurePublisher:
     def __init__(self, msg_type, to: str, topic: str | None = None) -> None:
         """`to` = topic ("/cmd") o dirección ("127.0.0.1:7500"). Con dirección,
         `topic` es solo una etiqueta (default "/" + nombre del tipo)."""
+        _backend.notice_pure_once()
         self.type = msg_type
         self.to = to
         self.source_id = wire.new_source_id()
@@ -268,6 +273,11 @@ class _Receiver:
             self.listen = where
             self._sock.bind(_addr(where))
 
+    @property
+    def port(self) -> int:
+        """Puerto local donde escucha (útil con "127.0.0.1:0")."""
+        return self._sock.getsockname()[1]
+
     def _recv(self, deadline: float | None):
         """Siguiente datagrama de DATOS (los de control se procesan aquí)."""
         while True:
@@ -298,9 +308,10 @@ class _Receiver:
         self._sock.close()
 
 
-class Subscriber(_Receiver):
+class _PureSubscriber(_Receiver):
     def __init__(self, msg_type, where: str) -> None:
         """`where` = topic ("/cmd") o dirección donde escuchar ("127.0.0.1:7500")."""
+        _backend.notice_pure_once()
         self.type = msg_type
         self._clock_warned = False
         super().__init__(where, f"{msg_type.SCHEMA_ID:016x}", msg_type.NAME)
@@ -442,3 +453,155 @@ class RawPublisher:
         if self._link is not None:
             self._link.close()
         self._sock.close()
+
+
+# ---------------------------------------------------------------------------
+# Con el núcleo de C++ (RFC 0007): sockets, hub, anuncios y la espera en C++.
+# Mismo uso, mismos atributos.
+# ---------------------------------------------------------------------------
+
+class _Beats:
+    """Late por los Publisher y Subscriber del núcleo de C++ que pasan ratos sin
+    publicar o sin llamar receive() (el panel, un nodo que solo manda al cambiar
+    algo). C++ suelta el GIL mientras late."""
+
+    def __init__(self) -> None:
+        self.pubs: weakref.WeakSet = weakref.WeakSet()
+        self.thread: threading.Thread | None = None
+        self.lock = threading.Lock()
+
+    def add(self, pub) -> None:
+        with self.lock:
+            self.pubs.add(pub)
+            if self.thread is None:
+                self.thread = threading.Thread(target=self._loop, name="agmen-latidos", daemon=True)
+                self.thread.start()
+
+    def _loop(self) -> None:
+        while True:
+            time.sleep(0.25)
+            for p in list(self.pubs):
+                try:
+                    p._beat()
+                except Exception:  # noqa: BLE001 — un latido fallido no tumba a nadie
+                    pass
+
+
+_beats = _Beats()
+
+
+class _NativePublisher:
+    def __init__(self, msg_type, to: str, topic: str | None = None) -> None:
+        """`to` = topic ("/cmd") o dirección ("127.0.0.1:7500"). Con dirección,
+        `topic` es solo una etiqueta (default "/" + nombre del tipo)."""
+        self.type = msg_type
+        self.to = to
+        if hp.is_topic(to):
+            hp.check_topic(to)
+        label = "" if hp.is_topic(to) else (topic if topic is not None else "/" + msg_type.NAME)
+        self._core = _backend.core.Publisher(to, msg_type.NAME, msg_type.SCHEMA_TEXT, msg_type.SCHEMA_ID,
+                                             msg_type.LAYOUT.size, label)
+        self.topic = self._core.topic
+        self.source_id = self._core.source_id
+        self._lock = threading.Lock()
+        if hp.is_topic(to):
+            _beats.add(self)
+
+    def publish(self, msg, t_data: int | None = None) -> bool:
+        """Manda `msg`. t_data = instante al que corresponden los datos (default: ahora).
+        Devuelve False si no se pudo entregar a nadie (no es un error)."""
+        payload = msg.encode_payload()
+        return self._core.publish(payload, wire.now_ns() if t_data is None else int(t_data))
+
+    def announce(self) -> None:
+        self._core.announce()
+
+    def _beat(self) -> None:
+        with self._lock:
+            if not self._core.closed:
+                self._core.heartbeat()
+
+    @property
+    def seq(self) -> int:
+        return self._core.seq
+
+    @property
+    def subscribers(self) -> int:
+        return self._core.subscribers
+
+    def close(self) -> None:
+        with self._lock:
+            self._core.close()
+
+
+class _NativeSubscriber:
+    def __new__(cls, msg_type, where: str):
+        if where == "*":   # todos los topics con un tipo: solo en Python puro (lo usan pocas herramientas)
+            return _PureSubscriber(msg_type, where)
+        return super().__new__(cls)
+
+    def __init__(self, msg_type, where: str) -> None:
+        """`where` = topic ("/cmd") o dirección donde escuchar ("127.0.0.1:7500")."""
+        self.type = msg_type
+        if hp.is_topic(where):
+            hp.check_topic(where)
+        self.topic = where if hp.is_topic(where) else ""
+        self._core = _backend.core.Subscriber(where, msg_type.NAME, msg_type.SCHEMA_TEXT, msg_type.SCHEMA_ID,
+                                              msg_type.LAYOUT.size)
+        self.listen = f"127.0.0.1:{self._core.port}" if self.topic else where
+        self._lock = threading.Lock()
+        if self.topic:
+            _beats.add(self)   # sigue latiendo aunque no llames receive() por un rato
+
+    def receive(self, timeout: float | None = None):
+        """Espera hasta `timeout` s un mensaje (sin el GIL). Devuelve Sample, o None
+        si no llegó. Lanza wire.WireError si llega algo inválido o de otro tipo."""
+        got = self._core.receive(timeout)
+        if got is None:
+            return None
+        env, payload, sender = got
+        return Sample(wire.Envelope(*env), self.type.decode_payload(payload), sender)
+
+    @property
+    def announced(self) -> dict[int, tuple[str, str]]:
+        """schema_id → (topic, esquema) de los anuncios vistos."""
+        return self._core.announced()
+
+    @property
+    def port(self) -> int:
+        """Puerto local donde escucha (útil con "127.0.0.1:0")."""
+        return self._core.port
+
+    def fileno(self) -> int:
+        return self._core.fileno()
+
+    def _beat(self) -> None:
+        with self._lock:
+            if not self._core.closed:
+                self._core.heartbeat()
+
+    def close(self) -> None:
+        with self._lock:
+            self._core.close()
+
+
+# La clase que se usa se elige una vez, al importar: isinstance y herencia funcionan.
+Publisher = _NativePublisher if _backend.NATIVE else _PurePublisher
+Subscriber = _NativeSubscriber if _backend.NATIVE else _PureSubscriber
+
+
+if _backend.NATIVE:
+    import atexit
+
+    def _stderr(line: str) -> None:
+        stream = sys.stderr
+        if stream is not None:
+            try:
+                stream.write(line + "\n")
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+
+    _backend.core.set_log_sink(_stderr)
+    atexit.register(_backend.core.set_log_sink, None)
+    _backend.core.set_default_node_name(node_name())

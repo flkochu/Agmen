@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Estado** | 📝 **Propuesta** (2026-11-03). Decisiones abiertas en la [sección 5](#5-decisiones) |
+| **Estado** | ✅ **Aceptado** (2026-11-04, D1–D6 = a) e **implementado en Agmen 0.9.0**. Lo implementado, en la [sección 8](#8-lo-que-se-implementó-en-090) |
 | **Depende de** | RFC 0001 (formato v1), RFC 0005 (`.agmen` y `agmen.load`), RFC 0006 (`Node` y reloj) |
 | **Versión** | Agmen 0.9.0 |
 | **Requisitos** | b (Python de primera clase, C++ nativo) |
@@ -173,7 +173,7 @@ por esperar en Python.
 | 5 | **Crear objetos de Python** es lo que queda lento | Medirlo (`py_bench.py`); la cola `queue = 1` ya evita crear mensajes que nadie va a ver |
 | 6 | **Contribuir sin compilador** | `AGMEN_BACKEND=pure` y las pruebas de Python puro siguen corriendo sin compilar nada |
 
-## 7. Plan para Agmen 0.9.0
+## 7. Plan para Agmen 0.9.0 (hecho)
 
 1. `agmen::schema::Layout` en C++ (esquema en texto → layout dinámico), con los vectores de prueba compartidos.
 2. `agmen._core` con nanobind: codificar/decodificar, `Publisher`/`Subscriber`, `Node` y reloj; `agmen/__init__.py` elige el núcleo C++ o Python puro.
@@ -181,6 +181,56 @@ por esperar en Python.
 4. Empaquetado: `scikit-build-core` en `pyproject.toml`, *wheels* con `cibuildwheel` en el workflow de *release*, respaldo de Python puro (D2). Python 3.11+ (D3).
 5. Pruebas: todas las de Python corren con los dos núcleos; `scripts/py_bench.py` en el CI con el antes y el después.
 6. Tutorial: capítulo 13 (Python rápido y NumPy) y la instalación sin compilar en el capítulo 0.
+
+## 8. Lo que se implementó en 0.9.0
+
+| Pieza | Dónde |
+|---|---|
+| Esquemas en C++ en tiempo de ejecución | `include/agmen/layout.hpp`, `src/layout.cpp`, `tests/test_layout.cpp` |
+| Pub/sub sin plantilla (`PublisherCore`, `SubscriberCore`), `Node::subscribe_raw`, `agmen::log` | `include/agmen/pubsub.hpp`, `src/pubsub.cpp`, `src/node.cpp`, `src/log.cpp` |
+| `agmen._core` (nanobind) | `python/src/core.cpp`; CMake: `AGMEN_PYTHON` |
+| Elegir núcleo (D2, D6) | `python/agmen/_backend.py` (`AGMEN_BACKEND`) |
+| NumPy (D4) | `agmen.load(..., numpy=True)`, `Layout.numpy_fields` |
+| Empaquetado (D2, D3) | `pyproject.toml` (scikit-build-core, cibuildwheel), `.github/workflows/release.yml` |
+| Pruebas | Python con los dos núcleos en el CI, `python/test_core.py`, `scripts/py_bench.py`, `scripts/wheel_check.py` |
+
+**Medido** (`scripts/py_bench.py`, Linux sin carga, `Articulaciones` de Arca9):
+
+| | Python puro | Núcleo C++ | |
+|---|---|---|---|
+| Codificar | 9.5 µs | 1.9 µs | 4.9× |
+| Decodificar | 5.9 µs | 2.1 µs | 2.8× |
+| `publish()` | 14.6 µs | 3.2 µs | 4.5× |
+| Recibir | 12.2 µs | 4.0 µs | 3.1× |
+
+La meta de §3.5 era 5×: se llegó en codificar y publicar. Decodificar y
+recibir quedan en ~3× porque lo que sigue en Python es **crear los objetos**
+(el mensaje, su sobre y los enums), el reto 5 de §6. El `Layout` solo
+(`pack`/`unpack` en C++) es 10× y 5× más rápido que en Python puro.
+
+### Reglas que se fijaron al implementarlo
+
+- **El núcleo y el paquete deben ser de la misma versión.** Un `_core`
+  compilado de otra versión (en el repositorio, antes de volver a compilar) no
+  se usa: Agmen cae a Python puro y `_backend.WHY` dice por qué.
+- **El aviso de Python puro** (D2) sale una vez, al crear el primer `Node`,
+  `Publisher` o `Subscriber`, y solo si el paquete se instaló sin núcleo (no en
+  el repositorio).
+- **Los mismos errores.** Lo que lanza C++ llega como `agmen.wire.WireError` y
+  `agmen.schema.SchemaError`; si el sobre está mal, el texto es el de siempre
+  (se vuelve a leer con Python para dar el mismo mensaje).
+- **Sin el GIL**: `Subscriber.receive()` espera en C++ en tramos de 200 ms y
+  revisa Ctrl+C entre tramos; los constructores sueltan el GIL mientras
+  esperan al hub (el hub puede ser un hilo de Python del mismo proceso).
+- **Latidos**: un hilo (`agmen-latidos`) late por los `Publisher` y
+  `Subscriber` del núcleo cada 250 ms, aunque no publiquen ni lean.
+- **Los avisos de C++** (otro reloj, ciclos saltados, no hay hub) salen por
+  `sys.stderr` de Python, así se ven igual en `agmen run` y en las pruebas.
+- `Subscriber(tipo, "*")` (todos los topics con un tipo) sigue en Python puro;
+  las herramientas (`agmen run`, el panel, `agmen echo`, `agmen mux`) también
+  (D1).
+- **NumPy** funciona igual con los dos núcleos: `numpy.frombuffer` sobre los
+  bytes del payload, que ya no se copian.
 
 ## Fuentes
 

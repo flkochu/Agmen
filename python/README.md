@@ -4,12 +4,14 @@
 (en C++) es el "sistema nervioso" del robot: mueve mensajes entre nodos de
 forma rápida, confiable y con marca de tiempo.
 
-Este paquete es la **implementación de referencia en Python** del formato de
-mensajes. Con él, un nodo de Python habla con nodos de C++ sin dependencias
-extra.
+Desde la 0.9, este paquete trae **el mismo núcleo de C++** ya compilado para
+Windows, Linux x64, Linux ARM64 (Raspberry Pi) y macOS (Intel y Apple
+Silicon), con Python 3.11 o más nuevo: pip no compila nada. En otras
+computadoras se instala la versión de Python puro, que funciona igual pero más
+lenta. `agmen --version` dice cuál usas.
 
 ```bash
-pip install agmen
+pip install agmen            # pip install agmen[numpy] para arreglos como NumPy
 ```
 
 ```python
@@ -57,6 +59,9 @@ msgs = agmen.load("arca9.agmen")
 pub = agmen.Publisher(msgs.Articulaciones, "/arca9/q")
 pub.publish(msgs.Articulaciones(q=[90.0] * 12, modo=msgs.Modo.TROTAR))
 ```
+
+Con `agmen.load("arca9.agmen", numpy=True)`, los arreglos llegan como
+`numpy.ndarray` de solo lectura, sin copiar.
 
 `agmen gen arca9.agmen --python .` escribe el `.py` (para el autocompletado
 de tu editor) y `agmen gen arca9.agmen` muestra cada tipo con su esquema.
