@@ -10,8 +10,9 @@ respuesta del hub puede traer varias líneas en un solo datagrama (`state`).
 
 Nodo → hub
     pub   id node pid topic schema type text   registrar/latir un Publisher
-    sub   id node pid topic schema port        registrar/latir un Subscriber
-                                               (topic="*" = todos; schema="*" = cualquier tipo)
+    sub   id node pid topic schema port [tcp]  registrar/latir un Subscriber
+                                               (topic="*" = todos; schema="*" = cualquier tipo;
+                                               tcp = puerto TCP donde recibe mensajes arrow, RFC 0008)
     bye   id                                   el endpoint se va
     stat  node pid kind name ...               cuentas de un agmen.Node, cada segundo (RFC 0006):
                                                kind=timer: group period_ns runs late skipped
@@ -22,7 +23,9 @@ Nodo → hub
     ping                                       ¿hay hub?
 
 Hub → nodo
-    subs  id topic to=ip:puerto,ip:puerto       a quién mandarle los datos (a un Publisher)
+    subs  id topic to=ip:puerto,... [tcp=...]   a quién mandarle los datos (a un Publisher): `to` son
+                                               los puertos UDP (mensajes compact) y `tcp` los puertos
+                                               TCP de los que reciben mensajes arrow (RFC 0008)
     ok    id                                    latido recibido (a un Subscriber)
     error id msg                                registro rechazado (ej. choque de tipos)
     pong  version

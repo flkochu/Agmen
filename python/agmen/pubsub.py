@@ -23,6 +23,7 @@ topic, de registrarse con el hub y latir cada segundo.
 from __future__ import annotations
 
 import os
+import select
 import socket
 import sys
 import threading
@@ -30,7 +31,7 @@ import time
 import weakref
 from dataclasses import dataclass
 
-from . import _backend
+from . import _backend, _tcp
 from . import hubproto as hp
 from . import wire
 
@@ -135,6 +136,9 @@ class _PurePublisher:
         self._sock = wire.udp_socket()
         self._announced_at: float | None = None
         self._pub_lock = threading.Lock()   # se puede publicar desde varios grupos de un Node
+        # Un tipo arrow (string, bytes, T[], tensor) va por TCP (RFC 0008 D2); compact, por UDP.
+        self.arrow = msg_type.LAYOUT.encoding == wire.ENC_ARROW
+        self._tcp = _tcp.Fanout() if self.arrow else None
         if hp.is_topic(to):
             hp.check_topic(to)
             self.topic = to
@@ -157,6 +161,8 @@ class _PurePublisher:
             self.topic = topic if topic is not None else "/" + msg_type.NAME
             self.dests = [_addr(to)]
             self._link = None
+            if self._tcp is not None:
+                self._tcp.update(self.dests, self._announcement())
 
     # --- envío ---
     def _send(self, data: bytes, dest) -> bool:
@@ -173,13 +179,18 @@ class _PurePublisher:
 
     def announce(self) -> None:
         ann = self._announcement()
-        for d in list(self.dests):
-            self._send(ann, d)
+        if self._tcp is not None:
+            self._tcp.send(ann)
+        else:
+            for d in list(self.dests):
+                self._send(ann, d)
         self._announced_at = time.monotonic()
 
     def _drain_locked(self) -> None:
         with self._lock:
             self._drain()
+            if self._tcp is not None:
+                self._tcp.flush()      # termina lo que quedó a medias aunque no se publique
 
     def _drain(self) -> None:
         """Lee las respuestas del hub (a quién mandarle los datos)."""
@@ -203,11 +214,15 @@ class _PurePublisher:
                     continue
                 self._link.got_reply()
                 if op == "subs":
-                    new = [_addr(a) for a in f.get("to", "").split(",") if a]
-                    ann = self._announcement()
-                    for d in new:
-                        if d not in self.dests:   # recién llegado: que sepa el esquema desde ya
-                            self._send(ann, d)
+                    if self._tcp is not None:   # los que reciben arrow dicen su puerto TCP
+                        new = [_addr(a) for a in f.get("tcp", "").split(",") if a]
+                        self._tcp.update(new, self._announcement())
+                    else:
+                        new = [_addr(a) for a in f.get("to", "").split(",") if a]
+                        ann = self._announcement()
+                        for d in new:
+                            if d not in self.dests:   # recién llegado: que sepa el esquema desde ya
+                                self._send(ann, d)
                     self.dests = new
                     self._link.error = None
                 elif op == "error":
@@ -229,6 +244,8 @@ class _PurePublisher:
                 self.announce()
             data = wire.encode(msg, self.seq, t_data, topic=self.topic, source_id=self.source_id)
             self.seq += 1
+            if self._tcp is not None:
+                return self._tcp.send(data)
         ok = False
         for d in dests:
             ok = self._send(data, d) or ok
@@ -238,9 +255,16 @@ class _PurePublisher:
     def subscribers(self) -> int:
         return len(self.dests)
 
+    @property
+    def dropped(self) -> int:
+        """Mensajes arrow que no se entregaron a algún suscriptor lento (RFC 0008 D3)."""
+        return self._tcp.dropped if self._tcp is not None else 0
+
     def close(self) -> None:
         if self._link is not None:
             self._link.close()
+        if self._tcp is not None:
+            self._tcp.close()
         self._sock.close()
 
 
@@ -255,30 +279,67 @@ class _Receiver:
     """Lo común de Subscriber y RawSubscriber: un socket propio, y en modo
     topic, el registro con el hub."""
 
-    def __init__(self, where: str, schema: str, type_name: str = "") -> None:
+    def __init__(self, where: str, schema: str, type_name: str = "", tcp: bool = True) -> None:
         self._sock = wire.udp_socket()
         self.announced: dict[int, tuple[str, str]] = {}   # schema_id → (topic, esquema)
         self._link = None
+        # Los mensajes arrow llegan por TCP (RFC 0008): un puerto más, que se registra en el hub.
+        self._tcp: _tcp.Listener | None = None
         if hp.is_topic(where) or where == "*":
             hp.check_topic(where, allow_wildcard=True)
             self.topic = where
             self._sock.bind(("127.0.0.1", 0))
             port = self._sock.getsockname()[1]
             self.listen = f"127.0.0.1:{port}"
+            if tcp:
+                self._tcp = _tcp.Listener(("127.0.0.1", 0))
             self._link = _HubLink(self._sock, dict(
                 op="sub", id=f"{wire.new_source_id():016x}", node=node_name(), pid=os.getpid(),
-                topic=where, schema=schema, type=type_name, port=port))
+                topic=where, schema=schema, type=type_name, port=port,
+                tcp=self._tcp.port if self._tcp is not None else ""))
         else:
             self.topic = ""
             self.listen = where
             self._sock.bind(_addr(where))
+            if tcp:   # con dirección fija, el mismo puerto en TCP
+                self._tcp = _tcp.Listener(self._sock.getsockname())
 
     @property
     def port(self) -> int:
         """Puerto local donde escucha (útil con "127.0.0.1:0")."""
         return self._sock.getsockname()[1]
 
+    @property
+    def tcp_port(self) -> int:
+        """Puerto TCP donde recibe mensajes arrow (0 si este tipo no los usa)."""
+        return self._tcp.port if self._tcp is not None else 0
+
+    def filenos(self) -> list:
+        """Los sockets que hay que vigilar (para select)."""
+        return [self._sock, *(self._tcp.filenos() if self._tcp is not None else [])]
+
     def _recv(self, deadline: float | None):
+        """Siguiente paquete de DATOS, (bytes, "ip:puerto"). Los de control se procesan aquí."""
+        if self._tcp is None:
+            return self._recv_udp(deadline)
+        while True:
+            if self._tcp.ready:
+                return self._tcp.ready.pop(0)
+            left = None if deadline is None else max(0.0, deadline - time.monotonic())
+            try:
+                r, _, _ = select.select(self.filenos(), [], [], left)
+            except (OSError, ValueError):
+                return None
+            if not r:
+                return None
+            if self._sock in r:
+                got = self._recv_udp(0.0)
+                if got is not None:
+                    return got
+                r.remove(self._sock)
+            self._tcp.service(r)
+
+    def _recv_udp(self, deadline: float | None):
         """Siguiente datagrama de DATOS (los de control se procesan aquí)."""
         while True:
             left = None if deadline is None else max(0.0, deadline - time.monotonic())
@@ -305,6 +366,8 @@ class _Receiver:
     def close(self) -> None:
         if self._link is not None:
             self._link.close()
+        if self._tcp is not None:
+            self._tcp.close()
         self._sock.close()
 
 
@@ -314,7 +377,8 @@ class _PureSubscriber(_Receiver):
         _backend.notice_pure_once()
         self.type = msg_type
         self._clock_warned = False
-        super().__init__(where, f"{msg_type.SCHEMA_ID:016x}", msg_type.NAME)
+        super().__init__(where, f"{msg_type.SCHEMA_ID:016x}", msg_type.NAME,
+                         tcp=msg_type.LAYOUT.encoding == wire.ENC_ARROW)
 
     def receive(self, timeout: float | None = None):
         """Espera hasta `timeout` s un mensaje. Devuelve Sample, o None si no llegó.
@@ -499,8 +563,10 @@ class _NativePublisher:
         if hp.is_topic(to):
             hp.check_topic(to)
         label = "" if hp.is_topic(to) else (topic if topic is not None else "/" + msg_type.NAME)
+        layout = msg_type.LAYOUT
+        self.arrow = layout.encoding == wire.ENC_ARROW
         self._core = _backend.core.Publisher(to, msg_type.NAME, msg_type.SCHEMA_TEXT, msg_type.SCHEMA_ID,
-                                             msg_type.LAYOUT.size, label)
+                                             layout.size or 0, self.arrow, label)
         self.topic = self._core.topic
         self.source_id = self._core.source_id
         self._lock = threading.Lock()
@@ -529,6 +595,11 @@ class _NativePublisher:
     def subscribers(self) -> int:
         return self._core.subscribers
 
+    @property
+    def dropped(self) -> int:
+        """Mensajes arrow que no se entregaron a algún suscriptor lento (RFC 0008 D3)."""
+        return self._core.dropped
+
     def close(self) -> None:
         with self._lock:
             self._core.close()
@@ -546,8 +617,9 @@ class _NativeSubscriber:
         if hp.is_topic(where):
             hp.check_topic(where)
         self.topic = where if hp.is_topic(where) else ""
+        layout = msg_type.LAYOUT
         self._core = _backend.core.Subscriber(where, msg_type.NAME, msg_type.SCHEMA_TEXT, msg_type.SCHEMA_ID,
-                                              msg_type.LAYOUT.size)
+                                              layout.size or 0, layout.encoding == wire.ENC_ARROW)
         self.listen = f"127.0.0.1:{self._core.port}" if self.topic else where
         self._lock = threading.Lock()
         if self.topic:
@@ -574,6 +646,14 @@ class _NativeSubscriber:
 
     def fileno(self) -> int:
         return self._core.fileno()
+
+    def filenos(self) -> list:
+        return self._core.filenos()
+
+    @property
+    def tcp_port(self) -> int:
+        """Puerto TCP donde recibe mensajes arrow (0 si este tipo no los usa)."""
+        return self._core.tcp_port
 
     def _beat(self) -> None:
         with self._lock:

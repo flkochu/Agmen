@@ -32,7 +32,6 @@ Uso directo (agmen run lo arma solo desde [[mux]] en robot.toml):
 from __future__ import annotations
 
 import selectors
-import socket
 import struct
 import sys
 import threading
@@ -173,6 +172,11 @@ class Mux:
 
         if text is not None:
             # No cuenta como hablar: un anuncio no le quita el mando a nadie.
+            if not schema.parse(text).size and self.schema_text != text:
+                self._error(inp, f"manda un tipo con campos de tamaño variable ({schema.parse(text).name}): el "
+                                 f"mux arbitra comandos de actuadores (tipos compact); los mensajes arrow "
+                                 f"(RFC 0008) no pasan por él")
+                return False
             self.schema_text = text
             if self.pub is not None:      # con topic, el RawPublisher anuncia por su cuenta
                 self.pub.set_schema(text, schema.parse(text).name, env.schema_id)

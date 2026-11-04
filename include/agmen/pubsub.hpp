@@ -21,6 +21,14 @@
 // latido sale dentro de publish() y receive(). Si un nodo pasa más de 3 s sin
 // llamarlos, el hub lo da por muerto; en esos ciclos lentos, llama heartbeat().
 //
+// Los mensajes compact viajan en un datagrama UDP. Los de tipos con campos de
+// tamaño variable (string, bytes, T[], tensor; codificación arrow, RFC 0008)
+// pueden medir megabytes y van por TCP: el Subscriber escucha en un puerto TCP
+// (que registra en el hub) y el Publisher se conecta a cada uno. Un hilo del
+// Publisher termina de mandar lo que no cupo de una vez; a un suscriptor lento
+// se le guarda solo el mensaje más nuevo (dropped() cuenta los que no se
+// entregaron). Un suscriptor lento nunca frena al publicador ni a los demás.
+//
 // Por dentro, Publisher<M> y Subscriber<M> son una capa delgada sobre
 // PublisherCore y SubscriberCore, que no dependen del tipo: los usa también el
 // módulo de Python (agmen._core) con tipos que no se compilaron (RFC 0007).
@@ -51,11 +59,12 @@ struct TypeInfo {
     std::string schema_text;   ///< canónico completo: "agmen/1 MotorCommand{...}"
     std::uint64_t schema_id = 0;
     std::size_t payload_size = 0;   ///< tamaño compact (0 = no revisar)
+    bool arrow = false;             ///< campos de tamaño variable: codificación arrow, por TCP (RFC 0008)
 
     template <wire::Message M>
     [[nodiscard]] static TypeInfo of() {
         return TypeInfo{std::string(M::kName), wire::schema_text<M>(), wire::schema_id_v<M>,
-                        wire::compact_size_v<M>};
+                        wire::compact_size_v<M>, wire::is_arrow_v<M>};
     }
 };
 
@@ -71,7 +80,7 @@ public:
     PublisherCore& operator=(const PublisherCore&) = delete;
     ~PublisherCore();
 
-    /// Manda un payload compact; t_data en ns de Agmen.
+    /// Manda un payload (compact o arrow, según el tipo); t_data en ns de Agmen.
     net::SendStatus publish_payload(wire::ByteView payload, std::int64_t t_data);
     void announce();
     void heartbeat();
@@ -81,6 +90,8 @@ public:
     [[nodiscard]] const std::string& topic() const;
     [[nodiscard]] std::size_t subscribers() const;
     [[nodiscard]] const TypeInfo& type() const;
+    /// Mensajes arrow que no se entregaron a algún suscriptor lento (RFC 0008 D3).
+    [[nodiscard]] std::uint64_t dropped() const;
 
 private:
     struct State;
@@ -112,9 +123,14 @@ public:
     void heartbeat();
 
     [[nodiscard]] const std::string& last_from() const;
+    /// El socket UDP (para esperar varios a la vez). Un tipo arrow también
+    /// tiene los de TCP: native_handles() los da todos.
     [[nodiscard]] std::intptr_t native_handle() const;
-    /// Puerto local donde escucha (útil con "127.0.0.1:0").
+    [[nodiscard]] std::vector<std::intptr_t> native_handles() const;
+    /// Puerto local (UDP) donde escucha (útil con "127.0.0.1:0").
     [[nodiscard]] std::uint16_t local_port() const;
+    /// Puerto TCP donde recibe mensajes arrow (0 si el tipo no los usa).
+    [[nodiscard]] std::uint16_t tcp_port() const;
     [[nodiscard]] const std::string& where() const;
     [[nodiscard]] const TypeInfo& type() const;
     /// Anuncios vistos: schema_id → (topic, esquema).
@@ -145,7 +161,7 @@ public:
         wire::Bytes payload;
         payload.reserve(wire::compact_size_v<M>);
         msg.encode_payload(payload);
-        if (payload.size() != wire::compact_size_v<M>) {
+        if (!wire::is_arrow_v<M> && payload.size() != wire::compact_size_v<M>) {
             // Un error de programación: el encode_payload no sigue al esquema.
             throw std::logic_error("encode_payload de '" + std::string(M::kName) + "' produjo " +
                                    std::to_string(payload.size()) + " bytes, pero su esquema mide " +
@@ -166,6 +182,8 @@ public:
     [[nodiscard]] const std::string& topic() const { return core_.topic(); }
     /// A cuántos receptores se manda cada mensaje.
     [[nodiscard]] std::size_t subscribers() const { return core_.subscribers(); }
+    /// Mensajes que no se entregaron a algún suscriptor lento (solo tipos arrow, RFC 0008 D3).
+    [[nodiscard]] std::uint64_t dropped() const { return core_.dropped(); }
 
 private:
     PublisherCore core_;
@@ -202,6 +220,12 @@ public:
 
     /// El socket, para que un Node espere varias suscripciones a la vez.
     [[nodiscard]] std::intptr_t native_handle() const { return core_.native_handle(); }
+    /// Todos los sockets (UDP, y los de TCP si el tipo es arrow).
+    [[nodiscard]] std::vector<std::intptr_t> native_handles() const { return core_.native_handles(); }
+    /// Puerto local (UDP) donde escucha (útil con "127.0.0.1:0").
+    [[nodiscard]] std::uint16_t local_port() const { return core_.local_port(); }
+    /// Puerto TCP donde recibe mensajes arrow (0 si el tipo no los usa).
+    [[nodiscard]] std::uint16_t tcp_port() const { return core_.tcp_port(); }
 
     /// Topic o dirección donde escucha.
     [[nodiscard]] const std::string& where() const { return core_.where(); }

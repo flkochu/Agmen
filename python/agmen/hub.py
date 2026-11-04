@@ -38,8 +38,9 @@ class Endpoint:
     pid: str
     topic: str                # "*" = todos (solo sub)
     schema: str               # hex de 16 dígitos, o "*" (solo sub)
-    addr: tuple[str, int]     # pub: de dónde late (ahí recibe "subs"); sub: dónde recibe datos
+    addr: tuple[str, int]     # pub: de dónde late (ahí recibe "subs"); sub: dónde recibe datos (UDP)
     type: str = ""
+    tcp: int = 0              # sub: puerto TCP donde recibe mensajes arrow (0 = no recibe)
     text: str = ""
     last_seen: float = field(default_factory=time.monotonic)
 
@@ -97,8 +98,10 @@ class Hub:
         return [e for e in self.endpoints.values() if e.kind == "sub" and e.topic in (topic, "*")]
 
     def _push_subs(self, pub: Endpoint) -> None:
-        to = ",".join(f"{s.addr[0]}:{s.addr[1]}" for s in self.subscribers_of(pub.topic))
-        self._send(hp.encode("subs", id=pub.id, topic=pub.topic, to=to), pub.addr)
+        subs = self.subscribers_of(pub.topic)
+        to = ",".join(f"{s.addr[0]}:{s.addr[1]}" for s in subs)
+        tcp = ",".join(f"{s.addr[0]}:{s.tcp}" for s in subs if s.tcp)
+        self._send(hp.encode("subs", id=pub.id, topic=pub.topic, to=to, tcp=tcp), pub.addr)
 
     def _push_topic(self, topic: str) -> None:
         for e in list(self.endpoints.values()):
@@ -186,20 +189,22 @@ class Hub:
                 raise hp.ProtocolError(f"'{topic}' ya es de tipo {have[1] or have[0]} (schema_id {have[0]}) y "
                                        f"'{f.get('node', '?')}' quiere usarlo con {theirs} (schema_id {schema}). "
                                        f"Un topic, un tipo: usa otro nombre de topic o el mismo esquema")
+        tcp = 0
         if kind == "sub":
             addr = (addr[0], int(f["port"]))
+            tcp = int(f.get("tcp") or 0)
         e = self.endpoints.get(eid)
-        is_new = e is None or e.addr != addr or e.topic != topic
+        is_new = e is None or e.addr != addr or e.topic != topic or e.tcp != tcp
         if e is None:
             e = Endpoint(eid, kind, f.get("node", "?"), f.get("pid", ""), topic, schema, addr,
-                         f.get("type", ""), f.get("text", ""))
+                         f.get("type", ""), tcp, f.get("text", ""))
             self.endpoints[eid] = e
             what = "todos los topics" if topic == "*" else topic
             tipo = f" ({e.type})" if e.type else ""
             self.log(f"▶ '{e.node}' {'publica' if kind == 'pub' else 'escucha'} {what}{tipo}")
             self._check_expected(e)
         else:
-            e.addr, e.topic, e.schema = addr, topic, schema
+            e.addr, e.topic, e.schema, e.tcp = addr, topic, schema, tcp
             e.type, e.text = f.get("type", e.type), f.get("text", e.text)
         e.last_seen = now
         if kind == "pub":
@@ -238,7 +243,8 @@ class Hub:
         now = time.monotonic()
         for e in self.endpoints.values():
             lines.append(hp.line("ep", id=e.id, kind=e.kind, node=e.node, pid=e.pid, topic=e.topic,
-                                 type=e.type, addr=f"{e.addr[0]}:{e.addr[1]}", age=f"{now - e.last_seen:.1f}"))
+                                 type=e.type, addr=f"{e.addr[0]}:{e.addr[1]}", tcp=e.tcp or "",
+                                 age=f"{now - e.last_seen:.1f}"))
         for _key, (f, _seen) in sorted(self.stats.items()):
             lines.append(hp.line("stat", **f))
         return "\n".join(lines)

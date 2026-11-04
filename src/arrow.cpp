@@ -130,7 +130,7 @@ std::uint32_t Codec::build(std::uint32_t idx) {
                 for (auto d : dims) n.n *= d;
                 n.children.push_back(build(base));
             } else {
-                n.dims = {t.count};
+                n.dims.assign(1, t.count);
                 n.n = t.count;
                 n.children.push_back(build(t.elem));
             }

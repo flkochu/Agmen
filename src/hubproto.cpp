@@ -229,7 +229,24 @@ void Link::bye(net::UdpSocket& socket) noexcept {
     }
 }
 
-bool Link::handle(wire::ByteView data, std::optional<std::vector<std::string>>& subs) {
+namespace {
+
+std::vector<std::string> split_list(const std::string& list) {
+    std::vector<std::string> out;
+    std::size_t p = 0;
+    while (p < list.size()) {
+        auto c = list.find(',', p);
+        if (c == std::string::npos) c = list.size();
+        if (c > p) out.push_back(list.substr(p, c - p));
+        p = c + 1;
+    }
+    return out;
+}
+
+}  // namespace
+
+bool Link::handle(wire::ByteView data, std::optional<std::vector<std::string>>& subs,
+                  std::optional<std::vector<std::string>>* tcp) {
     if (!is_control(data)) return false;
     std::vector<Line> lines;
     try {
@@ -241,16 +258,8 @@ bool Link::handle(wire::ByteView data, std::optional<std::vector<std::string>>& 
         if (l.get("id") != id_) continue;
         replied_ = true;
         if (l.op == "subs") {
-            std::vector<std::string> to;
-            const std::string list = l.get("to");
-            std::size_t p = 0;
-            while (p < list.size()) {
-                auto c = list.find(',', p);
-                if (c == std::string::npos) c = list.size();
-                if (c > p) to.push_back(list.substr(p, c - p));
-                p = c + 1;
-            }
-            subs = std::move(to);
+            subs = split_list(l.get("to"));
+            if (tcp != nullptr) *tcp = split_list(l.get("tcp"));
             error_.clear();
         } else if (l.op == "ok") {
             error_.clear();

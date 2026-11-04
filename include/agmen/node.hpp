@@ -136,6 +136,8 @@ public:
     RawSub(const std::string& w, const TypeInfo& type, Callback cb, const SubscribeOptions& opt);
 
     [[nodiscard]] std::intptr_t handle() const { return sub_.native_handle(); }
+    /// Todos los sockets (UDP, y los de TCP si el tipo es arrow; cambian con las conexiones).
+    [[nodiscard]] std::vector<std::intptr_t> handles() const { return sub_.native_handles(); }
     /// Lee lo que ya llegó al socket (sin esperar) y lo pone en la cola.
     void pull();
     [[nodiscard]] bool pending() const { return !q_.empty(); }

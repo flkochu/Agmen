@@ -43,6 +43,7 @@ public:
 
 private:
     friend class UdpSocket;
+    friend class TcpStream;
     std::array<std::uint8_t, 16> raw_{};  // un sockaddr_in
 };
 
@@ -97,5 +98,74 @@ private:
 /// Espera hasta `timeout` a que alguno de los sockets tenga datos. Marca en
 /// `ready` cuáles los tienen y devuelve cuántos (0 = nadie a tiempo).
 int wait_readable(std::span<const std::intptr_t> sockets, std::chrono::milliseconds timeout, std::span<bool> ready);
+
+/// Como wait_readable, pero espera lectura en los primeros `n_read` sockets y
+/// escritura en el resto. Devuelve cuántos están listos.
+int wait_io(std::span<const std::intptr_t> sockets, std::size_t n_read, std::chrono::milliseconds timeout,
+            std::span<bool> ready);
+
+// ---------------------------------------------------------------------------
+// TCP: el transporte de los mensajes grandes (arrow, RFC 0008). Los sockets
+// son no bloqueantes: quien los usa espera con wait_readable / wait_io.
+// ---------------------------------------------------------------------------
+
+/// Una conexión TCP (del lado que se conecta o del que acepta).
+class TcpStream {
+public:
+    /// Se conecta a "ip:puerto" esperando hasta `timeout`. Lanza NetError si no se pudo.
+    [[nodiscard]] static TcpStream connect(const Address& to, std::chrono::milliseconds timeout);
+
+    TcpStream() = default;
+    TcpStream(TcpStream&& other) noexcept;
+    TcpStream& operator=(TcpStream&& other) noexcept;
+    TcpStream(const TcpStream&) = delete;
+    TcpStream& operator=(const TcpStream&) = delete;
+    ~TcpStream();
+
+    /// Manda lo que el sistema acepte ahora: cuántos bytes salieron (0 si no
+    /// acepta nada por el momento). -1 si la conexión se cerró o falló.
+    std::ptrdiff_t send_some(std::span<const std::uint8_t> data);
+    /// Lee lo que haya: cuántos bytes llegaron (0 si no hay nada por ahora).
+    /// -1 si el otro lado cerró o falló.
+    std::ptrdiff_t recv_some(std::span<std::uint8_t> buffer);
+
+    [[nodiscard]] bool valid() const { return handle_ != -1; }
+    [[nodiscard]] std::intptr_t native_handle() const { return handle_; }
+    [[nodiscard]] const std::string& peer() const { return peer_; }
+    void close() noexcept;
+
+private:
+    friend class TcpListener;
+    TcpStream(std::intptr_t handle, std::string peer) : handle_(handle), peer_(std::move(peer)) {}
+
+    std::intptr_t handle_ = -1;
+    std::string peer_;   ///< "ip:puerto" del otro lado
+};
+
+/// Un puerto TCP que acepta conexiones (no bloqueante).
+class TcpListener {
+public:
+    /// Escucha en "ip:puerto" ("127.0.0.1:0" = puerto libre). Lanza NetError.
+    [[nodiscard]] static TcpListener bind(std::string_view address);
+
+    TcpListener() = default;
+    TcpListener(TcpListener&& other) noexcept;
+    TcpListener& operator=(TcpListener&& other) noexcept;
+    TcpListener(const TcpListener&) = delete;
+    TcpListener& operator=(const TcpListener&) = delete;
+    ~TcpListener();
+
+    /// La siguiente conexión pendiente, si hay (no espera).
+    [[nodiscard]] std::optional<TcpStream> accept();
+
+    [[nodiscard]] bool valid() const { return handle_ != -1; }
+    [[nodiscard]] std::intptr_t native_handle() const { return handle_; }
+    [[nodiscard]] std::uint16_t local_port() const;
+    void close() noexcept;
+
+private:
+    explicit TcpListener(std::intptr_t handle) : handle_(handle) {}
+    std::intptr_t handle_ = -1;
+};
 
 }  // namespace agmen::net

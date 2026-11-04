@@ -376,17 +376,9 @@ EnvTuple env_tuple(const agmen::wire::Envelope& e) {
             e.payload_len, static_cast<int>(e.clock), e.header_len};
 }
 
-agmen::TypeInfo type_info(const std::string& name, const std::string& text, std::uint64_t id, std::size_t size) {
-    return agmen::TypeInfo{name, text, id, size};
-}
-
-std::vector<std::uint8_t> buffer_bytes(nb::handle buf) {
-    Py_buffer view;
-    if (PyObject_GetBuffer(buf.ptr(), &view, PyBUF_SIMPLE) != 0) throw nb::python_error();
-    const auto* p = static_cast<const std::uint8_t*>(view.buf);
-    std::vector<std::uint8_t> out(p, p + view.len);
-    PyBuffer_Release(&view);
-    return out;
+agmen::TypeInfo type_info(const std::string& name, const std::string& text, std::uint64_t id, std::size_t size,
+                          bool arrow) {
+    return agmen::TypeInfo{name, text, id, arrow ? 0 : size, arrow};
 }
 
 // ---------------------------------------------------------------------------
@@ -396,12 +388,29 @@ std::vector<std::uint8_t> buffer_bytes(nb::handle buf) {
 class PyPublisher {
 public:
     PyPublisher(const std::string& to, const std::string& name, const std::string& text, std::uint64_t id,
-                std::size_t size, const std::string& topic)
-        : core_(std::make_unique<agmen::PublisherCore>(to, type_info(name, text, id, size), topic)) {}
+                std::size_t size, bool arrow, const std::string& topic)
+        : core_(std::make_unique<agmen::PublisherCore>(to, type_info(name, text, id, size, arrow), topic)) {}
 
     bool publish(nb::handle payload, std::int64_t t_data) {
-        const auto bytes = buffer_bytes(payload);
-        return live().publish_payload(bytes, t_data) == agmen::net::SendStatus::Ok;
+        // El payload se lee del buffer de Python sin copiarlo aquí (una imagen de
+        // varios MB): se copia una vez al armar el paquete, con el GIL suelto.
+        Py_buffer view;
+        if (PyObject_GetBuffer(payload.ptr(), &view, PyBUF_SIMPLE) != 0) throw nb::python_error();
+        auto& c = live();
+        try {
+            const agmen::wire::ByteView data(static_cast<const std::uint8_t*>(view.buf),
+                                             static_cast<std::size_t>(view.len));
+            agmen::net::SendStatus st;
+            {
+                nb::gil_scoped_release nogil;
+                st = c.publish_payload(data, t_data);
+            }
+            PyBuffer_Release(&view);
+            return st == agmen::net::SendStatus::Ok;
+        } catch (...) {
+            PyBuffer_Release(&view);
+            throw;
+        }
     }
     void announce() { live().announce(); }
     void heartbeat() {
@@ -415,6 +424,7 @@ public:
     [[nodiscard]] std::uint64_t source_id() { return live().source_id(); }
     [[nodiscard]] std::string topic() { return live().topic(); }
     [[nodiscard]] std::size_t subscribers() { return live().subscribers(); }
+    [[nodiscard]] std::uint64_t dropped() { return live().dropped(); }
 
 private:
     agmen::PublisherCore& live() {
@@ -427,8 +437,8 @@ private:
 class PySubscriber {
 public:
     PySubscriber(const std::string& where, const std::string& name, const std::string& text, std::uint64_t id,
-                 std::size_t size)
-        : core_(std::make_unique<agmen::SubscriberCore>(where, type_info(name, text, id, size))) {}
+                 std::size_t size, bool arrow)
+        : core_(std::make_unique<agmen::SubscriberCore>(where, type_info(name, text, id, size, arrow))) {}
 
     /// None, o (sobre, payload, "ip:puerto"). timeout en segundos (None = sin límite).
     std::optional<std::tuple<EnvTuple, nb::bytes, std::string>> receive(std::optional<double> timeout) {
@@ -470,7 +480,9 @@ public:
     void close() { core_.reset(); }
     [[nodiscard]] bool closed() const { return !core_; }
     [[nodiscard]] std::intptr_t fileno() { return live().native_handle(); }
+    [[nodiscard]] std::vector<std::intptr_t> filenos() { return live().native_handles(); }
     [[nodiscard]] std::uint16_t port() { return live().local_port(); }
+    [[nodiscard]] std::uint16_t tcp_port() { return live().tcp_port(); }
 
 private:
     agmen::SubscriberCore& live() {
@@ -504,10 +516,10 @@ public:
     }
 
     void subscribe(const std::string& where, const std::string& name, const std::string& text, std::uint64_t id,
-                   std::size_t size, nb::handle fn, std::size_t queue, const std::string& group) {
+                   std::size_t size, bool arrow, nb::handle fn, std::size_t queue, const std::string& group) {
         PyRef ref(fn);
         live().subscribe_raw(
-            where, type_info(name, text, id, size),
+            where, type_info(name, text, id, size, arrow),
             [ref](const agmen::RawSample& s) {
                 nb::gil_scoped_acquire gil;
                 try {
@@ -632,9 +644,9 @@ NB_MODULE(_core, m) {
         .def("unpack", &PyLayout::unpack, "payload"_a, "offset"_a = 0);
 
     nb::class_<PyPublisher>(m, "Publisher")
-        .def(nb::init<const std::string&, const std::string&, const std::string&, std::uint64_t, std::size_t,
+        .def(nb::init<const std::string&, const std::string&, const std::string&, std::uint64_t, std::size_t, bool,
                       const std::string&>(),
-             "to"_a, "name"_a, "text"_a, "schema_id"_a, "size"_a, "topic"_a,
+             "to"_a, "name"_a, "text"_a, "schema_id"_a, "size"_a, "arrow"_a, "topic"_a,
              nb::call_guard<nb::gil_scoped_release>())
         .def("publish", &PyPublisher::publish, "payload"_a, "t_data"_a)
         .def("announce", &PyPublisher::announce)
@@ -644,24 +656,28 @@ NB_MODULE(_core, m) {
         .def_prop_ro("seq", &PyPublisher::seq)
         .def_prop_ro("source_id", &PyPublisher::source_id)
         .def_prop_ro("topic", &PyPublisher::topic)
-        .def_prop_ro("subscribers", &PyPublisher::subscribers);
+        .def_prop_ro("subscribers", &PyPublisher::subscribers)
+        .def_prop_ro("dropped", &PyPublisher::dropped);
 
     nb::class_<PySubscriber>(m, "Subscriber")
-        .def(nb::init<const std::string&, const std::string&, const std::string&, std::uint64_t, std::size_t>(),
-             "where"_a, "name"_a, "text"_a, "schema_id"_a, "size"_a, nb::call_guard<nb::gil_scoped_release>())
+        .def(nb::init<const std::string&, const std::string&, const std::string&, std::uint64_t, std::size_t, bool>(),
+             "where"_a, "name"_a, "text"_a, "schema_id"_a, "size"_a, "arrow"_a,
+             nb::call_guard<nb::gil_scoped_release>())
         .def("receive", &PySubscriber::receive, "timeout"_a.none())
         .def("announced", &PySubscriber::announced)
         .def("heartbeat", &PySubscriber::heartbeat)
         .def("fileno", &PySubscriber::fileno)
+        .def("filenos", &PySubscriber::filenos)
         .def_prop_ro("port", &PySubscriber::port)
+        .def_prop_ro("tcp_port", &PySubscriber::tcp_port)
         .def_prop_ro("closed", &PySubscriber::closed)
         .def("close", &PySubscriber::close);
 
     nb::class_<PyNode>(m, "Node")
         .def(nb::init<const std::string&>(), "name"_a)
         .def("every", &PyNode::every, "period_ns"_a, "fn"_a, "group"_a)
-        .def("subscribe", &PyNode::subscribe, "where"_a, "name"_a, "text"_a, "schema_id"_a, "size"_a, "fn"_a,
-             "queue"_a, "group"_a)
+        .def("subscribe", &PyNode::subscribe, "where"_a, "name"_a, "text"_a, "schema_id"_a, "size"_a, "arrow"_a,
+             "fn"_a, "queue"_a, "group"_a)
         .def("group", &PyNode::group, "name"_a)
         .def("spin", &PyNode::spin, "seconds"_a.none())
         .def("stop", &PyNode::stop)

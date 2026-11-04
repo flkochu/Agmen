@@ -89,8 +89,10 @@ public:
     void bye(net::UdpSocket& socket) noexcept;
 
     /// Si `data` es control, lo procesa y devuelve true. Si trae la lista de
-    /// receptores de este endpoint, la deja en `subs`.
-    bool handle(wire::ByteView data, std::optional<std::vector<std::string>>& subs);
+    /// receptores de este endpoint, la deja en `subs` (los puertos UDP) y, si
+    /// se pide, en `tcp` (los puertos TCP de los que reciben arrow, RFC 0008).
+    bool handle(wire::ByteView data, std::optional<std::vector<std::string>>& subs,
+                std::optional<std::vector<std::string>>* tcp = nullptr);
 
     [[nodiscard]] bool replied() const { return replied_; }
     [[nodiscard]] const std::string& error() const { return error_; }

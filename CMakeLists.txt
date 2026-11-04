@@ -211,6 +211,11 @@ if(AGMEN_BUILD_TESTS)
     agmen_set_warnings(test_arrow)
     add_test(NAME arrow COMMAND test_arrow)
 
+    add_executable(test_tcp tests/test_tcp.cpp)
+    target_link_libraries(test_tcp PRIVATE agmen::core)
+    agmen_set_warnings(test_tcp)
+    add_test(NAME tcp COMMAND test_tcp)
+
     # Node y el reloj de Agmen (RFC 0006).
     add_executable(test_node tests/test_node.cpp)
     target_link_libraries(test_node PRIVATE agmen::core)

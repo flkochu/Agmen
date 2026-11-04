@@ -117,8 +117,9 @@ class _Sub:
         self.q: collections.deque[Sample] = collections.deque()
         self.stats = SubscriptionStats(where, msg_type.NAME, group, self.queue)
 
-    def fileno(self) -> int:
-        return self.sub._sock.fileno()
+    def filenos(self) -> list:
+        """Los sockets de la suscripción: UDP, y el TCP de los mensajes arrow (RFC 0008)."""
+        return self.sub.filenos()
 
     def pull(self) -> None:
         for _ in range(1024):
@@ -440,13 +441,22 @@ class _PureNode:
             if timeout > 0:
                 self._stop.wait(timeout)
             return []
+        owner = {}
+        for sub in g.subs:
+            for f in sub.filenos():
+                owner[f] = sub
         try:
-            r, _, _ = select.select(g.subs, [], [], timeout)
+            r, _, _ = select.select(list(owner), [], [], timeout)
         except (OSError, ValueError):
             if self._stop.is_set():
                 return []
             raise
-        return r
+        ready = []
+        for f in r:
+            sub = owner[f]
+            if sub not in ready:
+                ready.append(sub)
+        return ready
 
     def _warn(self, t: _Timer, g: _GroupRt, wall: int) -> None:
         if t.win_skipped == 0 or wall - t.last_warn < 5 * _SEC:
@@ -563,8 +573,10 @@ class _NativeNode:
                 except BaseException as e:  # noqa: BLE001 — se relanza en spin()
                     self._fail(e)
 
+            layout = msg_type.LAYOUT
             self._core.subscribe(where, msg_type.NAME, msg_type.SCHEMA_TEXT, msg_type.SCHEMA_ID,
-                                 msg_type.LAYOUT.size, deliver, max(1, int(queue)), (group or Group()).name)
+                                 layout.size or 0, layout.encoding == wire.ENC_ARROW, deliver, max(1, int(queue)),
+                                 (group or Group()).name)
             return f
 
         return add if fn is None else add(fn)

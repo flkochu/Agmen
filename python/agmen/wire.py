@@ -290,8 +290,10 @@ def max_message() -> int:
 
 
 def too_big_text(what: str, n: int) -> str:
-    return (f"'{what}' mide {n / (1 << 20):.1f} MiB y el máximo de un mensaje es "
-            f"{max_message() / (1 << 20):.0f} MiB: si de verdad lo necesitas, sube AGMEN_MAX_MESSAGE_MB")
+    limit = max_message() / (1 << 20)
+    shown = f"{limit:.0f}" if limit == int(limit) else f"{limit:.1f}"
+    return (f"'{what}' mide {n / (1 << 20):.1f} MiB y el máximo de un mensaje es {shown} MiB: "
+            f"si de verdad lo necesitas, sube AGMEN_MAX_MESSAGE_MB")
 
 
 def type_mismatch_text(cls, got: int, got_text: str | None = None) -> str:

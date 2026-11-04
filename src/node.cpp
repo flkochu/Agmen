@@ -295,10 +295,22 @@ struct NodeImpl {
 
     void run_group_impl(GroupRt& g, bool is_main, std::int64_t end_steady) {
         using namespace std::chrono;
+        // Los sockets a vigilar. Los de un tipo arrow cambian (conexiones TCP que
+        // llegan y se van, RFC 0008), así que la lista se arma en cada vuelta.
         std::vector<std::intptr_t> handles;
-        for (const auto& s : g.subs) handles.push_back(s->handle());
-        std::unique_ptr<bool[]> ready(new bool[handles.size() + 1]());
-        const std::span<bool> ready_span(ready.get(), handles.size());
+        std::vector<std::size_t> owner;   // handles[i] es de g.subs[owner[i]]
+        const auto gather = [&] {
+            handles.clear();
+            owner.clear();
+            for (std::size_t k = 0; k < g.subs.size(); ++k) {
+                for (const auto h : g.subs[k]->handles()) {
+                    handles.push_back(h);
+                    owner.push_back(k);
+                }
+            }
+        };
+        std::unique_ptr<bool[]> ready;
+        std::size_t ready_cap = 0;
 
         // En simulación, el tiempo empieza cuando llega el primer /clock.
         while (!g.timers.empty() && clock::mode() == clock::Mode::Sim && !clock::state().received) {
@@ -409,6 +421,12 @@ struct NodeImpl {
             }
             if (wait < 0) wait = 0;
 
+            gather();
+            if (handles.size() + 1 > ready_cap) {
+                ready_cap = handles.size() + 1;
+                ready.reset(new bool[ready_cap]());
+            }
+            const std::span<bool> ready_span(ready.get(), handles.size());
             int n = 0;
             if (wait >= 2 * kMs) {
                 // poll() tiene resolución de 1 ms: se despierta ~1 ms antes y
@@ -421,8 +439,12 @@ struct NodeImpl {
                 }
             }
             if (n > 0) {
+                std::vector<bool> pulled(g.subs.size(), false);
                 for (std::size_t i = 0; i < handles.size(); ++i) {
-                    if (ready[i]) g.subs[i]->pull();
+                    if (ready[i] && !pulled[owner[i]]) {
+                        pulled[owner[i]] = true;
+                        g.subs[owner[i]]->pull();
+                    }
                 }
             }
         }

@@ -12,8 +12,10 @@
 #else
 #  include <arpa/inet.h>
 #  include <cerrno>
+#  include <fcntl.h>
 #  include <netdb.h>
 #  include <netinet/in.h>
+#  include <netinet/tcp.h>
 #  include <poll.h>
 #  include <sys/socket.h>
 #  include <unistd.h>
@@ -282,6 +284,239 @@ std::optional<Received> UdpSocket::recv_from(std::span<std::uint8_t> buffer,
         throw NetError(code, "falló la recepción UDP");
     }
     return Received{static_cast<std::size_t>(n), to_string(from)};
+}
+
+}  // namespace agmen::net
+
+// ---------------------------------------------------------------------------
+// TCP (RFC 0008)
+// ---------------------------------------------------------------------------
+
+namespace agmen::net {
+
+namespace {
+
+void close_native(std::intptr_t h) noexcept {
+#ifdef _WIN32
+    ::closesocket(native(h));
+#else
+    ::close(native(h));
+#endif
+}
+
+void set_nonblocking(NativeSocket s) {
+#ifdef _WIN32
+    u_long on = 1;
+    ::ioctlsocket(s, FIONBIO, &on);
+#else
+    const int flags = ::fcntl(s, F_GETFL, 0);
+    ::fcntl(s, F_SETFL, flags | O_NONBLOCK);
+#endif
+}
+
+/// Un buffer grande para que una imagen quepa de una vez. En Linux no se toca:
+/// fijar SO_SNDBUF apaga el ajuste automático (que llega a 4 MB) y lo recorta
+/// a wmem_max (~200 KB).
+void tune_tcp(NativeSocket s, bool sending) {
+    const int one = 1;
+    ::setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof one);
+#ifndef __linux__
+    const int big = 4 << 20;
+    ::setsockopt(s, SOL_SOCKET, sending ? SO_SNDBUF : SO_RCVBUF, reinterpret_cast<const char*>(&big), sizeof big);
+#else
+    (void)sending;
+#endif
+}
+
+bool is_in_progress(int code) {
+#ifdef _WIN32
+    return code == WSAEWOULDBLOCK || code == WSAEINPROGRESS;
+#else
+    return code == EINPROGRESS || code == EWOULDBLOCK || code == EAGAIN;
+#endif
+}
+
+}  // namespace
+
+int wait_io(std::span<const std::intptr_t> sockets, std::size_t n_read, std::chrono::milliseconds timeout,
+            std::span<bool> ready) {
+    for (auto& r : ready) r = false;
+    if (sockets.empty()) {
+        if (timeout.count() > 0) std::this_thread::sleep_for(timeout);
+        return 0;
+    }
+#ifdef _WIN32
+    std::vector<WSAPOLLFD> fds(sockets.size());
+    for (std::size_t i = 0; i < sockets.size(); ++i) {
+        fds[i] = WSAPOLLFD{native(sockets[i]), static_cast<SHORT>(i < n_read ? POLLRDNORM : POLLWRNORM), 0};
+    }
+    const int n = WSAPoll(fds.data(), static_cast<ULONG>(fds.size()), static_cast<INT>(timeout.count()));
+#else
+    std::vector<pollfd> fds(sockets.size());
+    for (std::size_t i = 0; i < sockets.size(); ++i) {
+        fds[i] = pollfd{native(sockets[i]), static_cast<short>(i < n_read ? POLLIN : POLLOUT), 0};
+    }
+    const int n = ::poll(fds.data(), static_cast<nfds_t>(fds.size()), static_cast<int>(timeout.count()));
+#endif
+    if (n < 0) {
+        const int code = last_error();
+        if (is_would_block(code)) return 0;
+        throw NetError(code, "falló la espera de datos");
+    }
+    int count = 0;
+    for (std::size_t i = 0; i < sockets.size() && i < ready.size(); ++i) {
+        ready[i] = fds[i].revents != 0;
+        count += ready[i] ? 1 : 0;
+    }
+    return count;
+}
+
+TcpStream TcpStream::connect(const Address& to, std::chrono::milliseconds timeout) {
+    ensure_winsock();
+    sockaddr_in addr{};
+    std::memcpy(&addr, to.raw_.data(), sizeof addr);
+    const NativeSocket s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == kInvalid) throw NetError(last_error(), "no se pudo crear el socket TCP");
+    tune_tcp(s, true);
+    set_nonblocking(s);
+    if (::connect(s, reinterpret_cast<const sockaddr*>(&addr), sizeof addr) != 0) {
+        const int code = last_error();
+        if (!is_in_progress(code)) {
+            close_native(static_cast<std::intptr_t>(s));
+            throw NetError(code, "no se pudo conectar a " + to.to_string());
+        }
+        // Esperar a que conecte (a 127.0.0.1 tarda microsegundos).
+#ifdef _WIN32
+        WSAPOLLFD pfd{s, POLLWRNORM, 0};
+        const int n = WSAPoll(&pfd, 1, static_cast<INT>(timeout.count()));
+#else
+        pollfd pfd{s, POLLOUT, 0};
+        const int n = ::poll(&pfd, 1, static_cast<int>(timeout.count()));
+#endif
+        int err = 0;
+        socklen_t len = sizeof err;
+        if (n <= 0 || ::getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len) != 0 || err != 0) {
+            close_native(static_cast<std::intptr_t>(s));
+            throw NetError(err, "no se pudo conectar a " + to.to_string());
+        }
+    }
+    return TcpStream(static_cast<std::intptr_t>(s), to.to_string());
+}
+
+TcpStream::TcpStream(TcpStream&& other) noexcept : handle_(other.handle_), peer_(std::move(other.peer_)) {
+    other.handle_ = -1;
+}
+
+TcpStream& TcpStream::operator=(TcpStream&& other) noexcept {
+    if (this != &other) {
+        close();
+        handle_ = other.handle_;
+        peer_ = std::move(other.peer_);
+        other.handle_ = -1;
+    }
+    return *this;
+}
+
+TcpStream::~TcpStream() { close(); }
+
+void TcpStream::close() noexcept {
+    if (handle_ == -1) return;
+    close_native(handle_);
+    handle_ = -1;
+}
+
+std::ptrdiff_t TcpStream::send_some(std::span<const std::uint8_t> data) {
+    if (handle_ == -1) return -1;
+    if (data.empty()) return 0;
+#ifdef _WIN32
+    const int flags = 0;
+#else
+    const int flags = MSG_NOSIGNAL;   // un suscriptor que se fue no debe matar al proceso con SIGPIPE
+#endif
+    const auto n = ::send(native(handle_), reinterpret_cast<const char*>(data.data()),
+                          static_cast<LenType>(data.size()), flags);
+    if (n < 0) {
+        const int code = last_error();
+        if (is_would_block(code)) return 0;
+        close();
+        return -1;
+    }
+    return static_cast<std::ptrdiff_t>(n);
+}
+
+std::ptrdiff_t TcpStream::recv_some(std::span<std::uint8_t> buffer) {
+    if (handle_ == -1) return -1;
+    if (buffer.empty()) return 0;
+    const auto n = ::recv(native(handle_), reinterpret_cast<char*>(buffer.data()),
+                          static_cast<LenType>(buffer.size()), 0);
+    if (n == 0) {
+        close();
+        return -1;   // el otro lado cerró
+    }
+    if (n < 0) {
+        const int code = last_error();
+        if (is_would_block(code)) return 0;
+        close();
+        return -1;
+    }
+    return static_cast<std::ptrdiff_t>(n);
+}
+
+TcpListener TcpListener::bind(std::string_view address) {
+    ensure_winsock();
+    const sockaddr_in addr = resolve(address);
+    const NativeSocket s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == kInvalid) throw NetError(last_error(), "no se pudo crear el socket TCP");
+#ifndef _WIN32
+    const int one = 1;
+    ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof one);
+#endif
+    if (::bind(s, reinterpret_cast<const sockaddr*>(&addr), sizeof addr) != 0 || ::listen(s, 16) != 0) {
+        const int code = last_error();
+        close_native(static_cast<std::intptr_t>(s));
+        throw NetError(code, "no se pudo escuchar (TCP) en " + std::string(address) +
+                                 ". ¿Hay otro proceso usando ese puerto?");
+    }
+    set_nonblocking(s);
+    return TcpListener(static_cast<std::intptr_t>(s));
+}
+
+TcpListener::TcpListener(TcpListener&& other) noexcept : handle_(other.handle_) { other.handle_ = -1; }
+
+TcpListener& TcpListener::operator=(TcpListener&& other) noexcept {
+    if (this != &other) {
+        close();
+        handle_ = other.handle_;
+        other.handle_ = -1;
+    }
+    return *this;
+}
+
+TcpListener::~TcpListener() { close(); }
+
+void TcpListener::close() noexcept {
+    if (handle_ == -1) return;
+    close_native(handle_);
+    handle_ = -1;
+}
+
+std::optional<TcpStream> TcpListener::accept() {
+    sockaddr_in from{};
+    socklen_t len = sizeof from;
+    const NativeSocket c = ::accept(native(handle_), reinterpret_cast<sockaddr*>(&from), &len);
+    if (c == kInvalid) return std::nullopt;
+    tune_tcp(c, false);
+    set_nonblocking(c);
+    return TcpStream(static_cast<std::intptr_t>(c), to_string(from));
+}
+
+std::uint16_t TcpListener::local_port() const {
+    sockaddr_in addr{};
+    socklen_t len = sizeof addr;
+    if (::getsockname(native(handle_), reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+        throw NetError(last_error(), "no se pudo leer el puerto local");
+    }
+    return ntohs(addr.sin_port);
 }
 
 }  // namespace agmen::net
