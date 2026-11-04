@@ -135,6 +135,17 @@ def stats() -> dict[tuple[str, str], dict]:
 
 
 def runs(node: str, name: str) -> int:
+    """Ciclos que le TOCARON al temporizador: los que corrió + los que se saltó.
+
+    Esto es lo que dice a qué velocidad va el reloj. Cuántos corrió de verdad
+    depende de la máquina: las del CI de macOS despiertan tarde y a 1 kHz se
+    saltan muchos (el Node los salta a propósito, D4 del RFC 0006)."""
+    f = stats().get((node, name))
+    return int(f["runs"]) + int(f["skipped"]) if f else -1
+
+
+def ran(node: str, name: str) -> int:
+    """Solo los que corrió de verdad."""
     f = stats().get((node, name))
     return int(f["runs"]) if f else -1
 
@@ -143,7 +154,7 @@ def wait_runs(node: str, name: str, at_least: int, timeout: float = 15.0) -> int
     end = time.monotonic() + timeout
     n = -1
     while time.monotonic() < end:
-        n = runs(node, name)
+        n = ran(node, name)
         if n >= at_least:
             return n
         time.sleep(0.2)
@@ -199,9 +210,12 @@ cmd = "python {(TMP / 'contador.py').as_posix()}"
         check("sim ×2: every(0.1 s) corre ~20 veces por segundo real", 14 <= r <= 23, f"{r:.1f}/s")
         if exe:
             wait_runs("doble_ritmo", "every(1 ms)", 100)
+            r0 = ran("doble_ritmo", "every(1 ms)")
             rc = rate("doble_ritmo", "every(1 ms)", 2.0)
-            # Ideal 2000/s; las máquinas de macOS del CI dan ~1100 (despiertan tarde cada 0.5 ms).
-            check("sim ×2: el C++ every(1 ms) corre ~2000 veces por segundo real", 700 <= rc <= 2300, f"{rc:.0f}/s")
+            really = ran("doble_ritmo", "every(1 ms)") - r0
+            check("sim ×2: al C++ every(1 ms) le tocan ~2000 ciclos por segundo real", 1500 <= rc <= 2300,
+                  f"{rc:.0f}/s (mientras se medía corrió {really} veces; si la máquina despierta tarde, el resto se salta)")
+            check("…y de verdad corre", really > 100, f"corrió {really}")
         else:
             print("SALTO C++ en simulación: no encontré build/bin/doble_ritmo")
 
