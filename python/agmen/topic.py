@@ -148,6 +148,7 @@ def cmd_hz(args) -> int:
         times: list[float] = []
         start = time.monotonic()
         total = 0
+        nbytes = 0
         while not stop.is_set():
             got = rx.receive_raw(0.1)
             now = time.monotonic()
@@ -159,18 +160,22 @@ def cmd_hz(args) -> int:
                 if env.encoding != wire.ENC_SCHEMA:
                     times.append(now)
                     total += 1
+                    nbytes += len(got[0])
             if now - start >= args.window:
                 if len(times) >= 2:
-                    gaps = [b - a for a, b in zip(times, times[1:])]
+                    gaps = [b - a for a, b in zip(times, times[1:], strict=False)]
                     mean = statistics.fmean(gaps)
                     sd = statistics.pstdev(gaps) if len(gaps) > 1 else 0.0
+                    rate = nbytes / (now - start)
+                    size = f"   {rate / 1e6:.2f} MB/s" if rate >= 100_000 else f"   {rate / 1e3:.1f} kB/s"
                     print(f"promedio {1 / mean:8.2f} Hz   entre mensajes: min {min(gaps) * 1e3:6.2f} ms  "
-                          f"max {max(gaps) * 1e3:6.2f} ms  desv {sd * 1e3:5.2f} ms   ({len(times)} mensajes)",
+                          f"max {max(gaps) * 1e3:6.2f} ms  desv {sd * 1e3:5.2f} ms   ({len(times)} mensajes){size}",
                           flush=True)
                     times = times[-1:]
                 else:
                     print("sin mensajes", flush=True)
                 start = now
+                nbytes = 0
             if args.count and total >= args.count:
                 stop.set()
 

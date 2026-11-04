@@ -162,19 +162,14 @@ def udp_receiver(hub: SensorHub, bridge: Bridge | None, listen: str | None, stop
     de microcontrolador) y de TODOS los topics, como un receptor más
     registrado en el hub ("*"). Cuenta estadísticas y le pasa cada paquete,
     sin decodificar, al puente."""
-    import selectors
+    import select
 
     os.environ.setdefault("AGMEN_NODE", "panel")
-    sel = selectors.DefaultSelector()
     receivers: list[RawSubscriber] = []
     if listen:
-        rx = RawSubscriber(listen)
-        receivers.append(rx)
-        sel.register(rx._sock, selectors.EVENT_READ, rx)
+        receivers.append(RawSubscriber(listen))
     if topics:
-        rx = RawSubscriber("*")
-        receivers.append(rx)
-        sel.register(rx._sock, selectors.EVENT_READ, rx)
+        receivers.append(RawSubscriber("*"))
     hub.update(listening=", ".join(filter(None, [listen, "todos los topics" if topics else None])))
     book = SchemaBook()
     expected: dict[tuple[str, int], int] = {}     # (emisor, source_id) → seq esperado
@@ -197,7 +192,7 @@ def udp_receiver(hub: SensorHub, bridge: Bridge | None, listen: str | None, stop
             if layout is None:
                 raise wire.WireError(f"llega schema_id {env.schema_id:#018x} sin anuncio de esquema "
                                      f"todavía (cada Publisher lo anuncia una vez por segundo)")
-            if not payload or len(payload) % layout.size:
+            if layout.fixed and (not payload or len(payload) % layout.size):
                 raise wire.WireError(f"payload de {len(payload)} bytes: no es múltiplo de {layout.size} "
                                      f"(el tamaño de '{layout.name}')")
         except (wire.WireError, schema.SchemaError) as e:
@@ -211,8 +206,9 @@ def udp_receiver(hub: SensorHub, bridge: Bridge | None, listen: str | None, stop
         last_seen[source] = now
         topic = book.topics.get((source, env.topic_id), "")
         key = topic or source
-        st = per_topic.setdefault(key, {"count": 0, "rate_hz": 0.0, "lost": 0, "sources": {}})
+        st = per_topic.setdefault(key, {"count": 0, "bytes": 0, "rate_hz": 0.0, "bytes_s": 0.0, "lost": 0, "sources": {}})
         st["count"] += 1
+        st["bytes"] += len(data)
         st["sources"][source] = now
         exp = expected.get((source, env.source_id))
         if exp is not None and env.seq > exp:
@@ -226,8 +222,16 @@ def udp_receiver(hub: SensorHub, bridge: Bridge | None, listen: str | None, stop
 
     try:
         while not stop.is_set():
-            for k, _ in sel.select(timeout=0.25):
-                rx: RawSubscriber = k.data
+            # Los sockets cambian: los mensajes arrow llegan por conexiones TCP que van y vienen (RFC 0008).
+            owner = {}
+            for rx in receivers:
+                for f in rx.filenos():
+                    owner[f] = rx
+            try:
+                ready, _, _ = select.select(list(owner), [], [], 0.25)
+            except (OSError, ValueError):
+                continue
+            for rx in {owner[f] for f in ready}:
                 while True:
                     try:
                         got = rx.receive_raw(0)
@@ -245,10 +249,11 @@ def udp_receiver(hub: SensorHub, bridge: Bridge | None, listen: str | None, stop
                 topics_out = {}
                 for key, st in per_topic.items():
                     st["rate_hz"] = round(st.pop("count") / dt, 1)
-                    st["count"] = 0
+                    st["bytes_s"] = round(st.pop("bytes") / dt)
+                    st["count"] = st["bytes"] = 0
                     srcs = sorted(s for s, t in st["sources"].items() if now - t < 2.0)
                     if srcs or st["rate_hz"]:
-                        topics_out[key] = {k2: v for k2, v in st.items() if k2 not in ("count", "sources")}
+                        topics_out[key] = {k2: v for k2, v in st.items() if k2 not in ("count", "bytes", "sources")}
                         topics_out[key]["sources"] = srcs
                 hub.update(rate_hz=round(window_rx / dt, 1), sources=active, topics=topics_out,
                            lost=lost_total)
@@ -256,7 +261,6 @@ def udp_receiver(hub: SensorHub, bridge: Bridge | None, listen: str | None, stop
     finally:
         for rx in receivers:
             rx.close()
-        sel.close()
 
 
 class Teleop:

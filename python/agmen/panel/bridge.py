@@ -59,6 +59,29 @@ class _Announcement:
     schema_id: int
 
 
+# Los tipos estándar de imagen (agmen.msgs, RFC 0008 D4) tienen los mismos campos que
+# los de Foxglove: se anuncian con el nombre que Foxglove reconoce y el panel Image los muestra.
+_FOX_IMAGE = {
+    "Imagen{time timestamp;string frame_id;u32 width;u32 height;string encoding;u32 step;bytes data}":
+        "foxglove.RawImage",
+    "ImagenComprimida{time timestamp;string frame_id;string format;bytes data}": "foxglove.CompressedImage",
+}
+
+
+def foxglove_name(layout: schema.Layout) -> str:
+    return _FOX_IMAGE.get(layout.text[len(schema.PREFIX):], layout.name)
+
+
+def foxglove_row(layout: schema.Layout, row: dict) -> dict:
+    """Una fila decodificada → el JSON que entiende Foxglove (bytes en base64;
+    en los tipos de Foxglove, el tiempo como {sec, nsec})."""
+    out = schema.jsonable(row)
+    if foxglove_name(layout) != layout.name:
+        t = int(row.get("timestamp", 0))
+        out["timestamp"] = {"sec": t // 1_000_000_000, "nsec": t % 1_000_000_000}
+    return out
+
+
 @dataclass
 class _Channel:                     # un canal de Foxglove = un (topic, tipo)
     id: int
@@ -66,8 +89,13 @@ class _Channel:                     # un canal de Foxglove = un (topic, tipo)
     layout: schema.Layout
 
     def advert(self) -> dict:
-        return {"id": self.id, "topic": self.topic, "encoding": "json", "schemaName": self.layout.name,
-                "schema": json.dumps(self.layout.json_schema()), "schemaEncoding": "jsonschema"}
+        name = foxglove_name(self.layout)
+        js = self.layout.json_schema()
+        if name != self.layout.name:
+            js["properties"]["timestamp"] = {"type": "object", "properties": {"sec": {"type": "integer"},
+                                                                              "nsec": {"type": "integer"}}}
+        return {"id": self.id, "topic": self.topic, "encoding": "json", "schemaName": name,
+                "schema": json.dumps(js), "schemaEncoding": "jsonschema"}
 
 
 @dataclass
@@ -165,8 +193,9 @@ class Bridge:
                         continue
                     if rows is None:     # se convierte a JSON una sola vez para todos los clientes
                         try:
-                            rows = [json.dumps(r, separators=(",", ":")).encode() for r in layout.unpack_rows(payload)]
-                        except schema.SchemaError:
+                            rows = [json.dumps(foxglove_row(layout, r), separators=(",", ":")).encode()
+                                    for r in layout.unpack_rows(payload)]
+                        except (schema.SchemaError, wire.WireError):
                             return
                     stamp = max(0, env.t_data)
                     for sid in subs:

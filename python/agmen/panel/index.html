@@ -118,6 +118,11 @@
   .topicsec { display: grid; gap: 10px; }
   .topicsec > h3 { margin: 4px 0 0; font: 600 13px var(--mono); display: flex; gap: 10px; align-items: baseline; }
   .topicsec > h3 small { color: var(--muted); font-weight: 400; }
+  .camera { position: relative; background: #000; border-radius: 8px; overflow: hidden; min-height: 120px; }
+  .camera canvas, .camera img { width: 100%; height: auto; max-height: 70vh; object-fit: contain; display: block; background: #000; }
+  .camera .meta { position: absolute; left: 8px; bottom: 6px; font: 11px var(--mono); color: #ddd; background: rgba(0,0,0,.55); padding: 2px 6px; border-radius: 4px; }
+  .camera .fps { display: flex; gap: 6px; align-items: center; position: absolute; right: 8px; top: 6px; font: 11px var(--mono); color: #ddd; background: rgba(0,0,0,.55); padding: 2px 6px; border-radius: 4px; }
+  .camera select { font: 11px var(--mono); background: #222; color: #ddd; border: 1px solid #555; border-radius: 4px; }
   .chips.topics .chip.focus { box-shadow: 0 0 0 2px var(--accent) inset; }
   .clock .t { font: 600 22px/1.3 var(--mono); }
   .clock .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
@@ -205,6 +210,16 @@ const nodeColor = {};
 let state = { nodes: [], teleop: null, managed: false };
 let filter = null;                      // nodo seleccionado en los logs (null = todos)
 const MAX_HZ = 100;                     // por topic: más rápido que esto no se nota en una gráfica
+// Los tipos estándar de imagen (agmen.msgs, RFC 0008): se ven en la tarjeta Cámara, no en gráficas.
+const IMAGE_RAW = "Imagen{time timestamp;string frame_id;u32 width;u32 height;string encoding;u32 step;bytes data}";
+const IMAGE_JPEG = "ImagenComprimida{time timestamp;string frame_id;string format;bytes data}";
+const RAW_FPS_DEFAULT = 10, JPEG_FPS_DEFAULT = 30;   // una imagen cruda de 640×480 a 30 fps son 27 MB/s: más que un WiFi
+function imageKind(layout) {
+  const body = layout.text.slice(Agmen.PREFIX.length);
+  return body === IMAGE_RAW ? "raw" : body === IMAGE_JPEG ? "jpeg" : null;
+}
+const camRate = {};                     // topic → imágenes por segundo pedidas
+function rateFor(topic) { return camRate[topic] || MAX_HZ; }
 
 // ---------- utilidades ----------
 function toast(msg) {
@@ -481,7 +496,7 @@ function T(topic) {
   if (!tstate[topic]) tstate[topic] = { buf: [], followSrc: null, lastSeen: {}, groups: [], groupsKey: "", last: null };
   return tstate[topic];
 }
-function resubscribe() { for (const t of selected) send({ op: "subscribe", topic: t, max_hz: MAX_HZ }); }
+function resubscribe() { for (const t of selected) send({ op: "subscribe", topic: t, max_hz: rateFor(t) }); }
 function toggleTopic(t, ev) {
   if (selected.has(t) && focus === t) {               // clic al que ya tiene el foco: lo quita
     selected.delete(t); send({ op: "unsubscribe", topic: t });
@@ -490,7 +505,7 @@ function toggleTopic(t, ev) {
   } else if (selected.has(t)) {
     focus = t;                                        // clic a otro elegido: solo cambia el foco
   } else {
-    selected.add(t); focus = t; send({ op: "subscribe", topic: t, max_hz: MAX_HZ });
+    selected.add(t); focus = t; send({ op: "subscribe", topic: t, max_hz: rateFor(t) });
   }
   lastTopicsKey = ""; layoutCharts(); renderInspector(true);
 }
@@ -509,7 +524,8 @@ function renderTopics(topics) {
   for (const t of names) {
     const b = document.createElement("button");
     b.className = "chip" + (selected.has(t) ? " on" : "") + (t === focus ? " focus" : "");
-    b.innerHTML = `${esc(t)} <small>${esc(topics[t].type)} · ${topics[t].rate_hz.toFixed(0)} Hz</small>`;
+    const heavy = topics[t].bytes_s >= 100000 ? ` · ${(topics[t].bytes_s / 1e6).toFixed(1)} MB/s` : "";
+    b.innerHTML = `${esc(t)} <small>${esc(topics[t].type)} · ${topics[t].rate_hz.toFixed(0)} Hz${heavy}</small>`;
     b.title = selected.has(t) ? (t === focus ? "clic: quitar la gráfica" : "clic: ver sus datos arriba y en el inspector") : "clic: graficar";
     b.onclick = () => toggleTopic(t);
     box.appendChild(b);
@@ -552,7 +568,7 @@ function updateStats(g) {
   const topics = g.topics || {};
   renderTopics(topics);
   const s = topics[focus] || g;    // las tarjetas muestran el topic con el foco
-  $("rate").textContent = s.rate_hz ? s.rate_hz.toFixed(0) + " Hz" : "0 Hz";
+  $("rate").textContent = (s.rate_hz ? s.rate_hz.toFixed(0) + " Hz" : "0 Hz") + (s.bytes_s >= 100000 ? ` · ${(s.bytes_s / 1e6).toFixed(1)} MB/s` : "");
   $("lat").textContent = s.latency_ms == null ? "—" : s.latency_ms.toFixed(2) + " ms";
   $("lost").textContent = s.lost; $("errors").textContent = g.errors;
   $("source").textContent = s.type ? `${s.topic || "(sin topic)"} · ${s.type} · ${s.source}` : `esperando en ${g.listening}`;
@@ -576,6 +592,14 @@ function onPacket(buf) {
   if (ts.followSrc === null || now - (ts.lastSeen[ts.followSrc] || 0) > 500) { ts.followSrc = src; ts.buf.length = 0; }
   if (src !== ts.followSrc) return;
   const row = m.rows[m.rows.length - 1];
+  const kind = imageKind(m.layout);
+  if (kind) {                                          // una cámara: a la tarjeta, no a las gráficas
+    ts.last = { m, row, at: now };
+    if (ts.groupsKey !== "camera|" + m.layout.name) { ts.groupsKey = "camera|" + m.layout.name; layoutCharts(); }
+    showImage(ts, kind, row, now);
+    lastData = now;
+    return;
+  }
   const sample = { t: Number(m.env.tData) / 1e9, type: m.layout.name, v: Agmen.flatten(row) };
   if (ts.buf.length && ts.buf[ts.buf.length - 1].type !== sample.type) ts.buf.length = 0;   // cambió el tipo
   ts.buf.push(sample);
@@ -583,6 +607,76 @@ function onPacket(buf) {
   ts.last = { m, row, at: now };
   if (ts.groupsKey !== sample.type + "|" + Object.keys(sample.v).join(",")) layoutCharts();
   lastData = now;
+}
+
+// ---------- cámara: Imagen (cruda, a un canvas) e ImagenComprimida (JPEG/PNG/WebP, a un <img>) ----------
+function cameraCard(topic, ts, kind) {
+  const el = document.createElement("div"); el.className = "camera";
+  el.innerHTML = kind === "jpeg" ? '<img alt="">' : "<canvas></canvas>";
+  el.insertAdjacentHTML("beforeend", '<div class="meta">esperando imágenes…</div><label class="fps">imágenes/s <select></select><span></span></label>');
+  const sel = el.querySelector("select");
+  const choices = kind === "jpeg" ? [5, 10, 15, 30, 60] : [1, 2, 5, 10, 15, 30];
+  const cur = camRate[topic] || (kind === "jpeg" ? JPEG_FPS_DEFAULT : RAW_FPS_DEFAULT);
+  if (camRate[topic] !== cur) { camRate[topic] = cur; send({ op: "subscribe", topic, max_hz: cur }); }  // pedir solo las que se ven
+  for (const c of choices) { const o = document.createElement("option"); o.value = c; o.textContent = c; o.selected = c === cur; sel.appendChild(o); }
+  sel.onchange = () => { camRate[topic] = +sel.value; send({ op: "subscribe", topic, max_hz: camRate[topic] }); };
+  ts.cam = { el, kind, frames: 0, fpsAt: performance.now(), fps: 0, url: null,
+             out: el.querySelector(kind === "jpeg" ? "img" : "canvas"), meta: el.querySelector(".meta"), fpsEl: el.querySelector(".fps span") };
+  return el;
+}
+function showImage(ts, kind, row, now) {
+  const cam = ts.cam; if (!cam || cam.kind !== kind) return;
+  cam.frames++;
+  if (now - cam.fpsAt >= 1000) { cam.fps = cam.frames * 1000 / (now - cam.fpsAt); cam.frames = 0; cam.fpsAt = now; cam.fpsEl.textContent = cam.fps.toFixed(0) + " fps"; }
+  const data = row.data;
+  if (kind === "jpeg") {
+    const fmt = String(row.format || "jpeg").toLowerCase();
+    const blob = new Blob([data], { type: "image/" + (fmt === "jpg" ? "jpeg" : fmt) });
+    const url = URL.createObjectURL(blob), prev = cam.url; cam.url = url;
+    cam.out.onload = () => { if (prev) URL.revokeObjectURL(prev); };
+    cam.out.src = url;
+    cam.meta.textContent = `${row.format} · ${(data.length / 1024).toFixed(0)} kB · ${row.frame_id || ""} · ${fmtTime(ts.last.m.env.tData)}`;
+    return;
+  }
+  const w = row.width, h = row.height, enc = row.encoding, step = row.step || w * bytesPerPixel(enc);
+  if (!w || !h) { cam.meta.textContent = "imagen vacía"; return; }
+  const canvas = cam.out;
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  const ctx = canvas.getContext("2d");
+  const img = ctx.createImageData(w, h), px = img.data, bpp = bytesPerPixel(enc);
+  if (data.length < step * h) { cam.meta.textContent = `faltan bytes: ${data.length} de ${step * h}`; return; }
+  const u16 = (enc === "mono16" || enc === "16UC1");
+  let lo = 0, hi = 1;
+  if (enc === "32FC1") {   // se normaliza entre el mínimo y el máximo
+    const f = new Float32Array(data.buffer, data.byteOffset, (step * h) >> 2); lo = Infinity; hi = -Infinity;
+    for (let i = 0; i < f.length; i++) { const v = f[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+    if (!(hi > lo)) { hi = lo + 1; }
+  }
+  for (let y = 0; y < h; y++) {
+    let src = y * step, dst = y * w * 4;
+    for (let x = 0; x < w; x++, dst += 4) {
+      let r, g, b, a = 255;
+      switch (enc) {
+        case "rgb8": r = data[src]; g = data[src + 1]; b = data[src + 2]; src += 3; break;
+        case "bgr8": b = data[src]; g = data[src + 1]; r = data[src + 2]; src += 3; break;
+        case "rgba8": r = data[src]; g = data[src + 1]; b = data[src + 2]; a = data[src + 3]; src += 4; break;
+        case "bgra8": b = data[src]; g = data[src + 1]; r = data[src + 2]; a = data[src + 3]; src += 4; break;
+        case "32FC1": { const v = new DataView(data.buffer, data.byteOffset + src, 4).getFloat32(0, true); r = g = b = Math.max(0, Math.min(255, Math.round(255 * (v - lo) / (hi - lo)))); src += 4; break; }
+        case "yuyv": case "yuv422_yuy2": case "uyvy": case "yuv422": {
+          const yv = enc.startsWith("u") ? data[src + 1] : data[src]; r = g = b = yv; src += 2; break;   // solo la luminancia
+        }
+        default: {   // mono8, mono16, 8UC1, bayer_* (se ve en gris)
+          if (u16) { r = g = b = data[src + 1]; src += 2; } else { r = g = b = data[src]; src += bpp; }
+        }
+      }
+      px[dst] = r; px[dst + 1] = g; px[dst + 2] = b; px[dst + 3] = a;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  cam.meta.textContent = `${w}×${h} ${enc} · ${(data.length / 1024).toFixed(0)} kB · ${row.frame_id || ""} · ${fmtTime(ts.last.m.env.tData)}`;
+}
+function bytesPerPixel(enc) {
+  return { rgb8: 3, bgr8: 3, "8UC3": 3, rgba8: 4, bgra8: 4, mono16: 2, "16UC1": 2, "32FC1": 4, yuyv: 2, yuv422_yuy2: 2, uyvy: 2, yuv422: 2 }[enc] || 1;
 }
 
 // Las gráficas se arman solas a partir de los campos del mensaje (el panel
@@ -619,6 +713,17 @@ function layoutCharts() {
     const ts = T(topic), last = ts.buf[ts.buf.length - 1];
     const sec = document.createElement("div"); sec.className = "topicsec panel wide";
     const st = (stats.topics || {})[topic] || {};
+    const camKind = ts.last && imageKind(ts.last.m.layout);
+    if (camKind) {                                     // una cámara: la imagen, no gráficas
+      const mb = st.bytes_s ? ` · ${(st.bytes_s / 1e6).toFixed(1)} MB/s` : "";
+      sec.innerHTML = `<h3>${esc(topic)} <small>${esc(ts.last.m.layout.name)}${mb}</small></h3>`;
+      sec.appendChild(cameraCard(topic, ts, camKind));
+      ts.groups = []; ts.groupsKey = "camera|" + ts.last.m.layout.name;
+      box.appendChild(sec);
+      if (ts.last) showImage(ts, camKind, ts.last.row, performance.now());
+      continue;
+    }
+    ts.cam = null;
     sec.innerHTML = `<h3>${esc(topic)} <small>${esc(last ? last.type : st.type || "")}</small></h3>`;
     ts.groups = last ? groupsFor(last) : [];
     ts.groupsKey = last ? last.type + "|" + Object.keys(last.v).join(",") : "";
@@ -681,9 +786,15 @@ function fmtTime(ns) {               // t_data (ns desde 1970) → hora local co
 }
 function treeRows(value, depth, name, out) {
   const pad = "  ".repeat(depth);
-  if (Array.isArray(value)) {
-    if (value.length <= 12 && value.every((x) => typeof x !== "object")) {
+  if (ArrayBuffer.isView(value) || Agmen.isTensor(value)) {     // bytes y tensores: resumidos
+    out.push(`<div class="row"><span class="f">${pad}${esc(name)}</span><span class="val">${esc(Agmen.summarize(value))}</span></div>`);
+  } else if (typeof value === "string") {
+    out.push(`<div class="row"><span class="f">${pad}${esc(name)}</span><span class="val">${esc(JSON.stringify(value))}</span></div>`);
+  } else if (Array.isArray(value)) {
+    if (value.length <= 12 && value.every((x) => typeof x !== "object" && typeof x !== "string")) {
       out.push(`<div class="row"><span class="f">${pad}${esc(name)}</span><span class="val">[${value.map(fmtVal).join(", ")}]</span></div>`);
+    } else if (value.length > 64 && value.every((x) => typeof x === "number")) {
+      out.push(`<div class="row"><span class="f">${pad}${esc(name)}</span><span class="val">[${value.length} números]</span></div>`);
     } else {
       out.push(`<div class="row"><span class="f">${pad}${esc(name)}</span><span class="val">[${value.length}]</span></div>`);
       value.forEach((v, k) => treeRows(v, depth + 1, `[${k}]`, out));

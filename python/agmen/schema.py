@@ -532,6 +532,57 @@ def _json_type(t: Type) -> dict:
 
 
 FLATTEN_MAX = 64     # un arreglo más largo no se grafica número por número
+SHOW_MAX = 16        # un arreglo más largo se resume al mostrarlo (echo, inspector)
+
+
+def _is_ndarray(v) -> bool:
+    return hasattr(v, "dtype") and hasattr(v, "shape") and hasattr(v, "tobytes")
+
+
+def jsonable(value):
+    """Un mensaje decodificado → algo que json.dumps acepta (para --json y Foxglove):
+    bytes y memoryview en base64, tensores como {"shape", "data"}, NumPy como listas."""
+    import base64
+
+    if isinstance(value, dict):
+        return {k: jsonable(v) for k, v in value.items()}
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return base64.b64encode(bytes(value)).decode("ascii")
+    if _is_ndarray(value):
+        return value.tolist()
+    if hasattr(value, "shape") and hasattr(value, "data"):          # agmen.Tensor
+        data = value.data
+        return {"shape": list(value.shape), "data": data.tolist() if hasattr(data, "tolist") else list(data)}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(v) for v in value]
+    if isinstance(value, (bool, int, float, str)) or value is None:
+        return value
+    return str(value)
+
+
+def summarize(value) -> str:
+    """Un valor para mostrarlo en una línea: los datos grandes se resumen
+    (`<921 600 bytes>`, `tensor [480, 640]`, `[1, 2, 3, … 1000]`)."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        n = len(value) if not isinstance(value, memoryview) else value.nbytes
+        return f"<{n:,} bytes>".replace(",", " ")
+    if isinstance(value, str):
+        return repr(value) if len(value) <= 80 else repr(value[:77]) + "…"
+    if _is_ndarray(value):
+        if value.ndim == 1 and value.size <= SHOW_MAX:
+            return "[" + ", ".join(summarize(x.item()) for x in value) + "]"
+        return f"tensor {list(value.shape)} {value.dtype}"
+    if hasattr(value, "shape") and hasattr(value, "data"):          # agmen.Tensor sin NumPy
+        return f"tensor {list(value.shape)}"
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple)):
+        if len(value) <= SHOW_MAX:
+            return "[" + ", ".join(summarize(x) for x in value) + "]"
+        return "[" + ", ".join(summarize(x) for x in value[:3]) + f", … {len(value)} elementos]"
+    return str(value)
 
 
 def flatten_numbers(value, prefix: str = "") -> dict[str, float]:

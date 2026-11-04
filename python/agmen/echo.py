@@ -28,20 +28,22 @@ from .pubsub import RawSubscriber
 
 
 def _fmt_value(v) -> str:
-    if isinstance(v, float):
-        return f"{v:.6g}"
-    if isinstance(v, list):
-        return "[" + ", ".join(_fmt_value(x) for x in v) + "]"
-    return str(v)
+    return schema.summarize(v)
 
 
 def format_message(values: dict, indent: str = "  ") -> list[str]:
-    """Estilo YAML, como `ros2 topic echo`."""
+    """Estilo YAML, como `ros2 topic echo`. Los campos grandes (bytes, tensores,
+    listas largas) se resumen: `data: <921 600 bytes>`."""
     lines = []
     for k, v in values.items():
         if isinstance(v, dict):
             lines.append(f"{indent}{k}:")
             lines += format_message(v, indent + "  ")
+        elif isinstance(v, list) and v and all(isinstance(x, dict) for x in v) and len(v) <= schema.SHOW_MAX:
+            lines.append(f"{indent}{k}: [{len(v)}]")
+            for i, x in enumerate(v):
+                lines.append(f"{indent}  [{i}]:")
+                lines += format_message(x, indent + "    ")
         else:
             lines.append(f"{indent}{k}: {_fmt_value(v)}")
     return lines
@@ -111,7 +113,7 @@ class Echo:
         for row in rows:
             if self.as_json:
                 self.out(json.dumps({"topic": topic, "type": layout.name, "src": source, **wire.envelope_dict(env),
-                                     "data": row}, ensure_ascii=False))
+                                     "data": schema.jsonable(row)}, ensure_ascii=False))
             else:
                 if env.clock == wire.CLOCK_REAL:
                     when = f"t_data {_time(env.t_data)} · {source} · latencia {(recv_ns - env.t_pub) / 1e6:.2f} ms"

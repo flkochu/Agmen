@@ -11,6 +11,9 @@ Funciona en Windows, Linux y macOS. Requiere haber compilado antes.
    el proceso del panel (informativo: depende de la máquina).
 4. El ejemplo del tutorial (capítulo 10, examples/tutorial/mirar_panel.py).
 5. Foxglove: serverInfo y advertise del topic.
+6. Cámara (RFC 0008): una Imagen cruda de 320×240 a 30 fps llega por TCP; un
+   navegador a 10 imágenes/s recibe ~10; Foxglove la ve como foxglove.RawImage
+   (JSON con base64); y, si hay Playwright, el panel la dibuja en su canvas.
 """
 
 import json
@@ -51,6 +54,29 @@ pub = agmen.Publisher(Articulaciones, "127.0.0.1:7801", topic="/arca9/q")
 for k in range(150):
     pub.publish(Articulaciones([90 + 20 * math.sin(k / 10 + j) for j in range(12)]))
     time.sleep(0.01)
+"""
+
+CAMERA = """
+import time
+import numpy as np
+import agmen
+from agmen.msgs import Imagen
+
+node = agmen.Node("camara")
+pub = node.publisher(Imagen, "/camara")
+frame = np.zeros((240, 320, 3), dtype=np.uint8)
+frame[:, :, 2] = 200                      # BGR: rojo
+frame[100:140, 140:180] = (0, 255, 0)     # un cuadro verde en el centro
+n = [0]
+
+@node.every(1 / 30)
+def leer():
+    n[0] += 1
+    pub.publish(Imagen.from_array(frame, frame_id="camara"))
+    if n[0] >= 150:
+        node.stop()
+
+node.spin()
 """
 
 failures = 0
@@ -173,6 +199,91 @@ def main() -> None:
         check("Foxglove: serverInfo + advertise con /imu (JSON Schema)", info.get("op") == "serverInfo"
               and adv.get("op") == "advertise" and "/imu" in topics, f"{info} {adv}"[:400])
         fox.close()
+
+        # 6) Cámara (RFC 0008): imágenes crudas de 320×240 a 30 fps por TCP
+        try:
+            import numpy  # noqa: F401
+        except ImportError:
+            print("      (sin NumPy: se salta la prueba de la cámara)")
+        else:
+            cam_slow = Counter("/camara", 10)
+            cam_full = Counter("/camara", 0)
+            fox = ws.connect(f"ws://{HTTP}/ws", protocols=["foxglove.websocket.v1"])
+            fox.sock.settimeout(5)
+            fox.recv()                                 # serverInfo
+            fox_msgs: list = []
+            fox_adv: dict = {}
+
+            def fox_loop() -> None:
+                while (m := fox.recv()) is not None:
+                    if isinstance(m, bytes):
+                        fox_msgs.append(m)
+                    else:
+                        j = json.loads(m)
+                        if j.get("op") == "advertise":
+                            for ch in j["channels"]:
+                                fox_adv[ch["topic"]] = ch
+                                if ch["topic"] == "/camara":
+                                    fox.send_text(json.dumps({"op": "subscribe",
+                                                              "subscriptions": [{"id": 7, "channelId": ch["id"]}]}))
+
+            threading.Thread(target=fox_loop, daemon=True).start()
+            cam = subprocess.Popen([sys.executable, "-c", CAMERA], env=ENV)
+            procs.append(cam)
+            t0 = time.monotonic()
+            cam.wait(30)
+            elapsed = time.monotonic() - t0
+            time.sleep(0.5)
+            st = state()["stats"]
+            ct = st["topics"].get("/camara", {})
+            check("cámara: el panel recibe /camara (Imagen) por TCP y mide MB/s",
+                  ct.get("type") == "Imagen" and ct.get("bytes_s", 0) > 1_000_000 and st["errors"] == 0,
+                  json.dumps(st)[:400])
+            env, payload = wire.parse(cam_full.first or b"")
+            from agmen.msgs import Imagen as _Imagen
+            img = _Imagen.decode_payload(payload) if cam_full.first else None
+            check("cámara: un navegador recibe la imagen entera (320×240 bgr8, arrow)",
+                  img is not None and env.encoding == wire.ENC_ARROW and (img.width, img.height, img.encoding) == (320, 240, "bgr8")
+                  and bytes(img.data[0:3]) == b"\x00\x00\xc8", f"{env} {img and (img.width, img.height, img.encoding)}")
+            rate = cam_slow.data / elapsed
+            check("cámara: el navegador a 10 imágenes/s recibe ~10 por segundo (y el otro, todas)",
+                  6 <= rate <= 14 and cam_full.data >= 120, f"lento {cam_slow.data}, completo {cam_full.data} en {elapsed:.1f} s")
+            adv = fox_adv.get("/camara", {})
+            fj = json.loads(fox_msgs[-1][13:]) if fox_msgs else {}
+            check("Foxglove: /camara se anuncia como foxglove.RawImage y llega en JSON (base64, timestamp {sec, nsec})",
+                  adv.get("schemaName") == "foxglove.RawImage" and fj.get("width") == 320 and "sec" in fj.get("timestamp", {})
+                  and isinstance(fj.get("data"), str) and len(fj["data"]) > 1000, f"{adv.get('schemaName')} {str(fj)[:200]}")
+            for c in (cam_slow, cam_full):
+                c.close()
+            fox.close()
+            try:
+                from playwright.sync_api import sync_playwright
+            except ImportError:
+                print("      (sin Playwright: se salta el dibujo en el navegador)")
+            else:
+                cam = subprocess.Popen([sys.executable, "-c", CAMERA], env=ENV)
+                procs.append(cam)
+                with sync_playwright() as pw:
+                    browser = pw.chromium.launch()
+                    pg = browser.new_page()
+                    pg.goto(f"http://{HTTP}/", wait_until="load")
+                    pg.wait_for_function("document.querySelectorAll('#topicchips .chip').length > 0", timeout=15000)
+                    chip = pg.locator("#topicchips .chip", has_text="/camara")
+                    if "on" not in (chip.get_attribute("class") or ""):     # el panel elige solo el primer topic
+                        chip.click()
+                    pg.wait_for_selector(".camera canvas", timeout=15000)
+                    pg.wait_for_function("(() => { const c = document.querySelector('.camera canvas'); return c && c.width === 320; })()",
+                                         timeout=15000)
+                    time.sleep(1.5)
+                    fps = pg.inner_text(".camera .fps span")
+                    px = pg.evaluate("(() => { const c = document.querySelector('.camera canvas'); const d = c.getContext('2d').getImageData(160, 120, 1, 1).data; "
+                                     "const e = c.getContext('2d').getImageData(10, 10, 1, 1).data; return [Array.from(d), Array.from(e)]; })()")
+                    meta = pg.inner_text(".camera .meta")
+                    browser.close()
+                cam.kill()
+                check("navegador: la tarjeta Cámara dibuja la imagen (verde al centro, rojo en la esquina) a ~10 por segundo",
+                      px[0][:3] == [0, 255, 0] and px[1][:3] == [200, 0, 0] and "320×240 bgr8" in meta
+                      and 6 <= float(fps.split()[0] or 0) <= 14, f"{px} {meta} {fps}")
     finally:
         for p in procs:
             if p.poll() is None:
