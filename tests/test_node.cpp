@@ -41,10 +41,16 @@ void test_every_rate() {
     agmen::Node node("prueba");
     std::atomic<int> n{0};
     node.every(10ms, [&] { ++n; });
-    node.spin_for(500ms);
-    std::printf("  every(10 ms) en 0.5 s: %d veces\n", n.load());
-    CHECK(n >= 35 && n <= 52);
+    node.spin_for(1s);
     const auto t = node.timers();
+    std::printf("  every(10 ms) en 1 s: %d veces, %llu saltados (ideal 99 + 0)\n", n.load(),
+                static_cast<unsigned long long>(t[0].skipped));
+    // Por deadline, corridos + saltados = los ciclos que cupieron en 1 s, aunque
+    // la máquina despierte tarde (el CI de macOS a veces tarda 100 ms). Si el
+    // atraso se acumulara, la suma se quedaría corta (~66 en esa máquina).
+    const auto total = t[0].runs + t[0].skipped;
+    CHECK(total >= 85 && total <= 101);
+    CHECK(n >= 30);
     CHECK(t.size() == 1);
     CHECK(t[0].name == "every(10 ms)");
     CHECK(t[0].runs == static_cast<std::uint64_t>(n.load()));
@@ -155,9 +161,13 @@ void test_sim_clock() {
         agmen::Node node("sim");
         std::atomic<int> n{0};
         node.every(20ms, [&] { ++n; });
-        node.spin_for(500ms);
-        std::printf("  sim ×2, every(20 ms) en 0.5 s reales: %d veces (ideal 50)\n", n.load());
-        CHECK(n >= 35 && n <= 52);
+        node.spin_for(1s);
+        const auto t = node.timers();
+        std::printf("  sim ×2, every(20 ms) en 1 s real: %d veces, %llu saltados (ideal 99 + 0)\n", n.load(),
+                    static_cast<unsigned long long>(t[0].skipped));
+        const auto total = t[0].runs + t[0].skipped;
+        CHECK(total >= 85 && total <= 101);   // 2 s simulados
+        CHECK(n >= 30);
     }
     // En pausa no corre.
     ck::update(ClockMsg{.t = ck::now_ns(), .speed = 1.0, .paused = true});

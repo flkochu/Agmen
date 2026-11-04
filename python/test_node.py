@@ -36,9 +36,12 @@ class TestEvery(unittest.TestCase):
         node = agmen.Node("prueba")
         n = [0]
         node.every(0.01, lambda: n.__setitem__(0, n[0] + 1))
-        node.spin_for(0.5)
-        self.assertTrue(35 <= n[0] <= 52, n[0])
+        node.spin_for(1.0)
         t = node.timers()
+        # Por deadline, corridos + saltados = los ciclos que cupieron (ideal 99),
+        # aunque la máquina despierte tarde; si el atraso se acumulara, faltarían.
+        self.assertTrue(85 <= t[0].runs + t[0].skipped <= 101, t[0])
+        self.assertGreaterEqual(n[0], 30)
         self.assertEqual(t[0].name, "every(10 ms)")
         self.assertEqual(t[0].runs, n[0])
         node.close()
@@ -142,8 +145,10 @@ class TestSimClock(unittest.TestCase):
         node = agmen.Node("sim")
         n = [0]
         node.every(0.02, lambda: n.__setitem__(0, n[0] + 1))
-        node.spin_for(0.5)
-        self.assertTrue(35 <= n[0] <= 52, n[0])
+        node.spin_for(1.0)
+        t = node.timers()[0]
+        self.assertTrue(85 <= t.runs + t.skipped <= 101, t)   # 2 s simulados
+        self.assertGreaterEqual(n[0], 30)
 
         # En pausa no corre, y el tiempo no se mueve.
         clock.update(Clock(t=clock.now_ns(), speed=1.0, paused=True))
