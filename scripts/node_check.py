@@ -8,7 +8,8 @@
   3. `agmen node list` muestra los temporizadores y las colas de cada nodo.
   4. Un mensaje con reloj real en un robot simulado se avisa (una vez).
   5. [clock] source = "simulador": el tiempo solo avanza cuando el simulador
-     publica /clock (paso a paso).
+     publica /clock (paso a paso), y el nodo sigue exactamente al tiempo que
+     el simulador publicó (aunque el simulador vaya más lento de lo que quería).
 
 Funciona en Windows, Linux y macOS. Usa build/bin/doble_ritmo si existe.
 
@@ -76,7 +77,7 @@ while True:                 # un "simulador" lento: 10 ms simulados cada 20 ms r
 
 def check(name, ok, detail=""):
     results.append(bool(ok))
-    show = detail and (not ok or len(detail) < 60)
+    show = detail and (not ok or len(detail) < 160)
     print(f"{'OK  ' if ok else 'FALLA'} {name}" + (f" — {detail}" if show else ""), flush=True)
 
 
@@ -199,7 +200,8 @@ cmd = "python {(TMP / 'contador.py').as_posix()}"
         if exe:
             wait_runs("doble_ritmo", "every(1 ms)", 100)
             rc = rate("doble_ritmo", "every(1 ms)", 2.0)
-            check("sim ×2: el C++ every(1 ms) corre ~2000 veces por segundo real", 1000 <= rc <= 2300, f"{rc:.0f}/s")
+            # Ideal 2000/s; las máquinas de macOS del CI dan ~1100 (despiertan tarde cada 0.5 ms).
+            check("sim ×2: el C++ every(1 ms) corre ~2000 veces por segundo real", 700 <= rc <= 2300, f"{rc:.0f}/s")
         else:
             print("SALTO C++ en simulación: no encontré build/bin/doble_ritmo")
 
@@ -273,9 +275,34 @@ cmd = "python {(TMP / 'contador.py').as_posix()}"
     try:
         check("agmen run: el tiempo lo manda el simulador", run.wait_for(r"lo manda el nodo 'simulador'"))
         wait_runs("contador", "every(100 ms)", 3)
-        r = rate("contador", "every(100 ms)", 3.0)
-        # 10 ms simulados cada 20 ms reales → every(0.1 s) ≈ 5 veces por segundo real.
-        check("paso a paso: el nodo sigue al simulador (×0.5)", 3 <= r <= 6.5, f"{r:.1f}/s")
+        # El simulador quiere ir a ×0.5 (10 ms simulados cada 20 ms reales),
+        # pero su sleep puede tardar más (las máquinas de macOS del CI
+        # despiertan tarde): lo que se revisa es que el nodo siga al tiempo que
+        # el simulador DE VERDAD publicó, sea cual sea su velocidad.
+        sub = agmen.Subscriber(agmen.clock.Clock, "/clock")
+        sub._clock_warned = True   # este script usa el reloj real a propósito
+
+        def sim_t() -> int:
+            last = None
+            while (s := sub.receive(0)) is not None:   # lo que ya llegó
+                last = s
+            if last is None:
+                last = sub.receive(1.0)
+            return last.message.t if last else 0
+
+        sim_t()
+        a, t0 = fresh("contador", "every(100 ms)")
+        s0 = sim_t()
+        time.sleep(2.0)
+        b, t1 = fresh("contador", "every(100 ms)")
+        s1 = sim_t()
+        sub.close()
+        sim_s = (s1 - s0) / 1e9
+        expected = sim_s / 0.1
+        ok = sim_s > 0.2 and abs((b - a) - expected) <= 0.3 * expected + 2
+        check("paso a paso: el nodo sigue al tiempo del simulador", ok,
+              f"el simulador avanzó {sim_s:.2f} s en {t1 - t0:.1f} s reales (×{sim_s / (t1 - t0):.2f}); "
+              f"every(0.1 s) corrió {b - a} veces (esperadas ~{expected:.0f})")
         st = stats().get(("contador", "every(100 ms)"), {})
         check("…sin ciclos saltados", st and int(st["skipped"]) == 0, str(st))
     finally:
