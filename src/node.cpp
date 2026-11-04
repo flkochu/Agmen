@@ -245,6 +245,7 @@ struct NodeImpl {
     }
 
     void run_group(GroupRt& g, bool is_main, std::int64_t end_steady) {
+        const platform::PromptThread prompt;   // macOS: que el hilo despierte a tiempo
         try {
             run_group_impl(g, is_main, end_steady);
         } catch (...) {

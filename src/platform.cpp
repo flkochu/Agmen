@@ -2,6 +2,11 @@
 
 #include <thread>
 
+#if defined(__APPLE__)
+#  include <pthread.h>
+#  include <pthread/qos.h>
+#endif
+
 #ifdef _WIN32
 #  include <windows.h>
 #  include <mmsystem.h>  // timeBeginPeriod
@@ -75,6 +80,28 @@ void init_console() {}
 
 FineTimers::FineTimers() = default;
 FineTimers::~FineTimers() = default;
+
+#endif
+
+#if defined(__APPLE__)
+
+PromptThread::PromptThread() {
+    qos_class_t cls = QOS_CLASS_UNSPECIFIED;
+    int rel = 0;
+    if (pthread_get_qos_class_np(pthread_self(), &cls, &rel) == 0) previous_ = static_cast<int>(cls);
+    (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+}
+
+PromptThread::~PromptThread() {
+    if (previous_ >= 0 && previous_ != static_cast<int>(QOS_CLASS_UNSPECIFIED)) {
+        (void)pthread_set_qos_class_self_np(static_cast<qos_class_t>(previous_), 0);
+    }
+}
+
+#else
+
+PromptThread::PromptThread() = default;
+PromptThread::~PromptThread() = default;
 
 #endif
 

@@ -24,6 +24,22 @@ public:
     FineTimers& operator=(const FineTimers&) = delete;
 };
 
+/// Mientras exista, pide que ESTE hilo despierte a tiempo. En macOS, el
+/// sistema agrupa los despertares de los hilos "normales" para ahorrar
+/// energía (se atrasan 1-2 ms): aquí se le da al hilo la clase de servicio
+/// "interactiva", la de menor holgura. En Windows y Linux no hace nada. Lo usa
+/// cada grupo de un agmen::Node.
+class PromptThread {
+public:
+    PromptThread();
+    ~PromptThread();
+    PromptThread(const PromptThread&) = delete;
+    PromptThread& operator=(const PromptThread&) = delete;
+
+private:
+    int previous_ = -1;
+};
+
 /// Hace que la consola muestre bien los acentos y "µs" (UTF-8).
 /// En Linux/macOS no hace nada; en Windows cambia la página de códigos.
 void init_console();

@@ -332,12 +332,13 @@ def _doble_ritmo() -> Path | None:
     return None
 
 
-def _correr_doble_ritmo(exe: Path, same_group: bool, seconds: float) -> tuple[int, int, float]:
+def _correr_doble_ritmo(exe: Path, mode: str, seconds: float) -> tuple[int, int, float]:
+    """mode: "" (IA en otro grupo), "--mismo-grupo" o "--sin-ia"."""
     import subprocess
 
-    args = [str(exe), str(seconds)] + (["--mismo-grupo"] if same_group else [])
+    args = [str(exe), str(seconds)] + ([mode] if mode else [])
     out = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                         timeout=seconds + 30).stdout
+                         timeout=seconds + 30, check=False).stdout
     line = next((ln for ln in out.splitlines() if ln.startswith("RESULTADO")), None)
     if line is None:
         raise RuntimeError(f"doble_ritmo no dio resultado:\n{out}")
@@ -346,22 +347,31 @@ def _correr_doble_ritmo(exe: Path, same_group: bool, seconds: float) -> tuple[in
 
 
 def prueba_grupos() -> None:
+    """La pregunta: ¿la IA en otro grupo le quita ciclos al control?
+
+    No todas las máquinas sostienen 1 kHz ni con el control SOLO (las
+    virtuales de macOS del CI despiertan 1-2 ms tarde de cada sleep). Por eso
+    se compara contra una referencia: el mismo control sin IA, en esta misma
+    máquina. Pasa si con la IA en otro grupo pierde casi lo mismo que solo, y
+    si con la IA en el mismo grupo pierde claramente más.
+    """
     exe = _doble_ritmo()
     if exe is None:
         print("SALTO dentro de un nodo: no encontré build/bin/doble_ritmo (compila con cmake --build build)")
         return
     seconds = 3.0
     ideal = int(seconds * 1000)
-    n_o, sk_o, worst_o = _correr_doble_ritmo(exe, False, seconds)
-    n_s, sk_s, worst_s = _correr_doble_ritmo(exe, True, seconds)
-    # Otro grupo: casi ningún ciclo perdido. Mismo grupo: se pierde más de la mitad
-    # (márgenes para las máquinas virtuales del CI, que a veces despiertan tarde)
-    ok = sk_o <= 0.20 * ideal and sk_s >= 0.5 * ideal and sk_o * 3 <= sk_s
+    _, sk_b, worst_b = _correr_doble_ritmo(exe, "--sin-ia", seconds)
+    n_o, sk_o, worst_o = _correr_doble_ritmo(exe, "", seconds)
+    _, sk_s, worst_s = _correr_doble_ritmo(exe, "--mismo-grupo", seconds)
+    ok = sk_o <= sk_b + 0.10 * ideal and sk_s >= sk_o + 0.30 * ideal
+    note = f"referencia, el control solo (sin IA) en esta máquina: {sk_b} saltados, peor atraso {worst_b:.1f} ms"
+    if sk_b > 0.10 * ideal:
+        note += " (esta máquina no sostiene 1 kHz ni sin la IA)"
     row("dentro de un nodo: control 1 kHz + IA de 80 ms en OTRO grupo",
         f"el control pierde ~{int(0.8 * ideal)} de {ideal} ciclos (mismo grupo: medido {sk_s}, peor atraso "
         f"{worst_s:.0f} ms)",
-        f"{n_o} ciclos, {sk_o} saltados ({100 * sk_o / ideal:.1f} %), peor atraso {worst_o:.1f} ms", ok,
-        "la IA corre en su propio hilo")
+        f"{n_o} ciclos, {sk_o} saltados ({100 * sk_o / ideal:.1f} %), peor atraso {worst_o:.1f} ms", ok, note)
 
 
 def main() -> int:

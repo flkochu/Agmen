@@ -10,6 +10,7 @@
 //   ./build/bin/doble_ritmo                 # para siempre (Ctrl+C)
 //   ./build/bin/doble_ritmo 3               # 3 segundos y un resumen
 //   ./build/bin/doble_ritmo 3 --mismo-grupo # lo mismo, sin grupo para la IA
+//   ./build/bin/doble_ritmo 3 --sin-ia      # solo el control (referencia de esta máquina)
 
 #include <agmen/agmen.hpp>
 
@@ -39,9 +40,12 @@ int main(int argc, char** argv) {
     agmen::platform::init_console();
     double seconds = 0;
     bool same_group = false;
+    bool with_ai = true;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--mismo-grupo") == 0) {
             same_group = true;
+        } else if (std::strcmp(argv[i], "--sin-ia") == 0) {
+            with_ai = false;
         } else {
             seconds = std::atof(argv[i]);
         }
@@ -56,11 +60,15 @@ int main(int argc, char** argv) {
         (void)pub.publish(MotorCommand{.left = v, .right = v});
     });
 
-    const agmen::Group ia = same_group ? agmen::Group{} : node.group("ia");
-    node.every(100ms, [&] { plan.set(planear(80)); }, ia);   // 10 Hz, ~80 ms de cálculo
+    if (with_ai) {
+        const agmen::Group ia = same_group ? agmen::Group{} : node.group("ia");
+        node.every(100ms, [&] { plan.set(planear(80)); }, ia);   // 10 Hz, ~80 ms de cálculo
+    }
 
-    std::printf("[doble_ritmo] control a 1 kHz + IA de 80 ms a 10 Hz en %s (reloj %s)\n",
-                same_group ? "el MISMO grupo" : "OTRO grupo", std::string(agmen::clock::mode_name()).c_str());
+    std::printf("[doble_ritmo] control a 1 kHz%s (reloj %s)\n",
+                !with_ai ? ", sin IA" : same_group ? " + IA de 80 ms a 10 Hz en el MISMO grupo"
+                                                   : " + IA de 80 ms a 10 Hz en OTRO grupo",
+                std::string(agmen::clock::mode_name()).c_str());
     std::fflush(stdout);
     if (seconds > 0) {
         node.spin_for(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(seconds)));
