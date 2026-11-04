@@ -44,9 +44,19 @@ def hub_address() -> str:
     return os.environ.get("AGMEN_HUB", hp.DEFAULT_HUB)
 
 
+_default_name = ""
+
+
+def set_default_node_name(name: str) -> None:
+    """El nombre a usar si no hay AGMEN_NODE (lo llama agmen.Node)."""
+    global _default_name
+    _default_name = name
+
+
 def node_name() -> str:
-    """Nombre del nodo: el de robot.toml (agmen run pone AGMEN_NODE) o el del script."""
-    name = os.environ.get("AGMEN_NODE")
+    """Nombre del nodo: el de robot.toml (agmen run pone AGMEN_NODE), el de
+    agmen.Node, o el del script."""
+    name = os.environ.get("AGMEN_NODE") or _default_name
     if name:
         return name
     base = os.path.basename(sys.argv[0] or "") if sys.argv else ""
@@ -119,6 +129,7 @@ class Publisher:
         self.seq = 0
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._announced_at: float | None = None
+        self._pub_lock = threading.Lock()   # se puede publicar desde varios grupos de un Node
         if hp.is_topic(to):
             hp.check_topic(to)
             self.topic = to
@@ -208,10 +219,11 @@ class Publisher:
                 raise wire.WireError(f"el hub rechazó publicar en '{self.topic}': {self._link.error}")
         else:
             dests = self.dests
-        if self._announced_at is None or time.monotonic() - self._announced_at >= ANNOUNCE_EVERY_S:
-            self.announce()
-        data = wire.encode(msg, self.seq, t_data, topic=self.topic, source_id=self.source_id)
-        self.seq += 1
+        with self._pub_lock:
+            if self._announced_at is None or time.monotonic() - self._announced_at >= ANNOUNCE_EVERY_S:
+                self.announce()
+            data = wire.encode(msg, self.seq, t_data, topic=self.topic, source_id=self.source_id)
+            self.seq += 1
         ok = False
         for d in dests:
             ok = self._send(data, d) or ok
@@ -290,6 +302,7 @@ class Subscriber(_Receiver):
     def __init__(self, msg_type, where: str) -> None:
         """`where` = topic ("/cmd") o dirección donde escuchar ("127.0.0.1:7500")."""
         self.type = msg_type
+        self._clock_warned = False
         super().__init__(where, f"{msg_type.SCHEMA_ID:016x}", msg_type.NAME)
 
     def receive(self, timeout: float | None = None):
@@ -310,7 +323,22 @@ class Subscriber(_Receiver):
                 detail = f"{known[1]}, topic {known[0]}" if known else None
                 raise wire.WireError(wire.type_mismatch_text(self.type, env.schema_id, detail))
             _, msg = wire.decode(self.type, data)
+            self._check_clock(env)
             return Sample(env, msg, src)
+
+    def _check_clock(self, env) -> None:
+        """RFC 0001 §8.8: un mensaje de otro reloj se avisa una vez (el dato llega igual)."""
+        if self._clock_warned:
+            return
+        from . import clock
+
+        if env.clock == clock.domain():
+            return
+        self._clock_warned = True
+        got = wire.CLOCKS.get(env.clock, str(env.clock))
+        print(f"[agmen] ⚠ '{self.topic or self.listen}' llega con reloj {got} y este nodo usa reloj "
+              f"{clock.mode_name()}. ¿Corriste el nodo fuera de 'agmen run'? Usa el mismo reloj: "
+              f"AGMEN_CLOCK={'sim' if env.clock == wire.CLOCK_SIM else 'real'}", file=sys.stderr, flush=True)
 
 
 class RawSubscriber(_Receiver):

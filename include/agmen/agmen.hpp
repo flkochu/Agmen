@@ -7,8 +7,10 @@
 // drivers; eso vive en paquetes opcionales.
 #pragma once
 
+#include "agmen/clock.hpp"
 #include "agmen/hubproto.hpp"
 #include "agmen/net.hpp"
+#include "agmen/node.hpp"
 #include "agmen/platform.hpp"
 #include "agmen/pubsub.hpp"
 #include "agmen/version.hpp"

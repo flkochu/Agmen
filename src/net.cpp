@@ -2,6 +2,8 @@
 
 #include <cstring>
 #include <string>
+#include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #  include <winsock2.h>
@@ -206,6 +208,35 @@ std::uint16_t UdpSocket::local_port() const {
         throw NetError(last_error(), "no se pudo leer el puerto local");
     }
     return ntohs(addr.sin_port);
+}
+
+int wait_readable(std::span<const std::intptr_t> sockets, std::chrono::milliseconds timeout,
+                  std::span<bool> ready) {
+    for (auto& r : ready) r = false;
+    if (sockets.empty()) {
+        if (timeout.count() > 0) std::this_thread::sleep_for(timeout);
+        return 0;
+    }
+#ifdef _WIN32
+    std::vector<WSAPOLLFD> fds(sockets.size());
+    for (std::size_t i = 0; i < sockets.size(); ++i) fds[i] = WSAPOLLFD{native(sockets[i]), POLLRDNORM, 0};
+    const int n = WSAPoll(fds.data(), static_cast<ULONG>(fds.size()), static_cast<INT>(timeout.count()));
+#else
+    std::vector<pollfd> fds(sockets.size());
+    for (std::size_t i = 0; i < sockets.size(); ++i) fds[i] = pollfd{native(sockets[i]), POLLIN, 0};
+    const int n = ::poll(fds.data(), static_cast<nfds_t>(fds.size()), static_cast<int>(timeout.count()));
+#endif
+    if (n < 0) {
+        const int code = last_error();
+        if (is_would_block(code)) return 0;
+        throw NetError(code, "falló la espera de datos");
+    }
+    int count = 0;
+    for (std::size_t i = 0; i < sockets.size() && i < ready.size(); ++i) {
+        ready[i] = fds[i].revents != 0;
+        count += ready[i] ? 1 : 0;
+    }
+    return count;
 }
 
 std::optional<Received> UdpSocket::recv_from(std::span<std::uint8_t> buffer,

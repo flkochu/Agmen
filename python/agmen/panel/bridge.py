@@ -252,6 +252,8 @@ class Bridge:
                 return "left/right deben ser números"
             c.teleop_at = time.monotonic() if (left, right) != (0.0, 0.0) else 0.0
             return None
+        if op == "clock":
+            return self.panel.clock_action(str(m.get("action", "")), m.get("value"))
         if op == "node":
             if self.panel.launcher is None:
                 return "este panel no administra nodos (usa 'agmen run')"

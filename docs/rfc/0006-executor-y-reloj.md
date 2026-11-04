@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Estado** | 📝 **Propuesta** (2026-11-03). Decisiones abiertas en la [sección 5](#5-decisiones) |
+| **Estado** | ✅ **Aceptado** (2026-11-03, D1–D5 = a) e **implementado en Agmen 0.8.0**. Lo implementado, en la [sección 8](#8-lo-que-se-implementó-en-080) |
 | **Depende de** | RFC 0001 (campo `clock` del sobre, §8.8), RFC 0003 (`agmen run`), RFC 0004 (topics) |
 | **Versión** | Agmen 0.8.0 |
 | **Requisitos** | d (misma interfaz para simulación y robot real), e (nodos a frecuencias distintas sin bloquearse) |
@@ -212,7 +212,7 @@ node.subscribe<Evento>("/eventos", on_evento, {.queue = 100});
 | 5 | Dos implementaciones (C++ y Python) que deben comportarse igual | Las mismas pruebas de comportamiento en los dos: frecuencia, saltos, colas, reloj sim a ×2 y en pausa |
 | 6 | El GIL de Python | Documentarlo con números: lo que sí y lo que no separa un grupo en Python (§3.5) |
 
-## 7. Plan para Agmen 0.8.0
+## 7. Plan para Agmen 0.8.0 (hecho)
 
 1. Reloj de Agmen (`real`, `sim`) en C++ y Python, con el topic `/clock`.
 2. `Node` con `every`, `subscribe`/`on`, colas, grupos y sus cuentas, en C++
@@ -225,6 +225,71 @@ node.subscribe<Evento>("/eventos", on_evento, {.queue = 100});
    el mismo grupo, para ver la diferencia); colas; reloj sim a ×2 y en pausa;
    C++ y Python iguales. En el CI de los 4 sistemas.
 6. El tutorial: el motor y el cerebro pasan a `Node`; capítulo 12.
+
+## 8. Lo que se implementó en 0.8.0
+
+| Pieza | Dónde |
+|---|---|
+| Reloj de Agmen, `ClockMsg` / `Clock`, `/clock` | `include/agmen/clock.hpp`, `src/clock.cpp`, `python/agmen/clock.py` |
+| `Node`, `Group`, `Latest<T>`, cuentas | `include/agmen/node.hpp`, `src/node.cpp`, `python/agmen/node.py` |
+| `[clock]` en robot.toml, `/clock` desde `agmen run` | `python/agmen/run.py`, `python/agmen/cli.py` (`ClockServer`) |
+| Panel: *Reloj* y *Ritmo de los nodos* | `python/agmen/panel/` (operación `clock` del WebSocket) |
+| `agmen node list` con temporizadores y colas | operación `stat` del hub (`python/agmen/hub.py`, `hubproto.py`) |
+| Pruebas | `tests/test_node.cpp`, `python/test_node.py`, `scripts/node_check.py`, prueba 6 de `scripts/paralelo_check.py` |
+| Ejemplos y tutorial | `examples/nodos/` (`doble_ritmo`, `cerebro.py`, `robot.toml`), capítulo 12 |
+
+**Lo prometido para el requisito e, medido** (contenedor Linux de 2 núcleos,
+3 s, control `every(1 ms)` + IA de 80 ms de CPU a 10 Hz):
+
+| La IA está en… | Ciclos del control | Saltados | Peor atraso |
+|---|---|---|---|
+| otro grupo (`node.group("ia")`) | 2996 de 3000 | 3 (0.1 %) | 3.5 ms |
+| el mismo grupo | 737 de 3000 | 2262 | 79 ms |
+
+### Reglas que se fijaron al implementarlo
+
+- **El primer ciclo** de `every(p)` es en `inicio + p` (no de inmediato).
+- **Saltar ciclos**: si al terminar la función ya pasó **más de un periodo
+  completo**, esos ciclos se saltan; si va menos de un periodo tarde, corre
+  de inmediato (así una función que a veces tarda un poco más no pierde la
+  mitad de sus ciclos).
+- **"Tarde"** es más de una décima del periodo y de 1 ms. El aviso de ciclos
+  saltados sale a lo más cada 5 s por temporizador y dice qué función del
+  grupo fue la lenta; si ninguna tardó tanto, dice que el sistema despertó
+  tarde al nodo (carga de la computadora). En simulación compara contra el
+  periodo en tiempo real (a ×2, 1 ms simulado = 0.5 ms reales).
+- **Esperar**: un `poll` (`WSAPoll` en Windows) por grupo sobre los sockets de
+  sus suscripciones, hasta ~1 ms antes del siguiente temporizador; el último
+  tramo se duerme con `platform::sleep_until` en pedazos de 0.5 ms revisando
+  los sockets. Durante `spin()` se piden temporizadores de 1 ms al sistema
+  (`timeBeginPeriod(1)` en Windows; C++ y Python).
+- **Simulación**: el tiempo empieza en 0. Los temporizadores arrancan cuando
+  llega el primer `/clock` (si no, un nodo que arrancó antes "saltaría" todo
+  lo que pasó). En pausa o con un simulador paso a paso, cada grupo vuelve a
+  preguntar cada 20 ms (pausa) o 1 ms (paso a paso). El botón *paso* avanza
+  0.1 s simulados y deja la pausa.
+- **Velocidad**: entre 0 y 1000 (`[clock] speed` y el panel). `speed` y
+  `paused` solo valen con `source = "agmen"`; con un simulador, el tiempo lo
+  decide él. `mode = "replay"` se rechaza con un mensaje que apunta al nivel 9.
+- **Cuentas**: cada `Node` manda al hub sus temporizadores y colas una vez
+  por segundo (operación `stat`; un hub viejo la ignora). Las usan `agmen
+  node list` y el panel.
+- **Nombre del nodo**: con `agmen run`, el de robot.toml; si no, el que le
+  das a `Node("…")`.
+- **Python** tiene `@node.on(...)` y también `node.subscribe(...)` (el mismo
+  método). Sus grupos son hilos con el GIL (§3.5); el aviso de ciclos
+  saltados lo recuerda.
+
+### Diferencias con la propuesta
+
+- §3.3 decía que `agmen topic echo` "aprende el reloj del hub". Quedó más
+  simple: cada mensaje dice su reloj en el sobre, así que `echo` muestra el
+  tiempo simulado en segundos y no calcula una latencia contra el reloj de
+  la terminal. El panel corre dentro de `agmen run` y usa su reloj.
+- D5 decía que el tutorial pasaría a `Node`. Los capítulos 1 a 11 se quedan
+  con sus lazos de `receive()` a propósito (es lo más fácil para empezar y
+  siguen funcionando, D5); el `Node` llega en el capítulo 12, con sus propios
+  ejemplos.
 
 ## Fuentes
 

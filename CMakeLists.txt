@@ -73,7 +73,9 @@ add_library(agmen_core
     src/wire.cpp
     src/net.cpp
     src/platform.cpp
-    src/hubproto.cpp)
+    src/hubproto.cpp
+    src/clock.cpp
+    src/node.cpp)
 add_library(agmen::core ALIAS agmen_core)
 
 # agmen/version.hpp se genera desde VERSION.
@@ -112,6 +114,10 @@ if(AGMEN_BUILD_EXAMPLES)
         target_link_libraries(tutorial_${name} PRIVATE tutorial_msgs)
         agmen_set_warnings(tutorial_${name})
     endforeach()
+    # Un nodo, dos ritmos (capítulo 12, RFC 0006; scripts/paralelo_check.py).
+    add_executable(doble_ritmo examples/nodos/doble_ritmo.cpp)
+    target_link_libraries(doble_ritmo PRIVATE tutorial_msgs)
+    agmen_set_warnings(doble_ritmo)
     # Los mensajes de un perro robot de 12 servos (capítulo 11, scripts/gen_smoke.py).
     agmen_add_messages(arca9_msgs examples/mensajes/arca9.agmen)
     add_executable(arca9_eco examples/mensajes/arca9_eco.cpp)
@@ -128,6 +134,12 @@ if(AGMEN_BUILD_TESTS)
         AGMEN_VECTORS_FILE="${CMAKE_CURRENT_SOURCE_DIR}/tests/vectors/v1.txt")
     agmen_set_warnings(test_wire)
     add_test(NAME wire COMMAND test_wire)
+
+    # Node y el reloj de Agmen (RFC 0006).
+    add_executable(test_node tests/test_node.cpp)
+    target_link_libraries(test_node PRIVATE agmen::core)
+    agmen_set_warnings(test_node)
+    add_test(NAME node COMMAND test_node)
 
     # El C++ que genera agmen gen pone los mismos bytes que los vectores.
     agmen_add_messages(vectores_msgs tests/vectors/v1.agmen)

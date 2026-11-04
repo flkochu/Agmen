@@ -13,6 +13,11 @@ Nodo → hub
     sub   id node pid topic schema port        registrar/latir un Subscriber
                                                (topic="*" = todos; schema="*" = cualquier tipo)
     bye   id                                   el endpoint se va
+    stat  node pid kind name ...               cuentas de un agmen.Node, cada segundo (RFC 0006):
+                                               kind=timer: group period_ns runs late skipped
+                                                           worst_late_ns worst_run_ns
+                                               kind=sub:   type group queue received delivered
+                                                           replaced dropped worst_run_ns
     query                                      pedir el estado completo (herramientas)
     ping                                       ¿hay hub?
 
@@ -21,7 +26,7 @@ Hub → nodo
     ok    id                                    latido recibido (a un Subscriber)
     error id msg                                registro rechazado (ej. choque de tipos)
     pong  version
-    state (varias líneas: topic ..., ep ..., expect ...)
+    state (varias líneas: topic ..., ep ..., stat ...)
 
 Los datos (formato v1, "AGM...") y el control ("agmen-hub/1 ...") pueden llegar
 al mismo socket; se distinguen por los primeros bytes.

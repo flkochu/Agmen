@@ -1,5 +1,7 @@
 #include "agmen/wire.hpp"
 
+#include "agmen/clock.hpp"
+
 #include <chrono>
 #include <cstdio>
 #include <random>
@@ -183,7 +185,9 @@ ImuSample ImuSample::decode_payload(ByteView p) {
     };
 }
 
-std::int64_t now_ns() {
+std::int64_t now_ns() { return clock::now_ns(); }   // el reloj de Agmen (real o simulación)
+
+std::int64_t wall_ns() {
     using namespace std::chrono;
     return static_cast<std::int64_t>(
         duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count());

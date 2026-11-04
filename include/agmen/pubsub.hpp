@@ -24,7 +24,10 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -33,6 +36,10 @@
 #include "agmen/hubproto.hpp"
 #include "agmen/net.hpp"
 #include "agmen/wire.hpp"
+
+namespace agmen::clock {
+[[nodiscard]] wire::Clock domain();   // agmen/clock.hpp
+}
 
 namespace agmen {
 
@@ -58,7 +65,8 @@ public:
     /// dirección, `topic` es solo una etiqueta que viaja en el sobre.
     explicit Publisher(const std::string& to, std::string topic = "/" + std::string(M::kName))
         // Por topic todo es local (nivel 2): 127.0.0.1, así Windows no pregunta por el firewall.
-        : socket_(net::UdpSocket::bind(hub::is_topic(to) ? "127.0.0.1:0" : "0.0.0.0:0")),
+        : mu_(std::make_unique<std::mutex>()),
+          socket_(net::UdpSocket::bind(hub::is_topic(to) ? "127.0.0.1:0" : "0.0.0.0:0")),
           topic_(hub::is_topic(to) ? to : std::move(topic)),
           source_id_(wire::random_source_id()),
           schema_text_(wire::schema_text<M>()),
@@ -102,6 +110,7 @@ public:
     /// Manda `msg`; t_data = instante al que corresponden los datos (ej. la
     /// captura del sensor), en ns desde la época Unix.
     net::SendStatus publish(const M& msg, std::int64_t t_data) {
+        std::lock_guard lock(*mu_);   // se puede publicar desde varios grupos de un Node (hilos)
         if (link_) {
             link_->maybe_beat(socket_);
             drain(std::chrono::milliseconds(0));
@@ -112,13 +121,14 @@ public:
             }
         }
         const auto now = std::chrono::steady_clock::now();
-        if (!announced_ || now - last_announce_ >= kAnnounceEvery) announce();
+        if (!announced_ || now - last_announce_ >= kAnnounceEvery) announce_locked();
         const auto packet = wire::encode(msg, wire::Envelope{
                                                   .topic_id = topic_id_,
                                                   .source_id = source_id_,
                                                   .seq = seq_,
                                                   .t_data = t_data,
                                                   .t_pub = wire::now_ns(),
+                                                  .clock = clock::domain(),
                                               });
         ++seq_;
         auto status = net::SendStatus::NoListener;
@@ -130,16 +140,24 @@ public:
 
     /// Manda el anuncio del esquema ya, a todos los receptores (publish() lo hace solo).
     void announce() {
+        std::lock_guard lock(*mu_);
+        announce_locked();
+    }
+
+private:
+    void announce_locked() {
         const auto ann = announcement();
         for (const auto& d : dests_) (void)socket_.send_to(ann, d);
         announced_ = true;
         last_announce_ = std::chrono::steady_clock::now();
     }
 
+public:
     /// Late con el hub y lee sus respuestas. Llámalo si tu ciclo publica menos
     /// de una vez cada 3 s (si no, publish() ya lo hace).
     void heartbeat() {
         if (!link_) return;
+        std::lock_guard lock(*mu_);
         link_->maybe_beat(socket_);
         drain(std::chrono::milliseconds(0));
     }
@@ -152,9 +170,11 @@ public:
 
 private:
     wire::Bytes announcement() const {
-        return wire::encode_announcement(
-            schema_text_, topic_,
-            wire::Envelope{.source_id = source_id_, .seq = seq_, .t_pub = wire::now_ns()});
+        return wire::encode_announcement(schema_text_, topic_,
+                                         wire::Envelope{.source_id = source_id_,
+                                                        .seq = seq_,
+                                                        .t_pub = wire::now_ns(),
+                                                        .clock = clock::domain()});
     }
 
     /// Lee las respuestas del hub (a quién mandarle los datos).
@@ -178,6 +198,7 @@ private:
         }
     }
 
+    std::unique_ptr<std::mutex> mu_;
     net::UdpSocket socket_;
     std::string topic_;
     std::uint64_t topic_id_ = 0;
@@ -204,7 +225,8 @@ class Subscriber {
 public:
     /// `where` = topic ("/cmd") o dirección donde escuchar ("127.0.0.1:7500").
     explicit Subscriber(const std::string& where)
-        : socket_(net::UdpSocket::bind(hub::is_topic(where) ? "127.0.0.1:0" : where)),
+        : where_(where),
+          socket_(net::UdpSocket::bind(hub::is_topic(where) ? "127.0.0.1:0" : where)),
           buf_(65536) {
         AGMEN_CHECK_SCHEMA(M);
         if (hub::is_topic(where)) {
@@ -272,6 +294,7 @@ public:
                                              env.schema_id, detail));
             }
             auto decoded = wire::decode<M>(data);
+            warn_clock(decoded.envelope);
             return Sample<M>{decoded.envelope, decoded.message, rx->from};
         }
     }
@@ -284,12 +307,36 @@ public:
     /// "ip:puerto" del último paquete recibido (útil al reportar un error).
     [[nodiscard]] const std::string& last_from() const { return last_from_; }
 
+    /// El socket, para que un Node espere varias suscripciones a la vez.
+    [[nodiscard]] std::intptr_t native_handle() const { return socket_.native_handle(); }
+
+    /// Topic o dirección donde escucha.
+    [[nodiscard]] const std::string& where() const { return where_; }
+
     /// Anuncios vistos: schema_id → (topic, esquema).
     [[nodiscard]] const std::map<std::uint64_t, wire::Announcement>& announced() const {
         return announced_;
     }
 
 private:
+    /// RFC 0001 §8.8: un mensaje de otro reloj (real en un robot simulado, o al
+    /// revés) se avisa una vez. No es un error: el dato llega igual.
+    void warn_clock(const wire::Envelope& env) {
+        if (clock_warned_ || env.clock == clock::domain()) return;
+        clock_warned_ = true;
+        const auto name = [](wire::Clock c) {
+            return c == wire::Clock::Sim ? "simulación" : c == wire::Clock::Replay ? "reproducción" : "real";
+        };
+        std::fprintf(stderr,
+                     "[agmen] ⚠ '%s' llega con reloj %s y este nodo usa reloj %s. ¿Corriste el nodo fuera de "
+                     "'agmen run'? Usa el mismo reloj: AGMEN_CLOCK=%s\n",
+                     where_.c_str(), name(env.clock), name(clock::domain()),
+                     env.clock == wire::Clock::Sim ? "sim" : "real");
+        std::fflush(stderr);
+    }
+
+    bool clock_warned_ = false;
+    std::string where_;
     net::UdpSocket socket_;
     std::vector<std::uint8_t> buf_;
     std::optional<hub::Link> link_;

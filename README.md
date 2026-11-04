@@ -32,7 +32,7 @@ como paquetes opcionales.
   mandan al mismo motor, **un `[[mux]]` decide quién manda**: tú le ganas al
   modo autónomo y al soltar lo retoma solo.
 
-**Versión actual: 0.7.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
+**Versión actual: 0.8.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
 
 | Para… | Lee |
 |---|---|
@@ -42,7 +42,7 @@ como paquetes opcionales.
 | La interfaz web | [RFC 0002](docs/rfc/0002-interfaz-web.md) (aceptado, implementado en 0.6.0: WebSocket, red con clave, Foxglove) · [RFC 0003](docs/rfc/0003-lanzador-y-panel.md) (`agmen run` y panel) |
 | Topics y el hub | [RFC 0004](docs/rfc/0004-topics-y-descubrimiento.md) (aceptado, implementado en 0.5.0) |
 | Mensajes en archivos `.agmen` | [RFC 0005](docs/rfc/0005-esquemas-agmen.md) (aceptado, implementado en 0.7.0) |
-| Varias frecuencias en un nodo y el reloj de Agmen | [RFC 0006](docs/rfc/0006-executor-y-reloj.md) (propuesta para 0.8.0) |
+| Varias frecuencias en un nodo y el reloj de Agmen | [RFC 0006](docs/rfc/0006-executor-y-reloj.md) (aceptado, implementado en 0.8.0) |
 | Publicar versiones | [`docs/PUBLICAR.md`](docs/PUBLICAR.md) |
 
 ## Estado
@@ -55,8 +55,9 @@ como paquetes opcionales.
 | 0.4.0 ✅ | 1 | Sobre v1 + codificación `compact` + esquema en texto + decodificación dinámica |
 | 0.5.0 ✅ | 2 | Topics: los nodos se encuentran solos (`agmen hub`), `agmen topic list/info/echo/hz`, `agmen node list` |
 | 0.6.0 ✅ | 3 | Panel por WebSocket: el navegador decodifica los bytes de Agmen, varias gráficas, inspector, celular con clave, compatible con Foxglove |
-| **0.7.0 ✅** | **4** | **Archivos `.agmen`: escribes tus mensajes una vez y se genera el código de C++ y de Python** |
-| … | 5–14 | Ver [`docs/VISION.md`](docs/VISION.md#7-roadmap-por-niveles) |
+| 0.7.0 ✅ | 4 | Archivos `.agmen`: escribes tus mensajes una vez y se genera el código de C++ y de Python |
+| **0.8.0 ✅** | **5** | **Un nodo con varios ritmos (`Node`, `every`, grupos con su propio hilo) y el reloj de Agmen: simulación más rápida, más lenta o en pausa** |
+| … | 6–14 | Ver [`docs/VISION.md`](docs/VISION.md#7-roadmap-por-niveles) |
 
 ## Estructura
 
@@ -64,10 +65,11 @@ como paquetes opcionales.
 agmen/
 ├── VERSION                  la versión (fuente única de verdad)
 ├── CHANGELOG.md · LICENSE · pyproject.toml (pip install agmen)
-├── include/agmen/           API pública: agmen.hpp, wire.hpp, net.hpp, platform.hpp
+├── include/agmen/           API pública: agmen.hpp, wire.hpp, net.hpp, platform.hpp, node.hpp, clock.hpp
 ├── src/                     implementación del núcleo
 ├── examples/nivel0/         publisher y subscriber
 ├── examples/tutorial/       código del tutorial (motor, controlador, cerebro.py)
+├── examples/nodos/          un nodo con dos ritmos y el reloj de Agmen (capítulo 12)
 ├── tests/                   pruebas (ctest)
 ├── examples/tutorial/robot.toml  el robot del tutorial completo, para `agmen run`
 ├── python/agmen/            paquete de Python: import agmen + el comando `agmen`

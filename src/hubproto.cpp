@@ -1,5 +1,7 @@
 #include "agmen/hubproto.hpp"
 
+#include <mutex>
+
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -157,7 +159,30 @@ std::string process_id() {
 #endif
 }
 
-std::string node_name() { return env_or("AGMEN_NODE", "cpp-" + process_id()); }
+namespace {
+std::mutex& name_mu() {
+    static std::mutex m;
+    return m;
+}
+std::string& default_name() {
+    static std::string n;
+    return n;
+}
+}  // namespace
+
+void set_default_node_name(std::string name) {
+    std::lock_guard lock(name_mu());
+    default_name() = std::move(name);
+}
+
+std::string node_name() {
+    std::string fallback;
+    {
+        std::lock_guard lock(name_mu());
+        fallback = default_name();
+    }
+    return env_or("AGMEN_NODE", fallback.empty() ? "cpp-" + process_id() : fallback);
+}
 
 std::string hex16(std::uint64_t v) {
     char buf[17];

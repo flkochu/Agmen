@@ -119,6 +119,14 @@
   .topicsec > h3 { margin: 4px 0 0; font: 600 13px var(--mono); display: flex; gap: 10px; align-items: baseline; }
   .topicsec > h3 small { color: var(--muted); font-weight: 400; }
   .chips.topics .chip.focus { box-shadow: 0 0 0 2px var(--accent) inset; }
+  .clock .t { font: 600 22px/1.3 var(--mono); }
+  .clock .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
+  .clock select { background: var(--panel); color: inherit; border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; }
+  .rhythm { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .rhythm td { padding: 3px 4px; border-top: 1px solid var(--line); vertical-align: top; }
+  .rhythm td.num { font-family: var(--mono); text-align: right; white-space: nowrap; }
+  .rhythm .bad { color: var(--bad, #e5534b); }
+  .rhythm .grp { color: var(--muted); }
 </style>
 </head>
 <body>
@@ -132,6 +140,16 @@
     <section class="panel">
       <h2>Nodos <span class="right" id="nodesum"></span></h2>
       <div id="nodes"><div class="empty">cargando…</div></div>
+    </section>
+
+    <section class="panel clock" id="clockpanel">
+      <h2>Reloj <span class="right hint" id="clockmode"></span></h2>
+      <div id="clock"><div class="empty">cargando…</div></div>
+    </section>
+
+    <section class="panel" id="rhythmpanel" style="display:none">
+      <h2>Ritmo de los nodos <span class="right hint" id="rhythmsum"></span></h2>
+      <div id="rhythm"></div>
     </section>
 
     <section class="panel" id="drivepanel">
@@ -279,6 +297,87 @@ function renderNodes() {
     row.onclick = () => { filter = filter === n.name ? null : n.name; renderChips(); rerenderLogs(); renderNodes(); };
     box.appendChild(row);
   }
+}
+
+// ---------- reloj (RFC 0006) ----------
+let clockSeen = null;   // [t simulado, performance.now()] para animar entre estados
+function renderClock(c) {
+  const box = $("clock");
+  if (c.mode !== "sim") {
+    $("clockmode").textContent = "real";
+    if (box.dataset.mode !== "real") {
+      box.dataset.mode = "real";
+      box.innerHTML = '<div class="dim">El robot usa la hora de la computadora. Para simular más rápido, más lento ' +
+                      'o en pausa: <code>[clock] mode = "sim"</code> en robot.toml.</div>';
+    }
+    clockSeen = null;
+    return;
+  }
+  const own = c.source === "agmen";
+  $("clockmode").textContent = own ? "simulación" : `simulación · lo manda '${c.source}'`;
+  if (box.dataset.mode !== "sim" + own) {
+    box.dataset.mode = "sim" + own;
+    box.innerHTML = `<div class="t" id="clockt">—</div><div class="dim" id="clockst"></div>` + (own ? `
+      <div class="row">
+        <button id="clockpause"></button>
+        <button id="clockstep" title="avanza 0.1 s simulados y se queda en pausa">paso</button>
+        <select id="clockspeed" title="velocidad de la simulación">
+          ${[0.1, 0.25, 0.5, 1, 2, 5, 10].map((v) => `<option value="${v}">×${v}</option>`).join("")}
+        </select>
+      </div>` : "");
+    if (own) {
+      $("clockpause").onclick = () => act({ op: "clock", action: renderClock.paused ? "resume" : "pause" });
+      $("clockstep").onclick = () => act({ op: "clock", action: "step", value: 0.1 });
+      $("clockspeed").onchange = (ev) => act({ op: "clock", action: "speed", value: Number(ev.target.value) });
+    }
+  }
+  renderClock.paused = c.paused;
+  clockSeen = [c.t, performance.now(), c.paused ? 0 : c.speed];
+  const st = c.paused ? "⏸ en pausa" : `▶ ×${c.speed}`;
+  $("clockst").textContent = st + (c.received === false ? " · esperando el primer /clock" : "");
+  if (own) {
+    $("clockpause").textContent = c.paused ? "▶ seguir" : "⏸ pausar";
+    const sel = $("clockspeed");
+    if (document.activeElement !== sel) {
+      if (![...sel.options].some((o) => Number(o.value) === c.speed)) sel.add(new Option("×" + c.speed, c.speed));
+      sel.value = String(c.speed);
+    }
+  }
+  tickClock();
+}
+function tickClock() {
+  const el = $("clockt");
+  if (!el || !clockSeen) return;
+  const [t, at, speed] = clockSeen;
+  el.textContent = "t = " + (t + speed * (performance.now() - at) / 1000).toFixed(2) + " s";
+}
+setInterval(tickClock, 100);
+
+// ---------- ritmo: temporizadores y colas de agmen.Node ----------
+function renderRhythm(list) {
+  $("rhythmpanel").style.display = list.length ? "" : "none";
+  if (!list.length) return;
+  const key = JSON.stringify(list);
+  if (key === renderRhythm.key) return;
+  renderRhythm.key = key;
+  let bad = 0;
+  const rows = list.map((f) => {
+    const grp = f.group ? `grupo ${esc(f.group)}` : "principal";
+    if (f.kind === "timer") {
+      const sk = Number(f.skipped || 0);
+      if (sk) bad++;
+      const note = sk ? `<span class="bad">⚠ ${sk} saltados · peor ${(Number(f.worst_late_ns) / 1e6).toFixed(1)} ms</span>`
+                      : "a tiempo";
+      return `<tr><td>${esc(f.node)} <span class="grp">${grp}</span><br>${esc(f.name)}</td>
+              <td class="num">${f.runs}×<br>${note}</td></tr>`;
+    }
+    const q = Number(f.queue || 1), lost = Number(f.replaced || 0) + Number(f.dropped || 0);
+    const note = lost ? `${lost} ${q === 1 ? "reemplazados" : "descartados"}` : "sin pérdidas";
+    return `<tr><td>${esc(f.node)} <span class="grp">${grp}</span><br>on(${esc(f.name)}) cola ${q}</td>
+            <td class="num">${f.delivered} entregados<br>${note}</td></tr>`;
+  });
+  $("rhythm").innerHTML = `<table class="rhythm">${rows.join("")}</table>`;
+  $("rhythmsum").textContent = bad ? `⚠ ${bad} atrasado${bad > 1 ? "s" : ""}` : "todo a tiempo";
 }
 
 // ---------- manejar (teleoperación) ----------
@@ -431,6 +530,8 @@ function onState(m) {
     onState.nodesKey = key; onState.names = names; renderNodes(); if (namesChanged) renderChips();
   }
   if (!!state.teleop !== prevTeleop || !$("drive").dataset.ready) renderDrive();
+  renderClock(m.clock || { mode: "real" });
+  renderRhythm(m.rhythm || []);
   stats = m.stats || {};
   updateStats(stats);
   // CPU del puente: con dos lecturas seguidas

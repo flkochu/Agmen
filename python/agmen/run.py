@@ -87,6 +87,21 @@ class TopicConfig:
 
 
 @dataclass
+class ClockConfig:
+    """[clock] en robot.toml (RFC 0006): un solo reloj para todo el robot."""
+    mode: str = "real"        # "real" | "sim"
+    speed: float = 1.0        # sim: 2.0 = el doble de rápido
+    source: str = "agmen"     # quién manda el tiempo: "agmen" o el nombre de tu nodo simulador
+    paused: bool = False      # sim con source = "agmen": arrancar en pausa
+
+    def env(self) -> dict[str, str]:
+        out = {"AGMEN_CLOCK": self.mode}
+        if self.mode == "sim":
+            out["AGMEN_CLOCK_SOURCE"] = self.source
+        return out
+
+
+@dataclass
 class RobotConfig:
     name: str
     base_dir: Path
@@ -95,6 +110,7 @@ class RobotConfig:
     before: list[list[str]] = field(default_factory=list)
     topics: list[TopicConfig] = field(default_factory=list)
     hub: bool = True                    # ¿arrancar un agmen hub? ([hub] enabled)
+    clock: ClockConfig = field(default_factory=ClockConfig)
 
 
 def _check_keys(table: dict, allowed: set[str], where: str) -> None:
@@ -128,7 +144,7 @@ def load_config(path: str | Path) -> RobotConfig:
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{path.name} no es TOML válido: {e}") from None
 
-    _check_keys(data, {"robot", "node", "mux", "topic", "hub", "web"}, path.name)
+    _check_keys(data, {"robot", "node", "mux", "topic", "hub", "web", "clock"}, path.name)
     robot = data.get("robot", {})
     _check_keys(robot, {"name", "before"}, "[robot]")
     base_dir = path.parent
@@ -274,10 +290,46 @@ def load_config(path: str | Path) -> RobotConfig:
         allow_origins=origins,
     )
 
+    clock = _parse_clock(data.get("clock", {}), nodes)
+    for n in nodes:
+        n.env.update(clock.env())   # todos con el mismo reloj: nadie lo olvida
+
     before = [_parse_cmd(c, "[robot] before") for c in robot.get("before", [])]
     return RobotConfig(name=robot.get("name", path.stem), base_dir=base_dir,
                        nodes=nodes, web=web, before=before, topics=topics,
-                       hub=bool(hub_raw.get("enabled", True)))
+                       hub=bool(hub_raw.get("enabled", True)), clock=clock)
+
+
+def _parse_clock(raw, nodes: list[NodeConfig]) -> ClockConfig:
+    if not isinstance(raw, dict):
+        raise ConfigError("[clock] es una tabla, ej.\n\n  [clock]\n  mode = \"sim\"")
+    _check_keys(raw, {"mode", "speed", "source", "paused"}, "[clock]")
+    mode = raw.get("mode", "real")
+    if mode not in ("real", "sim"):
+        hint = " (la reproducción de grabaciones llega en el nivel 9)" if mode == "replay" else ""
+        raise ConfigError(f"[clock] mode = '{mode}' no es válido. Usa \"real\" o \"sim\"{hint}")
+    speed = raw.get("speed", 1.0)
+    if isinstance(speed, bool) or not isinstance(speed, (int, float)) or not (0 < speed <= 1000):
+        raise ConfigError("[clock] speed debe ser un número mayor que 0 (0.5 = la mitad de rápido, 2.0 = el doble)")
+    source = raw.get("source", "agmen")
+    if not isinstance(source, str) or not source:
+        raise ConfigError("[clock] source: \"agmen\" o el nombre del nodo que simula")
+    if mode == "real":
+        extra = [k for k in ("speed", "source", "paused") if k in raw]
+        if extra:
+            raise ConfigError(f"[clock] {', '.join(extra)} solo aplica con mode = \"sim\" "
+                              f"(el tiempo real no se puede acelerar ni pausar)")
+    if source != "agmen":
+        names = [n.name for n in nodes]
+        if source not in names:
+            hint = difflib.get_close_matches(source, names, n=1)
+            extra = f" ¿Quisiste decir '{hint[0]}'?" if hint else ""
+            raise ConfigError(f"[clock] source = '{source}': no hay un [[node]] con ese nombre.{extra} "
+                              f"Usa \"agmen\" para que agmen run mande el tiempo, o el nombre de tu nodo simulador")
+        if "speed" in raw or "paused" in raw:
+            raise ConfigError(f"[clock] speed y paused son para source = \"agmen\": con '{source}', "
+                              f"el tiempo lo decide tu simulador")
+    return ClockConfig(mode=mode, speed=float(speed), source=source, paused=bool(raw.get("paused", False)))
 
 
 def prepare_hub(config: RobotConfig, ping=None) -> tuple[RobotConfig, str]:

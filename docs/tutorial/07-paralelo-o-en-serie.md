@@ -20,9 +20,10 @@ programas. El sistema operativo los reparte entre los núcleos del
 procesador, así que corren **en paralelo** de verdad: un nodo atorado
 esperando un puerto serial no detiene al nodo que controla los motores.
 
-**Dentro de un nodo**, en cambio, el código corre en orden: es un ciclo,
-como el `loop()` de Arduino. Si dentro de tu nodo pones algo lento (leer
-una cámara, esperar la red), el resto de ese ciclo espera. La regla:
+**Dentro de un nodo** con un lazo escrito a mano, el código corre en orden:
+es un ciclo, como el `loop()` de Arduino. Si dentro de tu nodo pones algo
+lento (leer una cámara, esperar la red), el resto de ese ciclo espera. La
+regla:
 
 > Si una parte **no debe esperar** a otra, ponlas en **nodos distintos**.
 
@@ -97,14 +98,17 @@ tienes dos opciones:
    vueltas (`if ciclo % 100 == 0`). Funciona mientras la tarea lenta sea
    rápida de ejecutar.
 
-En el nivel 5 del roadmap, Agmen tendrá un *executor* con varios
-temporizadores por nodo, para hacerlo sin escribir el ciclo a mano.
+💡 Desde Agmen 0.8 también se puede **dentro de un nodo**: con `agmen::Node`,
+cada `node.group("...")` es otro hilo, y la prueba 6 de `paralelo_check` mide
+un control a 1 kHz junto a una tarea de 80 ms en otro grupo
+([capítulo 12](12-nodos-y-reloj.md)). En Python puro, por el GIL, lo pesado
+sigue yendo en otro nodo.
 
 ## Lo que aprendiste
 
 - La diferencia entre serie y paralelo, y cómo medirla.
 - Que en Agmen el paralelismo es **entre nodos** (procesos), y dentro de un
-  nodo el código corre en orden.
+  nodo, entre los grupos de un `Node` (capítulo 12).
 - Que un recurso compartido (la terminal) puede volver serie a un sistema
   paralelo, y cómo se evita.
 

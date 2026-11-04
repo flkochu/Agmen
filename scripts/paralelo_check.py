@@ -15,8 +15,12 @@ Cada prueba compara lo que tardaría en serie contra lo que se mide:
   4. Apagado: N nodos que tardan 1 s en cerrar, ¿Ctrl+C tarda N s o 1 s?
   5. Panel: varios navegadores conectados a la vez, ¿se turnan o se atienden
      en paralelo?
+  6. Dentro de un nodo (agmen::Node, RFC 0006): un control a 1 kHz junto a una
+     "IA" que calcula 80 ms. Con la IA en otro grupo (otro hilo), ¿el control
+     pierde ciclos? Y la misma IA en el mismo grupo, para ver la diferencia.
 
-Funciona en Windows, Linux y macOS. No necesita compilar nada.
+Funciona en Windows, Linux y macOS. Las pruebas 1 a 5 no necesitan compilar
+nada; la 6 usa build/bin/doble_ritmo (si no está, se salta y lo dice).
 
     python scripts/paralelo_check.py
 """
@@ -317,9 +321,52 @@ def prueba_panel() -> None:
         worst < 0.5 and alive)
 
 
+# --- 6. dentro de un nodo: grupos --------------------------------------------
+
+def _doble_ritmo() -> Path | None:
+    for rel in ("build/bin/doble_ritmo", "build/bin/Release/doble_ritmo", "build/bin/Debug/doble_ritmo"):
+        for ext in ("", ".exe"):
+            p = ROOT / (rel + ext)
+            if p.exists():
+                return p
+    return None
+
+
+def _correr_doble_ritmo(exe: Path, same_group: bool, seconds: float) -> tuple[int, int, float]:
+    import subprocess
+
+    args = [str(exe), str(seconds)] + (["--mismo-grupo"] if same_group else [])
+    out = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                         timeout=seconds + 30).stdout
+    line = next((ln for ln in out.splitlines() if ln.startswith("RESULTADO")), None)
+    if line is None:
+        raise RuntimeError(f"doble_ritmo no dio resultado:\n{out}")
+    f = dict(kv.split("=") for kv in line.split()[1:])
+    return int(f["ciclos"]), int(f["saltados"]), float(f["peor_ms"])
+
+
+def prueba_grupos() -> None:
+    exe = _doble_ritmo()
+    if exe is None:
+        print("SALTO dentro de un nodo: no encontré build/bin/doble_ritmo (compila con cmake --build build)")
+        return
+    seconds = 3.0
+    ideal = int(seconds * 1000)
+    n_o, sk_o, worst_o = _correr_doble_ritmo(exe, False, seconds)
+    n_s, sk_s, worst_s = _correr_doble_ritmo(exe, True, seconds)
+    # Otro grupo: casi ningún ciclo perdido. Mismo grupo: se pierde más de la mitad
+    # (márgenes para las máquinas virtuales del CI, que a veces despiertan tarde)
+    ok = sk_o <= 0.20 * ideal and sk_s >= 0.5 * ideal and sk_o * 3 <= sk_s
+    row("dentro de un nodo: control 1 kHz + IA de 80 ms en OTRO grupo",
+        f"el control pierde ~{int(0.8 * ideal)} de {ideal} ciclos (mismo grupo: medido {sk_s}, peor atraso "
+        f"{worst_s:.0f} ms)",
+        f"{n_o} ciclos, {sk_o} saltados ({100 * sk_o / ideal:.1f} %), peor atraso {worst_o:.1f} ms", ok,
+        "la IA corre en su propio hilo")
+
+
 def main() -> int:
     print(f"Agmen · prueba de paralelismo · {CORES} núcleos · Python {sys.version.split()[0]} · {sys.platform}\n")
-    for prueba in (prueba_calculo, prueba_bloqueo, prueba_terminal, prueba_apagado, prueba_panel):
+    for prueba in (prueba_calculo, prueba_bloqueo, prueba_terminal, prueba_apagado, prueba_panel, prueba_grupos):
         try:
             prueba()
         except Exception as e:  # noqa: BLE001 — que una prueba rota no esconda las demás
@@ -330,8 +377,9 @@ def main() -> int:
     for name, serial, measured, ok, _ in rows:
         print(f"  {'✔' if ok else '✖'} {name}\n      en serie: {serial}\n      medido:   {measured}")
     failed = sum(1 for r in rows if not r[3])
-    print("\n" + ("Agmen trabaja en paralelo en las 5 pruebas." if not failed else f"{failed} prueba(s) fallaron."))
-    print("Nota: DENTRO de cada nodo el código corre en orden (un ciclo); el paralelismo es ENTRE nodos.")
+    print("\n" + (f"Agmen trabaja en paralelo en las {len(rows)} pruebas." if not failed
+                  else f"{failed} prueba(s) fallaron."))
+    print("Nota: dentro de un nodo, lo de un mismo grupo corre en orden; cada node.group(...) es otro hilo.")
     return 1 if failed else 0
 
 

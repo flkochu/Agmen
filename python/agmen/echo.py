@@ -113,9 +113,12 @@ class Echo:
                 self.out(json.dumps({"topic": topic, "type": layout.name, "src": source, **wire.envelope_dict(env),
                                      "data": row}, ensure_ascii=False))
             else:
-                lat = (recv_ns - env.t_pub) / 1e6
-                self.out(f"--- {topic or '(sin topic)'} · {layout.name} · seq {env.seq} · t_data {_time(env.t_data)}"
-                         f" · {source} · latencia {lat:.2f} ms")
+                if env.clock == wire.CLOCK_REAL:
+                    when = f"t_data {_time(env.t_data)} · {source} · latencia {(recv_ns - env.t_pub) / 1e6:.2f} ms"
+                else:
+                    # Tiempo simulado: la latencia contra el reloj de esta terminal no significa nada.
+                    when = f"t_data {env.t_data / 1e9:.3f} s ({wire.CLOCKS.get(env.clock, '?')}) · {source}"
+                self.out(f"--- {topic or '(sin topic)'} · {layout.name} · seq {env.seq} · {when}")
                 for line in format_message(row):
                     self.out(line)
 
@@ -133,7 +136,7 @@ class Echo:
             if got is None:
                 continue
             data, sender = got
-            self.handle(data, sender, wire.now_ns())
+            self.handle(data, sender, wire.wall_ns())
             if count and sum(self.counts.values()) >= count:
                 break
 

@@ -56,7 +56,7 @@ jobs:
       - name: agmen run (un comando para todo el robot + panel + prioridad)
         run: python scripts/run_smoke.py
 
-      - name: ¿Paralelo o en serie? (nodos, terminal, apagado y panel)
+      - name: ¿Paralelo o en serie? (nodos, terminal, apagado, panel y grupos de un Node)
         run: python scripts/paralelo_check.py
 
       - name: Topics y hub (C++ <-> Python, topic list/echo/hz, un topic un tipo)
@@ -64,6 +64,9 @@ jobs:
 
       - name: Mensajes .agmen (C++ generado <-> Python con agmen.load)
         run: python scripts/gen_smoke.py
+
+      - name: Node y reloj de Agmen (sim ×2, pausa desde el panel, simulador paso a paso)
+        run: python scripts/node_check.py
 
       - name: Instalar el paquete y probar el comando agmen
         run: |

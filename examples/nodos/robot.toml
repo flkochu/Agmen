@@ -1,0 +1,26 @@
+# Capítulo 12: un nodo con dos ritmos y el reloj de Agmen (RFC 0006).
+#
+#   cmake --build build
+#   agmen run examples/nodos/robot.toml
+#
+# En el panel (tarjeta "Reloj") puedes pausar, avanzar un paso o cambiar la
+# velocidad: doble_ritmo y cerebro siguen al tiempo simulado.
+
+[robot]
+name = "nodos"
+
+[clock]
+mode = "sim"        # "real" (por defecto) | "sim"
+speed = 1.0         # 0.5 = la mitad de rápido, 2.0 = el doble
+
+[[topic]]
+name = "/cmd"
+type = "MotorCommand"
+
+[[node]]
+name = "doble_ritmo"
+cmd = "../../build/bin/doble_ritmo"
+
+[[node]]
+name = "cerebro"
+cmd = "python cerebro.py"

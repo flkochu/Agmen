@@ -75,6 +75,33 @@ class TestConfig(unittest.TestCase):
     def test_teleop_sin_target(self):
         self.assertConfigError(MINIMO + '\n[web.teleop]\nmax_speed = 1.0\n', "falta 'target'")
 
+    # --- [clock] (RFC 0006) ---
+    def test_reloj_real_por_defecto(self):
+        cfg = self.load(MINIMO)
+        self.assertEqual(cfg.clock.mode, "real")
+        self.assertEqual(cfg.nodes[0].env["AGMEN_CLOCK"], "real")
+
+    def test_reloj_sim_llega_a_todos_los_nodos(self):
+        cfg = self.load(MINIMO + '\n[[node]]\nname = "b"\ncmd = "x"\nenv = { AGMEN_CLOCK = "real" }\n'
+                        '\n[clock]\nmode = "sim"\nspeed = 2.0\n')
+        self.assertEqual((cfg.clock.mode, cfg.clock.speed, cfg.clock.source), ("sim", 2.0, "agmen"))
+        for n in cfg.nodes:   # aunque el nodo diga otra cosa: un solo reloj
+            self.assertEqual((n.env["AGMEN_CLOCK"], n.env["AGMEN_CLOCK_SOURCE"]), ("sim", "agmen"))
+
+    def test_reloj_fuente_es_un_nodo(self):
+        cfg = self.load(MINIMO + '\n[[node]]\nname = "simulador"\ncmd = "x"\n\n[clock]\nmode = "sim"\n'
+                        'source = "simulador"\n')
+        self.assertEqual(cfg.nodes[0].env["AGMEN_CLOCK_SOURCE"], "simulador")
+        self.assertConfigError(MINIMO + '\n[[node]]\nname = "simulador"\ncmd = "x"\n\n[clock]\nmode = "sim"\n'
+                               'source = "simuladr"\n', "¿Quisiste decir 'simulador'?")
+
+    def test_reloj_errores(self):
+        self.assertConfigError(MINIMO + '\n[clock]\nmode = "rapido"\n', "no es válido")
+        self.assertConfigError(MINIMO + '\n[clock]\nmode = "replay"\n', "nivel 9")
+        self.assertConfigError(MINIMO + '\n[clock]\nmode = "sim"\nspeed = 0\n', "mayor que 0")
+        self.assertConfigError(MINIMO + '\n[clock]\nspeed = 2.0\n', 'solo aplica con mode = "sim"')
+        self.assertConfigError(MINIMO + '\n[clock]\nmodo = "sim"\n', "¿Quisiste decir 'mode'?")
+
 
 class TerminalBloqueada(io.StringIO):
     """Una terminal que no deja escribir hasta que se le diga."""

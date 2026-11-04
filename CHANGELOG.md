@@ -7,9 +7,62 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 
 ## [Sin publicar]
 
-### Planeado (nivel 5, versión 0.8.0)
-- Executor y tiempo: varios temporizadores y frecuencias en un nodo, colas
-  por suscripción y el reloj de Agmen (real y simulación).
+### Planeado (nivel 6, versión 0.9.0)
+- Python de primera clase: el paquete `agmen` compilado desde el núcleo de
+  C++ (nanobind), con NumPy sin copias.
+
+## [0.8.0] — 2026-11-03
+
+**Nivel 5: un nodo con varios ritmos y el reloj de Agmen** (RFC 0006,
+aceptado). Lo lento ya no frena a lo rápido dentro de un mismo nodo, y el
+mismo código corre en tiempo real o simulado.
+
+### Agregado
+- **`agmen::Node` (C++) y `agmen.Node` (Python)**: `every(periodo, f)`
+  programa por *deadline*; `subscribe` / `@node.on` llaman a tu función cuando
+  llega un mensaje; `spin()` / `spin_for()` / `stop()`; `node.now()` es la
+  hora de Agmen. `node.publisher<M>(topic)` publica con `t_data = node.now()`.
+- **Grupos**: `node.group("ia")` es otro hilo. Lo del grupo principal corre
+  una función a la vez (sin candados); grupos distintos corren al mismo
+  tiempo. `agmen::Latest<T>`: el último valor, seguro entre hilos.
+- **Ciclos saltados**: si una función tarda más que su periodo, los ciclos
+  perdidos se saltan (no se recuperan de golpe), se cuentan y se avisan una
+  vez cada 5 s, diciendo qué función del grupo fue la lenta (o que la
+  computadora despertó tarde al nodo).
+- **Colas por suscripción**: `queue = 1` (por defecto) entrega el más reciente
+  y cuenta los reemplazados; `queue = N` guarda hasta N y cuenta los
+  descartados.
+- **Excepciones**: si tu función lanza, el nodo se detiene y `spin()` la
+  relanza. Ctrl+C, SIGTERM y el CTRL_BREAK de `agmen run` lo detienen en orden.
+- **El reloj de Agmen** (`agmen/clock.hpp`, `agmen.clock`): `now_ns()`,
+  `mono_ns()`, modo `real` o `sim`. En simulación sigue al topic `/clock`
+  (`Clock{time t;f64 speed;bool paused}`), interpolando entre mensajes, y
+  nunca va hacia atrás.
+- **`[clock]` en robot.toml**: `mode = "sim"`, `speed`, `paused` y `source`.
+  Con `source = "agmen"`, `agmen run` publica `/clock` 50 veces por segundo;
+  con el nombre de un nodo, tu simulador manda el tiempo paso a paso. Todos
+  los nodos reciben el mismo reloj (`AGMEN_CLOCK`, `AGMEN_CLOCK_SOURCE`).
+- **Panel**: tarjeta *Reloj* (pausa, paso, velocidad; operación `clock` del
+  WebSocket) y *Ritmo de los nodos* (temporizadores y colas).
+- **`agmen node list`** muestra los temporizadores y las colas de cada
+  `Node`; el hub las recibe con la operación nueva `stat`.
+- `examples/nodos/`: `doble_ritmo` (control a 1 kHz + IA de 80 ms) y
+  `cerebro.py`; tutorial, capítulo 12.
+- `scripts/node_check.py` en el CI (sim ×2, pausa desde el panel, simulador
+  paso a paso, aviso de otro reloj) y la prueba 6 de `paralelo_check`:
+  control a 1 kHz con la IA en otro grupo (en el contenedor de pruebas: 3 de
+  3000 ciclos saltados; en el mismo grupo: 2262).
+
+### Cambiado
+- `wire::now_ns()` (C++) y `wire.now_ns()` (Python) devuelven la hora de
+  Agmen; en modo real es la misma de siempre. `wire::wall_ns()` / `wire.wall_ns()`
+  dan la de la computadora.
+- El campo `clock` del sobre ya se llena con el modo del proceso, y quien
+  recibe un mensaje de otro reloj lo avisa una vez (RFC 0001 §8.8).
+- `Publisher` es seguro entre hilos (se puede publicar desde varios grupos).
+- `agmen topic echo` muestra el tiempo simulado en segundos y no calcula
+  latencia contra un reloj distinto.
+- El hub no pide declarar `/clock` en robot.toml (es de Agmen).
 
 ## [0.7.0] — 2026-11-03
 

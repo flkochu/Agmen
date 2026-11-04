@@ -26,6 +26,10 @@ from . import hubproto as hp
 from ._version import __version__
 
 
+# Topics que pone Agmen mismo: no hace falta declararlos en robot.toml.
+BUILTIN_TOPICS = {"/clock": "Clock"}   # el tiempo de la simulación (RFC 0006)
+
+
 @dataclass
 class Endpoint:
     id: str
@@ -61,6 +65,7 @@ class Hub:
         self.sock.settimeout(0.25)
         self.log = log
         self.endpoints: dict[str, Endpoint] = {}
+        self.stats: dict[tuple[str, str, str, str], tuple[dict[str, str], float]] = {}
         self.expected = {e.topic: e for e in (expected or [])}
         self.grace_s = grace_s
         self.started = time.monotonic()
@@ -103,6 +108,12 @@ class Hub:
     # --- topics esperados (D3) ---
     def _check_expected(self, e: Endpoint) -> None:
         if not self.expected or e.topic == "*":
+            return
+        if e.topic in BUILTIN_TOPICS:
+            if e.type and e.type != BUILTIN_TOPICS[e.topic]:
+                self._warn_once(("tipo", e.topic, e.type),
+                                f"'{e.topic}' es de Agmen y es de tipo {BUILTIN_TOPICS[e.topic]}; "
+                                f"'{e.node}' usa {e.type}")
             return
         exp = self.expected.get(e.topic)
         if exp is None:
@@ -156,6 +167,10 @@ class Hub:
                     self._push_topic(e.topic)
         elif op in ("pub", "sub"):
             self._register(op, f, addr, now)
+        elif op == "stat":
+            # Cuentas de un agmen.Node (RFC 0006): temporizadores y colas.
+            key = (f["node"], f.get("pid", ""), f["kind"], f["name"])
+            self.stats[key] = (dict(f), now)
         else:
             raise hp.ProtocolError(f"operación desconocida '{op}'")
 
@@ -195,6 +210,8 @@ class Hub:
                 self._push_topic(topic)
 
     def expire(self, now: float) -> None:
+        for k in [k for k, (_, seen) in self.stats.items() if now - seen > hp.EXPIRE_S]:
+            del self.stats[k]
         dead = [e for e in self.endpoints.values() if now - e.last_seen > hp.EXPIRE_S]
         for e in dead:
             del self.endpoints[e.id]
@@ -222,6 +239,8 @@ class Hub:
         for e in self.endpoints.values():
             lines.append(hp.line("ep", id=e.id, kind=e.kind, node=e.node, pid=e.pid, topic=e.topic,
                                  type=e.type, addr=f"{e.addr[0]}:{e.addr[1]}", age=f"{now - e.last_seen:.1f}"))
+        for _key, (f, _seen) in sorted(self.stats.items()):
+            lines.append(hp.line("stat", **f))
         return "\n".join(lines)
 
     # --- ciclo ---

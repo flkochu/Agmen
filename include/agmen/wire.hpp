@@ -516,7 +516,12 @@ struct Announcement {
 ///
 /// Sirve para medir latencia entre procesos de la MISMA máquina. Entre
 /// máquinas los relojes no están sincronizados (se resuelve en el nivel 11).
+/// La hora de Agmen en ns (RFC 0006): en el reloj real, desde la época Unix;
+/// en simulación, el tiempo de la simulación. Es la que va en t_data y t_pub.
 [[nodiscard]] std::int64_t now_ns();
+
+/// La hora de la computadora (siempre la real). Casi nunca la necesitas.
+[[nodiscard]] std::int64_t wall_ns();
 
 /// Identificador aleatorio de 64 bits (≠ 0) para el source_id de una instancia.
 [[nodiscard]] std::uint64_t random_source_id();

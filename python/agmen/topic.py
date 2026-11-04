@@ -93,7 +93,34 @@ def cmd_node_list(args) -> int:
              f"hace {n['age']:.1f} s"] for name, n in sorted(nodes.items())]
     for line in _table(rows, ["nodo", "pid", "publica", "escucha", "último latido"]):
         print(line)
+    stats = [f for op, f in hubmod.query(hub_address()) if op == "stat"]
+    for line in stats_lines(stats):
+        print(line)
     return 0
+
+
+def stats_lines(stats: list[dict[str, str]]) -> list[str]:
+    """Las cuentas de los agmen.Node (RFC 0006): ciclos saltados y colas."""
+    if not stats:
+        return []
+    out = ["", "# temporizadores y suscripciones de agmen.Node"]
+    rows = []
+    for f in stats:
+        group = f.get("group") or "principal"
+        if f.get("kind") == "timer":
+            skipped = int(f.get("skipped", 0))
+            worst = int(f.get("worst_late_ns", 0)) / 1e6
+            note = f"⚠ {skipped} saltados (peor atraso {worst:.1f} ms)" if skipped else "a tiempo"
+            rows.append([f["node"], group, f["name"], f"{f.get('runs', 0)} veces", note])
+        else:
+            q = int(f.get("queue", 1))
+            lost = int(f.get("replaced", 0)) + int(f.get("dropped", 0))
+            what = "reemplazados" if q == 1 else "descartados"
+            note = f"{lost} {what}" if lost else "sin pérdidas"
+            rows.append([f["node"], group, f"on({f['name']}) cola={q}", f"{f.get('delivered', 0)} entregados",
+                         note])
+    out += _table(rows, ["nodo", "grupo", "qué", "corrió", ""])
+    return out
 
 
 def cmd_echo(args) -> int:

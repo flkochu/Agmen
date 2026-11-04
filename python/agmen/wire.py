@@ -43,8 +43,23 @@ SEQ_OFFSET, SOURCE_OFFSET = 32, 24
 
 
 def now_ns() -> int:
-    """Tiempo actual en ns desde la época Unix (reloj real de Agmen)."""
+    """La hora de Agmen en ns (agmen.clock): en el reloj real, desde la época
+    Unix; en simulación, el tiempo simulado."""
+    from . import clock   # aquí: clock importa este módulo
+
+    return clock.now_ns()
+
+
+def wall_ns() -> int:
+    """La hora de la computadora en ns, aunque el robot esté en simulación
+    (para registros y medir latencia de red)."""
     return time.time_ns()
+
+
+def _domain() -> int:
+    from . import clock
+
+    return clock.domain()
 
 
 def topic_id(topic: str) -> int:
@@ -191,7 +206,7 @@ class ImuSample(Message):
 
 
 def encode(msg, seq: int, t_data: int | None = None, t_pub: int | None = None, *,
-           topic: str = "", source_id: int = 0, clock: int = CLOCK_REAL, flags: int = 0) -> bytes:
+           topic: str = "", source_id: int = 0, clock: int | None = None, flags: int = 0) -> bytes:
     """Sobre + payload compact listos para mandar. Si no das t_pub, es "ahora";
     si no das t_data, es igual a t_pub."""
     payload = msg.encode_payload()
@@ -200,6 +215,7 @@ def encode(msg, seq: int, t_data: int | None = None, t_pub: int | None = None, *
         raise WireError(f"encode_payload de '{type(msg).NAME}' produjo {len(payload)} bytes, "
                         f"pero su esquema mide {expected}")
     t_pub = now_ns() if t_pub is None else t_pub
+    clock = _domain() if clock is None else clock
     env = Envelope(ENC_COMPACT, flags, type(msg).SCHEMA_ID, topic_id(topic), source_id, seq,
                    t_pub if t_data is None else t_data, t_pub, len(payload), clock)
     return env.pack() + payload
@@ -228,13 +244,14 @@ def decode(cls, buf: bytes):
 # ---------------------------------------------------------------------------
 
 def encode_announcement(schema_text: str, topic: str, *, source_id: int = 0, seq: int = 0,
-                        t: int | None = None, clock: int = CLOCK_REAL) -> bytes:
+                        t: int | None = None, clock: int | None = None) -> bytes:
     """Le dice al receptor qué esquema y qué topic usa este emisor.
 
     payload = "<topic>\\n<texto canónico del esquema>" en UTF-8."""
     text = _schema.canonical(schema_text)
     payload = f"{topic}\n{text}".encode()
     t = now_ns() if t is None else t
+    clock = _domain() if clock is None else clock
     env = Envelope(ENC_SCHEMA, 0, fnv1a64(text.encode()), topic_id(topic), source_id, seq,
                    t, t, len(payload), clock)
     return env.pack() + payload

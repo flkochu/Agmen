@@ -203,5 +203,4 @@ cambiar nada más.
 - Los bytes no cambian: lo generado habla con lo escrito a mano, con el panel
   y con Foxglove.
 
-**Siguiente (Agmen 0.8.0):** nodos con varias frecuencias a la vez y el reloj
-de Agmen (nivel 5).
+**Siguiente:** [capítulo 12 — un nodo con varios ritmos y el reloj de Agmen](12-nodos-y-reloj.md).

@@ -24,12 +24,13 @@ de C++ **o** de Python. No necesitas saber de redes ni de ROS.
 | 9 | [Topics: los nodos se encuentran solos](09-topics.md) | `Publisher("/imu")` sin IPs ni puertos; `agmen topic list/info/echo/hz` y `node list` | 0.5.0 |
 | 10 | [El panel: varias gráficas, inspector, celular y Foxglove](10-panel-celular-y-foxglove.md) | Ves varios topics a la vez, cualquier mensaje campo por campo, manejas desde el celular con clave y te conectas con Foxglove | 0.6.0 |
 | 11 | [Tus mensajes en un archivo `.agmen`](11-mensajes-agmen.md) | Escribes los mensajes de un perro robot una sola vez y Agmen genera el código de C++ y de Python (con enums y valores por defecto) | 0.7.0 |
+| 12 | [Un nodo con varios ritmos y el reloj de Agmen](12-nodos-y-reloj.md) | Control a 1 kHz y una IA lenta en el mismo nodo sin frenarse; simulas más rápido, más lento o en pausa desde el panel | 0.8.0 |
 
 ### Próximamente
 
 | # | Capítulo | Versión |
 |---|---|---|
-| 12 | Nodos con varias frecuencias y el reloj de Agmen (simulación) | 0.8.0 |
+| 13 | Python de primera clase (compilado desde el núcleo de C++) | 0.9.0 |
 
 ## Convenciones
 

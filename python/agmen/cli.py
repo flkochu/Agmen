@@ -52,6 +52,9 @@ def cmd_run(args) -> int:
     if not launcher.run_before():
         launcher.printer.close()
         return 1
+    clock_server, clock_note = _setup_clock(config.clock)
+    if clock_note:
+        launcher.say(clock_note)
 
     panel = None
     if config.web.enabled and not args.no_web:
@@ -59,7 +62,7 @@ def cmd_run(args) -> int:
         http = _http_for(args.http or config.web.http, args.red)
         try:
             panel = Panel(http, config.web.listen, config.name, launcher, teleop,
-                          token=config.web.token, allow_origins=config.web.allow_origins)
+                          token=config.web.token, allow_origins=config.web.allow_origins, clock=clock_server)
         except OSError as e:
             launcher.printer.close()
             print(f"no se pudo abrir el panel web en {http}: {e}. "
@@ -78,7 +81,32 @@ def cmd_run(args) -> int:
         launcher.stop_all()
         if panel:
             panel.shutdown()
+        if clock_server:
+            clock_server.close()
     return 0
+
+
+def _setup_clock(cfg):
+    """El reloj de este proceso (panel, teleop) y, con source = "agmen", quien
+    publica /clock. Los nodos lo reciben en AGMEN_CLOCK (run.py)."""
+    from . import clock
+
+    if cfg.mode != clock.SIM:
+        clock.configure(clock.REAL)
+        return None, ""
+    if cfg.source == "agmen":
+        from .pubsub import set_default_node_name
+
+        set_default_node_name("agmen run")
+        server = clock.ClockServer(speed=cfg.speed, paused=cfg.paused)
+        server.start()
+        state = "en pausa" if cfg.paused else f"×{cfg.speed:g}"
+        return server, f"reloj: simulación {state}, lo manda agmen run en /clock (pausa, paso y velocidad en el panel)"
+    import os
+
+    os.environ["AGMEN_CLOCK_SOURCE"] = cfg.source
+    clock.configure(clock.SIM, stepped=True, listen=True)
+    return None, f"reloj: simulación, lo manda el nodo '{cfg.source}' en /clock (el tiempo avanza cuando él lo dice)"
 
 
 def _http_for(http: str, red: bool) -> str:

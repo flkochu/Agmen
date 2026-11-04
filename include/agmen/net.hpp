@@ -76,6 +76,9 @@ public:
     /// false si el socket fue movido a otro objeto.
     [[nodiscard]] bool valid() const { return handle_ != -1; }
 
+    /// El socket del sistema operativo (para esperar varios a la vez con wait_readable).
+    [[nodiscard]] std::intptr_t native_handle() const { return handle_; }
+
     /// Puerto local en el que quedó el socket (útil si se abrió con puerto 0).
     [[nodiscard]] std::uint16_t local_port() const;
 
@@ -90,5 +93,9 @@ private:
 
     std::intptr_t handle_ = -1;  // SOCKET en Windows, int en POSIX
 };
+
+/// Espera hasta `timeout` a que alguno de los sockets tenga datos. Marca en
+/// `ready` cuáles los tienen y devuelve cuántos (0 = nadie a tiempo).
+int wait_readable(std::span<const std::intptr_t> sockets, std::chrono::milliseconds timeout, std::span<bool> ready);
 
 }  // namespace agmen::net

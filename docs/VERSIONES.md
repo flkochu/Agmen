@@ -17,7 +17,8 @@
 | **0.5.0** | 2 | Topics con `agmen hub` (RFC 0004), `agmen topic list/info/echo/hz`, `agmen node list` |
 | **0.6.0** | 3 | Panel por WebSocket (RFC 0002): bytes de Agmen al navegador, inspector, varias gráficas, modo red con clave, Foxglove |
 | **0.7.0** | 4 | Archivos `.agmen` (RFC 0005): `agmen gen`, `agmen_add_messages`, `agmen.load` |
-| 0.8.0 | 5 | Executor y tiempo: varias frecuencias por nodo, reloj de Agmen (real/sim) |
+| **0.8.0** | 5 | `Node` con varios ritmos y grupos, reloj de Agmen real/sim con `/clock` (RFC 0006) |
+| 0.9.0 | 6 | Python de primera clase: paquete compilado desde el núcleo de C++ (nanobind) |
 | … | … | Un nivel por versión menor |
 | 1.0.0 | — | API estable: a partir de aquí romper la API exige subir MAYOR |
 

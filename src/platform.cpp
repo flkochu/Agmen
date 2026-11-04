@@ -62,6 +62,9 @@ void init_console() {
     SetConsoleOutputCP(CP_UTF8);
 }
 
+FineTimers::FineTimers() { timeBeginPeriod(1); }
+FineTimers::~FineTimers() { timeEndPeriod(1); }
+
 #else
 
 void sleep_until(std::chrono::steady_clock::time_point deadline) {
@@ -69,6 +72,9 @@ void sleep_until(std::chrono::steady_clock::time_point deadline) {
 }
 
 void init_console() {}
+
+FineTimers::FineTimers() = default;
+FineTimers::~FineTimers() = default;
 
 #endif
 

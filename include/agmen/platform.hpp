@@ -13,6 +13,17 @@ namespace agmen::platform {
 /// (10 ms) sería imposible. Aquí se usa un temporizador de alta resolución.
 void sleep_until(std::chrono::steady_clock::time_point deadline);
 
+/// Mientras exista, pide al sistema temporizadores de 1 ms (Windows: por
+/// defecto, esperar un socket o dormir tiene ~15.6 ms de resolución). En
+/// Linux y macOS no hace nada. Lo usa agmen::Node::spin().
+class FineTimers {
+public:
+    FineTimers();
+    ~FineTimers();
+    FineTimers(const FineTimers&) = delete;
+    FineTimers& operator=(const FineTimers&) = delete;
+};
+
 /// Hace que la consola muestre bien los acentos y "µs" (UTF-8).
 /// En Linux/macOS no hace nada; en Windows cambia la página de códigos.
 void init_console();

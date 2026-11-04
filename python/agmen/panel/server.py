@@ -185,7 +185,7 @@ def udp_receiver(hub: SensorHub, bridge: Bridge | None, listen: str | None, stop
 
     def handle(data: bytes, source: str) -> None:
         nonlocal window_rx, lost_total, errors_total
-        recv_ns = wire.now_ns()
+        recv_ns = wire.now_ns()   # en simulación, el reloj simulado (agmen run lo configura)
         try:
             env, payload = wire.parse(data)
             if env.encoding == wire.ENC_SCHEMA:
@@ -293,8 +293,10 @@ class Teleop:
 class Panel:
     def __init__(self, http: str, listen: str | None, robot_name: str = "",
                  launcher=None, teleop: Teleop | None = None, topics: bool = True,
-                 token: str | None = None, allow_origins: list[str] | None = None) -> None:
+                 token: str | None = None, allow_origins: list[str] | None = None, clock=None) -> None:
         self.http = http
+        self.clock = clock            # agmen.clock.ClockServer si agmen run manda el tiempo
+        self.rhythm: list[dict] = []  # cuentas de los agmen.Node (del hub)
         self.listen = listen
         self.topics = topics
         self.robot_name = robot_name
@@ -335,6 +337,8 @@ class Panel:
                              daemon=True, name="panel-udp").start()
         threading.Thread(target=self.server.serve_forever, daemon=True, name="panel-http").start()
         threading.Thread(target=self.bridge.ticker, args=(self.stop,), daemon=True, name="panel-ticker").start()
+        if self.topics:
+            threading.Thread(target=self._poll_rhythm, daemon=True, name="panel-rhythm").start()
         if open_browser:
             threading.Timer(0.8, webbrowser.open, args=(self.url,)).start()
 
@@ -354,7 +358,54 @@ class Panel:
             "nodes": self.launcher.nodes_info() if self.launcher else [],
             "managed": self.launcher is not None,
             "teleop": self.teleop.info() if self.teleop else None,
+            "clock": self.clock_info(),
+            "rhythm": self.rhythm,
         }
+
+    def clock_info(self) -> dict:
+        from .. import clock as ck
+
+        if self.clock is not None:
+            return self.clock.info()
+        if ck.mode() == ck.SIM:
+            return ck.external_info()
+        return {"mode": ck.REAL}
+
+    def clock_action(self, action: str, value=None) -> str | None:
+        """Pausa, paso y velocidad del tiempo simulado (solo si lo manda agmen run)."""
+        if self.clock is None:
+            from .. import clock as ck
+
+            if ck.mode() == ck.SIM:
+                src = ck.external_info().get("source") or "tu simulador"
+                return f"el tiempo lo manda '{src}' ([clock] source): pausa y velocidad se controlan allá"
+            return "el robot usa el reloj real: pon [clock] mode = \"sim\" en robot.toml para pausar o acelerar"
+        try:
+            if action == "pause":
+                self.clock.pause()
+            elif action == "resume":
+                self.clock.resume()
+            elif action == "step":
+                self.clock.step(float(value if value is not None else 0.1))
+            elif action == "speed":
+                self.clock.set_speed(float(value))
+            else:
+                return f"acción de reloj desconocida '{action}' (pause, resume, step, speed)"
+        except (TypeError, ValueError) as e:
+            return str(e)
+        return None
+
+    def _poll_rhythm(self) -> None:
+        """Cada segundo, las cuentas de los agmen.Node (ciclos saltados, colas)."""
+        from .. import hub as hubmod
+        from ..pubsub import hub_address
+
+        while not self.stop.wait(1.0):
+            try:
+                msgs = hubmod.query(hub_address(), timeout=0.3)
+            except Exception:  # noqa: BLE001 — sin hub, no hay cuentas
+                msgs = []
+            self.rhythm = [f for op, f in msgs if op == "stat"]
 
     def state(self) -> dict:
         """Lo que ven el panel y /api/state. `cpu_s`: CPU usada por este proceso

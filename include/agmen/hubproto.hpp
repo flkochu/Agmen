@@ -64,8 +64,11 @@ void check_topic(std::string_view topic);
 /// Dónde está el hub: $AGMEN_HUB o 127.0.0.1:7390.
 [[nodiscard]] std::string hub_address();
 
-/// Nombre de este nodo: $AGMEN_NODE (lo pone `agmen run`) o "cpp-<pid>".
+/// Nombre de este nodo: $AGMEN_NODE (lo pone `agmen run`), el de agmen::Node, o "cpp-<pid>".
 [[nodiscard]] std::string node_name();
+
+/// El nombre a usar si no hay $AGMEN_NODE (lo llama agmen::Node).
+void set_default_node_name(std::string name);
 
 [[nodiscard]] std::string process_id();
 
