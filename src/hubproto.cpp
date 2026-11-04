@@ -1,5 +1,7 @@
 #include "agmen/hubproto.hpp"
 
+#include "agmen/log.hpp"
+
 #include <mutex>
 
 #include <cstdio>
@@ -212,12 +214,9 @@ void Link::maybe_beat(net::UdpSocket& socket) {
     beat(socket);
     if (!replied_ && !warned_ && now - started_ > std::chrono::seconds(2)) {
         warned_ = true;
-        std::fprintf(stderr,
-                     "[agmen] ⚠ no hay un agmen hub en esta máquina (%s): corre tu robot con "
-                     "'agmen run' o abre 'agmen hub' en otra terminal. Sigo intentando cada "
-                     "segundo.\n",
-                     hub_.to_string().c_str());
-        std::fflush(stderr);
+        log::write("[agmen] ⚠ no hay un agmen hub en esta máquina (" + hub_.to_string() +
+                   "): corre tu robot con 'agmen run' o abre 'agmen hub' en otra terminal. Sigo "
+                   "intentando cada segundo.");
     }
 }
 

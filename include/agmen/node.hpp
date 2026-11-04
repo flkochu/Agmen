@@ -125,76 +125,34 @@ private:
 
 namespace detail {
 
-// Una suscripción sin tipo, para que el executor las maneje todas igual.
-class SubBase {
+std::int64_t steady_now_ns();
+void note_max(std::atomic<std::int64_t>& slot, std::int64_t value);
+
+// Una suscripción, sin tipo: la cola guarda los mensajes sin decodificar y
+// solo se decodifica lo que se entrega (con queue = 1, el más reciente).
+class RawSub {
 public:
-    virtual ~SubBase() = default;
-    [[nodiscard]] virtual std::intptr_t handle() const = 0;
+    using Callback = std::function<void(const RawSample&)>;
+    RawSub(const std::string& w, const TypeInfo& type, Callback cb, const SubscribeOptions& opt);
+
+    [[nodiscard]] std::intptr_t handle() const { return sub_.native_handle(); }
     /// Lee lo que ya llegó al socket (sin esperar) y lo pone en la cola.
-    virtual void pull() = 0;
-    [[nodiscard]] virtual bool pending() const = 0;
+    void pull();
+    [[nodiscard]] bool pending() const { return !q_.empty(); }
     /// Entrega a tu función lo que hay en la cola.
-    virtual void dispatch() = 0;
-    virtual void heartbeat() = 0;
+    void dispatch();
+    void heartbeat() { sub_.heartbeat(); }
     [[nodiscard]] SubscriptionStats stats() const;
 
     std::string where, type, group;
     std::size_t queue = 1;
     std::atomic<std::uint64_t> received{0}, delivered{0}, replaced{0}, dropped{0};
     std::atomic<std::int64_t> worst_run_ns{0};
-};
-
-std::int64_t steady_now_ns();
-void note_max(std::atomic<std::int64_t>& slot, std::int64_t value);
-
-template <wire::Message M>
-class Sub final : public SubBase {
-public:
-    using Callback = std::function<void(const Sample<M>&)>;
-    Sub(const std::string& w, Callback cb, const SubscribeOptions& opt) : sub_(w), cb_(std::move(cb)) {
-        where = w;
-        type = std::string(M::kName);
-        group = opt.group.name;
-        queue = opt.queue == 0 ? 1 : opt.queue;
-    }
-    [[nodiscard]] std::intptr_t handle() const override { return sub_.native_handle(); }
-    void pull() override {
-        // Tope por vuelta: si llegan mensajes sin parar, los temporizadores
-        // del grupo también tienen su turno.
-        for (int i = 0; i < 1024; ++i) {
-            auto s = sub_.receive(std::chrono::milliseconds(0));
-            if (!s) return;
-            ++received;
-            if (q_.size() >= queue) {
-                q_.pop_front();
-                if (queue == 1) {
-                    ++replaced;
-                } else {
-                    ++dropped;
-                }
-            }
-            q_.push_back(std::move(*s));
-        }
-    }
-    [[nodiscard]] bool pending() const override { return !q_.empty(); }
-    void dispatch() override {
-        // Se entrega lo que había al empezar: lo que llegue mientras tanto
-        // espera a la siguiente vuelta.
-        std::deque<Sample<M>> batch;
-        batch.swap(q_);
-        for (const auto& s : batch) {
-            const auto t0 = steady_now_ns();
-            cb_(s);
-            note_max(worst_run_ns, steady_now_ns() - t0);
-            ++delivered;
-        }
-    }
-    void heartbeat() override { sub_.heartbeat(); }
 
 private:
-    Subscriber<M> sub_;
+    SubscriberCore sub_;
     Callback cb_;
-    std::deque<Sample<M>> q_;
+    std::deque<RawSample> q_;
 };
 
 struct NodeImpl;
@@ -224,16 +182,24 @@ public:
     /// recibe `const agmen::Sample<M>&` (sobre + mensaje) o `const M&`.
     template <wire::Message M, class F>
     void subscribe(const std::string& where, F&& cb, SubscribeOptions opt = {}) {
-        typename detail::Sub<M>::Callback fn;
+        detail::RawSub::Callback fn;
         if constexpr (std::is_invocable_v<F&, const Sample<M>&>) {
-            fn = std::forward<F>(cb);
+            fn = [f = std::forward<F>(cb)](const RawSample& r) mutable {
+                const Sample<M> s{r.envelope, M::decode_payload(r.payload), r.from};
+                f(s);
+            };
         } else {
             static_assert(std::is_invocable_v<F&, const M&>,
                           "subscribe<M>: la función debe recibir const agmen::Sample<M>& o const M&");
-            fn = [f = std::forward<F>(cb)](const Sample<M>& s) mutable { f(s.message); };
+            fn = [f = std::forward<F>(cb)](const RawSample& r) mutable { f(M::decode_payload(r.payload)); };
         }
-        add_subscription(std::make_unique<detail::Sub<M>>(where, std::move(fn), opt));
+        subscribe_raw(where, TypeInfo::of<M>(), std::move(fn), opt);
     }
+
+    /// Como subscribe<M>, para tipos que no se compilaron (lo usa el módulo de
+    /// Python): `cb` recibe el sobre y el payload sin decodificar.
+    void subscribe_raw(const std::string& where, const TypeInfo& type, detail::RawSub::Callback cb,
+                       SubscribeOptions opt = {});
 
     /// Llama a `cb` cada `period` (tiempo de Agmen).
     void every(std::chrono::nanoseconds period, std::function<void()> cb, const Group& group = {});
@@ -261,7 +227,6 @@ public:
 
 private:
     void add_heartbeat(std::function<void()> fn);
-    void add_subscription(std::unique_ptr<detail::SubBase> sub);
     void run(std::optional<std::chrono::nanoseconds> duration);
 
     std::unique_ptr<detail::NodeImpl> impl_;

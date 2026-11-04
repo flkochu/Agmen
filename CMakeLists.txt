@@ -75,7 +75,10 @@ add_library(agmen_core
     src/platform.cpp
     src/hubproto.cpp
     src/clock.cpp
-    src/node.cpp)
+    src/node.cpp
+    src/layout.cpp
+    src/log.cpp
+    src/pubsub.cpp)
 add_library(agmen::core ALIAS agmen_core)
 
 # agmen/version.hpp se genera desde VERSION.
@@ -134,6 +137,14 @@ if(AGMEN_BUILD_TESTS)
         AGMEN_VECTORS_FILE="${CMAKE_CURRENT_SOURCE_DIR}/tests/vectors/v1.txt")
     agmen_set_warnings(test_wire)
     add_test(NAME wire COMMAND test_wire)
+
+    # Esquemas en tiempo de ejecución (RFC 0007) contra los vectores.
+    add_executable(test_layout tests/test_layout.cpp)
+    target_link_libraries(test_layout PRIVATE agmen::core)
+    target_compile_definitions(test_layout PRIVATE
+        AGMEN_VECTORS_FILE="${CMAKE_CURRENT_SOURCE_DIR}/tests/vectors/v1.txt")
+    agmen_set_warnings(test_layout)
+    add_test(NAME layout COMMAND test_layout)
 
     # Node y el reloj de Agmen (RFC 0006).
     add_executable(test_node tests/test_node.cpp)

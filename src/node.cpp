@@ -8,6 +8,7 @@
 #include <thread>
 
 #include "agmen/hubproto.hpp"
+#include "agmen/log.hpp"
 #include "agmen/net.hpp"
 #include "agmen/platform.hpp"
 
@@ -26,7 +27,47 @@ void note_max(std::atomic<std::int64_t>& slot, std::int64_t value) {
     }
 }
 
-SubscriptionStats SubBase::stats() const {
+RawSub::RawSub(const std::string& w, const TypeInfo& t, Callback cb, const SubscribeOptions& opt)
+    : sub_(w, t), cb_(std::move(cb)) {
+    where = w;
+    type = t.name;
+    group = opt.group.name;
+    queue = opt.queue == 0 ? 1 : opt.queue;
+}
+
+void RawSub::pull() {
+    // Tope por vuelta: si llegan mensajes sin parar, los temporizadores del
+    // grupo también tienen su turno.
+    for (int i = 0; i < 1024; ++i) {
+        auto s = sub_.receive_raw(std::chrono::milliseconds(0));
+        if (!s) return;
+        ++received;
+        if (q_.size() >= queue) {
+            q_.pop_front();
+            if (queue == 1) {
+                ++replaced;
+            } else {
+                ++dropped;
+            }
+        }
+        q_.push_back(std::move(*s));
+    }
+}
+
+void RawSub::dispatch() {
+    // Se entrega lo que había al empezar: lo que llegue mientras tanto espera
+    // a la siguiente vuelta.
+    std::deque<RawSample> batch;
+    batch.swap(q_);
+    for (const auto& s : batch) {
+        const auto t0 = steady_now_ns();
+        cb_(s);
+        note_max(worst_run_ns, steady_now_ns() - t0);
+        ++delivered;
+    }
+}
+
+SubscriptionStats RawSub::stats() const {
     return SubscriptionStats{
         .where = where,
         .type = type,
@@ -118,7 +159,7 @@ struct Timer {
 
 struct GroupRt {
     std::string name;
-    std::vector<std::unique_ptr<SubBase>> subs;
+    std::vector<std::unique_ptr<RawSub>> subs;
     std::vector<std::unique_ptr<Timer>> timers;
     // Lo más lento del grupo en la ventana actual (para explicar los saltos).
     std::string slow_label;
@@ -183,10 +224,9 @@ struct NodeImpl {
             why = "\n" + std::string(name.size() + 4, ' ') + "Tu función tardó " + format_ms(g.slow_ns) +
                   " y el periodo es " + format_ns(t.period) + unit + ".";
         }
-        std::fprintf(stderr, "[%s] ⚠ %s: %llu ciclos saltados en el último segundo (peor atraso %s, %s).%s\n",
-                     name.c_str(), t.label.c_str(), static_cast<unsigned long long>(t.win_skipped),
-                     format_ms(t.win_worst_late).c_str(), where.c_str(), why.c_str());
-        std::fflush(stderr);
+        log::write("[" + name + "] ⚠ " + t.label + ": " + std::to_string(t.win_skipped) +
+                   " ciclos saltados en el último segundo (peor atraso " + format_ms(t.win_worst_late) + ", " +
+                   where + ")." + why);
     }
 
     // Cuentas al hub (agmen node list, panel). Si el hub no existe o es viejo, no pasa nada.
@@ -406,8 +446,11 @@ void Node::add_heartbeat(std::function<void()> fn) {
     impl_->heartbeats.push_back(std::move(fn));
 }
 
-void Node::add_subscription(std::unique_ptr<detail::SubBase> sub) {
+void Node::subscribe_raw(const std::string& where, const TypeInfo& type, detail::RawSub::Callback cb,
+                         SubscribeOptions opt) {
     if (impl_->running.load()) throw std::logic_error("Node::subscribe: llámalo antes de spin()");
+    if (!cb) throw std::invalid_argument("Node::subscribe: falta la función");
+    auto sub = std::make_unique<detail::RawSub>(where, type, std::move(cb), opt);
     std::lock_guard lock(impl_->mu);
     auto& g = impl_->group(sub->group);
     g.subs.push_back(std::move(sub));

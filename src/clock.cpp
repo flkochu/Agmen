@@ -6,6 +6,7 @@
 #include <mutex>
 #include <thread>
 
+#include "agmen/log.hpp"
 #include "agmen/pubsub.hpp"
 
 namespace agmen {
@@ -87,7 +88,7 @@ void ensure_configured_locked(Global& s) {
         const std::string src = env("AGMEN_CLOCK_SOURCE");
         s.stepped = !src.empty() && src != "agmen";
     } else if (!m.empty() && m != "real") {
-        std::fprintf(stderr, "[agmen] ⚠ AGMEN_CLOCK='%s' no existe (usa real o sim): uso el reloj real\n", m.c_str());
+        log::write("[agmen] ⚠ AGMEN_CLOCK='" + m + "' no existe (usa real o sim): uso el reloj real");
     }
 }
 
@@ -100,7 +101,7 @@ void listen_forever() {
                 if (auto s = sub.receive(std::chrono::milliseconds(200))) update(s->message);
             }
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "[agmen] ⚠ reloj de simulación: %s (reintento en 1 s)\n", e.what());
+            log::write(std::string("[agmen] ⚠ reloj de simulación: ") + e.what() + " (reintento en 1 s)");
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }

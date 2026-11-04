@@ -9,6 +9,8 @@
 
 #include "agmen/clock.hpp"
 #include "agmen/hubproto.hpp"
+#include "agmen/layout.hpp"
+#include "agmen/log.hpp"
 #include "agmen/net.hpp"
 #include "agmen/node.hpp"
 #include "agmen/platform.hpp"

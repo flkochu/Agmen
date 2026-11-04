@@ -20,11 +20,14 @@
 // topic, de registrarse con el hub y latir cada segundo. No usan hilos: el
 // latido sale dentro de publish() y receive(). Si un nodo pasa más de 3 s sin
 // llamarlos, el hub lo da por muerto; en esos ciclos lentos, llama heartbeat().
+//
+// Por dentro, Publisher<M> y Subscriber<M> son una capa delgada sobre
+// PublisherCore y SubscriberCore, que no dependen del tipo: los usa también el
+// módulo de Python (agmen._core) con tipos que no se compilaron (RFC 0007).
 #pragma once
 
 #include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -37,26 +40,87 @@
 #include "agmen/net.hpp"
 #include "agmen/wire.hpp"
 
-namespace agmen::clock {
-[[nodiscard]] wire::Clock domain();   // agmen/clock.hpp
-}
-
 namespace agmen {
 
 /// Cada cuánto el Publisher repite el anuncio de su esquema.
 inline constexpr std::chrono::milliseconds kAnnounceEvery{1000};
 
-namespace detail {
+/// Lo que define a un tipo de mensaje sin conocerlo en compilación.
+struct TypeInfo {
+    std::string name;          ///< "MotorCommand"
+    std::string schema_text;   ///< canónico completo: "agmen/1 MotorCommand{...}"
+    std::uint64_t schema_id = 0;
+    std::size_t payload_size = 0;   ///< tamaño compact (0 = no revisar)
 
-inline void check_topic_or_throw(const std::string& topic) {
-    try {
-        hub::check_topic(topic);
-    } catch (const std::invalid_argument& e) {
-        throw wire::WireError(wire::WireError::Kind::HubRejected, e.what());
+    template <wire::Message M>
+    [[nodiscard]] static TypeInfo of() {
+        return TypeInfo{std::string(M::kName), wire::schema_text<M>(), wire::schema_id_v<M>,
+                        wire::compact_size_v<M>};
     }
-}
+};
 
-}  // namespace detail
+/// Publica payloads de un tipo (ya codificados). Seguro entre hilos.
+class PublisherCore {
+public:
+    /// `to` = topic ("/cmd") o dirección ("127.0.0.1:7500"); con dirección,
+    /// `topic` es la etiqueta que viaja en el sobre ("" = "/" + nombre del tipo).
+    PublisherCore(const std::string& to, const TypeInfo& type, std::string topic = "");
+    PublisherCore(PublisherCore&&) noexcept;
+    PublisherCore& operator=(PublisherCore&&) noexcept;
+    PublisherCore(const PublisherCore&) = delete;
+    PublisherCore& operator=(const PublisherCore&) = delete;
+    ~PublisherCore();
+
+    /// Manda un payload compact; t_data en ns de Agmen.
+    net::SendStatus publish_payload(wire::ByteView payload, std::int64_t t_data);
+    void announce();
+    void heartbeat();
+
+    [[nodiscard]] std::uint64_t seq() const;
+    [[nodiscard]] std::uint64_t source_id() const;
+    [[nodiscard]] const std::string& topic() const;
+    [[nodiscard]] std::size_t subscribers() const;
+    [[nodiscard]] const TypeInfo& type() const;
+
+private:
+    struct State;
+    std::unique_ptr<State> s_;
+};
+
+/// Un mensaje recibido, todavía sin decodificar el payload.
+struct RawSample {
+    wire::Envelope envelope;
+    wire::Bytes payload;
+    std::string from;   ///< "ip:puerto"
+};
+
+/// Recibe mensajes de un tipo, sin decodificar el payload. Valida el sobre, el
+/// tipo y el tamaño; procesa los anuncios y el control del hub.
+class SubscriberCore {
+public:
+    SubscriberCore(const std::string& where, const TypeInfo& type);
+    SubscriberCore(SubscriberCore&&) noexcept;
+    SubscriberCore& operator=(SubscriberCore&&) noexcept;
+    SubscriberCore(const SubscriberCore&) = delete;
+    SubscriberCore& operator=(const SubscriberCore&) = delete;
+    ~SubscriberCore();
+
+    /// Espera hasta `timeout` un mensaje. std::nullopt si no llegó. Lanza
+    /// wire::WireError si llega algo inválido o de otro tipo.
+    [[nodiscard]] std::optional<RawSample> receive_raw(std::chrono::milliseconds timeout);
+    void heartbeat();
+
+    [[nodiscard]] const std::string& last_from() const;
+    [[nodiscard]] std::intptr_t native_handle() const;
+    [[nodiscard]] const std::string& where() const;
+    [[nodiscard]] const TypeInfo& type() const;
+    /// Anuncios vistos: schema_id → (topic, esquema).
+    [[nodiscard]] const std::map<std::uint64_t, wire::Announcement>& announced() const;
+
+private:
+    struct State;
+    std::unique_ptr<State> s_;
+};
 
 template <wire::Message M>
 class Publisher {
@@ -64,43 +128,8 @@ public:
     /// `to` = topic ("/cmd") o dirección del receptor ("127.0.0.1:7500"). Con
     /// dirección, `topic` es solo una etiqueta que viaja en el sobre.
     explicit Publisher(const std::string& to, std::string topic = "/" + std::string(M::kName))
-        // Por topic todo es local (nivel 2): 127.0.0.1, así Windows no pregunta por el firewall.
-        : mu_(std::make_unique<std::mutex>()),
-          socket_(net::UdpSocket::bind(hub::is_topic(to) ? "127.0.0.1:0" : "0.0.0.0:0")),
-          topic_(hub::is_topic(to) ? to : std::move(topic)),
-          source_id_(wire::random_source_id()),
-          schema_text_(wire::schema_text<M>()),
-          buf_(65536) {
+        : core_(to, TypeInfo::of<M>(), std::move(topic)) {
         AGMEN_CHECK_SCHEMA(M);
-        if (hub::is_topic(to)) {
-            detail::check_topic_or_throw(to);
-            const auto id = hub::hex16(source_id_);
-            link_.emplace(id, hub::line("pub", {{"id", id},
-                                                {"node", hub::node_name()},
-                                                {"pid", hub::process_id()},
-                                                {"topic", topic_},
-                                                {"schema", hub::hex16(wire::schema_id_v<M>)},
-                                                {"type", std::string(M::kName)},
-                                                {"text", schema_text_}}));
-            link_->beat(socket_);
-            // Espera breve a la primera respuesta del hub: si ya hay receptores,
-            // el primer mensaje no se pierde por no saber a quién mandarlo.
-            const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
-            while (!link_->replied() && std::chrono::steady_clock::now() < end) {
-                drain(std::chrono::milliseconds(10));
-            }
-        } else {
-            dests_.push_back(net::Address::resolve(to));
-        }
-        topic_id_ = wire::topic_id(topic_);
-    }
-
-    Publisher(Publisher&&) noexcept = default;
-    Publisher& operator=(Publisher&&) noexcept = default;
-    Publisher(const Publisher&) = delete;
-    Publisher& operator=(const Publisher&) = delete;
-    ~Publisher() {
-        if (link_ && socket_.valid()) link_->bye(socket_);
     }
 
     /// Manda `msg` con t_data = ahora. NoListener = no hay a quién entregarlo
@@ -108,108 +137,35 @@ public:
     net::SendStatus publish(const M& msg) { return publish(msg, wire::now_ns()); }
 
     /// Manda `msg`; t_data = instante al que corresponden los datos (ej. la
-    /// captura del sensor), en ns desde la época Unix.
+    /// captura del sensor), en ns de Agmen.
     net::SendStatus publish(const M& msg, std::int64_t t_data) {
-        std::lock_guard lock(*mu_);   // se puede publicar desde varios grupos de un Node (hilos)
-        if (link_) {
-            link_->maybe_beat(socket_);
-            drain(std::chrono::milliseconds(0));
-            if (!link_->error().empty()) {
-                throw wire::WireError(wire::WireError::Kind::HubRejected,
-                                      "el hub rechazó publicar en '" + topic_ + "': " +
-                                          link_->error());
-            }
+        wire::Bytes payload;
+        payload.reserve(wire::compact_size_v<M>);
+        msg.encode_payload(payload);
+        if (payload.size() != wire::compact_size_v<M>) {
+            // Un error de programación: el encode_payload no sigue al esquema.
+            throw std::logic_error("encode_payload de '" + std::string(M::kName) + "' produjo " +
+                                   std::to_string(payload.size()) + " bytes, pero su esquema mide " +
+                                   std::to_string(wire::compact_size_v<M>));
         }
-        const auto now = std::chrono::steady_clock::now();
-        if (!announced_ || now - last_announce_ >= kAnnounceEvery) announce_locked();
-        const auto packet = wire::encode(msg, wire::Envelope{
-                                                  .topic_id = topic_id_,
-                                                  .source_id = source_id_,
-                                                  .seq = seq_,
-                                                  .t_data = t_data,
-                                                  .t_pub = wire::now_ns(),
-                                                  .clock = clock::domain(),
-                                              });
-        ++seq_;
-        auto status = net::SendStatus::NoListener;
-        for (const auto& d : dests_) {
-            if (socket_.send_to(packet, d) == net::SendStatus::Ok) status = net::SendStatus::Ok;
-        }
-        return status;
+        return core_.publish_payload(payload, t_data);
     }
 
     /// Manda el anuncio del esquema ya, a todos los receptores (publish() lo hace solo).
-    void announce() {
-        std::lock_guard lock(*mu_);
-        announce_locked();
-    }
+    void announce() { core_.announce(); }
 
-private:
-    void announce_locked() {
-        const auto ann = announcement();
-        for (const auto& d : dests_) (void)socket_.send_to(ann, d);
-        announced_ = true;
-        last_announce_ = std::chrono::steady_clock::now();
-    }
-
-public:
     /// Late con el hub y lee sus respuestas. Llámalo si tu ciclo publica menos
     /// de una vez cada 3 s (si no, publish() ya lo hace).
-    void heartbeat() {
-        if (!link_) return;
-        std::lock_guard lock(*mu_);
-        link_->maybe_beat(socket_);
-        drain(std::chrono::milliseconds(0));
-    }
+    void heartbeat() { core_.heartbeat(); }
 
-    [[nodiscard]] std::uint64_t seq() const { return seq_; }
-    [[nodiscard]] std::uint64_t source_id() const { return source_id_; }
-    [[nodiscard]] const std::string& topic() const { return topic_; }
+    [[nodiscard]] std::uint64_t seq() const { return core_.seq(); }
+    [[nodiscard]] std::uint64_t source_id() const { return core_.source_id(); }
+    [[nodiscard]] const std::string& topic() const { return core_.topic(); }
     /// A cuántos receptores se manda cada mensaje.
-    [[nodiscard]] std::size_t subscribers() const { return dests_.size(); }
+    [[nodiscard]] std::size_t subscribers() const { return core_.subscribers(); }
 
 private:
-    wire::Bytes announcement() const {
-        return wire::encode_announcement(schema_text_, topic_,
-                                         wire::Envelope{.source_id = source_id_,
-                                                        .seq = seq_,
-                                                        .t_pub = wire::now_ns(),
-                                                        .clock = clock::domain()});
-    }
-
-    /// Lee las respuestas del hub (a quién mandarle los datos).
-    void drain(std::chrono::milliseconds wait) {
-        while (const auto rx = socket_.recv_from(buf_, wait)) {
-            std::optional<std::vector<std::string>> subs;
-            link_->handle(wire::ByteView(buf_.data(), rx->size), subs);
-            if (subs) {
-                std::vector<net::Address> fresh;
-                fresh.reserve(subs->size());
-                const auto ann = announcement();
-                for (const auto& a : *subs) {
-                    fresh.push_back(net::Address::resolve(a));
-                    bool known = false;
-                    for (const auto& d : dests_) known = known || d == fresh.back();
-                    if (!known) (void)socket_.send_to(ann, fresh.back());  // recién llegado
-                }
-                dests_ = std::move(fresh);
-            }
-            wait = std::chrono::milliseconds(0);
-        }
-    }
-
-    std::unique_ptr<std::mutex> mu_;
-    net::UdpSocket socket_;
-    std::string topic_;
-    std::uint64_t topic_id_ = 0;
-    std::uint64_t source_id_;
-    std::string schema_text_;
-    std::vector<std::uint8_t> buf_;
-    std::vector<net::Address> dests_;
-    std::optional<hub::Link> link_;
-    std::uint64_t seq_ = 0;
-    bool announced_ = false;
-    std::chrono::steady_clock::time_point last_announce_{};
+    PublisherCore core_;
 };
 
 /// Un mensaje recibido.
@@ -224,125 +180,36 @@ template <wire::Message M>
 class Subscriber {
 public:
     /// `where` = topic ("/cmd") o dirección donde escuchar ("127.0.0.1:7500").
-    explicit Subscriber(const std::string& where)
-        : where_(where),
-          socket_(net::UdpSocket::bind(hub::is_topic(where) ? "127.0.0.1:0" : where)),
-          buf_(65536) {
-        AGMEN_CHECK_SCHEMA(M);
-        if (hub::is_topic(where)) {
-            detail::check_topic_or_throw(where);
-            topic_ = where;
-            const auto id = hub::hex16(wire::random_source_id());
-            link_.emplace(id, hub::line("sub", {{"id", id},
-                                                {"node", hub::node_name()},
-                                                {"pid", hub::process_id()},
-                                                {"topic", where},
-                                                {"schema", hub::hex16(wire::schema_id_v<M>)},
-                                                {"type", std::string(M::kName)},
-                                                {"port", std::to_string(socket_.local_port())}}));
-            link_->beat(socket_);
-        }
-    }
-
-    Subscriber(Subscriber&&) noexcept = default;
-    Subscriber& operator=(Subscriber&&) noexcept = default;
-    Subscriber(const Subscriber&) = delete;
-    Subscriber& operator=(const Subscriber&) = delete;
-    ~Subscriber() {
-        if (link_ && socket_.valid()) link_->bye(socket_);
-    }
+    explicit Subscriber(const std::string& where) : core_(where, TypeInfo::of<M>()) { AGMEN_CHECK_SCHEMA(M); }
 
     /// Espera hasta `timeout` un mensaje de tipo M. std::nullopt si no llegó.
     /// Lanza wire::WireError si llega algo inválido, de otro tipo, o si el hub
     /// rechazó el topic.
     [[nodiscard]] std::optional<Sample<M>> receive(std::chrono::milliseconds timeout) {
-        using namespace std::chrono;
-        const auto deadline = steady_clock::now() + timeout;
-        for (;;) {
-            if (link_) link_->maybe_beat(socket_);
-            const auto left = duration_cast<milliseconds>(deadline - steady_clock::now());
-            const auto rx = socket_.recv_from(buf_, left.count() > 0 ? left : milliseconds(0));
-            if (!rx) return std::nullopt;
-            last_from_ = rx->from;
-            const wire::ByteView data(buf_.data(), rx->size);
-            if (link_) {
-                std::optional<std::vector<std::string>> unused;
-                if (link_->handle(data, unused)) {
-                    if (!link_->error().empty()) {
-                        throw wire::WireError(wire::WireError::Kind::HubRejected,
-                                              "el hub rechazó escuchar '" + topic_ + "': " +
-                                                  link_->error());
-                    }
-                    if (steady_clock::now() >= deadline) return std::nullopt;
-                    continue;
-                }
-            }
-            const auto [env, payload] = wire::Envelope::read_from(data);
-            if (env.encoding == wire::Encoding::Announcement) {
-                announced_[env.schema_id] = wire::read_announcement(env, payload);
-                if (steady_clock::now() >= deadline) return std::nullopt;
-                continue;
-            }
-            if (env.schema_id != wire::schema_id_v<M>) {
-                std::string detail;
-                if (const auto it = announced_.find(env.schema_id); it != announced_.end()) {
-                    detail = it->second.schema + ", topic " + it->second.topic;
-                }
-                throw wire::WireError(
-                    wire::WireError::Kind::TypeMismatch,
-                    wire::type_mismatch_text(wire::schema_text<M>(), wire::schema_id_v<M>,
-                                             env.schema_id, detail));
-            }
-            auto decoded = wire::decode<M>(data);
-            warn_clock(decoded.envelope);
-            return Sample<M>{decoded.envelope, decoded.message, rx->from};
-        }
+        auto raw = core_.receive_raw(timeout);
+        if (!raw) return std::nullopt;
+        return Sample<M>{raw->envelope, M::decode_payload(raw->payload), std::move(raw->from)};
     }
 
     /// Late con el hub. Llámalo si pasas más de 3 s sin llamar receive().
-    void heartbeat() {
-        if (link_) link_->maybe_beat(socket_);
-    }
+    void heartbeat() { core_.heartbeat(); }
 
     /// "ip:puerto" del último paquete recibido (útil al reportar un error).
-    [[nodiscard]] const std::string& last_from() const { return last_from_; }
+    [[nodiscard]] const std::string& last_from() const { return core_.last_from(); }
 
     /// El socket, para que un Node espere varias suscripciones a la vez.
-    [[nodiscard]] std::intptr_t native_handle() const { return socket_.native_handle(); }
+    [[nodiscard]] std::intptr_t native_handle() const { return core_.native_handle(); }
 
     /// Topic o dirección donde escucha.
-    [[nodiscard]] const std::string& where() const { return where_; }
+    [[nodiscard]] const std::string& where() const { return core_.where(); }
 
     /// Anuncios vistos: schema_id → (topic, esquema).
     [[nodiscard]] const std::map<std::uint64_t, wire::Announcement>& announced() const {
-        return announced_;
+        return core_.announced();
     }
 
 private:
-    /// RFC 0001 §8.8: un mensaje de otro reloj (real en un robot simulado, o al
-    /// revés) se avisa una vez. No es un error: el dato llega igual.
-    void warn_clock(const wire::Envelope& env) {
-        if (clock_warned_ || env.clock == clock::domain()) return;
-        clock_warned_ = true;
-        const auto name = [](wire::Clock c) {
-            return c == wire::Clock::Sim ? "simulación" : c == wire::Clock::Replay ? "reproducción" : "real";
-        };
-        std::fprintf(stderr,
-                     "[agmen] ⚠ '%s' llega con reloj %s y este nodo usa reloj %s. ¿Corriste el nodo fuera de "
-                     "'agmen run'? Usa el mismo reloj: AGMEN_CLOCK=%s\n",
-                     where_.c_str(), name(env.clock), name(clock::domain()),
-                     env.clock == wire::Clock::Sim ? "sim" : "real");
-        std::fflush(stderr);
-    }
-
-    bool clock_warned_ = false;
-    std::string where_;
-    net::UdpSocket socket_;
-    std::vector<std::uint8_t> buf_;
-    std::optional<hub::Link> link_;
-    std::string topic_;
-    std::map<std::uint64_t, wire::Announcement> announced_;
-    std::string last_from_;
+    SubscriberCore core_;
 };
 
 }  // namespace agmen
