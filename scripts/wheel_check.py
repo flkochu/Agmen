@@ -83,7 +83,10 @@ def main() -> int:
 
     exe = Path(sys.executable).with_name("agmen.exe" if os.name == "nt" else "agmen")
     cmd = [str(exe)] if exe.exists() else [sys.executable, "-m", "agmen"]
-    out = subprocess.run([*cmd, "--version"], capture_output=True, text=True, check=False).stdout.strip()
+    # agmen siempre escribe en UTF-8 (agmen/__init__.py); en Windows el
+    # predeterminado de subprocess es cp1252 y "núcleo" llegaría como "nÃºcleo".
+    out = subprocess.run([*cmd, "--version"], capture_output=True, text=True, encoding="utf-8",
+                         errors="replace", check=False).stdout.strip()
     check("agmen --version", out == _backend.describe(), out)
 
     failed = results.count(False)
