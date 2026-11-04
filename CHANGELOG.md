@@ -7,9 +7,66 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 
 ## [Sin publicar]
 
-### Planeado (nivel 7, versión 0.10.0)
-- Codificación `arrow`: imágenes, tensores y nubes de puntos; cámara en el
-  panel; el puente del panel en C++.
+### Planeado (nivel 8, versión 0.11.0)
+- Memoria compartida para no copiar imágenes y tensores entre procesos.
+
+## [0.10.0] — 2026-11-04
+
+**Nivel 7: imágenes, tensores y texto** (RFC 0008, aceptado). Los mensajes con
+campos de tamaño variable viajan con la codificación `arrow` y por TCP; los de
+siempre no cambian ni un byte.
+
+### Agregado
+- **Tipos de tamaño variable en `.agmen`**: `string`, `bytes`, `T[]` y
+  `tensor<T,N>` (también en esquemas escritos a mano). Un `message` con alguno
+  va en la codificación **`arrow`** (RFC 0001 §6: un RecordBatch de Arrow IPC
+  que `pyarrow`, Polars y DuckDB leen tal cual). Agmen implementa el subconjunto
+  que usan sus tipos en C++ (`agmen::arrow`), Python (`agmen.arrow`, la
+  referencia) y JavaScript (`agmen.js`), con los mismos bytes
+  (`tests/vectors/v1.txt`); en el CI, `pyarrow` lee lo que escribe Agmen y al
+  revés.
+- **Transporte TCP** para los mensajes `arrow` (hasta 64 MiB;
+  `AGMEN_MAX_MESSAGE_MB`): el `Subscriber` escucha también en un puerto TCP que
+  registra en el hub (`sub ... tcp=`); el `Publisher` se conecta a cada uno y
+  un hilo termina de mandar lo que no cupo de una vez. **Un suscriptor lento
+  recibe solo el mensaje más nuevo** y no frena al publicador ni a los demás
+  (`Publisher.dropped` cuenta los descartados). Los `compact` siguen por UDP.
+- **`agmen.msgs`**: `Imagen` e `ImagenComprimida`, con los mismos campos que
+  los tipos de Foxglove. `import "agmen/msgs.agmen"` en tu `.agmen`,
+  `from agmen.msgs import Imagen` en Python (`Imagen.from_array()` y
+  `as_array()` van y vienen de NumPy sin copiar), `<agmen/msgs.hpp>` en C++.
+- **`agmen gen`** genera para los tipos arrow `to_value()`/`from_value()` y, en
+  los `message`, `encode_payload`/`decode_payload` con `agmen::arrow::Codec`;
+  `agmen.load(..., numpy=True)` da `T[]` y los tensores como NumPy sin copiar;
+  `agmen.Tensor` para tensores sin NumPy. Valores por defecto `string s = "hola"`
+  y `f32[] x = [1, 2]`.
+- **Panel: tarjeta Cámara** para `Imagen` (cruda, en un canvas, 10 imágenes
+  por segundo por defecto) e `ImagenComprimida` (JPEG/PNG/WebP, a 30), con
+  selector de imágenes por segundo; MB/s por topic; el inspector y
+  `agmen echo` resumen los campos grandes (`data: <921 600 bytes>`);
+  `agmen topic hz` muestra MB/s. **Foxglove** ve `Imagen` como
+  `foxglove.RawImage` e `ImagenComprimida` como `foxglove.CompressedImage`.
+- Ejemplo `examples/vision` (capítulo 14): una cámara (OpenCV o un cuadro que
+  se mueve), una IA en Python que la mira con NumPy y un contador en C++.
+  `scripts/paralelo_check.py` mide una cámara de 640×480 a 30 fps (27 MB/s)
+  hacia el panel y dos navegadores, uno que no lee, mientras un control a
+  1 kHz no pierde ciclos; `scripts/py_bench.py` mide la imagen de 640×480.
+- En C++: `agmen::schema::Layout` lee los tipos variables; `TcpStream`,
+  `TcpListener` y `wait_io` en `agmen/net.hpp`; `Subscriber::native_handles()`
+  y `tcp_port()`; `wire::is_arrow_v<M>`, `encoding_v<M>`, `max_message()`.
+
+### Corregido
+- **macOS no dejaba mandar mensajes de más de 9 KB** (`Message too long`,
+  `net.inet.udp.maxdgram`): todos los sockets UDP piden `SO_SNDBUF` de
+  65 507 bytes. Prueba en el CI con un `compact` de 60 KB.
+- El límite de mensajes por segundo del panel (`max_hz`) dejaba pasar uno de
+  cada dos cuadros de una cámara que publica exactamente a ese ritmo.
+
+### Cambiado
+- El `[[mux]]` rechaza con un aviso claro los tipos arrow: arbitra comandos
+  de actuadores (`compact`).
+- El puente del panel sigue en Python (RFC 0008, D6): medido con la cámara de
+  27 MB/s, usa ~5 % de un núcleo y el control a 1 kHz no pierde ciclos.
 
 ## [0.9.0] — 2026-11-04
 

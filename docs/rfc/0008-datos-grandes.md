@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Estado** | 📝 **Propuesta**: faltan las decisiones de la [sección 5](#5-decisiones) |
+| **Estado** | ✅ **Aceptado** (2026-11-04, D1–D6 = a) e **implementado en Agmen 0.10.0**. Lo implementado, en la [sección 8](#8-lo-que-se-implementó-en-0100) |
 | **Depende de** | RFC 0001 (sobre v1 y codificación `arrow`), RFC 0002 (panel), RFC 0004 (hub y topics), RFC 0005 (`.agmen`), RFC 0007 (núcleo de C++ en Python) |
 | **Versión** | Agmen 0.10.0 |
 | **Requisitos** | a (datos grandes), b (Python de primera clase), h (interfaz que no le cueste al robot) |
@@ -71,7 +71,7 @@ message Deteccion {
   f32       confianza
   f32[4]    caja             # fijo: sigue igual que hoy
   f32[]     puntos           # tamaño variable
-  tensor<f32> mascara        # forma dinámica, por ejemplo [alto, ancho]
+  tensor<f32,2> mascara      # 2 dimensiones; la forma ([alto, ancho]) viaja con él
 }
 ```
 
@@ -79,8 +79,8 @@ message Deteccion {
 |---|---|---|---|
 | `string` | Texto UTF-8 | `str` | `std::string` |
 | `bytes` | Bytes sin interpretar | `memoryview` (sin copiar) | `std::vector<std::uint8_t>` |
-| `T[]` | Arreglo de tamaño variable | tupla, o `numpy.ndarray` con `numpy=True` (sin copiar) | `std::vector<T>` |
-| `tensor<T>` | Arreglo con forma (por ejemplo `[480, 640, 3]`) | `numpy.ndarray` con su forma (sin copiar), o `memoryview` con forma si no hay NumPy | `agmen::Tensor<T>` (forma + datos) |
+| `T[]` | Arreglo de tamaño variable | lista, o `numpy.ndarray` con `numpy=True` (sin copiar) | `std::vector<T>` |
+| `tensor<T,N>` | Arreglo de N dimensiones; su forma (por ejemplo `[480, 640, 3]`) viaja con él | `numpy.ndarray` con su forma (sin copiar), o `agmen.Tensor` si no hay NumPy | `agmen::Tensor<T>` (`shape` + `data`) |
 
 - **Agmen elige la codificación sola**: si un mensaje tiene algún campo
   variable, va en `arrow`; si no, en `compact` como hoy. Los mensajes que ya
@@ -112,10 +112,11 @@ message Deteccion {
 
 ### 3.3 Imágenes estándar
 
-Agmen trae un `std.agmen` con dos tipos que usa todo el mundo (D4):
+Agmen trae un `msgs.agmen` con dos tipos que usa todo el mundo (D4). (Se
+llama `msgs` y no `std` porque en C++ `agmen::std` chocaría con `std::`.)
 
 ```
-import "agmen/std.agmen"
+import "agmen/msgs.agmen"
 
 message Imagen {                 # cruda (los mismos campos que foxglove.RawImage)
   time   timestamp
@@ -139,7 +140,7 @@ Con OpenCV, publicar tu cámara queda así:
 
 ```python
 import cv2, agmen
-from agmen.std import ImagenComprimida
+from agmen.msgs import ImagenComprimida
 
 node = agmen.Node("camara")
 pub = node.publisher(ImagenComprimida, "/camara")
@@ -179,13 +180,14 @@ def ver(s):
 
 ### 3.5 Límites claros
 
-- Un mensaje mide como mucho **64 MiB** por defecto (configurable). Más que
-  eso es casi siempre un error, y se reporta así:
-  `'/mapa' mandó 130 MB y el máximo es 64 MiB (agmen.max_message)`.
+- Un mensaje mide como mucho **64 MiB** por defecto (`AGMEN_MAX_MESSAGE_MB`).
+  Más que eso es casi siempre un error, y se reporta así: `'/mapa' mide
+  130.0 MiB y el máximo de un mensaje es 64 MiB: si de verdad lo necesitas,
+  sube AGMEN_MAX_MESSAGE_MB`.
 - `agmen topic echo` y el inspector del panel resumen los campos grandes:
-  `data: <921 600 bytes>`, `mascara: tensor<f32> [480, 640]`.
-- `agmen topic hz` y `agmen topic info` muestran también **MB/s** y cuántos
-  mensajes se descartaron por suscriptor lento.
+  `data: <921 600 bytes>`, `mascara: tensor [480, 640]`.
+- `agmen topic hz` y el panel muestran también **MB/s**; `Publisher.dropped`
+  cuenta los mensajes que no se entregaron a un suscriptor lento.
 
 ## 4. Lo que NO entra en 0.10.0
 
@@ -195,7 +197,7 @@ def ver(s):
 - **Video comprimido (H.264, WebRTC)**: gasta mucho menos WiFi que JPEG, pero
   es mucho más complejo; se ve después de tener el nivel 11.
 - **Nube de puntos y mapa estándar** (`PointCloud`, `Mapa`): se pueden definir
-  en tu `.agmen` con `tensor<f32>`; tipos estándar y vista 3D, nivel 14.
+  en tu `.agmen` con `tensor<f32,2>`; tipos estándar y vista 3D, nivel 14.
 - **Varias filas por mensaje** (agrupar 10 lecturas en un mensaje, RFC 0001
   §6) y **compresión** dentro de Arrow: después.
 
@@ -203,10 +205,10 @@ def ver(s):
 
 | # | Pregunta | Opciones | Recomendada | Por qué |
 |---|---|---|---|---|
-| **D1** | ¿Cómo se escriben y leen los mensajes `arrow`? | (a) **Agmen implementa solo la parte de Arrow IPC que usan sus tipos, en C++, Python y JavaScript, como ya hace con `compact`; el CI comprueba con `pyarrow` que los bytes son Arrow válido en los dos sentidos**, (b) el núcleo de C++ usa **nanoarrow** (la versión ligera oficial de Arrow, en C) y el navegador una librería de Arrow para JavaScript, (c) el núcleo usa **Arrow C++** completo | **(a)** | Con (a) el núcleo sigue sin dependencias (regla 9), Python puro y el navegador leen lo mismo, y `pyarrow` es el juez en el CI. (b) es código probado, pero el respaldo de Python puro necesitaría `pyarrow` (~40 MB) para leer una imagen, y el panel cargaría una librería de 43–210 KB. (c) es una dependencia enorme y difícil de compilar en Windows y en la Raspberry |
+| **D1** | ¿Cómo se escriben y leen los mensajes `arrow`? | (a) **Agmen implementa solo la parte de Arrow IPC que usan sus tipos, en C++, Python y JavaScript, como ya hace con `compact`; el CI comprueba con `pyarrow` que los bytes son Arrow válido en los dos sentidos**, (b) el núcleo de C++ usa **nanoarrow** (la versión ligera oficial de Arrow, en C) y el navegador una librería de Arrow para JavaScript, (c) el núcleo usa **Arrow C++** completo | **(a)** | Con (a) el núcleo sigue sin dependencias (regla 9), Python puro y el navegador leen lo mismo, y `pyarrow` es el juez en el CI. Con (b) cada lenguaje usaría un escritor distinto (nanoarrow en C++, otro en JavaScript, `nanoarrow` para Python en el respaldo puro): todos darían Arrow válido, pero no necesariamente los mismos bytes, y la alineación a 64 bytes (RFC 0001) dependería de cada librería; además el respaldo de Python puro necesitaría una librería compilada justo donde no hay wheel. (c) es una dependencia enorme y difícil de compilar en Windows y en la Raspberry |
 | **D2** | ¿Cómo viajan los mensajes grandes? | (a) **Los mensajes `arrow` van por TCP (una conexión del suscriptor al publicador); los `compact` siguen por UDP**, (b) partir el mensaje en varios paquetes UDP, como DDS, (c) esperar al nivel 8 y limitar `arrow` a ~64 KB | **(a)** | (b) es lo que hace ROS 2 con DDS, y en Linux pierde imágenes si no subes `rmem_max` a mano en cada computadora; en macOS ni siquiera deja mandar más de 9 KB por paquete sin ajustarlo. (a) es lo que hace Zenoh y funciona sin tocar el sistema. (c) deja fuera justo las cámaras |
 | **D3** | ¿Qué pasa si un suscriptor va más lento que el publicador? | (a) **El publicador guarda como mucho el mensaje más nuevo para ese suscriptor y tira los viejos (y los cuenta)**; un suscriptor puede pedir más (`queue = N`), (b) el publicador espera a que el lento lea, (c) se cierra la conexión del lento | **(a)** | Con (b), una IA lenta frena a la cámara y a todos los demás suscriptores. Con (a), cada quien recibe lo más nuevo que alcanza a leer, que es lo que quieres de una cámara o un LiDAR. Es la misma regla que `queue = 1` del `Node` (RFC 0006) |
-| **D4** | ¿Agmen trae tipos de imagen? | (a) **Sí: `Imagen` e `ImagenComprimida` en `agmen/std.agmen`, con los mismos campos que los de Foxglove**, (b) no; cada quien define el suyo y el panel adivina por los nombres de los campos, (c) solo tensores (`tensor<u8>` de forma `[alto, ancho, 3]`) | **(a)** | Con (a), la cámara, la IA, el panel, Foxglove y las grabaciones del nivel 9 hablan el mismo tipo sin ponerse de acuerdo. (b) hace que dos cámaras no se entiendan. (c) no dice si es RGB o BGR (el error más común con OpenCV) ni sirve para JPEG |
+| **D4** | ¿Agmen trae tipos de imagen? | (a) **Sí: `Imagen` e `ImagenComprimida` en `agmen/msgs.agmen`, con los mismos campos que los de Foxglove**, (b) no; cada quien define el suyo y el panel adivina por los nombres de los campos, (c) solo tensores (`tensor<u8>` de forma `[alto, ancho, 3]`) | **(a)** | Con (a), la cámara, la IA, el panel, Foxglove y las grabaciones del nivel 9 hablan el mismo tipo sin ponerse de acuerdo. (b) hace que dos cámaras no se entiendan. (c) no dice si es RGB o BGR (el error más común con OpenCV) ni sirve para JPEG |
 | **D5** | ¿Quién comprime la imagen para el panel? | (a) **Nadie en el núcleo: el panel muestra `ImagenComprimida` tal cual y las crudas a pocas imágenes por segundo; quien quiera JPEG lo publica (5 líneas con OpenCV, §3.3)**, (b) el puente del panel convierte las crudas a JPEG, (c) video H.264 por WebRTC | **(a)** | (b) pone a comprimir al robot (va contra la regla 7) y mete una librería de JPEG en el núcleo. (c) usa mucho menos WiFi, pero es otro nivel de complejidad; se puede agregar encima de (a) más adelante |
 | **D6** | ¿El puente del panel pasa a C++ en esta versión? | (a) **No por ahora: sigue en Python, recibiendo con el núcleo de C++ (0.9.0) y reenviando los bytes sin decodificarlos. Se mide en el CI con una cámara a 30 fps; si no cumple, se pasa el reenvío a C++ en esta misma versión**, (b) sí: el reenvío de datos al WebSocket pasa a C++ desde ya, (c) todo `agmen web` (HTTP, JSON, Foxglove) pasa a C++ | **(a)** | El puente vive en el proceso de `agmen run`, no en tus nodos, y solo copia bytes (el navegador decodifica, RFC 0002); desde 0.9.0 recibir ya es C++. Con (a) no se escribe C++ que quizá no haga falta, y la meta medida (§6, reto 4) decide. (b) es más trabajo seguro. (c) es reescribir el panel entero |
 
@@ -221,16 +223,61 @@ def ver(s):
 | 5 | **Mensajes enormes por error** (un `bytes` de 2 GB) | Límite de 64 MiB por defecto, revisado antes de reservar memoria, con un error que dice el topic, el tamaño y cómo cambiar el límite |
 | 6 | **El error de macOS** (§1.2) | Todos los sockets UDP piden `SO_SNDBUF` de al menos 65 507 bytes, y una prueba en el CI de macOS manda un mensaje `compact` de 60 KB |
 
-## 7. Plan para Agmen 0.10.0
+## 7. Plan para Agmen 0.10.0 (hecho)
 
 1. Arreglar el límite de 9 KB de macOS (§1.2), con su prueba.
-2. `.agmen`: `string`, `bytes`, `T[]`, `tensor<T>`; `agmen gen` genera C++ y Python para ellos; la codificación se elige sola.
+2. `.agmen`: `string`, `bytes`, `T[]`, `tensor<T,N>`; `agmen gen` genera C++ y Python para ellos; la codificación se elige sola.
 3. Codificación `arrow` (D1) en C++, Python y `agmen.js`, con vectores compartidos y `pyarrow` en el CI.
 4. Transporte TCP para los mensajes `arrow` (D2) con el descarte por suscriptor lento (D3), en el núcleo de C++ y en Python puro.
-5. `agmen/std.agmen` con `Imagen` e `ImagenComprimida` (D4); `as_array()` en Python.
+5. `agmen/msgs.agmen` con `Imagen` e `ImagenComprimida` (D4); `as_array()` en Python.
 6. Panel: tarjeta Cámara (D5), inspector y `agmen topic` con campos grandes, MB/s y descartes; Foxglove ve las imágenes.
 7. Medir el puente (D6) en `paralelo_check.py`; pasarlo a C++ solo si no cumple.
 8. Tutorial: capítulo 14 (cámara, imágenes y datos grandes), con un ejemplo de cámara con OpenCV y una "IA" que lee la imagen.
+
+## 8. Lo que se implementó en 0.10.0
+
+| Pieza | Dónde |
+|---|---|
+| Tipos variables en esquemas (texto y `.agmen`) | `python/agmen/schema.py`, `idl.py`; `include/agmen/layout.hpp`, `wire.hpp` (el `check` en compilación) |
+| Codificación arrow (D1) | `python/agmen/arrow.py` (referencia), `src/arrow.cpp`, `agmen.js` (lectura); vectores en `tests/vectors/v1.txt`; `pyarrow` en `python/test_arrow.py` |
+| Transporte TCP y descarte por suscriptor lento (D2, D3) | `python/agmen/_tcp.py`, `src/pubsub.cpp`, `src/net.cpp`; el hub pasa los puertos TCP (`hub.py`, `hubproto.py`); pruebas `python/test_tcp.py`, `tests/test_tcp.cpp` |
+| Tipos de imagen (D4) | `python/agmen/msgs.agmen`, `msgs.py` (`as_array`, `from_array`), `include/agmen/msgs.hpp` (generado; el CI lo revisa) |
+| Código generado | `gen.py`: `to_value`/`from_value` en C++, `Codec` en los `message` arrow; `tests/test_gen.cpp` y `test_idl.py` contra los vectores |
+| Panel y herramientas (D5) | tarjeta Cámara en `index.html`; el puente vigila TCP (`server.py`); Foxglove en `bridge.py`; `echo.py`, `topic.py` |
+| Medición (D6) | `scripts/paralelo_check.py` (prueba 7), `scripts/py_bench.py` (imagen), `scripts/web_smoke.py` (cámara y navegador) |
+| Ejemplo y tutorial | `examples/vision/`, capítulo 14 |
+
+**Medido** (Linux sin carga, cámara de 640×480 bgr8, 921 600 bytes por imagen):
+
+| | |
+|---|---|
+| Codificar / decodificar una imagen en Python | 0.32 ms / 0.04 ms (`as_array` sin copiar) |
+| `publish()` / recibir por TCP (núcleo C++) | 0.40 ms / 0.25 ms |
+| Cámara a 30 fps (27 MB/s) → panel → navegador rápido | 29 imágenes/s recibidas; el navegador que no lee pierde ~110 de 119 y no frena a nadie |
+| Control a 1 kHz mientras tanto (`doble_ritmo --sin-ia`) | 0 ciclos saltados (solo: 3) |
+| CPU del puente del panel con la cámara | ~5 % de un núcleo |
+
+La meta del reto 4 (§6) se cumplió con el puente en Python, así que se queda ahí (D6).
+
+### Reglas que se fijaron al implementarlo
+
+- **La forma de un tensor viaja, pero su número de dimensiones es parte del
+  tipo**: `tensor<f32,2>`. Arrow lo exige (`variable_shape_tensor` fija las
+  dimensiones) y así el esquema dice qué esperar.
+- **Un `struct` con campos variables puede ir dentro de un `message`** (y en
+  arreglos); el `message` entero va en arrow. Un `struct` fijo dentro de un
+  `message` arrow se convierte con `to_value()`/`from_value()`.
+- **Con dirección fija** (`Subscriber(Imagen, "127.0.0.1:7500")`), el
+  suscriptor escucha en el mismo puerto en TCP; con topic, en uno libre que
+  registra en el hub (`tcp=`), y solo si su tipo es arrow (o escucha `*`).
+- **Dos copias por imagen** al recibir en Python con el núcleo de C++ (del
+  socket al paquete, y del paquete al objeto de Python); de ahí en adelante,
+  vistas sin copiar. La memoria compartida (nivel 8) quita las dos.
+- `max_hz` del panel deja pasar un mensaje si pasó al menos el 80 % del
+  periodo pedido: una cámara a 30 fps con `max_hz = 30` pasa entera.
+- La codificación arrow en Python es Python en los dos núcleos (0.3 ms por
+  imagen de 640×480: lo que cuesta copiar los bytes); un codificador arrow en
+  C++ para Python queda para cuando haga falta.
 
 ## Fuentes
 

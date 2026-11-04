@@ -184,6 +184,10 @@ if(AGMEN_BUILD_EXAMPLES)
     add_executable(arca9_eco examples/mensajes/arca9_eco.cpp)
     target_link_libraries(arca9_eco PRIVATE arca9_msgs)
     agmen_set_warnings(arca9_eco)
+    # Una cámara en C++ (capítulo 14, RFC 0008): Imagen viene con Agmen (<agmen/msgs.hpp>).
+    add_executable(vision_contador examples/vision/contador.cpp)
+    target_link_libraries(vision_contador PRIVATE agmen::core)
+    agmen_set_warnings(vision_contador)
 endif()
 
 if(AGMEN_BUILD_TESTS)

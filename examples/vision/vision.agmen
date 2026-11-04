@@ -1,0 +1,16 @@
+# Capítulo 14: una cámara y una IA que la mira (RFC 0008).
+#
+# Los tipos de imagen vienen con Agmen (agmen/msgs.agmen): Imagen (cruda) e
+# ImagenComprimida (JPEG/PNG/WebP). Aquí se define lo que la IA responde.
+package vision
+import "agmen/msgs.agmen"
+
+# Lo que la IA vio en la última imagen.
+message Deteccion {
+    time   timestamp         # el t_data de la imagen que miró
+    string clase             # qué encontró ("verde", "nada")
+    f32    confianza         # 0 a 1
+    f32[2] centro            # dónde, en píxeles (x, y)
+    u32    pixeles           # cuántos píxeles son
+    f32[]  historial         # confianzas anteriores (tamaño variable)
+}

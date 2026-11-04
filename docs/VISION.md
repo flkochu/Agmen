@@ -28,9 +28,10 @@ opcionales que se conectan al núcleo:
 |---|---|---|
 | `agmen-core` | Núcleo en C++20: `#include <agmen/agmen.hpp>`, `namespace agmen::` | Desde ya |
 | `agmen` (comando) | `agmen run robot.toml` (todo el robot + panel), `agmen web`, `agmen mux`, `agmen echo`, `agmen hub`, `agmen topic list/info/echo/hz`, `agmen node list`, `agmen gen` | 0.2.0 (run, web); `mux` en 0.3.0; `echo` en 0.4.0; hub y topics en 0.5.0; `--red` en 0.6.0; `gen` en 0.7.0 |
-| Archivos `.agmen` | Los mensajes de un robot en un archivo; genera C++ (`agmen_add_messages`) y Python (`agmen.load`) (RFC 0005) | 0.7.0 |
+| Archivos `.agmen` | Los mensajes de un robot en un archivo; genera C++ (`agmen_add_messages`) y Python (`agmen.load`) (RFC 0005). Desde 0.10.0 con `string`, `bytes`, `T[]` y `tensor<T,N>` (RFC 0008) | 0.7.0; tipos variables en 0.10.0 |
+| `agmen.msgs` | Mensajes estándar: `Imagen` e `ImagenComprimida`, con los campos de Foxglove (RFC 0008 D4) | 0.10.0 |
 | `agmen::Node` / `agmen.Node` | Varias frecuencias en un nodo (`every`, `subscribe`/`on`, colas, grupos con su propio hilo) y el reloj de Agmen (real y simulación, `/clock`) (RFC 0006) | 0.8.0 |
-| Panel web | Nodos, logs, sensores, inspector y manejo desde el navegador; el robot no dibuja (RFC 0002, 0003) | 0.2.0; WebSocket, red con clave y Foxglove en 0.6.0; puente en C++ en el nivel 7 |
+| Panel web | Nodos, logs, sensores, inspector, cámara y manejo desde el navegador; el robot no dibuja (RFC 0002, 0003) | 0.2.0; WebSocket, red con clave y Foxglove en 0.6.0; cámara en 0.10.0. El puente sigue en Python: medido, no frena al robot (RFC 0008 D6) |
 | `agmen` (Python, PyPI) | `pip install agmen` / `import agmen`. Desde 0.9.0 trae el núcleo de C++ compilado (`agmen._core`, nanobind) para 5 sistemas; Python puro como respaldo y referencia | 0.1.0; compilado en 0.9.0 |
 | `agmen-micro` | Cliente ligero para microcontroladores | Nivel 12 |
 | `agmen-iot` | Puentes MQTT y similares | Nivel 12 |
@@ -132,8 +133,13 @@ igual antes y después de la migración, sin tocarlos. Es la regla 3 en acción.
 - ✅ El paquete de Python usa el núcleo de C++ (`agmen._core`): formato, topics, `Node` y reloj son el mismo código que en C++. Codificar ~5× y publicar ~4.5× más rápido; el `Node` de Python espera sin el GIL. NumPy sin copias con `agmen.load(..., numpy=True)`.
 - ✅ `pip install agmen` no compila nada en Windows, Linux x64 y ARM64, macOS Intel y Apple Silicon (wheels con cibuildwheel); en lo demás, Python puro.
 
+### Cambió en 0.10.0 (RFC 0008, nivel 7)
+- ✅ Codificación `arrow` (RFC 0001 §6) implementada en C++, Python y JavaScript con los mismos bytes; `pyarrow` la valida en el CI. Un mensaje con `string`, `bytes`, `T[]` o `tensor<T,N>` va en arrow y por **TCP** (hasta 64 MiB); los demás siguen en `compact` por UDP sin cambiar un byte.
+- ✅ Un suscriptor lento recibe solo el mensaje más nuevo y no frena al publicador (medido: una cámara de 640×480 a 30 fps, 27 MB/s, con un navegador que no lee, y el control a 1 kHz no pierde ciclos).
+- ✅ `agmen.msgs.Imagen` e `ImagenComprimida`; la tarjeta Cámara del panel; Foxglove las ve como `foxglove.RawImage` / `CompressedImage`.
+
 ### Falta (siguientes niveles)
-- Payload `arrow` para datos variables y grandes (nivel 7).
+- Memoria compartida para no copiar imágenes entre procesos (nivel 8).
 
 ### Se rehace
 - **Python**: ✅ de reimplementación en Python puro a paquete compilado desde el núcleo de C++ (nanobind, 0.9.0). La versión pura se queda como referencia y para pruebas.
@@ -183,8 +189,8 @@ iceoryx2).
 | **3 ✅** (0.6.0) | **Panel por WebSocket (RFC 0002): el navegador decodifica los bytes de Agmen, varias gráficas a la vez, inspector de mensajes, modo red local con clave, hombre muerto en el puente, compatible con Foxglove** | h |
 | **4 ✅** (0.7.0) | **Archivos `.agmen` (RFC 0005): mensajes con enums, constantes y valores por defecto; `agmen gen` genera C++ y Python, `agmen_add_messages` en CMake, `agmen.load` en Python** | b |
 | **5 ✅** (0.8.0) | **Executor y tiempo (RFC 0006): `Node` con `every`, `subscribe`/`on`, colas (`queue = 1` el más reciente), grupos con su propio hilo, ciclos saltados contados y avisados; reloj de Agmen real/sim con `/clock`, pausa, paso y velocidad desde el panel** | d, e |
-| **6 ✅** (0.9.0) | **Python de primera clase (RFC 0007): `agmen._core` compilado con nanobind (formato, topics, `Node`, reloj), wheels para 5 sistemas y Python puro de respaldo, NumPy sin copias** | b |
-| 7 | Codificación `arrow`: imágenes, tensores; panel de cámara en la web; puente del panel en C++ | a, b, h |
+| 6 ✅ (0.9.0) | Python de primera clase (RFC 0007): `agmen._core` compilado con nanobind (formato, topics, `Node`, reloj), wheels para 5 sistemas y Python puro de respaldo, NumPy sin copias | b |
+| **7 ✅** (0.10.0) | **Datos grandes (RFC 0008): codificación `arrow` (`string`, `bytes`, `T[]`, `tensor<T,N>`) por TCP con descarte por suscriptor lento; `agmen.msgs.Imagen`; cámara en el panel y en Foxglove. El puente del panel se quedó en Python: medido, cumple** | a, b, h |
 | 8 | Memoria compartida para mensajes grandes | a |
 | 9 | Grabación y reproducción; exportar a Parquet; reproducir en la web | c |
 | 10 | Abstracción sim/real; `robot.toml` con nodos en varias máquinas (el lanzador básico ya existe desde 0.2.0) | d, i |
@@ -206,7 +212,7 @@ iceoryx2).
 | ~~Archivos `.agmen`: sintaxis, quién genera, qué trae~~ | ✅ RFC 0005 aceptado el 2026-11-03 (las cinco opciones recomendadas) |
 | ~~Executor: un hilo o varios; tiempo de simulación~~ | ✅ RFC 0006 aceptado el 2026-11-03: un hilo por defecto y grupos con su propio hilo; un reloj para todo el robot en robot.toml |
 | ~~Python: qué pasa a C++, wheels, NumPy~~ | ✅ RFC 0007 aceptado el 2026-11-04 (las seis opciones recomendadas) |
-| Datos grandes: implementar Arrow, TCP o UDP, imágenes estándar, cámara en el panel | [RFC 0008](rfc/0008-datos-grandes.md), propuesta para el nivel 7 |
+| ~~Datos grandes: implementar Arrow, TCP o UDP, imágenes estándar, cámara en el panel~~ | ✅ RFC 0008 aceptado el 2026-11-04 (las seis opciones recomendadas) |
 | Prioridades de tiempo real (`SCHED_FIFO`, afinidad de núcleo) por grupo | Cuando un robot lo necesite |
 | Unidades y rangos en los esquemas, que muestre el panel | Cuando se diseñe (cambia el anuncio del RFC 0001) |
 | Nombre y alcance del visualizador propio | Nivel 14 |

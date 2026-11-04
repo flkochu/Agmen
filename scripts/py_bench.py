@@ -8,6 +8,10 @@ y con el núcleo de C++ (agmen._core). El mensaje es Articulaciones de Arca9
   2. publish() completo, hasta el socket (µs por mensaje).
   3. Recibir: un Subscriber que recibe 20 000 mensajes (µs por mensaje).
   4. Un Node de Python con every(1 ms) durante 2 s: ciclos corridos y saltados.
+  5. Una imagen de 640×480 (921 600 bytes, codificación arrow, RFC 0008):
+     codificar, decodificar (as_array sin copiar), publicar por TCP y recibir
+     (ms por imagen). Informativo: la codificación arrow es Python en los dos
+     casos; lo que cambia es el transporte.
 
 Pasa si con el núcleo de C++ codificar, decodificar, publicar y recibir son al
 menos 1.8 veces más rápidos (en una máquina sin carga dan de 2.5 a 5 veces; el
@@ -80,6 +84,37 @@ def measure() -> dict:
     t = node.timers()[0]
     out["every_runs"], out["every_skipped"] = t.runs, t.skipped
     node.close()
+
+    # 5. Una imagen de 640×480 por TCP (RFC 0008).
+    try:
+        import numpy as np
+    except ImportError:
+        return out
+    from agmen.msgs import Imagen
+
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    img = Imagen.from_array(frame, frame_id="camara")
+    ipacket = wire.encode(img, 0, topic="/camara")
+    out["img_encode_us"] = per(lambda: wire.encode(img, 0, topic="/camara"), 200)
+    out["img_decode_us"] = per(lambda: wire.decode(Imagen, ipacket)[1].as_array(), 200)
+    sub = agmen.Subscriber(Imagen, "127.0.0.1:0")
+    pub = agmen.Publisher(Imagen, f"127.0.0.1:{sub.port}", topic="/camara")
+    pub.publish(img)
+    sub.receive(1)
+    got, t_rx, t_tx = 0, 0.0, 0.0
+    for _ in range(100):
+        t = time.perf_counter()
+        pub.publish(img)
+        t_tx += time.perf_counter() - t
+        t = time.perf_counter()
+        if sub.receive(1) is not None:
+            got += 1
+        t_rx += time.perf_counter() - t
+    out["img_publish_us"] = t_tx / 100 * 1e6
+    out["img_receive_us"] = t_rx / max(got, 1) * 1e6
+    out["img_received"] = got
+    pub.close()
+    sub.close()
     return out
 
 
@@ -118,6 +153,13 @@ def main() -> int:
           f"{native['every_skipped']} saltados")
     if native["every_runs"] + 200 < pure["every_runs"]:   # 10 % de margen: el CI comparte máquina
         ok = False
+    if "img_encode_us" in pure and "img_encode_us" in native:
+        print("\nImagen de 640×480 (921 600 bytes, arrow por TCP), ms por imagen:")
+        print(f"{'':14}{'Python puro':>14}{'núcleo C++':>14}")
+        for label, key in [("codificar", "img_encode_us"), ("decodificar", "img_decode_us"),
+                           ("publish()", "img_publish_us"), ("recibir", "img_receive_us")]:
+            print(f"{label:14}{pure[key] / 1000:>11.2f} ms{native[key] / 1000:>11.2f} ms")
+        print(f"(recibidas {native['img_received']}/100; la codificación arrow es Python en los dos casos)")
     print("\n" + ("OK" if ok else "FALLA") + ": el núcleo de C++ " +
           ("es al menos 1.8 veces más rápido para codificar, decodificar, publicar y recibir" if ok else
            "no fue lo bastante más rápido"))

@@ -103,5 +103,4 @@ node.spin()
 - `agmen --version` dice cuál usas.
 - `agmen.load(..., numpy=True)` da los arreglos como NumPy, sin copiar.
 
-**Siguiente (Agmen 0.10.0):** imágenes y tensores con la codificación `arrow`
-(nivel 7).
+**Siguiente:** [capítulo 14, una cámara, imágenes y datos grandes](14-camara-e-imagenes.md).

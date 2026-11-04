@@ -81,6 +81,31 @@ def main() -> int:
     node.close()
     check("Node: every() y on()", ticks[0] == 20 and len(seen) >= 15, f"{ticks[0]} ticks, {len(seen)} recibidos")
 
+    # Datos grandes (RFC 0008): una Imagen de 640×480 (921 600 bytes) por TCP, sin copiar al leerla.
+    from agmen.msgs import Imagen, ImagenComprimida
+
+    sub = agmen.Subscriber(Imagen, "127.0.0.1:0")
+    pub = agmen.Publisher(Imagen, f"127.0.0.1:{sub.port}", topic="/camara")
+    pixels = bytes(range(256)) * 3600
+    pub.publish(Imagen(width=640, height=480, encoding="bgr8", step=1920, data=pixels, frame_id="wheel"))
+    s = sub.receive(2.0)
+    check("Imagen de 640×480 por TCP (arrow)", s is not None and s.envelope.encoding == wire.ENC_ARROW
+          and (s.message.width, s.message.encoding) == (640, "bgr8") and bytes(s.message.data) == pixels,
+          "" if s else "no llegó")
+    try:
+        import numpy as np
+    except ImportError:
+        print("      (sin NumPy: as_array no se prueba)")
+    else:
+        arr = s.message.as_array() if s else None
+        check("Imagen.as_array sin copiar", arr is not None and arr.shape == (480, 640, 3) and arr.base is not None
+              and int(arr[0, 1, 0]) == 3)
+        img = Imagen.from_array(np.zeros((2, 2), np.uint8))
+        check("Imagen.from_array", (img.encoding, img.step, len(img.data)) == ("mono8", 2, 4))
+    check("ImagenComprimida", ImagenComprimida(data=b"\xff\xd8").format == "jpeg")
+    pub.close()
+    sub.close()
+
     exe = Path(sys.executable).with_name("agmen.exe" if os.name == "nt" else "agmen")
     cmd = [str(exe)] if exe.exists() else [sys.executable, "-m", "agmen"]
     # agmen siempre escribe en UTF-8 (agmen/__init__.py); en Windows el

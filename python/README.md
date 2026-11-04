@@ -63,6 +63,25 @@ pub.publish(msgs.Articulaciones(q=[90.0] * 12, modo=msgs.Modo.TROTAR))
 Con `agmen.load("arca9.agmen", numpy=True)`, los arreglos llegan como
 `numpy.ndarray` de solo lectura, sin copiar.
 
+## Imágenes y datos grandes (desde 0.10)
+
+Un mensaje con `string`, `bytes`, `T[]` o `tensor<T,N>` viaja con la
+codificación `arrow` y por TCP: puede medir megabytes. Los tipos de imagen
+vienen con Agmen:
+
+```python
+from agmen.msgs import Imagen            # o ImagenComprimida (JPEG/PNG/WebP)
+
+pub = node.publisher(Imagen, "/camara")
+pub.publish(Imagen.from_array(frame, encoding="bgr8"))   # frame: numpy (alto, ancho, 3)
+
+@node.on(Imagen, "/camara")              # siempre la más nueva: una IA lenta no se atrasa
+def ver(s):
+    img = s.message.as_array()           # numpy, sin copiar
+```
+
+El panel la muestra en la tarjeta Cámara, y Foxglove como `foxglove.RawImage`.
+
 `agmen gen arca9.agmen --python .` escribe el `.py` (para el autocompletado
 de tu editor) y `agmen gen arca9.agmen` muestra cada tipo con su esquema.
 

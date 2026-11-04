@@ -32,7 +32,7 @@ como paquetes opcionales.
   mandan al mismo motor, **un `[[mux]]` decide quién manda**: tú le ganas al
   modo autónomo y al soltar lo retoma solo.
 
-**Versión actual: 0.9.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
+**Versión actual: 0.10.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
 
 | Para… | Lee |
 |---|---|
@@ -44,7 +44,7 @@ como paquetes opcionales.
 | Mensajes en archivos `.agmen` | [RFC 0005](docs/rfc/0005-esquemas-agmen.md) (aceptado, implementado en 0.7.0) |
 | Varias frecuencias en un nodo y el reloj de Agmen | [RFC 0006](docs/rfc/0006-executor-y-reloj.md) (aceptado, implementado en 0.8.0) |
 | Python compilado desde el núcleo de C++ | [RFC 0007](docs/rfc/0007-python-compilado.md) (aceptado, implementado en 0.9.0) |
-| Imágenes, tensores y texto (datos grandes) | [RFC 0008](docs/rfc/0008-datos-grandes.md) (propuesta para 0.10.0) |
+| Imágenes, tensores y texto (datos grandes) | [RFC 0008](docs/rfc/0008-datos-grandes.md) (aceptado, implementado en 0.10.0) |
 | Publicar versiones | [`docs/PUBLICAR.md`](docs/PUBLICAR.md) |
 
 ## Estado
@@ -59,8 +59,9 @@ como paquetes opcionales.
 | 0.6.0 ✅ | 3 | Panel por WebSocket: el navegador decodifica los bytes de Agmen, varias gráficas, inspector, celular con clave, compatible con Foxglove |
 | 0.7.0 ✅ | 4 | Archivos `.agmen`: escribes tus mensajes una vez y se genera el código de C++ y de Python |
 | 0.8.0 ✅ | 5 | Un nodo con varios ritmos (`Node`, `every`, grupos con su propio hilo) y el reloj de Agmen: simulación más rápida, más lenta o en pausa |
-| **0.9.0 ✅** | **6** | **`pip install agmen` trae el núcleo de C++ compilado: el mismo código de Python, varias veces más rápido; arreglos como NumPy sin copiar** |
-| … | 7–14 | Ver [`docs/VISION.md`](docs/VISION.md#7-roadmap-por-niveles) |
+| 0.9.0 ✅ | 6 | `pip install agmen` trae el núcleo de C++ compilado: el mismo código de Python, varias veces más rápido; arreglos como NumPy sin copiar |
+| **0.10.0 ✅** | **7** | **Imágenes, tensores y texto: `string`, `bytes`, `T[]` y `tensor<T,N>` en tus `.agmen` (codificación `arrow`, por TCP), `agmen.msgs.Imagen`, cámara en el panel y en Foxglove** |
+| … | 8–14 | Ver [`docs/VISION.md`](docs/VISION.md#7-roadmap-por-niveles) |
 
 ## Estructura
 
@@ -68,14 +69,15 @@ como paquetes opcionales.
 agmen/
 ├── VERSION                  la versión (fuente única de verdad)
 ├── CHANGELOG.md · LICENSE · pyproject.toml (pip install agmen)
-├── include/agmen/           API pública: agmen.hpp, wire.hpp, net.hpp, platform.hpp, node.hpp, clock.hpp
+├── include/agmen/           API pública: agmen.hpp, wire.hpp, arrow.hpp, net.hpp, node.hpp, clock.hpp, msgs.hpp (Imagen)
 ├── src/                     implementación del núcleo
 ├── examples/nivel0/         publisher y subscriber
 ├── examples/tutorial/       código del tutorial (motor, controlador, cerebro.py)
 ├── examples/nodos/          un nodo con dos ritmos y el reloj de Agmen (capítulo 12)
+├── examples/vision/         una cámara, una IA que la mira y un contador en C++ (capítulo 14)
 ├── tests/                   pruebas (ctest)
 ├── examples/tutorial/robot.toml  el robot del tutorial completo, para `agmen run`
-├── python/agmen/            paquete de Python: import agmen + el comando `agmen`
+├── python/agmen/            paquete de Python: import agmen + el comando `agmen`; msgs.agmen (Imagen)
 ├── python/src/core.cpp      agmen._core: el núcleo de C++ para Python (nanobind)
 │   ├── run.py               agmen run: lanzador y supervisor de nodos
 │   ├── mux.py               agmen mux: prioridad de comandos (¿quién manda?)

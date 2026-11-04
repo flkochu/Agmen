@@ -19,7 +19,8 @@
 | **0.7.0** | 4 | Archivos `.agmen` (RFC 0005): `agmen gen`, `agmen_add_messages`, `agmen.load` |
 | **0.8.0** | 5 | `Node` con varios ritmos y grupos, reloj de Agmen real/sim con `/clock` (RFC 0006) |
 | **0.9.0** | 6 | Python de primera clase: `agmen._core` compilado desde el núcleo de C++ (RFC 0007), wheels para 5 sistemas, NumPy sin copias |
-| 0.10.0 | 7 | Codificación `arrow`: imágenes, tensores, cámara en el panel |
+| **0.10.0** | 7 | Codificación `arrow` (RFC 0008): `string`, `bytes`, `T[]`, `tensor<T,N>`; mensajes grandes por TCP; `agmen.msgs.Imagen`; cámara en el panel y en Foxglove |
+| 0.11.0 | 8 | Memoria compartida para mensajes grandes |
 | … | … | Un nivel por versión menor |
 | 1.0.0 | — | API estable: a partir de aquí romper la API exige subir MAYOR |
 

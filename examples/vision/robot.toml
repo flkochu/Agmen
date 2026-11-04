@@ -1,0 +1,29 @@
+# Capítulo 14: una cámara, una IA que la mira y el panel que la muestra (RFC 0008).
+#
+#   agmen run examples/vision/robot.toml
+#
+# En el panel, el topic /camara aparece en la tarjeta "Cámara" (10 imágenes por
+# segundo por defecto: cámbialo ahí). /deteccion se grafica como cualquier otro.
+
+[robot]
+name = "vision"
+
+[[topic]]
+name = "/camara"
+type = "Imagen"
+
+[[topic]]
+name = "/deteccion"
+type = "Deteccion"
+
+[[node]]
+name = "camara"
+cmd = "python camara.py"
+
+[[node]]
+name = "ia"
+cmd = "python ia.py"
+
+[[node]]
+name = "contador"
+cmd = "../../build/bin/vision_contador"

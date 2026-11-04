@@ -175,8 +175,10 @@ class Bridge:
                     continue
                 key = (env.topic_id, env.source_id)
                 if max_hz > 0:
+                    # Con margen: una cámara a 30 fps y max_hz = 30 debe pasar entera aunque un
+                    # cuadro llegue 2 ms antes que el anterior (si no, se perdería uno de cada dos).
                     last = c.last_sent.get(key)
-                    if last is not None and now - last < 1.0 / max_hz:
+                    if last is not None and now - last < 0.8 / max_hz:
                         continue
                 c.last_sent[key] = now
                 self._announce_to(c, key)
