@@ -206,6 +206,7 @@ iceoryx2).
 | ~~Archivos `.agmen`: sintaxis, quién genera, qué trae~~ | ✅ RFC 0005 aceptado el 2026-11-03 (las cinco opciones recomendadas) |
 | ~~Executor: un hilo o varios; tiempo de simulación~~ | ✅ RFC 0006 aceptado el 2026-11-03: un hilo por defecto y grupos con su propio hilo; un reloj para todo el robot en robot.toml |
 | ~~Python: qué pasa a C++, wheels, NumPy~~ | ✅ RFC 0007 aceptado el 2026-11-04 (las seis opciones recomendadas) |
+| Datos grandes: implementar Arrow, TCP o UDP, imágenes estándar, cámara en el panel | [RFC 0008](rfc/0008-datos-grandes.md), propuesta para el nivel 7 |
 | Prioridades de tiempo real (`SCHED_FIFO`, afinidad de núcleo) por grupo | Cuando un robot lo necesite |
 | Unidades y rangos en los esquemas, que muestre el panel | Cuando se diseñe (cambia el anuncio del RFC 0001) |
 | Nombre y alcance del visualizador propio | Nivel 14 |
