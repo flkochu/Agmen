@@ -1,5 +1,6 @@
 #include "agmen/platform.hpp"
 
+#include <cstdlib>
 #include <thread>
 
 #if defined(__APPLE__)
@@ -104,5 +105,21 @@ PromptThread::PromptThread() = default;
 PromptThread::~PromptThread() = default;
 
 #endif
+
+std::string env(const char* name) {
+#ifdef _MSC_VER
+    char* value = nullptr;
+    std::size_t len = 0;
+    std::string out;
+    if (_dupenv_s(&value, &len, name) == 0 && value != nullptr) {
+        out = value;
+        std::free(value);
+    }
+    return out;
+#else
+    const char* value = std::getenv(name);
+    return value != nullptr ? std::string(value) : std::string();
+#endif
+}
 
 }  // namespace agmen::platform

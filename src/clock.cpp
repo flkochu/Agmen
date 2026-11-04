@@ -7,6 +7,7 @@
 #include <thread>
 
 #include "agmen/log.hpp"
+#include "agmen/platform.hpp"
 #include "agmen/pubsub.hpp"
 
 namespace agmen {
@@ -63,29 +64,13 @@ Global& g() {
     return *instance;
 }
 
-std::string env(const char* name) {
-#ifdef _MSC_VER
-    char* value = nullptr;
-    std::size_t len = 0;
-    std::string out;
-    if (_dupenv_s(&value, &len, name) == 0 && value != nullptr) {
-        out = value;
-        std::free(value);
-    }
-    return out;
-#else
-    const char* v = std::getenv(name);
-    return v ? std::string(v) : std::string();
-#endif
-}
-
 void ensure_configured_locked(Global& s) {
     if (s.configured) return;
     s.configured = true;
-    const std::string m = env("AGMEN_CLOCK");
+    const std::string m = platform::env("AGMEN_CLOCK");
     if (m == "sim") {
         s.mode = Mode::Sim;
-        const std::string src = env("AGMEN_CLOCK_SOURCE");
+        const std::string src = platform::env("AGMEN_CLOCK_SOURCE");
         s.stepped = !src.empty() && src != "agmen";
     } else if (!m.empty() && m != "real") {
         log::write("[agmen] ⚠ AGMEN_CLOCK='" + m + "' no existe (usa real o sim): uso el reloj real");

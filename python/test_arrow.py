@@ -73,6 +73,27 @@ def to_pyarrow_row(t, v):
     return v
 
 
+def _as_ints(t):
+    """El mismo tipo de pyarrow con time/duration como int64 (mismos bytes en Arrow).
+
+    Sin pandas, pyarrow no sabe pasar timestamp[ns] ni duration[ns] a Python
+    (datetime solo llega a microsegundos), así que se comparan como enteros.
+    """
+    def field(f):
+        return pa.field(f.name, _as_ints(f.type), f.nullable)
+    if pa.types.is_timestamp(t) or pa.types.is_duration(t):
+        return pa.int64()
+    if pa.types.is_struct(t):
+        return pa.struct([field(t.field(i)) for i in range(t.num_fields)])
+    if pa.types.is_fixed_size_list(t):
+        return pa.list_(field(t.value_field), t.list_size)
+    if pa.types.is_large_list(t):
+        return pa.large_list(field(t.value_field))
+    if pa.types.is_list(t):
+        return pa.list_(field(t.value_field))
+    return t
+
+
 def from_pyarrow_row(t, v):
     if isinstance(t, schema.Struct):
         return {f.name: from_pyarrow_row(f.type, v[f.name]) for f in t.fields}
@@ -137,6 +158,8 @@ class TestPyarrow(unittest.TestCase):
                 batch = pa.ipc.read_record_batch(pa.py_buffer(payload), storage)
                 batch.validate(full=True)
                 self.assertEqual(batch.num_rows, 1)
+                ints = pa.schema([pa.field(f.name, _as_ints(f.type), f.nullable) for f in storage])
+                batch = pa.ipc.read_record_batch(pa.py_buffer(payload), ints)
                 got = from_pyarrow_row(layout.root, batch.to_pylist()[0])
                 self.assertEqual(norm(layout.root, got), norm(layout.root, values))
 

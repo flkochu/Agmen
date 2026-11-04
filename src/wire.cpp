@@ -5,6 +5,7 @@
 #include <cstdlib>
 
 #include "agmen/clock.hpp"
+#include "agmen/platform.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -132,11 +133,11 @@ std::string type_mismatch_text(std::string_view expected_text, std::uint64_t exp
 std::size_t max_message() {
     // Se lee cada vez (es barato) para que un cambio en el entorno cuente, como en Python.
     constexpr std::size_t kDefault = std::size_t{64} << 20;
-    const char* raw = std::getenv("AGMEN_MAX_MESSAGE_MB");
-    if (raw == nullptr || *raw == '\0') return kDefault;
+    const std::string raw = platform::env("AGMEN_MAX_MESSAGE_MB");
+    if (raw.empty()) return kDefault;
     char* end = nullptr;
-    const double mb = std::strtod(raw, &end);
-    if (end == raw || mb <= 0) return kDefault;
+    const double mb = std::strtod(raw.c_str(), &end);
+    if (end == raw.c_str() || mb <= 0) return kDefault;
     return std::max<std::size_t>(1, static_cast<std::size_t>(mb * static_cast<double>(1 << 20)));
 }
 

@@ -3,6 +3,7 @@
 #pragma once
 
 #include <chrono>
+#include <string>
 
 namespace agmen::platform {
 
@@ -43,5 +44,11 @@ private:
 /// Hace que la consola muestre bien los acentos y "µs" (UTF-8).
 /// En Linux/macOS no hace nada; en Windows cambia la página de códigos.
 void init_console();
+
+/// El valor de la variable de entorno `name`, o "" si no existe.
+///
+/// Por qué existe: MSVC marca std::getenv como inseguro (C4996, que el CI
+/// trata como error) y pide _dupenv_s. Todo el núcleo lee el entorno aquí.
+std::string env(const char* name);
 
 }  // namespace agmen::platform

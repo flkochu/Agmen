@@ -161,11 +161,13 @@ public:
         wire::Bytes payload;
         payload.reserve(wire::compact_size_v<M>);
         msg.encode_payload(payload);
-        if (!wire::is_arrow_v<M> && payload.size() != wire::compact_size_v<M>) {
-            // Un error de programación: el encode_payload no sigue al esquema.
-            throw std::logic_error("encode_payload de '" + std::string(M::kName) + "' produjo " +
-                                   std::to_string(payload.size()) + " bytes, pero su esquema mide " +
-                                   std::to_string(wire::compact_size_v<M>));
+        if constexpr (!wire::is_arrow_v<M>) {
+            if (payload.size() != wire::compact_size_v<M>) {
+                // Un error de programación: el encode_payload no sigue al esquema.
+                throw std::logic_error("encode_payload de '" + std::string(M::kName) + "' produjo " +
+                                       std::to_string(payload.size()) + " bytes, pero su esquema mide " +
+                                       std::to_string(wire::compact_size_v<M>));
+            }
         }
         return core_.publish_payload(payload, t_data);
     }

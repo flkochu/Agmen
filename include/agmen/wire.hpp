@@ -479,7 +479,7 @@ template <Message M>
     out.resize(kEnvelopeLen);
     msg.encode_payload(out);
     const std::size_t payload = out.size() - kEnvelopeLen;
-    if (is_arrow_v<M>) {
+    if constexpr (is_arrow_v<M>) {
         if (payload > max_message()) throw WireError(WireError::Kind::TooBig, too_big_text(M::kName, payload));
     } else if (payload != compact_size_v<M>) {
         // Un error de programación: el encode_payload no sigue al esquema.
@@ -533,9 +533,11 @@ template <Message M>
         throw WireError(WireError::Kind::TypeMismatch,
                         type_mismatch_text(schema_text<M>(), schema_id_v<M>, env.schema_id));
     }
-    if (!is_arrow_v<M> && payload.size() != compact_size_v<M>) {
-        throw WireError(WireError::Kind::BadPayloadSize,
-                        payload_size_text(M::kName, compact_size_v<M>, payload.size()));
+    if constexpr (!is_arrow_v<M>) {
+        if (payload.size() != compact_size_v<M>) {
+            throw WireError(WireError::Kind::BadPayloadSize,
+                            payload_size_text(M::kName, compact_size_v<M>, payload.size()));
+        }
     }
     return {env, M::decode_payload(payload)};
 }

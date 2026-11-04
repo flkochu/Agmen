@@ -1,6 +1,7 @@
 #include "agmen/hubproto.hpp"
 
 #include "agmen/log.hpp"
+#include "agmen/platform.hpp"
 
 #include <mutex>
 
@@ -31,19 +32,8 @@ int hex_digit(char c) {
 }
 
 std::string env_or(const char* name, std::string_view fallback) {
-#ifdef _MSC_VER
-    char* value = nullptr;
-    std::size_t len = 0;
-    if (_dupenv_s(&value, &len, name) == 0 && value != nullptr) {
-        std::string out(value);
-        std::free(value);
-        if (!out.empty()) return out;
-    }
-    return std::string(fallback);
-#else
-    const char* value = std::getenv(name);
-    return value != nullptr && *value != '\0' ? std::string(value) : std::string(fallback);
-#endif
+    std::string value = platform::env(name);
+    return value.empty() ? std::string(fallback) : value;
 }
 
 }  // namespace

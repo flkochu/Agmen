@@ -619,7 +619,10 @@ function cameraCard(topic, ts, kind) {
   const cur = camRate[topic] || (kind === "jpeg" ? JPEG_FPS_DEFAULT : RAW_FPS_DEFAULT);
   if (camRate[topic] !== cur) { camRate[topic] = cur; send({ op: "subscribe", topic, max_hz: cur }); }  // pedir solo las que se ven
   for (const c of choices) { const o = document.createElement("option"); o.value = c; o.textContent = c; o.selected = c === cur; sel.appendChild(o); }
-  sel.onchange = () => { camRate[topic] = +sel.value; send({ op: "subscribe", topic, max_hz: camRate[topic] }); };
+  sel.onchange = () => {
+    camRate[topic] = +sel.value; send({ op: "subscribe", topic, max_hz: camRate[topic] });
+    if (ts.cam) { ts.cam.frames = 0; ts.cam.fpsAt = performance.now(); }   // contar desde la frecuencia nueva
+  };
   ts.cam = { el, kind, frames: 0, fpsAt: performance.now(), fps: 0, url: null,
              out: el.querySelector(kind === "jpeg" ? "img" : "canvas"), meta: el.querySelector(".meta"), fpsEl: el.querySelector(".fps span") };
   return el;

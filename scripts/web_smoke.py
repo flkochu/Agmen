@@ -274,7 +274,9 @@ def main() -> None:
                     pg.wait_for_selector(".camera canvas", timeout=15000)
                     pg.wait_for_function("(() => { const c = document.querySelector('.camera canvas'); return c && c.width === 320; })()",
                                          timeout=15000)
-                    time.sleep(1.5)
+                    # La primera ventana de 1 s puede traer imágenes que ya venían en camino a la
+                    # frecuencia anterior; se lee la segunda.
+                    time.sleep(2.5)
                     fps = pg.inner_text(".camera .fps span")
                     px = pg.evaluate("(() => { const c = document.querySelector('.camera canvas'); const d = c.getContext('2d').getImageData(160, 120, 1, 1).data; "
                                      "const e = c.getContext('2d').getImageData(10, 10, 1, 1).data; return [Array.from(d), Array.from(e)]; })()")
