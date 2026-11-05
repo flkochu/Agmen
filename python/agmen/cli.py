@@ -1,11 +1,15 @@
 """El comando `agmen`.
 
     agmen run [robot.toml]     lanza todo el robot + panel web, con un solo comando
-    agmen web                  solo el panel web (sin administrar nodos)
+    agmen web [ARCHIVO.mcap]   solo el panel web (sin administrar nodos), o para ver una grabación
     agmen mux --out ... --in   prioridad de comandos: ¿quién manda al motor?
     agmen echo IP:PUERTO       muestra cualquier mensaje que llegue (sin código del tipo)
     agmen hub                  el directorio de topics (agmen run lo arranca solo)
     agmen topic list|info|echo|hz      ver los topics por dentro
+    agmen record [TOPIC...]    graba topics en un .mcap (RFC 0010)
+    agmen info ARCHIVO.mcap    resume una grabación (--reparar si quedó cortada)
+    agmen play ARCHIVO.mcap    la reproduce con su tiempo original
+    agmen export ARCHIVO.mcap  --parquet CARPETA (para entrenar) o --foxglove SALIDA.mcap
     agmen node list            los nodos registrados
     agmen version              muestra la versión
 """
@@ -13,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 import threading
@@ -48,14 +53,48 @@ def cmd_run(args) -> int:
     except ConfigError as e:
         print(f"error en {args.archivo}: {e}", file=sys.stderr)
         return 2
+    names = [n.name for n in config.nodes]
+    for name in args.skip:
+        if name not in names:
+            print(f"error: --skip {name}: no hay un nodo con ese nombre (hay: {', '.join(names)})", file=sys.stderr)
+            return 2
+    for n in config.nodes:
+        if n.name in args.skip:
+            n.autostart = False             # se puede arrancar desde el panel
+        if args.play:                       # RFC 0010: todos con el tiempo de la grabación
+            n.env.update({"AGMEN_CLOCK": "replay", "AGMEN_CLOCK_SOURCE": "agmen"})
     launcher = Launcher(config)
+    out = _SayTo(launcher)
     launcher.say(f"Agmen {__version__} · robot '{config.name}' · {len(config.nodes)} nodos · {hub_note}")
     if not launcher.run_before():
         launcher.printer.close()
         return 1
-    clock_server, clock_note = _setup_clock(config.clock)
-    if clock_note:
-        launcher.say(clock_note)
+    player = None
+    if args.play:
+        from .play import Player
+
+        try:
+            player = Player(args.play, args.play_topic or None, paused=True, out=out)
+        except (ValueError, OSError) as e:
+            launcher.printer.close()
+            print(f"error: --play: {e}", file=sys.stderr)
+            return 2
+        if config.clock.mode == "sim":
+            launcher.say("⚠ --play usa el tiempo de la grabación: no aplica [clock] mode = \"sim\"")
+        player.start()
+        clock_server = player
+        launcher.say(f"reloj: reproducción de {args.play} ({', '.join(player.topics)}; {player.duration / 1e9:.1f} s), "
+                     f"lo manda agmen run en /clock (pausa y velocidad en el panel)")
+    else:
+        clock_server, clock_note = _setup_clock(config.clock)
+        if clock_note:
+            launcher.say(clock_note)
+    recording = _recording_for(config, args, out)
+    if args.record or (config.record is not None and config.record.auto):
+        err = recording.start()
+        if err:
+            launcher.say(f"⚠ no se pudo grabar: {err}")
+    launcher.recording = recording
 
     panel = None
     if config.web.enabled and not args.no_web:
@@ -75,16 +114,63 @@ def cmd_run(args) -> int:
 
     launcher.start_all()
     launcher.say("todo arrancado. Ctrl+C para detener todo.")
+    if player is not None:   # que los nodos alcancen a suscribirse antes del primer mensaje
+        threading.Timer(2.0, player.resume).start()
     stop = threading.Event()
+
+    def close_recording():
+        if recording.rec is not None:
+            recording.stop()
+
     try:
         _wait_for_ctrl_c(stop)
     finally:
-        launcher.stop_all()
+        launcher.stop_all(then=close_recording)
         if panel:
             panel.shutdown()
-        if clock_server:
+        if player is not None:
+            player.stop()
+        elif clock_server:
             clock_server.close()
     return 0
+
+
+class _SayTo:
+    """Una salida para el grabador y el reproductor: cada línea va al log de agmen run."""
+
+    def __init__(self, launcher) -> None:
+        self.launcher = launcher
+        self._buf = ""
+
+    def write(self, text: str) -> int:
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            line = line.strip()
+            if line.startswith("[agmen] "):
+                line = line[len("[agmen] "):]
+            if line:
+                self.launcher.say(line)
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+
+def _recording_for(config, args, out):
+    """El control de grabación de agmen run ([record] en robot.toml, --record y el botón del panel)."""
+    from .record import RecordingControl
+    from .run import RecordConfig
+
+    rc = config.record or RecordConfig(auto=False)
+    attachments = []
+    if config.path is not None:
+        attachments.append((config.path.name, "text/plain", config.path.read_bytes()))
+    info = {"robot": config.name, "comando": " ".join(["agmen", *sys.argv[1:]])}
+    if args.play:
+        info["reproduciendo"] = args.play
+    return RecordingControl(rc.topics, directory=str(config.base_dir / rc.dir), split=rc.split,
+                            compression=rc.compress, attachments=attachments, info=info, out=out)
 
 
 def _setup_clock(cfg):
@@ -150,12 +236,30 @@ def cmd_web(args) -> int:
         return 2
     teleop = Teleop(args.teleop, 1.0) if args.teleop else None
     http = _http_for(args.http, args.red)
+    rec_note = ""
+    if args.archivo:                        # RFC 0010: ver una grabación en el navegador
+        from .record import describe, size_text
+
+        try:
+            d = describe(args.archivo)
+        except (OSError, ValueError) as e:
+            print(f"[agmen web] ✗ {args.archivo}: {e}", file=sys.stderr)
+            return 1
+        if d["profile"] != "agmen" and not any(t["encoding"] == "agmen" for t in d["topics"]):
+            print(f"[agmen web] ✗ {args.archivo} no es una grabación de Agmen (perfil '{d['profile']}'): "
+                  f"ábrela en Foxglove", file=sys.stderr)
+            return 1
+        rec_note = (f"grabación {os.path.basename(args.archivo)} ({size_text(d['size'])}, {d['seconds']:.1f} s, "
+                    f"{len(d['topics'])} topics): se abre sola en el panel")
     try:
-        panel = Panel(http, args.listen, "", None, teleop, token=args.token, allow_origins=args.allow_origin)
+        panel = Panel(http, args.listen, "", None, teleop, token=args.token, allow_origins=args.allow_origin,
+                      recording_file=args.archivo)
     except OSError as e:
         print(f"no se pudo abrir el panel en {http}: {e}", file=sys.stderr)
         return 1
     panel.start(open_browser=not args.no_browser)
+    if rec_note:
+        print(f"[agmen web] {rec_note}")
     print(f"[agmen web] recibiendo Agmen de todos los topics y de udp://{args.listen}")
     for line in _panel_lines(panel):
         print(f"[agmen web] {line}")
@@ -198,9 +302,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--http", help="dónde servir el panel (default: el de robot.toml, 127.0.0.1:8080)")
     p.add_argument("--red", action="store_true",
                    help="abrir el panel a tu red local (celular, otra laptop), con clave")
+    p.add_argument("--record", action="store_true",
+                   help="grabar todos los topics mientras corre (o lo que diga [record] en robot.toml)")
+    p.add_argument("--play", metavar="ARCHIVO.mcap",
+                   help="reproducir una grabación: todos los nodos usan el tiempo de la grabación")
+    p.add_argument("--play-topic", action="append", default=[], metavar="TOPIC",
+                   help="con --play: reproducir solo este topic (se puede repetir)")
+    p.add_argument("--skip", action="append", default=[], metavar="NODO",
+                   help="no arrancar este nodo (ej. el de la cámara, si --play la reproduce)")
     p.set_defaults(func=cmd_run)
 
-    p = sub.add_parser("web", help="solo el panel web (sin administrar nodos)")
+    p = sub.add_parser("web", help="solo el panel web (sin administrar nodos); o una grabación: agmen web vuelta1.mcap")
+    p.add_argument("archivo", nargs="?", metavar="ARCHIVO.mcap",
+                   help="una grabación para ver en el navegador (gráficas, cámara y barra de tiempo)")
     p.add_argument("--listen", default="127.0.0.1:7400", help="dónde recibir mensajes Agmen (UDP)")
     p.add_argument("--http", default="127.0.0.1:8080", help="dónde servir el panel")
     p.add_argument("--teleop", metavar="TOPIC|IP:PUERTO",
@@ -247,6 +361,18 @@ def main(argv: list[str] | None = None) -> int:
 
     add_topic_parsers(sub)
 
+    from .record import add_parsers as add_record_parsers
+
+    add_record_parsers(sub)
+
+    from .play import add_parser as add_play_parser
+
+    add_play_parser(sub)
+
+    from .recording import add_parser as add_export_parser
+
+    add_export_parser(sub)
+
     p = sub.add_parser("version", help="muestra la versión")
     p.set_defaults(func=lambda a: print(_backend.describe()) or 0)
 
@@ -254,6 +380,11 @@ def main(argv: list[str] | None = None) -> int:
 
     ensure_utf8_output()
     args = ap.parse_args(argv)
+    if args.cmd in ("run", "record", "play", "topic", "node", "web", "echo", "mux"):
+        # Su nombre para el hub ("▶ 'agmen play' publica /imu"), si no trae AGMEN_NODE.
+        from .pubsub import set_default_node_name
+
+        set_default_node_name(f"agmen {args.cmd}")
     return args.func(args)
 
 

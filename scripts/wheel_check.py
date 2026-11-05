@@ -125,6 +125,23 @@ def main() -> int:
     pub.close()
     sub.close()
 
+    # Grabaciones (RFC 0010): el MCAP sin dependencias, agmen.Recording y el lector del panel.
+    import tempfile
+
+    from agmen import _mcap
+
+    path = os.path.join(tempfile.mkdtemp(), "wheel.mcap")
+    w = _mcap.Writer(path)
+    cid = w.add_channel("/imu", "agmen", w.add_schema("ImuSample", "agmen", wire.ImuSample.SCHEMA_TEXT.encode()))
+    for i in range(3):
+        w.add_message(cid, 1000 + i, 1000 + i, i, wire.encode(wire.ImuSample((i, 0, 9.8), (0, 0, 0)), i, topic="/imu"))
+    w.close()
+    with agmen.Recording(path) as rec:
+        accel = [s.message.accel[0] for s in rec.messages("/imu")]
+    check("agmen.Recording lee un .mcap", accel == [0.0, 1.0, 2.0], str(accel))
+    panel = Path(agmen.__file__).with_name("panel")
+    check("el panel trae mcap.js (abrir grabaciones)", (panel / "mcap.js").is_file() and (panel / "agmen.js").is_file())
+
     exe = Path(sys.executable).with_name("agmen.exe" if os.name == "nt" else "agmen")
     cmd = [str(exe)] if exe.exists() else [sys.executable, "-m", "agmen"]
     # agmen siempre escribe en UTF-8 (agmen/__init__.py); en Windows el

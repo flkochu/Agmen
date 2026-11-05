@@ -738,7 +738,10 @@ NB_MODULE(_core, m) {
 
     // --- reloj de Agmen (uno por proceso, compartido con C++) ---
     namespace ck = agmen::clock;
-    m.def("clock_mode", [] { return ck::mode() == ck::Mode::Sim ? "sim" : "real"; });
+    m.def("clock_mode", [] {
+        const auto md = ck::mode();
+        return md == ck::Mode::Sim ? "sim" : md == ck::Mode::Replay ? "replay" : "real";
+    });
     m.def("clock_domain", [] { return static_cast<int>(ck::domain()); });
     m.def("clock_now_ns", [] { return ck::now_ns(); });
     m.def("clock_mono_ns", [] { return ck::mono_ns(); });
@@ -752,7 +755,8 @@ NB_MODULE(_core, m) {
         return std::make_tuple(s.t, s.speed, s.paused, s.received);
     });
     m.def("clock_configure", [](const std::string& mode, bool stepped, bool listen) {
-        ck::configure(mode == "sim" ? ck::Mode::Sim : ck::Mode::Real, stepped, listen);
+        ck::configure(mode == "sim" ? ck::Mode::Sim : mode == "replay" ? ck::Mode::Replay : ck::Mode::Real, stepped,
+                      listen);
     }, "mode"_a, "stepped"_a, "listen"_a);
     m.def("clock_update", [](std::int64_t t, double speed, bool paused) {
         ck::update(agmen::ClockMsg{.t = t, .speed = speed, .paused = paused});

@@ -38,7 +38,9 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-numpy = ["numpy>=1.24"]   # agmen.load(..., numpy=True)
+numpy = ["numpy>=1.24"]                 # agmen.load(..., numpy=True)
+grabar = ["zstandard", "lz4"]           # agmen record --compress zstd|lz4 (RFC 0010 D5)
+datasets = ["pyarrow>=14"]              # agmen export --parquet, Recording.table() (RFC 0010 D7)
 
 [project.scripts]
 agmen = "agmen.cli:main"

@@ -31,6 +31,8 @@ from agmen import schema, wire  # noqa: E402
 PANEL = HERE / "agmen" / "panel"
 INDEX = PANEL / "index.html"
 AGMEN_JS = PANEL / "agmen.js"
+MCAP_JS = PANEL / "mcap.js"
+MCAP_VECTOR = HERE.parent / "tests" / "vectors" / "grabacion.mcap"
 VECTORS = HERE.parent / "tests" / "vectors" / "v1.txt"
 SAFE = 2**53 - 1
 
@@ -144,8 +146,9 @@ class TestPanelJs(unittest.TestCase):
             path.write_text("\n".join(scripts), encoding="utf-8")
             r = self._node("--check", str(path))
             self.assertEqual(r.returncode, 0, r.stderr)
-        r = self._node("--check", str(AGMEN_JS))
-        self.assertEqual(r.returncode, 0, r.stderr)
+        for js in (AGMEN_JS, MCAP_JS):
+            r = self._node("--check", str(js))
+            self.assertEqual(r.returncode, 0, r.stderr)
 
     def _run(self, cases):
         with tempfile.TemporaryDirectory() as d:
@@ -249,6 +252,153 @@ class TestPanelJs(unittest.TestCase):
             with self.subTest(name):
                 self.assertNotEqual(msg_, "ok")
         self.assertIn("v0", res[2])
+
+
+
+# Lee cada archivo con mcap.js (por partes de 4 KB, como File.slice) y con su
+# decodificador agmen.js, y lo devuelve en JSON para compararlo con Python.
+MCAP_SCRIPT = r"""
+const M = require(process.argv[2]), A = require(process.argv[3]), fs = require("fs");
+const files = JSON.parse(fs.readFileSync(0, "utf8"));
+const piecewise = (b) => ({ name: "", size: b.length, reads: 0,
+  read(pos, n) { this.reads++; if (n > 4 * 1024 * 1024) throw new Error("lectura enorme"); return Promise.resolve(b.subarray(pos, pos + n)); } });
+(async () => {
+  const out = [];
+  for (const f of files) {
+    try {
+      const src = piecewise(fs.readFileSync(f));
+      const r = await M.open(src);
+      const msgs = await r.allMessages();
+      const topics = {};
+      for (const c of r.channels.values()) topics[c.topic] = c.messageEncoding;
+      const first = msgs.find((m) => r.channels.get(m.channelId).topic === "/imu");
+      let decoded = null;
+      if (first) {
+        const sch = r.schemas.get(r.channels.get(first.channelId).schemaId);
+        const L = new A.Layout(new TextDecoder().decode(sch.data)), env = A.parseEnvelope(first.data);
+        decoded = { seq: Number(env.seq), rows: L.decodeRows(env.payload) };
+      }
+      out.push({ complete: r.complete, truncated: r.truncated, profile: r.profile, library: r.library, topics,
+                 count: r.statistics.messageCount, start: r.start.toString(), end: r.end.toString(),
+                 meta: Object.fromEntries(r.metadata.map((m) => [m.name, m.values])), decoded,
+                 msgs: msgs.map((m) => [r.channels.get(m.channelId).topic, m.logTime.toString(), m.publishTime.toString(),
+                                         m.sequence, Buffer.from(m.data).toString("hex")]) });
+    } catch (e) {
+      out.push({ error: e instanceof M.McapError ? "McapError: " + e.message : e instanceof A.AgmenError ? "AgmenError: " + e.message
+                        : "OTRO " + String(e && e.stack || e) });
+    }
+  }
+  process.stdout.write(JSON.stringify(out));
+})();
+"""
+
+
+@unittest.skipIf(shutil.which("node") is None, "Node no está instalado")
+class TestMcapJs(unittest.TestCase):
+    """mcap.js (el lector del panel, RFC 0010) lee lo mismo que el de Python."""
+
+    def _run(self, paths):
+        with tempfile.TemporaryDirectory() as d:
+            script = Path(d) / "mcap.js"
+            script.write_text(MCAP_SCRIPT, encoding="utf-8")
+            r = subprocess.run(["node", str(script), str(MCAP_JS), str(AGMEN_JS)], input=json.dumps([str(p) for p in paths]),
+                               capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def _python(self, path):
+        from agmen import _mcap
+
+        with _mcap.Reader(str(path)) as r:
+            msgs = [[m.channel.topic, str(m.log_time), str(m.publish_time), m.sequence, bytes(m.data).hex()]
+                    for m in r.messages()]
+            return {"complete": r.complete, "truncated": r.truncated, "msgs": msgs, "meta": dict(r.metadata)}
+
+    def test_el_vector(self):
+        got = self._run([MCAP_VECTOR])[0]
+        exp = self._python(MCAP_VECTOR)
+        self.assertNotIn("error", got)
+        self.assertEqual(got["msgs"], exp["msgs"])
+        self.assertEqual((got["complete"], got["truncated"], got["profile"], got["library"]), (True, False, "agmen", "agmen 0.12.0"))
+        self.assertEqual(got["topics"], {"/imu": "agmen", "/camara": "agmen"})
+        self.assertEqual(got["count"], 15)
+        self.assertEqual(got["meta"], exp["meta"])
+        self.assertEqual(got["decoded"]["rows"][0]["ay"], wire.ImuSample.decode_payload(
+            wire.parse(bytes.fromhex(exp["msgs"][0][4]))[1]).accel[1])
+
+    def test_comprimidas_y_cortadas(self):
+        """Sin comprimir y con lz4, completas y cortadas en varios puntos: lo mismo que Python
+        (hasta el último chunk completo). Nunca otro error que McapError."""
+        from agmen import _mcap
+
+        data = MCAP_VECTOR.read_bytes()
+        with tempfile.TemporaryDirectory() as d:
+            paths = []
+            try:
+                _mcap._need("lz4")
+                lz4 = Path(d) / "lz4.mcap"
+                w = _mcap.Writer(str(lz4), chunk_size=600, compression="lz4")
+                with _mcap.Reader(str(MCAP_VECTOR)) as r:
+                    ids = {}
+                    for c in r.channels.values():
+                        s = r.schemas[c.schema_id]
+                        ids[c.id] = w.add_channel(c.topic, "agmen", w.add_schema(s.name, s.encoding, bytes(s.data)))
+                    for m in r.messages():
+                        w.add_message(ids[m.channel.id], m.log_time, m.publish_time, m.sequence, bytes(m.data))
+                w.close()
+                paths.append(lz4)
+            except _mcap.McapError:
+                pass                                 # sin lz4 instalado
+            for cut in (len(data) // 3, len(data) // 2, len(data) * 4 // 5, len(data) - 10):
+                p = Path(d) / f"cortada-{cut}.mcap"
+                p.write_bytes(data[:cut])
+                paths.append(p)
+            got = self._run(paths)
+            for p, g in zip(paths, got, strict=True):
+                with self.subTest(p.name):
+                    self.assertNotIn("error", g, g.get("error"))
+                    exp = self._python(p)
+                    self.assertEqual(g["msgs"], exp["msgs"])
+                    self.assertEqual(g["complete"], exp["complete"])
+
+    def test_danado_solo_da_mcaperror(self):
+        import random
+
+        data = MCAP_VECTOR.read_bytes()
+        rng = random.Random(10)
+        with tempfile.TemporaryDirectory() as d:
+            paths = []
+            for k in range(60):
+                bad = bytearray(data)
+                for _ in range(rng.randint(1, 8)):
+                    bad[rng.randrange(len(bad))] = rng.randrange(256)
+                p = Path(d) / f"danado-{k}.mcap"
+                p.write_bytes(bytes(bad))
+                paths.append(p)
+            not_mcap = Path(d) / "no.mcap"
+            not_mcap.write_bytes(b"hola, no soy un mcap")
+            paths.append(not_mcap)
+            got = self._run(paths)
+        for p, g in zip(paths, got, strict=True):
+            with self.subTest(p.name):
+                self.assertFalse(g.get("error", "").startswith("OTRO"), g.get("error"))
+        self.assertIn("no es un archivo MCAP", got[-1]["error"])
+
+    def test_zstd_sin_servidor_lo_dice(self):
+        from agmen import _mcap
+
+        try:
+            _mcap._need("zstd")
+        except _mcap.McapError:
+            self.skipTest("sin zstandard")
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "z.mcap"
+            w = _mcap.Writer(str(p), compression="zstd")
+            c = w.add_channel("/imu", "agmen", w.add_schema("ImuSample", "agmen", wire.ImuSample.SCHEMA_TEXT.encode()))
+            w.add_message(c, 1, 1, 0, wire.encode(wire.ImuSample((1, 2, 3), (4, 5, 6)), 0, topic="/imu"))
+            w.close()
+            got = self._run([p])[0]
+        self.assertIn("agmen web", got["error"])
 
 
 if __name__ == "__main__":

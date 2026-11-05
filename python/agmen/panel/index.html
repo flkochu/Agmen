@@ -132,6 +132,20 @@
   .rhythm td.num { font-family: var(--mono); text-align: right; white-space: nowrap; }
   .rhythm .bad { color: var(--bad, #e5534b); }
   .rhythm .grp { color: var(--muted); }
+  /* grabaciones (RFC 0010) */
+  .rec .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
+  .rec .row:first-child { margin-top: 0; }
+  .rec .t { font: 600 18px/1.3 var(--mono); }
+  .rec .file { font: 600 13px var(--mono); word-break: break-all; }
+  .rec input[type=range] { width: 100%; margin: 10px 0 0; }
+  .rec select, .clock select { background: var(--panel); color: inherit; border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; }
+  .rec .warn { color: var(--warn); }
+  button.recbtn.on { background: var(--bad); border-color: var(--bad); color: #fff; }
+  .progress { height: 6px; border-radius: 3px; background: var(--panel2); border: 1px solid var(--line); overflow: hidden; margin-top: 8px; }
+  .progress i { display: block; height: 100%; width: 0; background: var(--accent); }
+  body.dropping::after { content: "suelta el .mcap para verlo aquí"; position: fixed; inset: 12px; z-index: 20; pointer-events: none;
+    display: flex; align-items: center; justify-content: center; font-size: 22px; color: var(--accent);
+    border: 3px dashed var(--accent); border-radius: 16px; background: color-mix(in srgb, var(--bg) 75%, transparent); }
 </style>
 </head>
 <body>
@@ -142,6 +156,12 @@
 
 <main>
   <div class="side">
+    <section class="panel rec" id="recpanel">
+      <h2>Grabación <span class="right hint" id="recsum"></span></h2>
+      <div id="rec"></div>
+      <input type="file" id="recfile" accept=".mcap" hidden>
+    </section>
+
     <section class="panel">
       <h2>Nodos <span class="right" id="nodesum"></span></h2>
       <div id="nodes"><div class="empty">cargando…</div></div>
@@ -200,6 +220,7 @@
 </main>
 <div class="toast" id="toast"></div>
 <script src="agmen.js"></script>
+<script src="mcap.js"></script>
 
 <script>
 "use strict";
@@ -207,7 +228,8 @@ const $ = (id) => document.getElementById(id);
 const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const PALETTE = ["#4f8ff7", "#c678dd", "#e9b949", "#4cc38a", "#56b6c2", "#ef8a5a", "#e06c9f", "#9aa5ce"];
 const nodeColor = {};
-let state = { nodes: [], teleop: null, managed: false };
+let state = { nodes: [], teleop: null, managed: false, recording: null };
+let rec = null;                         // la grabación abierta en el panel (RFC 0010); null = en vivo
 let filter = null;                      // nodo seleccionado en los logs (null = todos)
 const MAX_HZ = 100;                     // por topic: más rápido que esto no se nota en una gráfica
 // Los tipos estándar de imagen (agmen.msgs, RFC 0008): se ven en la tarjeta Cámara, no en gráficas.
@@ -318,6 +340,7 @@ function renderNodes() {
 let clockSeen = null;   // [t simulado, performance.now()] para animar entre estados
 function renderClock(c) {
   const box = $("clock");
+  if (c.mode === "replay") { renderReplayClock(c); return; }
   if (c.mode !== "sim") {
     $("clockmode").textContent = "real";
     if (box.dataset.mode !== "real") {
@@ -363,8 +386,46 @@ function renderClock(c) {
 function tickClock() {
   const el = $("clockt");
   if (!el || !clockSeen) return;
-  const [t, at, speed] = clockSeen;
-  el.textContent = "t = " + (t + speed * (performance.now() - at) / 1000).toFixed(2) + " s";
+  const [t, at, speed, dur] = clockSeen, now = t + speed * (performance.now() - at) / 1000;
+  if (dur == null) { el.textContent = "t = " + now.toFixed(2) + " s"; return; }
+  const pos = Math.min(dur, Math.max(0, now));       // reproducción: dónde va, de cuánto
+  el.textContent = `${pos.toFixed(1)} s de ${dur.toFixed(1)} s`;
+  const bar = $("clockprog"); if (bar) bar.style.width = (dur > 0 ? 100 * pos / dur : 0).toFixed(1) + "%";
+}
+// agmen run --play: el tiempo de los nodos es el de la grabación (RFC 0010); pausa y velocidad, desde aquí.
+function renderReplayClock(c) {
+  const box = $("clock");
+  $("clockmode").textContent = "reproducción";
+  if (box.dataset.mode !== "replay") {
+    box.dataset.mode = "replay";
+    box.innerHTML = `<div class="dim" id="clockfile"></div><div class="t" id="clockt">—</div>
+      <div class="progress"><i id="clockprog"></i></div><div class="dim" id="clockst"></div>
+      <div class="row">
+        <button id="clockpause"></button>
+        <button id="clockstep" title="avanza 0.1 s de la grabación y se queda en pausa">paso</button>
+        <select id="clockspeed" title="velocidad de la reproducción">
+          ${[0.1, 0.25, 0.5, 1, 2, 5, 10].map((v) => `<option value="${v}">×${v}</option>`).join("")}
+        </select>
+      </div>
+      <div class="note" style="margin-top:6px">Los nodos viven en el tiempo de la grabación: saltar hacia atrás no se puede (su reloj nunca regresa). Para verla con libertad, ábrela en el panel (Grabación → abrir).</div>`;
+    $("clockpause").onclick = () => act({ op: "clock", action: renderClock.paused ? "resume" : "pause" });
+    $("clockstep").onclick = () => act({ op: "clock", action: "step", value: 0.1 });
+    $("clockspeed").onchange = (ev) => act({ op: "clock", action: "speed", value: Number(ev.target.value) });
+  }
+  renderClock.paused = c.paused;
+  $("clockfile").textContent = c.file || "";
+  const ended = c.paused && c.position >= c.duration - 0.05;
+  $("clockst").textContent = ended ? "⏹ terminó: el tiempo quedó en pausa al final de la grabación"
+                                   : c.paused ? "⏸ en pausa" : `▶ ×${c.speed}`;
+  $("clockpause").textContent = c.paused ? "▶ seguir" : "⏸ pausar";
+  $("clockpause").disabled = ended;
+  const sel = $("clockspeed");
+  if (document.activeElement !== sel) {
+    if (![...sel.options].some((o) => Number(o.value) === c.speed)) sel.add(new Option("×" + c.speed, c.speed));
+    sel.value = String(c.speed);
+  }
+  clockSeen = [c.position, performance.now(), c.paused ? 0 : c.speed, c.duration];
+  tickClock();
 }
 setInterval(tickClock, 100);
 
@@ -459,7 +520,7 @@ function showCmd([l, r], active) {
   for (const b of document.querySelectorAll("#pad [data-d]")) b.classList.toggle("on", keys.has(b.dataset.d));
 }
 function press(dir, down) {
-  if (!state.teleop) return;
+  if (!state.teleop || rec) return;                    // viendo una grabación no se maneja: los datos no son de ahora
   if (down) keys.add(dir); else keys.delete(dir);
   if (keys.size && !driveTimer) {
     tick(); driveTimer = setInterval(tick, 50);            // 20 Hz mientras se presiona
@@ -496,25 +557,29 @@ function T(topic) {
   if (!tstate[topic]) tstate[topic] = { buf: [], followSrc: null, lastSeen: {}, groups: [], groupsKey: "", last: null };
   return tstate[topic];
 }
-function resubscribe() { for (const t of selected) send({ op: "subscribe", topic: t, max_hz: rateFor(t) }); }
+function liveSend(obj) { if (!rec) send(obj); }    // viendo una grabación no se le pide nada al robot
+function resubscribe() { for (const t of selected) liveSend({ op: "subscribe", topic: t, max_hz: rateFor(t) }); }
 function toggleTopic(t, ev) {
   if (selected.has(t) && focus === t) {               // clic al que ya tiene el foco: lo quita
-    selected.delete(t); send({ op: "unsubscribe", topic: t });
+    selected.delete(t); liveSend({ op: "unsubscribe", topic: t });
     delete tstate[t];
     focus = selected.size ? [...selected][selected.size - 1] : null;
   } else if (selected.has(t)) {
     focus = t;                                        // clic a otro elegido: solo cambia el foco
   } else {
-    selected.add(t); focus = t; send({ op: "subscribe", topic: t, max_hz: rateFor(t) });
+    selected.add(t); focus = t; liveSend({ op: "subscribe", topic: t, max_hz: rateFor(t) });
   }
   lastTopicsKey = ""; layoutCharts(); renderInspector(true);
+  if (rec) recSeek(rec.pos);                          // la historia del topic nuevo, desde el archivo
 }
 function renderTopics(topics) {
   const names = Object.keys(topics).filter((t) => t.startsWith("/")).sort();
-  // Al principio, el topic con más mensajes por segundo (normalmente un sensor).
-  if (!autoPicked && names.length) {
+  // Al principio, el topic con más mensajes por segundo (normalmente un sensor). /clock no:
+  // es el tiempo del sistema (y con agmen run --play llega antes que los sensores).
+  const pool = names.filter((t) => t !== "/clock");
+  if (!autoPicked && pool.length) {
     autoPicked = true;
-    const best = names.reduce((a, b) => (topics[b].rate_hz > topics[a].rate_hz ? b : a));
+    const best = pool.reduce((a, b) => (topics[b].rate_hz > topics[a].rate_hz ? b : a));
     toggleTopic(best);
   }
   const k = JSON.stringify(names.map((t) => [t, Math.round(topics[t].rate_hz)])) + [...selected].join() + focus;
@@ -537,7 +602,7 @@ function onState(m) {
   $("ver").textContent = "v" + m.version;
   document.title = `Agmen · ${m.robot || "panel"}`;
   const prevTeleop = !!state.teleop;
-  state = { nodes: m.nodes, teleop: m.teleop, managed: m.managed };
+  state = { nodes: m.nodes, teleop: m.teleop, managed: m.managed, recording: m.recording || null };
   document.querySelector(".logs").style.display = m.managed ? "" : "none";  // agmen web: no hay nodos que mostrar
   const key = JSON.stringify(m.nodes.map((n) => [n.name, n.state, n.restarts, n.pid, Math.floor((n.uptime || 0))]));
   if (key !== onState.nodesKey) {
@@ -548,8 +613,13 @@ function onState(m) {
   if (!!state.teleop !== prevTeleop || !$("drive").dataset.ready) renderDrive();
   renderClock(m.clock || { mode: "real" });
   renderRhythm(m.rhythm || []);
+  renderRec();
+  if (m.recording_file && onState.autoRec !== m.recording_file.name) {   // agmen web vuelta1.mcap
+    onState.autoRec = m.recording_file.name;
+    openRecording(AgmenMcap.urlSource("/api/recording", m.recording_file.size, m.recording_file.name, "/api/recording/chunk"));
+  }
   stats = m.stats || {};
-  updateStats(stats);
+  if (!rec) updateStats(stats);
   // CPU del puente: con dos lecturas seguidas
   const now = performance.now();
   if (onState.cpu) {
@@ -560,7 +630,8 @@ function onState(m) {
   }
   onState.cpu = [m.cpu_s, now];
   const bad = m.nodes.filter((n) => n.state === "falló").length;
-  if (bad) setStatus("bad", `${bad} nodo${bad > 1 ? "s" : ""} con falla`);
+  if (rec) setStatus("ok", `grabación · ${rec.name}`);
+  else if (bad) setStatus("bad", `${bad} nodo${bad > 1 ? "s" : ""} con falla`);
   else if (lastData && performance.now() - lastData < 1500) setStatus("ok", "conectado · recibiendo datos");
   else setStatus("warn", "conectado · sin datos");
 }
@@ -584,12 +655,17 @@ function updateStats(g) {
 
 // ---------- datos que llegan (bytes de Agmen) ----------
 function onPacket(buf) {
+  if (rec) return;                                     // viendo una grabación: lo que llega en vivo no se muestra
   let m;
   try { m = dec.feed(new Uint8Array(buf)); } catch (e) { onPacket.lastError = "panel: " + e.message; return; }
-  if (m.kind !== "data" || !selected.has(m.topic)) return;
+  if (m.kind === "data") handleData(m, performance.now());
+}
+// srcNow: el tiempo con que se decide a qué emisor seguir (en vivo, el de ahora; en una grabación, el suyo).
+function handleData(m, srcNow) {
+  if (!selected.has(m.topic)) return;
   const ts = T(m.topic), now = performance.now(), src = Agmen.hex64(m.env.sourceId);
-  ts.lastSeen[src] = now;
-  if (ts.followSrc === null || now - (ts.lastSeen[ts.followSrc] || 0) > 500) { ts.followSrc = src; ts.buf.length = 0; }
+  ts.lastSeen[src] = srcNow;
+  if (ts.followSrc === null || srcNow - (ts.lastSeen[ts.followSrc] || 0) > 500) { ts.followSrc = src; ts.buf.length = 0; }
   if (src !== ts.followSrc) return;
   const row = m.rows[m.rows.length - 1];
   const kind = imageKind(m.layout);
@@ -617,10 +693,10 @@ function cameraCard(topic, ts, kind) {
   const sel = el.querySelector("select");
   const choices = kind === "jpeg" ? [5, 10, 15, 30, 60] : [1, 2, 5, 10, 15, 30];
   const cur = camRate[topic] || (kind === "jpeg" ? JPEG_FPS_DEFAULT : RAW_FPS_DEFAULT);
-  if (camRate[topic] !== cur) { camRate[topic] = cur; send({ op: "subscribe", topic, max_hz: cur }); }  // pedir solo las que se ven
+  if (camRate[topic] !== cur) { camRate[topic] = cur; liveSend({ op: "subscribe", topic, max_hz: cur }); }  // pedir solo las que se ven
   for (const c of choices) { const o = document.createElement("option"); o.value = c; o.textContent = c; o.selected = c === cur; sel.appendChild(o); }
   sel.onchange = () => {
-    camRate[topic] = +sel.value; send({ op: "subscribe", topic, max_hz: camRate[topic] });
+    camRate[topic] = +sel.value; liveSend({ op: "subscribe", topic, max_hz: camRate[topic] });
     if (ts.cam) { ts.cam.frames = 0; ts.cam.fpsAt = performance.now(); }   // contar desde la frecuencia nueva
   };
   ts.cam = { el, kind, frames: 0, fpsAt: performance.now(), fps: 0, url: null,
@@ -824,6 +900,221 @@ function renderInspector(force) {
 }
 setInterval(renderInspector, 100);
 
+// ---------- grabaciones (RFC 0010): ⏺ grabar, y ver un .mcap en el navegador ----------
+// Viendo una grabación, el panel deja de mostrar lo que llega en vivo: los mensajes salen del
+// archivo (leído por partes con su índice, aunque mida varios GB) a su tiempo, y se dibujan con
+// el mismo código que los en vivo. Aquí sí se puede saltar a cualquier punto: no hay nodos.
+const utf8text = new TextDecoder();
+function fmtBytes(n) { return n < 1048576 ? (n / 1024).toFixed(0) + " kB" : n < 1073741824 ? (n / 1048576).toFixed(1) + " MB" : (n / 1073741824).toFixed(2) + " GB"; }
+function baseName(p) { return String(p || "").split(/[\\/]/).pop(); }
+function recNs(sec) { return rec.t0 + BigInt(Math.round(sec * 1e9)); }
+function recSec(t) { return Number(t - rec.t0) / 1e9; }
+function renderRec() {
+  const box = $("rec");
+  if (rec) { renderRecPlayer(); return; }
+  const r = state.recording;
+  const key = r ? (r.recording ? "rec-on" : "rec-off") : "rec-none";
+  $("recsum").textContent = r && r.recording ? "⏺ grabando" : "";
+  if (box.dataset.k !== key) {
+    box.dataset.k = key;
+    box.innerHTML = (r ? `<div class="row"><button class="recbtn${r.recording ? " on" : ""}" id="recbtn"
+        title="${r.recording ? "cierra el archivo (con lo que quedó en la cola)" : "graba lo de [record] en robot.toml (o todos los topics)"}">
+        ${r.recording ? "⏹ detener" : "⏺ grabar"}</button><span class="note" id="recinfo"></span></div>` : "") +
+      `<div class="row note">Ver una grabación: <button id="recopen">abrir .mcap…</button> o arrástrala aquí.</div>` +
+      (r ? "" : `<div class="note">Para grabar desde aquí, lanza el robot con <code>agmen run</code> (o corre <code>agmen record</code>).</div>`);
+    if (r) $("recbtn").onclick = () => act({ op: "record", action: state.recording.recording ? "stop" : "start" });
+    $("recopen").onclick = () => $("recfile").click();
+  }
+  const info = $("recinfo");
+  if (info && r) {
+    info.textContent = r.recording
+      ? `${fmtUptime(r.seconds)} · ${fmtBytes(r.bytes)} · ${r.messages} mensajes · ${baseName(r.file)}`
+      : r.file ? `la última: ${baseName(r.file)} (${r.messages} mensajes)` : "";
+    info.className = "note" + (r.lost ? " warn" : "");
+    if (r.lost) info.textContent += ` · ⚠ ${r.lost} perdidos`;
+  }
+}
+function renderRecPlayer() {
+  const box = $("rec");
+  $("recsum").textContent = "▶ viendo una grabación";
+  if (box.dataset.k !== "player") {
+    box.dataset.k = "player";
+    box.innerHTML = `<div class="file" id="recname"></div><div class="note" id="recmeta"></div>
+      <input type="range" id="recpos" min="0" max="1000" step="1" value="0" aria-label="posición en la grabación">
+      <div class="row">
+        <button id="recplay"></button>
+        <select id="recspeed" title="velocidad">${[0.1, 0.25, 0.5, 1, 2, 5, 10].map((v) => `<option value="${v}"${v === 1 ? " selected" : ""}>×${v}</option>`).join("")}</select>
+        <span class="t" id="rect">0.0 s</span>
+        <button id="recclose" style="margin-left:auto" title="volver a lo que llega del robot">cerrar</button>
+      </div><div class="note" id="recwarn"></div>`;
+    $("recplay").onclick = () => {
+      if (!rec) return;
+      if (!rec.playing && rec.pos >= rec.dur) { recSeek(0).then(() => { if (rec) { rec.playing = true; renderRecPlayer(); } }); return; }
+      rec.playing = !rec.playing; rec.lastFrame = 0; renderRecPlayer();
+    };
+    $("recspeed").onchange = (ev) => { if (rec) rec.speed = Number(ev.target.value); };
+    const pos = $("recpos");
+    pos.oninput = () => { if (rec) { rec.dragging = true; showRecTime(Number(pos.value) / 1000 * rec.dur); } };
+    pos.onchange = () => { if (rec) { rec.dragging = false; recSeek(Number(pos.value) / 1000 * rec.dur); } };
+    $("recclose").onclick = closeRecording;
+  }
+  $("recname").textContent = rec.name;
+  const i = rec.info, lost = Number(rec.lostMeta.total || 0);
+  $("recmeta").textContent = `${rec.dur.toFixed(1)} s · ${Object.keys(rec.topics).length} topics` +
+    (i.version ? ` · grabado con Agmen ${i.version}` + (i.computadora ? ` en ${i.computadora}` : "") : "") +
+    (i.reloj && i.reloj !== "real" ? ` · reloj ${i.reloj}` : "") + (rec.reader.complete ? "" : " · sin índice (se leyó completa)");
+  $("recwarn").textContent = (lost ? `⚠ se perdieron ${lost} mensajes al grabar (agmen info dice cuáles). ` : "") + (rec.lastErr ? `⚠ ${rec.lastErr}` : "");
+  $("recwarn").className = "note warn";
+  $("recplay").textContent = rec.playing ? "⏸ pausar" : rec.pos >= rec.dur ? "↺ otra vez" : "▶ reproducir";
+  showRecTime(rec.pos);
+}
+function showRecTime(sec) {
+  const t = $("rect"); if (!t || !rec) return;
+  t.textContent = `${sec.toFixed(1)} s`;
+  t.title = `de ${rec.dur.toFixed(1)} s`;
+  if (!rec.dragging) $("recpos").value = String(rec.dur > 0 ? Math.round(1000 * sec / rec.dur) : 0);
+}
+function resetTopics() {
+  for (const t of selected) liveSend({ op: "unsubscribe", topic: t });
+  selected.clear(); focus = null; autoPicked = false; lastTopicsKey = "";
+  for (const k of Object.keys(tstate)) delete tstate[k];
+  layoutCharts(); renderInspector(true);
+}
+async function openRecording(source) {
+  let reader;
+  try { reader = await AgmenMcap.open(source); }
+  catch (e) { toast(`no se pudo abrir ${source.name || "la grabación"}: ${e.message}`); return; }
+  const chans = [...reader.channels.values()];
+  const foreign = chans.find((c) => c.messageEncoding !== "agmen");
+  if (!chans.length) { toast(`${source.name}: no trae mensajes`); return; }
+  if (foreign) { toast(`${source.name} no es una grabación de Agmen (${foreign.topic} viene en '${foreign.messageEncoding}'): ábrela en Foxglove`); return; }
+  allStop(); resetTopics();
+  livePanels(false);
+  const dur = Math.max(0, Number(reader.end - reader.start) / 1e9);
+  const counts = reader.statistics ? reader.statistics.channelMessageCounts : new Map();
+  const lostMeta = reader.meta("agmen.perdidos") || {};
+  const layouts = new Map(), topics = {};
+  for (const c of chans) {
+    const sch = reader.schemas.get(c.schemaId);
+    let layout = null;
+    try { layout = new Agmen.Layout(utf8text.decode(sch.data)); } catch (e) { layout = null; }
+    layouts.set(c.id, { topic: c.topic, layout });
+    const n = (topics[c.topic] ? topics[c.topic].count : 0) + (counts.get(c.id) || 0);
+    let lost = 0;
+    for (const [k, v] of Object.entries(lostMeta)) if (k.split(" ")[0] === c.topic) lost += Number(v) || 0;
+    topics[c.topic] = { count: n, rate_hz: dur > 0 ? n / dur : n, bytes_s: 0, lost, sources: [], topic: c.topic,
+                        type: layout ? layout.name : (sch ? sch.name : "?"), schema: layout ? layout.text : "", source: source.name };
+  }
+  rec = { reader, name: source.name || "grabación", t0: reader.start, endNs: reader.end, dur, pos: 0, playing: false, speed: 1,
+          layouts, topics, queue: [], loadedNs: reader.start, loading: false, gen: 0, errors: 0, lastErr: "", lastFrame: 0,
+          lat: {}, info: reader.meta("agmen.grabacion") || {}, lostMeta, statsAt: 0, dragging: false };
+  setStatus("ok", `grabación · ${rec.name}`);
+  renderRec(); updateStats(recStats());              // elige solo el topic más rápido, como en vivo
+  await recSeek(0);
+  if (rec) { rec.playing = true; rec.lastFrame = 0; renderRecPlayer(); }
+}
+function closeRecording() {
+  if (!rec) return;
+  rec.gen++; rec = null;
+  resetTopics(); renderRec(); updateStats(stats);   // de vuelta a lo que llega en vivo
+  livePanels(true);
+}
+// Manejar y el reloj son del robot de ahora: mientras se ve una grabación se esconden (y no se maneja).
+function livePanels(on) {
+  for (const id of ["drivepanel", "clockpanel"]) $(id).style.display = on ? "" : "none";
+}
+function recIds() {
+  const ids = new Set();
+  for (const [id, ch] of rec.layouts) if (selected.has(ch.topic)) ids.add(id);
+  return ids;
+}
+function recError(e) { if (rec) { rec.lastErr = e.message || String(e); rec.playing = false; renderRecPlayer(); } }
+// Saltar: se vacían las gráficas y se llenan con los últimos WINDOW_S segundos antes de `sec`.
+async function recSeek(sec) {
+  const r = rec; if (!r) return;
+  const gen = ++r.gen;
+  r.pos = Math.max(0, Math.min(r.dur, sec)); r.queue = []; r.loading = false; r.lastFrame = 0;
+  r.loadedNs = recNs(r.pos);
+  for (const t of selected) { const ts = T(t); ts.buf.length = 0; ts.followSrc = null; ts.lastSeen = {}; ts.recShown = 0; }
+  showRecTime(r.pos);
+  const ids = recIds();
+  if (!ids.size) return;
+  let msgs;
+  try { msgs = await r.reader.messagesBetween(recNs(Math.max(0, r.pos - WINDOW_S)), r.loadedNs + 1n, ids); }
+  catch (e) { recError(e); return; }
+  if (rec !== r || gen !== r.gen) return;            // hubo otro salto mientras se leía
+  recDispatch(msgs, true);
+}
+async function recLoad(r) {
+  r.loading = true;
+  const gen = r.gen, from = r.loadedNs;
+  let to = from + BigInt(Math.round(Math.max(0.5, r.speed) * 1e9));
+  if (to > r.endNs) to = r.endNs;
+  try {
+    const msgs = await r.reader.messagesBetween(from + 1n, to + 1n, recIds());
+    if (rec !== r || gen !== r.gen) return;
+    r.queue = r.queue.concat(msgs); r.loadedNs = to;
+  } catch (e) { if (rec === r) recError(e); }
+  finally { if (rec === r && gen === r.gen) r.loading = false; }
+}
+function recDispatch(msgs, force) {
+  const cams = new Map();                            // de las cámaras, solo la última imagen
+  for (const m of msgs) {
+    const ch = rec.layouts.get(m.channelId);
+    if (!ch || !ch.layout) continue;
+    if (imageKind(ch.layout)) cams.set(ch.topic, [m, ch]); else recFeed(m, ch);
+  }
+  const now = performance.now();
+  for (const [topic, [m, ch]] of cams) {
+    const ts = T(topic), fps = camRate[topic] || RAW_FPS_DEFAULT;
+    if (!force && now - (ts.recShown || 0) < 1000 / fps) continue;   // "imágenes/s" también aquí
+    ts.recShown = now; recFeed(m, ch);
+  }
+}
+function recFeed(m, ch) {
+  let env, rows;
+  try {
+    env = Agmen.parseEnvelope(m.data);
+    if (env.schemaId !== ch.layout.schemaId) throw new Agmen.AgmenError(`${ch.topic}: un mensaje de otro tipo`);
+    rows = ch.layout.decodeRows(env.payload);
+  } catch (e) { rec.errors++; rec.lastErr = e.message; return; }
+  rec.lat[ch.topic] = Number(m.logTime - env.tPub) / 1e6;    // de que se publicó a que lo grabó
+  handleData({ kind: "data", env, topic: ch.topic, layout: ch.layout, rows }, recSec(m.logTime) * 1000);
+}
+function recStats() {
+  const topics = {};
+  for (const [t, v] of Object.entries(rec.topics)) topics[t] = { ...v, latency_ms: rec.lat[t] == null ? null : rec.lat[t] };
+  return { topics, errors: rec.errors, last_error: rec.lastErr, listening: rec.name, lost: Number(rec.lostMeta.total || 0) };
+}
+function recTick() {
+  const r = rec; if (!r) return;
+  const now = performance.now(), dt = r.lastFrame ? (now - r.lastFrame) / 1000 : 0;
+  r.lastFrame = now;
+  if (r.playing && !r.dragging) {
+    r.pos = Math.min(r.dur, r.pos + dt * r.speed);
+    if (r.pos >= r.dur) { r.playing = false; renderRecPlayer(); }
+  }
+  const until = recNs(r.pos);
+  let k = 0;
+  while (k < r.queue.length && r.queue[k].logTime <= until) k++;
+  if (k) recDispatch(r.queue.splice(0, k), false);
+  if (!r.loading && r.loadedNs < r.endNs && recSec(r.loadedNs) < r.pos + 1.5 * Math.max(1, r.speed)) recLoad(r);
+  showRecTime(r.pos);
+  if (now - r.statsAt > 500) { r.statsAt = now; updateStats(recStats()); }
+}
+$("recfile").onchange = (ev) => { const f = ev.target.files[0]; if (f) openRecording(AgmenMcap.fileSource(f)); ev.target.value = ""; };
+addEventListener("dragover", (e) => {
+  if (e.dataTransfer && [...e.dataTransfer.types].includes("Files")) { e.preventDefault(); document.body.classList.add("dropping"); }
+});
+addEventListener("dragleave", (e) => { if (!e.relatedTarget) document.body.classList.remove("dropping"); });
+addEventListener("drop", (e) => {
+  document.body.classList.remove("dropping");
+  const files = e.dataTransfer ? [...e.dataTransfer.files] : [];
+  if (!files.length) return;
+  e.preventDefault();
+  openRecording(AgmenMcap.fileSource(files.find((f) => /\.mcap$/i.test(f.name)) || files[0]));
+});
+
 // ---------- logs ----------
 const logLines = [];                  // todas las líneas recibidas (máx 3000)
 let lastLogIdx = -1;                  // al reconectar llegan otra vez las últimas: no repetirlas
@@ -871,10 +1162,11 @@ function rerenderLogs() {
 $("clear").onclick = () => { logLines.length = 0; $("loglist").innerHTML = ""; };
 
 function frame() {
+  recTick();
   for (const topic of selected) { const ts = tstate[topic]; if (ts) for (const g of ts.groups) draw(ts, g); }
   requestAnimationFrame(frame);
 }
-renderChips(); layoutCharts(); connect(); requestAnimationFrame(frame);
+renderChips(); renderRec(); layoutCharts(); connect(); requestAnimationFrame(frame);
 </script>
 </body>
 </html>

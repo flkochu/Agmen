@@ -200,6 +200,30 @@ void test_sim_clock() {
     CHECK(ck::now_ns() == 1'500'000'000);
 }
 
+// RFC 0010: el modo replay sigue a /clock como la simulación (lo publica agmen
+// play), pero los mensajes dicen clock = replay.
+void test_replay_clock() {
+    namespace ck = agmen::clock;
+    ck::configure(ck::Mode::Replay, /*stepped=*/false, /*listen=*/false);
+    CHECK(ck::mode() == ck::Mode::Replay);
+    CHECK(ck::domain() == agmen::wire::Clock::Replay);
+    CHECK(ck::mode_name() == "reproducción");
+    const std::int64_t rec = 1'700'000'000'000'000'000;   // una grabación de 2023
+    ck::update(ClockMsg{.t = rec, .speed = 2.0});
+    std::this_thread::sleep_for(50ms);
+    const auto t = ck::now_ns();
+    CHECK(t > rec + 60'000'000 && t < rec + 1'000'000'000);   // ×2: unos 100 ms de grabación
+    {   // lo que publica un nodo en reproducción dice clock = replay
+        agmen::Subscriber<ClockMsg> sub("127.0.0.1:0");
+        agmen::Publisher<ClockMsg> pub("127.0.0.1:" + std::to_string(sub.local_port()), "/x");
+        (void)pub.publish(ClockMsg{});
+        const auto got = sub.receive(1s);
+        CHECK(got.has_value() && got->envelope.clock == agmen::wire::Clock::Replay);
+    }
+    ck::update(ClockMsg{.t = rec, .speed = 1.0, .paused = true});
+    CHECK(ck::now_ns() >= t);                                // nunca hacia atrás
+}
+
 
 // Un anuncio de esquema con miles de structs anidados, en un solo paquete.
 agmen::wire::Bytes nested_announcement(int levels, const std::string& topic) {
@@ -316,6 +340,7 @@ int main() {
     test_exception();
     test_stop();
     test_sim_clock();
+    test_replay_clock();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_node: %d fallas\n", g_failures);
         return 1;

@@ -872,7 +872,7 @@ def pyarrow_field(name: str, t: S.Type, extensions: bool = True):
 
     typ = pyarrow_type(t, extensions)
     meta = None
-    if extensions and isinstance(t, S.Tensor) and not isinstance(typ, pa.ExtensionType):
+    if extensions and isinstance(t, S.Tensor) and not isinstance(typ, pa.BaseExtensionType):
         meta = {b"ARROW:extension:name": b"arrow.variable_shape_tensor", b"ARROW:extension:metadata": b"{}"}
     return pa.field(name, typ, nullable=False, metadata=meta)
 
@@ -906,7 +906,7 @@ def to_pyarrow(root: S.Struct, payload):
     full = pyarrow_schema(root, extensions=True)
     cols = []
     for col, field in zip(batch.columns, full, strict=True):
-        if isinstance(field.type, pa.ExtensionType):
+        if isinstance(field.type, pa.BaseExtensionType):
             col = field.type.wrap_array(col)
         cols.append(col)
     return pa.RecordBatch.from_arrays(cols, schema=full)

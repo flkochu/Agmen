@@ -197,6 +197,37 @@ class TestMismoPuerto(unittest.TestCase):
         finally:
             sub.close()
 
+    def test_con_puerto_0_en_un_rango_reservado_de_windows(self):
+        # Windows aparta rangos enteros de puertos TCP (Hyper-V, WSL, Docker): ahí bind
+        # da WinError 10013, y como da los puertos de corrido, 20 UDP nuevos caían en el
+        # mismo rango (pasó en el CI de Windows). Se pide primero el TCP; el UDP lo sigue.
+        real, calls = _tcp.Listener, []
+
+        def reserved(bind, shm=False):
+            calls.append(bind)
+            if bind[1] != 0:
+                raise PermissionError(errno.EACCES, "An attempt was made to access a socket in a way "
+                                                    "forbidden by its access permissions")
+            return real(bind, shm=shm)
+
+        with unittest.mock.patch.object(_tcp, "Listener", reserved):
+            sub = pubsub._PureSubscriber(Img, "127.0.0.1:0")
+        try:
+            self.assertEqual(sub.tcp_port, sub.port, "UDP y TCP en el mismo número")
+            self.assertEqual(calls[1:], [("127.0.0.1", 0)], "un solo intento más: el TCP primero")
+            pub = agmen.Publisher(Img, f"127.0.0.1:{sub.port}", topic="/img")
+            try:
+                end = time.monotonic() + 3
+                got = None
+                while got is None and time.monotonic() < end:
+                    pub.publish(Img(1, 2, b"x" * 100))
+                    got = sub.receive(0.1)
+                self.assertIsNotNone(got, "llega por el TCP del mismo puerto")
+            finally:
+                pub.close()
+        finally:
+            sub.close()
+
     def test_con_puerto_fijo_ocupado_es_un_error(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as t:
             t.bind(("127.0.0.1", 0))

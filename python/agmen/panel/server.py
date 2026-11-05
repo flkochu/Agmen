@@ -37,12 +37,13 @@ from urllib.parse import parse_qs, urlsplit
 from .. import schema, wire
 from .. import ws as wsmod
 from .._version import __version__
-from ..pubsub import Publisher, RawSubscriber
+from ..pubsub import RawSubscriber, _PurePublisher
 from .bridge import FOXGLOVE_PROTOCOL, PROTOCOLS, Bridge
 
 HERE = Path(__file__).resolve().parent
 INDEX_HTML = (HERE / "index.html").read_bytes()
 AGMEN_JS = (HERE / "agmen.js").read_bytes()
+MCAP_JS = (HERE / "mcap.js").read_bytes()
 COOKIE = "agmen_t"
 
 # Visores que pueden abrir el WebSocket desde otra página (solo con el
@@ -156,6 +157,11 @@ class SchemaBook:
         return topic, self.layouts[env.schema_id]
 
 
+def panel_node_name() -> str:
+    """El nombre del panel en el hub: "panel" (o el AGMEN_NODE con que lo corriste)."""
+    return os.environ.get("AGMEN_NODE") or "panel"
+
+
 def udp_receiver(hub: SensorHub, bridge: Bridge | None, listen: str | None, stop: threading.Event,
                  topics: bool = True) -> None:
     """Recibe de su dirección fija (`listen`, para nodos sin hub como un puente
@@ -164,12 +170,14 @@ def udp_receiver(hub: SensorHub, bridge: Bridge | None, listen: str | None, stop
     sin decodificar, al puente."""
     import select
 
-    os.environ.setdefault("AGMEN_NODE", "panel")
+    # Se llama "panel" en el hub sin cambiar el nombre del proceso: en agmen run, el
+    # grabador y el reproductor viven en el mismo proceso y no son el panel.
+    name = panel_node_name()
     receivers: list[RawSubscriber] = []
     if listen:
-        receivers.append(RawSubscriber(listen))
+        receivers.append(RawSubscriber(listen, node=name))
     if topics:
-        receivers.append(RawSubscriber("*"))
+        receivers.append(RawSubscriber("*", node=name))
     hub.update(listening=", ".join(filter(None, [listen, "todos los topics" if topics else None])))
     book = SchemaBook()
     expected: dict[tuple[str, int], int] = {}     # (emisor, source_id) → seq esperado
@@ -269,10 +277,11 @@ class Teleop:
     se pierde la conexión el puente manda alto por él."""
 
     def __init__(self, target: str, max_speed: float) -> None:
-        os.environ.setdefault("AGMEN_NODE", "panel")   # así aparece en 'agmen node list'
         self.target = target
         self.max_speed = max(0.0, min(1.0, max_speed))
-        self.pub = Publisher(MotorCommand, target, topic="/teleop")
+        # "panel" en 'agmen node list'. 20 comandos chicos por segundo: el Publisher de
+        # Python puro alcanza, y es el que deja ponerle nombre sin cambiar el del proceso.
+        self.pub = _PurePublisher(MotorCommand, target, topic="/teleop", node=panel_node_name())
         self.lock = threading.Lock()
         self.last_sent = 0.0
         self.last_cmd = (0.0, 0.0)
@@ -297,9 +306,14 @@ class Teleop:
 class Panel:
     def __init__(self, http: str, listen: str | None, robot_name: str = "",
                  launcher=None, teleop: Teleop | None = None, topics: bool = True,
-                 token: str | None = None, allow_origins: list[str] | None = None, clock=None) -> None:
+                 token: str | None = None, allow_origins: list[str] | None = None, clock=None,
+                 recording_file: str | None = None) -> None:
         self.http = http
         self.clock = clock            # agmen.clock.ClockServer si agmen run manda el tiempo
+        # agmen web vuelta1.mcap (RFC 0010): el navegador la lee por partes de /api/recording.
+        self.recording_file = os.path.abspath(recording_file) if recording_file else None
+        self._rec_reader = None
+        self._rec_lock = threading.Lock()
         self.rhythm: list[dict] = []  # cuentas de los agmen.Node (del hub)
         self.listen = listen
         self.topics = topics
@@ -348,6 +362,10 @@ class Panel:
 
     def shutdown(self) -> None:
         self.stop.set()
+        with self._rec_lock:
+            if self._rec_reader is not None:
+                self._rec_reader.close()
+                self._rec_reader = None
         with self.bridge.lock:
             clients = [c.ws for c in self.bridge.agmen + self.bridge.fox]
         for w in clients:
@@ -364,14 +382,53 @@ class Panel:
             "teleop": self.teleop.info() if self.teleop else None,
             "clock": self.clock_info(),
             "rhythm": self.rhythm,
+            "recording": self.recording_info(),
+            "recording_file": ({"name": os.path.basename(self.recording_file),
+                                "size": os.path.getsize(self.recording_file)}
+                               if self.recording_file and os.path.isfile(self.recording_file) else None),
         }
+
+    # --- grabar (RFC 0010): el botón ⏺ del panel, con agmen run ---
+    def _recording_control(self):
+        return getattr(self.launcher, "recording", None) if self.launcher is not None else None
+
+    def recording_info(self) -> dict | None:
+        rc = self._recording_control()
+        return rc.info() if rc is not None else None
+
+    def record_action(self, action: str) -> str | None:
+        rc = self._recording_control()
+        if rc is None:
+            return ("este panel no graba: lanza el robot con 'agmen run' (o corre 'agmen record' en otra "
+                    "terminal)")
+        if action == "start":
+            return rc.start()
+        if action == "stop":
+            if rc.rec is None:
+                return "no está grabando"
+            # Cerrar escribe lo que quedó en la cola: que no espere el navegador.
+            threading.Thread(target=rc.stop, daemon=True, name="panel-record-stop").start()
+            return None
+        return f"acción de grabación desconocida '{action}' (start, stop)"
+
+    def recording_chunk(self, start: int) -> bytes | None:
+        """Los registros de un chunk ya descomprimidos (zstd: el navegador no lo trae)."""
+        from .. import _mcap
+
+        with self._rec_lock:
+            if self._rec_reader is None:
+                self._rec_reader = _mcap.Reader(self.recording_file)
+            for info in self._rec_reader.chunks:
+                if info.start == start:
+                    return bytes(self._rec_reader._chunk_data(info))
+        return None
 
     def clock_info(self) -> dict:
         from .. import clock as ck
 
         if self.clock is not None:
             return self.clock.info()
-        if ck.mode() == ck.SIM:
+        if ck.mode() != ck.REAL:
             return ck.external_info()
         return {"mode": ck.REAL}
 
@@ -380,7 +437,7 @@ class Panel:
         if self.clock is None:
             from .. import clock as ck
 
-            if ck.mode() == ck.SIM:
+            if ck.mode() != ck.REAL:
                 src = ck.external_info().get("source") or "tu simulador"
                 return f"el tiempo lo manda '{src}' ([clock] source): pausa y velocidad se controlan allá"
             return "el robot usa el reloj real: pon [clock] mode = \"sim\" en robot.toml para pausar o acelerar"
@@ -515,6 +572,9 @@ class Panel:
                 if path == "/agmen.js":
                     self._send(HTTPStatus.OK, "text/javascript; charset=utf-8", AGMEN_JS)
                     return
+                if path == "/mcap.js":
+                    self._send(HTTPStatus.OK, "text/javascript; charset=utf-8", MCAP_JS)
+                    return
                 if not self._authorized():
                     if path in ("/", "/index.html"):
                         self._deny_token()
@@ -528,8 +588,67 @@ class Panel:
                     self._send(HTTPStatus.OK, "text/html; charset=utf-8", INDEX_HTML, extra)
                 elif path == "/api/state":
                     self._json(panel.state())
+                elif path == "/api/recording" and panel.recording_file:
+                    self._send_file(panel.recording_file)
+                elif path == "/api/recording/chunk" and panel.recording_file:
+                    try:
+                        start = int(parse_qs(urlsplit(self.path).query).get("start", [""])[0])
+                        data = panel.recording_chunk(start)
+                    except (ValueError, OSError) as e:
+                        self._json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
+                        return
+                    if data is None:
+                        self._json({"error": "no hay un chunk en esa posición"}, HTTPStatus.NOT_FOUND)
+                    else:
+                        self._send(HTTPStatus.OK, "application/octet-stream", data)
                 else:
                     self._send(HTTPStatus.NOT_FOUND, "text/plain; charset=utf-8", b"no encontrado")
+
+            def _send_file(self, path: str) -> None:
+                """La grabación, entera o por partes (Range: bytes=a-b): el navegador
+                lee solo los chunks que va a mostrar, aunque mida varios GB."""
+                try:
+                    size = os.path.getsize(path)
+                    f = open(path, "rb")
+                except OSError as e:
+                    self._json({"error": f"no se pudo abrir la grabación: {e}"}, HTTPStatus.NOT_FOUND)
+                    return
+                with f:
+                    start, end, status = 0, size - 1, HTTPStatus.OK
+                    rng = self.headers.get("Range", "")
+                    if rng.startswith("bytes="):
+                        try:
+                            a, _, b = rng[6:].split(",")[0].strip().partition("-")
+                            start = int(a) if a else max(0, size - int(b))
+                            end = min(int(b), size - 1) if a and b else size - 1
+                        except ValueError:
+                            start, end = 0, -1
+                        if start > end or start >= size:
+                            self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                            self.send_header("Content-Range", f"bytes */{size}")
+                            self.send_header("Content-Length", "0")
+                            self.end_headers()
+                            return
+                        status = HTTPStatus.PARTIAL_CONTENT
+                    n = end - start + 1
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(n))
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Cache-Control", "no-store")
+                    if status == HTTPStatus.PARTIAL_CONTENT:
+                        self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                    self.end_headers()
+                    f.seek(start)
+                    try:
+                        while n > 0:
+                            block = f.read(min(n, 1 << 20))
+                            if not block:
+                                break
+                            self.wfile.write(block)
+                            n -= len(block)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass               # el navegador ya no lo quiso (saltó a otra parte)
 
             # --- POST (para scripts; el panel usa el WebSocket) ---
             def do_POST(self):
@@ -555,6 +674,10 @@ class Panel:
                         return
                     err = panel.launcher.action(parts[2], parts[3])
                     self._json({"error": err} if err else {"ok": True},
+                               HTTPStatus.BAD_REQUEST if err else HTTPStatus.OK)
+                elif parts == ["api", "record"]:
+                    err = panel.record_action(str(body.get("action", "")))
+                    self._json({"error": err} if err else {"ok": True, "recording": panel.recording_info()},
                                HTTPStatus.BAD_REQUEST if err else HTTPStatus.OK)
                 elif parts == ["api", "teleop"]:
                     if panel.teleop is None:

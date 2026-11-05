@@ -384,7 +384,7 @@ class _PureNode:
     def _run_group_impl(self, g: _GroupRt, is_main: bool, end: int | None) -> None:
         stop = self._stop
         # En simulación, el tiempo empieza cuando llega el primer /clock.
-        while g.timers and clock.mode() == clock.SIM and not clock.state().received:
+        while g.timers and clock.mode() != clock.REAL and not clock.state().received:
             if stop.is_set() or (end is not None and time.monotonic_ns() >= end):
                 return
             clock.wait_change(0.05)
@@ -500,9 +500,9 @@ class _PureNode:
         pad = "\n" + " " * (len(self.name) + 4)
         # slow_ns es tiempo real; el periodo, tiempo de Agmen (en simulación a ×2, 1 ms = 0.5 ms reales).
         speed, unit = 1.0, ""
-        if clock.mode() == clock.SIM:
+        if clock.mode() != clock.REAL:
             speed = clock.state().speed or 1.0
-            unit = f" simulados (×{speed:g})"
+            unit = f" simulados (×{speed:g})" if clock.mode() == clock.SIM else f" de la grabación (×{speed:g})"
         why = ""
         if g.slow_ns < t.period / speed:
             why = (f"{pad}Ninguna función del grupo tardó tanto (lo más lento: {g.slow_ns / 1e6:.1f} ms): el sistema "

@@ -23,7 +23,7 @@
 | 0.10.1 | — | Parche: los mensajes se pueden pasar por `pickle` (`multiprocessing`, `DataLoader` de PyTorch) |
 | **0.11.0** | 8 | Memoria compartida (RFC 0009): imágenes y tensores sin copiar entre procesos de la misma computadora; TCP entre computadoras |
 | 0.11.1 | — | Parche: auditoría del decodificador con fuzzing (un paquete mal hecho ya no tumba ni detiene a nadie); memoria compartida con tope según la RAM y que se encoge sola (RFC 0009, D6 a′); pickle de lo que llega por memoria compartida; macOS sin soporte oficial (ahí se instala Python puro) |
-| 0.12.0 | 9 | Grabación y reproducción; exportar a Parquet |
+| **0.12.0** | 9 | Grabar y reproducir: `agmen record`, `agmen play` con el tiempo de la grabación (reloj `replay`), `agmen run --record/--play`, el `.mcap` en el panel y en Foxglove, y `agmen export --parquet` / `agmen.Recording` para entrenar |
 | … | … | Un nivel por versión menor |
 | 1.0.0 | — | API estable: a partir de aquí romper la API exige subir MAYOR |
 

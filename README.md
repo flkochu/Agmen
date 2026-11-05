@@ -32,12 +32,17 @@ como paquetes opcionales.
   un `numpy.ndarray` que apunta a esa misma memoria, sin cambiar tu código
   (4K con 3 suscriptores: de 21.9 ms a 5.8 ms, y la cámara gasta 11 veces
   menos CPU). Si están en computadoras distintas, va por TCP solo.
+- **Tu robot como dataset:** `agmen run --record` (o el botón ⏺ del panel)
+  graba todos los topics en un `.mcap` sin frenar a nadie; `agmen run --play`
+  lo reproduce con su tiempo original en vez de los sensores; el panel lo
+  muestra en el navegador con barra de tiempo, y `agmen export --parquet` lo
+  convierte en tablas para entrenar (`agmen.Recording` en Python).
 - Los nodos corren **en paralelo** (un proceso cada uno) y se mide en cada
   cambio (`scripts/paralelo_check.py`). Si el panel y un cerebro autónomo
   mandan al mismo motor, **un `[[mux]]` decide quién manda**: tú le ganas al
   modo autónomo y al soltar lo retoma solo.
 
-**Versión actual: 0.11.1** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
+**Versión actual: 0.12.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
 
 | Para… | Lee |
 |---|---|
@@ -51,6 +56,7 @@ como paquetes opcionales.
 | Python compilado desde el núcleo de C++ | [RFC 0007](docs/rfc/0007-python-compilado.md) (aceptado, implementado en 0.9.0) |
 | Imágenes, tensores y texto (datos grandes) | [RFC 0008](docs/rfc/0008-datos-grandes.md) (aceptado, implementado en 0.10.0) |
 | Memoria compartida: imágenes sin copiar entre procesos | [RFC 0009](docs/rfc/0009-memoria-compartida.md) (aceptado, implementado en 0.11.0; D6 a′ en 0.11.1) |
+| Grabar, reproducir y exportar a Parquet | [RFC 0010](docs/rfc/0010-grabar-y-reproducir.md) (aceptado, implementado en 0.12.0) · [el perfil `agmen` de MCAP](docs/PROTOCOLO.md#grabaciones-mcap) |
 | Publicar versiones | [`docs/PUBLICAR.md`](docs/PUBLICAR.md) |
 
 ## Estado
@@ -67,8 +73,9 @@ como paquetes opcionales.
 | 0.8.0 ✅ | 5 | Un nodo con varios ritmos (`Node`, `every`, grupos con su propio hilo) y el reloj de Agmen: simulación más rápida, más lenta o en pausa |
 | 0.9.0 ✅ | 6 | `pip install agmen` trae el núcleo de C++ compilado: el mismo código de Python, varias veces más rápido; arreglos como NumPy sin copiar |
 | 0.10.0 ✅ | 7 | Imágenes, tensores y texto: `string`, `bytes`, `T[]` y `tensor<T,N>` en tus `.agmen` (codificación `arrow`, por TCP), `agmen.msgs.Imagen`, cámara en el panel y en Foxglove |
-| **0.11.0 ✅** | **8** | **Memoria compartida: en la misma computadora, las imágenes y los tensores no se copian entre procesos (C++ y Python, Linux, Windows y macOS); en computadoras distintas, TCP** |
-| … | 9–14 | Ver [`docs/VISION.md`](docs/VISION.md#7-roadmap-por-niveles) |
+| 0.11.0 ✅ | 8 | Memoria compartida: en la misma computadora, las imágenes y los tensores no se copian entre procesos (C++ y Python); en computadoras distintas, TCP |
+| **0.12.0 ✅** | **9** | **Grabar y reproducir: `agmen record`, `agmen play` con el tiempo de la grabación, el `.mcap` en el panel (barra de tiempo) y en Foxglove, y `agmen export --parquet` / `agmen.Recording` para entrenar** |
+| … | 10–14 | Ver [`docs/VISION.md`](docs/VISION.md#7-roadmap-por-niveles) |
 
 ## Estructura
 
@@ -79,7 +86,7 @@ agmen/
 ├── include/agmen/           API pública: agmen.hpp, wire.hpp, arrow.hpp, net.hpp, shm.hpp, node.hpp, clock.hpp, msgs.hpp (Imagen)
 ├── src/                     implementación del núcleo
 ├── examples/nivel0/         publisher y subscriber
-├── examples/tutorial/       código del tutorial (motor, controlador, cerebro.py)
+├── examples/tutorial/       código del tutorial (motor, controlador, cerebro.py, dataset.py)
 ├── examples/nodos/          un nodo con dos ritmos y el reloj de Agmen (capítulo 12)
 ├── examples/vision/         una cámara, una IA que la mira y un contador en C++ (capítulos 14 y 15)
 ├── tests/                   pruebas (ctest)
@@ -91,12 +98,15 @@ agmen/
 │   ├── hub.py · hubproto.py agmen hub: el directorio de topics (RFC 0004)
 │   ├── topic.py             agmen topic list/info/echo/hz, agmen node list
 │   ├── _tcp.py · _shm.py    mensajes grandes por TCP y por memoria compartida (RFC 0008, 0009)
+│   ├── _mcap.py             lector y escritor de MCAP, sin dependencias (RFC 0010)
+│   ├── record.py · play.py  agmen record / info y agmen play
+│   ├── recording.py         agmen.Recording y agmen export (Parquet, Foxglove)
 │   ├── idl.py · gen.py      archivos .agmen y agmen gen (RFC 0005)
 │   ├── ws.py                WebSocket con la librería estándar
-│   └── panel/               panel web: servidor, puente (bridge.py), agmen.js y la página
+│   └── panel/               panel web: servidor, puente (bridge.py), agmen.js, mcap.js (grabaciones) y la página
 ├── cmake/                   AgmenMessages.cmake: agmen_add_messages()
-├── scripts/                 interop, web, foxglove, run, paralelo, topics, gen, tutorial y check_version (todos corren en el CI)
-├── bench/                   mediciones que respaldan decisiones de diseño (shm_vs_tcp.py: RFC 0009)
+├── scripts/                 interop, web, foxglove, run, grabar, paralelo, topics, gen, tutorial y check_version (todos corren en el CI)
+├── bench/                   mediciones que respaldan decisiones de diseño (shm_vs_tcp.py: RFC 0009; grabar.py: RFC 0010)
 ├── docs/                    tutorial/, VISION, PROTOCOLO, VERSIONES, PUBLICAR, rfc/
 └── .github/workflows/       ci.yml (3 sistemas, ARM incluido, + sanitizers y fuzzing) · release.yml (PyPI + GitHub Release)
 ```
