@@ -65,6 +65,15 @@ assert _DESC.size == DESCRIPTOR_LEN and _HEADER.size == HEADER_LEN and _RECORD.s
 
 _WINDOWS = sys.platform == "win32"
 _LINUX = sys.platform.startswith("linux")
+if _WINDOWS:
+    import ctypes
+    from ctypes import wintypes
+
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _k32.OpenFileMappingW.restype = wintypes.HANDLE
+    _k32.OpenFileMappingW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    _k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _FILE_MAP_READ = 0x0004
 try:
     import _posixshmem   # Linux y macOS (CPython)
 except ImportError:      # pragma: no cover - Windows u otros Python
@@ -251,10 +260,20 @@ def create(name: str, size: int) -> mmap.mmap:
 def open_readonly(name: str, size: int) -> mmap.mmap:
     """Abre un bloque que ya existe, de solo lectura. Lanza ShmError."""
     if _WINDOWS:
+        # mmap con tagname CREA el bloque si no existe (CreateFileMapping): un
+        # bloque que ya se liberó "se abría" vacío. Primero se abre el que ya
+        # existe, como en C++ (OpenFileMappingW), y se tiene abierto mientras se
+        # mapea, para que no desaparezca entre las dos llamadas.
+        tag = _windows_name(name)
+        handle = _k32.OpenFileMappingW(_FILE_MAP_READ, False, tag)
+        if not handle:
+            raise ShmError(f"no pude abrir {name} ({_os_error(ctypes.WinError(ctypes.get_last_error()))})")
         try:
-            return mmap.mmap(-1, size, tagname=_windows_name(name), access=mmap.ACCESS_READ)
+            return mmap.mmap(-1, size, tagname=tag, access=mmap.ACCESS_READ)
         except OSError as e:
             raise ShmError(f"no pude abrir {name} ({_os_error(e)})") from None
+        finally:
+            _k32.CloseHandle(handle)
     if _posixshmem is None:
         raise ShmError("este Python no tiene memoria compartida (_posixshmem)")
     try:
@@ -334,11 +353,12 @@ _sweep_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 
 class _Block:
-    __slots__ = ("name", "mm", "size", "holders", "used")
+    __slots__ = ("name", "mm", "size", "holders", "used", "order")
 
     def __init__(self, name: str, mm: mmap.mmap, size: int) -> None:
         self.name, self.mm, self.size, self.holders = name, mm, size, 0
-        self.used = time.monotonic()      # la última vez que se escribió o se soltó
+        self.used = time.monotonic()      # la última vez que se escribió o se soltó (para trim)
+        self.order = 0                    # y en qué orden (para elegir el más reciente)
 
     def close(self) -> None:
         unlink(self.name)
@@ -359,6 +379,7 @@ class Pool:
         self.counter = 0
         self.blocks: list[_Block | None] = []
         self._probe: _Block | None = None
+        self._tick = 0      # cuenta los usos: en Windows, time.monotonic() avanza de 16 en 16 ms
         self.registry = ""
         if not _WINDOWS:
             with _sweep_lock:
@@ -417,7 +438,7 @@ class Pool:
         pick = None
         count = len(self.blocks)
         for i, b in enumerate(self.blocks):
-            if b is not None and b.holders == 0 and b.size >= need and (pick is None or b.used > self.blocks[pick].used):
+            if b is not None and b.holders == 0 and b.size >= need and (pick is None or b.order > self.blocks[pick].order):
                 pick = i
         if pick is None:
             size = -(-(need + need // 8) // BLOCK_ROUND) * BLOCK_ROUND
@@ -443,7 +464,7 @@ class Pool:
                 self.blocks.append(block)
                 pick = len(self.blocks) - 1
         b = self.blocks[pick]
-        b.used = time.monotonic()
+        self._touch(b)
         b.mm[HEADER_LEN:HEADER_LEN + n] = payload
         write_header(b.mm, self.owner, generation, n, b.size)
         return Descriptor(b.name, b.size, HEADER_LEN, n, generation, pick)
@@ -469,7 +490,11 @@ class Pool:
             if b is not None and b.holders > 0:
                 b.holders -= 1
                 if b.holders == 0:
-                    b.used = time.monotonic()
+                    self._touch(b)
+
+    def _touch(self, b: _Block) -> None:
+        self._tick += 1
+        b.used, b.order = time.monotonic(), self._tick
 
     def trim(self, now: float | None = None) -> int:
         """Libera los bloques que nadie tiene prestados y que no se usaron en

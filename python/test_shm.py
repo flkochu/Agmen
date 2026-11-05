@@ -530,7 +530,6 @@ class TestPoolSeEncoge(unittest.TestCase):
             c = pool.write(3, BIG)
             pool.hold(c.slot)
             pool.release(a.slot)
-            time.sleep(0.01)
             pool.release(c.slot)                                 # c se soltó al último: se usa c
             self.assertEqual(pool.write(4, BIG).slot, c.slot)
         finally:

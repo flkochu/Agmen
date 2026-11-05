@@ -5,15 +5,18 @@ Corre con los dos núcleos (AGMEN_BACKEND=pure|native)."""
 
 from __future__ import annotations
 
+import errno
 import os
+import socket
 import threading
 import time
 import unittest
+import unittest.mock
 from dataclasses import dataclass
 
 import agmen
+from agmen import _tcp, pubsub, wire
 from agmen import hub as hubmod
-from agmen import wire
 
 
 @dataclass
@@ -160,6 +163,47 @@ class TestConHub(unittest.TestCase):
                 second.close()
         finally:
             pub.close()
+
+
+class TestMismoPuerto(unittest.TestCase):
+    """Con dirección fija, el TCP escucha en el mismo puerto que el UDP."""
+
+    def test_con_puerto_0_prueba_otro_si_el_tcp_esta_ocupado(self):
+        # El sistema eligió un puerto libre en UDP que está ocupado en TCP (por la
+        # conexión de otro programa; pasó en el CI de Linux): se prueba con otro.
+        real, calls = _tcp.Listener, []
+
+        def busy_once(bind, shm=False):
+            calls.append(bind)
+            if len(calls) == 1:
+                raise OSError(errno.EADDRINUSE, "Address already in use")
+            return real(bind, shm=shm)
+
+        with unittest.mock.patch.object(_tcp, "Listener", busy_once):
+            sub = pubsub._PureSubscriber(Img, "127.0.0.1:0")
+        try:
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(sub.tcp_port, sub.port)
+            pub = agmen.Publisher(Img, f"127.0.0.1:{sub.port}", topic="/img")
+            try:
+                end = time.monotonic() + 3
+                got = None
+                while got is None and time.monotonic() < end:
+                    pub.publish(Img(1, 2, b"x" * 100))
+                    got = sub.receive(0.1)
+                self.assertIsNotNone(got, "llega por el TCP del puerto nuevo")
+            finally:
+                pub.close()
+        finally:
+            sub.close()
+
+    def test_con_puerto_fijo_ocupado_es_un_error(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as t:
+            t.bind(("127.0.0.1", 0))
+            t.listen(1)
+            port = t.getsockname()[1]
+            with self.assertRaises(OSError):
+                agmen.Subscriber(Img, f"127.0.0.1:{port}")
 
 
 if __name__ == "__main__":

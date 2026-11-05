@@ -618,8 +618,12 @@ class Listener:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         except OSError:
             pass
-        self.sock.bind(bind)
-        self.sock.listen(16)
+        try:
+            self.sock.bind(bind)
+            self.sock.listen(16)
+        except OSError:
+            self.sock.close()
+            raise
         self.sock.setblocking(False)
         self.shm = shm
         self.conns: dict[socket.socket, _Incoming] = {}

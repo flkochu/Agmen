@@ -30,9 +30,20 @@ from agmen.pubsub import Publisher  # noqa: E402
 
 
 def free_udp() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    """Un puerto libre en UDP **y en TCP**: el panel escucha en los dos (los
+    mensajes arrow llegan por TCP al mismo puerto). Antes solo se revisaba UDP,
+    y si una conexión TCP de otra prueba usaba ese número, el panel no podía
+    abrir su TCP (Address already in use; pasó en el CI de Linux)."""
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u, \
+                socket.socket(socket.AF_INET, socket.SOCK_STREAM) as t:
+            u.bind(("127.0.0.1", 0))
+            port = u.getsockname()[1]
+            try:
+                t.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
 
 
 class TestWebSocket(unittest.TestCase):

@@ -332,7 +332,24 @@ class _Receiver:
             self.listen = where
             self._sock.bind(_addr(where))
             if tcp:   # con dirección fija, la misma IP y el mismo puerto en TCP
-                self._tcp = _tcp.Listener(self._sock.getsockname(), shm=shm)
+                self._tcp = self._same_port_tcp(where, shm)
+
+    def _same_port_tcp(self, where: str, shm: bool) -> _tcp.Listener:
+        """El TCP en la misma IP y el mismo puerto que el UDP. Con el puerto 0, el
+        sistema eligió uno libre en UDP que puede estar ocupado en TCP (por la
+        conexión de otro programa): se prueba con otro."""
+        host, port = _addr(where)
+        for attempt in range(20):
+            try:
+                return _tcp.Listener(self._sock.getsockname(), shm=shm)
+            except OSError:
+                if port != 0 or attempt == 19:
+                    self._sock.close()
+                    raise
+                self._sock.close()
+                self._sock = wire.udp_socket()
+                self._sock.bind((host, 0))
+        raise AssertionError("no llega aquí")   # pragma: no cover
 
     @property
     def port(self) -> int:

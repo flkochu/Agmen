@@ -464,7 +464,7 @@ std::optional<Descriptor> Pool::write(std::uint64_t generation, wire::ByteView p
     std::optional<std::size_t> pick;
     for (std::size_t i = 0; i < blocks_.size(); ++i) {
         const auto& b = blocks_[i];
-        if (b.holders == 0 && b.segment && b.segment->size() >= need && (!pick || b.used > blocks_[*pick].used)) {
+        if (b.holders == 0 && b.segment && b.segment->size() >= need && (!pick || b.order > blocks_[*pick].order)) {
             pick = i;
         }
     }
@@ -500,7 +500,7 @@ std::optional<Descriptor> Pool::write(std::uint64_t generation, wire::ByteView p
         }
     }
     auto& b = blocks_[*pick];
-    b.used = std::chrono::steady_clock::now();
+    touch(b);
     std::memcpy(b.segment->data() + kHeaderLen, payload.data(), payload.size());
     BlockHeader{owner_, generation, payload.size(), b.segment->size()}.write(b.segment->data());
     // Lo escrito se ve antes que el descriptor (que sale después por TCP).
@@ -530,8 +530,13 @@ void Pool::hold(std::uint32_t slot) {
 
 void Pool::release(std::uint32_t slot) {
     if (slot < blocks_.size() && blocks_[slot].holders > 0) {
-        if (--blocks_[slot].holders == 0) blocks_[slot].used = std::chrono::steady_clock::now();
+        if (--blocks_[slot].holders == 0) touch(blocks_[slot]);
     }
+}
+
+void Pool::touch(Block& b) {
+    b.used = std::chrono::steady_clock::now();
+    b.order = ++tick_;
 }
 
 std::size_t Pool::trim(std::chrono::steady_clock::time_point now) {

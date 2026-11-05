@@ -994,9 +994,7 @@ struct SubscriberCore::State {
         : type(std::move(t)), where(w), socket(net::UdpSocket::bind(hub::is_topic(w) ? "127.0.0.1:0" : w)) {
         if (type.arrow) {
             // Los mensajes arrow llegan por TCP: con dirección fija, la misma IP y el mismo puerto.
-            tcp = std::make_unique<Listener>(hub::is_topic(w) ? std::string("127.0.0.1:0")
-                                                              : host_of(w) + ":" + std::to_string(socket.local_port()),
-                                             shm::enabled());
+            tcp = hub::is_topic(w) ? std::make_unique<Listener>("127.0.0.1:0", shm::enabled()) : same_port_listener(w);
         }
         if (hub::is_topic(w)) {
             check_topic_or_throw(w);
@@ -1017,6 +1015,22 @@ struct SubscriberCore::State {
 
     ~State() {
         if (link && socket.valid()) link->bye(socket);
+    }
+
+    // El TCP en la misma IP y el mismo puerto que el UDP. Con el puerto 0, el
+    // sistema eligió uno libre en UDP que puede estar ocupado en TCP (por la
+    // conexión de otro programa): se prueba con otro.
+    std::unique_ptr<Listener> same_port_listener(const std::string& w) {
+        const bool any_port = w.size() >= 2 && w.compare(w.size() - 2, 2, ":0") == 0;
+        for (int attempt = 0;; ++attempt) {
+            try {
+                return std::make_unique<Listener>(host_of(w) + ":" + std::to_string(socket.local_port()),
+                                                  shm::enabled());
+            } catch (const net::NetError&) {
+                if (!any_port || attempt >= 19) throw;
+                socket = net::UdpSocket::bind(w);
+            }
+        }
     }
 
     /// RFC 0001 §8.8: un mensaje de otro reloj (real en un robot simulado, o al

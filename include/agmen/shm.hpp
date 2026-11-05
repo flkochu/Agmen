@@ -215,15 +215,18 @@ private:
     struct Block {
         std::unique_ptr<Segment> segment;   // nullptr: la ranura quedó libre (trim)
         std::uint32_t holders = 0;
-        std::chrono::steady_clock::time_point used{};   // la última vez que se escribió o se soltó
+        std::chrono::steady_clock::time_point used{};   // la última vez que se escribió o se soltó (trim)
+        std::uint64_t order = 0;                         // y en qué orden (el más reciente se reusa)
     };
 
     [[nodiscard]] std::string next_name();
     [[nodiscard]] Segment create(std::size_t size);
     void rewrite_registry() const;
+    void touch(Block& b);
 
     std::uint64_t owner_;
     std::uint32_t counter_ = 0;
+    std::uint64_t tick_ = 0;
     std::vector<Block> blocks_;
     std::unique_ptr<Segment> probe_;
     std::chrono::steady_clock::time_point probe_used_{};
