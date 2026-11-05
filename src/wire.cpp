@@ -56,7 +56,7 @@ void Envelope::write_to(Bytes& out) const {
     put_padding(out, 3);  // reservado
 }
 
-std::pair<Envelope, ByteView> Envelope::read_from(ByteView buf) {
+std::pair<Envelope, ByteView> Envelope::read_from(ByteView buf, bool shm) {
     const auto too_short = [&] {
         return WireError(WireError::Kind::TooShort,
                          "paquete demasiado corto: " + std::to_string(buf.size()) +
@@ -108,9 +108,10 @@ std::pair<Envelope, ByteView> Envelope::read_from(ByteView buf) {
         throw WireError(WireError::Kind::UnknownEncoding,
                         "flags desconocidos: " + std::to_string(env.flags));
     }
-    if ((env.flags & kFlagShm) != 0) {
+    if ((env.flags & kFlagShm) != 0 && !shm) {
         throw WireError(WireError::Kind::Unsupported,
-                        "payload en memoria compartida: llega en el nivel 8, este nodo no lo soporta");
+                        "llegó un descriptor de memoria compartida (RFC 0009) a quien no la pidió: solo lo lee un "
+                        "Subscriber que se lo dijo al publicador");
     }
     // header_len > 64: un sobre más nuevo; saltamos los campos que no conocemos.
     const ByteView payload = buf.subspan(env.header_len);

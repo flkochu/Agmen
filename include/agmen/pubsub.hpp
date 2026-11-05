@@ -29,6 +29,14 @@
 // se le guarda solo el mensaje más nuevo (dropped() cuenta los que no se
 // entregaron). Un suscriptor lento nunca frena al publicador ni a los demás.
 //
+// Memoria compartida (desde Agmen 0.11, RFC 0009): si el suscriptor está en la
+// misma computadora y puede abrir la memoria del publicador (lo prueban al
+// conectarse), un mensaje arrow de 4 KiB o más se escribe UNA vez en un bloque
+// de memoria compartida y por TCP viaja solo un descriptor. El suscriptor
+// recibe una vista del bloque (RawSample::payload, sin copiar) y se lo devuelve
+// al publicador cuando el último Payload que lo ve se destruye. Si no puede
+// (otra computadora, otro contenedor, AGMEN_SHM=0), todo sigue por TCP.
+//
 // Por dentro, Publisher<M> y Subscriber<M> son una capa delgada sobre
 // PublisherCore y SubscriberCore, que no dependen del tipo: los usa también el
 // módulo de Python (agmen._core) con tipos que no se compilaron (RFC 0007).
@@ -92,16 +100,49 @@ public:
     [[nodiscard]] const TypeInfo& type() const;
     /// Mensajes arrow que no se entregaron a algún suscriptor lento (RFC 0008 D3).
     [[nodiscard]] std::uint64_t dropped() const;
+    /// A cuántos suscriptores se les manda por memoria compartida (RFC 0009).
+    [[nodiscard]] std::size_t shm_subscribers() const;
+    /// Mensajes que debían ir por memoria compartida y fueron por TCP porque no
+    /// hubo lugar (se avisa una vez por qué; RFC 0009 D6).
+    [[nodiscard]] std::uint64_t shm_fallbacks() const;
 
 private:
     struct State;
     std::unique_ptr<State> s_;
 };
 
+/// El payload de un mensaje recibido. Casi siempre son bytes propios; si llegó
+/// por memoria compartida (RFC 0009), es una vista del bloque del publicador,
+/// que se le devuelve cuando el último Payload que lo ve se destruye. Se usa
+/// donde va un wire::ByteView (std::span lo acepta solo: data(), size(), begin(), end()).
+class Payload {
+public:
+    Payload() = default;
+    Payload(wire::Bytes bytes) : own_(std::move(bytes)) {}   // NOLINT: implícito a propósito
+    /// Una vista de memoria que vive mientras viva `keep`.
+    Payload(wire::ByteView view, std::shared_ptr<const void> keep) : view_(view), keep_(std::move(keep)) {}
+
+    [[nodiscard]] const std::uint8_t* data() const { return keep_ ? view_.data() : own_.data(); }
+    [[nodiscard]] std::size_t size() const { return keep_ ? view_.size() : own_.size(); }
+    [[nodiscard]] bool empty() const { return size() == 0; }
+    [[nodiscard]] const std::uint8_t* begin() const { return data(); }
+    [[nodiscard]] const std::uint8_t* end() const { return data() + size(); }
+    [[nodiscard]] wire::ByteView view() const { return {data(), size()}; }
+    /// ¿Es una vista de la memoria compartida del publicador?
+    [[nodiscard]] bool shared() const { return static_cast<bool>(keep_); }
+    /// Una copia de los bytes.
+    [[nodiscard]] wire::Bytes to_bytes() const { return wire::Bytes(begin(), end()); }
+
+private:
+    wire::Bytes own_;
+    wire::ByteView view_{};
+    std::shared_ptr<const void> keep_;
+};
+
 /// Un mensaje recibido, todavía sin decodificar el payload.
 struct RawSample {
-    wire::Envelope envelope;
-    wire::Bytes payload;
+    wire::Envelope envelope;   ///< con kFlagShm si llegó por memoria compartida; payload_len = bytes de datos
+    Payload payload;
     std::string from;   ///< "ip:puerto"
 };
 
@@ -186,6 +227,10 @@ public:
     [[nodiscard]] std::size_t subscribers() const { return core_.subscribers(); }
     /// Mensajes que no se entregaron a algún suscriptor lento (solo tipos arrow, RFC 0008 D3).
     [[nodiscard]] std::uint64_t dropped() const { return core_.dropped(); }
+    /// A cuántos suscriptores se les manda por memoria compartida (tipos arrow, RFC 0009).
+    [[nodiscard]] std::size_t shm_subscribers() const { return core_.shm_subscribers(); }
+    /// Mensajes que no cupieron en la memoria compartida y fueron por TCP (RFC 0009 D6).
+    [[nodiscard]] std::uint64_t shm_fallbacks() const { return core_.shm_fallbacks(); }
 
 private:
     PublisherCore core_;
@@ -212,6 +257,13 @@ public:
         auto raw = core_.receive_raw(timeout);
         if (!raw) return std::nullopt;
         return Sample<M>{raw->envelope, M::decode_payload(raw->payload), std::move(raw->from)};
+    }
+
+    /// Como receive(), sin decodificar: el payload llega como lo mandaron. Si
+    /// vino por memoria compartida, es una vista del bloque sin copiar (decodifícalo
+    /// con agmen::arrow::Codec mientras tengas el RawSample; RFC 0009).
+    [[nodiscard]] std::optional<RawSample> receive_raw(std::chrono::milliseconds timeout) {
+        return core_.receive_raw(timeout);
     }
 
     /// Late con el hub. Llámalo si pasas más de 3 s sin llamar receive().
