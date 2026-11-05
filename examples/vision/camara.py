@@ -78,8 +78,8 @@ def leer():
 
 @node.every(1.0)
 def reporte():
-    print(f"[camara] {n[0]} imágenes publicadas · {pub.subscribers} escuchan · "
-          f"{pub.dropped} descartadas por lentos", flush=True)
+    print(f"[camara] {n[0]} imágenes publicadas · {pub.subscribers} escuchan "
+          f"({pub.shm_subscribers} por memoria compartida) · {pub.dropped} descartadas por lentos", flush=True)
 
 
 if opts.seconds > 0:

@@ -54,7 +54,7 @@ enum class Encoding : std::uint8_t {
 /// Dominio del reloj de las marcas de tiempo.
 enum class Clock : std::uint8_t { Real = 0, Sim = 1, Replay = 2 };
 
-inline constexpr std::uint8_t kFlagShm = 0x01;  ///< payload en memoria compartida (nivel 8)
+inline constexpr std::uint8_t kFlagShm = 0x01;  ///< el payload es un descriptor de memoria compartida (RFC 0009)
 inline constexpr std::uint8_t kFlagFin = 0x02;  ///< último mensaje del stream o episodio
 
 // ---------------------------------------------------------------------------
@@ -71,7 +71,7 @@ public:
         UnsupportedVersion,  ///< otra versión del protocolo (ej. v0 de Agmen ≤ 0.3)
         BadHeader,           ///< header_len inválido
         UnknownEncoding,     ///< encoding o flags desconocidos
-        Unsupported,         ///< memoria compartida (nivel 8) o una parte de Arrow que Agmen no lee
+        Unsupported,         ///< un descriptor de memoria compartida donde no se pidió, o una parte de Arrow que Agmen no lee
         BadArrow,            ///< payload arrow mal formado o que no coincide con el esquema
         TooBig,              ///< el mensaje pasa del máximo (64 MiB o AGMEN_MAX_MESSAGE_MB)
         TypeMismatch,        ///< el tipo no es el que espera el receptor
@@ -372,7 +372,11 @@ struct Envelope {
 
     /// Lee y valida el sobre (RFC 0001 §8, reglas 1–4). Lanza WireError si
     /// algo no cuadra. Devuelve el sobre y la vista del payload.
-    [[nodiscard]] static std::pair<Envelope, ByteView> read_from(ByteView buf);
+    ///
+    /// Con kFlagShm el payload es un descriptor de memoria compartida (RFC
+    /// 0009), no los datos: solo lo acepta quien lo pidió (`shm = true`, el
+    /// Subscriber que le dijo al publicador que puede abrirla).
+    [[nodiscard]] static std::pair<Envelope, ByteView> read_from(ByteView buf, bool shm = false);
 
     friend bool operator==(const Envelope&, const Envelope&) = default;
 };

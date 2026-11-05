@@ -31,7 +31,7 @@ import time
 import weakref
 from dataclasses import dataclass
 
-from . import _backend, _tcp
+from . import _backend, _shm, _tcp
 from . import hubproto as hp
 from . import wire
 
@@ -136,12 +136,15 @@ class _PurePublisher:
         self._sock = wire.udp_socket()
         self._announced_at: float | None = None
         self._pub_lock = threading.Lock()   # se puede publicar desde varios grupos de un Node
-        # Un tipo arrow (string, bytes, T[], tensor) va por TCP (RFC 0008 D2); compact, por UDP.
+        # Un tipo arrow (string, bytes, T[], tensor) va por TCP (RFC 0008 D2) o, en la misma
+        # computadora, por memoria compartida (RFC 0009); compact, por UDP.
         self.arrow = msg_type.LAYOUT.encoding == wire.ENC_ARROW
-        self._tcp = _tcp.Fanout() if self.arrow else None
         if hp.is_topic(to):
             hp.check_topic(to)
-            self.topic = to
+        self.topic = to if hp.is_topic(to) else (topic if topic is not None else "/" + msg_type.NAME)
+        self._topic_id = wire.topic_id(self.topic)
+        self._tcp = _tcp.Fanout(self.topic, self.source_id, self._topic_id) if self.arrow else None
+        if hp.is_topic(to):
             self.dests: list[tuple[str, int]] = []
             self._sock.bind(("127.0.0.1", 0))   # local (nivel 2): Windows no pregunta por el firewall
             self._sock.setblocking(False)
@@ -158,7 +161,6 @@ class _PurePublisher:
                 time.sleep(0.005)
                 self._drain()
         else:
-            self.topic = topic if topic is not None else "/" + msg_type.NAME
             self.dests = [_addr(to)]
             self._link = None
             if self._tcp is not None:
@@ -242,10 +244,20 @@ class _PurePublisher:
         with self._pub_lock:
             if self._announced_at is None or time.monotonic() - self._announced_at >= ANNOUNCE_EVERY_S:
                 self.announce()
+            if self._tcp is not None:
+                # El payload aparte: el Fanout lo escribe una vez en memoria compartida o
+                # arma el paquete de TCP, según cada suscriptor (RFC 0009).
+                payload = msg.encode_payload()
+                n = payload.nbytes if isinstance(payload, memoryview) else len(payload)
+                if n > wire.max_message():
+                    raise wire.WireError(wire.too_big_text(self.topic, n))
+                t_pub = wire.now_ns()
+                env = wire.Envelope(wire.ENC_ARROW, 0, self.type.SCHEMA_ID, self._topic_id, self.source_id,
+                                    self.seq, t_pub if t_data is None else t_data, t_pub, n, wire._domain())
+                self.seq += 1
+                return self._tcp.send_message(env, payload)
             data = wire.encode(msg, self.seq, t_data, topic=self.topic, source_id=self.source_id)
             self.seq += 1
-            if self._tcp is not None:
-                return self._tcp.send(data)
         ok = False
         for d in dests:
             ok = self._send(data, d) or ok
@@ -259,6 +271,16 @@ class _PurePublisher:
     def dropped(self) -> int:
         """Mensajes arrow que no se entregaron a algún suscriptor lento (RFC 0008 D3)."""
         return self._tcp.dropped if self._tcp is not None else 0
+
+    @property
+    def shm_subscribers(self) -> int:
+        """A cuántos suscriptores se les manda por memoria compartida (RFC 0009)."""
+        return self._tcp.shm_subscribers if self._tcp is not None else 0
+
+    @property
+    def shm_fallbacks(self) -> int:
+        """Mensajes que debían ir por memoria compartida y fueron por TCP porque no hubo lugar (RFC 0009 D6)."""
+        return self._tcp.fallbacks if self._tcp is not None else 0
 
     def close(self) -> None:
         if self._link is not None:
@@ -279,7 +301,7 @@ class _Receiver:
     """Lo común de Subscriber y RawSubscriber: un socket propio, y en modo
     topic, el registro con el hub."""
 
-    def __init__(self, where: str, schema: str, type_name: str = "", tcp: bool = True) -> None:
+    def __init__(self, where: str, schema: str, type_name: str = "", tcp: bool = True, shm: bool = False) -> None:
         self._sock = wire.udp_socket()
         self.announced: dict[int, tuple[str, str]] = {}   # schema_id → (topic, esquema)
         self._link = None
@@ -292,7 +314,7 @@ class _Receiver:
             port = self._sock.getsockname()[1]
             self.listen = f"127.0.0.1:{port}"
             if tcp:
-                self._tcp = _tcp.Listener(("127.0.0.1", 0))
+                self._tcp = _tcp.Listener(("127.0.0.1", 0), shm=shm)
             self._link = _HubLink(self._sock, dict(
                 op="sub", id=f"{wire.new_source_id():016x}", node=node_name(), pid=os.getpid(),
                 topic=where, schema=schema, type=type_name, port=port,
@@ -301,8 +323,8 @@ class _Receiver:
             self.topic = ""
             self.listen = where
             self._sock.bind(_addr(where))
-            if tcp:   # con dirección fija, el mismo puerto en TCP
-                self._tcp = _tcp.Listener(self._sock.getsockname())
+            if tcp:   # con dirección fija, la misma IP y el mismo puerto en TCP
+                self._tcp = _tcp.Listener(self._sock.getsockname(), shm=shm)
 
     @property
     def port(self) -> int:
@@ -319,7 +341,8 @@ class _Receiver:
         return [self._sock, *(self._tcp.filenos() if self._tcp is not None else [])]
 
     def _recv(self, deadline: float | None):
-        """Siguiente paquete de DATOS, (bytes, "ip:puerto"). Los de control se procesan aquí."""
+        """Siguiente paquete de DATOS, (bytes, "ip:puerto", conexión TCP o None). Los
+        de control se procesan aquí."""
         if self._tcp is None:
             return self._recv_udp(deadline)
         while True:
@@ -361,7 +384,7 @@ class _Receiver:
                 if self._link.error:
                     raise wire.WireError(f"el hub rechazó escuchar '{self.topic}': {self._link.error}")
                 continue
-            return data, f"{sender[0]}:{sender[1]}"
+            return data, f"{sender[0]}:{sender[1]}", None
 
     def close(self) -> None:
         if self._link is not None:
@@ -377,8 +400,10 @@ class _PureSubscriber(_Receiver):
         _backend.notice_pure_once()
         self.type = msg_type
         self._clock_warned = False
-        super().__init__(where, f"{msg_type.SCHEMA_ID:016x}", msg_type.NAME,
-                         tcp=msg_type.LAYOUT.encoding == wire.ENC_ARROW)
+        arrow = msg_type.LAYOUT.encoding == wire.ENC_ARROW
+        super().__init__(where, f"{msg_type.SCHEMA_ID:016x}", msg_type.NAME, tcp=arrow,
+                         shm=arrow and _shm.enabled())
+        self._shm = _shm.Receiver(where) if arrow else None
 
     def receive(self, timeout: float | None = None):
         """Espera hasta `timeout` s un mensaje. Devuelve Sample, o None si no llegó.
@@ -388,18 +413,30 @@ class _PureSubscriber(_Receiver):
             got = self._recv(deadline)
             if got is None:
                 return None
-            data, src = got
-            env, payload = wire.parse(data)
+            data, src, peer = got
+            env, payload = wire.parse(data, shm=peer is not None and peer.hello)
             if env.encoding == wire.ENC_SCHEMA:
                 self.announced[env.schema_id] = wire.read_announcement(env, payload)
                 continue
-            if env.schema_id != self.type.SCHEMA_ID:
-                known = self.announced.get(env.schema_id)
-                detail = f"{known[1]}, topic {known[0]}" if known else None
-                raise wire.WireError(wire.type_mismatch_text(self.type, env.schema_id, detail))
+            if env.flags & wire.FLAG_SHM:
+                # Un descriptor de memoria compartida (RFC 0009): la vista del bloque, sin copiar.
+                shared = self._shm.take(env, payload, peer, self._check_type)
+                if shared is None:
+                    continue                     # la prueba, o un bloque que no se pudo abrir
+                env, payload = shared
+                msg = self.type.decode_payload(payload)
+                self._check_clock(env)
+                return Sample(env, msg, src)
+            self._check_type(env)
             _, msg = wire.decode(self.type, data)
             self._check_clock(env)
             return Sample(env, msg, src)
+
+    def _check_type(self, env) -> None:
+        if env.schema_id != self.type.SCHEMA_ID:
+            known = self.announced.get(env.schema_id)
+            detail = f"{known[1]}, topic {known[0]}" if known else None
+            raise wire.WireError(wire.type_mismatch_text(self.type, env.schema_id, detail))
 
     def _check_clock(self, env) -> None:
         """RFC 0001 §8.8: un mensaje de otro reloj se avisa una vez (el dato llega igual)."""
@@ -425,9 +462,12 @@ class RawSubscriber(_Receiver):
         super().__init__(where, "*")
 
     def receive_raw(self, timeout: float | None = None):
-        """(bytes, "ip:puerto") del siguiente paquete Agmen, o None."""
+        """(bytes, "ip:puerto") del siguiente paquete Agmen, o None. Las
+        herramientas reciben siempre por TCP, nunca por memoria compartida:
+        necesitan los bytes (el panel los manda al navegador)."""
         deadline = None if timeout is None else time.monotonic() + timeout
-        return self._recv(deadline)
+        got = self._recv(deadline)
+        return None if got is None else got[:2]
 
 
 class RawPublisher:
@@ -599,6 +639,16 @@ class _NativePublisher:
     def dropped(self) -> int:
         """Mensajes arrow que no se entregaron a algún suscriptor lento (RFC 0008 D3)."""
         return self._core.dropped
+
+    @property
+    def shm_subscribers(self) -> int:
+        """A cuántos suscriptores se les manda por memoria compartida (RFC 0009)."""
+        return self._core.shm_subscribers
+
+    @property
+    def shm_fallbacks(self) -> int:
+        """Mensajes que debían ir por memoria compartida y fueron por TCP porque no hubo lugar (RFC 0009 D6)."""
+        return self._core.shm_fallbacks
 
     def close(self) -> None:
         with self._lock:

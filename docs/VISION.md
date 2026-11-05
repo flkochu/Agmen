@@ -30,6 +30,7 @@ opcionales que se conectan al núcleo:
 | `agmen` (comando) | `agmen run robot.toml` (todo el robot + panel), `agmen web`, `agmen mux`, `agmen echo`, `agmen hub`, `agmen topic list/info/echo/hz`, `agmen node list`, `agmen gen` | 0.2.0 (run, web); `mux` en 0.3.0; `echo` en 0.4.0; hub y topics en 0.5.0; `--red` en 0.6.0; `gen` en 0.7.0 |
 | Archivos `.agmen` | Los mensajes de un robot en un archivo; genera C++ (`agmen_add_messages`) y Python (`agmen.load`) (RFC 0005). Desde 0.10.0 con `string`, `bytes`, `T[]` y `tensor<T,N>` (RFC 0008) | 0.7.0; tipos variables en 0.10.0 |
 | `agmen.msgs` | Mensajes estándar: `Imagen` e `ImagenComprimida`, con los campos de Foxglove (RFC 0008 D4) | 0.10.0 |
+| Memoria compartida | Imágenes y tensores sin copiar entre procesos de la misma computadora; entre computadoras, TCP. Sin cambiar el código de los nodos (RFC 0009) | 0.11.0 |
 | `agmen::Node` / `agmen.Node` | Varias frecuencias en un nodo (`every`, `subscribe`/`on`, colas, grupos con su propio hilo) y el reloj de Agmen (real y simulación, `/clock`) (RFC 0006) | 0.8.0 |
 | Panel web | Nodos, logs, sensores, inspector, cámara y manejo desde el navegador; el robot no dibuja (RFC 0002, 0003) | 0.2.0; WebSocket, red con clave y Foxglove en 0.6.0; cámara en 0.10.0. El puente sigue en Python: medido, no frena al robot (RFC 0008 D6) |
 | `agmen` (Python, PyPI) | `pip install agmen` / `import agmen`. Desde 0.9.0 trae el núcleo de C++ compilado (`agmen._core`, nanobind) para 5 sistemas; Python puro como respaldo y referencia | 0.1.0; compilado en 0.9.0 |
@@ -138,12 +139,19 @@ igual antes y después de la migración, sin tocarlos. Es la regla 3 en acción.
 - ✅ Un suscriptor lento recibe solo el mensaje más nuevo y no frena al publicador (medido: una cámara de 640×480 a 30 fps, 27 MB/s, con un navegador que no lee, y el control a 1 kHz no pierde ciclos).
 - ✅ `agmen.msgs.Imagen` e `ImagenComprimida`; la tarjeta Cámara del panel; Foxglove las ve como `foxglove.RawImage` / `CompressedImage`.
 
+### Cambió en 0.11.0 (RFC 0009, nivel 8)
+- ✅ Requisito a, sin copias: en la misma computadora, un mensaje `arrow` de 4 KiB o más se escribe **una vez** en memoria compartida (la bandera `SHM` del sobre, reservada desde el RFC 0001) y por TCP viaja solo un descriptor de 72 bytes. En Python llega como `memoryview` / `numpy.ndarray` que apunta a la memoria del publicador. Medido (`bench/shm_vs_tcp.py`): 1920×1080 con 3 suscriptores, de 5.1 ms a 1.9 ms de latencia; 4K con 3 suscriptores, de 21.9 ms a 5.8 ms, y la cámara pasa de 28.9 ms a 2.6 ms de CPU por imagen (con TCP paga una copia por suscriptor).
+- ✅ Propia y sin dependencias (D1: no iceoryx2), en C++ y en Python puro con los mismos bytes; Linux, macOS y Windows. El publicador es el dueño de los bloques y el suscriptor se los devuelve por la conexión TCP al soltarlos: un proceso que muere no deja candados, y si es el suscriptor, sus bloques vuelven en el acto.
+- ✅ Misma computadora se **prueba**, no se adivina (D4): si el suscriptor no puede abrir la memoria del publicador (otra computadora, otro contenedor, otro usuario), todo sigue por TCP y se avisa una vez. Con dirección fija, el suscriptor escucha TCP en la IP que pide: las imágenes ya cruzan la red.
+- ✅ Nadie frena a nadie y la memoria tiene tope (D6): hasta 4 mensajes (o 64 MiB) prestados por suscriptor; hasta 8 (o 128 MiB) sin devolver por conexión, y luego D3 del RFC 0008; un pool de hasta 512 MiB por publicador. Los bloques de un nodo que se cayó los borra el siguiente que arranca.
+
 ### Falta (siguientes niveles)
-- Memoria compartida para no copiar imágenes entre procesos (nivel 8).
+- Grabación y reproducción; exportar a Parquet (nivel 9).
+- Que la cámara escriba directo en la memoria compartida (préstamo para escribir, RFC 0009 §4): quitaría la copia que queda en el publicador.
 
 ### Se rehace
 - **Python**: ✅ de reimplementación en Python puro a paquete compilado desde el núcleo de C++ (nanobind, 0.9.0). La versión pura se queda como referencia y para pruebas.
-- **Transporte**: ✅ de UDP punto a punto a pub/sub con topics (0.5.0, el hub es solo de control). Falta: memoria compartida local (nivel 8) y red entre máquinas (nivel 11).
+- **Transporte**: ✅ de UDP punto a punto a pub/sub con topics (0.5.0, el hub es solo de control), ✅ TCP para los mensajes grandes (0.10.0) y ✅ memoria compartida local (0.11.0). Falta: red entre máquinas con topics (nivel 11).
 
 ## 6. dora-rs como referencia
 
@@ -165,6 +173,7 @@ que llegó a la versión 1.0 en septiembre de 2026.
 | Lenguaje del núcleo | Rust | C++, el lenguaje que ya usa la comunidad de robótica |
 | Tipos | Anotaciones opcionales; hash de esquema agregado en 1.0 | Esquema obligatorio desde el día 0 y decodificación dinámica |
 | Mensajes chicos | Arrow siempre; debajo de 4 KB pasan por el daemon | Codificación `compact` sin sobrecosto (meta: control a 1 kHz; hay que medirlo) |
+| Memoria compartida | Arriba de 4 KB; los *drop tokens* vuelven por el daemon | Arriba de 4 KiB (`arrow`); el bloque se devuelve directo por la conexión TCP del suscriptor, sin daemon; si no se puede abrir, TCP (RFC 0009) |
 | Windows | "Best effort" | De primera clase, verificado por CI |
 | Interfaz | Herramientas de terminal | Interfaz web integrada (local, red, nube); el robot no dibuja |
 | Microcontroladores | Su README no los menciona | `compact` + sobre ligero (`agmen-micro`) |
@@ -191,7 +200,7 @@ iceoryx2).
 | **5 ✅** (0.8.0) | **Executor y tiempo (RFC 0006): `Node` con `every`, `subscribe`/`on`, colas (`queue = 1` el más reciente), grupos con su propio hilo, ciclos saltados contados y avisados; reloj de Agmen real/sim con `/clock`, pausa, paso y velocidad desde el panel** | d, e |
 | 6 ✅ (0.9.0) | Python de primera clase (RFC 0007): `agmen._core` compilado con nanobind (formato, topics, `Node`, reloj), wheels para 5 sistemas y Python puro de respaldo, NumPy sin copias | b |
 | **7 ✅** (0.10.0) | **Datos grandes (RFC 0008): codificación `arrow` (`string`, `bytes`, `T[]`, `tensor<T,N>`) por TCP con descarte por suscriptor lento; `agmen.msgs.Imagen`; cámara en el panel y en Foxglove. El puente del panel se quedó en Python: medido, cumple** | a, b, h |
-| 8 | Memoria compartida para mensajes grandes | a |
+| **8 ✅** (0.11.0) | **Memoria compartida (RFC 0009): imágenes y tensores sin copiar entre procesos de la misma computadora, en C++ y Python, Linux, Windows y macOS; se prueba si se puede y si no, TCP; préstamos que se devuelven solos y con tope; `bench/shm_vs_tcp.py`** | a, b, g |
 | 9 | Grabación y reproducción; exportar a Parquet; reproducir en la web | c |
 | 10 | Abstracción sim/real; `robot.toml` con nodos en varias máquinas (el lanzador básico ya existe desde 0.2.0) | d, i |
 | 11 | Red multi-máquina, sincronización de relojes y **`agmen-web` en la nube** (relay con autenticación) | c, h |
@@ -216,7 +225,8 @@ iceoryx2).
 | Prioridades de tiempo real (`SCHED_FIFO`, afinidad de núcleo) por grupo | Cuando un robot lo necesite |
 | Unidades y rangos en los esquemas, que muestre el panel | Cuando se diseñe (cambia el anuncio del RFC 0001) |
 | Nombre y alcance del visualizador propio | Nivel 14 |
-| Memoria compartida propia o con iceoryx2 por debajo | Nivel 8 |
+| Memoria compartida propia o con iceoryx2 por debajo | Propuesta: propia ([RFC 0009](rfc/0009-memoria-compartida.md) D1), implementada en 0.11.0 con las siete opciones recomendadas. Falta que Adán la acepte |
+| Préstamo para escribir directo en la memoria compartida (la cámara llena el bloque) | Cuando se mida que la copia del publicador estorba (RFC 0009 §4) |
 | Formato de grabación: MCAP o propio sobre Arrow IPC | Nivel 9 |
 
 ## Fuentes

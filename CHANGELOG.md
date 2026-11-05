@@ -7,8 +7,84 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 
 ## [Sin publicar]
 
-### Planeado (nivel 8, versión 0.11.0)
-- Memoria compartida para no copiar imágenes y tensores entre procesos.
+### Planeado (nivel 9, versión 0.12.0)
+- Grabación y reproducción; exportar a Parquet.
+
+## [0.11.0] — 2026-11-05
+
+**Nivel 8: memoria compartida** (RFC 0009, propuesto con las opciones
+recomendadas). En la misma computadora, las imágenes y los tensores ya no se
+copian entre procesos; tu código no cambia ni una línea.
+
+### Agregado
+- **Memoria compartida para los mensajes `arrow` de 4 KiB o más**: el
+  publicador escribe el payload **una vez** en un bloque de memoria compartida
+  y por la conexión TCP (RFC 0008) manda solo un descriptor de 72 bytes, con la
+  bandera `SHM` del sobre (reservada desde el RFC 0001). El suscriptor recibe
+  una vista del bloque, sin copiar, y se lo devuelve al publicador cuando ya
+  nadie la usa. En Python, `as_array()` y `agmen.load(..., numpy=True)` dan un
+  `numpy.ndarray` (de solo lectura) que apunta a la memoria de la cámara.
+  Linux y macOS con `shm_open`, Windows con `CreateFileMappingW`; en C++
+  (`agmen/shm.hpp`), en el núcleo de C++ para Python (`agmen._core.ShmPayload`)
+  y en Python puro (`agmen._shm`), con los mismos bytes y nombres.
+- **Se prueba si se puede, y si no, TCP.** Al conectarse, el suscriptor dice que
+  puede y el publicador le pide abrir un bloque de prueba. Si no puede (otra
+  computadora, otro contenedor sin `--ipc=host`, otro usuario), todo sigue por
+  TCP y el suscriptor lo dice una vez: `'/camara' llega por TCP y no por
+  memoria compartida: no pude abrir /agm… ¿El publicador está en otra
+  computadora o en otro contenedor?`. Un nodo de 0.10 y uno de 0.11 se siguen
+  entendiendo por TCP en los dos sentidos.
+- **Nadie frena a nadie y la memoria tiene tope**: hasta 4 mensajes (y 64 MiB)
+  prestados por suscriptor (del siguiente en adelante se copian al recibir, con
+  un aviso); hasta 8 (y 128 MiB) sin devolver por conexión y luego solo el más
+  nuevo (D3 del RFC 0008); hasta 64 bloques y 512 MiB por publicador
+  (`AGMEN_SHM_MB`). Si no alcanza o `/dev/shm` está lleno (Docker: 64 MB), ese
+  mensaje va por TCP y se avisa por qué.
+- **Limpieza**: si un suscriptor muere, sus bloques vuelven al cerrarse su
+  conexión; si un publicador muere, las vistas que ya se tenían siguen siendo
+  válidas y el siguiente publicador que arranca borra sus bloques (registro en
+  `$TMPDIR/agmen-shm-<uid>`; en Windows el sistema los borra solo). En Linux se
+  reserva el bloque con `posix_fallocate`: un `/dev/shm` lleno es un aviso, no
+  un `SIGBUS`.
+- `pub.shm_subscribers` y `pub.shm_fallbacks` (C++ y Python);
+  `envelope.flags & FLAG_SHM` dice si un mensaje llegó por memoria compartida;
+  `AGMEN_SHM=0` lo apaga.
+- En C++: `agmen::Payload` (bytes propios o una vista prestada) en
+  `RawSample::payload`; `Subscriber<M>::receive_raw()` para leer el mensaje
+  directo del bloque; `Envelope::read_from(buf, shm)`; `net::wait_rw`. En
+  Python: `wire.parse(buf, shm=False)`.
+- **`bench/shm_vs_tcp.py`**: la cámara y los suscriptores en procesos distintos,
+  de 640×480 a 4K, con 1 y 3 suscriptores, contra el TCP de 0.10.0. Medido: 4K
+  con 3 suscriptores, de 21.9 ms a 5.8 ms de latencia y de 28.9 ms a 2.6 ms de
+  CPU de la cámara por imagen; 1920×1080 con 3, de 5.1 ms a 1.9 ms (tabla
+  completa en el RFC 0009 §8).
+- Tutorial, capítulo 15 (memoria compartida); el ejemplo `examples/vision`
+  dice cuántas imágenes llegaron por memoria compartida.
+
+### Cambiado
+- Con dirección fija, el suscriptor de C++ escucha TCP en la misma IP que pidió
+  para UDP (antes, siempre en `127.0.0.1`; Python ya lo hacía):
+  `Subscriber(Imagen, "0.0.0.0:7500")` recibe imágenes de otra computadora.
+- El `Publisher` de un tipo arrow lee lo que le dice cada suscriptor por TCP y
+  se entera en el acto cuando uno se desconecta.
+- Un mensaje chico ya no se adelanta a uno grande que espera en la fila de un
+  suscriptor lento: lo reemplaza (D3), como siempre debió ser.
+- Un sobre con `SHM` en un paquete que no lo pidió da un error claro (antes:
+  "llega en el nivel 8").
+
+### Pruebas
+- `tests/test_shm.cpp` (también con ASan/UBSan) y `python/test_shm.py`, con los
+  dos núcleos y cruzados (publicador en C++ y suscriptor en Python puro, y al
+  revés): bytes del descriptor y los avisos, préstamos y topes, orden, un
+  suscriptor que no puede abrir la memoria (como si estuviera en otra
+  computadora), `AGMEN_SHM=0`, el tope de memoria, y un proceso que muere sin
+  cerrar (lo que deja C++ lo limpia Python).
+- `scripts/tutorial_check.py`: en el capítulo 14, el contador de C++ y la IA de
+  Python deben recibir casi todas las imágenes por memoria compartida, en los
+  cuatro sistemas del CI.
+- `scripts/wheel_check.py` revisa que cada wheel (las 5 compiladas y la de
+  Python puro) reciba una `Imagen` por memoria compartida; `scripts/py_bench.py`
+  dice cuántas imágenes llegaron así.
 
 ## [0.10.1] — 2026-11-04
 

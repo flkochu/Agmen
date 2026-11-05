@@ -181,11 +181,11 @@ contador de C++ sigue viendo las 30 por segundo.
 - Un mensaje mide como mucho **64 MiB**. Más es casi siempre un error, y lo
   dice: `'/mapa' mide 130.0 MiB y el máximo de un mensaje es 64 MiB: si de
   verdad lo necesitas, sube AGMEN_MAX_MESSAGE_MB`.
-- Los mensajes arrow van por TCP **en la misma computadora** (`127.0.0.1`). La
-  red entre computadoras llega en el nivel 11; la memoria compartida (sin
-  copiar entre procesos), en el nivel 8. Hoy una imagen se copia al mandarla y
-  al recibirla: unos 0.3 ms por imagen de 640×480, mídelo con
-  `python scripts/py_bench.py`.
+- Con topics, los mensajes arrow van **en la misma computadora** (`127.0.0.1`);
+  la red entre computadoras con topics llega en el nivel 11. Por TCP una imagen
+  se copia al mandarla y al recibirla (unos 0.3 ms por imagen de 640×480,
+  mídelo con `python scripts/py_bench.py`): desde la 0.11 ya no, va por
+  **memoria compartida** ([capítulo 15](15-memoria-compartida.md)).
 - El `[[mux]]` (capítulo 6) arbitra comandos de actuadores: no pasa mensajes
   arrow.
 - Video (H.264): más adelante, encima de esto.
@@ -199,5 +199,5 @@ contador de C++ sigue viendo las 30 por segundo.
 - `queue = 1` en la IA y "solo la más nueva" en la cámara: nadie frena a nadie.
 - El panel muestra la cámara y cada navegador pide las imágenes que alcanza.
 
-**Siguiente (Agmen 0.11.0):** memoria compartida para no copiar imágenes entre
-procesos (nivel 8).
+**Siguiente:** [capítulo 15](15-memoria-compartida.md), memoria compartida: la
+misma cámara sin copiar la imagen de un proceso a otro (Agmen 0.11.0).

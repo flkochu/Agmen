@@ -129,18 +129,22 @@ class Envelope:
 Header = Envelope   # nombre de Agmen ≤ 0.3, por compatibilidad
 
 
-def parse(buf: bytes) -> tuple[Envelope, bytes]:
-    """Lee y valida el sobre (RFC 0001 §8, reglas 1–4). Devuelve (sobre, payload)."""
+def parse(buf: bytes, shm: bool = False) -> tuple[Envelope, bytes]:
+    """Lee y valida el sobre (RFC 0001 §8, reglas 1–4). Devuelve (sobre, payload).
+
+    Con FLAG_SHM el payload es un descriptor de memoria compartida (RFC 0009),
+    no los datos: solo lo acepta quien lo pidió (`shm=True`, el Subscriber que
+    le dijo al publicador que puede abrirla)."""
     if _NATIVE_PARSE is not None:
         try:
-            env, payload = _NATIVE_PARSE(buf)
+            env, payload = _NATIVE_PARSE(buf, shm)
         except WireError:
-            return _parse_py(buf)   # el mismo error, con el texto de siempre
+            return _parse_py(buf, shm)   # el mismo error, con el texto de siempre
         return Envelope(*env), payload
-    return _parse_py(buf)
+    return _parse_py(buf, shm)
 
 
-def _parse_py(buf: bytes) -> tuple[Envelope, bytes]:
+def _parse_py(buf: bytes, shm: bool = False) -> tuple[Envelope, bytes]:
     if len(buf) < 4:
         raise WireError(f"paquete demasiado corto: {len(buf)} bytes, se necesitan al menos {ENVELOPE_LEN}")
     if bytes(buf[:3]) != MAGIC:
@@ -161,8 +165,9 @@ def _parse_py(buf: bytes) -> tuple[Envelope, bytes]:
         raise WireError(f"encoding desconocido: {encoding}")
     if flags & ~KNOWN_FLAGS:
         raise WireError(f"flags desconocidos: {flags:#04x}")
-    if flags & FLAG_SHM:
-        raise WireError("payload en memoria compartida: llega en el nivel 8, este nodo no lo soporta")
+    if flags & FLAG_SHM and not shm:
+        raise WireError("llegó un descriptor de memoria compartida (RFC 0009) a quien no la pidió: solo lo lee un "
+                        "Subscriber que se lo dijo al publicador")
     # header_len > 64: saltamos campos que no conocemos. En arrow los datos
     # grandes no se copian: el payload es una vista (memoryview) del paquete.
     payload = memoryview(buf)[header_len:] if encoding == ENC_ARROW else bytes(buf[header_len:])

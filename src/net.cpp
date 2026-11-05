@@ -371,6 +371,49 @@ int wait_io(std::span<const std::intptr_t> sockets, std::size_t n_read, std::chr
     return count;
 }
 
+int wait_rw(std::span<const std::intptr_t> sockets, std::span<const bool> write, std::chrono::milliseconds timeout,
+            std::span<bool> readable, std::span<bool> writable) {
+    for (auto& r : readable) r = false;
+    for (auto& w : writable) w = false;
+    if (sockets.empty()) {
+        if (timeout.count() > 0) std::this_thread::sleep_for(timeout);
+        return 0;
+    }
+#ifdef _WIN32
+    std::vector<WSAPOLLFD> fds(sockets.size());
+    for (std::size_t i = 0; i < sockets.size(); ++i) {
+        const bool w = i < write.size() && write[i];
+        fds[i] = WSAPOLLFD{native(sockets[i]), static_cast<SHORT>(POLLRDNORM | (w ? POLLWRNORM : 0)), 0};
+    }
+    const int n = WSAPoll(fds.data(), static_cast<ULONG>(fds.size()), static_cast<INT>(timeout.count()));
+    constexpr SHORT kRead = POLLRDNORM | POLLHUP | POLLERR | POLLNVAL;
+    constexpr SHORT kWrite = POLLWRNORM;
+#else
+    std::vector<pollfd> fds(sockets.size());
+    for (std::size_t i = 0; i < sockets.size(); ++i) {
+        const bool w = i < write.size() && write[i];
+        fds[i] = pollfd{native(sockets[i]), static_cast<short>(POLLIN | (w ? POLLOUT : 0)), 0};
+    }
+    const int n = ::poll(fds.data(), static_cast<nfds_t>(fds.size()), static_cast<int>(timeout.count()));
+    constexpr short kRead = POLLIN | POLLHUP | POLLERR | POLLNVAL;
+    constexpr short kWrite = POLLOUT;
+#endif
+    if (n < 0) {
+        const int code = last_error();
+        if (is_would_block(code)) return 0;
+        throw NetError(code, "falló la espera de datos");
+    }
+    int count = 0;
+    for (std::size_t i = 0; i < sockets.size(); ++i) {
+        const bool r = (fds[i].revents & kRead) != 0;
+        const bool w = (fds[i].revents & kWrite) != 0;
+        if (i < readable.size()) readable[i] = r;
+        if (i < writable.size()) writable[i] = w;
+        count += (r || w) ? 1 : 0;
+    }
+    return count;
+}
+
 TcpStream TcpStream::connect(const Address& to, std::chrono::milliseconds timeout) {
     ensure_winsock();
     sockaddr_in addr{};
