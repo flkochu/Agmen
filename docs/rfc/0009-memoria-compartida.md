@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| **Estado** | 🟡 **Propuesto** (2026-11-05) e **implementado en Agmen 0.11.0** con las opciones recomendadas (D1–D7 = a). Falta que Adán lo acepte: si cambia una decisión, se ajusta antes de publicar 0.11.0. Lo implementado, en la [sección 8](#8-lo-que-se-implementó-en-0110) |
+| **Estado** | ✅ **Aceptado** (2026-11-05, D1–D5 y D7 = a, D6 = a′) e **implementado en Agmen 0.11.0**; D6 (a′) en 0.11.1. Lo implementado, en la [sección 8](#8-lo-que-se-implementó-en-0110) |
 | **Depende de** | RFC 0001 (bandera `SHM` del sobre, §7), RFC 0004 (hub y topics), RFC 0006 (`Node` y colas), RFC 0007 (núcleo de C++ en Python), RFC 0008 (codificación `arrow` y transporte TCP) |
 | **Versión** | Agmen 0.11.0 |
-| **Requisitos** | a (datos grandes sin copias entre nodos), b (Python de primera clase), g (Windows, Linux y macOS) |
+| **Requisitos** | a (datos grandes sin copias entre nodos), b (Python de primera clase), g (Windows y Linux, x86-64 y ARM64) |
 
 ## 1. El problema
 
@@ -43,7 +43,7 @@ lo dejó para este nivel.
   cuántos suscriptores haya.
 - **Sin cambiar ni una línea** de los nodos: los mismos `Publisher`,
   `Subscriber`, `Node` y tipos de `.agmen`.
-- Que funcione igual en **Linux, Windows y macOS**, en C++ y en Python (con el
+- Que funcione igual en **Linux y Windows**, en C++ y en Python (con el
   núcleo de C++ y en Python puro).
 - Que si el publicador y el suscriptor **no comparten memoria** (otra
   computadora, otro contenedor de Docker, otro usuario), el mensaje llegue
@@ -192,14 +192,18 @@ Dos casos que no deben dejar al publicador sin memoria ni frenarlo:
 
 ### 3.6 Nombres y limpieza en cada sistema (D2)
 
-| | Linux | macOS | Windows |
-|---|---|---|---|
-| Crear (publicador) | `shm_open` + `ftruncate` + `posix_fallocate` | `shm_open` + `ftruncate` | `CreateFileMappingW` (respaldado por el archivo de paginación) |
-| Abrir (suscriptor) | `shm_open(O_RDONLY)` + `mmap(PROT_READ)` | igual | `OpenFileMappingW(FILE_MAP_READ)` + `MapViewOfFile` |
-| Nombre | `/agm` + pid + 8 hex + contador (24 caracteres) | igual (macOS permite 31) | `Local\agm…` |
-| Si el publicador muere | El nombre queda en `/dev/shm`: lo limpia el siguiente publicador (abajo) | Igual | **El sistema lo borra solo** cuando nadie lo usa |
+| | Linux | Windows |
+|---|---|---|
+| Crear (publicador) | `shm_open` + `ftruncate` + `posix_fallocate` | `CreateFileMappingW` (respaldado por el archivo de paginación) |
+| Abrir (suscriptor) | `shm_open(O_RDONLY)` + `mmap(PROT_READ)` | `OpenFileMappingW(FILE_MAP_READ)` + `MapViewOfFile` |
+| Nombre | `/agm` + pid + 8 hex + contador (24 caracteres) | `Local\agm…` |
+| Si el publicador muere | El nombre queda en `/dev/shm`: lo limpia el siguiente publicador (abajo) | **El sistema lo borra solo** cuando nadie lo usa |
 
-- En Linux y macOS, cada publicador anota sus bloques en un archivo pequeño
+> **macOS:** el código es POSIX (como en Linux, sin `posix_fallocate`; los
+> nombres caben en sus 31 caracteres), sin soporte oficial desde 0.11.1: no se
+> prueba en el CI ni hay wheels compiladas.
+
+- En Linux, cada publicador anota sus bloques en un archivo pequeño
   (`$TMPDIR/agmen-shm-<usuario>/<pid>-<id>.txt`). El primer publicador que
   arranca en un proceso revisa esos archivos: si el proceso que los escribió
   ya no existe, borra sus bloques. Así un nodo que se cae 100 veces mientras
@@ -266,7 +270,7 @@ nunca se entrega como mensaje.
 | **D3** | ¿Quién libera un bloque y cuándo? | (a) **El publicador es el dueño; el suscriptor lo tiene prestado mientras tu código use el mensaje y lo devuelve por TCP; si el suscriptor muere, al cerrarse su conexión se libera todo**, (b) anillo con generaciones (*seqlock*): el publicador sobreescribe y el suscriptor revisa si lo pisaron, (c) copiar al recibir (una copia en vez de cuatro) | **(a)** | Con (b), un `ndarray` que guardaste podría cambiar debajo de ti sin que nadie te avise: va contra la regla 1. (c) sigue copiando lo que más pesa. (a) es el *drop token* de dora, sin daemon de por medio, y la conexión TCP que ya existe detecta sola a un suscriptor muerto |
 | **D4** | ¿Cómo se sabe que están en la misma computadora? | (a) **Probando: el suscriptor dice que puede, el publicador le pide abrir un bloque de prueba, y solo si lo abre y trae la marca se usa memoria compartida**, (b) por la IP: `127.0.0.1` = misma computadora, (c) por el nombre de la computadora o el `boot_id` | **(a)** | (b) y (c) se equivocan con Docker (misma IP o mismo kernel, pero `/dev/shm` distinto), con otro usuario, y con la IP de red de la propia computadora. (a) prueba justo lo que importa (¿puedo abrir esta memoria?), y es compatible con 0.10 en los dos sentidos porque el suscriptor habla primero |
 | **D5** | ¿Desde qué tamaño? | (a) **Mensajes `arrow` de 4 KiB o más; los `arrow` chicos siguen en línea por TCP y los `compact` por UDP**, (b) todo `arrow`, (c) también `compact` | **(a)** | Abajo de unos KB, apartar un bloque y devolverlo cuesta más que copiar. 4 KB es el umbral que usa dora. (c) le pondría sobrecosto al control de 1 kHz (regla 6) |
-| **D6** | ¿Qué pasa si un suscriptor se queda con muchos mensajes o lee lento? | (a) **Hasta 4 prestados (y 64 MiB) por suscriptor, los demás se copian al recibir, con un aviso; hasta 8 (y 128 MiB) sin devolver por conexión y luego D3 del RFC 0008 (el más nuevo); pool de hasta 64 bloques y 512 MiB, y si no alcanza, TCP**, (b) el publicador espera a que le devuelvan, (c) dejar de mandarle hasta que devuelva | **(a)** | (b) deja que una IA lenta frene a la cámara (va contra D3 del RFC 0008 y la regla 12). (c) deja sin datos a quien guarda 10 imágenes, sin que sepa por qué. Con (a) nadie espera, nadie se queda sin datos y la memoria tiene un tope |
+| **D6** | ¿Qué pasa si un suscriptor se queda con muchos mensajes o lee lento? | (a) Hasta 4 prestados (y 64 MiB) por suscriptor, los demás se copian al recibir, con un aviso; hasta 8 (y 128 MiB) sin devolver por conexión y luego D3 del RFC 0008 (el más nuevo); pool de hasta 64 bloques y 512 MiB, y si no alcanza, TCP, (a′) **lo mismo que (a), pero el tope del pool depende de la computadora (el menor entre 512 MiB, ¼ de la RAM y, en Linux, ½ de `/dev/shm`; `AGMEN_SHM_MB` lo cambia) y el pool se encoge: un bloque que nadie tiene prestado y no se usó en 5 s se libera**, (b) el publicador espera a que le devuelvan, (c) dejar de mandarle hasta que devuelva | **(a′)** | (b) deja que una IA lenta frene a la cámara (va contra D3 del RFC 0008 y la regla 12). (c) deja sin datos a quien guarda 10 imágenes, sin que sepa por qué. Con (a) nadie espera, nadie se queda sin datos y la memoria tiene un tope; pero 512 MiB fijos son la mitad de una Raspberry Pi 3 (1 GB), y lo que se apartó en un pico quedaba apartado hasta que el nodo terminaba. (a′) arregla las dos cosas sin cambiar nada más |
 | **D7** | ¿Cómo llega a Python? | (a) **Una vista sin copiar: el núcleo de C++ entrega un objeto con el protocolo de buffer que devuelve el bloque al destruirse; Python puro hace lo mismo con un `mmap` por mensaje**, (b) `bytes` (una copia), (c) solo en el núcleo de C++ | **(a)** | Python es donde vive la IA (requisito b): ahí es donde importa no copiar. Con (a), `as_array()` y `agmen.load(..., numpy=True)` dan un `ndarray` que apunta a la memoria de la cámara, y el bloque vuelve cuando el último `ndarray` que lo usa se destruye |
 
 ## 6. Las partes difíciles
@@ -274,12 +278,12 @@ nunca se entrega como mensaje.
 | # | Reto | Cómo se enfrenta |
 |---|---|---|
 | 1 | **Un bloque que alguien todavía lee se vuelve a escribir** | El publicador nunca escribe un bloque con préstamos. Los avisos llevan la generación y se revisan contra lo que el publicador sabe que prestó; un aviso repetido o equivocado se ignora. El suscriptor revisa marca, dueño, generación y longitud antes de entregar |
-| 2 | **Procesos que mueren a la mitad** | Suscriptor muerto: se cierra su TCP y se recuperan sus bloques. Publicador muerto: las vistas siguen siendo válidas; Windows borra el bloque solo; en Linux y macOS, el registro (§3.6) |
+| 2 | **Procesos que mueren a la mitad** | Suscriptor muerto: se cierra su TCP y se recuperan sus bloques. Publicador muerto: las vistas siguen siendo válidas; Windows borra el bloque solo; en Linux, el registro (§3.6) |
 | 3 | **`/dev/shm` chico o lleno** (Docker: 64 MB) | `posix_fallocate` al crear el bloque: falla con un error y no con `SIGBUS`. Aviso con la causa y TCP para ese mensaje |
-| 4 | **Tres sistemas operativos** | Todo lo que cambia está en `agmen/shm.hpp` (como `net.hpp` para los sockets). Los nombres caben en los 31 caracteres de macOS. Pruebas en los 4 sistemas del CI |
+| 4 | **Dos sistemas operativos** | Todo lo que cambia está en `agmen/shm.hpp` (como `net.hpp` para los sockets). Pruebas en los 3 sistemas del CI (Ubuntu x86-64, Ubuntu ARM64 y Windows) |
 | 5 | **Python sin C++** | Python puro usa `mmap` y `_posixshmem` (lo que usa `multiprocessing` por dentro) sin registrar los bloques en el *resource tracker* (que borraría los del publicador). La vista es un `mmap` por mensaje con `weakref.finalize`: cuando el último `memoryview` o `ndarray` se destruye, se devuelve el bloque |
 | 6 | **Dos versiones de Agmen en el mismo robot** | El suscriptor habla primero (§3.3). Entre 0.10 y 0.11, en cualquier sentido, todo sigue por TCP como antes |
-| 7 | **Que no haya que probarlo a mano en otra computadora** | El respaldo se prueba en el CI simulando que el suscriptor no puede abrir la memoria del publicador (en Linux y macOS se borra el bloque de prueba antes de que el suscriptor llegue; con `AGMEN_SHM=0` en los cuatro sistemas) |
+| 7 | **Que no haya que probarlo a mano en otra computadora** | El respaldo se prueba en el CI simulando que el suscriptor no puede abrir la memoria del publicador (en Linux se borra el bloque de prueba antes de que el suscriptor llegue; con `AGMEN_SHM=0` en los tres sistemas) |
 
 ## 7. Plan para Agmen 0.11.0
 
@@ -310,7 +314,7 @@ nunca se entrega como mensaje.
 | `pub.shm_subscribers`, `pub.shm_fallbacks`, `AGMEN_SHM=0`, `AGMEN_SHM_MB` | C++ y los dos núcleos de Python |
 | Con dirección fija, el TCP del suscriptor escucha en la misma IP que el UDP (antes, siempre `127.0.0.1` en C++): imágenes entre computadoras, por TCP | `src/pubsub.cpp` |
 | `net::wait_rw` (leer y escribir en el mismo socket con una sola espera, también en Windows) | `include/agmen/net.hpp`, `src/net.cpp` |
-| Pruebas | `tests/test_shm.cpp` (también con ASan/UBSan), `python/test_shm.py` (los dos núcleos, cruzados C++ ↔ Python puro, respaldo por TCP, limpieza de un proceso muerto, topes); `scripts/tutorial_check.py` revisa que el contador de C++ y la IA de Python del capítulo 14 reciban por memoria compartida en los 4 sistemas del CI |
+| Pruebas | `tests/test_shm.cpp` (también con ASan/UBSan), `python/test_shm.py` (los dos núcleos, cruzados C++ ↔ Python puro, respaldo por TCP, limpieza de un proceso muerto, topes); `scripts/tutorial_check.py` revisa que el contador de C++ y la IA de Python del capítulo 14 reciban por memoria compartida en los 3 sistemas del CI |
 | Medición | `bench/shm_vs_tcp.py` |
 | Tutorial | Capítulo 15; el ejemplo `examples/vision` dice por dónde llegó cada imagen |
 
@@ -384,7 +388,17 @@ Lo que dice la tabla:
 ### Diferencias con la propuesta
 
 - D6 con topes en bytes además de en mensajes, y el pool de 512 MiB en vez de
-  256 MiB (arriba). Lo demás, como se propuso.
+  256 MiB (arriba).
+- **D6 = (a′), al aceptar el RFC** (2026-11-05, en 0.11.1): el mismo diseño de
+  topes, con dos cambios para computadoras chicas como una Raspberry Pi 3 (1 GB):
+  - el tope del pool por defecto es el menor entre 512 MiB, ¼ de la RAM física
+    y, en Linux, ½ del tamaño de `/dev/shm`. Si `AGMEN_SHM_MB` está puesto,
+    manda ese valor, aunque pase del ¼;
+  - el pool se encoge: un bloque que nadie tiene prestado y no se usó en 5 s se
+    libera (se borra su nombre y sale del registro). Nunca se libera un bloque
+    con préstamos ni uno que nombra un descriptor que todavía va en camino.
+- Lo demás, como se propuso. macOS dejó de tener soporte oficial en 0.11.1
+  (`docs/VISION.md`).
 
 ## Fuentes
 

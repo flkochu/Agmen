@@ -225,7 +225,7 @@ iceoryx2).
 | Prioridades de tiempo real (`SCHED_FIFO`, afinidad de núcleo) por grupo | Cuando un robot lo necesite |
 | Unidades y rangos en los esquemas, que muestre el panel | Cuando se diseñe (cambia el anuncio del RFC 0001) |
 | Nombre y alcance del visualizador propio | Nivel 14 |
-| Memoria compartida propia o con iceoryx2 por debajo | Propuesta: propia ([RFC 0009](rfc/0009-memoria-compartida.md) D1), implementada en 0.11.0 con las siete opciones recomendadas. Falta que Adán la acepte |
+| ~~Memoria compartida propia o con iceoryx2 por debajo~~ | ✅ [RFC 0009](rfc/0009-memoria-compartida.md) aceptado el 2026-11-05: propia (D1); D1–D5 y D7 = a, D6 = a′ (tope según la RAM y el pool se encoge, en 0.11.1) |
 | Préstamo para escribir directo en la memoria compartida (la cámara llena el bloque) | Cuando se mida que la copia del publicador estorba (RFC 0009 §4) |
 | Formato de grabación: MCAP o propio sobre Arrow IPC | Nivel 9 |
 
