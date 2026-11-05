@@ -1,5 +1,5 @@
 // msgs.agmen
-// Generado por `agmen gen` (Agmen 0.11.0) desde msgs.agmen.
+// Generado por `agmen gen` (Agmen 0.11.1) desde msgs.agmen.
 // No lo edites: cambia msgs.agmen y vuelve a generar.
 #pragma once
 
