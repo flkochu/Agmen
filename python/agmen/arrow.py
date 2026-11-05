@@ -175,18 +175,27 @@ class Tensor:
         return f"Tensor(shape={self.shape})"
 
     def __reduce__(self):
-        # Para pickle (multiprocessing): una vista sin copiar pasa a lista de números.
-        data = self.data.tolist() if isinstance(self.data, memoryview) else self.data
-        return (Tensor, (self.shape, data))
+        # Para pickle (multiprocessing): una vista sin copiar (a veces del bloque
+        # de memoria compartida) se copia a bytes, y del otro lado vuelve a ser
+        # una vista de números del mismo tipo.
+        if isinstance(self.data, memoryview):
+            return (_tensor_from_bytes, (self.shape, self.data.tobytes(), self.data.format))
+        return (Tensor, (self.shape, self.data))
+
+
+def _tensor_from_bytes(shape, raw: bytes, fmt: str) -> Tensor:
+    return Tensor(shape, memoryview(raw).cast(fmt) if raw else [])
 
 
 def picklable(value):
     """Lo que guarda pickle de un campo: un memoryview (la vista sin copiar de
-    lo recibido) pasa a bytes, también dentro de listas."""
+    lo recibido) pasa a bytes, también dentro de listas y de structs."""
     if isinstance(value, memoryview):
         return value.tobytes()
     if isinstance(value, list):
         return [picklable(v) for v in value]
+    if isinstance(value, dict):           # un struct anidado de un tipo escrito a mano
+        return {k: picklable(v) for k, v in value.items()}
     return value
 
 

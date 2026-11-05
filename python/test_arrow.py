@@ -7,6 +7,7 @@ de GitHub siempre está).
 """
 
 import ast
+import pickle
 import struct
 import sys
 import unittest
@@ -229,6 +230,20 @@ class TestNumpy(unittest.TestCase):
         layout = schema.Layout("T{tensor<u16,2> m}")
         d = layout.unpack(layout.pack({"m": arrow.Tensor((2, 2), struct.pack("<4H", 1, 2, 3, 65535))}))
         self.assertEqual(d["m"].tolist(), [[1, 2], [3, 65535]])
+
+
+class TestTensorPickle(unittest.TestCase):
+    def test_una_vista_se_copia_y_sigue_siendo_de_numeros(self):
+        # multiprocessing sin NumPy: la vista sin copiar (a veces del bloque de
+        # memoria compartida) se copia a bytes, no a una lista de números, y
+        # del otro lado es otra vez una vista del mismo tipo.
+        raw = struct.pack("<4H", 1, 2, 3, 65535)
+        back = pickle.loads(pickle.dumps(arrow.Tensor((2, 2), memoryview(raw).cast("H"))))
+        self.assertEqual((back.shape, back.data.format, list(back.data)), ((2, 2), "H", [1, 2, 3, 65535]))
+        layout = schema.Layout("T{tensor<u16,2> m}")
+        self.assertEqual(layout.pack({"m": back}), layout.pack({"m": arrow.Tensor((2, 2), raw)}))
+        empty = pickle.loads(pickle.dumps(arrow.Tensor((0, 3), memoryview(b"").cast("H"))))
+        self.assertEqual((empty.shape, list(empty.data)), ((0, 3), []))
 
 
 class TestErrores(unittest.TestCase):

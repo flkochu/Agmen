@@ -181,6 +181,9 @@ def _parse_py(buf: bytes, shm: bool = False) -> tuple[Envelope, bytes]:
 # Mensajes
 # ---------------------------------------------------------------------------
 
+_OBJECT_GETSTATE = getattr(object, "__getstate__", None)   # Python ≥ 3.11; antes no existe
+
+
 class Message:
     """Base de todos los tipos de mensaje (equivale al `concept Message` de C++).
 
@@ -216,6 +219,13 @@ class Message:
                 cls.NAME = layout.name
             elif cls.NAME != layout.name:
                 raise _schema.SchemaError(f"NAME = '{cls.NAME}' pero el esquema se llama '{layout.name}'")
+            # Lo recibido en arrow trae los bytes como memoryview (sin copiar, a
+            # veces del bloque de memoria compartida); pickle no los sabe guardar.
+            # Igual que en los tipos generados: solo al hacer pickle pasan a bytes.
+            if layout.encoding == ENC_ARROW and getattr(cls, "__getstate__", None) is _OBJECT_GETSTATE:
+                from . import arrow as _arrow
+
+                cls.__getstate__ = _arrow.getstate
 
     @classmethod
     def check_payload_size(cls, payload: bytes, expected: int | None) -> None:

@@ -9,8 +9,10 @@ tests/test_shm.cpp."""
 
 from __future__ import annotations
 
+import dataclasses
 import gc
 import io
+import multiprocessing
 import os
 import pickle
 import subprocess
@@ -38,6 +40,14 @@ class Img(wire.Message):
     w: int
     h: int
     data: bytes
+
+
+@dataclass
+class Nube(wire.Message):
+    """Un tipo arrow escrito a mano, con un struct anidado (llega como dict)."""
+    SCHEMA = "Nube{bytes data;P{f64 x;bytes etiqueta}[] puntos}"
+    data: bytes
+    puntos: list
 
 
 BIG = bytes(range(256)) * 4000      # 1 MB
@@ -68,6 +78,17 @@ def drain(sub, timeout=0.3):
 def is_view(sample) -> bool:
     """¿El campo `data` apunta a la memoria compartida (y no a una copia)?"""
     return not isinstance(sample.message.data.obj, (bytes, bytearray))
+
+
+def _eco(msg):
+    """En el proceso hijo (multiprocessing con spawn): lo regresa tal cual."""
+    return msg
+
+
+def _resumen(msg):
+    """En el proceso hijo: lo que llegó, campo por campo."""
+    return (type(msg).__name__, msg.timestamp, msg.frame_id, msg.width, msg.height, msg.encoding, msg.step,
+            bytes(msg.data))
 
 
 class EnvVar:
@@ -250,6 +271,107 @@ class TestDirecto(unittest.TestCase):
         finally:
             sub.close()
             pub.close()
+
+
+@unittest.skipUnless(_shm.enabled(), "sin memoria compartida")
+class TestPickleConMemoriaCompartida(unittest.TestCase):
+    """multiprocessing y DataLoader (0.10.1) con una Imagen que llegó por
+    memoria compartida: pickle copia la vista a bytes, lo que llega del otro
+    lado es igual a lo publicado, y el bloque vuelve al publicador al soltar el
+    mensaje original. El suscriptor es el del núcleo que se prueba; el
+    publicador, de Python puro, para poder mirar su pool por dentro."""
+
+    def setUp(self):
+        from agmen.msgs import Imagen
+
+        self.sub = agmen.Subscriber(Imagen, "127.0.0.1:0")
+        self.pub = pubsub._PurePublisher(Imagen, f"127.0.0.1:{self.sub.port}", topic="/camara")
+        self.sent = Imagen(timestamp=123_456_789, frame_id="camara", width=640, height=480, encoding="bgr8",
+                           step=1920, data=bytes(range(256)) * 3600)
+
+    def tearDown(self):
+        self.sub.close()
+        self.pub.close()
+
+    def _shared(self):
+        end = time.monotonic() + 3
+        while time.monotonic() < end:
+            self.pub.publish(self.sent)
+            s = self.sub.receive(0.05)
+            if s is not None and s.envelope.flags & wire.FLAG_SHM:
+                return s
+        self.fail("la Imagen no llegó por memoria compartida")
+
+    def _busy(self):
+        with self.pub._tcp.lock:
+            return self.pub._tcp.pool.busy()
+
+    def _wait_free(self, timeout=2.0):
+        end = time.monotonic() + timeout
+        while self._busy() and time.monotonic() < end:
+            gc.collect()
+            time.sleep(0.01)
+        return self._busy()
+
+    def test_pickle_es_igual_a_lo_publicado(self):
+        s = self._shared()
+        self.assertTrue(is_view(s), "llegó como vista del bloque")
+        for proto in range(2, pickle.HIGHEST_PROTOCOL + 1):
+            with self.subTest(protocolo=proto):
+                back = pickle.loads(pickle.dumps(s.message, protocol=proto))
+                self.assertEqual(back, self.sent)
+                self.assertIsInstance(back.data, bytes, "una copia, no una vista del bloque")
+
+    def test_un_tipo_escrito_a_mano_tambien(self):
+        # Antes solo los tipos generados (agmen gen, agmen.msgs) sabían hacer
+        # pickle de lo recibido: un @dataclass(wire.Message) con bytes lanzaba
+        # "cannot pickle 'memoryview' object". Ahora wire.Message se lo da a
+        # todos los tipos arrow; también a los structs anidados (dicts).
+        sub = agmen.Subscriber(Nube, "127.0.0.1:0")
+        pub = pubsub._PurePublisher(Nube, f"127.0.0.1:{sub.port}", topic="/nube")
+        sent = Nube(BIG, [{"x": 1.5, "etiqueta": b"a" * 10}])
+        try:
+            got = None
+            end = time.monotonic() + 3
+            while got is None and time.monotonic() < end:
+                pub.publish(sent)
+                s = sub.receive(0.05)
+                if s is not None and s.envelope.flags & wire.FLAG_SHM:
+                    got = s
+            self.assertIsNotNone(got)
+            self.assertIsInstance(got.message.data, memoryview)
+            back = pickle.loads(pickle.dumps(got.message))
+            self.assertEqual(bytes(back.data), BIG)
+            self.assertEqual(back.puntos, [{"x": 1.5, "etiqueta": b"a" * 10}])
+        finally:
+            sub.close()
+            pub.close()
+
+    def test_multiprocessing_pool_con_spawn(self):
+        s = self._shared()
+        with multiprocessing.get_context("spawn").Pool(1) as pool:
+            echoed = pool.apply(_eco, (s.message,))
+            summary = pool.apply(_resumen, (s.message,))
+        self.assertEqual(echoed, self.sent)
+        self.assertEqual(summary, ("Imagen", 123_456_789, "camara", 640, 480, "bgr8", 1920, self.sent.data))
+
+    def test_el_bloque_vuelve_aunque_exista_la_copia(self):
+        s = self._shared()
+        gc.collect()
+        time.sleep(0.2)
+        self.assertEqual(self._busy(), 1, "mientras exista el mensaje, su bloque sigue prestado")
+        copy = pickle.loads(pickle.dumps(s.message))
+        del s
+        self.assertEqual(self._wait_free(), 0, "al soltar el original, el bloque vuelve")
+        # El publicador reutiliza el bloque con otros datos: la copia no cambia.
+        other = dataclasses.replace(self.sent, data=bytes(len(self.sent.data)))
+        for _ in range(5):
+            self.pub.publish(other)
+            r = self.sub.receive(1)
+            self.assertIsNotNone(r)
+            self.assertEqual(bytes(r.message.data), other.data)
+            del r
+        self.assertEqual(copy, self.sent)
 
 
 class TestElBloqueVuelveAlSoltarLaUltimaVista(unittest.TestCase):

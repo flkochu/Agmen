@@ -152,6 +152,18 @@ del ultimas[:-10]
 Los arreglos que llegan son **de solo lectura** (como en el capítulo 14): un
 nodo no puede escribir en la imagen que ven los demás.
 
+**A otro proceso con `multiprocessing`** (o los *workers* de un `DataLoader`
+de PyTorch): manda el mensaje tal cual. Al hacer `pickle`, la vista se copia a
+`bytes`; el otro proceso recibe una imagen igual a la publicada, y el bloque
+vuelve a la cámara en cuanto sueltas el mensaje original, aunque la copia siga
+viva. Vale para `agmen.msgs`, para los tipos de `agmen gen` y para los que
+escribes a mano con `@dataclass`.
+
+```python
+with multiprocessing.get_context("spawn").Pool(4) as pool:
+    caras = pool.apply(detectar_caras, (s.message,))    # una copia viaja; el bloque vuelve
+```
+
 ## 6. Docker, límites y limpieza
 
 - **Docker**: para que dos contenedores compartan memoria, córrelos con
