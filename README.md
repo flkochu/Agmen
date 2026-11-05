@@ -51,6 +51,7 @@ como paquetes opcionales.
 | Python compilado desde el núcleo de C++ | [RFC 0007](docs/rfc/0007-python-compilado.md) (aceptado, implementado en 0.9.0) |
 | Imágenes, tensores y texto (datos grandes) | [RFC 0008](docs/rfc/0008-datos-grandes.md) (aceptado, implementado en 0.10.0) |
 | Memoria compartida: imágenes sin copiar entre procesos | [RFC 0009](docs/rfc/0009-memoria-compartida.md) (aceptado, implementado en 0.11.0; D6 a′ en 0.11.1) |
+| Grabar, reproducir y exportar a Parquet (nivel 9) | [RFC 0010](docs/rfc/0010-grabar-y-reproducir.md) (propuesto: falta decidir) |
 | Publicar versiones | [`docs/PUBLICAR.md`](docs/PUBLICAR.md) |
 
 ## Estado

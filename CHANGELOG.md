@@ -8,7 +8,9 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 ## [Sin publicar]
 
 ### Planeado (nivel 9, versión 0.12.0)
-- Grabación y reproducción; exportar a Parquet.
+- Grabación y reproducción; exportar a Parquet. Diseño propuesto en el
+  [RFC 0010](docs/rfc/0010-grabar-y-reproducir.md) (recomienda MCAP con los
+  mensajes de Agmen adentro); falta decidir antes de implementar.
 
 ## [0.11.1] — 2026-11-05
 
