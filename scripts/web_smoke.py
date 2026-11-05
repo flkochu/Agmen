@@ -1,6 +1,6 @@
 """Prueba de `agmen web` (el panel y su puente WebSocket) con nodos reales.
 
-Funciona en Windows, Linux y macOS. Requiere haber compilado antes.
+Funciona en Windows y Linux. Requiere haber compilado antes.
 
     python scripts/web_smoke.py
 

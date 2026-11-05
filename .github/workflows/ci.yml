@@ -1,7 +1,8 @@
-# Compila y prueba en Windows (MSVC), Linux (GCC), macOS (Apple Clang) y
-# Linux ARM64 (el mismo procesador que una Raspberry Pi 3/4/5 con sistema de
-# 64 bits) en cada push y pull request. Si algo deja de funcionar en un sistema, GitHub
-# te avisa.
+# Compila y prueba en Windows (MSVC), Linux (GCC) y Linux ARM64 (el mismo
+# procesador que una Raspberry Pi 3/4/5 con sistema de 64 bits) en cada push y
+# pull request. Si algo deja de funcionar en un sistema, GitHub te avisa.
+# macOS no tiene soporte oficial desde 0.11.1 (docs/VISION.md, §4): el código
+# sigue siendo POSIX, pero ya no se prueba aquí.
 name: CI
 
 on:
@@ -16,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest, ubuntu-24.04-arm]
+        os: [ubuntu-latest, windows-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6

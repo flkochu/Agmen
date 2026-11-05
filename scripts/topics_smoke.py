@@ -1,6 +1,6 @@
 """Prueba de topics (RFC 0004) entre C++ y Python, con un `agmen hub` real.
 
-Funciona en Windows, Linux y macOS. Requiere haber compilado antes.
+Funciona en Windows y Linux. Requiere haber compilado antes.
 
     python scripts/topics_smoke.py
 """

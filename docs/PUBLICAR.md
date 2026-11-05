@@ -28,8 +28,8 @@ versión 0.1.0 de Agmen ya funciona, así que es el momento de publicarla.
    ```
 3. Si el dueño no es `flkochu`, cambia las URLs en `pyproject.toml` y en
    `CHANGELOG.md`.
-4. Revisa la pestaña **Actions**: el CI debe salir en verde en Windows, Linux
-   y macOS.
+4. Revisa la pestaña **Actions**: el CI debe salir en verde en Windows y Linux
+   (x86-64 y ARM64).
 
 ## Paso 2 — Cuenta de PyPI
 
@@ -70,8 +70,8 @@ En la pestaña **Actions** vas a ver el workflow **Release**:
 verificar → pruebas en todos los sistemas → wheels (desde 0.9.0: una compilada
 por sistema con cibuildwheel, más la de Python puro y el sdist; cada una se
 instala y se prueba con `scripts/wheel_check.py`) → PyPI → Release de GitHub.
-Las wheels tardan más que las pruebas (~10–20 min): las de macOS y Windows
-son las más lentas.
+Las wheels tardan más que las pruebas (~10 min): la de Windows es la más
+lenta. Desde 0.11.1 no hay wheels de macOS: ahí pip instala la de Python puro.
 Al terminar:
 
 ```bash

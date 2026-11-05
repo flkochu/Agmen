@@ -1,7 +1,7 @@
 """Prueba de `agmen run`: un solo comando levanta el robot del tutorial y el
 panel web; se controla todo por la API del panel, igual que el navegador.
 
-Funciona en Windows, Linux y macOS. Requiere haber compilado antes.
+Funciona en Windows y Linux. Requiere haber compilado antes.
 
     python scripts/run_smoke.py
 """

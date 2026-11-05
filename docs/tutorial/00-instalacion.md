@@ -6,7 +6,7 @@ Al final de este capítulo tendrás Agmen compilado y sus pruebas pasando.
 
 💡 **¿Solo quieres usar Agmen desde Python?** No hace falta compilar nada:
 `pip install agmen` (Python 3.11 o más nuevo) ya trae el núcleo de C++
-compilado para Windows, Linux, macOS y Raspberry Pi
+compilado para Windows, Linux y Raspberry Pi
 ([capítulo 13](13-python-rapido-y-numpy.md)). Este capítulo es para tener el
 repositorio completo: el C++, los ejemplos y las pruebas.
 
@@ -18,7 +18,6 @@ Necesitas un compilador de C++20, CMake 3.20+ y Python 3.11+.
 |---|---|
 | **Windows** | [Visual Studio 2022 Community](https://visualstudio.microsoft.com/) con la carga de trabajo **"Desarrollo para el escritorio con C++"** (incluye CMake), y [Python](https://www.python.org/downloads/) (marca "Add python.exe to PATH") |
 | **Ubuntu / Debian** | `sudo apt install build-essential cmake python3 git` |
-| **macOS** | `xcode-select --install` y luego `brew install cmake python git` |
 
 Revisa que todo esté:
 
@@ -48,7 +47,7 @@ cmake --build build --config Release
 ```
 
 - `-S .` = "el código está aquí"; `-B build` = "compila en la carpeta `build`".
-- `--config Release` = optimizado. En Linux/macOS no hace falta, pero no estorba.
+- `--config Release` = optimizado. En Linux no hace falta, pero no estorba.
 
 Los programas quedan en `build/bin/` (en Windows, `build\bin\programa.exe`).
 El núcleo de Python queda en `python/agmen/` (`_core.abi3.so`, o `.pyd` en

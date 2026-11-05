@@ -184,7 +184,7 @@ with multiprocessing.get_context("spawn").Pool(4) as pool:
   print(pub.shm_bytes / 2**20, "MiB")   # 80 en la ráfaga 4K; 0 a los 5 s sin publicar
   ```
 - Si un nodo **se cae**, sus suscriptores siguen viendo lo que ya tenían, y el
-  siguiente publicador que arranca borra los bloques que dejó (Linux y macOS;
+  siguiente publicador que arranca borra los bloques que dejó (Linux;
   en Windows el sistema los borra solo). En Linux puedes verlos con
   `ls /dev/shm/agm*`.
 

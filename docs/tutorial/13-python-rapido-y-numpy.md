@@ -34,8 +34,8 @@ lento; Agmen lo avisa una vez al crear tu primer nodo.
 
 | Sistema | `pip install agmen` trae |
 |---|---|
-| Windows x64, Linux x64, Linux ARM64 (Raspberry Pi), macOS Intel y Apple Silicon, con Python 3.11 o más nuevo | El núcleo de C++, sin compilar nada |
-| Cualquier otro | Python puro |
+| Windows x64, Linux x64, Linux ARM64 (Raspberry Pi), con Python 3.11 o más nuevo | El núcleo de C++, sin compilar nada |
+| Cualquier otro (también macOS, sin soporte oficial desde 0.11.1) | Python puro |
 
 ## 2. Cuánto más rápido
 

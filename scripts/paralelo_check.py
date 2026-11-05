@@ -23,7 +23,7 @@ Cada prueba compara lo que tardaría en serie contra lo que se mide:
      ≥ 25 por segundo? ¿El control a 1 kHz de la prueba 6 pierde ciclos por
      la cámara?
 
-Funciona en Windows, Linux y macOS. Las pruebas 1 a 5 y 7 no necesitan
+Funciona en Windows y Linux. Las pruebas 1 a 5 y 7 no necesitan
 compilar nada; la 6 (y la mitad de la 7) usan build/bin/doble_ritmo (si no
 está, se salta y lo dice).
 

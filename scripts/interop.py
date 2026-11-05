@@ -1,6 +1,6 @@
 """Prueba de interoperabilidad C++ <-> Python y decodificación dinámica.
 
-Funciona en Windows, Linux y macOS.
+Funciona en Windows y Linux.
 
 Requiere haber compilado antes (si los binarios están desactualizados, la
 prueba falla con errores de formato):
