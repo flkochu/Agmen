@@ -223,7 +223,10 @@ class TestTablas(RecordingCase):
         self.assertTrue(pa.types.is_struct(f("sub").type))
         self.assertIsInstance(f("m").type, pa.FixedShapeTensorType)
         self.assertEqual(f("m").type.shape, [2, 3])
-        row = t.slice(5, 1).to_pylist()[0]
+        # Sin pandas, pyarrow no pasa un timestamp/duration en ns a datetime: esos se revisan como enteros.
+        row = t.drop_columns(["t_data", "t_pub", "log_time", "t", "dt"]).slice(5, 1).to_pylist()[0]
+        self.assertEqual((t.column("t").cast(pa.int64())[5].as_py(), t.column("dt").cast(pa.int64())[5].as_py()),
+                         (T0 + 5, -5))
         self.assertEqual((row["x"], row["flags"], row["ok"], row["sub"]),
                          (2.5, [5, -5, 1], False, {"a": 105, "b": False}))
         self.assertEqual(row["ps"], [{"k": 5, "v": 0.5}, {"k": 2, "v": 5.0}])
