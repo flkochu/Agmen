@@ -406,6 +406,180 @@ class TestElBloqueVuelveAlSoltarLaUltimaVista(unittest.TestCase):
             pub.close()
 
 
+# --- D6 a′: el tope según la RAM, y el pool que se encoge -------------------------
+
+def fake_ram(n):
+    """Finge la RAM de la máquina en los dos núcleos (0 o None = la de verdad).
+    Es un gancho interno de las pruebas, no una variable de entorno."""
+    _shm._fake_ram = n or None
+    if _backend.NATIVE:
+        _backend.core._shm_fake_ram(int(n or 0))
+
+
+def limit():
+    """(bytes, de dónde sale) según el núcleo que publica."""
+    return _backend.core.shm_limit() if _backend.NATIVE else _shm.limit()
+
+
+def my_devshm_entries():
+    """Linux: los bloques de este proceso que se ven en /dev/shm."""
+    if not sys.platform.startswith("linux"):
+        return []
+    prefix = f"agm{os.getpid() & 0xFFFFFFFF:08x}"
+    return [f for f in os.listdir("/dev/shm") if f.startswith(prefix)]
+
+
+def my_shm_mappings():
+    """Linux: cuántos bloques de Agmen tiene mapeados este proceso."""
+    if not sys.platform.startswith("linux"):
+        return 0
+    with open("/proc/self/maps", encoding="utf-8", errors="replace") as fh:
+        return sum("/dev/shm/agm" in line for line in fh)
+
+
+class TestTopeSegunLaRam(unittest.TestCase):
+    def tearDown(self):
+        fake_ram(0)
+
+    def test_una_maquina_de_1_gb(self):
+        with EnvVar("AGMEN_SHM_MB", None):
+            fake_ram(1 << 30)
+            quarter = 256 << 20
+            dev = _shm.devshm_size()
+            want = min(quarter, dev // 2) if dev else quarter
+            self.assertEqual(limit(), (want, "¼ de la RAM" if want == quarter else "½ de /dev/shm"))
+            self.assertEqual(_shm.limit(), limit(), "Python puro y C++ calculan lo mismo")
+        with EnvVar("AGMEN_SHM_MB", "600"):                 # manda, aunque pase de ¼ de la RAM
+            self.assertEqual(limit(), (600 << 20, "AGMEN_SHM_MB"))
+
+    def test_la_de_verdad(self):
+        fake_ram(0)
+        with EnvVar("AGMEN_SHM_MB", None):
+            cap, _ = limit()
+            self.assertLessEqual(cap, 512 << 20)
+            if _shm.physical_ram():
+                self.assertLessEqual(cap, _shm.physical_ram() // 4)
+            if _shm.devshm_size():
+                self.assertLessEqual(cap, _shm.devshm_size() // 2)
+
+    @unittest.skipUnless(_shm.enabled(), "sin memoria compartida")
+    def test_el_publicador_lo_respeta(self):
+        # Con 16 MiB de RAM, el tope es 4 MiB: guardando todo, el resto va por TCP.
+        fake_ram(16 << 20)
+        sub = agmen.Subscriber(Img, "127.0.0.1:0")
+        pub = agmen.Publisher(Img, f"127.0.0.1:{sub.port}", topic="/img")
+        try:
+            with EnvVar("AGMEN_SHM_MB", None), redirect_stderr(io.StringIO()) as err:
+                self.assertIsNotNone(until_shared(pub, sub))
+                kept = []
+                for k in range(8):
+                    pub.publish(Img(k, 0, BIG))
+                    kept += drain(sub, 0.2)
+                self.assertLessEqual(pub.shm_bytes, 4 << 20)
+                self.assertGreater(pub.shm_fallbacks, 0)
+            self.assertIn("¼ de la RAM", err.getvalue())
+        finally:
+            sub.close()
+            pub.close()
+
+
+@unittest.skipUnless(_shm.enabled(), "sin memoria compartida")
+class TestPoolSeEncoge(unittest.TestCase):
+    """El pool de Python puro, por dentro (tests/test_shm.cpp hace lo mismo en C++)."""
+
+    def test_libera_lo_que_nadie_usa_y_nunca_lo_prestado(self):
+        owner = 0xA6E70003
+        pool = _shm.Pool(owner)
+        try:
+            held = []
+            for g in range(1, 7):                  # una ráfaga: 6 sin devolver = 6 bloques
+                d = pool.write(g, BIG)
+                self.assertIsInstance(d, _shm.Descriptor)
+                pool.hold(d.slot)
+                held.append(d)
+            probe = pool.probe()
+            self.assertEqual(pool.count(), 6)
+            for d in held[1:]:
+                pool.release(d.slot)
+            now = time.monotonic()
+            self.assertEqual(pool.trim(now), 0, "recién usados: nada")
+            self.assertGreater(pool.trim(now + _shm.IDLE_FREE + 1), 0)
+            self.assertEqual((pool.count(), pool.busy()), (1, 1), "el prestado nunca se libera")
+            for d in held[1:] + [probe]:
+                with self.assertRaises(_shm.ShmError):
+                    _shm.open_readonly(d.name, _shm.PROBE_SIZE)
+            _shm.open_readonly(held[0].name, _shm.PROBE_SIZE).close()
+            if pool.registry:
+                with open(pool.registry, encoding="ascii") as fh:
+                    self.assertEqual(fh.read().split(), [held[0].name], "el registro dice lo que existe")
+            pool.release(held[0].slot)
+            self.assertGreater(pool.trim(time.monotonic() + _shm.IDLE_FREE + 1), 0)
+            self.assertEqual((pool.count(), pool.bytes()), (0, 0))
+            if pool.registry:
+                self.assertFalse(os.path.exists(pool.registry))
+            self.assertIsInstance(pool.write(7, BIG), _shm.Descriptor, "y vuelve a crecer")
+        finally:
+            pool.close()
+
+    def test_reusa_el_mas_reciente(self):
+        pool = _shm.Pool(0xA6E70004)
+        try:
+            a, b = pool.write(1, BIG), pool.write(2, BIG)       # a libre: b es otro bloque solo si a está prestado
+            self.assertEqual(a.slot, b.slot)
+            pool.hold(a.slot)
+            c = pool.write(3, BIG)
+            pool.hold(c.slot)
+            pool.release(a.slot)
+            time.sleep(0.01)
+            pool.release(c.slot)                                 # c se soltó al último: se usa c
+            self.assertEqual(pool.write(4, BIG).slot, c.slot)
+        finally:
+            pool.close()
+
+
+@unittest.skipUnless(_shm.enabled(), "sin memoria compartida")
+class TestRafaga4K(unittest.TestCase):
+    """Una cámara 4K (24.9 MB por imagen) y un suscriptor que guarda todo lo que
+    le llega durante la ráfaga; luego lo suelta y la cámara se calla: a los 5 s,
+    el publicador ya no aparta nada y (Linux) /dev/shm queda limpio."""
+
+    def test_el_pool_se_encoge(self):
+        frame = bytes([7]) * (3840 * 2160 * 3)
+        sub = agmen.Subscriber(Img, "127.0.0.1:0")
+        pub = agmen.Publisher(Img, f"127.0.0.1:{sub.port}", topic="/camara")
+        try:
+            self.assertIsNotNone(until_shared(pub, sub, frame))
+            peak = 0
+            kept = []
+            with redirect_stderr(io.StringIO()):
+                for k in range(12):
+                    pub.publish(Img(k, 0, frame))
+                    kept += drain(sub, 0.03)
+                    peak = max(peak, pub.shm_bytes)
+            self.assertTrue(kept)
+            del kept
+            gc.collect()
+            t0 = time.monotonic()
+            while pub.shm_bytes and time.monotonic() - t0 < 10:
+                sub.receive(0.1)             # el suscriptor sigue escuchando: no llega nada
+            seconds = time.monotonic() - t0
+            after = pub.shm_bytes
+            print(f"\n  ráfaga 4K ({_backend.NAME}): {peak / (1 << 20):.0f} MiB apartados → "
+                  f"{after / (1 << 20):.0f} MiB a los {seconds:.1f} s sin usar", file=sys.stderr)
+            self.assertGreaterEqual(peak, 50 << 20, "al menos dos imágenes 4K")
+            self.assertEqual(after, 0)
+            self.assertGreaterEqual(seconds, 4.0, "no antes de 5 s (menos el segundo del hilo)")
+            if _backend.NATIVE:
+                time.sleep(1.1)
+                sub.receive(0.1)             # suelta los bloques que tenía abiertos
+                self.assertEqual(sub._core.shm_mapped, 0)
+            self.assertEqual(my_devshm_entries(), [], "ni el bloque de prueba queda en /dev/shm")
+            self.assertEqual(my_shm_mappings(), 0, "nadie en este proceso los tiene mapeados")
+        finally:
+            sub.close()
+            pub.close()
+
+
 class TestRespaldoPorTcp(unittest.TestCase):
     def test_agmen_shm_0(self):
         with EnvVar("AGMEN_SHM", "0"):

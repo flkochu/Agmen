@@ -35,6 +35,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import weakref
 from dataclasses import dataclass
 
@@ -49,6 +50,8 @@ MAX_LENT_BYTES = 64 << 20
 MAX_UNRETURNED = 8         # D6: sin devolver por conexión (y 128 MiB, siempre al menos 2); luego, el más nuevo
 MAX_UNRETURNED_BYTES = 128 << 20
 MAX_BLOCKS = 64
+MAX_POOL = 512 << 20       # D6 a′: el tope, si la RAM y /dev/shm no piden menos
+IDLE_FREE = 5.0            # D6 a′: un bloque sin préstamos ni uso en 5 s se libera
 PROBE_SIZE = 4096
 BLOCK_ROUND = 64 << 10
 MAGIC = b"AGMSHM1\0"
@@ -77,13 +80,67 @@ def enabled() -> bool:
     return os.environ.get("AGMEN_SHM") != "0" and (_WINDOWS or _posixshmem is not None)
 
 
-def limit_bytes() -> int:
-    """Lo más que puede apartar un publicador: AGMEN_SHM_MB (512 por defecto)."""
+_fake_ram: int | None = None    # solo para las pruebas: finge la RAM de la máquina
+
+
+def physical_ram() -> int:
+    """La RAM física de la máquina (0 si no se sabe)."""
+    if _fake_ram:
+        return int(_fake_ram)
     try:
-        mb = float(os.environ.get("AGMEN_SHM_MB", "") or 512)
+        if _WINDOWS:
+            import ctypes
+
+            class _Status(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            st = _Status()
+            st.dwLength = ctypes.sizeof(_Status)
+            return int(st.ullTotalPhys) if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)) else 0
+        pages, page = os.sysconf("SC_PHYS_PAGES"), os.sysconf("SC_PAGE_SIZE")
+        return pages * page if pages > 0 and page > 0 else 0
+    except (OSError, ValueError, AttributeError):   # pragma: no cover - un sistema que no lo dice
+        return 0
+
+
+def devshm_size() -> int:
+    """Linux: lo que mide /dev/shm (en Docker, 64 MB si no se cambia). 0 en los demás."""
+    if not _LINUX:
+        return 0
+    try:
+        st = os.statvfs("/dev/shm")
+    except OSError:
+        return 0
+    return st.f_blocks * st.f_frsize
+
+
+def limit() -> tuple[int, str]:
+    """El tope de un publicador y de dónde sale (D6 a′): AGMEN_SHM_MB si está
+    puesta (aunque pase de ¼ de la RAM); si no, lo menor entre 512 MiB, ¼ de
+    la RAM física y, en Linux, ½ de /dev/shm."""
+    try:
+        mb = float(os.environ.get("AGMEN_SHM_MB", "") or 0)
     except ValueError:
-        mb = 512
-    return int((mb if mb > 0 else 512) * (1 << 20))
+        mb = 0
+    if mb > 0:
+        return int(min(mb, 1 << 20) * (1 << 20)), "AGMEN_SHM_MB"
+    out = (MAX_POOL, "el máximo")
+    ram = physical_ram()
+    if ram and ram // 4 < out[0]:
+        out = (ram // 4, "¼ de la RAM")
+    dev = devshm_size()
+    if dev and dev // 2 < out[0]:
+        out = (dev // 2, "½ de /dev/shm")
+    return out
+
+
+def limit_bytes() -> int:
+    """Lo más que puede apartar un publicador (ver limit())."""
+    return limit()[0]
 
 
 def _os_error(e: OSError) -> str:
@@ -277,10 +334,11 @@ _sweep_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 
 class _Block:
-    __slots__ = ("name", "mm", "size", "holders")
+    __slots__ = ("name", "mm", "size", "holders", "used")
 
     def __init__(self, name: str, mm: mmap.mmap, size: int) -> None:
         self.name, self.mm, self.size, self.holders = name, mm, size, 0
+        self.used = time.monotonic()      # la última vez que se escribió o se soltó
 
     def close(self) -> None:
         unlink(self.name)
@@ -300,7 +358,6 @@ class Pool:
         self.owner = owner
         self.counter = 0
         self.blocks: list[_Block | None] = []
-        self.next = 0
         self._probe: _Block | None = None
         self.registry = ""
         if not _WINDOWS:
@@ -340,7 +397,12 @@ class Pool:
         raise ShmError("no se pudo crear la memoria compartida")   # pragma: no cover
 
     def bytes(self) -> int:
+        """Bytes apartados en bloques de datos (sin el de prueba)."""
         return sum(b.size for b in self.blocks if b is not None)
+
+    def count(self) -> int:
+        """Bloques de datos que existen (sin el de prueba)."""
+        return sum(1 for b in self.blocks if b is not None)
 
     def busy(self) -> int:
         return sum(1 for b in self.blocks if b is not None and b.holders)
@@ -349,23 +411,24 @@ class Pool:
         """Escribe `payload` en un bloque libre; su descriptor, o el texto de por qué no se pudo."""
         n = payload.nbytes if isinstance(payload, memoryview) else len(payload)
         need = HEADER_LEN + n
+        # El bloque libre que se usó más recientemente (sus páginas siguen
+        # calientes): así, después de una ráfaga, los demás se quedan sin usar
+        # y trim() los libera.
         pick = None
         count = len(self.blocks)
-        for k in range(count):
-            i = (self.next + k) % count
-            b = self.blocks[i]
-            if b is not None and b.holders == 0 and b.size >= need:
+        for i, b in enumerate(self.blocks):
+            if b is not None and b.holders == 0 and b.size >= need and (pick is None or b.used > self.blocks[pick].used):
                 pick = i
-                break
         if pick is None:
             size = -(-(need + need // 8) // BLOCK_ROUND) * BLOCK_ROUND
             small = next((i for i, b in enumerate(self.blocks) if b is None or b.holders == 0), None)
             if small is None and count >= MAX_BLOCKS:
                 return f"los suscriptores tienen prestados los {MAX_BLOCKS} bloques"
             total = self.bytes() - (self.blocks[small].size if small is not None and self.blocks[small] else 0)
-            if total + size > limit_bytes():
+            cap, reason = limit()
+            if total + size > cap:
                 return (f"se llegó al tope de memoria compartida de este publicador "
-                        f"({limit_bytes() / (1 << 20):.1f} MiB, AGMEN_SHM_MB)")
+                        f"({cap / (1 << 20):.1f} MiB, {reason}; cámbialo con AGMEN_SHM_MB)")
             try:
                 block = self._create(size)
             except ShmError as e:
@@ -380,7 +443,7 @@ class Pool:
                 self.blocks.append(block)
                 pick = len(self.blocks) - 1
         b = self.blocks[pick]
-        self.next = pick + 1
+        b.used = time.monotonic()
         b.mm[HEADER_LEN:HEADER_LEN + n] = payload
         write_header(b.mm, self.owner, generation, n, b.size)
         return Descriptor(b.name, b.size, HEADER_LEN, n, generation, pick)
@@ -393,6 +456,7 @@ class Pool:
             except ShmError as e:
                 return str(e)
             write_header(self._probe.mm, self.owner, 0, 0, PROBE_SIZE)
+        self._probe.used = time.monotonic()
         return Descriptor(self._probe.name, PROBE_SIZE, HEADER_LEN, 0, 0, 0xFFFFFFFF)
 
     def hold(self, slot: int) -> None:
@@ -404,6 +468,48 @@ class Pool:
             b = self.blocks[slot]
             if b is not None and b.holders > 0:
                 b.holders -= 1
+                if b.holders == 0:
+                    b.used = time.monotonic()
+
+    def trim(self, now: float | None = None) -> int:
+        """Libera los bloques que nadie tiene prestados y que no se usaron en
+        IDLE_FREE segundos, y el de prueba si nadie lo pidió en ese tiempo (D6
+        a′): borra el nombre, suelta la memoria y lo quita del registro. Un
+        bloque prestado o nombrado por un descriptor que todavía viaja (los dos
+        cuentan en hold()) nunca se libera. Devuelve los bytes liberados."""
+        now = time.monotonic() if now is None else now
+        freed = 0
+        for i, b in enumerate(self.blocks):
+            if b is not None and b.holders == 0 and now - b.used >= IDLE_FREE:
+                freed += b.size
+                b.close()
+                self.blocks[i] = None
+        if self._probe is not None and now - self._probe.used >= IDLE_FREE:
+            freed += self._probe.size
+            self._probe.close()
+            self._probe = None             # se vuelve a crear si llega otro suscriptor
+        while self.blocks and self.blocks[-1] is None:
+            self.blocks.pop()              # las ranuras vacías del final: nadie las nombra
+        if freed:
+            self._rewrite_registry()
+        return freed
+
+    def _rewrite_registry(self) -> None:
+        if not self.registry:
+            return
+        names = [b.name for b in self.blocks if b is not None]
+        if self._probe is not None:
+            names.append(self._probe.name)
+        try:
+            if not names:
+                os.remove(self.registry)   # _create() lo vuelve a escribir
+                return
+            tmp = self.registry + ".tmp"
+            with open(tmp, "w", encoding="ascii") as fh:
+                fh.write("".join(n + "\n" for n in names))
+            os.replace(tmp, self.registry)
+        except OSError:
+            pass   # el registro es para limpiar si el proceso muere: nunca tumba al nodo
 
     def close(self) -> None:
         for b in self.blocks:

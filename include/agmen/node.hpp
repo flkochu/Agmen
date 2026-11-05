@@ -143,7 +143,10 @@ public:
     [[nodiscard]] bool pending() const { return !q_.empty(); }
     /// Entrega a tu función lo que hay en la cola.
     void dispatch();
-    void heartbeat() { sub_.heartbeat(); }
+    void heartbeat() {
+        sub_.heartbeat();
+        sub_.forget_idle_blocks();   // D6 a′: aunque no lleguen mensajes
+    }
     [[nodiscard]] SubscriptionStats stats() const;
 
     std::string where, type, group;

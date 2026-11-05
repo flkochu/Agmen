@@ -105,6 +105,9 @@ public:
     /// Mensajes que debían ir por memoria compartida y fueron por TCP porque no
     /// hubo lugar (se avisa una vez por qué; RFC 0009 D6).
     [[nodiscard]] std::uint64_t shm_fallbacks() const;
+    /// Bytes de memoria compartida que este publicador tiene apartados ahora
+    /// (sus bloques de datos). Baja solo: un bloque sin usar 5 s se libera (D6 a′).
+    [[nodiscard]] std::size_t shm_bytes() const;
 
 private:
     struct State;
@@ -162,6 +165,13 @@ public:
     /// wire::WireError si llega algo inválido o de otro tipo.
     [[nodiscard]] std::optional<RawSample> receive_raw(std::chrono::milliseconds timeout);
     void heartbeat();
+    /// Suelta los bloques de memoria compartida que tenía abiertos para
+    /// recibir y que ningún mensaje usa desde hace 5 s (D6 a′; los prestados
+    /// siguen hasta que los sueltes). receive_raw() lo hace solo, una vez por
+    /// segundo; el Node, en cada latido. Llámalo desde el hilo que recibe.
+    void forget_idle_blocks();
+    /// Bloques de memoria compartida que tiene abiertos para recibir.
+    [[nodiscard]] std::size_t shm_mapped() const;
 
     [[nodiscard]] const std::string& last_from() const;
     /// El socket UDP (para esperar varios a la vez). Un tipo arrow también
@@ -231,6 +241,8 @@ public:
     [[nodiscard]] std::size_t shm_subscribers() const { return core_.shm_subscribers(); }
     /// Mensajes que no cupieron en la memoria compartida y fueron por TCP (RFC 0009 D6).
     [[nodiscard]] std::uint64_t shm_fallbacks() const { return core_.shm_fallbacks(); }
+    /// Bytes de memoria compartida apartados ahora (RFC 0009 D6 a′).
+    [[nodiscard]] std::size_t shm_bytes() const { return core_.shm_bytes(); }
 
 private:
     PublisherCore core_;
@@ -268,6 +280,11 @@ public:
 
     /// Late con el hub. Llámalo si pasas más de 3 s sin llamar receive().
     void heartbeat() { core_.heartbeat(); }
+    /// Suelta los bloques de memoria compartida que ningún mensaje usa desde
+    /// hace 5 s (receive() lo hace solo, una vez por segundo; RFC 0009 D6 a′).
+    void forget_idle_blocks() { core_.forget_idle_blocks(); }
+    /// Bloques de memoria compartida que tiene abiertos para recibir (RFC 0009).
+    [[nodiscard]] std::size_t shm_mapped() const { return core_.shm_mapped(); }
 
     /// "ip:puerto" del último paquete recibido (útil al reportar un error).
     [[nodiscard]] const std::string& last_from() const { return core_.last_from(); }

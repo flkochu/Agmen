@@ -293,6 +293,11 @@ public:
         return fallbacks_;
     }
 
+    [[nodiscard]] std::size_t shm_bytes() const {
+        std::lock_guard lock(mu_);
+        return pool_ ? pool_->bytes() : 0;
+    }
+
 private:
     std::string topic_;
     std::uint64_t source_id_;
@@ -461,6 +466,7 @@ private:
 
     void loop() {
         std::vector<std::uint8_t> drain(64);
+        auto last_trim = std::chrono::steady_clock::now();
         while (!closed_) {
             // Se lee de todas las conexiones (los avisos del suscriptor) y se
             // escribe en las que tienen algo que se puede mandar.
@@ -469,6 +475,11 @@ private:
             bool any_write = false;
             {
                 std::lock_guard lock(mu_);
+                // D6 a′: una vez por segundo, los bloques sin usar 5 s se liberan.
+                if (const auto now = std::chrono::steady_clock::now(); pool_ && now - last_trim >= std::chrono::seconds(1)) {
+                    last_trim = now;
+                    (void)pool_->trim(now);
+                }
                 for (const auto& [_, c] : conns_) {
                     if (!c.alive()) continue;
                     handles.push_back(c.stream.native_handle());
@@ -521,9 +532,21 @@ struct Peer {
     net::TcpStream stream;
     wire::Bytes pending;        // avisos que el sistema no aceptó todavía
     bool closed = false;
-    // Solo los usa el hilo que recibe:
-    std::map<std::uint32_t, std::shared_ptr<const shm::Segment>> blocks;
+    // Solo los usa el hilo que recibe: los bloques que ya abrió, para no
+    // abrirlos con cada mensaje, y cuándo los nombró el último descriptor.
+    struct Cached {
+        std::shared_ptr<const shm::Segment> segment;
+        std::chrono::steady_clock::time_point used{};
+    };
+    std::map<std::uint32_t, Cached> blocks;
     bool hello = false;         // le dijimos que podemos
+
+    /// Suelta los que ningún descriptor nombró en kIdleFree (D6 a′): el
+    /// publicador ya pudo haberlos liberado, y en Windows la memoria de un
+    /// bloque no se libera mientras alguien lo tenga abierto.
+    void forget_idle(std::chrono::steady_clock::time_point now) {
+        std::erase_if(blocks, [&](const auto& kv) { return now - kv.second.used >= shm::kIdleFree; });
+    }
 
     [[nodiscard]] std::intptr_t handle() {
         std::lock_guard lock(mu);
@@ -739,6 +762,7 @@ struct Listener {
                                    [](const auto& c) {
                                        if (c->handle() != -1) return false;
                                        c->peer->mark_closed();
+                                       c->peer->blocks.clear();   // los prestados siguen vivos en su Lease
                                        return true;
                                    }),
                     conns.end());
@@ -746,7 +770,18 @@ struct Listener {
 
     void drop(std::vector<std::unique_ptr<Incoming>>::iterator it) {
         (*it)->peer->mark_closed();
+        (*it)->peer->blocks.clear();
         conns.erase(it);
+    }
+
+    void forget_idle(std::chrono::steady_clock::time_point now) {
+        for (auto& c : conns) c->peer->forget_idle(now);
+    }
+
+    [[nodiscard]] std::size_t mapped() const {
+        std::size_t n = 0;
+        for (const auto& c : conns) n += c->peer->blocks.size();
+        return n;
     }
 };
 
@@ -924,6 +959,7 @@ const TypeInfo& PublisherCore::type() const { return s_->type; }
 std::uint64_t PublisherCore::dropped() const { return s_->fanout ? s_->fanout->dropped() : 0; }
 std::size_t PublisherCore::shm_subscribers() const { return s_->fanout ? s_->fanout->shm_subscribers() : 0; }
 std::uint64_t PublisherCore::shm_fallbacks() const { return s_->fanout ? s_->fanout->shm_fallbacks() : 0; }
+std::size_t PublisherCore::shm_bytes() const { return s_->fanout ? s_->fanout->shm_bytes() : 0; }
 
 // ---------------------------------------------------------------------------
 // SubscriberCore
@@ -945,6 +981,14 @@ struct SubscriberCore::State {
     std::shared_ptr<Lent> lent = std::make_shared<Lent>();
     bool tcp_warned = false;
     bool lent_warned = false;
+    std::chrono::steady_clock::time_point last_forget = std::chrono::steady_clock::now();
+
+    void forget_idle_blocks(bool now_please) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!tcp || (!now_please && now - last_forget < std::chrono::seconds(1))) return;
+        last_forget = now;
+        tcp->forget_idle(now);
+    }
 
     State(const std::string& w, TypeInfo t)
         : type(std::move(t)), where(w), socket(net::UdpSocket::bind(hub::is_topic(w) ? "127.0.0.1:0" : w)) {
@@ -1063,10 +1107,11 @@ struct SubscriberCore::State {
         std::shared_ptr<const shm::Segment> seg;
         try {
             auto& cached = peer->blocks[d.slot];
-            if (!cached || cached->name() != d.name || cached->size() != d.size) {
-                cached = std::make_shared<const shm::Segment>(shm::Segment::open(d.name, d.size));
+            if (!cached.segment || cached.segment->name() != d.name || cached.segment->size() != d.size) {
+                cached.segment = std::make_shared<const shm::Segment>(shm::Segment::open(d.name, d.size));
             }
-            seg = cached;
+            cached.used = std::chrono::steady_clock::now();
+            seg = cached.segment;
             std::atomic_thread_fence(std::memory_order_acquire);
             const auto h = shm::BlockHeader::read(seg->data());
             if (h.owner != env.source_id || h.generation != d.generation || h.length != d.length) {
@@ -1130,6 +1175,7 @@ std::optional<RawSample> SubscriberCore::receive_raw(std::chrono::milliseconds t
             std::lock_guard lock(s.link_mu);
             s.link->maybe_beat(s.socket);
         }
+        s.forget_idle_blocks(false);
         const auto left = duration_cast<milliseconds>(deadline - steady_clock::now());
         const auto wait = left.count() > 0 ? left : milliseconds(0);
         if (!s.tcp) {
@@ -1164,6 +1210,10 @@ void SubscriberCore::heartbeat() {
     std::lock_guard lock(s_->link_mu);
     s_->link->maybe_beat(s_->socket);
 }
+
+void SubscriberCore::forget_idle_blocks() { s_->forget_idle_blocks(true); }
+
+std::size_t SubscriberCore::shm_mapped() const { return s_->tcp ? s_->tcp->mapped() : 0; }
 
 std::uint16_t SubscriberCore::local_port() const { return s_->socket.local_port(); }
 std::uint16_t SubscriberCore::tcp_port() const { return s_->tcp ? s_->tcp->listener.local_port() : 0; }

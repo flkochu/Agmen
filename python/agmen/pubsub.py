@@ -282,6 +282,14 @@ class _PurePublisher:
         """Mensajes que debían ir por memoria compartida y fueron por TCP porque no hubo lugar (RFC 0009 D6)."""
         return self._tcp.fallbacks if self._tcp is not None else 0
 
+    @property
+    def shm_bytes(self) -> int:
+        """Bytes de memoria compartida apartados ahora. Baja solo: un bloque sin usar 5 s se libera (D6 a′)."""
+        if self._tcp is None:
+            return 0
+        with self._tcp.lock:
+            return self._tcp.pool.bytes() if self._tcp.pool is not None else 0
+
     def close(self) -> None:
         if self._link is not None:
             self._link.close()
@@ -649,6 +657,11 @@ class _NativePublisher:
     def shm_fallbacks(self) -> int:
         """Mensajes que debían ir por memoria compartida y fueron por TCP porque no hubo lugar (RFC 0009 D6)."""
         return self._core.shm_fallbacks
+
+    @property
+    def shm_bytes(self) -> int:
+        """Bytes de memoria compartida apartados ahora. Baja solo: un bloque sin usar 5 s se libera (D6 a′)."""
+        return self._core.shm_bytes
 
     def close(self) -> None:
         with self._lock:

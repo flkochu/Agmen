@@ -19,6 +19,7 @@
 #include <nanobind/stl/vector.h>
 
 #include <agmen/agmen.hpp>
+#include <agmen/shm.hpp>
 
 #include <bit>
 #include <cfloat>
@@ -457,6 +458,7 @@ public:
     [[nodiscard]] std::uint64_t dropped() { return live().dropped(); }
     [[nodiscard]] std::size_t shm_subscribers() { return live().shm_subscribers(); }
     [[nodiscard]] std::uint64_t shm_fallbacks() { return live().shm_fallbacks(); }
+    [[nodiscard]] std::size_t shm_bytes() { return live().shm_bytes(); }
 
 private:
     agmen::PublisherCore& live() {
@@ -512,6 +514,7 @@ public:
     [[nodiscard]] std::vector<std::intptr_t> filenos() { return live().native_handles(); }
     [[nodiscard]] std::uint16_t port() { return live().local_port(); }
     [[nodiscard]] std::uint16_t tcp_port() { return live().tcp_port(); }
+    [[nodiscard]] std::size_t shm_mapped() { return live().shm_mapped(); }
 
 private:
     agmen::SubscriberCore& live() {
@@ -686,7 +689,8 @@ NB_MODULE(_core, m) {
         .def_prop_ro("subscribers", &PyPublisher::subscribers)
         .def_prop_ro("dropped", &PyPublisher::dropped)
         .def_prop_ro("shm_subscribers", &PyPublisher::shm_subscribers)
-        .def_prop_ro("shm_fallbacks", &PyPublisher::shm_fallbacks);
+        .def_prop_ro("shm_fallbacks", &PyPublisher::shm_fallbacks)
+        .def_prop_ro("shm_bytes", &PyPublisher::shm_bytes);
 
     nb::class_<ShmPayload>(m, "ShmPayload", nb::type_slots(shm_payload_slots),
                            "Un payload en la memoria compartida del publicador (RFC 0009): úsalo con "
@@ -708,6 +712,7 @@ NB_MODULE(_core, m) {
         .def("filenos", &PySubscriber::filenos)
         .def_prop_ro("port", &PySubscriber::port)
         .def_prop_ro("tcp_port", &PySubscriber::tcp_port)
+        .def_prop_ro("shm_mapped", &PySubscriber::shm_mapped)
         .def_prop_ro("closed", &PySubscriber::closed)
         .def("close", &PySubscriber::close);
 
@@ -773,6 +778,10 @@ NB_MODULE(_core, m) {
             throw;
         }
     }, "buf"_a, "shm"_a = false);
+    // Memoria compartida (RFC 0009 D6 a′): el tope y de dónde sale. _shm_fake_ram
+    // es solo para las pruebas (finge la RAM de la máquina; 0 = la de verdad).
+    m.def("shm_limit", [] { return nb::make_tuple(agmen::shm::limit_bytes(), agmen::shm::limit_reason()); });
+    m.def("_shm_fake_ram", [](std::uint64_t bytes) { agmen::shm::detail::fake_physical_ram(bytes); }, "bytes"_a);
     m.def("fnv1a64", [](nb::bytes b) { return agmen::wire::fnv1a64(std::string_view(b.c_str(), b.size())); });
     m.def("set_default_node_name", [](const std::string& n) { agmen::hub::set_default_node_name(n); });
     m.def("set_log_sink", &set_log_sink, "fn"_a.none());

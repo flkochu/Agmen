@@ -185,10 +185,33 @@ Dos casos que no deben dejar al publicador sin memoria ni frenarlo:
   suscriptor puede tener prestados), y la copia solo la pagan quienes guardan
   más de la cuenta. Se avisa una vez: `'/camara': tienes 4 mensajes de memoria
   compartida sin soltar (el tope es 4 o 64 MiB); los siguientes se copian`.
-- El *pool* de un publicador crece según haga falta, hasta **64 bloques y
-  512 MiB** (`AGMEN_SHM_MB`). Si no alcanza (o el sistema no da memoria
-  compartida), ese mensaje va por TCP, se cuenta en `pub.shm_fallbacks` y se
-  avisa una vez diciendo por qué (en Docker: sube `--shm-size`).
+- El *pool* de un publicador crece según haga falta, hasta **64 bloques** y
+  un tope que depende de la computadora (D6 a′): el menor entre **512 MiB,
+  ¼ de la RAM física y, en Linux, ½ de `/dev/shm`**. En una Raspberry Pi 3
+  (1 GB) son 256 MiB; en Docker con el `/dev/shm` de 64 MB, 32 MiB.
+  `AGMEN_SHM_MB` lo cambia, aunque pase del ¼. Si no alcanza (o el sistema no
+  da memoria compartida), ese mensaje va por TCP, se cuenta en
+  `pub.shm_fallbacks` y se avisa una vez diciendo por qué y de dónde sale el
+  tope (`… (256.0 MiB, ¼ de la RAM; cámbialo con AGMEN_SHM_MB)`; en Docker:
+  sube `--shm-size`).
+- **El pool se encoge (D6 a′).** Una ráfaga (una cámara 4K mientras una IA
+  guarda imágenes) puede apartar varios bloques grandes. Un bloque que nadie
+  tiene prestado y que no se usó en **5 s** se libera: se borra su nombre, se
+  suelta su memoria y sale del registro; el de prueba también, y se vuelve a
+  crear si llega otro suscriptor. Nunca se libera un bloque prestado ni uno
+  que nombra un descriptor que todavía va en camino: los dos cuentan como
+  préstamo desde que el descriptor sale. Para que los que sobran se queden
+  sin usar, el publicador escribe en el bloque libre que se usó más
+  recientemente (antes: en orden circular, que mantenía vivos a todos). El
+  publicador revisa una vez por segundo, en el hilo que ya atiende las
+  conexiones.
+- **El suscriptor suelta lo que ya no ve.** El suscriptor de C++ guarda
+  abiertos los bloques que le mandan, para no abrirlos con cada mensaje. Uno
+  que ningún descriptor nombró en 5 s se cierra (en `receive()`, una vez por
+  segundo, y en cada latido del `Node`): si no, en Windows la memoria de un
+  bloque liberado seguiría apartada mientras el suscriptor lo tuviera abierto,
+  y en Linux seguiría ocupando `/dev/shm` aunque ya no se viera su nombre. El
+  de Python puro abre un `mmap` por mensaje y no guarda nada.
 
 ### 3.6 Nombres y limpieza en cada sistema (D2)
 
@@ -312,6 +335,7 @@ nunca se entrega como mensaje.
 | Python sin copiar (D7): `agmen._core.ShmPayload` con el protocolo de buffer; en Python puro, un `mmap` por mensaje con `weakref.finalize` | `python/src/core.cpp`, `python/agmen/_shm.py` |
 | `Envelope::read_from(buf, shm)` / `wire.parse(buf, shm=)`: un descriptor solo lo lee quien lo pidió | `src/wire.cpp`, `python/agmen/wire.py` |
 | `pub.shm_subscribers`, `pub.shm_fallbacks`, `AGMEN_SHM=0`, `AGMEN_SHM_MB` | C++ y los dos núcleos de Python |
+| D6 (a′), en 0.11.1: el tope según la RAM y `/dev/shm` (`shm::limit_bytes()`, `_shm.limit()`), `Pool::trim()` cada segundo, el bloque libre más reciente, el suscriptor que suelta lo que no ve en 5 s; `pub.shm_bytes` | `src/shm.cpp`, `Fanout` y `Peer` en `src/pubsub.cpp`; `python/agmen/_shm.py`, `_tcp.py` |
 | Con dirección fija, el TCP del suscriptor escucha en la misma IP que el UDP (antes, siempre `127.0.0.1` en C++): imágenes entre computadoras, por TCP | `src/pubsub.cpp` |
 | `net::wait_rw` (leer y escribir en el mismo socket con una sola espera, también en Windows) | `include/agmen/net.hpp`, `src/net.cpp` |
 | Pruebas | `tests/test_shm.cpp` (también con ASan/UBSan), `python/test_shm.py` (los dos núcleos, cruzados C++ ↔ Python puro, respaldo por TCP, limpieza de un proceso muerto, topes); `scripts/tutorial_check.py` revisa que el contador de C++ y la IA de Python del capítulo 14 reciban por memoria compartida en los 3 sistemas del CI |
@@ -397,6 +421,14 @@ Lo que dice la tabla:
   - el pool se encoge: un bloque que nadie tiene prestado y no se usó en 5 s se
     libera (se borra su nombre y sale del registro). Nunca se libera un bloque
     con préstamos ni uno que nombra un descriptor que todavía va en camino.
+  - Al implementarlo (§3.5): el publicador escribe en el bloque libre usado
+    más recientemente, no en orden circular (si no, todos seguían "en uso"
+    y ninguno se liberaba), y el suscriptor de C++ cierra los bloques que
+    ningún descriptor nombró en 5 s. Medido (`test_shm`, Linux): una ráfaga 4K
+    apartó 80 MiB y a los 5 s sin usar quedaron 0, sin nada en `/dev/shm`.
+    `bench/shm_vs_tcp.py` no empeoró (mediana por memoria compartida, antes →
+    después, 4 núcleos: 640×480 con 3 suscriptores 0.61 → 0.52 ms, 1920×1080
+    1.49 → 1.49 ms, 3840×2160 4.59 → 4.87 ms, dentro del ruido de la máquina).
 - Lo demás, como se propuso. macOS dejó de tener soporte oficial en 0.11.1
   (`docs/VISION.md`).
 
