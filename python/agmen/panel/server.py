@@ -371,7 +371,7 @@ class Panel:
 
         if self.clock is not None:
             return self.clock.info()
-        if ck.mode() == ck.SIM:
+        if ck.mode() != ck.REAL:
             return ck.external_info()
         return {"mode": ck.REAL}
 
@@ -380,7 +380,7 @@ class Panel:
         if self.clock is None:
             from .. import clock as ck
 
-            if ck.mode() == ck.SIM:
+            if ck.mode() != ck.REAL:
                 src = ck.external_info().get("source") or "tu simulador"
                 return f"el tiempo lo manda '{src}' ([clock] source): pausa y velocidad se controlan allá"
             return "el robot usa el reloj real: pon [clock] mode = \"sim\" en robot.toml para pausar o acelerar"

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import agmen
-from agmen import _mcap, _shm, pubsub, record, wire
+from agmen import _mcap, _shm, play, pubsub, record, wire
 from agmen import hub as hubmod
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -173,6 +173,22 @@ class TestGrabar(HubCase):
         self.assertEqual(s.topics["/imu"].lost_before, 3)
         _, meta, _ = self.read(path)
         self.assertEqual(meta["agmen.perdidos"]["/imu antes de llegar"], "3")
+
+    def test_otro_reloj_se_avisa(self):
+        path = os.path.join(self.dir, "r.mcap")
+        err = io.StringIO()
+        rec = record.Recorder(path, ["/imu"], quiet=True, out=err).start()
+        pub = play._ReplayPublisher(play._RecordedType(wire.ImuSample.SCHEMA_TEXT), "/imu", 0x42)
+        self.closers.append(pub.close)
+        self.wait_subscribers(pub)
+        for i in range(5):                    # como un simulador que corre fuera de agmen run
+            pub.send_packet(wire.encode(imu(i), i, 1_000 + i, topic="/imu", source_id=0x42, clock=wire.CLOCK_SIM))
+            time.sleep(0.01)
+        time.sleep(0.3)
+        s = rec.stop()
+        self.assertEqual(s.messages, 5, "se graba igual")
+        self.assertEqual(err.getvalue().count("llega con reloj simulación"), 1, err.getvalue())
+        self.assertIn("AGMEN_CLOCK=sim", err.getvalue())
 
     def test_dividir_por_tamano(self):
         base = os.path.join(self.dir, "e.mcap")

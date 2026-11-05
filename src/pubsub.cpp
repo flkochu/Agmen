@@ -1041,7 +1041,7 @@ struct SubscriberCore::State {
         log::write("[agmen] ⚠ '" + where + "' llega con reloj " + clock_name(env.clock) +
                    " y este nodo usa reloj " + clock_name(clock::domain()) +
                    ". ¿Corriste el nodo fuera de 'agmen run'? Usa el mismo reloj: AGMEN_CLOCK=" +
-                   (env.clock == wire::Clock::Sim ? "sim" : "real"));
+                   (env.clock == wire::Clock::Sim ? "sim" : env.clock == wire::Clock::Replay ? "replay" : "real"));
     }
 
     /// RFC 0009 §3.3: no se pudo abrir la memoria del publicador. Llega por TCP

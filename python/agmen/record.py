@@ -92,6 +92,15 @@ def mib(n: float) -> str:
     return f"{n / (1 << 20):.1f}"
 
 
+def size_text(n: float) -> str:
+    """41 kB, 3.2 MB, 1.40 GB: lo que se lee de un vistazo."""
+    if n < 1 << 20:
+        return f"{n / 1024:.0f} kB"
+    if n < 1 << 30:
+        return f"{n / (1 << 20):.1f} MB"
+    return f"{n / (1 << 30):.2f} GB"
+
+
 def _nbytes(b) -> int:
     """Bytes de un bytes, bytearray o memoryview (una vista del bloque de memoria
     compartida, o su copia si ya había muchas prestadas)."""
@@ -206,6 +215,7 @@ class Recorder:
         self._t0 = 0.0
         self._last_status = 0.0
         self._last_warn: dict[str, float] = {}
+        self._clock_warned = False
         self._rate_in: collections.deque = collections.deque()    # (monotonic, bytes) de los últimos 2 s
         self._rate_out: collections.deque = collections.deque()
         self.error: BaseException | None = None
@@ -302,6 +312,8 @@ class Recorder:
             parts, size = (head, view), len(head) + _nbytes(view)
         else:
             parts, size = (data,), _nbytes(data)
+        if env.clock != clock.domain() and not self._clock_warned:
+            self._warn_clock(env)
         item = _Item(env.topic_id, env.schema_id, env.source_id, env.seq, max(0, env.t_pub), env.encoding,
                      max(0, clock.now_ns()), parts, size)
         if env.topic_id not in self._names or env.schema_id not in self._schemas:
@@ -311,6 +323,17 @@ class Recorder:
             self._pending.append(item)
             return
         self._accept(item)
+
+    def _warn_clock(self, env) -> None:
+        """Una vez: el log_time sale de este reloj, y si no es el del robot, la
+        grabación mezcla dos tiempos (y se reproduciría con el equivocado)."""
+        self._clock_warned = True
+        got = wire.CLOCKS.get(env.clock, str(env.clock))
+        mode = {wire.CLOCK_SIM: "sim", wire.CLOCK_REPLAY: "replay"}.get(env.clock, "real")
+        topic = self._names.get(env.topic_id, f"el topic {env.topic_id:016x}")
+        self._say(f"⚠ {topic} llega con reloj {got} y el grabador usa reloj {clock.mode_name()}: el tiempo de "
+                  f"la grabación no sería el del robot. Graba con 'agmen run --record' o corre el grabador con "
+                  f"AGMEN_CLOCK={mode}")
 
     def _ask_hub(self) -> None:
         """Los nombres y esquemas que sabe el hub, sin esperar al anuncio (a lo más cada 0.5 s)."""
@@ -508,12 +531,65 @@ class Recorder:
             rates.append(f"{topic} {(st.messages - self._prev_counts.get(topic, 0)) / dt:.0f}/s")
             self._prev_counts[topic] = st.messages
         lost = self.summary.lost
-        self._say(f"⏺ {os.path.basename(self.path)}: {mib(self.summary.bytes)} MB, {now - self._t0:.0f} s"
+        self._say(f"⏺ {os.path.basename(self.path)}: {size_text(self.summary.bytes)}, {now - self._t0:.0f} s"
                   + (" · " + ", ".join(rates) if rates else " · esperando mensajes")
                   + (f" · ⚠ {lost} perdidos" if lost else ""))
 
     def _say(self, text: str) -> None:
         print(f"[agmen] {text}", file=self.out, flush=True)
+
+
+class RecordingControl:
+    """Grabar y dejar de grabar desde `agmen run` y desde el panel (botón ⏺)."""
+
+    def __init__(self, topics=("*",), *, directory: str = ".", split: str | None = None,
+                 compression: str | None = None, attachments=(), info: dict | None = None, out=None) -> None:
+        self.topics, self.directory, self.split = list(topics), directory, split
+        self.compression, self.attachments, self.info_extra = compression, list(attachments), dict(info or {})
+        self.out = out
+        self._lock = threading.Lock()
+        self.rec: Recorder | None = None
+        self.last: Summary | None = None
+
+    def start(self) -> str | None:
+        """Empieza a grabar. Devuelve un error (texto) o None."""
+        with self._lock:
+            if self.rec is not None:
+                return "ya está grabando"
+            try:
+                self.rec = Recorder(None, self.topics, directory=self.directory, split=self.split,
+                                    compression=self.compression, attachments=self.attachments,
+                                    info=self.info_extra, out=self.out).start()
+            except (ValueError, OSError, _mcap.McapError) as e:
+                self.rec = None
+                return str(e)
+            what = "todos los topics" if self.rec.topics == ["*"] else ", ".join(self.rec.topics)
+            self._say(f"⏺ grabando {what} en {self.rec.path}")
+            return None
+
+    def stop(self) -> str | None:
+        with self._lock:
+            rec, self.rec = self.rec, None
+        if rec is None:
+            return "no está grabando"
+        s = self.last = rec.stop()
+        self._say(f"⏹ {', '.join(s.files)}: {s.messages} mensajes, {size_text(s.bytes)}, {s.seconds:.1f} s"
+                  + (f" · ⚠ {s.lost} perdidos" if s.lost else ""))
+        return None
+
+    def info(self) -> dict:
+        rec = self.rec
+        if rec is None:
+            last = self.last
+            return {"recording": False, "file": last.files[-1] if last and last.files else "",
+                    "messages": last.messages if last else 0, "bytes": last.bytes if last else 0,
+                    "lost": last.lost if last else 0}
+        s = rec.summary
+        return {"recording": True, "file": rec.path, "messages": s.messages, "bytes": s.bytes, "lost": s.lost,
+                "seconds": time.monotonic() - rec._t0}
+
+    def _say(self, text: str) -> None:
+        print(f"[agmen] {text}", file=self.out if self.out is not None else sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -569,7 +645,7 @@ def cmd_info(args) -> int:
         print(f"[agmen] ✗ {path}: {e}", file=sys.stderr)
         return 1
     rec = d["recording"]
-    print(f"{d['path']}  ({mib(d['size'])} MB, {d['seconds']:.1f} s)")
+    print(f"{d['path']}  ({size_text(d['size'])}, {d['seconds']:.1f} s)")
     if d["profile"] != PROFILE:
         print(f"  MCAP de otra herramienta (perfil '{d['profile']}', {d['library']})")
     if rec:
@@ -630,7 +706,7 @@ def cmd_record(args) -> int:
         pass
     s = rec.stop()
     files = ", ".join(s.files)
-    print(f"[agmen] ⏹ {files}: {s.messages} mensajes, {mib(s.bytes)} MB, {s.seconds:.1f} s"
+    print(f"[agmen] ⏹ {files}: {s.messages} mensajes, {size_text(s.bytes)}, {s.seconds:.1f} s"
           + (f" · ⚠ {s.lost} perdidos (agmen info {s.files[-1]})" if s.lost else ""), file=sys.stderr, flush=True)
     return 0
 

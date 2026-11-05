@@ -5,15 +5,19 @@ el mismo código corre en el robot real y en una simulación que va más rápido
 más lento o en pausa.
 
     agmen.clock.now_ns()   la hora de Agmen (la que va en t_data)
-    agmen.clock.mode()     "real" o "sim"
+    agmen.clock.mode()     "real", "sim" o "replay"
 
 El modo lo decide `agmen run` para TODO el robot ([clock] en robot.toml) y se
-lo pasa a cada nodo en AGMEN_CLOCK=real|sim (y AGMEN_CLOCK_SOURCE). En
+lo pasa a cada nodo en AGMEN_CLOCK=real|sim|replay (y AGMEN_CLOCK_SOURCE). En
 simulación, el tiempo llega por el topic /clock (Clock):
 
 - source = "agmen": lo publica agmen run unas 50 veces por segundo; entre un
   mensaje y otro el reloj avanza solo, a la velocidad indicada.
 - source = "<tu simulador>": solo avanza cuando llega un /clock (paso a paso).
+
+En reproducción (`replay`, RFC 0010) es igual que en simulación, pero el
+tiempo es el de una grabación (lo publica `agmen play`) y los mensajes dicen
+clock = replay.
 
 El reloj nunca va hacia atrás.
 """
@@ -28,7 +32,9 @@ from dataclasses import dataclass
 
 from . import _backend, wire
 
-REAL, SIM = "real", "sim"
+REAL, SIM, REPLAY = "real", "sim", "replay"
+_DOMAINS = {REAL: wire.CLOCK_REAL, SIM: wire.CLOCK_SIM, REPLAY: wire.CLOCK_REPLAY}
+_NAMES = {REAL: "real", SIM: "simulación", REPLAY: "reproducción"}
 
 
 @dataclass
@@ -71,12 +77,12 @@ def _ensure_configured_locked() -> None:
         return
     _g.configured = True
     m = os.environ.get("AGMEN_CLOCK", "")
-    if m == SIM:
-        _g.mode = SIM
+    if m in (SIM, REPLAY):
+        _g.mode = m
         src = os.environ.get("AGMEN_CLOCK_SOURCE", "")
         _g.stepped = bool(src) and src != "agmen"
     elif m and m != REAL:
-        print(f"[agmen] ⚠ AGMEN_CLOCK='{m}' no existe (usa real o sim): uso el reloj real",
+        print(f"[agmen] ⚠ AGMEN_CLOCK='{m}' no existe (usa real, sim o replay): uso el reloj real",
               file=sys.stderr, flush=True)
 
 
@@ -91,12 +97,12 @@ def _listen_forever() -> None:
                 if s is not None:
                     update(s.message)
         except Exception as e:
-            print(f"[agmen] ⚠ reloj de simulación: {e} (reintento en 1 s)", file=sys.stderr, flush=True)
+            print(f"[agmen] ⚠ reloj (/clock): {e} (reintento en 1 s)", file=sys.stderr, flush=True)
             time.sleep(1.0)
 
 
 def _start_listener_locked() -> None:
-    if _g.mode != SIM or not _g.listen or _g.listener is not None:
+    if _g.mode == REAL or not _g.listen or _g.listener is not None:
         return
     _g.listener = threading.Thread(target=_listen_forever, name="agmen-clock", daemon=True)
     _g.listener.start()
@@ -112,7 +118,7 @@ def _sim_now_locked() -> int:
 
 
 def mode() -> str:
-    """El modo de este proceso: "real" (por defecto) o "sim"."""
+    """El modo de este proceso: "real" (por defecto), "sim" o "replay"."""
     if _g.configured and (_g.mode == REAL or _g.listener is not None or not _g.listen):
         return _g.mode
     with _g.lock:
@@ -122,12 +128,12 @@ def mode() -> str:
 
 
 def domain() -> int:
-    """El valor del campo `clock` de los mensajes (wire.CLOCK_REAL / CLOCK_SIM)."""
-    return wire.CLOCK_SIM if mode() == SIM else wire.CLOCK_REAL
+    """El valor del campo `clock` de los mensajes (wire.CLOCK_REAL / SIM / REPLAY)."""
+    return _DOMAINS[mode()]
 
 
 def mode_name() -> str:
-    return "simulación" if mode() == SIM else "real"
+    return _NAMES[mode()]
 
 
 def now_ns() -> int:
@@ -166,7 +172,7 @@ def state() -> State:
     with _g.lock:
         _ensure_configured_locked()
         out = State(_g.st.t, _g.st.speed, _g.st.paused, _g.st.received)
-        if _g.mode == SIM:
+        if _g.mode != REAL:
             out.t = _sim_now_locked()
         return out
 
@@ -180,8 +186,8 @@ def wait_change(timeout: float) -> None:
 def configure(m: str, stepped: bool = False, listen: bool = True) -> None:
     """Para pruebas y para quien publica /clock en el mismo proceso: cambia el
     modo sin leer el entorno, y si `listen` es False no escucha /clock."""
-    if m not in (REAL, SIM):
-        raise ValueError(f"modo de reloj '{m}': usa 'real' o 'sim'")
+    if m not in (REAL, SIM, REPLAY):
+        raise ValueError(f"modo de reloj '{m}': usa 'real', 'sim' o 'replay'")
     with _g.lock:
         _g.configured = True
         _g.mode = m
@@ -211,11 +217,11 @@ if _backend.NATIVE:
     _c = _backend.core
 
     def mode() -> str:  # noqa: F811
-        """El modo de este proceso: "real" (por defecto) o "sim"."""
+        """El modo de este proceso: "real" (por defecto), "sim" o "replay"."""
         return _c.clock_mode()
 
     def domain() -> int:  # noqa: F811
-        """El valor del campo `clock` de los mensajes (wire.CLOCK_REAL / CLOCK_SIM)."""
+        """El valor del campo `clock` de los mensajes (wire.CLOCK_REAL / SIM / REPLAY)."""
         return _c.clock_domain()
 
     def now_ns() -> int:  # noqa: F811
@@ -236,8 +242,8 @@ if _backend.NATIVE:
         time.sleep(min(timeout, 0.005))
 
     def configure(m: str, stepped: bool = False, listen: bool = True) -> None:  # noqa: F811
-        if m not in (REAL, SIM):
-            raise ValueError(f"modo de reloj '{m}': usa 'real' o 'sim'")
+        if m not in (REAL, SIM, REPLAY):
+            raise ValueError(f"modo de reloj '{m}': usa 'real', 'sim' o 'replay'")
         _c.clock_configure(m, bool(stepped), bool(listen))
 
     def update(m: Clock) -> None:  # noqa: F811
@@ -245,11 +251,12 @@ if _backend.NATIVE:
 
 
 def mode_name() -> str:  # noqa: F811
-    return "simulación" if mode() == SIM else "real"
+    return _NAMES[mode()]
 
 
 class ClockServer:
-    """El tiempo de la simulación cuando source = "agmen" (lo usa `agmen run`).
+    """El tiempo de la simulación cuando source = "agmen" (lo usa `agmen run`),
+    o el de una grabación (`mode="replay"`, lo usa `agmen play`; RFC 0010).
 
     Publica /clock unas 50 veces por segundo. Entre mensajes, cada nodo
     interpola solo. Desde el panel: pausa, paso, velocidad.
@@ -257,11 +264,15 @@ class ClockServer:
 
     RATE_HZ = 50.0
 
-    def __init__(self, speed: float = 1.0, paused: bool = False, publish: bool = True) -> None:
+    def __init__(self, speed: float = 1.0, paused: bool = False, publish: bool = True, mode: str = SIM,
+                 t: int = 0) -> None:
         if speed <= 0:
             raise ValueError("la velocidad de la simulación debe ser mayor que 0")
+        if mode not in (SIM, REPLAY):
+            raise ValueError(f"ClockServer: modo '{mode}' (usa sim o replay)")
+        self.mode = mode
         self._lock = threading.Lock()
-        self.t = 0                       # ns simulados
+        self.t = int(t)                  # ns simulados (o de la grabación)
         self.speed = float(speed)
         self.paused = bool(paused)
         self._at = time.monotonic_ns()
@@ -269,7 +280,7 @@ class ClockServer:
         self._pub = None
         self._thread: threading.Thread | None = None
         self._publish = publish
-        configure(SIM, stepped=False, listen=False)   # este proceso es la fuente
+        configure(mode, stepped=False, listen=False)   # este proceso es la fuente
         self._feed()
 
     # --- el tiempo ---
@@ -325,10 +336,23 @@ class ClockServer:
             self.t += int(seconds * 1e9)
         self._send()
 
+    def seek(self, t: int) -> None:
+        """Salta a `t` (solo hacia adelante: el reloj de los nodos nunca regresa)."""
+        with self._lock:
+            self._advance_locked()
+            self.t = max(self.t, int(t))
+        self._send()
+
+    def now(self) -> int:
+        """El tiempo de ahora (ns), sin publicar."""
+        with self._lock:
+            self._advance_locked()
+            return self.t
+
     def info(self) -> dict:
         with self._lock:
             self._advance_locked()
-            return {"mode": SIM, "source": "agmen", "t": self.t / 1e9, "speed": self.speed,
+            return {"mode": self.mode, "source": "agmen", "t": self.t / 1e9, "speed": self.speed,
                     "paused": self.paused}
 
     # --- hilo ---

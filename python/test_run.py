@@ -97,10 +97,31 @@ class TestConfig(unittest.TestCase):
 
     def test_reloj_errores(self):
         self.assertConfigError(MINIMO + '\n[clock]\nmode = "rapido"\n', "no es válido")
-        self.assertConfigError(MINIMO + '\n[clock]\nmode = "replay"\n', "nivel 9")
+        self.assertConfigError(MINIMO + '\n[clock]\nmode = "replay"\n', "--play archivo.mcap")
         self.assertConfigError(MINIMO + '\n[clock]\nmode = "sim"\nspeed = 0\n', "mayor que 0")
         self.assertConfigError(MINIMO + '\n[clock]\nspeed = 2.0\n', 'solo aplica con mode = "sim"')
         self.assertConfigError(MINIMO + '\n[clock]\nmodo = "sim"\n', "¿Quisiste decir 'mode'?")
+
+    # --- [record] (RFC 0010) ---
+    def test_sin_record_no_graba(self):
+        cfg = self.load(MINIMO)
+        self.assertIsNone(cfg.record)
+        self.assertEqual(cfg.path.name, "robot.toml")
+
+    def test_record(self):
+        cfg = self.load(MINIMO + '\n[record]\ntopics = ["/camara", "/imu"]\nsplit = "1GiB"\n')
+        r = cfg.record
+        self.assertEqual((r.topics, r.dir, r.split, r.compress, r.auto),
+                         (["/camara", "/imu"], "grabaciones", "1GiB", None, True))
+        r = self.load(MINIMO + '\n[record]\ntopics = "*"\ndir = "datos"\ncompress = "zstd"\nauto = false\n').record
+        self.assertEqual((r.topics, r.dir, r.compress, r.auto), (["*"], "datos", "zstd", False))
+
+    def test_record_errores(self):
+        self.assertConfigError(MINIMO + '\n[record]\ntopics = ["camara"]\n', "una lista de topics")
+        self.assertConfigError(MINIMO + '\n[record]\ncompress = "gzip"\n', '"zstd" o "lz4"')
+        self.assertConfigError(MINIMO + '\n[record]\nsplit = "mucho"\n', "[record] split")
+        self.assertConfigError(MINIMO + '\n[record]\ntopic = ["/imu"]\n', "¿Quisiste decir 'topics'?")
+        self.assertConfigError('record = 1\n' + MINIMO, "[record] es una tabla")
 
 
 class TerminalBloqueada(io.StringIO):

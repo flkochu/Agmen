@@ -66,7 +66,7 @@ def node_name() -> str:
         return name
     base = os.path.basename(sys.argv[0] or "") if sys.argv else ""
     base = os.path.splitext(base)[0]
-    return base if base and base not in ("-", "-c", "__main__") else f"python-{os.getpid()}"
+    return base if base and base not in ("-", "-c", "-m", "__main__") else f"python-{os.getpid()}"
 
 
 class _HubLink:
@@ -475,7 +475,8 @@ class _PureSubscriber(_Receiver):
         got = wire.CLOCKS.get(env.clock, str(env.clock))
         print(f"[agmen] ⚠ '{self.topic or self.listen}' llega con reloj {got} y este nodo usa reloj "
               f"{clock.mode_name()}. ¿Corriste el nodo fuera de 'agmen run'? Usa el mismo reloj: "
-              f"AGMEN_CLOCK={'sim' if env.clock == wire.CLOCK_SIM else 'real'}", file=sys.stderr, flush=True)
+              f"AGMEN_CLOCK={ {wire.CLOCK_SIM: 'sim', wire.CLOCK_REPLAY: 'replay'}.get(env.clock, 'real') }",
+              file=sys.stderr, flush=True)
 
 
 class RawSubscriber(_Receiver):

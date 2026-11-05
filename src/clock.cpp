@@ -68,17 +68,17 @@ void ensure_configured_locked(Global& s) {
     if (s.configured) return;
     s.configured = true;
     const std::string m = platform::env("AGMEN_CLOCK");
-    if (m == "sim") {
-        s.mode = Mode::Sim;
+    if (m == "sim" || m == "replay") {
+        s.mode = m == "sim" ? Mode::Sim : Mode::Replay;
         const std::string src = platform::env("AGMEN_CLOCK_SOURCE");
         s.stepped = !src.empty() && src != "agmen";
     } else if (!m.empty() && m != "real") {
-        log::write("[agmen] ⚠ AGMEN_CLOCK='" + m + "' no existe (usa real o sim): uso el reloj real");
+        log::write("[agmen] ⚠ AGMEN_CLOCK='" + m + "' no existe (usa real, sim o replay): uso el reloj real");
     }
 }
 
 void listen_forever() {
-    // Un hilo por proceso, solo en simulación: escucha /clock y alimenta el reloj.
+    // Un hilo por proceso, solo en simulación o reproducción: escucha /clock y alimenta el reloj.
     for (;;) {
         try {
             Subscriber<ClockMsg> sub("/clock");
@@ -86,14 +86,14 @@ void listen_forever() {
                 if (auto s = sub.receive(std::chrono::milliseconds(200))) update(s->message);
             }
         } catch (const std::exception& e) {
-            log::write(std::string("[agmen] ⚠ reloj de simulación: ") + e.what() + " (reintento en 1 s)");
+            log::write(std::string("[agmen] ⚠ reloj (/clock): ") + e.what() + " (reintento en 1 s)");
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }
 }
 
 void start_listener_if_needed(Global& s) {
-    if (s.mode != Mode::Sim || !s.listen) return;
+    if (s.mode == Mode::Real || !s.listen) return;
     std::call_once(s.listener_started, [] { std::thread(listen_forever).detach(); });
 }
 
@@ -111,28 +111,37 @@ std::int64_t sim_now_locked(Global& s) {
 
 }  // namespace
 
-// 0 = aún no se sabe, 1 = real, 2 = sim. Se lee en cada mensaje: sin candado.
+// 0 = aún no se sabe, 1 = real, 2 = sim, 3 = replay. Se lee en cada mensaje: sin candado.
 static std::atomic<int> g_mode_cache{0};
 
+namespace {
+int cache_of(Mode m) { return m == Mode::Sim ? 2 : m == Mode::Replay ? 3 : 1; }
+Mode mode_of(int c) { return c == 2 ? Mode::Sim : c == 3 ? Mode::Replay : Mode::Real; }
+}  // namespace
+
 Mode mode() {
-    if (const int c = g_mode_cache.load(std::memory_order_acquire); c != 0) {
-        return c == 2 ? Mode::Sim : Mode::Real;
-    }
+    if (const int c = g_mode_cache.load(std::memory_order_acquire); c != 0) return mode_of(c);
     auto& s = g();
-    bool sim = false;
+    Mode m = Mode::Real;
     {
         std::lock_guard lk(s.mu);
         ensure_configured_locked(s);
-        sim = s.mode == Mode::Sim;
+        m = s.mode;
     }
-    if (sim) start_listener_if_needed(s);
-    g_mode_cache.store(sim ? 2 : 1, std::memory_order_release);
-    return sim ? Mode::Sim : Mode::Real;
+    if (m != Mode::Real) start_listener_if_needed(s);
+    g_mode_cache.store(cache_of(m), std::memory_order_release);
+    return m;
 }
 
-wire::Clock domain() { return mode() == Mode::Sim ? wire::Clock::Sim : wire::Clock::Real; }
+wire::Clock domain() {
+    const Mode m = mode();
+    return m == Mode::Sim ? wire::Clock::Sim : m == Mode::Replay ? wire::Clock::Replay : wire::Clock::Real;
+}
 
-std::string_view mode_name() { return mode() == Mode::Sim ? "simulación" : "real"; }
+std::string_view mode_name() {
+    const Mode m = mode();
+    return m == Mode::Sim ? "simulación" : m == Mode::Replay ? "reproducción" : "real";
+}
 
 std::int64_t now_ns() {
     if (mode() == Mode::Real) return system_ns();
@@ -163,7 +172,7 @@ State state() {
     std::lock_guard lk(s.mu);
     ensure_configured_locked(s);
     State out = s.st;
-    if (s.mode == Mode::Sim) out.t = sim_now_locked(s);
+    if (s.mode != Mode::Real) out.t = sim_now_locked(s);
     return out;
 }
 
@@ -179,8 +188,8 @@ void configure(Mode m, bool stepped, bool listen) {
         s.at_wall = steady_ns();
         s.last_returned = 0;
     }
-    g_mode_cache.store(m == Mode::Sim ? 2 : 1, std::memory_order_release);
-    if (m == Mode::Sim) start_listener_if_needed(s);
+    g_mode_cache.store(cache_of(m), std::memory_order_release);
+    if (m != Mode::Real) start_listener_if_needed(s);
 }
 
 void update(const ClockMsg& m) {

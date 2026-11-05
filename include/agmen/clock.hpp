@@ -5,10 +5,10 @@
 // rápido, más lento o en pausa.
 //
 //   agmen::clock::now_ns()    la hora de Agmen (la que va en t_data)
-//   agmen::clock::mode()      Real o Sim
+//   agmen::clock::mode()      Real, Sim o Replay
 //
 // El modo lo decide `agmen run` para TODO el robot ([clock] en robot.toml) y
-// se lo pasa a cada nodo en AGMEN_CLOCK=real|sim (y AGMEN_CLOCK_SOURCE). En
+// se lo pasa a cada nodo en AGMEN_CLOCK=real|sim|replay (y AGMEN_CLOCK_SOURCE). En
 // simulación, el tiempo llega por el topic /clock (ClockMsg):
 //
 //   - source = "agmen": lo publica agmen run unas 50 veces por segundo; entre
@@ -46,7 +46,9 @@ static_assert(wire::compact_size_v<ClockMsg> == ClockMsg::kPayloadLen);
 
 namespace clock {
 
-enum class Mode { Real, Sim };
+/// Replay (RFC 0010): como Sim (el tiempo llega por /clock, lo publica `agmen
+/// play`), pero los mensajes dicen clock = replay: el tiempo es el de una grabación.
+enum class Mode { Real, Sim, Replay };
 
 /// El modo de este proceso (AGMEN_CLOCK; por defecto Real).
 [[nodiscard]] Mode mode();

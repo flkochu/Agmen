@@ -238,11 +238,15 @@ struct NodeImpl {
         // slow_ns es tiempo real; el periodo, tiempo de Agmen (en simulación a ×2, 1 ms = 0.5 ms reales).
         double speed = 1.0;
         std::string unit;
-        if (clock::mode() == clock::Mode::Sim) {
+        if (clock::mode() != clock::Mode::Real) {
             const auto st = clock::state();
             if (st.speed > 0) speed = st.speed;
             char b[48];
-            std::snprintf(b, sizeof b, " simulados (×%g)", speed);
+            if (clock::mode() == clock::Mode::Sim) {
+                std::snprintf(b, sizeof b, " simulados (×%g)", speed);
+            } else {
+                std::snprintf(b, sizeof b, " de la grabación (×%g)", speed);
+            }
             unit = b;
         }
         const auto period_real = static_cast<std::int64_t>(static_cast<double>(t.period) / speed);
@@ -345,8 +349,8 @@ struct NodeImpl {
         std::unique_ptr<bool[]> ready;
         std::size_t ready_cap = 0;
 
-        // En simulación, el tiempo empieza cuando llega el primer /clock.
-        while (!g.timers.empty() && clock::mode() == clock::Mode::Sim && !clock::state().received) {
+        // En simulación (y reproducción), el tiempo empieza cuando llega el primer /clock.
+        while (!g.timers.empty() && clock::mode() != clock::Mode::Real && !clock::state().received) {
             if (should_stop() || (end_steady != 0 && steady_now_ns() >= end_steady)) return;
             std::this_thread::sleep_for(milliseconds(5));
         }

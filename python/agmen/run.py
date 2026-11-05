@@ -102,6 +102,16 @@ class ClockConfig:
 
 
 @dataclass
+class RecordConfig:
+    """[record] en robot.toml (RFC 0010): grabar mientras el robot corre."""
+    topics: list[str] = field(default_factory=lambda: ["*"])
+    dir: str = "grabaciones"            # relativo a robot.toml
+    split: str | None = None            # "1GiB", "10min"…
+    compress: str | None = None         # "zstd" | "lz4"
+    auto: bool = True                   # grabar siempre con agmen run (si no, con --record o el panel)
+
+
+@dataclass
 class RobotConfig:
     name: str
     base_dir: Path
@@ -111,6 +121,8 @@ class RobotConfig:
     topics: list[TopicConfig] = field(default_factory=list)
     hub: bool = True                    # ¿arrancar un agmen hub? ([hub] enabled)
     clock: ClockConfig = field(default_factory=ClockConfig)
+    record: RecordConfig | None = None  # [record]
+    path: Path | None = None            # el robot.toml
 
 
 def _check_keys(table: dict, allowed: set[str], where: str) -> None:
@@ -144,7 +156,7 @@ def load_config(path: str | Path) -> RobotConfig:
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{path.name} no es TOML válido: {e}") from None
 
-    _check_keys(data, {"robot", "node", "mux", "topic", "hub", "web", "clock"}, path.name)
+    _check_keys(data, {"robot", "node", "mux", "topic", "hub", "web", "clock", "record"}, path.name)
     robot = data.get("robot", {})
     _check_keys(robot, {"name", "before"}, "[robot]")
     base_dir = path.parent
@@ -295,9 +307,35 @@ def load_config(path: str | Path) -> RobotConfig:
         n.env.update(clock.env())   # todos con el mismo reloj: nadie lo olvida
 
     before = [_parse_cmd(c, "[robot] before") for c in robot.get("before", [])]
+    record = _parse_record(data["record"]) if "record" in data else None
     return RobotConfig(name=robot.get("name", path.stem), base_dir=base_dir,
                        nodes=nodes, web=web, before=before, topics=topics,
-                       hub=bool(hub_raw.get("enabled", True)), clock=clock)
+                       hub=bool(hub_raw.get("enabled", True)), clock=clock, record=record, path=path)
+
+
+def _parse_record(raw) -> RecordConfig:
+    if not isinstance(raw, dict):
+        raise ConfigError("[record] es una tabla, ej.\n\n  [record]\n  topics = [\"/camara\", \"/imu\"]")
+    _check_keys(raw, {"topics", "dir", "split", "compress", "auto"}, "[record]")
+    topics = raw.get("topics", "*")
+    if isinstance(topics, str):
+        topics = [topics]
+    if not isinstance(topics, list) or not all(isinstance(t, str) and (t == "*" or t.startswith("/")) for t in topics):
+        raise ConfigError("[record] topics: una lista de topics (\"/camara\") o \"*\" para todos")
+    compress = raw.get("compress")
+    if compress not in (None, "zstd", "lz4"):
+        raise ConfigError("[record] compress: \"zstd\" o \"lz4\" (o quítalo para no comprimir)")
+    split = raw.get("split")
+    if split is not None:
+        from .record import parse_split
+
+        try:
+            parse_split(str(split))
+        except ValueError as e:
+            raise ConfigError(f"[record] split: {e}") from None
+    return RecordConfig(topics=topics or ["*"], dir=str(raw.get("dir", "grabaciones")),
+                        split=str(split) if split is not None else None, compress=compress,
+                        auto=bool(raw.get("auto", True)))
 
 
 def _parse_clock(raw, nodes: list[NodeConfig]) -> ClockConfig:
@@ -306,7 +344,8 @@ def _parse_clock(raw, nodes: list[NodeConfig]) -> ClockConfig:
     _check_keys(raw, {"mode", "speed", "source", "paused"}, "[clock]")
     mode = raw.get("mode", "real")
     if mode not in ("real", "sim"):
-        hint = " (la reproducción de grabaciones llega en el nivel 9)" if mode == "replay" else ""
+        hint = (" (para reproducir una grabación no se toca robot.toml: agmen run robot.toml --play "
+                "archivo.mcap pone a todos los nodos en replay)") if mode == "replay" else ""
         raise ConfigError(f"[clock] mode = '{mode}' no es válido. Usa \"real\" o \"sim\"{hint}")
     speed = raw.get("speed", 1.0)
     if isinstance(speed, bool) or not isinstance(speed, (int, float)) or not (0 < speed <= 1000):
@@ -668,6 +707,7 @@ class Launcher:
         self.printer = Printer([n.name for n in config.nodes] + ["agmen"], stream=stream)
         self.nodes = {n.name: Node(n, config.base_dir, self.logs, self.printer) for n in config.nodes}
         self.stopping = threading.Event()
+        self.recording = None    # el control de grabación (RFC 0010); lo pone agmen run
 
     def say(self, text: str, kind: str = "agmen") -> None:
         self.logs.add("agmen", text, kind)
@@ -690,7 +730,10 @@ class Launcher:
             else:
                 self.say(f"'{node.cfg.name}' no arranca solo (autostart = false); inícialo desde el panel")
 
-    def stop_all(self) -> None:
+    def stop_all(self, then=None) -> None:
+        """Detiene todos los nodos. `then()` corre después (con los nodos ya
+        detenidos) y antes del "listo": ej. cerrar la grabación, que así guarda
+        hasta el último mensaje y su resumen sale en el log."""
         if self.stopping.is_set():
             return
         self.stopping.set()
@@ -700,6 +743,8 @@ class Launcher:
             t.start()
         for t in threads:
             t.join()
+        if then is not None:
+            then()
         self.say("listo. ¡Hasta luego!")
         self.printer.close()
 
