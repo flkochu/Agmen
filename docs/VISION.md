@@ -225,7 +225,7 @@ iceoryx2).
 | 6 ✅ (0.9.0) | Python de primera clase (RFC 0007): `agmen._core` compilado con nanobind (formato, topics, `Node`, reloj), wheels para 5 sistemas y Python puro de respaldo, NumPy sin copias | b |
 | **7 ✅** (0.10.0) | **Datos grandes (RFC 0008): codificación `arrow` (`string`, `bytes`, `T[]`, `tensor<T,N>`) por TCP con descarte por suscriptor lento; `agmen.msgs.Imagen`; cámara en el panel y en Foxglove. El puente del panel se quedó en Python: medido, cumple** | a, b, h |
 | **8 ✅** (0.11.0) | **Memoria compartida (RFC 0009): imágenes y tensores sin copiar entre procesos de la misma computadora, en C++ y Python, Linux y Windows (y macOS hasta 0.11.0); se prueba si se puede y si no, TCP; préstamos que se devuelven solos y con tope; `bench/shm_vs_tcp.py`** | a, b, g |
-| 9 | Grabación y reproducción; exportar a Parquet; reproducir en la web ([RFC 0010](rfc/0010-grabar-y-reproducir.md), propuesto) | c |
+| 9 | Grabación y reproducción; exportar a Parquet; reproducir en la web ([RFC 0010](rfc/0010-grabar-y-reproducir.md), aceptado) | c |
 | 10 | Abstracción sim/real; `robot.toml` con nodos en varias máquinas (el lanzador básico ya existe desde 0.2.0) | d, i |
 | 11 | Red multi-máquina, sincronización de relojes y **`agmen-web` en la nube** (relay con autenticación) | c, h |
 | 12 | Puentes (`agmen-iot` MQTT, ROS 2) y `agmen-micro` | f |
@@ -252,7 +252,7 @@ iceoryx2).
 | ~~Memoria compartida propia o con iceoryx2 por debajo~~ | ✅ [RFC 0009](rfc/0009-memoria-compartida.md) aceptado el 2026-11-05: propia (D1); D1–D5 y D7 = a, D6 = a′ (tope según la RAM y el pool se encoge, en 0.11.1) |
 | Préstamo para escribir directo en la memoria compartida (la cámara llena el bloque) | Cuando se mida que la copia del publicador estorba (RFC 0009 §4) |
 | ~~¿Seguir probando y publicando para macOS?~~ | ✅ No, desde 0.11.1 (2026-11-05, §4): Windows y Linux, x86-64 y ARM64; en macOS, Python puro |
-| Formato de grabación: MCAP o propio sobre Arrow IPC | Nivel 9: [RFC 0010](rfc/0010-grabar-y-reproducir.md) propuesto el 2026-11-05 (recomienda MCAP con los mensajes de Agmen adentro); falta decidir D1–D9 |
+| ~~Formato de grabación: MCAP o propio sobre Arrow IPC~~ | ✅ [RFC 0010](rfc/0010-grabar-y-reproducir.md) aceptado el 2026-11-05 (D1–D9 = a): MCAP con los mensajes de Agmen adentro, sin cambiar un byte |
 
 ## Fuentes
 

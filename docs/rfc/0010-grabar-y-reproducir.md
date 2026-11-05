@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Estado** | 📝 **Propuesto** (2026-11-05). Falta que Adán decida D1–D9 ([sección 5](#5-decisiones)); no se implementa nada antes |
+| **Estado** | ✅ **Aceptado** (2026-11-05, D1–D9 = a). Se implementa en Agmen 0.12.0. Decisiones en la [sección 5](#5-decisiones) |
 | **Depende de** | RFC 0001 (el sobre: `t_data`, `t_pub`, `source_id`, `seq` y el campo `clock`; pregunta abierta 1 de §13), RFC 0002 (panel y Foxglove), RFC 0004 (hub y topics), RFC 0006 (el reloj de Agmen y el modo `replay`), RFC 0008 (`arrow`, `agmen.msgs.Imagen`, D3), RFC 0009 (memoria compartida) |
 | **Versión** | Agmen 0.12.0 |
 | **Requisitos** | c (todo mensaje con marca de tiempo; las grabaciones sirven como datasets), d (misma interfaz para simulación, robot real y grabación), h (interfaz web), i (un solo comando) |
