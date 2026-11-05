@@ -11,7 +11,7 @@
      publica /clock (paso a paso), y el nodo sigue exactamente al tiempo que
      el simulador publicó (aunque el simulador vaya más lento de lo que quería).
 
-Funciona en Windows, Linux y macOS. Usa build/bin/doble_ritmo si existe.
+Funciona en Windows y Linux. Usa build/bin/doble_ritmo si existe.
 
     python scripts/node_check.py
 """

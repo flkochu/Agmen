@@ -3,7 +3,7 @@
 #   agmen run examples/tutorial/robot.toml
 #
 # Las rutas son relativas a este archivo. "python" se reemplaza por el mismo
-# Python que corre agmen (funciona igual en Windows, Linux y macOS).
+# Python que corre agmen (funciona igual en Windows y Linux).
 #
 # Desde Agmen 0.5 los nodos se hablan por TOPICS ("/imu", "/cmd"): nadie
 # escribe IPs ni puertos. `agmen run` arranca solo el `agmen hub`, el

@@ -20,6 +20,7 @@
 // escriben y leen los mismos bytes y los mismos nombres.
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -50,6 +51,10 @@ inline constexpr std::size_t kMaxUnreturned = 8;
 inline constexpr std::size_t kMaxUnreturnedBytes = std::size_t{128} << 20;
 /// Bloques por publicador (D6).
 inline constexpr std::size_t kMaxBlocks = 64;
+/// Un bloque que nadie tiene prestado y que no se usó en este tiempo se libera
+/// (D6 a′): después de una ráfaga, el pool vuelve a lo que de verdad se usa. El
+/// suscriptor suelta lo que tenía abierto de un bloque tras el mismo tiempo.
+inline constexpr std::chrono::seconds kIdleFree{5};
 /// Tamaño del bloque de prueba (§3.3).
 inline constexpr std::size_t kProbeSize = 4096;
 /// Marca al principio de cada bloque.
@@ -66,8 +71,22 @@ public:
 /// ¿Está prendida? Sí, salvo AGMEN_SHM=0.
 [[nodiscard]] bool enabled();
 
-/// Lo más que puede apartar un publicador: AGMEN_SHM_MB (512 por defecto).
+/// Lo más que puede apartar un publicador (D6 a′): AGMEN_SHM_MB si está puesta
+/// (aunque pase de ¼ de la RAM); si no, lo menor entre 512 MiB, ¼ de la RAM
+/// física y, en Linux, ½ de /dev/shm.
 [[nodiscard]] std::size_t limit_bytes();
+/// De dónde sale limit_bytes(), para los avisos: "AGMEN_SHM_MB", "¼ de la RAM",
+/// "½ de /dev/shm" o "el máximo".
+[[nodiscard]] std::string limit_reason();
+/// La RAM física de la máquina (0 si no se sabe).
+[[nodiscard]] std::uint64_t physical_ram();
+/// Linux: lo que mide /dev/shm (en Docker, 64 MB si no se cambia). 0 en los demás.
+[[nodiscard]] std::uint64_t devshm_size();
+
+namespace detail {
+/// Solo para las pruebas: finge que la máquina tiene `bytes` de RAM (0 = la de verdad).
+void fake_physical_ram(std::uint64_t bytes);
+}  // namespace detail
 
 /// Los avisos del suscriptor al publicador, por la conexión TCP (§3.7).
 enum class Op : std::uint8_t {
@@ -178,25 +197,39 @@ public:
     void hold(std::uint32_t slot);
     void release(std::uint32_t slot);
 
+    /// Libera los bloques que nadie tiene prestado y que no se usaron en
+    /// kIdleFree, y el de prueba si nadie lo pidió en ese tiempo (D6 a′): borra
+    /// su nombre, suelta su memoria y lo quita del registro. Un bloque prestado
+    /// o nombrado por un descriptor que todavía viaja (los dos cuentan en
+    /// hold()) nunca se libera. Devuelve los bytes liberados.
+    std::size_t trim(std::chrono::steady_clock::time_point now);
+
+    /// Bloques de datos que existen (sin el de prueba).
     [[nodiscard]] std::size_t blocks() const;
+    /// Bytes apartados en bloques de datos (sin el de prueba).
     [[nodiscard]] std::size_t bytes() const;
     /// Cuántos bloques tienen algún préstamo.
     [[nodiscard]] std::size_t busy() const;
 
 private:
     struct Block {
-        std::unique_ptr<Segment> segment;
+        std::unique_ptr<Segment> segment;   // nullptr: la ranura quedó libre (trim)
         std::uint32_t holders = 0;
+        std::chrono::steady_clock::time_point used{};   // la última vez que se escribió o se soltó (trim)
+        std::uint64_t order = 0;                         // y en qué orden (el más reciente se reusa)
     };
 
     [[nodiscard]] std::string next_name();
     [[nodiscard]] Segment create(std::size_t size);
+    void rewrite_registry() const;
+    void touch(Block& b);
 
     std::uint64_t owner_;
     std::uint32_t counter_ = 0;
+    std::uint64_t tick_ = 0;
     std::vector<Block> blocks_;
-    std::size_t next_ = 0;
     std::unique_ptr<Segment> probe_;
+    std::chrono::steady_clock::time_point probe_used_{};
     std::string registry_;   // POSIX: el archivo donde se anotan los nombres
 };
 

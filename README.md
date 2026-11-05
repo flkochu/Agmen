@@ -8,7 +8,7 @@ mueve mensajes entre nodos de forma rápida, confiable y con marca de tiempo.
 La IA, la visión y el IoT **no viven dentro del núcleo**: se conectan a él
 como paquetes opcionales.
 
-- Núcleo en **C++20**; corre en **Windows, Linux, macOS y Linux ARM64** como la Raspberry Pi (verificado por CI).
+- Núcleo en **C++20**; corre en **Windows y Linux, x86-64 y ARM64** como la Raspberry Pi (verificado por CI). En macOS, `pip install agmen` instala la versión de Python puro (sin soporte oficial desde 0.11.1).
 - **Python de primera clase** y la compatibilidad vive en el formato de
   mensajes, no en un lenguaje. Un mensaje se describe con **una línea**
   (`Arca9Articulaciones{f32[12] q}`) y cualquier herramienta lo entiende sin
@@ -37,7 +37,7 @@ como paquetes opcionales.
   mandan al mismo motor, **un `[[mux]]` decide quién manda**: tú le ganas al
   modo autónomo y al soltar lo retoma solo.
 
-**Versión actual: 0.11.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
+**Versión actual: 0.11.1** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
 
 | Para… | Lee |
 |---|---|
@@ -50,7 +50,7 @@ como paquetes opcionales.
 | Varias frecuencias en un nodo y el reloj de Agmen | [RFC 0006](docs/rfc/0006-executor-y-reloj.md) (aceptado, implementado en 0.8.0) |
 | Python compilado desde el núcleo de C++ | [RFC 0007](docs/rfc/0007-python-compilado.md) (aceptado, implementado en 0.9.0) |
 | Imágenes, tensores y texto (datos grandes) | [RFC 0008](docs/rfc/0008-datos-grandes.md) (aceptado, implementado en 0.10.0) |
-| Memoria compartida: imágenes sin copiar entre procesos | [RFC 0009](docs/rfc/0009-memoria-compartida.md) (propuesto, implementado en 0.11.0) |
+| Memoria compartida: imágenes sin copiar entre procesos | [RFC 0009](docs/rfc/0009-memoria-compartida.md) (aceptado, implementado en 0.11.0; D6 a′ en 0.11.1) |
 | Publicar versiones | [`docs/PUBLICAR.md`](docs/PUBLICAR.md) |
 
 ## Estado
@@ -98,7 +98,7 @@ agmen/
 ├── scripts/                 interop, web, foxglove, run, paralelo, topics, gen, tutorial y check_version (todos corren en el CI)
 ├── bench/                   mediciones que respaldan decisiones de diseño (shm_vs_tcp.py: RFC 0009)
 ├── docs/                    tutorial/, VISION, PROTOCOLO, VERSIONES, PUBLICAR, rfc/
-└── .github/workflows/       ci.yml (4 sistemas, ARM incluido, + sanitizers) · release.yml (PyPI + GitHub Release)
+└── .github/workflows/       ci.yml (3 sistemas, ARM incluido, + sanitizers y fuzzing) · release.yml (PyPI + GitHub Release)
 ```
 
 ## Requisitos
@@ -107,9 +107,12 @@ agmen/
 |---|---|---|
 | **Windows** | [Visual Studio 2022 Community](https://visualstudio.microsoft.com/) con la carga de trabajo **"Desarrollo para el escritorio con C++"** (trae CMake) | 3.11+ desde python.org (comando `python` o `py`) |
 | **Linux** (Ubuntu/Debian) | `sudo apt install build-essential cmake` (GCC 11+) | `python3` (ya viene) |
-| **macOS** | `xcode-select --install` y `brew install cmake` | `python3` |
 
 Se necesita un compilador con C++20: GCC 11+, Clang 14+ o MSVC 2022.
+
+**macOS** no tiene soporte oficial desde 0.11.1: el código es POSIX y se
+compiló y probó ahí hasta 0.11.0, pero ya no se prueba en el CI ni hay wheels
+compiladas. `pip install agmen` instala la versión de Python puro.
 
 Solo para **usar** Agmen desde Python no hace falta nada de esto:
 `pip install agmen` (Python 3.11+) ya trae el núcleo de C++ compilado.
@@ -118,7 +121,7 @@ Para compilar también el núcleo de Python en el repositorio:
 
 ## Compilar y probar
 
-Mismos comandos en PowerShell (Windows) y en la terminal de Linux/macOS (en
+Mismos comandos en PowerShell (Windows) y en la terminal de Linux (en
 Windows usa `python` en vez de `python3`):
 
 ```bash
@@ -241,7 +244,7 @@ En Python, `msgs = agmen.load("mensajes/arca9.agmen")`. Todo en el
 | Serialización little-endian portable | `include/agmen/wire.hpp` → `put_le` / `get_le` |
 | Hash del esquema calculado en compilación | `fnv1a64` (`constexpr`) y `static_assert` en `tests/test_wire.cpp` |
 | Errores claros en vez de fallas silenciosas | `agmen::wire::WireError` |
-| Sockets en Windows vs Linux/macOS | `src/net.cpp` (Winsock vs BSD) |
+| Sockets en Windows vs Linux | `src/net.cpp` (Winsock vs BSD) |
 | Por qué el sleep en Windows es impreciso y cómo arreglarlo | `src/platform.cpp` |
 | Lazo a frecuencia fija sin acumular error | `examples/nivel0/publisher.cpp` (programación por *deadline*) |
 | Detección de pérdidas con números de secuencia | `examples/nivel0/common.hpp` → `SeqTracker` |
@@ -249,7 +252,7 @@ En Python, `msgs = agmen.load("mensajes/arca9.agmen")`. Todo en el
 | Layout de un struct de C: alineación y relleno | `python/agmen/schema.py` → `Layout` |
 | Decodificar cualquier tipo sin código compilado | `agmen echo` (`python/agmen/echo.py`) y el panel (`python/agmen/panel/agmen.js`, en el navegador) |
 | Dos implementaciones, los mismos bytes | `tests/vectors/v1.txt`, revisado por C++ y por Python |
-| Memoria compartida en tres sistemas, y quién suelta cada bloque | `src/shm.cpp` (`shm_open` vs `CreateFileMappingW`) y `src/pubsub.cpp` (préstamos que se devuelven por TCP) |
+| Memoria compartida en Windows y Linux, y quién suelta cada bloque | `src/shm.cpp` (`shm_open` vs `CreateFileMappingW`) y `src/pubsub.cpp` (préstamos que se devuelven por TCP) |
 
 ## Ejercicios
 

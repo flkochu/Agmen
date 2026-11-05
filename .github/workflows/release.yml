@@ -3,9 +3,10 @@
 #   git tag v0.1.0 && git push origin v0.1.0
 #
 # 1. Verifica que el tag coincida con VERSION, Python y CHANGELOG.
-# 2. Corre todas las pruebas en Windows, Linux y macOS.
-# 3. Construye las wheels compiladas (5 sistemas, cibuildwheel), la de Python
+# 2. Corre todas las pruebas en Windows y Linux (x86-64 y ARM64).
+# 3. Construye las wheels compiladas (3 sistemas, cibuildwheel), la de Python
 #    puro y el sdist, las prueba instaladas y las sube a PyPI (pip install agmen).
+#    En macOS (sin soporte oficial desde 0.11.1) pip instala la de Python puro.
 # 4. Crea el Release en GitHub con los archivos.
 #
 # Usa "Trusted Publishing" de PyPI: no hay contraseñas ni tokens guardados.
@@ -39,7 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-15-intel, macos-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6

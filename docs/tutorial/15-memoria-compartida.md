@@ -152,6 +152,18 @@ del ultimas[:-10]
 Los arreglos que llegan son **de solo lectura** (como en el capítulo 14): un
 nodo no puede escribir en la imagen que ven los demás.
 
+**A otro proceso con `multiprocessing`** (o los *workers* de un `DataLoader`
+de PyTorch): manda el mensaje tal cual. Al hacer `pickle`, la vista se copia a
+`bytes`; el otro proceso recibe una imagen igual a la publicada, y el bloque
+vuelve a la cámara en cuanto sueltas el mensaje original, aunque la copia siga
+viva. Vale para `agmen.msgs`, para los tipos de `agmen gen` y para los que
+escribes a mano con `@dataclass`.
+
+```python
+with multiprocessing.get_context("spawn").Pool(4) as pool:
+    caras = pool.apply(detectar_caras, (s.message,))    # una copia viaja; el bloque vuelve
+```
+
 ## 6. Docker, límites y limpieza
 
 - **Docker**: para que dos contenedores compartan memoria, córrelos con
@@ -159,10 +171,20 @@ nodo no puede escribir en la imagen que ven los demás.
   defecto; para varias cámaras grandes súbelo con `--shm-size=512m`. Si no
   alcanza, Agmen lo dice y manda por TCP:
   `⚠ '/camara': no hay memoria compartida para … En Docker, /dev/shm mide 64 MB: súbelo con --shm-size`.
-- Un publicador aparta como mucho **512 MiB** (`AGMEN_SHM_MB`) y 64 bloques.
-  Lo normal con una cámara son 2 a 4 bloques.
+- Un publicador aparta como mucho 64 bloques y lo **menor entre 512 MiB, ¼
+  de la RAM y, en Linux, ½ de `/dev/shm`**: en una Raspberry Pi 3 (1 GB) son
+  256 MiB, y en Docker con el `/dev/shm` de 64 MB, 32 MiB. `AGMEN_SHM_MB` lo
+  cambia (`AGMEN_SHM_MB=600`), aunque pase del ¼. Lo normal con una cámara
+  son 2 a 4 bloques.
+- Lo que se apartó en un pico **se devuelve solo**: un bloque que nadie tiene
+  prestado y que no se usó en 5 s se libera. `pub.shm_bytes` dice cuánto
+  tiene apartado ahora:
+
+  ```python
+  print(pub.shm_bytes / 2**20, "MiB")   # 80 en la ráfaga 4K; 0 a los 5 s sin publicar
+  ```
 - Si un nodo **se cae**, sus suscriptores siguen viendo lo que ya tenían, y el
-  siguiente publicador que arranca borra los bloques que dejó (Linux y macOS;
+  siguiente publicador que arranca borra los bloques que dejó (Linux;
   en Windows el sistema los borra solo). En Linux puedes verlos con
   `ls /dev/shm/agm*`.
 

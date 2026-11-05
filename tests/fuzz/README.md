@@ -62,7 +62,7 @@ hechas a mano salen de `regresiones/generar.py`, que explica cada una). Se
 vuelven a correr siempre, sin Clang ni atheris:
 
 - `ctest` (`fuzz_regresiones_wire`, `…_layout`, `…_arrow`): los fuzzers de C++
-  compilados con `replay.cpp` en vez de libFuzzer, en Windows, Linux y macOS;
+  compilados con `replay.cpp` en vez de libFuzzer, en Windows y Linux;
 - `python/test_fuzz.py`: el fuzzer de Python, más una prueba con nombre por
   cada error;
 - `python/test_panel_js.py`: las mismas entradas por `agmen.js`, el lector del

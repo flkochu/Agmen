@@ -1,10 +1,10 @@
 # Paquete de Python `agmen` (pip install agmen).
 #
 # Desde 0.9.0 (RFC 0007) trae el núcleo de C++ compilado (agmen._core, con
-# nanobind): las wheels de PyPI ya vienen compiladas para Windows, Linux x64 y
-# ARM64 (Raspberry Pi) y macOS (Intel y Apple Silicon), así que pip no compila
-# nada. En otras computadoras se instala la wheel de Python puro, que funciona
-# igual pero más lento.
+# nanobind): las wheels de PyPI ya vienen compiladas para Windows y Linux (x64
+# y ARM64, como la Raspberry Pi), así que pip no compila nada. En otras
+# computadoras (también macOS, sin soporte oficial desde 0.11.1) se instala la
+# wheel de Python puro, que funciona igual pero más lento.
 #
 #   pip install .                     compila el núcleo (necesita un compilador de C++20)
 #   AGMEN_PURE=1 python -m build      la wheel de Python puro (py3-none-any)
@@ -29,7 +29,8 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Natural Language :: Spanish",
-    "Operating System :: OS Independent",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: C++",
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering",
@@ -75,6 +76,3 @@ build = ["cp311-*", "cp312-*"]
 skip = ["*-musllinux_*", "*-win32", "*_i686", "*-win_arm64"]
 test-command = "python {project}/scripts/wheel_check.py"
 build-verbosity = 1
-
-[tool.cibuildwheel.macos.environment]
-MACOSX_DEPLOYMENT_TARGET = "11.0"

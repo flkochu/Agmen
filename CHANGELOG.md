@@ -7,11 +7,24 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 
 ## [Sin publicar]
 
-Auditoría de robustez del decodificador con fuzzing (`tests/fuzz/`). Todo lo
-de abajo se podía provocar con **un solo paquete** desde la red: un anuncio de
-esquema o un mensaje `arrow`.
+### Planeado (nivel 9, versión 0.12.0)
+- Grabación y reproducción; exportar a Parquet.
+
+## [0.11.1] — 2026-11-05
+
+**Parche de 0.11.0.** Tres cosas: la auditoría de robustez del decodificador
+con *fuzzing* (PR #2), la decisión D6 (a′) del RFC 0009, ya aceptado (la
+memoria compartida aparta según la computadora y se encoge sola), y **macOS
+sin soporte oficial**. Los bytes no cambian: un nodo de 0.11.1 habla con uno
+de 0.11.0 (solo se rechazan esquemas de más de 32 niveles o tipos fijos de más
+de 2 GiB, que no existían).
 
 ### Corregido
+
+**El decodificador** (PR #2, `tests/fuzz/`). Todo lo de abajo se podía
+provocar con **un solo paquete** desde la red: un anuncio de esquema o un
+mensaje `arrow`.
+
 - **Un anuncio con structs anidados tumbaba a cualquier `Subscriber` de C++**
   (desbordamiento de pila): `read_announcement` leía el esquema con
   `wire::schema::check`, recursivo y con 4 KB de pila por nivel, y ~1 500
@@ -75,6 +88,47 @@ esquema o un mensaje `arrow`.
   `agmen.Tensor`, lo que promete el RFC 0008, con los datos como una vista sin
   copiar. Lo encontró atheris en el CI.
 
+**La memoria compartida** (RFC 0009, D6 = a′). 512 MiB fijos eran la mitad de
+una Raspberry Pi 3 (1 GB), y lo que se apartaba en un pico quedaba apartado
+hasta que el nodo terminaba.
+- **El tope del pool depende de la computadora**: el menor entre 512 MiB, ¼ de
+  la RAM física y, en Linux, ½ de `/dev/shm` (en una Raspberry Pi 3, 256 MiB;
+  en Docker con el `/dev/shm` de 64 MB, 32 MiB). `AGMEN_SHM_MB` manda, aunque
+  pase del ¼, y en C++ ya acepta fracciones como en Python (`0.5`). El aviso
+  dice de dónde sale el tope: `… (256.0 MiB, ¼ de la RAM; cámbialo con
+  AGMEN_SHM_MB)`.
+- **El pool se encoge**: un bloque que nadie tiene prestado y que no se usó en
+  5 s se libera (se borra su nombre, se suelta su memoria y sale del
+  registro); el de prueba también. Nunca uno prestado ni uno que nombra un
+  descriptor en camino. En la ráfaga 4K de las pruebas: 80 MiB apartados → 0
+  a los 5 s, sin nada en `/dev/shm`.
+- **El suscriptor de C++ suelta los bloques que ya no ve**: cierra los que
+  ningún descriptor nombró en 5 s (en `receive()` y en el latido del `Node`).
+  Antes los guardaba abiertos mientras durara la conexión, y en Windows la
+  memoria de un bloque no se libera mientras alguien lo tenga abierto.
+
+**Otros.**
+- **Pickle de un tipo arrow escrito a mano** (`@dataclass` + `wire.Message`):
+  una vez recibido, fallaba con `cannot pickle 'memoryview' object`; solo los
+  tipos generados (`agmen gen`, `agmen.msgs`) sabían. Ahora `wire.Message` se
+  lo da a todos los tipos arrow, también a sus structs anidados (dicts).
+- Panel: el aviso "→ ALTO" del hombre muerto se escribe antes de mandar el
+  alto (en una máquina lenta, quien ya había recibido el alto todavía no veía
+  por qué; falló una vez `test_web` en Windows).
+
+### Cambiado
+- **macOS sin soporte oficial** (`docs/VISION.md`, §4): se prueba y se publica
+  para **Windows y Linux, x86-64 y ARM64**. El CI ya no corre en
+  `macos-latest` y el release ya no compila wheels para macOS (Intel ni Apple
+  Silicon). **En una Mac, `pip install agmen` instala la wheel de Python puro**
+  (`py3-none-any`): todo funciona igual, más lento. No se borró código:
+  `shm.cpp` y `net.cpp` siguen siendo POSIX y `platform.cpp` conserva su
+  `#ifdef __APPLE__`.
+- `pyproject.toml`: clasificadores `Operating System :: Microsoft :: Windows`
+  y `POSIX :: Linux` en vez de `OS Independent`.
+- El publicador escribe en el bloque libre que se usó más recientemente (antes,
+  en orden circular, que mantenía vivos a todos y el pool nunca se encogía).
+
 ### Agregado
 - **Fuzzers** en `tests/fuzz/` (README ahí): `fuzz_wire`, `fuzz_layout` y
   `fuzz_arrow` con libFuzzer, ASan y UBSan (`-DAGMEN_FUZZ=ON`, Clang), y
@@ -89,8 +143,25 @@ esquema o un mensaje `arrow`.
 - `SubscriptionStats::invalid` (C++ y Python): los paquetes mal hechos que el
   `Node` descartó. En Python, `wire.HubRejected` (hija de `WireError`) cuando
   el hub rechaza publicar o escuchar en un topic.
+- Memoria compartida: `pub.shm_bytes` (C++ `shm_bytes()`, los dos núcleos de
+  Python), lo que un publicador tiene apartado ahora;
+  `Subscriber::shm_mapped()` y `forget_idle_blocks()` en C++;
+  `shm::limit_bytes()`, `limit_reason()`, `physical_ram()` y `devshm_size()`
+  (en Python, `agmen._shm.limit()`).
 
 ### Pruebas
+- **Pickle con memoria compartida** (`python/test_shm.py`, con los dos
+  núcleos): una `Imagen` que llega por memoria compartida (`FLAG_SHM`) se hace
+  pickle igual a lo publicado, con todos los protocolos; viaja por un `Pool` de
+  `multiprocessing` con `spawn`; y el bloque vuelve al publicador al soltar el
+  mensaje original aunque la copia siga viva (y el publicador lo reutiliza sin
+  que la copia cambie). También un tipo escrito a mano con un struct anidado.
+- **D6 (a′)**, en C++ (`tests/test_shm.cpp`) y con los dos núcleos de Python:
+  el tope con 1 GB de RAM fingido (un gancho interno de las pruebas, no una
+  variable de entorno), que `AGMEN_SHM_MB` manda, que el publicador lo
+  respeta; el pool que se encoge, sin esperar (`trim(ahora + 6 s)`): nunca el
+  prestado, y el registro dice lo que existe; y la ráfaga 4K con 5 s de
+  silencio de verdad, que revisa también `/dev/shm` y `/proc/self/maps`.
 - `tests/fuzz/regresiones/`: cada entrada que rompió un decodificador (las
   hechas a mano salen de `generar.py`). Las corren `ctest`
   (`fuzz_regresiones_*`, en los tres sistemas y sin Clang, con `replay.cpp`),
@@ -108,9 +179,6 @@ esquema o un mensaje `arrow`.
   Python puro se detenía.
 - `test_tensor_sin_numpy_se_puede_volver_a_publicar`: decodificar sin NumPy,
   volver a codificar (los mismos bytes) y pickle, también con forma vacía.
-
-### Planeado (nivel 9, versión 0.12.0)
-- Grabación y reproducción; exportar a Parquet.
 
 ## [0.11.0] — 2026-11-05
 

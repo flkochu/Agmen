@@ -5,12 +5,20 @@
 #include <agmen/agmen.hpp>
 #include <agmen/shm.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
+
+#ifndef _WIN32
+#  include <unistd.h>
+#endif
 
 namespace {
 
@@ -411,6 +419,178 @@ void test_tipado_por_memoria_compartida() {
     }
 }
 
+
+// --- D6 a′: el tope según la RAM, y el pool que se encoge ---------------------
+
+double mib(std::size_t bytes) { return static_cast<double>(bytes) / (1 << 20); }
+
+/// ¿Todavía existe el bloque? (Linux: también se ve en /dev/shm.)
+bool opens(const std::string& name) {
+    try {
+        (void)shm::Segment::open(name, shm::kProbeSize);
+        return true;
+    } catch (const shm::ShmError&) {
+        return false;
+    }
+}
+
+#ifndef _WIN32
+std::filesystem::path registry_of(std::uint64_t owner) {
+    char file[64];
+    std::snprintf(file, sizeof file, "%llu-%016llx.txt", static_cast<unsigned long long>(getpid()),
+                  static_cast<unsigned long long>(owner));
+    return std::filesystem::temp_directory_path() / ("agmen-shm-" + std::to_string(getuid())) / file;
+}
+#endif
+
+/// Linux: los nombres de /dev/shm de los bloques de este proceso.
+std::vector<std::string> my_devshm_entries() {
+    std::vector<std::string> out;
+#ifdef __linux__
+    char prefix[16];
+    std::snprintf(prefix, sizeof prefix, "agm%08llx", static_cast<unsigned long long>(getpid()) & 0xffffffffULL);
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator("/dev/shm", ec)) {
+        const auto f = e.path().filename().string();
+        if (f.rfind(prefix, 0) == 0) out.push_back(f);
+    }
+#endif
+    return out;
+}
+
+/// Linux: cuántos bloques de Agmen tiene mapeados este proceso.
+int my_shm_mappings() {
+    int n = 0;
+#ifdef __linux__
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    while (std::getline(maps, line)) n += line.find("/dev/shm/agm") != std::string::npos ? 1 : 0;
+#endif
+    return n;
+}
+
+void test_tope_segun_la_ram() {
+    unset_env("AGMEN_SHM_MB");
+    shm::detail::fake_physical_ram(std::uint64_t{1} << 30);   // una máquina de 1 GB
+    const std::uint64_t quarter = std::uint64_t{256} << 20;
+    const std::uint64_t dev = shm::devshm_size();
+    const std::uint64_t want = dev > 0 ? std::min(quarter, dev / 2) : quarter;
+    std::printf("  con 1 GB de RAM: tope %.0f MiB (%s)\n", mib(shm::limit_bytes()), shm::limit_reason().c_str());
+    CHECK(shm::limit_bytes() == want);
+    CHECK(shm::limit_reason() == (want == quarter ? "¼ de la RAM" : "½ de /dev/shm"));
+    // AGMEN_SHM_MB manda, aunque pase de ¼ de la RAM.
+    set_env("AGMEN_SHM_MB", "600");
+    CHECK(shm::limit_bytes() == std::size_t{600} << 20);
+    CHECK(shm::limit_reason() == "AGMEN_SHM_MB");
+    unset_env("AGMEN_SHM_MB");
+    // Y el pool lo respeta: con 16 MiB de RAM, el tope es 4 MiB.
+    shm::detail::fake_physical_ram(std::uint64_t{16} << 20);
+    {
+        shm::Pool pool(1);
+        const auto data = big();
+        std::string why;
+        int ok = 0;
+        for (std::uint64_t g = 0; g < 10; ++g) {
+            const auto d = pool.write(g, data, why);
+            if (!d) break;
+            pool.hold(d->slot);   // nadie devuelve nada
+            ++ok;
+        }
+        CHECK(ok >= 1 && ok <= 4);
+        CHECK(pool.bytes() <= (std::size_t{4} << 20));
+        CHECK(why.find("¼ de la RAM") != std::string::npos);
+    }
+    shm::detail::fake_physical_ram(0);
+    // La de verdad: nunca más de 512 MiB ni de ¼ de la RAM.
+    CHECK(shm::limit_bytes() <= (std::size_t{512} << 20));
+    if (shm::physical_ram() > 0) CHECK(shm::limit_bytes() <= shm::physical_ram() / 4);
+}
+
+void test_el_pool_se_encoge() {
+    const std::uint64_t owner = 0xA6E7'0002;
+    shm::Pool pool(owner);
+    const auto data = big();
+    std::string why;
+    // Una ráfaga: 6 mensajes a la vez sin devolver = 6 bloques.
+    std::vector<shm::Descriptor> held;
+    for (std::uint64_t g = 1; g <= 6; ++g) {
+        const auto d = pool.write(g, data, why);
+        CHECK(d.has_value());
+        if (!d) return;
+        pool.hold(d->slot);
+        held.push_back(*d);
+    }
+    const auto probe = pool.probe(why);
+    CHECK(probe.has_value());
+    CHECK(pool.blocks() == 6);
+    // Vuelven todos menos uno.
+    for (std::size_t i = 1; i < held.size(); ++i) pool.release(held[i].slot);
+    const auto now = std::chrono::steady_clock::now();
+    CHECK(pool.trim(now) == 0);                                // recién usados: nada
+    CHECK(pool.trim(now + shm::kIdleFree + 1s) > 0);           // 5 s sin usarlos
+    CHECK(pool.blocks() == 1 && pool.busy() == 1);             // el prestado nunca se libera
+    CHECK(opens(held[0].name));
+    for (std::size_t i = 1; i < held.size(); ++i) CHECK(!opens(held[i].name));
+    CHECK(probe && !opens(probe->name));                       // el de prueba tampoco se usó
+#ifndef _WIN32
+    {
+        std::ifstream reg(registry_of(owner));
+        std::string line;
+        std::vector<std::string> names;
+        while (std::getline(reg, line)) names.push_back(line);
+        CHECK(names.size() == 1 && names[0] == held[0].name);   // el registro dice lo que existe
+    }
+#endif
+    pool.release(held[0].slot);
+    CHECK(pool.trim(std::chrono::steady_clock::now() + shm::kIdleFree + 1s) > 0);
+    CHECK(pool.blocks() == 0 && pool.bytes() == 0);
+    CHECK(!opens(held[0].name));
+#ifndef _WIN32
+    CHECK(!std::filesystem::exists(registry_of(owner)));
+#endif
+    // Y vuelve a crecer cuando hace falta.
+    const auto again = pool.write(7, data, why);
+    CHECK(again.has_value() && pool.blocks() == 1);
+}
+
+void test_rafaga_4k_y_luego_nada() {
+    // Una cámara 4K (24.9 MB por imagen) y un suscriptor que guarda todo lo que
+    // le llega durante la ráfaga; luego lo suelta y la cámara se calla.
+    const std::vector<std::uint8_t> frame(std::size_t{3840} * 2160 * 3, 7);
+    std::size_t peak = 0;
+    std::size_t after = 0;
+    double seconds = 0;
+    {
+        agmen::Subscriber<Img> sub("127.0.0.1:0");
+        agmen::Publisher<Img> pub("127.0.0.1:" + std::to_string(sub.local_port()), "/camara");
+        CHECK(until_shared(pub, sub, frame).has_value());
+        {
+            std::vector<agmen::RawSample> kept;
+            for (std::uint32_t k = 0; k < 12; ++k) {
+                (void)pub.publish(Img{k, 0, frame});
+                while (auto s = sub.receive_raw(30ms)) kept.push_back(std::move(*s));
+                peak = std::max(peak, pub.shm_bytes());
+            }
+            CHECK(!kept.empty());
+        }   // el suscriptor suelta todo
+        const auto t0 = std::chrono::steady_clock::now();
+        while (pub.shm_bytes() > 0 && std::chrono::steady_clock::now() - t0 < 10s) {
+            (void)sub.receive_raw(100ms);   // el suscriptor sigue escuchando: no llega nada
+        }
+        seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        after = pub.shm_bytes();
+        sub.forget_idle_blocks();
+        std::printf("  ráfaga 4K: %.0f MiB apartados → %.0f MiB a los %.1f s sin usar; el suscriptor tiene %zu abiertos\n",
+                    mib(peak), mib(after), seconds, sub.shm_mapped());
+        CHECK(peak >= (std::size_t{50} << 20));   // al menos dos imágenes 4K
+        CHECK(after == 0);
+        CHECK(seconds >= 4.0 && seconds < 10.0);  // no antes de 5 s (menos el segundo del hilo)
+        CHECK(sub.shm_mapped() == 0);
+        CHECK(my_devshm_entries().empty());        // Linux: ni el de prueba queda en /dev/shm
+        CHECK(my_shm_mappings() == 0);             // Linux: nadie en este proceso los tiene mapeados
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -420,6 +600,8 @@ int main() {
     test_bloque_se_ve_desde_otro_mapeo();
     test_pool_reutiliza_y_crece();
     test_pool_tiene_tope();
+    test_tope_segun_la_ram();
+    test_el_pool_se_encoge();
     test_un_megabyte_sin_copiar();
     test_los_bloques_vuelven();
     test_guardar_muchos_no_deja_a_nadie_sin_datos();
@@ -430,6 +612,7 @@ int main() {
     test_agmen_shm_0_va_por_tcp();
     test_la_vista_sobrevive_al_suscriptor();
     test_tipado_por_memoria_compartida();
+    test_rafaga_4k_y_luego_nada();
     if (g_failures == 0) std::printf("test_shm: todo bien\n");
     return g_failures == 0 ? 0 : 1;
 }

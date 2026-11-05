@@ -404,8 +404,14 @@ class Fanout:
         c.step(self.pool)
 
     def _loop(self) -> None:
+        last_trim = time.monotonic()
         while not self._closed:
             with self.lock:
+                # D6 a′: una vez por segundo, los bloques sin usar 5 s se liberan.
+                now = time.monotonic()
+                if self.pool is not None and now - last_trim >= 1.0:
+                    last_trim = now
+                    self.pool.trim(now)
                 alive = [c for c in self.conns.values() if c.alive]
                 rs = [c.sock for c in alive]
                 ws = [c.sock for c in alive if c.wants_write()]
@@ -612,8 +618,12 @@ class Listener:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         except OSError:
             pass
-        self.sock.bind(bind)
-        self.sock.listen(16)
+        try:
+            self.sock.bind(bind)
+            self.sock.listen(16)
+        except OSError:
+            self.sock.close()
+            raise
         self.sock.setblocking(False)
         self.shm = shm
         self.conns: dict[socket.socket, _Incoming] = {}

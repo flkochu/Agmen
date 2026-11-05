@@ -49,7 +49,7 @@ ahora puedes ignorarlos.
 - Cada `[[node]]` es un programa: C++, Python o lo que sea.
 - Las rutas son **relativas al archivo**, así que funciona desde cualquier carpeta.
 - `python` se reemplaza por tu Python, así que el mismo archivo funciona en
-  Windows, Linux y macOS.
+  Windows y Linux.
 
 ## 2. Córrelo
 

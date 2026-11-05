@@ -50,7 +50,7 @@ No se implementan todos ya, pero ninguna decisión debe impedirlos.
 | d | Misma interfaz para simulación y robot real |
 | e | Nodos a frecuencias distintas sin bloquearse (IA a 10 Hz, motores a 1 kHz) |
 | f | IoT por puentes, fuera del núcleo; a futuro, versión para microcontroladores |
-| g | Núcleo en C++; Windows, Linux y macOS |
+| g | Núcleo en C++; Windows y Linux, x86-64 y ARM64 |
 | h | **Interfaz gráfica que no le cueste recursos al robot**: web, local, red o nube (RFC 0002) |
 | i | **Un solo comando** levanta todo el robot; se monitorea y se controla desde el navegador, sin abrir una terminal por nodo (RFC 0003) |
 
@@ -65,7 +65,7 @@ No se implementan todos ya, pero ninguna decisión debe impedirlos.
 7. **El robot no dibuja.** La interfaz vive en el navegador.
 8. **Discovery que funcione en cualquier red**, sin depender de multicast.
 9. **Cero boilerplate y fácil de compilar**, para que la comunidad pueda contribuir.
-10. **Multiplataforma verificada por CI**, con advertencias tratadas como errores.
+10. **Multiplataforma verificada por CI** (Windows y Linux, x86-64 y ARM64), con advertencias tratadas como errores.
 11. **Un comando, una pantalla.** Si para usar algo hay que abrir otra terminal, es un bug de experiencia.
 12. **Paralelo entre nodos, y medido.** Ningún recurso compartido (terminal, panel, red) puede hacer que un nodo espere a otro. `scripts/paralelo_check.py` lo comprueba en el CI.
 13. **Un actuador, un dueño a la vez.** Si varias fuentes mandan al mismo actuador, un árbitro con prioridades (`[[mux]]`) decide, y nunca inventa comandos.
@@ -106,13 +106,37 @@ contribuir. Lo que mueve mensajes rápido sigue en C++.
 **Lo que no cambió:** el formato de mensajes. Los nodos de Python funcionaron
 igual antes y después de la migración, sin tocarlos. Es la regla 3 en acción.
 
+### Sin macOS (2026-11-05, desde 0.11.1)
+
+Agmen deja de tener soporte oficial en macOS: se prueba y se publica para
+**Windows y Linux, x86-64 y ARM64**. Lo recomendó el profesor asesor.
+
+**Por qué:**
+- **El CI de macOS fallaba por tiempos, no por Agmen.** Sus máquinas virtuales
+  despiertan tarde de cada `sleep` y a veces se congelan: `py_bench.py` y
+  `run_smoke.py` fallaron así en el PR #1, en el release de 0.11.0 y en el PR
+  #2, y cada vez hubo que volver a correrlas. Una falla que
+  se ignora "porque es macOS" esconde la que sí es de verdad (regla 1).
+- **Dos wheels de más** (Intel y Apple Silicon), las más lentas del release.
+- **Los robots no corren en macOS.** Lo que se usa es Linux (Raspberry Pi,
+  Jetson, una computadora a bordo) y Windows para desarrollar y para el panel.
+
+**Lo que no cambia:**
+- No se borra código: `src/shm.cpp` y `src/net.cpp` siguen siendo POSIX, y
+  `src/platform.cpp` conserva su `#ifdef __APPLE__`. Compilar en macOS debería
+  seguir funcionando, pero ya nadie lo revisa.
+- En macOS, `pip install agmen` instala la wheel de **Python puro**
+  (`py3-none-any`): todo funciona igual, más lento.
+- Si alguien quiere volver a probar en macOS, basta agregar `macos-latest` al
+  CI; la decisión se puede revisar si hay quien la mantenga.
+
 ## 5. Estado contra la visión
 
 ### Se queda igual
 - La prueba de interoperabilidad (C++ ↔ Python), ahora también con vectores de prueba byte por byte.
 - El hash del esquema con errores claros, los números de secuencia y el lazo por *deadline*.
 - El payload de `ImuSample`: el de v0 ya era layout `compact` válido y no cambió.
-- CI en Windows, Linux, macOS y Linux ARM64.
+- CI en Windows, Linux y Linux ARM64 (y en macOS hasta 0.11.0, §4).
 
 ### Cambió en 0.4.0 (RFC 0001, nivel 1)
 - ✅ Header de 32 B → sobre de 64 B con `header_len`, `encoding`, `flags`, `topic_id`, `source_id`, `t_data`/`t_pub` y reloj.
@@ -132,7 +156,7 @@ igual antes y después de la migración, sin tocarlos. Es la regla 3 en acción.
 
 ### Cambió en 0.9.0 (RFC 0007, nivel 6)
 - ✅ El paquete de Python usa el núcleo de C++ (`agmen._core`): formato, topics, `Node` y reloj son el mismo código que en C++. Codificar ~5× y publicar ~4.5× más rápido; el `Node` de Python espera sin el GIL. NumPy sin copias con `agmen.load(..., numpy=True)`.
-- ✅ `pip install agmen` no compila nada en Windows, Linux x64 y ARM64, macOS Intel y Apple Silicon (wheels con cibuildwheel); en lo demás, Python puro.
+- ✅ `pip install agmen` no compila nada en Windows, Linux x64 y ARM64 (wheels con cibuildwheel; también en macOS Intel y Apple Silicon hasta 0.11.0); en lo demás, Python puro.
 
 ### Cambió en 0.10.0 (RFC 0008, nivel 7)
 - ✅ Codificación `arrow` (RFC 0001 §6) implementada en C++, Python y JavaScript con los mismos bytes; `pyarrow` la valida en el CI. Un mensaje con `string`, `bytes`, `T[]` o `tensor<T,N>` va en arrow y por **TCP** (hasta 64 MiB); los demás siguen en `compact` por UDP sin cambiar un byte.
@@ -141,9 +165,9 @@ igual antes y después de la migración, sin tocarlos. Es la regla 3 en acción.
 
 ### Cambió en 0.11.0 (RFC 0009, nivel 8)
 - ✅ Requisito a, sin copias: en la misma computadora, un mensaje `arrow` de 4 KiB o más se escribe **una vez** en memoria compartida (la bandera `SHM` del sobre, reservada desde el RFC 0001) y por TCP viaja solo un descriptor de 72 bytes. En Python llega como `memoryview` / `numpy.ndarray` que apunta a la memoria del publicador. Medido (`bench/shm_vs_tcp.py`): 1920×1080 con 3 suscriptores, de 5.1 ms a 1.9 ms de latencia; 4K con 3 suscriptores, de 21.9 ms a 5.8 ms, y la cámara pasa de 28.9 ms a 2.6 ms de CPU por imagen (con TCP paga una copia por suscriptor).
-- ✅ Propia y sin dependencias (D1: no iceoryx2), en C++ y en Python puro con los mismos bytes; Linux, macOS y Windows. El publicador es el dueño de los bloques y el suscriptor se los devuelve por la conexión TCP al soltarlos: un proceso que muere no deja candados, y si es el suscriptor, sus bloques vuelven en el acto.
+- ✅ Propia y sin dependencias (D1: no iceoryx2), en C++ y en Python puro con los mismos bytes; Linux y Windows (y macOS hasta 0.11.0). El publicador es el dueño de los bloques y el suscriptor se los devuelve por la conexión TCP al soltarlos: un proceso que muere no deja candados, y si es el suscriptor, sus bloques vuelven en el acto.
 - ✅ Misma computadora se **prueba**, no se adivina (D4): si el suscriptor no puede abrir la memoria del publicador (otra computadora, otro contenedor, otro usuario), todo sigue por TCP y se avisa una vez. Con dirección fija, el suscriptor escucha TCP en la IP que pide: las imágenes ya cruzan la red.
-- ✅ Nadie frena a nadie y la memoria tiene tope (D6): hasta 4 mensajes (o 64 MiB) prestados por suscriptor; hasta 8 (o 128 MiB) sin devolver por conexión, y luego D3 del RFC 0008; un pool de hasta 512 MiB por publicador. Los bloques de un nodo que se cayó los borra el siguiente que arranca.
+- ✅ Nadie frena a nadie y la memoria tiene tope (D6): hasta 4 mensajes (o 64 MiB) prestados por suscriptor; hasta 8 (o 128 MiB) sin devolver por conexión, y luego D3 del RFC 0008; un pool por publicador de hasta 512 MiB, ¼ de la RAM o ½ de `/dev/shm` (lo menor; 0.11.1), que se encoge solo: un bloque sin usar 5 s se libera. Los bloques de un nodo que se cayó los borra el siguiente que arranca.
 
 ### Falta (siguientes niveles)
 - Grabación y reproducción; exportar a Parquet (nivel 9).
@@ -200,7 +224,7 @@ iceoryx2).
 | **5 ✅** (0.8.0) | **Executor y tiempo (RFC 0006): `Node` con `every`, `subscribe`/`on`, colas (`queue = 1` el más reciente), grupos con su propio hilo, ciclos saltados contados y avisados; reloj de Agmen real/sim con `/clock`, pausa, paso y velocidad desde el panel** | d, e |
 | 6 ✅ (0.9.0) | Python de primera clase (RFC 0007): `agmen._core` compilado con nanobind (formato, topics, `Node`, reloj), wheels para 5 sistemas y Python puro de respaldo, NumPy sin copias | b |
 | **7 ✅** (0.10.0) | **Datos grandes (RFC 0008): codificación `arrow` (`string`, `bytes`, `T[]`, `tensor<T,N>`) por TCP con descarte por suscriptor lento; `agmen.msgs.Imagen`; cámara en el panel y en Foxglove. El puente del panel se quedó en Python: medido, cumple** | a, b, h |
-| **8 ✅** (0.11.0) | **Memoria compartida (RFC 0009): imágenes y tensores sin copiar entre procesos de la misma computadora, en C++ y Python, Linux, Windows y macOS; se prueba si se puede y si no, TCP; préstamos que se devuelven solos y con tope; `bench/shm_vs_tcp.py`** | a, b, g |
+| **8 ✅** (0.11.0) | **Memoria compartida (RFC 0009): imágenes y tensores sin copiar entre procesos de la misma computadora, en C++ y Python, Linux y Windows (y macOS hasta 0.11.0); se prueba si se puede y si no, TCP; préstamos que se devuelven solos y con tope; `bench/shm_vs_tcp.py`** | a, b, g |
 | 9 | Grabación y reproducción; exportar a Parquet; reproducir en la web | c |
 | 10 | Abstracción sim/real; `robot.toml` con nodos en varias máquinas (el lanzador básico ya existe desde 0.2.0) | d, i |
 | 11 | Red multi-máquina, sincronización de relojes y **`agmen-web` en la nube** (relay con autenticación) | c, h |
@@ -225,8 +249,9 @@ iceoryx2).
 | Prioridades de tiempo real (`SCHED_FIFO`, afinidad de núcleo) por grupo | Cuando un robot lo necesite |
 | Unidades y rangos en los esquemas, que muestre el panel | Cuando se diseñe (cambia el anuncio del RFC 0001) |
 | Nombre y alcance del visualizador propio | Nivel 14 |
-| Memoria compartida propia o con iceoryx2 por debajo | Propuesta: propia ([RFC 0009](rfc/0009-memoria-compartida.md) D1), implementada en 0.11.0 con las siete opciones recomendadas. Falta que Adán la acepte |
+| ~~Memoria compartida propia o con iceoryx2 por debajo~~ | ✅ [RFC 0009](rfc/0009-memoria-compartida.md) aceptado el 2026-11-05: propia (D1); D1–D5 y D7 = a, D6 = a′ (tope según la RAM y el pool se encoge, en 0.11.1) |
 | Préstamo para escribir directo en la memoria compartida (la cámara llena el bloque) | Cuando se mida que la copia del publicador estorba (RFC 0009 §4) |
+| ~~¿Seguir probando y publicando para macOS?~~ | ✅ No, desde 0.11.1 (2026-11-05, §4): Windows y Linux, x86-64 y ARM64; en macOS, Python puro |
 | Formato de grabación: MCAP o propio sobre Arrow IPC | Nivel 9 |
 
 ## Fuentes

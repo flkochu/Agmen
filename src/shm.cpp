@@ -22,6 +22,9 @@
 #  include <sys/mman.h>
 #  include <sys/stat.h>
 #  include <unistd.h>
+#  ifdef __linux__
+#    include <sys/statvfs.h>
+#  endif
 #endif
 
 namespace agmen::shm {
@@ -84,22 +87,61 @@ bool process_alive(long pid) {
 }
 #endif
 
-std::uint64_t parse_u64(const std::string& raw, std::uint64_t fallback) {
-    if (raw.empty()) return fallback;
-    char* end = nullptr;
-    const double v = std::strtod(raw.c_str(), &end);
-    if (end == raw.c_str() || v <= 0) return fallback;
-    return static_cast<std::uint64_t>(v);
-}
-
 }  // namespace
 
 bool enabled() { return platform::env("AGMEN_SHM") != "0"; }
 
-std::size_t limit_bytes() {
-    const auto mb = parse_u64(platform::env("AGMEN_SHM_MB"), 512);
-    return static_cast<std::size_t>(mb) << 20;
+namespace {
+
+std::atomic<std::uint64_t> g_fake_ram{0};
+constexpr std::uint64_t kMaxPool = std::uint64_t{512} << 20;
+
+// El tope y de dónde sale (D6 a′).
+std::pair<std::uint64_t, const char*> limit() {
+    // AGMEN_SHM_MB acepta fracciones ("0.5"), como en Python.
+    const std::string raw = platform::env("AGMEN_SHM_MB");
+    char* end = nullptr;
+    const double mb = raw.empty() ? 0.0 : std::strtod(raw.c_str(), &end);
+    if (mb > 0 && end != raw.c_str()) {
+        return {static_cast<std::uint64_t>(std::min(mb, 1048576.0) * 1048576.0), "AGMEN_SHM_MB"};
+    }
+    std::pair<std::uint64_t, const char*> out{kMaxPool, "el máximo"};
+    if (const auto ram = physical_ram(); ram > 0 && ram / 4 < out.first) out = {ram / 4, "¼ de la RAM"};
+    if (const auto dev = devshm_size(); dev > 0 && dev / 2 < out.first) out = {dev / 2, "½ de /dev/shm"};
+    return out;
 }
+
+}  // namespace
+
+std::uint64_t physical_ram() {
+    if (const auto fake = g_fake_ram.load(); fake > 0) return fake;
+#ifdef _WIN32
+    MEMORYSTATUSEX st{};
+    st.dwLength = sizeof st;
+    return GlobalMemoryStatusEx(&st) ? static_cast<std::uint64_t>(st.ullTotalPhys) : 0;
+#else
+    const long pages = ::sysconf(_SC_PHYS_PAGES);
+    const long page = ::sysconf(_SC_PAGESIZE);
+    if (pages <= 0 || page <= 0) return 0;
+    return static_cast<std::uint64_t>(pages) * static_cast<std::uint64_t>(page);
+#endif
+}
+
+std::uint64_t devshm_size() {
+#ifdef __linux__
+    struct statvfs st {};
+    if (::statvfs("/dev/shm", &st) != 0) return 0;
+    return static_cast<std::uint64_t>(st.f_blocks) * static_cast<std::uint64_t>(st.f_frsize);
+#else
+    return 0;
+#endif
+}
+
+void detail::fake_physical_ram(std::uint64_t bytes) { g_fake_ram.store(bytes); }
+
+std::size_t limit_bytes() { return static_cast<std::size_t>(limit().first); }
+
+std::string limit_reason() { return limit().second; }
 
 // ---------------------------------------------------------------------------
 // Avisos, descriptor y cabecera
@@ -416,11 +458,15 @@ Segment Pool::create(std::size_t size) {
 
 std::optional<Descriptor> Pool::write(std::uint64_t generation, wire::ByteView payload, std::string& why) {
     const std::size_t need = kHeaderLen + payload.size();
+    // El bloque libre que se usó más recientemente (sus páginas siguen
+    // calientes): así, después de una ráfaga, los demás se quedan sin usar y
+    // trim() los libera.
     std::optional<std::size_t> pick;
-    for (std::size_t k = 0; k < blocks_.size() && !pick; ++k) {
-        const std::size_t i = (next_ + k) % blocks_.size();
+    for (std::size_t i = 0; i < blocks_.size(); ++i) {
         const auto& b = blocks_[i];
-        if (b.holders == 0 && b.segment && b.segment->size() >= need) pick = i;
+        if (b.holders == 0 && b.segment && b.segment->size() >= need && (!pick || b.order > blocks_[*pick].order)) {
+            pick = i;
+        }
     }
     if (!pick) {
         const std::size_t size = round_up(need + need / 8, kBlockRound);
@@ -434,9 +480,9 @@ std::optional<Descriptor> Pool::write(std::uint64_t generation, wire::ByteView p
         }
         std::size_t total = bytes();
         if (small && blocks_[*small].segment) total -= blocks_[*small].segment->size();
-        if (total + size > limit_bytes()) {
-            why = "se llegó al tope de memoria compartida de este publicador (" + mib(limit_bytes()) +
-                  " MiB, AGMEN_SHM_MB)";
+        if (const auto [cap, reason] = limit(); total + size > cap) {
+            why = "se llegó al tope de memoria compartida de este publicador (" + mib(static_cast<std::size_t>(cap)) +
+                  " MiB, " + reason + "; cámbialo con AGMEN_SHM_MB)";
             return std::nullopt;
         }
         try {
@@ -454,7 +500,7 @@ std::optional<Descriptor> Pool::write(std::uint64_t generation, wire::ByteView p
         }
     }
     auto& b = blocks_[*pick];
-    next_ = *pick + 1;
+    touch(b);
     std::memcpy(b.segment->data() + kHeaderLen, payload.data(), payload.size());
     BlockHeader{owner_, generation, payload.size(), b.segment->size()}.write(b.segment->data());
     // Lo escrito se ve antes que el descriptor (que sale después por TCP).
@@ -474,6 +520,7 @@ std::optional<Descriptor> Pool::probe(std::string& why) {
             return std::nullopt;
         }
     }
+    probe_used_ = std::chrono::steady_clock::now();
     return Descriptor{probe_->name(), probe_->size(), kHeaderLen, 0, 0, 0xffffffffU};
 }
 
@@ -482,10 +529,62 @@ void Pool::hold(std::uint32_t slot) {
 }
 
 void Pool::release(std::uint32_t slot) {
-    if (slot < blocks_.size() && blocks_[slot].holders > 0) --blocks_[slot].holders;
+    if (slot < blocks_.size() && blocks_[slot].holders > 0) {
+        if (--blocks_[slot].holders == 0) touch(blocks_[slot]);
+    }
 }
 
-std::size_t Pool::blocks() const { return blocks_.size(); }
+void Pool::touch(Block& b) {
+    b.used = std::chrono::steady_clock::now();
+    b.order = ++tick_;
+}
+
+std::size_t Pool::trim(std::chrono::steady_clock::time_point now) {
+    std::size_t freed = 0;
+    for (auto& b : blocks_) {
+        if (b.segment && b.holders == 0 && now - b.used >= kIdleFree) {
+            freed += b.segment->size();
+            b.segment.reset();   // borra el nombre y suelta la memoria
+        }
+    }
+    if (probe_ && now - probe_used_ >= kIdleFree) {
+        freed += probe_->size();
+        probe_.reset();          // se vuelve a crear si llega otro suscriptor
+    }
+    // Las ranuras vacías del final se quitan (nadie las nombra: holders == 0).
+    while (!blocks_.empty() && !blocks_.back().segment && blocks_.back().holders == 0) blocks_.pop_back();
+    if (freed > 0) rewrite_registry();
+    return freed;
+}
+
+void Pool::rewrite_registry() const {
+    if (registry_.empty()) return;
+    try {
+        std::vector<std::string> names;
+        for (const auto& b : blocks_) {
+            if (b.segment) names.push_back(b.segment->name());
+        }
+        if (probe_) names.push_back(probe_->name());
+        std::error_code ec;
+        if (names.empty()) {
+            std::filesystem::remove(registry_, ec);   // create() lo vuelve a escribir
+            return;
+        }
+        const std::string tmp = registry_ + ".tmp";
+        {
+            std::ofstream out(tmp, std::ios::trunc);
+            for (const auto& n : names) out << n << '\n';
+        }
+        std::filesystem::rename(tmp, registry_, ec);
+    } catch (...) {
+        // el registro es para limpiar si el proceso muere: nunca tumba al nodo
+    }
+}
+
+std::size_t Pool::blocks() const {
+    return static_cast<std::size_t>(
+        std::count_if(blocks_.begin(), blocks_.end(), [](const Block& b) { return b.segment != nullptr; }));
+}
 
 std::size_t Pool::bytes() const {
     std::size_t n = 0;

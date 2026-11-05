@@ -37,7 +37,7 @@ de C++ **o** de Python. No necesitas saber de redes ni de ROS.
 
 ## Convenciones
 
-- Los comandos están escritos para **Linux/macOS**. En **Windows (PowerShell)**:
+- Los comandos están escritos para **Linux**. En **Windows (PowerShell)**:
   - `./build/bin/programa` → `build\bin\programa.exe`
   - `python3` → `python`
 - 💡 son consejos, ⚠ son advertencias y 🧪 son experimentos para entender

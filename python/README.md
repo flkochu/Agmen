@@ -5,10 +5,10 @@
 forma rápida, confiable y con marca de tiempo.
 
 Desde la 0.9, este paquete trae **el mismo núcleo de C++** ya compilado para
-Windows, Linux x64, Linux ARM64 (Raspberry Pi) y macOS (Intel y Apple
-Silicon), con Python 3.11 o más nuevo: pip no compila nada. En otras
-computadoras se instala la versión de Python puro, que funciona igual pero más
-lenta. `agmen --version` dice cuál usas.
+Windows, Linux x64 y Linux ARM64 (Raspberry Pi), con Python 3.11 o más nuevo:
+pip no compila nada. En otras computadoras se instala la versión de Python
+puro, que funciona igual pero más lenta. En macOS (sin soporte oficial desde
+0.11.1) también se instala la de Python puro. `agmen --version` dice cuál usas.
 
 ```bash
 pip install agmen            # pip install agmen[numpy] para arreglos como NumPy
