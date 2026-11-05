@@ -36,6 +36,11 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   registrados antes de arrancar la cámara, y el contador corre hasta que la
   cámara termina (antes vivía 4 s fijos; si la cámara tardaba en arrancar, el
   contador ya se había ido).
+- `paralelo_check`, grupos: "solo" y "otro grupo" se corren dos veces,
+  alternadas, y cuenta la mejor. En una máquina que no sostiene 1 kHz ni con
+  el control solo (macOS del CI: 454 a 859 ciclos perdidos de 3000, según la
+  vuelta), se exige que con la IA en otro grupo quede más cerca de "solo" que
+  de "mismo grupo"; donde sí lo sostiene, sigue el 10 % de siempre.
 
 ## [0.10.0] — 2026-11-04
 
