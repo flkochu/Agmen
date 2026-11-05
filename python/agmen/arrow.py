@@ -61,6 +61,21 @@ def _align(n: int, a: int) -> int:
     return -(-n // a) * a
 
 
+_MAX_NOMINAL = 2**63 - 1
+
+
+def _shape_ok(shape, size: int) -> bool:
+    """¿NumPy puede tener un arreglo con esta forma? Las dimensiones (un 0
+    cuenta como 1) por el tamaño del elemento deben caber en 63 bits, aunque
+    haya un 0 (la misma regla en C++ y agmen.js)."""
+    nominal = size
+    for d in shape:
+        if d < 0:
+            return False
+        nominal *= d or 1
+    return nominal <= _MAX_NOMINAL
+
+
 # ---------------------------------------------------------------------------
 # Árbol de Arrow (tipos de almacenamiento) a partir del de Agmen
 # ---------------------------------------------------------------------------
@@ -456,6 +471,8 @@ def _tensor_parts(v, n: _Node, where: str):
         if d < 0:
             raise S.SchemaError(f"'{where}': forma inválida {shape}")
         want *= d
+    if not _shape_ok(shape, S.PRIMITIVES[n.child.prim][1]):
+        raise S.SchemaError(f"'{where}': su forma {shape} tiene más elementos de los que se pueden contar")
     got = _seq_len(data, where)
     if got != want:
         raise S.SchemaError(f"'{where}' tiene forma {shape} ({want} elementos) y trae {got} datos")
@@ -590,9 +607,13 @@ def _read_metadata(payload: memoryview):
     nodes = vec(1)
     bufs = vec(2)
     body_start = 8 + meta_len
-    if body_start + body_len > len(payload):
+    if body_len < 0 or body_start + body_len > len(payload):
         raise _wire_error(f"arrow mal formado: el cuerpo mide {body_len} bytes y solo llegaron "
                           f"{len(payload) - body_start}")
+    # Como en C++ (src/arrow.cpp): un número negativo aquí llegaba hasta
+    # struct.unpack_from o hasta un índice fuera de la tupla.
+    if rows < 0 or rows > len(payload):
+        raise _wire_error("arrow mal formado: número de filas inválido")
     return rows, nodes, bufs, payload[body_start:body_start + body_len]
 
 
@@ -614,6 +635,9 @@ class _Reader:
         self.i_node += 1
         if nulls:
             raise _wire_error("arrow: llegaron valores nulos y los esquemas de Agmen no los tienen")
+        # Cada valor ocupa al menos un bit del cuerpo (el mismo límite que C++).
+        if length < 0 or length > len(self.body) * 8 + 64:
+            raise _wire_error("arrow mal formado: una columna con un largo inválido")
         if want is not None and length != want:
             raise _wire_error(f"arrow mal formado: una columna mide {length} y debía medir {want}")
         return length
@@ -633,6 +657,8 @@ class _Reader:
         b = self.buf(4 * (length + 1))
         offs = struct.unpack_from(f"<{length + 1}i", b)
         prev = offs[0]
+        if prev < 0:   # en Python data[-2:2] no falla: toma bytes del final, en silencio
+            raise _wire_error("arrow mal formado: offsets negativos")
         for o in offs:
             if o < prev:
                 raise _wire_error("arrow mal formado: offsets que van hacia atrás")
@@ -715,7 +741,7 @@ class _Reader:
                 want = 1
                 for d in shape:
                     want *= d
-                if want != offs[i + 1] - offs[i] or any(d < 0 for d in shape):
+                if want != offs[i + 1] - offs[i] or not _shape_ok(shape, c.size):
                     raise _wire_error(f"arrow: un tensor de forma {shape} trae {offs[i + 1] - offs[i]} datos")
                 part = raw[offs[i] * c.size:offs[i + 1] * c.size]
                 out.append(_tensor_value(part, c, shape, self.np_tensor))
@@ -737,7 +763,10 @@ def _tensor_value(raw: memoryview, c: _Node, shape: tuple, np):
            "f32": "f", "f64": "d"}[c.prim]
     if 0 in shape:
         return Tensor(shape, [])
-    return raw.cast("B").cast(fmt, shape)
+    # Sin NumPy: un agmen.Tensor (lo que promete el RFC 0008), con los datos como
+    # una vista sin copiar. Antes era un memoryview con forma, y el codificador
+    # no lo aceptaba: un tensor recibido no se podía volver a publicar.
+    return Tensor(shape, raw.cast("B").cast(fmt))
 
 
 # ---------------------------------------------------------------------------

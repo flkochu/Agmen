@@ -4,10 +4,13 @@
 // Las pruebas de tiempo tienen márgenes amplios: el CI (sobre todo macOS)
 // despierta tarde. La medición fina está en scripts/node_check.py.
 #include <agmen/agmen.hpp>
+#include <agmen/msgs.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -197,6 +200,106 @@ void test_sim_clock() {
     CHECK(ck::now_ns() == 1'500'000'000);
 }
 
+
+// Un anuncio de esquema con miles de structs anidados, en un solo paquete.
+agmen::wire::Bytes nested_announcement(int levels, const std::string& topic) {
+    namespace w = agmen::wire;
+    std::string body = "u8 x";
+    for (int k = 0; k < levels; ++k) body = "S" + std::to_string(k) + "{" + body + "} f";
+    const std::string text = "agmen/1 Raiz{" + body + "}";
+    const std::string payload = topic + "\n" + text;
+    const w::Envelope env{.encoding = w::Encoding::Announcement,
+                          .schema_id = w::fnv1a64(text),
+                          .topic_id = w::topic_id(topic),
+                          .source_id = 7,
+                          .payload_len = static_cast<std::uint32_t>(payload.size())};
+    w::Bytes out;
+    env.write_to(out);
+    out.insert(out.end(), payload.begin(), payload.end());
+    return out;
+}
+
+void send_all(agmen::net::TcpStream& tcp, std::span<const std::uint8_t> data) {
+    const auto end = std::chrono::steady_clock::now() + 2s;
+    while (!data.empty() && std::chrono::steady_clock::now() < end) {
+        const auto n = tcp.send_some(data);
+        if (n < 0) return;
+        data = data.subspan(static_cast<std::size_t>(n));
+        if (n == 0) std::this_thread::sleep_for(1ms);
+    }
+}
+
+// Lo del PR #2: un paquete mal hecho no detiene al nodo; se descarta, se
+// cuenta y se avisa. Antes, un anuncio con miles de structs anidados tumbaba
+// al proceso (se acababa la pila), y cualquier WireError de una suscripción
+// detenía spin(). El Node corre en un std::thread: en Windows su pila es la
+// normal de 1 MB, donde 300 niveles ya bastaban para tumbarlo.
+void test_invalid_packets(int port) {
+    namespace w = agmen::wire;
+    using agmen::msgs::Imagen;
+    using agmen::wire::ImuSample;
+    const std::string udp_at = "127.0.0.1:" + std::to_string(port);
+    const std::string tcp_at = "127.0.0.1:" + std::to_string(port + 1);
+    agmen::Node node("prueba");
+    std::atomic<int> imus{0}, images{0};
+    node.subscribe<ImuSample>(udp_at, [&](const ImuSample&) { ++imus; }, {.queue = 64});
+    node.subscribe<Imagen>(tcp_at, [&](const Imagen& m) { images += m.width == 4 ? 1 : 0; }, {.queue = 64});
+    std::atomic<bool> stopped_by_error{false};
+    std::string error;
+    std::thread spinner([&] {
+        try {
+            node.spin_for(3s);
+        } catch (const std::exception& e) {
+            error = e.what();
+            stopped_by_error = true;
+        }
+    });
+
+    // 1. Por UDP: anuncios con 300 y 2500 niveles, basura y un sobre de otro tipo.
+    auto udp = agmen::net::UdpSocket::bind("127.0.0.1:0");
+    udp.connect(udp_at);
+    std::this_thread::sleep_for(50ms);
+    for (const int levels : {300, 2500}) (void)udp.send(nested_announcement(levels, "/t"));
+    const std::vector<std::uint8_t> junk(100, 0xAB);
+    (void)udp.send(junk);
+    // 2. Por TCP: un Imagen con el sobre correcto y un payload arrow que no se puede leer.
+    auto tcp = agmen::net::TcpStream::connect(agmen::net::Address::resolve(tcp_at), 2s);
+    const std::vector<std::uint8_t> bad_arrow(256, 0x5A);
+    const w::Envelope env{.encoding = w::Encoding::Arrow,
+                          .schema_id = w::schema_id_v<Imagen>,
+                          .source_id = 8,
+                          .payload_len = static_cast<std::uint32_t>(bad_arrow.size())};
+    w::Bytes packet;
+    env.write_to(packet);
+    packet.insert(packet.end(), bad_arrow.begin(), bad_arrow.end());
+    send_all(tcp, packet);
+    std::this_thread::sleep_for(200ms);
+
+    // 3. Y luego mensajes buenos: deben llegar todos.
+    agmen::Publisher<ImuSample> imu_pub(udp_at, "/t");
+    agmen::Publisher<Imagen> img_pub(tcp_at, "/camara");
+    const Imagen img{.width = 4, .height = 1, .encoding = "mono8", .step = 4, .data = {1, 2, 3, 4}};
+    for (int i = 0; i < 20 && imus < 5; ++i) {
+        (void)imu_pub.publish(ImuSample{});
+        (void)img_pub.publish(img);
+        std::this_thread::sleep_for(20ms);
+    }
+    std::this_thread::sleep_for(300ms);
+    node.stop();
+    spinner.join();
+
+    const auto subs = node.subscriptions();
+    std::uint64_t invalid = 0;
+    for (const auto& s : subs) invalid += s.invalid;
+    std::printf("  paquetes inválidos: %llu descartados; luego llegaron %d ImuSample y %d Imagen%s%s\n",
+                static_cast<unsigned long long>(invalid), imus.load(), images.load(),
+                stopped_by_error ? "; spin() falló: " : "", error.c_str());
+    CHECK(!stopped_by_error);
+    CHECK(imus >= 5);
+    CHECK(images >= 1);
+    CHECK(invalid >= 4);   // 2 anuncios, la basura y el arrow ilegible
+}
+
 }  // namespace
 
 int main() {
@@ -209,6 +312,7 @@ int main() {
     test_queue(1, 47811);
     test_queue(5, 47812);
     test_sample_callback(47813);
+    test_invalid_packets(47814);   // y 47815
     test_exception();
     test_stop();
     test_sim_clock();

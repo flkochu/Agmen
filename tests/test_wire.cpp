@@ -7,6 +7,7 @@
 
 #include <agmen/arrow.hpp>
 #include <agmen/hubproto.hpp>
+#include <agmen/layout.hpp>
 #include <agmen/wire.hpp>
 
 #include <cstdio>
@@ -155,6 +156,16 @@ static_assert(!schema::check("A{tensor<f32,0> t}").ok);
 static_assert(!schema::check("A{tensor<f32,33> t}").ok);
 static_assert(!schema::check("A{str s}").ok);
 static_assert(!schema::check("agmen/1 A{f32 x}").ok);                    // sin prefijo en kSchema
+// Límites (tests/fuzz): sin desbordes ni números que den la vuelta.
+static_assert(!schema::check("A{tensor<f32,18446744073709551617> t}").ok);  // antes: 2^64 + 1 → 1, aceptado
+static_assert(!schema::check("A{u8[1000000][1000000][1000000][1000000] x;u8 y}").ok);  // antes: el tamaño daba la vuelta
+static_assert(schema::check("A{u8[1048576][2047] x}").size == 2146435072);   // 2 GiB - 1 MiB: cabe
+static_assert(!schema::check("A{u8[1048576][2048] x}").ok);                   // 2 GiB: ya no
+static_assert(!schema::check("A{u8[][1048576][4096] x}").ok);                 // el u8[1048576][4096] de adentro es fijo
+static_assert(schema::check("A{u8[4096][1048576][] x}").variable);            // aquí nada fijo pasa de 2 GiB
+static_assert(schema::check("A{u8[1048576][][4096] x}").variable);
+static_assert(schema::check("A{u8[1048576][1500] a;u8[1048576][1500] b;string s}").variable);  // variable: no se suman
+static_assert(!schema::check("A{u8[1048576][1500] a;u8[1048576][1500] b}").ok);               // fijo: 3 GiB
 
 // --- Vectores compartidos con Python -------------------------------------------
 
@@ -333,6 +344,95 @@ void sobre_mas_largo_se_salta() {
     CHECK(d.envelope.seq == 5 && d.message == sample());
 }
 
+// A{A{A{...u8 x} a} a}: `levels` structs, uno dentro de otro.
+std::string nested(int levels) {
+    std::string s;
+    for (int k = 0; k < levels; ++k) s += "A{";
+    s += "u8 x";
+    for (int k = 1; k < levels; ++k) s += "} a";
+    return s + "}";
+}
+
+// A{u8[1][1]...[1] x}: un struct y `dims` arreglos.
+std::string dims(int n) {
+    std::string s = "A{u8";
+    for (int k = 0; k < n; ++k) s += "[1]";
+    return s + " x}";
+}
+
+// Anuncio con el schema_id y el topic_id bien puestos, con cualquier texto.
+Bytes raw_announcement(const std::string& text) {
+    Envelope env;
+    env.encoding = Encoding::Announcement;
+    env.schema_id = fnv1a64(text);
+    env.topic_id = topic_id("/t");
+    const std::string payload = "/t\n" + text;
+    env.payload_len = static_cast<std::uint32_t>(payload.size());
+    Bytes b;
+    env.write_to(b);
+    b.insert(b.end(), payload.begin(), payload.end());
+    return b;
+}
+
+void anuncio_con_structs_anidados_no_tumba_al_receptor() {
+    // Antes: read_announcement leía el esquema con schema::check, recursivo y
+    // con 4 KB de pila por nivel: ~2000 structs anidados (un anuncio de 10 KB,
+    // un solo datagrama) desbordaban la pila de cualquier Subscriber de C++.
+    for (const int levels : {33, 3000, 20000}) {
+        const Bytes b = raw_announcement("agmen/1 " + nested(levels));
+        const auto [env, payload] = Envelope::read_from(b);
+        expect_error([&] { (void)read_announcement(env, payload); }, WireError::Kind::BadAnnouncement,
+                     "demasiados niveles");
+    }
+    const Bytes ok = raw_announcement("agmen/1 " + nested(32));
+    const auto [env, payload] = Envelope::read_from(ok);
+    CHECK(read_announcement(env, payload).schema == "agmen/1 " + nested(32));
+}
+
+void anuncio_con_300_campos_se_acepta() {
+    // Antes: check() guardaba como mucho 256 nombres por struct y rechazaba
+    // un esquema que Python y Layout sí aceptan.
+    std::string text = "agmen/1 A{";
+    for (int k = 0; k < 300; ++k) text += (k != 0 ? ";u8 f" : "u8 f") + std::to_string(k);
+    text += "}";
+    const Bytes b = raw_announcement(text);
+    const auto [env, payload] = Envelope::read_from(b);
+    CHECK(read_announcement(env, payload).schema == text);
+    CHECK(schema::check(std::string_view(text).substr(kSchemaPrefix.size())).size == 300);
+    // y el repetido se sigue viendo, aunque esté lejos o dentro de otro struct
+    CHECK(!schema::check("A{u8 a;B{u8 a;u8 b} c;u8 d;u8 a}").ok);
+    CHECK(schema::check("A{u8 a;B{u8 a;u8 b} c;u8 b}").ok);
+}
+
+void limites_iguales_en_check_y_layout() {
+    // Los dos lectores de C++ (y Python, python/test_fuzz.py) aceptan lo mismo.
+    const auto both = [](const std::string& text) {
+        bool layout_ok = true;
+        try {
+            (void)agmen::schema::Layout(text);
+        } catch (const agmen::schema::SchemaError&) {
+            layout_ok = false;
+        }
+        const bool check_ok = schema::check(text).ok;
+        if (check_ok != layout_ok) std::fprintf(stderr, "  check y Layout no coinciden: %s\n", text.substr(0, 60).c_str());
+        return check_ok && layout_ok;
+    };
+    CHECK(both(nested(32)));
+    CHECK(!both(nested(33)));
+    CHECK(both(dims(31)));     // 1 struct + 31 arreglos = 32 niveles
+    CHECK(!both(dims(32)));
+    CHECK(both("A{" + nested(31) + " b}"));
+    CHECK(!both("A{" + nested(32) + " b}"));
+    CHECK(both("A{u8[1048576][2047] x}"));
+    CHECK(!both("A{u8[1048576][2048] x}"));
+    CHECK(both("A{u8[1048576][1500] a;u8[1048576][1500] b;string s}"));
+    CHECK(both("A{string s;u8[1048576][1500] a;u8[1048576][1500] b}"));
+    CHECK(!both("A{u8[1048576][1500] a;u8[1048576][1500] b}"));
+    CHECK(!both("A{u8[1000000][1000000][1000000][1000000] x;u8 y}"));
+    CHECK(!both("A{tensor<f32,18446744073709551617> t}"));
+    CHECK(both("A{tensor<f32,32> t}"));
+}
+
 void anuncio_alterado_se_rechaza() {
     auto b = encode_announcement(schema_text<MotorCommand>(), "/cmd", Envelope{});
     b.back() = 'X';  // cambiamos el texto: ya no coincide con su schema_id
@@ -398,6 +498,9 @@ int main() {
         {"rechaza_lo_invalido", rechaza_lo_invalido},
         {"sobre_mas_largo_se_salta", sobre_mas_largo_se_salta},
         {"anuncio_alterado_se_rechaza", anuncio_alterado_se_rechaza},
+        {"anuncio_con_structs_anidados_no_tumba_al_receptor", anuncio_con_structs_anidados_no_tumba_al_receptor},
+        {"anuncio_con_300_campos_se_acepta", anuncio_con_300_campos_se_acepta},
+        {"limites_iguales_en_check_y_layout", limites_iguales_en_check_y_layout},
         {"source_id_aleatorio", source_id_aleatorio},
         {"hub_protocolo", hub_protocolo},
     };

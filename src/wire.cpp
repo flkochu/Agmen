@@ -5,6 +5,7 @@
 #include <cstdlib>
 
 #include "agmen/clock.hpp"
+#include "agmen/layout.hpp"
 #include "agmen/platform.hpp"
 
 #include <chrono>
@@ -186,11 +187,19 @@ Announcement read_announcement(const Envelope& env, ByteView payload) {
     Announcement a{std::string(text.substr(0, nl)), std::string(text.substr(nl + 1))};
     if (fnv1a64(a.schema) != env.schema_id) throw bad("el texto no coincide con su schema_id");
     if (topic_id(a.topic) != env.topic_id) throw bad("el topic no coincide con su topic_id");
-    const std::string_view schema = a.schema;
-    if (!schema.starts_with(kSchemaPrefix) || !schema::check(schema.substr(kSchemaPrefix.size())).ok) {
-        throw bad("'" + a.schema + "' no es un esquema canónico");
+    // Lo lee el mismo lector que usan las herramientas para decodificar (y
+    // Python, wire.read_announcement): con los límites del protocolo y sin
+    // recursión sin fondo, porque este texto viene de la red.
+    std::string why;
+    try {
+        if (agmen::schema::Layout(a.schema).text() == a.schema) return a;
+    } catch (const agmen::schema::SchemaError& e) {
+        const std::string_view msg = e.what();
+        why = ": " + std::string(msg.substr(0, msg.find('\n')));  // el motivo, sin el texto repetido
     }
-    return a;
+    constexpr std::size_t kShown = 120;
+    const std::string shown = a.schema.size() > kShown ? a.schema.substr(0, kShown) + "…" : a.schema;
+    throw bad("'" + shown + "' no es un esquema canónico" + why);
 }
 
 void ImuSample::encode_payload(Bytes& out) const {

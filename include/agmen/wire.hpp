@@ -119,6 +119,23 @@ constexpr std::uint64_t topic_id(std::string_view topic) noexcept {
 
 namespace schema {
 
+// Límites de un esquema (RFC 0001, anexo A). Son los mismos en C++
+// (este revisor y agmen::schema::Layout), Python (agmen.schema) y JavaScript
+// (agmen.js): un esquema que uno acepta lo aceptan todos. Los esquemas también
+// llegan de la red, en los anuncios, y sin límites un anuncio de pocos KB
+// bastaba para tumbar al receptor.
+
+/// N de un arreglo T[N]: de 1 a 1048576.
+inline constexpr std::size_t kMaxArray = std::size_t{1} << 20;
+/// N de tensor<T,N>: de 1 a 32 dimensiones.
+inline constexpr std::size_t kMaxTensorDims = 32;
+/// Niveles de structs y arreglos anidados: cada struct y cada [N] o [] es un
+/// nivel. `Pose{Vec3{f64 x} p}` usa 2 y `A{f32[2][3] m}`, 3.
+inline constexpr std::size_t kMaxDepth = 32;
+/// Lo más que mide un tipo de tamaño fijo (y por tanto un mensaje compact):
+/// 2 GiB - 1. Para datos más grandes: bytes, T[] o tensor<T,N>.
+inline constexpr std::uint64_t kMaxFixedSize = 0x7FFFFFFF;
+
 /// Resultado de revisar un esquema: si es canónico y cuánto mide en compact.
 struct Check {
     bool ok = false;
@@ -135,6 +152,7 @@ struct Parser {
     std::size_t i = 0;
     bool ok = true;
     std::size_t err = 0;
+    std::size_t depth = 0;  ///< structs abiertos (la recursión no pasa de kMaxDepth)
 
     constexpr void fail() {
         if (ok) err = i;
@@ -164,9 +182,10 @@ struct Parser {
 };
 
 struct SizeAlign {
-    std::size_t size = 0;
+    std::uint64_t size = 0;  ///< hasta kMaxFixedSize + 1 (más que eso ya es error)
     std::size_t align = 1;
     bool variable = false;
+    std::size_t height = 0;  ///< niveles de structs y arreglos (un primitivo: 0)
 };
 
 constexpr std::size_t primitive_size(std::string_view n) {
@@ -175,6 +194,29 @@ constexpr std::size_t primitive_size(std::string_view n) {
     if (n == "i32" || n == "u32" || n == "f32") return 4;
     if (n == "i64" || n == "u64" || n == "f64" || n == "time" || n == "duration") return 8;
     return 0;
+}
+
+constexpr std::uint64_t align_up(std::uint64_t n, std::size_t a) { return (n + a - 1) / a * a; }
+
+/// ¿`name` ya es el nombre de un campo en `fields`? `fields` es el texto de
+/// los campos ya leídos de un struct (canónico: "T a;U b;..."), así que cada
+/// nombre es lo que hay entre el espacio y un ';' fuera de las llaves. Sin
+/// guardar los nombres: no hay límite de campos y la pila no crece.
+constexpr bool has_field(std::string_view fields, std::string_view name) {
+    std::size_t depth = 0;
+    for (std::size_t k = 0; k < fields.size(); ++k) {
+        const char c = fields[k];
+        if (c == '{') {
+            ++depth;
+        } else if (c == '}') {
+            --depth;
+        } else if (c == ';' && depth == 0) {
+            std::size_t b = k;
+            while (b > 0 && fields[b - 1] != ' ') --b;
+            if (fields.substr(b, k - b) == name) return true;
+        }
+    }
+    return false;
 }
 
 constexpr SizeAlign parse_struct(Parser& p);
@@ -187,8 +229,9 @@ constexpr SizeAlign parse_type(Parser& p) {
     if (p.peek() == '{') {  // struct anidado
         p.i = start;
         t = parse_struct(p);
+        if (!p.ok) return {};
     } else if (name == "string" || name == "bytes") {
-        t = {0, 1, true};
+        t = {0, 1, true, 0};
     } else if (name == "tensor") {  // tensor<T,N>, T numérico, N de 1 a 32
         p.expect('<');
         const std::string_view e = p.ident();
@@ -204,11 +247,14 @@ constexpr SizeAlign parse_type(Parser& p) {
         std::size_t n = 0;
         while (p.peek() >= '0' && p.peek() <= '9') {
             n = n * 10 + static_cast<std::size_t>(p.peek() - '0');
+            if (n > kMaxTensorDims) {  // aquí, antes de que el número dé la vuelta
+                p.fail();
+                return {};
+            }
             ++p.i;
         }
-        if (n > 32) p.fail();
         p.expect('>');
-        t = {0, 1, true};
+        t = {0, 1, true, 0};
     } else {
         const std::size_t sz = primitive_size(name);
         if (sz == 0) {
@@ -216,13 +262,21 @@ constexpr SizeAlign parse_type(Parser& p) {
             p.fail();
             return {};
         }
-        t = {sz, sz, false};
+        t = {sz, sz, false, 0};
     }
-    while (p.ok && p.peek() == '[') {  // T[N], T[N][M], T[]...
+    // T[N], T[N][M], T[]...: se leen todas y se arman de derecha a izquierda,
+    // como en Layout: f32[2][3] = 2 arreglos de f32[3]; f32[][3] = lista de f32[3].
+    std::array<std::size_t, kMaxDepth> dims{};  // 0 = T[]
+    std::size_t count = 0;
+    while (p.ok && p.peek() == '[') {
+        if (t.height + count + 1 > kMaxDepth) {
+            p.fail();
+            return {};
+        }
         ++p.i;
         if (p.peek() == ']') {  // T[]: tamaño variable
             ++p.i;
-            t.variable = true;
+            dims[count++] = 0;
             continue;
         }
         if (p.peek() == '0' || p.peek() < '0' || p.peek() > '9') {
@@ -233,41 +287,56 @@ constexpr SizeAlign parse_type(Parser& p) {
         while (p.peek() >= '0' && p.peek() <= '9') {
             n = n * 10 + static_cast<std::size_t>(p.peek() - '0');
             ++p.i;
-            if (n > (std::size_t{1} << 20)) {
+            if (n > kMaxArray) {
                 p.fail();
                 return {};
             }
         }
         p.expect(']');
-        t.size *= n;
+        dims[count++] = n;
     }
+    for (std::size_t k = count; k-- > 0;) {
+        if (dims[k] == 0) {
+            t.variable = true;
+        } else if (!t.variable) {
+            if (t.size > kMaxFixedSize / dims[k]) {  // el arreglo pasaría de 2 GiB
+                p.fail();
+                return {};
+            }
+            t.size *= dims[k];
+        }
+    }
+    t.height += count;
     return t;
 }
 
 constexpr SizeAlign parse_struct(Parser& p) {
+    if (++p.depth > kMaxDepth) {
+        p.fail();
+        return {};
+    }
     (void)p.ident();
     p.expect('{');
-    std::array<std::string_view, 256> names{};
-    std::size_t count = 0;
-    SizeAlign st{0, 1, false};
+    const std::size_t fields_at = p.i;
+    SizeAlign st{0, 1, false, 0};
     while (p.ok) {
         const SizeAlign f = parse_type(p);
         p.expect(' ');
         const std::size_t name_at = p.i;
         const std::string_view fname = p.ident();
         if (!p.ok) break;
-        for (std::size_t k = 0; k < count; ++k) {
-            if (names[k] == fname) {  // campo repetido
-                p.i = name_at;
-                p.fail();
-            }
+        if (has_field(p.s.substr(fields_at, name_at - fields_at), fname)) {  // campo repetido
+            p.i = name_at;
+            p.fail();
+            break;
         }
-        if (count == names.size()) p.fail();
-        if (!p.ok) break;
-        names[count++] = fname;
         if (f.variable) st.variable = true;
-        st.size = (st.size + f.align - 1) / f.align * f.align + f.size;
+        // Sin desbordes: cada campo mide como mucho kMaxFixedSize y la suma se
+        // detiene en kMaxFixedSize + 1. Solo cuenta si al final el struct es fijo.
+        st.size = align_up(st.size, f.align) + f.size;
+        if (st.size > kMaxFixedSize) st.size = kMaxFixedSize + 1;
         st.align = f.align > st.align ? f.align : st.align;
+        if (f.height + 1 > st.height) st.height = f.height + 1;
         if (p.peek() == ';') {
             ++p.i;
         } else {
@@ -275,7 +344,9 @@ constexpr SizeAlign parse_struct(Parser& p) {
             break;
         }
     }
-    st.size = (st.size + st.align - 1) / st.align * st.align;
+    --p.depth;
+    st.size = align_up(st.size, st.align);
+    if (p.ok && (st.height > kMaxDepth || (!st.variable && st.size > kMaxFixedSize))) p.fail();
     return st;
 }
 
@@ -283,14 +354,15 @@ constexpr SizeAlign parse_struct(Parser& p) {
 
 /// Revisa que `body` (sin el prefijo "agmen/1 ") sea un esquema canónico:
 /// tipos f32/u8/..., un solo espacio entre tipo y nombre, ';' entre campos y
-/// sin ';' final. Ej.: "MotorCommand{f32 left;f32 right}".
+/// sin ';' final. Ej.: "MotorCommand{f32 left;f32 right}". Con los límites de
+/// arriba (kMaxDepth, kMaxFixedSize...).
 constexpr Check check(std::string_view body) {
     detail::Parser p{body};
     const detail::SizeAlign st = detail::parse_struct(p);
     if (p.ok && p.i != body.size()) p.fail();  // sobra texto
     if (!p.ok) return Check{false, 0, 1, p.err, false};
     if (st.variable) return Check{true, 0, 1, 0, true};
-    return Check{true, st.size, st.align, 0, false};
+    return Check{true, static_cast<std::size_t>(st.size), st.align, 0, false};
 }
 
 }  // namespace schema

@@ -29,6 +29,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -75,6 +76,7 @@ struct SubscriptionStats {
     std::uint64_t replaced = 0;    ///< queue = 1: los que reemplazó uno más nuevo
     std::uint64_t dropped = 0;     ///< queue = N: los que se descartaron por cola llena
     std::int64_t worst_run_ns = 0;
+    std::uint64_t invalid = 0;     ///< paquetes mal hechos que se descartaron (y se avisaron)
 };
 
 /// Un "buzón" con el último valor, seguro entre hilos (para compartir datos
@@ -125,6 +127,23 @@ private:
 
 namespace detail {
 
+/// Un payload que llegó entero pero no se pudo decodificar. La lanza el
+/// decodificador de subscribe<M> (no tu función): el nodo descarta el mensaje,
+/// lo cuenta y lo avisa, como un paquete inválido, y sigue.
+class InvalidPayload : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+template <class M>
+M decode_or_invalid(const Payload& payload) {
+    try {
+        return M::decode_payload(payload);
+    } catch (const wire::WireError& e) {
+        throw InvalidPayload(e.what());
+    }
+}
+
 std::int64_t steady_now_ns();
 void note_max(std::atomic<std::int64_t>& slot, std::int64_t value);
 
@@ -150,11 +169,21 @@ public:
     std::size_t queue = 1;
     std::atomic<std::uint64_t> received{0}, delivered{0}, replaced{0}, dropped{0};
     std::atomic<std::int64_t> worst_run_ns{0};
+    /// Paquetes inválidos que se descartaron (y se avisaron) en vez de detener al nodo.
+    std::atomic<std::uint64_t> invalid{0};
 
 private:
+    /// Un paquete que no se pudo leer (un anuncio o un payload mal hecho): se
+    /// cuenta y se avisa (el primero en el acto, luego uno cada 5 s con la
+    /// cuenta); el nodo sigue.
+    void note_invalid(const std::string& why);
+
     SubscriberCore sub_;
     Callback cb_;
     std::deque<RawSample> q_;
+    std::uint64_t unreported_ = 0;
+    std::chrono::steady_clock::time_point last_warn_{};
+    bool warned_ = false;
 };
 
 struct NodeImpl;
@@ -187,13 +216,13 @@ public:
         detail::RawSub::Callback fn;
         if constexpr (std::is_invocable_v<F&, const Sample<M>&>) {
             fn = [f = std::forward<F>(cb)](const RawSample& r) mutable {
-                const Sample<M> s{r.envelope, M::decode_payload(r.payload), r.from};
+                const Sample<M> s{r.envelope, detail::decode_or_invalid<M>(r.payload), r.from};
                 f(s);
             };
         } else {
             static_assert(std::is_invocable_v<F&, const M&>,
                           "subscribe<M>: la función debe recibir const agmen::Sample<M>& o const M&");
-            fn = [f = std::forward<F>(cb)](const RawSample& r) mutable { f(M::decode_payload(r.payload)); };
+            fn = [f = std::forward<F>(cb)](const RawSample& r) mutable { f(detail::decode_or_invalid<M>(r.payload)); };
         }
         subscribe_raw(where, TypeInfo::of<M>(), std::move(fn), opt);
     }
