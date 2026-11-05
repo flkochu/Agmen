@@ -175,6 +175,9 @@ En el nivel 2 entra **lo local** (una máquina). Lo de varias máquinas se
 diseña aquí para no cerrarle la puerta, pero se implementa y se prueba en
 el nivel 11, junto con la sincronización de relojes. Hasta entonces, para
 mandar a otra máquina se usa el modo dirección (`"192.168.1.20:7500"`).
+(El [RFC 0011](0011-sim-real-y-varias-computadoras.md), propuesto, lo
+adelanta al nivel 10: las computadoras se declaran en `[[machine]]` y las
+tablas viajan por la conexión de `agmen agent`.)
 
 ## 4. Decisiones aprobadas
 
