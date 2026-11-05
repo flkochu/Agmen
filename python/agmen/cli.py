@@ -1,7 +1,7 @@
 """El comando `agmen`.
 
     agmen run [robot.toml]     lanza todo el robot + panel web, con un solo comando
-    agmen web                  solo el panel web (sin administrar nodos)
+    agmen web [ARCHIVO.mcap]   solo el panel web (sin administrar nodos), o para ver una grabación
     agmen mux --out ... --in   prioridad de comandos: ¿quién manda al motor?
     agmen echo IP:PUERTO       muestra cualquier mensaje que llegue (sin código del tipo)
     agmen hub                  el directorio de topics (agmen run lo arranca solo)
@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 import threading
@@ -235,12 +236,30 @@ def cmd_web(args) -> int:
         return 2
     teleop = Teleop(args.teleop, 1.0) if args.teleop else None
     http = _http_for(args.http, args.red)
+    rec_note = ""
+    if args.archivo:                        # RFC 0010: ver una grabación en el navegador
+        from .record import describe, size_text
+
+        try:
+            d = describe(args.archivo)
+        except (OSError, ValueError) as e:
+            print(f"[agmen web] ✗ {args.archivo}: {e}", file=sys.stderr)
+            return 1
+        if d["profile"] != "agmen" and not any(t["encoding"] == "agmen" for t in d["topics"]):
+            print(f"[agmen web] ✗ {args.archivo} no es una grabación de Agmen (perfil '{d['profile']}'): "
+                  f"ábrela en Foxglove", file=sys.stderr)
+            return 1
+        rec_note = (f"grabación {os.path.basename(args.archivo)} ({size_text(d['size'])}, {d['seconds']:.1f} s, "
+                    f"{len(d['topics'])} topics): se abre sola en el panel")
     try:
-        panel = Panel(http, args.listen, "", None, teleop, token=args.token, allow_origins=args.allow_origin)
+        panel = Panel(http, args.listen, "", None, teleop, token=args.token, allow_origins=args.allow_origin,
+                      recording_file=args.archivo)
     except OSError as e:
         print(f"no se pudo abrir el panel en {http}: {e}", file=sys.stderr)
         return 1
     panel.start(open_browser=not args.no_browser)
+    if rec_note:
+        print(f"[agmen web] {rec_note}")
     print(f"[agmen web] recibiendo Agmen de todos los topics y de udp://{args.listen}")
     for line in _panel_lines(panel):
         print(f"[agmen web] {line}")
@@ -293,7 +312,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="no arrancar este nodo (ej. el de la cámara, si --play la reproduce)")
     p.set_defaults(func=cmd_run)
 
-    p = sub.add_parser("web", help="solo el panel web (sin administrar nodos)")
+    p = sub.add_parser("web", help="solo el panel web (sin administrar nodos); o una grabación: agmen web vuelta1.mcap")
+    p.add_argument("archivo", nargs="?", metavar="ARCHIVO.mcap",
+                   help="una grabación para ver en el navegador (gráficas, cámara y barra de tiempo)")
     p.add_argument("--listen", default="127.0.0.1:7400", help="dónde recibir mensajes Agmen (UDP)")
     p.add_argument("--http", default="127.0.0.1:8080", help="dónde servir el panel")
     p.add_argument("--teleop", metavar="TOPIC|IP:PUERTO",

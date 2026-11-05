@@ -210,5 +210,40 @@ class TestArchivoDanado(unittest.TestCase):
             _mcap.Writer(os.path.join(tempfile.mkdtemp(), "x.mcap"), compression="zstd")
 
 
+
+class TestVector(unittest.TestCase):
+    """tests/vectors/grabacion.mcap (RFC 0010 §6.6): la leen igual el lector de Agmen, la
+    biblioteca oficial y el de JavaScript (test_panel_js), y el escritor la escribe igual."""
+
+    VECTOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests", "vectors", "grabacion.mcap")
+
+    def test_el_escritor_escribe_los_mismos_bytes(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "generar_mcap", os.path.join(os.path.dirname(self.VECTOR), "generar_mcap.py"))
+        gen = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gen)
+        out = os.path.join(tempfile.mkdtemp(), "otra.mcap")
+        from pathlib import Path
+
+        gen.build(Path(out))
+        self.assertEqual(read(out), read(self.VECTOR), "si cambió el formato a propósito: python tests/vectors/generar_mcap.py")
+
+    def test_lo_mismo_que_la_biblioteca_oficial(self):
+        with _mcap.Reader(self.VECTOR) as r:
+            ours = [(m.channel.topic, m.log_time, m.publish_time, m.sequence, bytes(m.data)) for m in r.messages()]
+            self.assertTrue(r.complete)
+            self.assertEqual(len(r.chunks), 4)
+            self.assertEqual(dict(r.metadata)["agmen.perdidos"], {"/imu antes de llegar": "1", "total": "1"})
+        self.assertEqual(len(ours), 15)
+        if make_reader is None:
+            self.skipTest("sin la biblioteca oficial de mcap")
+        with open(self.VECTOR, "rb") as f:
+            theirs = [(c.topic, m.log_time, m.publish_time, m.sequence, m.data)
+                      for _, c, m in make_reader(f).iter_messages(log_time_order=True)]
+        self.assertEqual(ours, theirs)
+
+
 if __name__ == "__main__":
     unittest.main()

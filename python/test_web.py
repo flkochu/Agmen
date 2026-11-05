@@ -313,6 +313,154 @@ class TestHombreMuerto(PanelCase):
         self.assertFalse(any("ALTO" in line["text"] for line in logs))
 
 
+class TestGrabaciones(unittest.TestCase):
+    """RFC 0010: agmen web vuelta1.mcap (el navegador la lee por partes) y el botón ⏺."""
+
+    def setUp(self):
+        import tempfile
+
+        from agmen import _mcap
+
+        self.dir = tempfile.mkdtemp()
+        self.path = str(Path(self.dir) / "vuelta.mcap")
+        w = _mcap.Writer(self.path, chunk_size=2000, compression=self.compression)
+        cid = w.add_channel("/cmd", "agmen", w.add_schema("MotorCommand", "agmen", MotorCommand.SCHEMA_TEXT.encode()))
+        for i in range(200):
+            w.add_message(cid, 1000 + i, 1000 + i, i, wire.encode(MotorCommand(i, -i), i, 1000 + i, topic="/cmd"))
+        w.close()
+        self.data = Path(self.path).read_bytes()
+        self.panel = Panel("127.0.0.1:0", None, "prueba", None, None, topics=False, recording_file=self.path)
+        self.panel.start()
+        self.base = f"http://127.0.0.1:{self.panel.port}"
+
+    compression = None
+
+    def tearDown(self):
+        self.panel.shutdown()
+
+    def get(self, path, headers=None):
+        req = urllib.request.Request(self.base + path, headers=headers or {})
+        try:
+            r = urllib.request.urlopen(req, timeout=5)
+            return r.status, r.read(), r.headers
+        except urllib.error.HTTPError as e:
+            return e.code, e.read(), e.headers
+
+    def test_por_partes(self):
+        st = json.loads(self.get("/api/state")[1])
+        self.assertEqual(st["recording_file"], {"name": "vuelta.mcap", "size": len(self.data)})
+        self.assertIsNone(st["recording"], "agmen web no graba")
+        status, body, h = self.get("/api/recording")
+        self.assertEqual((status, body), (200, self.data))
+        self.assertEqual(h["Accept-Ranges"], "bytes")
+        status, body, h = self.get("/api/recording", {"Range": "bytes=10-109"})
+        self.assertEqual((status, body, h["Content-Range"]), (206, self.data[10:110], f"bytes 10-109/{len(self.data)}"))
+        self.assertEqual(self.get("/api/recording", {"Range": "bytes=-37"})[1], self.data[-37:])
+        self.assertEqual(self.get("/api/recording", {"Range": f"bytes={len(self.data) - 5}-"})[1], self.data[-5:])
+        self.assertEqual(self.get("/api/recording", {"Range": f"bytes={len(self.data)}-"})[0], 416)
+        js = self.get("/mcap.js")[1]
+        self.assertIn(b"AgmenMcap", js)
+
+    def test_un_chunk_ya_descomprimido(self):
+        from agmen import _mcap
+
+        with _mcap.Reader(self.path) as r:
+            first = r.chunks[0]
+            raw = bytes(r._chunk_data(first))
+        status, body, _ = self.get(f"/api/recording/chunk?start={first.start}")
+        self.assertEqual((status, body), (200, raw))
+        self.assertEqual(self.get("/api/recording/chunk?start=3")[0], 404)
+        self.assertEqual(self.get("/api/recording/chunk?start=x")[0], 400)
+
+    def test_grabar_sin_agmen_run_lo_dice(self):
+        req = urllib.request.Request(self.base + "/api/record", data=b'{"action": "start"}', method="POST",
+                                     headers={"X-Agmen": "1", "Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertIn("agmen run", json.loads(ctx.exception.read())["error"])
+
+
+class TestGrabacionesZstd(TestGrabaciones):
+    compression = "zstd"
+
+    def setUp(self):
+        from agmen import _mcap
+
+        try:
+            _mcap._need("zstd")
+        except _mcap.McapError:
+            self.skipTest("sin zstandard")
+        super().setUp()
+
+
+class TestBotonGrabar(unittest.TestCase):
+    """El botón ⏺ del panel con agmen run: graba con el RecordingControl del Launcher."""
+
+    def test_empezar_y_detener(self):
+        import os
+        import tempfile
+
+        from agmen import hub as hubmod
+        from agmen.record import RecordingControl
+
+        hub = hubmod.Hub("127.0.0.1:0", log=lambda t: None)
+        old = os.environ.get("AGMEN_HUB")
+        os.environ["AGMEN_HUB"] = f"127.0.0.1:{hub.sock.getsockname()[1]}"
+        stop = threading.Event()
+        threading.Thread(target=hub.serve, args=(stop,), daemon=True).start()
+
+        class FakeLauncher:   # lo que el panel usa de un Launcher
+            def __init__(self):
+                from agmen.run import LogBook
+                self.logs = LogBook()
+                self.recording = RecordingControl(["/cmd"], directory=tempfile.mkdtemp(), out=io_null())
+
+            def nodes_info(self):
+                return []
+
+        def io_null():
+            import io
+            return io.StringIO()
+
+        launcher = FakeLauncher()
+        panel = Panel("127.0.0.1:0", None, "prueba", launcher, None, topics=False)
+        panel.start()
+        pub = Publisher(MotorCommand, "/cmd")
+        try:
+            c = ws.connect(f"ws://127.0.0.1:{panel.port}/ws", protocols=["agmen.ws.v1"])
+            c.sock.settimeout(5)
+            c.send_text(json.dumps({"op": "record", "action": "start"}))
+            end = time.monotonic() + 5
+            while not (launcher.recording.info()["recording"] and pub.subscribers) and time.monotonic() < end:
+                time.sleep(0.02)
+            for i in range(10):
+                pub.publish(MotorCommand(i, i))
+                time.sleep(0.01)
+            time.sleep(0.3)
+            st = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{panel.port}/api/state", timeout=5).read())
+            self.assertTrue(st["recording"]["recording"])
+            c.send_text(json.dumps({"op": "record", "action": "stop"}))
+            end = time.monotonic() + 5
+            while launcher.recording.info()["recording"] and time.monotonic() < end:
+                time.sleep(0.02)
+            time.sleep(0.2)
+            info = launcher.recording.info()
+            self.assertFalse(info["recording"])
+            self.assertEqual(info["messages"], 10)
+            self.assertTrue(Path(info["file"]).is_file())
+            c.close()
+        finally:
+            pub.close()
+            if launcher.recording.rec is not None:
+                launcher.recording.stop()
+            panel.shutdown()
+            stop.set()
+            if old is None:
+                os.environ.pop("AGMEN_HUB", None)
+            else:
+                os.environ["AGMEN_HUB"] = old
+
+
 class TestReglaDeLaClave(unittest.TestCase):
     def test_en_la_red_siempre_hay_clave(self):
         from agmen.panel.server import choose_token, is_loopback

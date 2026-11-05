@@ -2,6 +2,7 @@
 
 1. `agmen run robot.toml --record`: el robot corre (un IMU de C++ a 100 Hz y
    un nodo de Python que lo escucha) y todo se graba en grabaciones/*.mcap.
+   Con el botón del panel (⏹ y ⏺, por su API) se cierra y se empieza otra.
 2. `agmen info` resume la grabación: /imu, ImuSample, sin pérdidas, y el
    robot.toml adjunto.
 3. `agmen run robot.toml --play archivo.mcap --skip imu`: sin el sensor, la
@@ -21,6 +22,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -86,6 +88,15 @@ def get_state():
     return json.loads(urllib.request.urlopen(URL + "/api/state", timeout=5).read())
 
 
+def post(path, body=None):
+    req = urllib.request.Request(URL + path, data=json.dumps(body or {}).encode(), method="POST",
+                                 headers={"X-Agmen": "1", "Content-Type": "application/json"})
+    try:
+        return urllib.request.urlopen(req, timeout=5).status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
 def node(state, name):
     return next(n for n in state["nodes"] if n["name"] == name)
 
@@ -139,7 +150,15 @@ def main():
               wait_for(lambda: (s := get_state()) and node(s, "imu")["state"] == "corriendo"
                        and node(s, "eco")["state"] == "corriendo"))
         check("el panel recibe el IMU a ~100 Hz", wait_for(lambda: get_state()["stats"]["rate_hz"] > 50))
+        check("el panel dice que graba (⏺)", wait_for(lambda: get_state()["recording"]["recording"]))
         time.sleep(3.0)
+        check("⏹ desde el panel cierra el archivo",
+              post("/api/record", {"action": "stop"}) == 200
+              and wait_for(lambda: not (r := get_state()["recording"])["recording"] and r["messages"] > 250),
+              str(get_state().get("recording")))
+        check("⏺ desde el panel graba otra vez (en otro archivo)",
+              post("/api/record", {"action": "start"}) == 200 and wait_for(lambda: get_state()["recording"]["recording"]))
+        time.sleep(1.5)
     finally:
         out = stop(p)
         outs.append(out)
@@ -151,10 +170,15 @@ def main():
     e = eco_line(out)
     check("en vivo, el nodo usa el reloj real", e is not None and e[0] == "real" and e[1] == wire.CLOCK_REAL, str(e))
     files = sorted((WORK / "grabaciones").glob("*.mcap"))
-    check("quedó un .mcap en grabaciones/ (junto al robot.toml)", len(files) == 1, str(files))
+    check("quedaron dos .mcap en grabaciones/ (junto al robot.toml)", len(files) == 2, str(files))
     if not files:
         return finish(outs)
     path = files[0]
+    if len(files) == 2:
+        r = subprocess.run([sys.executable, "-m", "agmen", "info", str(files[1])], env=ENV, capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=60, check=False)
+        check("la del botón también está completa (Ctrl+C la cerró)", r.returncode == 0 and "/imu" in r.stdout
+              and "le falta el índice" not in r.stdout, r.stdout + r.stderr)
 
     # 2. agmen info.
     r = subprocess.run([sys.executable, "-m", "agmen", "info", str(path)], env=ENV, capture_output=True,
@@ -179,6 +203,8 @@ def main():
                        and node(s, "eco")["state"] == "corriendo"))
         check("el reloj del panel es el de la grabación (replay)",
               wait_for(lambda: get_state()["clock"]["mode"] == "replay"))
+        check("con --play también se puede grabar desde el panel (no graba solo)",
+              get_state()["recording"] is not None and not get_state()["recording"]["recording"])
         check("el panel recibe la grabación a ~100 Hz", wait_for(lambda: get_state()["stats"]["rate_hz"] > 50))
         c = get_state()["clock"]
         check("el reloj va en la hora de la grabación",

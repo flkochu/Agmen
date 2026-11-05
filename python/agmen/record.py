@@ -650,7 +650,7 @@ def cmd_info(args) -> int:
         print(f"  MCAP de otra herramienta (perfil '{d['profile']}', {d['library']})")
     if rec:
         print(f"  grabado con Agmen {rec.get('version', '?')} en {rec.get('computadora', '?')}, "
-              f"reloj {rec.get('reloj', '?')}, {rec.get('inicio', '')}")
+              f"reloj {rec.get('reloj', '?')}" + (f", {rec['inicio']}" if rec.get("inicio") else ""))
     rows = []
     for t in d["topics"]:
         rate = t["messages"] / d["seconds"] if d["seconds"] > 0 else 0.0
@@ -662,7 +662,8 @@ def cmd_info(args) -> int:
         print("  (sin mensajes)")
     lost = {k: v for k, v in d["lost"].items() if k != "total"}
     if lost:
-        print(f"  ⚠ se perdieron {d['lost'].get('total', '?')} mensajes al grabar:")
+        total = d["lost"].get("total", "?")
+        print("  ⚠ se perdió 1 mensaje al grabar:" if total == "1" else f"  ⚠ se perdieron {total} mensajes al grabar:")
         for k, v in sorted(lost.items()):
             print(f"    {k}: {v}")
     elif d["lost"]:

@@ -292,6 +292,8 @@ class Bridge:
             return None
         if op == "clock":
             return self.panel.clock_action(str(m.get("action", "")), m.get("value"))
+        if op == "record":
+            return self.panel.record_action(str(m.get("action", "")))
         if op == "node":
             if self.panel.launcher is None:
                 return "este panel no administra nodos (usa 'agmen run')"
