@@ -432,6 +432,7 @@ de topics viajan por la conexión del agente, que ya tiene clave.
 - ros2_control, *mock components* (`mock_components/GenericSystem`: copia los comandos a los estados; `mock_sensor_commands`): <https://control.ros.org/jazzy/doc/ros2_control/hardware_interface/doc/mock_components_userdoc.html>
 - gz_ros2_control (`gz_ros2_control/GazeboSimSystem` como *hardware* de ros2_control dentro de Gazebo): <https://control.ros.org/jazzy/doc/gz_ros2_control/doc/index.html>
 - `/clock` de Gazebo a ROS 2 con `ros_gz_bridge`: <https://docs.ros.org/en/jazzy/p/ros_gz_bridge/>; `use_sim_time` nodo por nodo y la queja de relojes inconsistentes: <https://discourse.openrobotics.org/t/ros2-use-sim-time-leads-to-inconsistent-clocks/42030>
+- ROS 1, la etiqueta `<machine>` de `roslaunch` (SSH, `env-loader`): <https://wiki.ros.org/roslaunch/XML/machine>
 - ROS 2 y los nodos en otra computadora (sin `<machine>`; `ssh` dentro del *launch*, systemd): <https://answers.ros.org/question/364152/remotely-launch-nodes-in-ros2>; `launch_remote` (SSH + `screen`): <https://github.com/NU-MSR/launch_remote>
 - dora-rs en varias computadoras (`dora cluster up`, `cluster.yml`, `deploy: machine`, `distribute`, Zenoh, seguridad): <https://github.com/dora-rs/dora/blob/main/docs/distributed-deployment.md>
 - Viam, componentes `fake` (ej. el brazo): <https://docs.viam.com/operate/reference/components/arm/fake> y la máquina como partes (principal y sub-partes): <https://docs.viam.com/architecture>
