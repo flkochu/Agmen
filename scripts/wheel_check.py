@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 for _stream in (sys.stdout, sys.stderr):
@@ -81,7 +82,7 @@ def main() -> int:
     node.close()
     check("Node: every() y on()", ticks[0] == 20 and len(seen) >= 15, f"{ticks[0]} ticks, {len(seen)} recibidos")
 
-    # Datos grandes (RFC 0008): una Imagen de 640×480 (921 600 bytes) por TCP, sin copiar al leerla.
+    # Datos grandes (RFC 0008): una Imagen de 640×480 (921 600 bytes), sin copiar al leerla.
     from agmen.msgs import Imagen, ImagenComprimida
 
     sub = agmen.Subscriber(Imagen, "127.0.0.1:0")
@@ -89,7 +90,7 @@ def main() -> int:
     pixels = bytes(range(256)) * 3600
     pub.publish(Imagen(width=640, height=480, encoding="bgr8", step=1920, data=pixels, frame_id="wheel"))
     s = sub.receive(2.0)
-    check("Imagen de 640×480 por TCP (arrow)", s is not None and s.envelope.encoding == wire.ENC_ARROW
+    check("Imagen de 640×480 (arrow)", s is not None and s.envelope.encoding == wire.ENC_ARROW
           and (s.message.width, s.message.encoding) == (640, "bgr8") and bytes(s.message.data) == pixels,
           "" if s else "no llegó")
     import pickle
@@ -111,6 +112,16 @@ def main() -> int:
         img = Imagen.from_array(np.zeros((2, 2), np.uint8))
         check("Imagen.from_array", (img.encoding, img.step, len(img.data)) == ("mono8", 2, 4))
     check("ImagenComprimida", ImagenComprimida(data=b"\xff\xd8").format == "jpeg")
+    # Memoria compartida (RFC 0009): en la misma computadora, la siguiente ya no se copia.
+    shared = None
+    end = time.monotonic() + 3
+    while shared is None and time.monotonic() < end:
+        pub.publish(Imagen(width=640, height=480, encoding="bgr8", step=1920, data=pixels, frame_id="wheel"))
+        got = sub.receive(0.2)
+        if got is not None and got.envelope.flags & wire.FLAG_SHM:
+            shared = got
+    check("Imagen por memoria compartida", shared is not None and bytes(shared.message.data) == pixels
+          and pub.shm_subscribers == 1, "" if shared else "llegó por TCP")
     pub.close()
     sub.close()
 
