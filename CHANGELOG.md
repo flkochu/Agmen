@@ -35,7 +35,11 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 - `tutorial_check`, capítulo 14: espera a que el contador de C++ y la IA estén
   registrados antes de arrancar la cámara, y el contador corre hasta que la
   cámara termina (antes vivía 4 s fijos; si la cámara tardaba en arrancar, el
-  contador ya se había ido).
+  contador ya se había ido). Y se compara contra lo que la cámara publicó de
+  verdad (`camara.py --seconds` ahora imprime el total al terminar): en macOS
+  del CI la cámara no llega a 30 fps, y eso no es culpa de quien recibe.
+- `web_smoke`: el ritmo del navegador a 10 imágenes/s se mide entre su primera
+  y su última imagen, sin contar lo que tardó la cámara en arrancar.
 - `paralelo_check`, grupos: "solo" y "otro grupo" se corren dos veces,
   alternadas, y cuenta la mejor. En una máquina que no sostiene 1 kHz ni con
   el control solo (macOS del CI: 454 a 859 ciclos perdidos de 3000, según la

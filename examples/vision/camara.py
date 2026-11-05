@@ -84,5 +84,7 @@ def reporte():
 
 if opts.seconds > 0:
     node.spin_for(opts.seconds)
+    print(f"[camara] terminé: {n[0]} imágenes publicadas en {opts.seconds:g} s · "
+          f"{pub.dropped} descartadas por lentos", flush=True)
 else:
     node.spin()

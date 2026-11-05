@@ -101,8 +101,14 @@ class Counter(threading.Thread):
         self.c.send_text(json.dumps({"op": "subscribe", "topic": topic, "max_hz": max_hz}))
         self.data = 0
         self.first: bytes | None = None
+        self.t_first = self.t_last = 0.0
         self.announced = False
         self.start()
+
+    def rate(self) -> float:
+        """Mensajes por segundo entre el primero y el último: no depende de
+        cuánto tardó en arrancar quien publica."""
+        return (self.data - 1) / (self.t_last - self.t_first) if self.data > 1 and self.t_last > self.t_first else 0.0
 
     def run(self) -> None:
         while (m := self.c.recv()) is not None:
@@ -112,7 +118,9 @@ class Counter(threading.Thread):
                     self.announced = True
                 else:
                     self.data += 1
-                    self.first = self.first or m
+                    self.t_last = time.monotonic()
+                    if self.first is None:
+                        self.first, self.t_first = m, self.t_last
 
     def close(self) -> None:
         self.c.close()
@@ -245,9 +253,13 @@ def main() -> None:
             check("cámara: un navegador recibe la imagen entera (320×240 bgr8, arrow)",
                   img is not None and env.encoding == wire.ENC_ARROW and (img.width, img.height, img.encoding) == (320, 240, "bgr8")
                   and bytes(img.data[0:3]) == b"\x00\x00\xc8", f"{env} {img and (img.width, img.height, img.encoding)}")
-            rate = cam_slow.data / elapsed
+            # La cámara publica 150 y se detiene: si la máquina va lenta solo tarda más. El
+            # ritmo del lento se mide entre su primera y su última imagen (no incluye
+            # lo que tardó la cámara en arrancar).
+            rate = cam_slow.rate()
             check("cámara: el navegador a 10 imágenes/s recibe ~10 por segundo (y el otro, todas)",
-                  6 <= rate <= 14 and cam_full.data >= 120, f"lento {cam_slow.data}, completo {cam_full.data} en {elapsed:.1f} s")
+                  6 <= rate <= 14 and cam_full.data >= 120,
+                  f"lento {cam_slow.data} ({rate:.1f}/s), completo {cam_full.data} de 150 en {elapsed:.1f} s")
             adv = fox_adv.get("/camara", {})
             fj = json.loads(fox_msgs[-1][13:]) if fox_msgs else {}
             check("Foxglove: /camara se anuncia como foxglove.RawImage y llega en JSON (base64, timestamp {sec, nsec})",

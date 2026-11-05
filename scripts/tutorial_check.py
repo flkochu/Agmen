@@ -86,10 +86,16 @@ def run_vision() -> bool:
     vistas = int(m.group(1)) if m else 0
     verdes = re.findall(r"(\d+) píxeles verdes", out)
     ia_m = re.findall(r"miré (\d+) imágenes", ia_out)
-    ok = (vistas >= 60 and verdes and int(verdes[-1]) == 3600 and ia_m and int(ia_m[-1]) >= 60
-          and "confianza 1.00" in ia_out and cam.returncode == 0)
-    print(f"{'OK  ' if ok else 'FALLA'} capítulo 14: cámara Python -> contador C++ e IA Python: C++ vio {vistas} "
-          f"imágenes ({verdes[-1] if verdes else '?'} píxeles verdes), la IA miró {ia_m[-1] if ia_m else '?'}")
+    pm = re.search(r"terminé: (\d+) imágenes publicadas", cam.stdout)
+    publicadas = int(pm.group(1)) if pm else 0
+    # Contra lo que la cámara publicó de verdad: en una máquina cargada (macOS del
+    # CI) no llega a 30 fps, y eso no es culpa de quien recibe. El contador debe
+    # ver casi todas; la IA usa queue=1 y se salta las viejas a propósito.
+    ok = (publicadas >= 30 and vistas >= 0.8 * publicadas and verdes and int(verdes[-1]) == 3600
+          and ia_m and int(ia_m[-1]) >= 0.5 * publicadas and "confianza 1.00" in ia_out and cam.returncode == 0)
+    print(f"{'OK  ' if ok else 'FALLA'} capítulo 14: cámara Python -> contador C++ e IA Python: la cámara publicó "
+          f"{publicadas}, C++ vio {vistas} ({verdes[-1] if verdes else '?'} píxeles verdes), la IA miró "
+          f"{ia_m[-1] if ia_m else '?'}")
     if not ok:
         print(out, ia_out, cam.stdout, cam.stderr)
     return ok
