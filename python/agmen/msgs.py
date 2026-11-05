@@ -107,5 +107,9 @@ def types(numpy: bool = False):
 _mod = types()
 Imagen = _mod.Imagen
 ImagenComprimida = _mod.ImagenComprimida
+# Que se llamen agmen.msgs.Imagen (en repr y en pickle) y no agmen_msgs.msgs.Imagen:
+# así otro proceso los encuentra con solo importar agmen.
+for _cls in (Imagen, ImagenComprimida):
+    _cls.__module__ = __name__
 
 __all__ = ["ENCODINGS", "Imagen", "ImagenComprimida", "PATH", "types"]

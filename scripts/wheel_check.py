@@ -92,6 +92,14 @@ def main() -> int:
     check("Imagen de 640×480 por TCP (arrow)", s is not None and s.envelope.encoding == wire.ENC_ARROW
           and (s.message.width, s.message.encoding) == (640, "bgr8") and bytes(s.message.data) == pixels,
           "" if s else "no llegó")
+    import pickle
+
+    try:   # multiprocessing y el DataLoader de PyTorch mandan los mensajes con pickle (0.10.1)
+        back = pickle.loads(pickle.dumps(s.message)) if s else None
+        check("pickle de una Imagen recibida", back is not None and type(back) is Imagen
+              and bytes(back.data) == pixels and Imagen.__module__ == "agmen.msgs")
+    except Exception as e:  # noqa: BLE001
+        check("pickle de una Imagen recibida", False, f"{type(e).__name__}: {e}")
     try:
         import numpy as np
     except ImportError:

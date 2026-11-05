@@ -7,6 +7,7 @@ Corre en el CI: si un cambio rompe el tutorial, el CI falla.
 
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -54,13 +55,29 @@ def run_vision() -> bool:
     stop = threading.Event()
     threading.Thread(target=h.serve, args=(stop,), daemon=True).start()
     vision = ROOT / "examples" / "vision"
-    contador = subprocess.Popen([str(BIN / f"vision_contador{EXE}"), "4"], stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", env=env)
+    # El contador corre hasta que la cámara termina (y entonces Ctrl+C): no se
+    # puede saber cuánto tarda la cámara en arrancar (una webcam real en
+    # Windows tarda 1-5 s en abrir, y una máquina cargada, más).
+    group = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
+    contador = subprocess.Popen([str(BIN / f"vision_contador{EXE}"), "60"], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", env=env,
+                                **group)
     ia = subprocess.Popen([sys.executable, str(vision / "ia.py")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                           text=True, encoding="utf-8", errors="replace", env=env)
-    time.sleep(1.0)
+
+    def subs_of(topic: str) -> int:
+        try:
+            return sum(1 for e in list(h.endpoints.values()) if e.kind == "sub" and e.topic == topic)
+        except RuntimeError:          # el hilo del hub cambió el diccionario mientras se contaba
+            return 0
+
+    deadline = time.monotonic() + 20
+    while subs_of("/camara") < 2 and time.monotonic() < deadline:   # los dos ya escuchan
+        time.sleep(0.05)
     cam = subprocess.run([sys.executable, str(vision / "camara.py"), "--seconds", "3"], capture_output=True,
                          text=True, encoding="utf-8", errors="replace", env=env)
+    time.sleep(0.3)                   # que lleguen las últimas imágenes
+    contador.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
     out, _ = contador.communicate(timeout=20)
     ia.terminate()
     ia_out, _ = ia.communicate(timeout=10)

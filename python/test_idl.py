@@ -166,7 +166,6 @@ class TestCarga(Tmp):
 
     def test_imagen_estandar(self):
         import numpy as np
-
         from agmen.msgs import Imagen, ImagenComprimida
 
         a = np.arange(2 * 3 * 3, dtype=np.uint8).reshape(2, 3, 3)
@@ -182,6 +181,76 @@ class TestCarga(Tmp):
         with self.assertRaisesRegex(wire.WireError, "hacen falta"):
             Imagen(width=10, height=10, encoding="rgb8", data=b"x").as_array()
         self.assertEqual(ImagenComprimida().format, "jpeg")
+
+    def test_pickle_para_multiprocessing(self):
+        """multiprocessing y los workers de PyTorch pasan los mensajes con pickle."""
+        import pickle
+
+        import numpy as np
+        from agmen.msgs import Imagen, types
+
+        self.assertEqual(Imagen.__module__, "agmen.msgs")
+        img = Imagen.from_array(np.arange(18, dtype=np.uint8).reshape(2, 3, 3), frame_id="cam")
+        for cls in (Imagen, types(numpy=True).Imagen):
+            with self.subTest(cls=cls.__module__):
+                back = pickle.loads(pickle.dumps(cls.decode_payload(img.encode_payload())))
+                self.assertIs(type(back), cls)
+                self.assertEqual((back.frame_id, back.width, back.encoding), ("cam", 3, "bgr8"))
+                self.assertTrue(np.array_equal(back.as_array(), img.as_array()))
+        path = self.write("robot_pickle.agmen", """
+            enum Modo : u8 { QUIETO, TROTAR }
+            struct Vec3 { f32 x; f32 y; f32 z; }
+            message Cosa { Modo modo; Vec3 p; string nombre; tensor<f32, 2> t; bytes datos; bytes[] trozos; }
+        """)
+        for numpy in (False, True):
+            with self.subTest(numpy=numpy):
+                m = agmen.load(path, numpy=numpy)
+                c = m.Cosa(modo=m.Modo.TROTAR, p=m.Vec3(1, 2, 3), nombre="ñ",
+                           t=agmen.Tensor((2, 2), [1.0, 2.0, 3.0, 4.0]), datos=b"\x00\xff", trozos=[b"a", b""])
+                recibido = m.Cosa.decode_payload(c.encode_payload())
+                self.assertIsInstance(recibido.datos, memoryview)        # al recibir, sin copiar
+                back = pickle.loads(pickle.dumps(recibido))
+                self.assertIs(type(back), m.Cosa)
+                self.assertIs(back.modo, m.Modo.TROTAR)
+                self.assertEqual((back.p, back.nombre, back.datos, back.trozos),
+                                 (m.Vec3(1, 2, 3), "ñ", b"\x00\xff", [b"a", b""]))
+                self.assertEqual(back.encode_payload(), c.encode_payload())
+                t = pickle.loads(pickle.dumps(agmen.Tensor((2,), memoryview(bytearray(8)).cast("f"))))
+                self.assertEqual((t.shape, t.data), ((2,), [0.0, 0.0]))
+
+    def test_multiprocessing_spawn(self):
+        """Con spawn (Windows, y el DataLoader de PyTorch) el hijo vuelve a correr el
+        agmen.load del script y encuentra los tipos."""
+        import subprocess
+
+        self.write("robot_mp.agmen", """
+            message Pedido { u32 n; string texto; }
+        """)
+        script = self.write("hijo.py", """
+            import multiprocessing as mp
+            import sys
+            from pathlib import Path
+            import agmen
+            from agmen.msgs import Imagen
+
+            msgs = agmen.load(Path(__file__).with_name("robot_mp.agmen"))
+
+            def doble(p):
+                return msgs.Pedido(n=p.n * 2, texto=p.texto.upper())
+
+            def ancho(img):
+                return Imagen(width=img.width * 2, encoding=img.encoding)
+
+            if __name__ == "__main__":
+                with mp.get_context("spawn").Pool(1) as pool:
+                    r = pool.map(doble, [msgs.Pedido(n=21, texto="hola")])[0]
+                    i = pool.map(ancho, [Imagen(width=320, encoding="mono8")])[0]
+                print(type(r).__name__, r.n, r.texto, type(i).__module__, i.width)
+        """)
+        env = {**__import__("os").environ, "PYTHONPATH": str(HERE)}
+        out = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, encoding="utf-8",
+                             env=env, timeout=120, check=False)
+        self.assertEqual(out.stdout.strip(), "Pedido 42 HOLA agmen.msgs 640", out.stderr)
 
     def test_enums_defaults_y_anidados(self):
         msgs = agmen.load(ARCA9)

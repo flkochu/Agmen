@@ -571,6 +571,10 @@ class _Py:
                 lines += [f"    SCHEMA = {s.body!r}", ""]
             lines += [f"    {fd.name}: {self.ann(fd)} = {self.default(fd)}" + (f"  # {fd.doc}" if fd.doc else "")
                       for fd in s.fields]
+            if s.arrow:
+                # Lo recibido trae los bytes como memoryview (sin copiar); pickle no los
+                # sabe guardar, así que solo al mandar a otro proceso pasan a bytes.
+                lines += ["", "    __getstate__ = _arrow.getstate"]
             args = ", ".join(f"{fd.name}={self.conv(fd, repr(fd.name).join(['d[', ']']), 0)}" for fd in s.fields)
             lines += ["", "    @classmethod", "    def from_dict(cls, d: dict):",
                       f"        return cls({args})"]
@@ -642,7 +646,16 @@ def load(path: str | Path, numpy: bool = False) -> types.ModuleType:
             dep = modules[str(imp.path.resolve()) + ("#numpy" if numpy else "")]
             for name in imp.types():
                 setattr(mod, name, getattr(dep, name))
-        sys.modules[mod.__name__] = mod      # dataclasses lo necesita
+        # dataclasses y pickle buscan el módulo por nombre: se registra con su
+        # paquete padre, para que multiprocessing y los workers de PyTorch
+        # puedan mandar estos mensajes entre procesos.
+        parent = sys.modules.get("agmen_msgs")
+        if parent is None:
+            parent = types.ModuleType("agmen_msgs", "Tipos cargados con agmen.load (uno por archivo .agmen)")
+            parent.__path__ = []
+            sys.modules["agmen_msgs"] = parent
+        sys.modules[mod.__name__] = mod
+        setattr(parent, mod.__name__.split(".", 1)[1], mod)
         exec(compile(python(x, for_load=True, numpy=numpy), str(x.path), "exec"), mod.__dict__)
         _LOADED[key] = (mtime, mod)
         modules[key] = mod

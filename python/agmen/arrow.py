@@ -174,6 +174,27 @@ class Tensor:
     def __repr__(self) -> str:
         return f"Tensor(shape={self.shape})"
 
+    def __reduce__(self):
+        # Para pickle (multiprocessing): una vista sin copiar pasa a lista de números.
+        data = self.data.tolist() if isinstance(self.data, memoryview) else self.data
+        return (Tensor, (self.shape, data))
+
+
+def picklable(value):
+    """Lo que guarda pickle de un campo: un memoryview (la vista sin copiar de
+    lo recibido) pasa a bytes, también dentro de listas."""
+    if isinstance(value, memoryview):
+        return value.tobytes()
+    if isinstance(value, list):
+        return [picklable(v) for v in value]
+    return value
+
+
+def getstate(self) -> dict:
+    """__getstate__ de los mensajes con campos variables (multiprocessing,
+    workers de PyTorch): copia los bytes recibidos solo cuando se hace pickle."""
+    return {k: picklable(v) for k, v in self.__dict__.items()}
+
 
 class _Writer:
     def __init__(self) -> None:

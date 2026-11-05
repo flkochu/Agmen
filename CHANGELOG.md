@@ -10,6 +10,33 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 ### Planeado (nivel 8, versión 0.11.0)
 - Memoria compartida para no copiar imágenes y tensores entre procesos.
 
+## [0.10.1] — 2026-11-04
+
+### Corregido
+- **Los mensajes ya se pueden mandar a otro proceso con `pickle`**
+  (`multiprocessing`, los workers del `DataLoader` de PyTorch). Antes fallaba
+  con cualquier tipo de `agmen.load` (`import of module 'agmen_msgs...'
+  failed`) y con todo mensaje recibido que trajera `bytes` (`cannot pickle
+  memoryview objects`). Ahora `agmen.load` registra el paquete `agmen_msgs`, y
+  los mensajes con campos variables convierten sus `memoryview` a `bytes` solo
+  al hacer pickle: al recibir siguen llegando sin copiar. Con `spawn` (Windows,
+  y el `DataLoader`), el proceso hijo encuentra los tipos porque vuelve a
+  correr el `agmen.load` de tu script.
+- `agmen.msgs.Imagen` e `ImagenComprimida` se llaman así (antes
+  `agmen_msgs.msgs.Imagen`): otro proceso las encuentra con solo importar
+  `agmen`.
+- `agmen.Tensor` se puede pasar por `pickle` aunque sus datos sean una vista
+  sin copiar.
+
+### Pruebas
+- `test_idl`: pickle de mensajes recibidos (con `bytes`, `bytes[]`, enums,
+  structs y tensores, con y sin `numpy=True`) y un `Pool` de `multiprocessing`
+  con `spawn`.
+- `tutorial_check`, capítulo 14: espera a que el contador de C++ y la IA estén
+  registrados antes de arrancar la cámara, y el contador corre hasta que la
+  cámara termina (antes vivía 4 s fijos; si la cámara tardaba en arrancar, el
+  contador ya se había ido).
+
 ## [0.10.0] — 2026-11-04
 
 **Nivel 7: imágenes, tensores y texto** (RFC 0008, aceptado). Los mensajes con
