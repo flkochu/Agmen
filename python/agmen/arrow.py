@@ -763,7 +763,10 @@ def _tensor_value(raw: memoryview, c: _Node, shape: tuple, np):
            "f32": "f", "f64": "d"}[c.prim]
     if 0 in shape:
         return Tensor(shape, [])
-    return raw.cast("B").cast(fmt, shape)
+    # Sin NumPy: un agmen.Tensor (lo que promete el RFC 0008), con los datos como
+    # una vista sin copiar. Antes era un memoryview con forma, y el codificador
+    # no lo aceptaba: un tensor recibido no se podía volver a publicar.
+    return Tensor(shape, raw.cast("B").cast(fmt))
 
 
 # ---------------------------------------------------------------------------

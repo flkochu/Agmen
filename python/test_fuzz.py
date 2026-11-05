@@ -11,11 +11,15 @@ Corre con el núcleo de C++ y con Python puro (el CI hace las dos):
 """
 
 import importlib.util
+import os
+import pickle
 import struct
+import subprocess
 import sys
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from agmen import arrow, schema, wire
 
@@ -162,6 +166,22 @@ class TestArrow(unittest.TestCase):
         with self.assertRaises(wire.WireError):
             lay.decode(bytes(bad))
 
+    def test_tensor_sin_numpy_se_puede_volver_a_publicar(self):
+        # Lo encontró atheris: sin NumPy, un tensor recibido llegaba como un
+        # memoryview con forma, y el codificador no lo aceptaba (no se podía
+        # volver a publicar). Ahora es un agmen.Tensor, lo que promete el RFC
+        # 0008, con los datos como una vista sin copiar.
+        lay = schema.Layout("A{tensor<u16,2> t}")
+        for shape, data in (((2, 3), [1, 2, 3, 4, 5, 65535]), ((0, 3), [])):
+            with self.subTest(shape), mock.patch.object(arrow, "_np", lambda: None):
+                sent = lay.pack({"t": arrow.Tensor(shape, data)})
+                got = lay.decode(sent)["t"]
+                self.assertIsInstance(got, arrow.Tensor)
+                self.assertEqual((got.shape, list(got.data)), (shape, data))
+                self.assertEqual(lay.pack({"t": got}), sent)            # se vuelve a publicar igual
+                again = pickle.loads(pickle.dumps(got))
+                self.assertEqual((again.shape, list(again.data)), (shape, data))
+
     def test_cuerpo_negativo(self):
         # Ya se rechazaba de rebote (ningún buffer cabía); ahora se revisa de
         # frente, con el mismo mensaje que C++.
@@ -169,6 +189,86 @@ class TestArrow(unittest.TestCase):
         struct.pack_into("<q", p, 8 + 24, -8)            # Message.bodyLength
         with self.assertRaisesRegex(wire.WireError, "cuerpo"):
             self.layout.unpack_rows(bytes(p))
+
+
+# Un Node en un hilo con la pila normal de Windows (1 MB) recibe anuncios mal
+# hechos, basura y un arrow ilegible, y luego mensajes buenos. En otro proceso:
+# si se cae (lo que pasaba antes del PR #2), la prueba falla en vez de tumbar
+# a unittest.
+_NODO_EN_UN_HILO = r"""
+import socket, struct, sys, threading, time
+sys.path.insert(0, sys.argv[1])
+import agmen
+from agmen import schema, wire
+from agmen.msgs import Imagen
+from agmen.wire import ImuSample
+
+port = int(sys.argv[2])
+udp_at, tcp_at = f"127.0.0.1:{port}", f"127.0.0.1:{port + 1}"
+got = {"imu": 0, "img": 0}
+node = agmen.Node("prueba")
+node.on(ImuSample, udp_at, lambda s: got.__setitem__("imu", got["imu"] + 1), queue=64)
+node.on(Imagen, tcp_at, lambda s: got.__setitem__("img", got["img"] + 1), queue=64)
+errors = []
+
+def spin():
+    try:
+        node.spin_for(4.0)
+    except BaseException as e:
+        errors.append(repr(e))
+
+threading.stack_size(1 << 20)      # la pila normal de un hilo en Windows
+t = threading.Thread(target=spin)
+t.start()
+time.sleep(0.3)
+
+def announcement(levels):
+    body = "u8 x"
+    for k in range(levels):
+        body = f"S{k}{{{body}}} f"
+    text = f"agmen/1 Raiz{{{body}}}"
+    payload = ("/t\n" + text).encode()
+    return wire.Envelope(wire.ENC_SCHEMA, 0, schema.fnv1a64(text.encode()), wire.topic_id("/t"), 7, 0, 0, 0,
+                         len(payload), wire.CLOCK_REAL).pack() + payload
+
+udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+for levels in (300, 2500):
+    udp.sendto(announcement(levels), ("127.0.0.1", port))
+udp.sendto(b"\xab" * 100, ("127.0.0.1", port))
+tcp = socket.create_connection(("127.0.0.1", port + 1), timeout=2)
+bad = b"\x5a" * 256
+tcp.sendall(wire.Envelope(wire.ENC_ARROW, 0, Imagen.SCHEMA_ID, 0, 8, 0, 0, 0, len(bad), wire.CLOCK_REAL).pack() + bad)
+time.sleep(0.3)
+
+imu_pub = agmen.Publisher(ImuSample, udp_at, topic="/t")
+img_pub = agmen.Publisher(Imagen, tcp_at, topic="/camara")
+for _ in range(40):
+    imu_pub.publish(ImuSample(accel=(0.0, 0.0, 9.8), gyro=(0.0, 0.0, 0.0)))
+    img_pub.publish(Imagen(width=4, height=1, encoding="mono8", step=4, data=bytes(4)))
+    time.sleep(0.02)
+    if got["imu"] >= 5 and got["img"] >= 5:
+        break
+time.sleep(0.3)
+node.stop()
+t.join()
+invalid = sum(s.invalid for s in node.subscriptions())
+print(f"errores={errors} imu={got['imu']} img={got['img']} invalidos={invalid}", flush=True)
+"""
+
+
+class TestNodo(unittest.TestCase):
+    def test_paquetes_malos_no_detienen_al_nodo_en_un_hilo_de_1_MB(self):
+        r = subprocess.run([sys.executable, "-c", _NODO_EN_UN_HILO, str(ROOT / "python"), "47991"], check=False,
+                           capture_output=True, text=True, encoding="utf-8", timeout=60,
+                           env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+        self.assertEqual(r.returncode, 0, f"el proceso se cayó ({r.returncode}):\n{r.stderr[-2000:]}")
+        self.assertIn("errores=[]", r.stdout, r.stdout + r.stderr[-2000:])
+        out = dict(kv.split("=") for kv in r.stdout.split()[1:])
+        self.assertGreaterEqual(int(out["imu"]), 5, r.stdout)
+        self.assertGreaterEqual(int(out["img"]), 5, r.stdout)
+        self.assertGreaterEqual(int(out["invalidos"]), 4, r.stdout)   # 2 anuncios, la basura y el arrow
+        self.assertIn("paquete inválido", r.stderr)
+        self.assertIn("El nodo sigue", r.stderr)
 
 
 if __name__ == "__main__":

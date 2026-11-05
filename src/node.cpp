@@ -35,11 +35,38 @@ RawSub::RawSub(const std::string& w, const TypeInfo& t, Callback cb, const Subsc
     queue = opt.queue == 0 ? 1 : opt.queue;
 }
 
+void RawSub::note_invalid(const std::string& why) {
+    ++invalid;
+    const auto now = std::chrono::steady_clock::now();
+    if (warned_ && now - last_warn_ < std::chrono::seconds(5)) {
+        ++unreported_;
+        return;
+    }
+    const std::string first_line = why.substr(0, why.find('\n'));
+    log::write("[agmen] ⚠ '" + where + "': " +
+               (unreported_ > 0 ? "descarté " + std::to_string(unreported_ + 1) + " paquetes inválidos; el último: "
+                                : std::string("descarté un paquete inválido: ")) +
+               first_line + ". El nodo sigue.");
+    warned_ = true;
+    unreported_ = 0;
+    last_warn_ = now;
+}
+
 void RawSub::pull() {
     // Tope por vuelta: si llegan mensajes sin parar, los temporizadores del
     // grupo también tienen su turno.
     for (int i = 0; i < 1024; ++i) {
-        auto s = sub_.receive_raw(std::chrono::milliseconds(0));
+        std::optional<RawSample> s;
+        try {
+            s = sub_.receive_raw(std::chrono::milliseconds(0));
+        } catch (const wire::WireError& e) {
+            // Que el hub rechace el topic es un error de configuración: detiene
+            // al nodo con su mensaje. Un paquete mal hecho (de otro programa, o a
+            // propósito) no: se descarta, se avisa y se sigue.
+            if (e.kind() == wire::WireError::Kind::HubRejected) throw;
+            note_invalid(e.what());
+            continue;
+        }
         if (!s) return;
         ++received;
         if (q_.size() >= queue) {
@@ -61,7 +88,12 @@ void RawSub::dispatch() {
     batch.swap(q_);
     for (const auto& s : batch) {
         const auto t0 = steady_now_ns();
-        cb_(s);
+        try {
+            cb_(s);
+        } catch (const InvalidPayload& e) {
+            note_invalid(e.what());   // el decodificador, no tu función: se descarta y se sigue
+            continue;
+        }
         note_max(worst_run_ns, steady_now_ns() - t0);
         ++delivered;
     }
@@ -78,6 +110,7 @@ SubscriptionStats RawSub::stats() const {
         .replaced = replaced.load(),
         .dropped = dropped.load(),
         .worst_run_ns = worst_run_ns.load(),
+        .invalid = invalid.load(),
     };
 }
 

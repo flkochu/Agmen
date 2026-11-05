@@ -62,6 +62,18 @@ esquema o un mensaje `arrow`.
   `RangeError`. Ahora se rechazan como en C++ (y un cuerpo de largo negativo,
   que ya se rechazaba de rebote, se revisa de frente). `agmen.js` también
   rechaza tensores con dimensiones negativas (`[-1, -2]` "medía" 2).
+- **Un paquete mal hecho detenía al `Node`** (C++, y Python con los dos
+  núcleos): cualquier `WireError` de una suscripción (un anuncio inválido,
+  basura, un `arrow` que no se puede leer) salía de `spin()`. Ahora el paquete
+  se descarta, se cuenta (`invalid` en `node.subscriptions()`) y se avisa:
+  `⚠ '127.0.0.1:7500': descarté un paquete inválido: …. El nodo sigue.` (el
+  primero en el acto, luego uno cada 5 s con la cuenta). Que el hub rechace el
+  topic sí lo detiene, como antes: es un error de configuración.
+- **arrow (Python sin NumPy): un tensor recibido no se podía volver a
+  publicar** (desde 0.10.0): llegaba como un `memoryview` con forma, y el
+  codificador solo acepta `agmen.Tensor` o `numpy.ndarray`. Ahora llega como
+  `agmen.Tensor`, lo que promete el RFC 0008, con los datos como una vista sin
+  copiar. Lo encontró atheris en el CI.
 
 ### Agregado
 - **Fuzzers** en `tests/fuzz/` (README ahí): `fuzz_wire`, `fuzz_layout` y
@@ -74,6 +86,9 @@ esquema o un mensaje `arrow`.
   en cada push; si encuentra algo, la entrada queda en los artefactos.
 - Constantes `wire::schema::kMaxDepth`, `kMaxFixedSize`, `kMaxArray` y
   `kMaxTensorDims`; en Python, `schema.MAX_DEPTH` y `schema.MAX_FIXED_SIZE`.
+- `SubscriptionStats::invalid` (C++ y Python): los paquetes mal hechos que el
+  `Node` descartó. En Python, `wire.HubRejected` (hija de `WireError`) cuando
+  el hub rechaza publicar o escuchar en un topic.
 
 ### Pruebas
 - `tests/fuzz/regresiones/`: cada entrada que rompió un decodificador (las
@@ -86,6 +101,13 @@ esquema o un mensaje `arrow`.
   bits, la memoria que pide una columna sin datos) y `python/test_fuzz.py`.
   Todas fallan (o se cuelgan) con el código anterior, menos la del cuerpo
   negativo.
+- **Un `Node` en un hilo con la pila normal de Windows (1 MB)** recibe anuncios
+  de 300 y 2 500 niveles, basura y un `arrow` ilegible, y luego todos los
+  mensajes buenos: `test_node` (C++) y `TestNodo` en `python/test_fuzz.py`
+  (con los dos núcleos). Con 0.11.0, el de C++ se caía por la pila y el de
+  Python puro se detenía.
+- `test_tensor_sin_numpy_se_puede_volver_a_publicar`: decodificar sin NumPy,
+  volver a codificar (los mismos bytes) y pickle, también con forma vacía.
 
 ### Planeado (nivel 9, versión 0.12.0)
 - Grabación y reproducción; exportar a Parquet.

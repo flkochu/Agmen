@@ -312,7 +312,8 @@ void flotante_fuera_de_rango_en_entero_de_64_bits() {
         return Value::structure({Value::text("x"), std::move(a), std::move(b), std::move(t)});
     };
     const Value ok = c.decode(c.encode(row(Value::real(-9.2e18), Value::real(1.8e19), Value::real(1e18))));
-    CHECK(ok.items[1].i == static_cast<std::int64_t>(-9.2e18) && ok.items[2].u == static_cast<std::uint64_t>(1.8e19));
+    // Enteros literales: MSVC avisa C4056 si se convierte 1.8e19 en compilación (pasa de i64).
+    CHECK(ok.items[1].i == -9'200'000'000'000'000'000LL && ok.items[2].u == 18'000'000'000'000'000'000ULL);
     const double nan = std::numeric_limits<double>::quiet_NaN();
     for (const double bad : {1e30, -1e30, 0x1p63, nan, 1.5}) {
         CHECK(schema_error([&] { (void)c.encode(row(Value::real(bad), Value::uinteger(0), Value::integer(0))); }, "i64"));
