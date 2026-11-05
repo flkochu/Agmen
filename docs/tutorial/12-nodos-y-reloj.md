@@ -40,6 +40,11 @@ node.spin();   // hasta Ctrl+C
 - **`node.spin()`** corre todo hasta Ctrl+C (o hasta que `agmen run` lo
   detenga). Si una de tus funciones lanza una excepción, el nodo se detiene y
   `spin()` la vuelve a lanzar: nunca falla en silencio.
+- Si llega un **paquete mal hecho** (basura, un anuncio inválido, un mensaje
+  que no se puede decodificar), el nodo no se detiene: lo descarta, lo cuenta
+  (`invalid` en `node.subscriptions()`) y avisa
+  `⚠ '…': descarté un paquete inválido: …. El nodo sigue.` Un paquete de la
+  red no debe poder apagar tu robot.
 - `pub.publish(...)` pone `t_data = node.now()`, la hora de Agmen (§4).
 
 ## 2. Los grupos: lo lento no frena a lo rápido

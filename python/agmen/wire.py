@@ -106,6 +106,11 @@ class WireError(Exception):
     """El paquete no se puede usar. El texto explica por qué."""
 
 
+class HubRejected(WireError):
+    """El hub rechazó registrar el topic (por ejemplo, ya es de otro tipo). A
+    diferencia de un paquete mal hecho, es un error de configuración."""
+
+
 @dataclass(slots=True)
 class Envelope:
     encoding: int = ENC_COMPACT

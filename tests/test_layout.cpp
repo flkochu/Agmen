@@ -86,6 +86,38 @@ void test_errors() {
     CHECK(fails("agmen/2 A{f32 x}", "no soportada"));
 }
 
+std::string nested(int levels) {
+    std::string s;
+    for (int k = 0; k < levels; ++k) s += "A{";
+    s += "u8 x";
+    for (int k = 1; k < levels; ++k) s += "} a";
+    return s + "}";
+}
+
+void structs_anidados_no_tumban() {
+    // Antes: el lector era recursivo sin límite y ~3000 structs anidados (15 KB
+    // de texto, lo que manda cualquiera en un anuncio) desbordaban la pila.
+    CHECK(fails(nested(100000).c_str(), "demasiados niveles"));
+    CHECK(fails(nested(33).c_str(), "demasiados niveles"));
+    CHECK(agmen::schema::Layout(nested(32)).size() == 1);
+    std::string many = "A{u8";
+    for (int k = 0; k < 100000; ++k) many += "[]";
+    CHECK(fails((many + " x}").c_str(), "demasiados niveles"));  // T[][][]...: también cuenta
+}
+
+void tamanos_sin_desbordes() {
+    // Antes: 10^24 bytes daban la vuelta en size_t; el tamaño y los offsets
+    // salían mal y decodificar leía fuera del payload.
+    CHECK(fails("A{u8[1000000][1000000][1000000][1000000] x;u8 y}", "2 GiB"));
+    CHECK(fails("A{string s;u8[1048576][1048576][1048576][16] x}", "2 GiB"));  // también dentro de uno variable
+    CHECK(fails("A{u8[1048576][1500] a;u8[1048576][1500] b}", "2 GiB"));       // la suma de los campos
+    CHECK(fails("A{tensor<f32,18446744073709551617> t}", "dimensiones"));
+    const agmen::schema::Layout big("A{u8[1048576][2047] x}");
+    CHECK(big.size() == 2146435072);
+    // variable: los campos fijos no se suman (va en arrow)
+    CHECK(!agmen::schema::Layout("A{u8[1048576][1500] a;u8[1048576][1500] b;string s}").fixed());
+}
+
 }  // namespace
 
 int main() {
@@ -93,6 +125,8 @@ int main() {
     test_vectors();
     test_tree();
     test_errors();
+    structs_anidados_no_tumban();
+    tamanos_sin_desbordes();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_layout: %d fallas\n", g_failures);
         return 1;

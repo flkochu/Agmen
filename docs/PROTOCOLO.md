@@ -69,6 +69,19 @@ structs anidados **expandidos** en el lugar donde se usan. Las herramientas
 de Python aceptan espacios de más y los normalizan; en C++ `kSchema` debe
 estar ya en forma canónica (sin el prefijo) y se valida al compilar.
 
+**Límites** (los mismos en C++, Python y JavaScript; un esquema que no los
+cumple se rechaza, también en un anuncio):
+
+| | Máximo |
+|---|---|
+| `N` de `T[N]` | 1 048 576 |
+| `N` de `tensor<T,N>` | 32 |
+| Niveles anidados (cada struct y cada `[N]` o `[]` es uno: `Pose{Vec3{f64 x} p}` usa 2, `A{f32[2][3] m}` usa 3) | 32 |
+| Tamaño de un tipo de tamaño fijo (y por tanto de un mensaje `compact`) | 2 GiB − 1 (2 147 483 647 bytes) |
+
+El texto de un esquema llega de la red en los anuncios: estos límites hacen
+que leerlo cueste lo mismo que su largo, sin importar qué mande el emisor.
+
 ## Payload `compact` (encoding = 1)
 
 El layout de un `struct` de C:

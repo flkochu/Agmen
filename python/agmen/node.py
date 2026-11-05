@@ -81,6 +81,7 @@ class SubscriptionStats:
     replaced: int = 0        # queue = 1: los que reemplazó uno más nuevo
     dropped: int = 0         # queue = N: los que se descartaron por cola llena
     worst_run_ns: int = 0
+    invalid: int = 0         # paquetes mal hechos que se descartaron (y se avisaron)
 
 
 def format_ns(ns: int) -> str:
@@ -108,6 +109,32 @@ class _Timer:
         self.last_warn = -10 * _SEC
 
 
+class _Invalid:
+    """Los paquetes de una suscripción que no se pudieron leer (un anuncio o un
+    payload mal hecho, de otro programa o a propósito): se descartan, se cuentan
+    y se avisan (el primero en el acto, luego uno cada 5 s con la cuenta). El
+    nodo sigue. Espejo de RawSub::note_invalid (src/node.cpp)."""
+
+    def __init__(self, where: str, stats: SubscriptionStats) -> None:
+        self.where = where
+        self.stats = stats
+        self._unreported = 0
+        self._last_warn: float | None = None
+
+    def note(self, e: Exception) -> None:
+        self.stats.invalid += 1
+        now = time.monotonic()
+        if self._last_warn is not None and now - self._last_warn < 5.0:
+            self._unreported += 1
+            return
+        what = (f"descarté {self._unreported + 1} paquetes inválidos; el último: " if self._unreported
+                else "descarté un paquete inválido: ")
+        why = str(e).splitlines()[0] if str(e) else type(e).__name__
+        print(f"[agmen] ⚠ '{self.where}': {what}{why}. El nodo sigue.", file=sys.stderr, flush=True)
+        self._unreported = 0
+        self._last_warn = now
+
+
 class _Sub:
     def __init__(self, msg_type, where: str, fn, queue: int, group: str) -> None:
         self.sub = Subscriber(msg_type, where)
@@ -116,6 +143,7 @@ class _Sub:
         self.queue = max(1, int(queue))
         self.q: collections.deque[Sample] = collections.deque()
         self.stats = SubscriptionStats(where, msg_type.NAME, group, self.queue)
+        self.invalid = _Invalid(where, self.stats)
 
     def filenos(self) -> list:
         """Los sockets de la suscripción: UDP, y el TCP de los mensajes arrow (RFC 0008)."""
@@ -123,7 +151,13 @@ class _Sub:
 
     def pull(self) -> None:
         for _ in range(1024):
-            s = self.sub.receive(0)
+            try:
+                s = self.sub.receive(0)
+            except wire.HubRejected:
+                raise                 # error de configuración: detiene al nodo con su mensaje
+            except wire.WireError as e:
+                self.invalid.note(e)   # un paquete mal hecho (de otro programa, o a propósito): se sigue
+                continue
             if s is None:
                 return
             self.stats.received += 1
@@ -569,7 +603,13 @@ class _NativeNode:
 
             def deliver(env, payload, sender):
                 try:
-                    f(Sample(envelope(*env), decode(payload), sender))
+                    message = decode(payload)
+                except wire.WireError as e:
+                    # Llegó entero pero mal hecho: C++ lo descarta, lo cuenta y lo
+                    # avisa (RawSub::note_invalid), y el nodo sigue.
+                    return str(e) or type(e).__name__
+                try:
+                    f(Sample(envelope(*env), message, sender))
                 except BaseException as e:  # noqa: BLE001 — se relanza en spin()
                     self._fail(e)
 

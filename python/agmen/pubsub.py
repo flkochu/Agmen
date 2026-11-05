@@ -238,7 +238,7 @@ class _PurePublisher:
                 self._drain()
                 dests = list(self.dests)
             if self._link.error:
-                raise wire.WireError(f"el hub rechazó publicar en '{self.topic}': {self._link.error}")
+                raise wire.HubRejected(f"el hub rechazó publicar en '{self.topic}': {self._link.error}")
         else:
             dests = self.dests
         with self._pub_lock:
@@ -390,7 +390,7 @@ class _Receiver:
                 except hp.ProtocolError:
                     pass
                 if self._link.error:
-                    raise wire.WireError(f"el hub rechazó escuchar '{self.topic}': {self._link.error}")
+                    raise wire.HubRejected(f"el hub rechazó escuchar '{self.topic}': {self._link.error}")
                 continue
             return data, f"{sender[0]}:{sender[1]}", None
 

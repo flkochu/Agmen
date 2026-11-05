@@ -553,13 +553,20 @@ public:
         live().subscribe_raw(
             where, type_info(name, text, id, size, arrow),
             [ref](const agmen::RawSample& s) {
-                nb::gil_scoped_acquire gil;
-                try {
-                    nb::handle(ref.o)(env_tuple(s.envelope), payload_object(s.payload), s.from);
-                } catch (nb::python_error& e) {
-                    e.restore();
-                    PyErr_WriteUnraisable(ref.o);
+                std::string invalid;
+                {
+                    nb::gil_scoped_acquire gil;
+                    try {
+                        // Regresa un texto si el payload no se pudo decodificar.
+                        const nb::object r = nb::handle(ref.o)(env_tuple(s.envelope), payload_object(s.payload), s.from);
+                        if (nb::isinstance<nb::str>(r)) invalid = nb::cast<std::string>(r);
+                    } catch (nb::python_error& e) {
+                        e.restore();
+                        PyErr_WriteUnraisable(ref.o);
+                    }
                 }
+                // Sin el GIL: el Node lo descarta, lo cuenta y lo avisa.
+                if (!invalid.empty()) throw agmen::detail::InvalidPayload(invalid);
             },
             agmen::SubscribeOptions{.queue = queue, .group = agmen::Group{group}});
     }
@@ -596,7 +603,7 @@ public:
         nb::list out;
         for (const auto& s : live().subscriptions()) {
             out.append(nb::make_tuple(s.where, s.type, s.group, s.queue, s.received, s.delivered, s.replaced,
-                                      s.dropped, s.worst_run_ns));
+                                      s.dropped, s.worst_run_ns, s.invalid));
         }
         return out;
     }
