@@ -40,8 +40,9 @@ def run_case(name, sender_cmd, expected):
 
 
 def run_vision() -> bool:
-    """Capítulo 14 (RFC 0008): camara.py (Imagen de 640×480 a 30 fps, por TCP) →
-    vision_contador (C++) e ia.py (NumPy sin copiar), todos por topics."""
+    """Capítulos 14 y 15 (RFC 0008 y 0009): camara.py (Imagen de 640×480 a 30 fps) →
+    vision_contador (C++) e ia.py (NumPy sin copiar), todos por topics y, en la
+    misma computadora, por memoria compartida."""
     try:
         import numpy  # noqa: F401
     except ImportError:
@@ -82,20 +83,27 @@ def run_vision() -> bool:
     ia.terminate()
     ia_out, _ = ia.communicate(timeout=10)
     stop.set()
-    m = re.search(r"RESULTADO vistas=(\d+)", out)
+    m = re.search(r"RESULTADO vistas=(\d+) compartidas=(\d+)", out)
     vistas = int(m.group(1)) if m else 0
+    compartidas = int(m.group(2)) if m else 0
     verdes = re.findall(r"(\d+) píxeles verdes", out)
-    ia_m = re.findall(r"miré (\d+) imágenes", ia_out)
+    ia_m = re.findall(r"miré (\d+) imágenes \((\d+) por memoria compartida\)", ia_out)
+    ia_vistas = int(ia_m[-1][0]) if ia_m else 0
+    ia_compartidas = int(ia_m[-1][1]) if ia_m else 0
     pm = re.search(r"terminé: (\d+) imágenes publicadas", cam.stdout)
     publicadas = int(pm.group(1)) if pm else 0
     # Contra lo que la cámara publicó de verdad: en una máquina cargada (macOS del
     # CI) no llega a 30 fps, y eso no es culpa de quien recibe. El contador debe
     # ver casi todas; la IA usa queue=1 y se salta las viejas a propósito.
+    # Capítulo 15: casi todas por memoria compartida (las primeras, mientras la
+    # prueba va y viene, pueden llegar por TCP).
     ok = (publicadas >= 30 and vistas >= 0.8 * publicadas and verdes and int(verdes[-1]) == 3600
-          and ia_m and int(ia_m[-1]) >= 0.5 * publicadas and "confianza 1.00" in ia_out and cam.returncode == 0)
-    print(f"{'OK  ' if ok else 'FALLA'} capítulo 14: cámara Python -> contador C++ e IA Python: la cámara publicó "
-          f"{publicadas}, C++ vio {vistas} ({verdes[-1] if verdes else '?'} píxeles verdes), la IA miró "
-          f"{ia_m[-1] if ia_m else '?'}")
+          and ia_vistas >= 0.5 * publicadas and "confianza 1.00" in ia_out and cam.returncode == 0
+          and compartidas >= 0.8 * vistas and ia_compartidas >= 0.8 * ia_vistas)
+    print(f"{'OK  ' if ok else 'FALLA'} capítulos 14 y 15: cámara Python -> contador C++ e IA Python: la cámara "
+          f"publicó {publicadas}, C++ vio {vistas} ({compartidas} por memoria compartida, "
+          f"{verdes[-1] if verdes else '?'} píxeles verdes), la IA miró {ia_vistas} ({ia_compartidas} por memoria "
+          f"compartida)")
     if not ok:
         print(out, ia_out, cam.stdout, cam.stderr)
     return ok

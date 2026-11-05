@@ -214,6 +214,11 @@ La semántica exacta (quién reserva, cómo se libera, préstamo de buffers para
 que una cámara escriba directo en memoria compartida) se define en el nivel 8.
 **Este RFC solo garantiza que el formato no lo impide.**
 
+> **Definido en el [RFC 0009](0009-memoria-compartida.md) (Agmen 0.11.0):** el
+> descriptor mide 72 bytes (nombre, tamaño, offset, longitud, generación y
+> bloque) y los datos del bloque empiezan en el byte 64. El sobre no cambió.
+> Formato completo en [`docs/PROTOCOLO.md`](../PROTOCOLO.md#memoria-compartida-flagsshm-desde-agmen-011).
+
 ## 8. Validación obligatoria al recibir
 
 El receptor rechaza el mensaje **y reporta el motivo** si:

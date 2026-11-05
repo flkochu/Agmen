@@ -193,6 +193,7 @@ def ver(s):
 
 - **Memoria compartida y cero copias entre procesos**: nivel 8. En 0.10.0 una
   imagen se copia al mandarla por TCP y al recibirla (unos 0.1 ms por MB).
+  Hecho en 0.11.0: [RFC 0009](0009-memoria-compartida.md).
 - **Datos grandes entre computadoras**: nivel 11.
 - **Video comprimido (H.264, WebRTC)**: gasta mucho menos WiFi que JPEG, pero
   es mucho más complejo; se ve después de tener el nivel 11.

@@ -27,12 +27,17 @@ como paquetes opcionales.
   inspector de mensajes y manejo. El robot **no dibuja ni convierte nada**: le
   manda al navegador los mismos bytes de Agmen y el navegador los decodifica.
   Ábrelo desde el celular con `--red` (con clave) o conéctate con **Foxglove**.
+- **Imágenes y tensores sin copiar:** en la misma computadora, una cámara
+  escribe cada imagen **una vez** en memoria compartida y la IA la recibe como
+  un `numpy.ndarray` que apunta a esa misma memoria, sin cambiar tu código
+  (4K con 3 suscriptores: de 21.9 ms a 5.8 ms, y la cámara gasta 11 veces
+  menos CPU). Si están en computadoras distintas, va por TCP solo.
 - Los nodos corren **en paralelo** (un proceso cada uno) y se mide en cada
   cambio (`scripts/paralelo_check.py`). Si el panel y un cerebro autónomo
   mandan al mismo motor, **un `[[mux]]` decide quién manda**: tú le ganas al
   modo autónomo y al soltar lo retoma solo.
 
-**Versión actual: 0.10.1** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
+**Versión actual: 0.11.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
 
 | Para… | Lee |
 |---|---|
@@ -45,6 +50,7 @@ como paquetes opcionales.
 | Varias frecuencias en un nodo y el reloj de Agmen | [RFC 0006](docs/rfc/0006-executor-y-reloj.md) (aceptado, implementado en 0.8.0) |
 | Python compilado desde el núcleo de C++ | [RFC 0007](docs/rfc/0007-python-compilado.md) (aceptado, implementado en 0.9.0) |
 | Imágenes, tensores y texto (datos grandes) | [RFC 0008](docs/rfc/0008-datos-grandes.md) (aceptado, implementado en 0.10.0) |
+| Memoria compartida: imágenes sin copiar entre procesos | [RFC 0009](docs/rfc/0009-memoria-compartida.md) (propuesto, implementado en 0.11.0) |
 | Publicar versiones | [`docs/PUBLICAR.md`](docs/PUBLICAR.md) |
 
 ## Estado
@@ -60,8 +66,9 @@ como paquetes opcionales.
 | 0.7.0 ✅ | 4 | Archivos `.agmen`: escribes tus mensajes una vez y se genera el código de C++ y de Python |
 | 0.8.0 ✅ | 5 | Un nodo con varios ritmos (`Node`, `every`, grupos con su propio hilo) y el reloj de Agmen: simulación más rápida, más lenta o en pausa |
 | 0.9.0 ✅ | 6 | `pip install agmen` trae el núcleo de C++ compilado: el mismo código de Python, varias veces más rápido; arreglos como NumPy sin copiar |
-| **0.10.0 ✅** | **7** | **Imágenes, tensores y texto: `string`, `bytes`, `T[]` y `tensor<T,N>` en tus `.agmen` (codificación `arrow`, por TCP), `agmen.msgs.Imagen`, cámara en el panel y en Foxglove** |
-| … | 8–14 | Ver [`docs/VISION.md`](docs/VISION.md#7-roadmap-por-niveles) |
+| 0.10.0 ✅ | 7 | Imágenes, tensores y texto: `string`, `bytes`, `T[]` y `tensor<T,N>` en tus `.agmen` (codificación `arrow`, por TCP), `agmen.msgs.Imagen`, cámara en el panel y en Foxglove |
+| **0.11.0 ✅** | **8** | **Memoria compartida: en la misma computadora, las imágenes y los tensores no se copian entre procesos (C++ y Python, Linux, Windows y macOS); en computadoras distintas, TCP** |
+| … | 9–14 | Ver [`docs/VISION.md`](docs/VISION.md#7-roadmap-por-niveles) |
 
 ## Estructura
 
@@ -69,12 +76,12 @@ como paquetes opcionales.
 agmen/
 ├── VERSION                  la versión (fuente única de verdad)
 ├── CHANGELOG.md · LICENSE · pyproject.toml (pip install agmen)
-├── include/agmen/           API pública: agmen.hpp, wire.hpp, arrow.hpp, net.hpp, node.hpp, clock.hpp, msgs.hpp (Imagen)
+├── include/agmen/           API pública: agmen.hpp, wire.hpp, arrow.hpp, net.hpp, shm.hpp, node.hpp, clock.hpp, msgs.hpp (Imagen)
 ├── src/                     implementación del núcleo
 ├── examples/nivel0/         publisher y subscriber
 ├── examples/tutorial/       código del tutorial (motor, controlador, cerebro.py)
 ├── examples/nodos/          un nodo con dos ritmos y el reloj de Agmen (capítulo 12)
-├── examples/vision/         una cámara, una IA que la mira y un contador en C++ (capítulo 14)
+├── examples/vision/         una cámara, una IA que la mira y un contador en C++ (capítulos 14 y 15)
 ├── tests/                   pruebas (ctest)
 ├── examples/tutorial/robot.toml  el robot del tutorial completo, para `agmen run`
 ├── python/agmen/            paquete de Python: import agmen + el comando `agmen`; msgs.agmen (Imagen)
@@ -83,12 +90,13 @@ agmen/
 │   ├── mux.py               agmen mux: prioridad de comandos (¿quién manda?)
 │   ├── hub.py · hubproto.py agmen hub: el directorio de topics (RFC 0004)
 │   ├── topic.py             agmen topic list/info/echo/hz, agmen node list
+│   ├── _tcp.py · _shm.py    mensajes grandes por TCP y por memoria compartida (RFC 0008, 0009)
 │   ├── idl.py · gen.py      archivos .agmen y agmen gen (RFC 0005)
 │   ├── ws.py                WebSocket con la librería estándar
 │   └── panel/               panel web: servidor, puente (bridge.py), agmen.js y la página
 ├── cmake/                   AgmenMessages.cmake: agmen_add_messages()
 ├── scripts/                 interop, web, foxglove, run, paralelo, topics, gen, tutorial y check_version (todos corren en el CI)
-├── bench/                   mediciones que respaldan decisiones de diseño
+├── bench/                   mediciones que respaldan decisiones de diseño (shm_vs_tcp.py: RFC 0009)
 ├── docs/                    tutorial/, VISION, PROTOCOLO, VERSIONES, PUBLICAR, rfc/
 └── .github/workflows/       ci.yml (4 sistemas, ARM incluido, + sanitizers) · release.yml (PyPI + GitHub Release)
 ```
@@ -241,6 +249,7 @@ En Python, `msgs = agmen.load("mensajes/arca9.agmen")`. Todo en el
 | Layout de un struct de C: alineación y relleno | `python/agmen/schema.py` → `Layout` |
 | Decodificar cualquier tipo sin código compilado | `agmen echo` (`python/agmen/echo.py`) y el panel (`python/agmen/panel/agmen.js`, en el navegador) |
 | Dos implementaciones, los mismos bytes | `tests/vectors/v1.txt`, revisado por C++ y por Python |
+| Memoria compartida en tres sistemas, y quién suelta cada bloque | `src/shm.cpp` (`shm_open` vs `CreateFileMappingW`) y `src/pubsub.cpp` (préstamos que se devuelven por TCP) |
 
 ## Ejercicios
 
@@ -249,6 +258,7 @@ En Python, `msgs = agmen.load("mensajes/arca9.agmen")`. Todo en el
 3. **Satura el sistema:** sube `--rate` (1000, 10000, 50000) y observa la latencia, los `perdidos` y los `retrasos`.
 4. **Pruébalo en red:** subscriber o puente web en otra PC con `--listen 0.0.0.0:7400`, publisher con `--to IP:7400`.
 5. Corre `python3 bench/arrow_vs_compact.py` (`pip install pyarrow numpy`) y relaciónalo con la sección 2 del RFC 0001.
+6. Corre `python3 bench/shm_vs_tcp.py --rapido` y explica, con la tabla del RFC 0009 §1.1, por qué TCP gasta más CPU con 3 suscriptores y la memoria compartida casi no.
 
 ## Contribuir
 

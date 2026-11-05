@@ -1,6 +1,6 @@
 # Tutorial de Agmen
 
-> **Versión del tutorial: Agmen 0.10.x.** El tutorial crece con cada versión:
+> **Versión del tutorial: Agmen 0.11.x.** El tutorial crece con cada versión:
 > cada nivel del roadmap agrega capítulos. Todo su código se compila y se
 > prueba en el CI (`scripts/tutorial_check.py`), así que lo que lees aquí
 > funciona con la versión indicada.
@@ -27,12 +27,13 @@ de C++ **o** de Python. No necesitas saber de redes ni de ROS.
 | 12 | [Un nodo con varios ritmos y el reloj de Agmen](12-nodos-y-reloj.md) | Control a 1 kHz y una IA lenta en el mismo nodo sin frenarse; simulas más rápido, más lento o en pausa desde el panel | 0.8.0 |
 | 13 | [Python rápido y NumPy](13-python-rapido-y-numpy.md) | `pip install agmen` trae el núcleo de C++: el mismo código de Python, varias veces más rápido; arreglos como NumPy sin copiar | 0.9.0 |
 | 14 | [Una cámara, imágenes y datos grandes](14-camara-e-imagenes.md) | `string`, `bytes`, `T[]` y `tensor<T,N>` en tus `.agmen`; una cámara de 640×480 por TCP, una IA que la mira con NumPy sin copiar, y la tarjeta Cámara del panel | 0.10.0 |
+| 15 | [Memoria compartida: imágenes sin copiar entre procesos](15-memoria-compartida.md) | La misma cámara, ahora sin copiar la imagen de un proceso a otro; lo mides contra TCP, ves cuándo no se puede (otra computadora, Docker) y mandas imágenes por la red | 0.11.0 |
 
 ### Próximamente
 
 | # | Capítulo | Versión |
 |---|---|---|
-| 15 | Memoria compartida: imágenes sin copiar entre procesos | 0.11.0 |
+| 16 | Grabar y reproducir: tu robot como dataset | 0.12.0 |
 
 ## Convenciones
 
