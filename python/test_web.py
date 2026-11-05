@@ -461,6 +461,53 @@ class TestBotonGrabar(unittest.TestCase):
                 os.environ["AGMEN_HUB"] = old
 
 
+class TestNombreDelPanel(unittest.TestCase):
+    def test_el_panel_no_cambia_el_nombre_del_proceso(self):
+        # En agmen run, el grabador y el reproductor viven en el proceso del panel: lo que
+        # creen después no debe anunciarse como 'panel' (antes el panel ponía AGMEN_NODE en
+        # el entorno de todo el proceso, desde su hilo; pasó en scripts/grabar_smoke.py).
+        import os
+
+        from agmen import hub as hubmod
+        from agmen import pubsub
+
+        hub = hubmod.Hub("127.0.0.1:0", log=lambda t: None)
+        old_hub, old_node = os.environ.get("AGMEN_HUB"), os.environ.get("AGMEN_NODE")
+        os.environ["AGMEN_HUB"] = f"127.0.0.1:{hub.sock.getsockname()[1]}"
+        os.environ.pop("AGMEN_NODE", None)
+        stop = threading.Event()
+        threading.Thread(target=hub.serve, args=(stop,), daemon=True).start()
+        before = pubsub.node_name()
+        panel = Panel("127.0.0.1:0", None, "prueba", None, Teleop("/cmd/teleop", 0.5), topics=True)
+        panel.start()
+        pub = None
+        try:
+            end = time.monotonic() + 5
+            nodes = lambda kind, topic: {e.node for e in list(hub.endpoints.values())   # noqa: E731
+                                         if e.kind == kind and e.topic == topic}
+            while "panel" not in nodes("sub", "*") and time.monotonic() < end:
+                time.sleep(0.02)
+            self.assertIn("panel", nodes("sub", "*"), "el receptor del panel se llama panel")
+            self.assertIn("panel", nodes("pub", "/cmd/teleop"), "y su teleop también")
+            self.assertIsNone(os.environ.get("AGMEN_NODE"))
+            self.assertEqual(pubsub.node_name(), before)
+            pub = pubsub._PurePublisher(MotorCommand, "/despues")
+            while not nodes("pub", "/despues") and time.monotonic() < end:
+                time.sleep(0.02)
+            self.assertEqual(nodes("pub", "/despues"), {before}, "lo que se crea después no es el panel")
+        finally:
+            if pub is not None:
+                pub.close()
+            panel.shutdown()
+            panel.teleop.pub.close()
+            stop.set()
+            for k, v in (("AGMEN_HUB", old_hub), ("AGMEN_NODE", old_node)):
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
 class TestReglaDeLaClave(unittest.TestCase):
     def test_en_la_red_siempre_hay_clave(self):
         from agmen.panel.server import choose_token, is_loopback

@@ -80,6 +80,19 @@ bytes de la red no cambian: un nodo de 0.12.0 habla con uno de 0.11.x.
   proceso, no de cada publicador.
 - `agmen.arrow`: los tipos de extensión de C++ de pyarrow
   (`fixed_shape_tensor`) no se reconocían con `pa.ExtensionType`.
+- Windows: un suscriptor de mensajes `arrow` con dirección fija y puerto 0
+  (`"127.0.0.1:0"`) podía fallar con `WinError 10013` si el puerto que el
+  sistema le dio en UDP caía en un rango TCP reservado (Hyper-V, WSL y Docker
+  apartan rangos enteros). Reintentar con otro UDP no servía: Windows da los
+  puertos de corrido y caían en el mismo rango. Ahora se pide primero el TCP
+  (el sistema nunca da uno reservado) y el UDP se abre en ese número, en C++ y
+  en Python. Pasó en el CI de Windows.
+- `agmen run` y `agmen web`: el panel ponía `AGMEN_NODE=panel` en el entorno
+  de **todo el proceso**, desde su hilo, y lo que se creaba después en ese
+  proceso (el reproductor de `--play`, una grabación empezada con el botón ⏺)
+  se anunciaba en el hub como `panel`. Ahora el nombre va solo en los
+  receptores y en el teleop del panel (`RawSubscriber(..., node=)`,
+  `_PurePublisher(..., node=)`).
 
 ## [0.11.1] — 2026-11-05
 

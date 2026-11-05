@@ -1017,18 +1017,27 @@ struct SubscriberCore::State {
         if (link && socket.valid()) link->bye(socket);
     }
 
-    // El TCP en la misma IP y el mismo puerto que el UDP. Con el puerto 0, el
-    // sistema eligió uno libre en UDP que puede estar ocupado en TCP (por la
-    // conexión de otro programa): se prueba con otro.
+    // El TCP en la misma IP y el mismo puerto que el UDP. Con el puerto 0, el que
+    // eligió el sistema para UDP puede no servir en TCP: ocupado (la conexión de
+    // otro programa) o, en Windows, reservado (Hyper-V, WSL y Docker apartan rangos
+    // enteros de puertos TCP: WSAEACCES). Como Windows da los puertos de corrido,
+    // probar con otro UDP caía en el mismo rango: se pide primero el TCP (el
+    // sistema nunca da uno reservado) y el UDP se abre en ese número.
     std::unique_ptr<Listener> same_port_listener(const std::string& w) {
         const bool any_port = w.size() >= 2 && w.compare(w.size() - 2, 2, ":0") == 0;
+        try {
+            return std::make_unique<Listener>(host_of(w) + ":" + std::to_string(socket.local_port()),
+                                              shm::enabled());
+        } catch (const net::NetError&) {
+            if (!any_port) throw;
+        }
         for (int attempt = 0;; ++attempt) {
+            auto tcp_first = std::make_unique<Listener>(host_of(w) + ":0", shm::enabled());
             try {
-                return std::make_unique<Listener>(host_of(w) + ":" + std::to_string(socket.local_port()),
-                                                  shm::enabled());
+                socket = net::UdpSocket::bind(host_of(w) + ":" + std::to_string(tcp_first->listener.local_port()));
+                return tcp_first;
             } catch (const net::NetError&) {
-                if (!any_port || attempt >= 19) throw;
-                socket = net::UdpSocket::bind(w);
+                if (attempt >= 19) throw;
             }
         }
     }

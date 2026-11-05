@@ -125,10 +125,12 @@ class _HubLink:
 
 
 class _PurePublisher:
-    def __init__(self, msg_type, to: str, topic: str | None = None, *, source_id: int | None = None) -> None:
+    def __init__(self, msg_type, to: str, topic: str | None = None, *, source_id: int | None = None,
+                 node: str | None = None) -> None:
         """`to` = topic ("/cmd") o dirección ("127.0.0.1:7500"). Con dirección,
         `topic` es solo una etiqueta (default "/" + nombre del tipo). `source_id`:
-        el de una grabación (agmen play); si no, uno al azar."""
+        el de una grabación (agmen play); si no, uno al azar. `node`: su nombre en
+        el hub (si no, el del proceso)."""
         _backend.notice_pure_once()
         self.type = msg_type
         self.to = to
@@ -154,7 +156,7 @@ class _PurePublisher:
             self._lock = threading.Lock()
             self._link = None
             self._link = _HubLink(self._sock, dict(
-                op="pub", id=f"{self.source_id:016x}", node=node_name(), pid=os.getpid(), topic=to,
+                op="pub", id=f"{self.source_id:016x}", node=node or node_name(), pid=os.getpid(), topic=to,
                 schema=f"{msg_type.SCHEMA_ID:016x}", type=msg_type.NAME, text=msg_type.SCHEMA_TEXT),
                 on_tick=self._drain_locked)
             # Espera breve a la primera respuesta del hub: si ya hay receptores,
@@ -312,7 +314,8 @@ class _Receiver:
     """Lo común de Subscriber y RawSubscriber: un socket propio, y en modo
     topic, el registro con el hub."""
 
-    def __init__(self, where: str, schema: str, type_name: str = "", tcp: bool = True, shm: bool = False) -> None:
+    def __init__(self, where: str, schema: str, type_name: str = "", tcp: bool = True, shm: bool = False,
+                 node: str | None = None) -> None:
         self._sock = wire.udp_socket()
         self.announced: dict[int, tuple[str, str]] = {}   # schema_id → (topic, esquema)
         self._link = None
@@ -327,7 +330,7 @@ class _Receiver:
             if tcp:
                 self._tcp = _tcp.Listener(("127.0.0.1", 0), shm=shm)
             self._link = _HubLink(self._sock, dict(
-                op="sub", id=f"{wire.new_source_id():016x}", node=node_name(), pid=os.getpid(),
+                op="sub", id=f"{wire.new_source_id():016x}", node=node or node_name(), pid=os.getpid(),
                 topic=where, schema=schema, type=type_name, port=port,
                 tcp=self._tcp.port if self._tcp is not None else ""))
         else:
@@ -339,19 +342,33 @@ class _Receiver:
 
     def _same_port_tcp(self, where: str, shm: bool) -> _tcp.Listener:
         """El TCP en la misma IP y el mismo puerto que el UDP. Con el puerto 0, el
-        sistema eligió uno libre en UDP que puede estar ocupado en TCP (por la
-        conexión de otro programa): se prueba con otro."""
+        que eligió el sistema para UDP puede no servir en TCP: ocupado (la conexión
+        de otro programa) o, en Windows, reservado (Hyper-V, WSL y Docker apartan
+        rangos enteros de puertos TCP: WinError 10013). Como Windows da los puertos
+        de corrido, probar con otro UDP caía en el mismo rango: se pide primero el
+        TCP (el sistema nunca da uno reservado) y el UDP se abre en ese número."""
         host, port = _addr(where)
+        try:
+            return _tcp.Listener(self._sock.getsockname(), shm=shm)
+        except OSError:
+            if port != 0:
+                self._sock.close()
+                raise
         for attempt in range(20):
+            listener = _tcp.Listener((host, 0), shm=shm)
+            udp = wire.udp_socket()
             try:
-                return _tcp.Listener(self._sock.getsockname(), shm=shm)
+                udp.bind((host, listener.port))
             except OSError:
-                if port != 0 or attempt == 19:
+                udp.close()
+                listener.close()
+                if attempt == 19:
                     self._sock.close()
                     raise
-                self._sock.close()
-                self._sock = wire.udp_socket()
-                self._sock.bind((host, 0))
+                continue
+            self._sock.close()
+            self._sock = udp
+            return listener
         raise AssertionError("no llega aquí")   # pragma: no cover
 
     @property
@@ -485,10 +502,11 @@ class _PureSubscriber(_Receiver):
 class RawSubscriber(_Receiver):
     """Recibe paquetes de CUALQUIER tipo (para herramientas: echo, hz, panel, mux).
 
-    `where` = un topic, "*" (todos los topics) o una dirección."""
+    `where` = un topic, "*" (todos los topics) o una dirección. `node`: su
+    nombre en el hub (si no, el del proceso)."""
 
-    def __init__(self, where: str) -> None:
-        super().__init__(where, "*")
+    def __init__(self, where: str, node: str | None = None) -> None:
+        super().__init__(where, "*", node=node)
 
     def receive_raw(self, timeout: float | None = None):
         """(bytes, "ip:puerto") del siguiente paquete Agmen, o None. Las

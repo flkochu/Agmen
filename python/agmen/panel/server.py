@@ -37,7 +37,7 @@ from urllib.parse import parse_qs, urlsplit
 from .. import schema, wire
 from .. import ws as wsmod
 from .._version import __version__
-from ..pubsub import Publisher, RawSubscriber
+from ..pubsub import RawSubscriber, _PurePublisher
 from .bridge import FOXGLOVE_PROTOCOL, PROTOCOLS, Bridge
 
 HERE = Path(__file__).resolve().parent
@@ -157,6 +157,11 @@ class SchemaBook:
         return topic, self.layouts[env.schema_id]
 
 
+def panel_node_name() -> str:
+    """El nombre del panel en el hub: "panel" (o el AGMEN_NODE con que lo corriste)."""
+    return os.environ.get("AGMEN_NODE") or "panel"
+
+
 def udp_receiver(hub: SensorHub, bridge: Bridge | None, listen: str | None, stop: threading.Event,
                  topics: bool = True) -> None:
     """Recibe de su dirección fija (`listen`, para nodos sin hub como un puente
@@ -165,12 +170,14 @@ def udp_receiver(hub: SensorHub, bridge: Bridge | None, listen: str | None, stop
     sin decodificar, al puente."""
     import select
 
-    os.environ.setdefault("AGMEN_NODE", "panel")
+    # Se llama "panel" en el hub sin cambiar el nombre del proceso: en agmen run, el
+    # grabador y el reproductor viven en el mismo proceso y no son el panel.
+    name = panel_node_name()
     receivers: list[RawSubscriber] = []
     if listen:
-        receivers.append(RawSubscriber(listen))
+        receivers.append(RawSubscriber(listen, node=name))
     if topics:
-        receivers.append(RawSubscriber("*"))
+        receivers.append(RawSubscriber("*", node=name))
     hub.update(listening=", ".join(filter(None, [listen, "todos los topics" if topics else None])))
     book = SchemaBook()
     expected: dict[tuple[str, int], int] = {}     # (emisor, source_id) → seq esperado
@@ -270,10 +277,11 @@ class Teleop:
     se pierde la conexión el puente manda alto por él."""
 
     def __init__(self, target: str, max_speed: float) -> None:
-        os.environ.setdefault("AGMEN_NODE", "panel")   # así aparece en 'agmen node list'
         self.target = target
         self.max_speed = max(0.0, min(1.0, max_speed))
-        self.pub = Publisher(MotorCommand, target, topic="/teleop")
+        # "panel" en 'agmen node list'. 20 comandos chicos por segundo: el Publisher de
+        # Python puro alcanza, y es el que deja ponerle nombre sin cambiar el del proceso.
+        self.pub = _PurePublisher(MotorCommand, target, topic="/teleop", node=panel_node_name())
         self.lock = threading.Lock()
         self.last_sent = 0.0
         self.last_cmd = (0.0, 0.0)
