@@ -6,6 +6,10 @@
     agmen echo IP:PUERTO       muestra cualquier mensaje que llegue (sin código del tipo)
     agmen hub                  el directorio de topics (agmen run lo arranca solo)
     agmen topic list|info|echo|hz      ver los topics por dentro
+    agmen record [TOPIC...]    graba topics en un .mcap (RFC 0010)
+    agmen info ARCHIVO.mcap    resume una grabación (--reparar si quedó cortada)
+    agmen play ARCHIVO.mcap    la reproduce con su tiempo original
+    agmen export ARCHIVO.mcap  --parquet CARPETA (para entrenar) o --foxglove SALIDA.mcap
     agmen node list            los nodos registrados
     agmen version              muestra la versión
 """
@@ -343,6 +347,10 @@ def main(argv: list[str] | None = None) -> int:
     from .play import add_parser as add_play_parser
 
     add_play_parser(sub)
+
+    from .recording import add_parser as add_export_parser
+
+    add_export_parser(sub)
 
     p = sub.add_parser("version", help="muestra la versión")
     p.set_defaults(func=lambda a: print(_backend.describe()) or 0)

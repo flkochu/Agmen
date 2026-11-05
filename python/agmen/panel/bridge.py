@@ -72,6 +72,16 @@ def foxglove_name(layout: schema.Layout) -> str:
     return _FOX_IMAGE.get(layout.text[len(schema.PREFIX):], layout.name)
 
 
+def foxglove_schema(layout: schema.Layout) -> dict:
+    """El JSON Schema que se le anuncia a Foxglove (en los tipos de Foxglove,
+    el tiempo como {sec, nsec}). Lo usan el puente en vivo y agmen export --foxglove."""
+    js = layout.json_schema()
+    if foxglove_name(layout) != layout.name:
+        js["properties"]["timestamp"] = {"type": "object", "properties": {"sec": {"type": "integer"},
+                                                                          "nsec": {"type": "integer"}}}
+    return js
+
+
 def foxglove_row(layout: schema.Layout, row: dict) -> dict:
     """Una fila decodificada → el JSON que entiende Foxglove (bytes en base64;
     en los tipos de Foxglove, el tiempo como {sec, nsec})."""
@@ -89,13 +99,8 @@ class _Channel:                     # un canal de Foxglove = un (topic, tipo)
     layout: schema.Layout
 
     def advert(self) -> dict:
-        name = foxglove_name(self.layout)
-        js = self.layout.json_schema()
-        if name != self.layout.name:
-            js["properties"]["timestamp"] = {"type": "object", "properties": {"sec": {"type": "integer"},
-                                                                              "nsec": {"type": "integer"}}}
-        return {"id": self.id, "topic": self.topic, "encoding": "json", "schemaName": name,
-                "schema": json.dumps(js), "schemaEncoding": "jsonschema"}
+        return {"id": self.id, "topic": self.topic, "encoding": "json", "schemaName": foxglove_name(self.layout),
+                "schema": json.dumps(foxglove_schema(self.layout)), "schemaEncoding": "jsonschema"}
 
 
 @dataclass

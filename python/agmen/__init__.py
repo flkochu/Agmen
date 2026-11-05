@@ -19,6 +19,9 @@ en Python puro (`agmen.wire`, `agmen.schema`, `agmen.arrow`).
 Los mensajes grandes (imágenes, tensores, texto; RFC 0008) usan la
 codificación arrow y viajan por TCP: `agmen.msgs.Imagen`,
 `agmen.msgs.ImagenComprimida`, `agmen.Tensor` y `agmen.load(..., numpy=True)`.
+
+Una grabación (`agmen record`, RFC 0010) se lee con `agmen.Recording`: sus
+mensajes, o una tabla de pyarrow por topic.
 """
 
 import sys
@@ -28,9 +31,10 @@ from ._version import __version__
 from .arrow import Tensor
 from .node import Group, Node
 from .pubsub import Publisher, Sample, Subscriber
+from .recording import Recording
 
-__all__ = ["wire", "schema", "clock", "Publisher", "Subscriber", "Sample", "Node", "Group", "Tensor", "__version__",
-           "ensure_utf8_output", "load", "msgs"]
+__all__ = ["wire", "schema", "clock", "Publisher", "Subscriber", "Sample", "Node", "Group", "Tensor", "Recording",
+           "__version__", "ensure_utf8_output", "load", "msgs"]
 
 
 def __getattr__(name: str):
