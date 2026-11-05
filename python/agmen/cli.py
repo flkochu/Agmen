@@ -247,6 +247,10 @@ def main(argv: list[str] | None = None) -> int:
 
     add_topic_parsers(sub)
 
+    from .record import add_parsers as add_record_parsers
+
+    add_record_parsers(sub)
+
     p = sub.add_parser("version", help="muestra la versión")
     p.set_defaults(func=lambda a: print(_backend.describe()) or 0)
 
