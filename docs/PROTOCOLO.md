@@ -18,7 +18,9 @@ revisan contra los mismos **vectores de prueba**: [`tests/vectors/v1.txt`](../te
 
 - Todos los enteros y flotantes van en **little-endian**.
 - Los flotantes son IEEE-754 (`f32` = 4 bytes, `f64` = 8 bytes).
-- Transporte: **un mensaje = un datagrama UDP**. Desde Agmen 0.5 (nivel 2)
+- Transporte de los `compact`: **un mensaje = un datagrama UDP**. Los `arrow`
+  van por TCP (RFC 0008) y, en la misma computadora, por memoria compartida
+  (RFC 0009, abajo). Desde Agmen 0.5 (nivel 2)
   los emisores averiguan a quién mandar con el `agmen hub`
   ([RFC 0004](rfc/0004-topics-y-descubrimiento.md), protocolo de control
   `agmen-hub/1`); el formato de los datos no cambió.
@@ -34,7 +36,7 @@ revisan contra los mismos **vectores de prueba**: [`tests/vectors/v1.txt`](../te
 | 3 | 1 | u8 | `version` | `1` |
 | 4 | 2 | u16 | `header_len` | Tamaño del sobre: `64`. El receptor salta lo que pase de 64 (sobres futuros) |
 | 6 | 1 | u8 | `encoding` | `0` sin payload · `1` compact · `2` arrow (nivel 7) · `3` anuncio de esquema |
-| 7 | 1 | u8 | `flags` | bit 0 `SHM` (nivel 8), bit 1 `FIN`. El resto en 0 |
+| 7 | 1 | u8 | `flags` | bit 0 `SHM`: el payload es un descriptor de memoria compartida (desde 0.11, abajo). bit 1 `FIN`. El resto en 0 |
 | 8 | 8 | u64 | `schema_id` | FNV-1a 64 del texto canónico del esquema |
 | 16 | 8 | u64 | `topic_id` | FNV-1a 64 del nombre del topic (`"/imu"`); 0 = sin topic |
 | 24 | 8 | u64 | `source_id` | Número aleatorio ≠ 0 de la instancia que publica |
@@ -122,10 +124,48 @@ El receptor rechaza el paquete y explica por qué si:
 |---|---|
 | 1 | Mide menos de 64 bytes o menos que `header_len` |
 | 2 | `magic` ≠ `"AGM"`; `version` ≠ 1 (si es 0, el mensaje dice que el emisor es Agmen 0.1–0.3) |
-| 3 | `encoding` > 3 o un bit de `flags` desconocido; `arrow` y `SHM` todavía no están soportados |
+| 3 | `encoding` > 3 o un bit de `flags` desconocido; `SHM` en un paquete que no llegó por una conexión que pidió memoria compartida |
 | 4 | `payload_len` ≠ bytes restantes |
 | 5 | `schema_id` ≠ el que espera el receptor (`TIPO INCOMPATIBLE`, con el esquema que llegó si ya se anunció) |
 | 6 | `compact`: el payload no mide lo que dice el esquema |
+
+## Memoria compartida (flags.SHM, desde Agmen 0.11)
+
+Diseño y razones en el [RFC 0009](rfc/0009-memoria-compartida.md). Solo para
+mensajes `arrow` de 4 KiB o más, entre un publicador y un suscriptor de la misma
+computadora, por la conexión TCP de los mensajes grandes (RFC 0008):
+
+1. Al aceptar la conexión, el suscriptor manda un **aviso** "puedo" (abajo). Un
+   suscriptor que no lo manda nunca recibe `SHM`.
+2. El publicador le manda una **prueba**: un sobre con `encoding = 0`,
+   `flags = SHM` y el descriptor de un bloque de 4 KiB. El suscriptor lo abre,
+   revisa la cabecera y contesta "sí pude" o "no pude". Una prueba nunca se
+   entrega como mensaje.
+3. Si pudo, cada mensaje grande viaja como sobre con `flags = SHM`,
+   `encoding = 2` (lo que hay en el bloque) y `payload_len = 72`, seguido del
+   descriptor. Si no, como siempre.
+4. Cuando ya nadie usa el mensaje, el suscriptor manda "suelto el bloque".
+
+**Descriptor** (72 bytes, el payload en línea):
+
+| Offset | Tamaño | Tipo | Campo |
+|---:|---:|---|---|
+| 0 | 32 | ASCII | `name`: "/agm…", relleno con ceros (en Windows se abre como `Local\agm…`) |
+| 32 | 8 | u64 | `size`: bytes del bloque |
+| 40 | 8 | u64 | `offset`: dónde empieza el payload (64) |
+| 48 | 8 | u64 | `length`: bytes del payload |
+| 56 | 8 | u64 | `generation`: el `seq` del mensaje |
+| 64 | 4 | u32 | `slot`: número de bloque del publicador |
+| 68 | 4 | — | reservado, 0 |
+
+**Cabecera de cada bloque** (64 bytes al principio del bloque): `"AGMSHM1\0"`
+(8), `owner` = `source_id` del publicador (u64), `generation` (u64), `length`
+(u64), `size` (u64) y 24 bytes en 0. El suscriptor revisa que `owner`,
+`generation` y `length` coincidan con el sobre y el descriptor.
+
+**Avisos del suscriptor** (16 bytes cada uno, por la misma conexión TCP, en
+sentido contrario): `"AGB"`, `op` (u8: 1 = puedo, 2 = la prueba salió bien, 3 =
+la prueba falló, 4 = suelto el bloque), `slot` (u32) y `generation` (u64).
 
 ## Ejemplo completo
 

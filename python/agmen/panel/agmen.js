@@ -456,7 +456,7 @@
     if (env.headerLen < ENVELOPE_LEN || env.headerLen > b.length) throw new AgmenError(`header_len inválido: ${env.headerLen}`);
     if (env.encoding > ENC.SCHEMA) throw new AgmenError(`encoding desconocido: ${env.encoding}`);
     if (env.flags & ~KNOWN_FLAGS) throw new AgmenError(`flags desconocidos: 0x${env.flags.toString(16)}`);
-    if (env.flags & FLAG_SHM) throw new AgmenError("payload en memoria compartida: llega en el nivel 8");
+    if (env.flags & FLAG_SHM) throw new AgmenError("payload en memoria compartida (RFC 0009): el navegador no la puede abrir; el puente manda los bytes");
     env.payload = b.subarray(env.headerLen);
     if (env.payload.length !== env.payloadLen) {
       throw new AgmenError(`el sobre dice payload de ${env.payloadLen} bytes pero llegaron ${env.payload.length}`);

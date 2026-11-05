@@ -6,6 +6,8 @@
 //   Layout       codificar y decodificar el layout compact de un esquema
 //   Publisher    PublisherCore: topics, hub, anuncios, seq, sockets
 //   Subscriber   SubscriberCore: espera SIN el GIL, revisa Ctrl+C cada 200 ms
+//   ShmPayload   un payload en la memoria compartida del publicador (RFC 0009),
+//                visto sin copiar (memoryview, NumPy)
 //   Node         el executor de C++: temporizadores, colas y grupos sin el GIL;
 //                tus funciones de Python toman el GIL solo mientras corren
 //   reloj        el reloj de Agmen del proceso (agmen/clock.hpp)
@@ -382,6 +384,34 @@ agmen::TypeInfo type_info(const std::string& name, const std::string& text, std:
 }
 
 // ---------------------------------------------------------------------------
+// Un payload que vive en la memoria compartida del publicador (RFC 0009, D7).
+// Python lo ve con el protocolo de buffer (memoryview, numpy.frombuffer) sin
+// copiar, de solo lectura. Las vistas que salen de él lo mantienen vivo, así
+// que el bloque vuelve al publicador cuando se destruye la última.
+// ---------------------------------------------------------------------------
+
+struct ShmPayload {
+    agmen::Payload payload;
+};
+
+int shm_payload_getbuffer(PyObject* self, Py_buffer* view, int flags) {
+    auto* p = nb::inst_ptr<ShmPayload>(self);
+    return PyBuffer_FillInfo(view, self, const_cast<std::uint8_t*>(p->payload.data()),
+                             static_cast<Py_ssize_t>(p->payload.size()), 1, flags);
+}
+
+PyType_Slot shm_payload_slots[] = {
+    {Py_bf_getbuffer, reinterpret_cast<void*>(shm_payload_getbuffer)},
+    {0, nullptr},
+};
+
+/// bytes (lo de siempre) o ShmPayload (memoria compartida, sin copiar).
+nb::object payload_object(agmen::Payload p) {
+    if (!p.shared()) return nb::bytes(reinterpret_cast<const char*>(p.data()), p.size());
+    return nb::cast(ShmPayload{std::move(p)});
+}
+
+// ---------------------------------------------------------------------------
 // Publisher / Subscriber
 // ---------------------------------------------------------------------------
 
@@ -425,6 +455,8 @@ public:
     [[nodiscard]] std::string topic() { return live().topic(); }
     [[nodiscard]] std::size_t subscribers() { return live().subscribers(); }
     [[nodiscard]] std::uint64_t dropped() { return live().dropped(); }
+    [[nodiscard]] std::size_t shm_subscribers() { return live().shm_subscribers(); }
+    [[nodiscard]] std::uint64_t shm_fallbacks() { return live().shm_fallbacks(); }
 
 private:
     agmen::PublisherCore& live() {
@@ -441,7 +473,8 @@ public:
         : core_(std::make_unique<agmen::SubscriberCore>(where, type_info(name, text, id, size, arrow))) {}
 
     /// None, o (sobre, payload, "ip:puerto"). timeout en segundos (None = sin límite).
-    std::optional<std::tuple<EnvTuple, nb::bytes, std::string>> receive(std::optional<double> timeout) {
+    /// El payload es bytes o, si llegó por memoria compartida, un ShmPayload.
+    std::optional<std::tuple<EnvTuple, nb::object, std::string>> receive(std::optional<double> timeout) {
         using namespace std::chrono;
         auto& c = live();
         const auto start = steady_clock::now();
@@ -457,11 +490,7 @@ public:
                 nb::gil_scoped_release nogil;
                 s = c.receive_raw(slice);
             }
-            if (s) {
-                return std::make_tuple(env_tuple(s->envelope),
-                                       nb::bytes(reinterpret_cast<const char*>(s->payload.data()), s->payload.size()),
-                                       s->from);
-            }
+            if (s) return std::make_tuple(env_tuple(s->envelope), payload_object(std::move(s->payload)), s->from);
             if (PyErr_CheckSignals() != 0) throw nb::python_error();
             if (timeout && steady_clock::now() - start >= duration<double>(*timeout)) return std::nullopt;
         }
@@ -523,9 +552,7 @@ public:
             [ref](const agmen::RawSample& s) {
                 nb::gil_scoped_acquire gil;
                 try {
-                    nb::handle(ref.o)(env_tuple(s.envelope),
-                                      nb::bytes(reinterpret_cast<const char*>(s.payload.data()), s.payload.size()),
-                                      s.from);
+                    nb::handle(ref.o)(env_tuple(s.envelope), payload_object(s.payload), s.from);
                 } catch (nb::python_error& e) {
                     e.restore();
                     PyErr_WriteUnraisable(ref.o);
@@ -657,7 +684,18 @@ NB_MODULE(_core, m) {
         .def_prop_ro("source_id", &PyPublisher::source_id)
         .def_prop_ro("topic", &PyPublisher::topic)
         .def_prop_ro("subscribers", &PyPublisher::subscribers)
-        .def_prop_ro("dropped", &PyPublisher::dropped);
+        .def_prop_ro("dropped", &PyPublisher::dropped)
+        .def_prop_ro("shm_subscribers", &PyPublisher::shm_subscribers)
+        .def_prop_ro("shm_fallbacks", &PyPublisher::shm_fallbacks);
+
+    nb::class_<ShmPayload>(m, "ShmPayload", nb::type_slots(shm_payload_slots),
+                           "Un payload en la memoria compartida del publicador (RFC 0009): úsalo con "
+                           "memoryview() o numpy.frombuffer(), sin copiar. El bloque vuelve al publicador "
+                           "cuando este objeto y sus vistas se destruyen.")
+        .def("__len__", [](const ShmPayload& p) { return p.payload.size(); })
+        .def("tobytes", [](const ShmPayload& p) {
+            return nb::bytes(reinterpret_cast<const char*>(p.payload.data()), p.payload.size());
+        });
 
     nb::class_<PySubscriber>(m, "Subscriber")
         .def(nb::init<const std::string&, const std::string&, const std::string&, std::uint64_t, std::size_t, bool>(),
@@ -709,13 +747,13 @@ NB_MODULE(_core, m) {
     }, "t"_a, "speed"_a, "paused"_a);
 
     // El sobre: (campos de agmen.wire.Envelope, payload). Lanza WireError.
-    m.def("parse", [](nb::handle buf) {
+    m.def("parse", [](nb::handle buf, bool shm) {
         Py_buffer view;
         if (PyObject_GetBuffer(buf.ptr(), &view, PyBUF_SIMPLE) != 0) throw nb::python_error();
         try {
             const agmen::wire::ByteView data(static_cast<const std::uint8_t*>(view.buf),
                                              static_cast<std::size_t>(view.len));
-            const auto [env, payload] = agmen::wire::Envelope::read_from(data);
+            const auto [env, payload] = agmen::wire::Envelope::read_from(data, shm);
             nb::object body;
             if (env.encoding == agmen::wire::Encoding::Arrow) {
                 // Datos grandes: una vista (memoryview) del paquete, sin copiar (RFC 0008).
@@ -734,7 +772,7 @@ NB_MODULE(_core, m) {
             PyBuffer_Release(&view);
             throw;
         }
-    });
+    }, "buf"_a, "shm"_a = false);
     m.def("fnv1a64", [](nb::bytes b) { return agmen::wire::fnv1a64(std::string_view(b.c_str(), b.size())); });
     m.def("set_default_node_name", [](const std::string& n) { agmen::hub::set_default_node_name(n); });
     m.def("set_log_sink", &set_log_sink, "fn"_a.none());

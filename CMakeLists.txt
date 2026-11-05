@@ -99,7 +99,8 @@ add_library(agmen_core
     src/arrow.cpp
     src/layout.cpp
     src/log.cpp
-    src/pubsub.cpp)
+    src/pubsub.cpp
+    src/shm.cpp)
 add_library(agmen::core ALIAS agmen_core)
 # El módulo de Python (agmen._core) es una biblioteca compartida: el núcleo
 # tiene que poder ir dentro de ella.
@@ -119,6 +120,10 @@ if(WIN32)
     # Windows 10+; ws2_32 = sockets, winmm = timeBeginPeriod.
     target_compile_definitions(agmen_core PUBLIC _WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX)
     target_link_libraries(agmen_core PUBLIC ws2_32 winmm)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # shm_open (memoria compartida, RFC 0009) vive en librt antes de glibc 2.34
+    # (las wheels manylinux_2_28 se compilan con glibc 2.28).
+    target_link_libraries(agmen_core PUBLIC rt)
 endif()
 
 # Mensajes en archivos .agmen → código de C++ (RFC 0005): agmen_add_messages().
@@ -235,6 +240,12 @@ if(AGMEN_BUILD_TESTS)
     target_link_libraries(test_tcp PRIVATE agmen::core)
     agmen_set_warnings(test_tcp)
     add_test(NAME tcp COMMAND test_tcp)
+
+    # Memoria compartida para los mensajes grandes (RFC 0009).
+    add_executable(test_shm tests/test_shm.cpp)
+    target_link_libraries(test_shm PRIVATE agmen::core)
+    agmen_set_warnings(test_shm)
+    add_test(NAME shm COMMAND test_shm)
 
     # Node y el reloj de Agmen (RFC 0006).
     add_executable(test_node tests/test_node.cpp)

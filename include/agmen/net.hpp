@@ -104,6 +104,13 @@ int wait_readable(std::span<const std::intptr_t> sockets, std::chrono::milliseco
 int wait_io(std::span<const std::intptr_t> sockets, std::size_t n_read, std::chrono::milliseconds timeout,
             std::span<bool> ready);
 
+/// Espera lectura en todos los sockets y, además, escritura en los que tengan
+/// `write[i]`. Deja en `readable` / `writable` qué pasó con cada uno (un
+/// socket cerrado o con error cuenta como legible: recv dirá -1). Devuelve
+/// cuántos están listos (0 = nadie a tiempo).
+int wait_rw(std::span<const std::intptr_t> sockets, std::span<const bool> write, std::chrono::milliseconds timeout,
+            std::span<bool> readable, std::span<bool> writable);
+
 // ---------------------------------------------------------------------------
 // TCP: el transporte de los mensajes grandes (arrow, RFC 0008). Los sockets
 // son no bloqueantes: quien los usa espera con wait_readable / wait_io.
