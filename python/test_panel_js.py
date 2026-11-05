@@ -16,6 +16,7 @@ está).
 import json
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -169,6 +170,59 @@ class TestPanelJs(unittest.TestCase):
             with self.subTest(text):
                 self.assertIn("error", res, f"'{text}' debió ser un error")
         self.assertIn("usa 'f32'", got[0]["error"])
+
+    def test_regresiones_del_fuzzer(self):
+        """Las entradas de tests/fuzz/regresiones/ (las que rompieron C++ o Python):
+        agmen.js las acepta o lanza AgmenError, nunca otro error. Y los mismos
+        límites y reglas que C++ y Python (python/test_fuzz.py)."""
+        from agmen import arrow
+
+        root = HERE.parent / "tests" / "fuzz" / "regresiones"
+        cases = []
+        for target in ("wire", "layout", "arrow"):
+            for f in sorted((root / target).iterdir()):
+                data = f.read_bytes()
+                if target == "arrow":
+                    nl = data.index(b"\n")
+                    cases.append({"name": f"{target}/{f.name}", "kind": "arrow", "schema": data[:nl].decode(),
+                                  "payload": data[nl + 1:].hex()})
+                else:
+                    cases.append({"name": f"{target}/{f.name}", "kind": target, "data": data.hex()})
+        nested = lambda n: "A{" * n + "u8 x" + "} a" * (n - 1) + "}"   # noqa: E731
+        expect = {}
+        for text, ok in [(nested(32), True), (nested(33), False), ("A{u8" + "[1]" * 31 + " x}", True),
+                         ("A{u8" + "[1]" * 32 + " x}", False), ("A{u8[1048576][2047] x}", True),
+                         ("A{u8[1048576][2048] x}", False), ("A{u8[1048576][1500] a;u8[1048576][1500] b;string s}", True)]:
+            name = f"límite {len(expect)} ({len(text)} letras): {text[:30]}"
+            cases.append({"name": name, "kind": "layout", "data": text.encode().hex()})
+            expect[name] = ok
+        # Un tensor con forma negativa ([-1, -2] "mide" 2) y offsets negativos: datos equivocados sin error.
+        nodes = [(1, 0), (1, 0), (2, 0), (1, 0), (2, 0)]
+        bufs = [b"", b"", struct.pack("<2i", 0, 2), b"", b"\x01\x02", b"", b"", struct.pack("<2i", -1, -2)]
+        cases.append({"name": "tensor-forma-negativa", "kind": "arrow", "schema": "A{tensor<u8,2> t}",
+                      "payload": arrow.assemble(nodes, bufs, 1).hex()})
+        expect["tensor-forma-negativa"] = False
+        script = ("const A=require(process.argv[2]);const c=JSON.parse(require('fs').readFileSync(0,'utf8'));"
+                  "const hex=(s)=>Uint8Array.from(s.match(/../g)||[],(h)=>parseInt(h,16));"
+                  "process.stdout.write(JSON.stringify(c.map((k)=>{try{"
+                  "if(k.kind==='wire')new A.Decoder().feed(hex(k.data));"
+                  "else if(k.kind==='layout')new A.Layout(new TextDecoder().decode(hex(k.data)));"
+                  "else new A.Layout(k.schema).decodeRows(hex(k.payload));return 'ok'}"
+                  "catch(e){return e instanceof A.AgmenError?'error':'OTRO '+e.name+': '+e.message}})));")
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "s.js"
+            path.write_text(script, encoding="utf-8")
+            r = self._node(str(path), str(AGMEN_JS), stdin=json.dumps(cases))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        got = json.loads(r.stdout)
+        self.assertGreater(len(got), 15)
+        for case, res in zip(cases, got, strict=True):
+            with self.subTest(case["name"]):
+                self.assertIn(res, ("ok", "error"))
+                if case["name"] in expect:
+                    self.assertEqual(res, "ok" if expect[case["name"]] else "error")
+        offs = next(res for case, res in zip(cases, got) if case["name"] == "arrow/offsets-negativos")
+        self.assertEqual(offs, "error")
 
     def test_paquete_invalido(self):
         # El mismo paquete que acepta Python, con un byte cambiado en cada regla del sobre.

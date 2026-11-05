@@ -66,6 +66,15 @@ TENSOR_ELEMS = ("i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f6
 MAX_TENSOR_DIMS = 32
 
 MAX_ARRAY = 1 << 20
+# Los mismos límites que C++ (wire::schema::kMaxDepth, kMaxFixedSize) y agmen.js.
+# Los esquemas también llegan de la red (anuncios): sin límites, un anuncio de
+# 1 KB tumbaba al receptor (RecursionError) y uno con u8[1048576][64] lo
+# dejaba 18 s armando el formato.
+MAX_DEPTH = 32                 # niveles de structs y arreglos ([N] o []) anidados
+MAX_FIXED_SIZE = 2**31 - 1     # bytes de un tipo de tamaño fijo (2 GiB - 1)
+_TOO_DEEP = "demasiados niveles: un esquema anida como mucho 32 structs y arreglos"
+_TOO_BIG = (" y un tipo de tamaño fijo mide como mucho 2 GiB (2147483647 bytes): para datos grandes usa bytes, "
+            "T[] o tensor<T,N>")
 
 
 class SchemaError(ValueError):
@@ -112,7 +121,10 @@ class Array:
 
     @property
     def size(self) -> int | None:
-        return None if self.elem.size is None else self.elem.size * self.n
+        # elem.size una sola vez: llamarlo dos veces costaba 2^niveles (un
+        # anuncio con u8[1][1]...[1] de 40 niveles colgaba al receptor).
+        s = self.elem.size
+        return None if s is None else s * self.n
 
     @property
     def align(self) -> int | None:
@@ -224,6 +236,7 @@ class _Parser:
             self.toks.append(("id", ident, start) if ident else ("num", num, start) if num else ("sym", sym, start))
             pos = m.end()
         self.i = 0
+        self.depth = 0      # structs abiertos: la recursión no pasa de MAX_DEPTH
 
     def error(self, msg: str, pos: int | None = None) -> SchemaError:
         if pos is None:
@@ -242,10 +255,20 @@ class _Parser:
         return tok
 
     def parse_struct(self) -> Struct:
+        return self._struct()[0]
+
+    def _struct(self) -> tuple[Struct, int]:
+        """El struct y su altura (niveles de structs y arreglos, MAX_DEPTH)."""
+        tok = self.peek()
+        at = tok[2] if tok is not None else len(self.text)
+        self.depth += 1
+        if self.depth > MAX_DEPTH:
+            raise self.error(_TOO_DEEP, at)
         name = self.take("id", what="el nombre del tipo")[1]
         self.take("sym", "{")
         fields: list[tuple[str, Type]] = []
         seen: set[str] = set()
+        height = 0
         while True:
             tok = self.peek()
             if tok is not None and tok == ("sym", "}", tok[2]):
@@ -253,7 +276,8 @@ class _Parser:
                     raise self.error(f"'{name}' no tiene campos")
                 self.i += 1
                 break
-            ftype = self.parse_type()
+            ftype, fheight = self._type()
+            height = max(height, fheight + 1)
             fname_tok = self.take("id", what="el nombre del campo")
             if fname_tok[1] in seen:
                 raise self.error(f"el campo '{fname_tok[1]}' está repetido en '{name}'", fname_tok[2])
@@ -264,15 +288,26 @@ class _Parser:
                 self.i += 1
             elif tok is None or tok[1] != "}":
                 raise self.error("se esperaba ';' o '}' después del campo")
-        return _make_struct(name, fields)
+        self.depth -= 1
+        if height > MAX_DEPTH:
+            raise self.error(_TOO_DEEP, at)
+        st = _make_struct(name, fields)
+        if st.size is not None and st.size > MAX_FIXED_SIZE:
+            raise self.error(f"'{name}' mediría {st.size} bytes{_TOO_BIG}", at)
+        return st, height
 
     def parse_type(self) -> Type:
+        return self._type()[0]
+
+    def _type(self) -> tuple[Type, int]:
+        """El tipo y su altura (un primitivo: 0; cada struct y cada [N] o []: +1)."""
         tok = self.peek()
         if tok is None or tok[0] != "id":
             raise self.error("se esperaba un tipo (f32, u8, Vec3{...}...)")
         nxt = self.toks[self.i + 1] if self.i + 1 < len(self.toks) else None
+        height = 0
         if nxt is not None and nxt[0] == "sym" and nxt[1] == "{":
-            base: Type = self.parse_struct()
+            base, height = self._struct()
         else:
             self.i += 1
             name = tok[1]
@@ -292,24 +327,29 @@ class _Parser:
             else:
                 raise self.error(f"tipo desconocido '{name}'. Usa {', '.join(PRIMITIVES)}, string, bytes, "
                                  f"tensor<T,N> o un struct anidado Nombre{{...}}", tok[2])
-        dims: list[int | None] = []
+        dims: list[tuple[int | None, int]] = []      # (N o None si es T[], posición)
         while (t := self.peek()) is not None and t[0] == "sym" and t[1] == "[":
+            if height + len(dims) + 1 > MAX_DEPTH:
+                raise self.error(_TOO_DEEP, t[2])
+            open_at = t[2]
             self.i += 1
             t = self.peek()
             if t is not None and t[0] == "sym" and t[1] == "]":
                 self.i += 1
-                dims.append(None)          # T[]: tamaño variable
+                dims.append((None, open_at))   # T[]: tamaño variable
                 continue
             n_tok = self.take("num", what="el tamaño del arreglo o ']'")
-            n = int(n_tok[1])
+            n = _small_int(n_tok[1])
             if n < 1 or n > MAX_ARRAY or (len(n_tok[1]) > 1 and n_tok[1][0] == "0"):
                 raise self.error(f"tamaño de arreglo inválido '{n_tok[1]}' (de 1 a {MAX_ARRAY}, sin ceros "
                                  f"a la izquierda)", n_tok[2])
             self.take("sym", "]")
-            dims.append(n)
-        for n in reversed(dims):   # f32[2][3] = 2 arreglos de f32[3]; f32[][3] = lista de f32[3]
+            dims.append((n, n_tok[2]))
+        for n, at in reversed(dims):   # f32[2][3] = 2 arreglos de f32[3]; f32[][3] = lista de f32[3]
+            if n is not None and base.size is not None and base.size * n > MAX_FIXED_SIZE:
+                raise self.error(f"el arreglo mediría más de 2 GiB{_TOO_BIG}", at)
             base = Seq(base) if n is None else Array(base, n)
-        return base
+        return base, height + len(dims)
 
     def parse_tensor(self, at: int) -> Tensor:
         """tensor<T,N> (ya se leyó 'tensor')."""
@@ -320,11 +360,17 @@ class _Parser:
                              f"'{t[1]}'", t[2])
         self.take("sym", ",", "',' y el número de dimensiones (ej. tensor<f32,2>)")
         n = self.take("num", what="el número de dimensiones (de 1 a 32)")
-        ndim = int(n[1])
+        ndim = _small_int(n[1])
         if ndim < 1 or ndim > MAX_TENSOR_DIMS or n[1][0] == "0":
             raise self.error(f"número de dimensiones inválido '{n[1]}' (de 1 a {MAX_TENSOR_DIMS})", n[2])
         self.take("sym", ">", "'>'")
         return Tensor(Prim(t[1]), ndim)
+
+
+def _small_int(digits: str) -> int:
+    """El número de un token; uno de más de 9 cifras ya es inválido aquí (y
+    int() con más de 4300 lanza ValueError en Python 3.11+)."""
+    return int(digits) if len(digits) <= 9 else 10**9
 
 
 def parse(text: str) -> Struct:
@@ -370,15 +416,12 @@ class Layout:
         self.fixed = self.size is not None
         self.encoding = 1 if self.fixed else 2    # wire.ENC_COMPACT / wire.ENC_ARROW
         self._native = None
+        self._fmt: struct.Struct | None = None
         if not self.fixed:
             from . import arrow
 
             self._arrow = arrow.Codec(self.root)
             return
-        fmt: list[str] = []
-        self._emit(self.root, 0, fmt)
-        self._struct = struct.Struct("<" + "".join(fmt))
-        assert self._struct.size == self.size, (self._struct.size, self.size)
         # El núcleo de C++ codifica y decodifica lo mismo, ~10× más rápido (RFC 0007).
         self._native = _backend.core.Layout(self.text) if _backend.NATIVE else None
         if self._native is not None:
@@ -386,12 +429,30 @@ class Layout:
             self.unpack = self._native.unpack   # type: ignore[method-assign]
 
     # --- formato ---
+    @property
+    def _struct(self) -> struct.Struct:
+        """El struct.Struct del layout, armado la primera vez que se usa: un
+        anuncio con un tipo grande no cuesta nada hasta que llega un dato."""
+        if self._fmt is None:
+            fmt: list[str] = []
+            self._emit(self.root, 0, fmt)
+            self._fmt = struct.Struct("<" + "".join(fmt))
+            assert self._fmt.size == self.size, (self._fmt.size, self.size)
+        return self._fmt
+
     def _emit(self, t: Type, at: int, fmt: list[str]) -> int:
         """Agrega t (que empieza en `at`) al formato; devuelve dónde termina."""
         if isinstance(t, Prim):
             fmt.append(PRIMITIVES[t.name][0])
             return at + t.size
         if isinstance(t, Array):
+            base, count = t, 1
+            while isinstance(base, Array):
+                count *= base.n
+                base = base.elem
+            if isinstance(base, Prim):    # f32[480][640]: "307200f", no 307200 letras
+                fmt.append(f"{count}{PRIMITIVES[base.name][0]}")
+                return at + t.size
             for _ in range(t.n):
                 at = self._emit(t.elem, at, fmt)
             return at

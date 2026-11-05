@@ -37,6 +37,12 @@
   };
   const TENSOR_ELEMS = new Set(["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64"]);
   const MAX_ARRAY = 1 << 20;
+  // Los mismos límites que C++ y Python (agmen.schema.MAX_DEPTH, MAX_FIXED_SIZE).
+  const MAX_DEPTH = 32;                 // niveles de structs y arreglos anidados
+  const MAX_FIXED_SIZE = 2 ** 31 - 1;   // bytes de un tipo de tamaño fijo
+  const MAX_NOMINAL = (1n << 63n) - 1n;   // forma de un tensor (como NumPy)
+  const TOO_DEEP = "demasiados niveles: un esquema anida como mucho 32 structs y arreglos";
+  const TOO_BIG = " y un tipo de tamaño fijo mide como mucho 2 GiB: para datos grandes usa bytes, T[] o tensor<T,N>";
 
   class AgmenError extends Error {}
 
@@ -114,12 +120,14 @@
       i++;
       return t;
     };
+    let depth = 0;   // structs abiertos: la recursión no pasa de MAX_DEPTH
+    // → [tipo, altura]: un primitivo 0; cada struct y cada [N] o [] suma 1.
     function parseType() {
       const t = peek();
       if (!t || t[0] !== "id") fail("se esperaba un tipo (f32, u8, Vec3{...}...)");
       const nxt = toks[i + 1];
-      let base;
-      if (nxt && nxt[0] === "sym" && nxt[1] === "{") base = parseStruct();
+      let base, height = 0;
+      if (nxt && nxt[0] === "sym" && nxt[1] === "{") [base, height] = parseStruct();
       else {
         i++;
         const name = t[1];
@@ -141,6 +149,7 @@
       }
       const dims = [];
       while (peek() && peek()[0] === "sym" && peek()[1] === "[") {
+        if (height + dims.length + 1 > MAX_DEPTH) fail(TOO_DEEP);
         i++;
         if (peek() && peek()[0] === "sym" && peek()[1] === "]") { i++; dims.push(null); continue; }
         const n = take("num", undefined, "el tamaño del arreglo");
@@ -150,15 +159,18 @@
         dims.push(v);
       }
       for (let k = dims.length - 1; k >= 0; k--) {
+        if (dims[k] !== null && base.size != null && base.size > MAX_FIXED_SIZE / dims[k]) fail("el arreglo mediría más de 2 GiB" + TOO_BIG);
         base = dims[k] === null ? { kind: "list", elem: base, size: null, align: null }
           : { kind: "array", elem: base, n: dims[k], size: base.size == null ? null : base.size * dims[k], align: base.align };
       }
-      return base;
+      return [base, height + dims.length];
     }
     function parseStruct() {
+      if (++depth > MAX_DEPTH) fail(TOO_DEEP);
       const name = take("id", undefined, "el nombre del tipo")[1];
       take("sym", "{");
       const fields = [], seen = new Set();
+      let height = 0;
       for (;;) {
         const t = peek();
         if (t && t[0] === "sym" && t[1] === "}") {
@@ -166,7 +178,8 @@
           i++;
           break;
         }
-        const type = parseType();
+        const [type, h] = parseType();
+        height = Math.max(height, h + 1);
         const fname = take("id", undefined, "el nombre del campo")[1];
         if (seen.has(fname)) fail(`el campo '${fname}' está repetido en '${name}'`);
         seen.add(fname);
@@ -175,9 +188,13 @@
         if (s && s[0] === "sym" && s[1] === ";") i++;
         else if (!s || s[1] !== "}") fail("se esperaba ';' o '}' después del campo");
       }
-      return makeStruct(name, fields);
+      depth--;
+      if (height > MAX_DEPTH) fail(TOO_DEEP);
+      const st = makeStruct(name, fields);
+      if (st.size != null && st.size > MAX_FIXED_SIZE) fail(`'${name}' mediría ${st.size} bytes` + TOO_BIG);
+      return [st, height];
     }
-    const root = parseStruct();
+    const [root] = parseStruct();
     if (i < toks.length) fail("sobra texto después del esquema");
     return root;
   }
@@ -292,12 +309,14 @@
     };
     const nodes = vec(1), bufs = vec(2);
     const bodyStart = 8 + metaLen;
-    if (bodyStart + bodyLen > payload.length) bad("el cuerpo se sale del mensaje");
+    if (bodyLen < 0 || bodyStart + bodyLen > payload.length) bad("el cuerpo se sale del mensaje");
+    if (rows < 0 || rows > payload.length) bad("número de filas inválido");   // como C++ y Python
     let iNode = 0, iBuf = 0;
     const node = (want) => {
       if (iNode >= nodes.length) bad("faltan columnas");
       const [len, nulls] = nodes[iNode++];
       if (nulls) bad("llegaron valores nulos");
+      if (len < 0 || len > bodyLen * 8 + 64) bad("una columna con un largo inválido");   // cada valor usa al menos un bit
       if (want !== undefined && len !== want) bad(`una columna mide ${len} y debía medir ${want}`);
       return len;
     };
@@ -312,6 +331,7 @@
     const offsets = (len) => {
       const b = dv(buf(4 * (len + 1))), out = new Array(len + 1);
       for (let j = 0; j <= len; j++) out[j] = b.getInt32(4 * j, true);
+      if (out[0] < 0) bad("offsets negativos");   // subarray(-2, 2) no falla: tomaría bytes del final
       for (let j = 1; j <= len; j++) if (out[j] < out[j - 1]) bad("offsets que van hacia atrás");
       return out;
     };
@@ -393,7 +413,12 @@
             const shape = [];
             for (let k = 0; k < n.ndim; k++) shape.push(sh.getInt32(4 * (j * n.ndim + k), true));
             const count = offs[j + 1] - offs[j];
-            if (shape.reduce((a, b) => a * b, 1) !== count) bad(`un tensor de forma [${shape}] trae ${count} datos`);
+            // Como C++ y Python (y NumPy): sin dimensiones negativas, y las dimensiones (un 0 cuenta como 1)
+            // por el tamaño del elemento caben en 63 bits.
+            const nominal = shape.reduce((a, d) => a * BigInt(d || 1), BigInt(c.size));
+            if (shape.some((d) => d < 0) || nominal > MAX_NOMINAL || shape.reduce((a, b) => a * b, 1) !== count) {
+              bad(`un tensor de forma [${shape}] trae ${count} datos`);
+            }
             out[j] = { shape, data: typed(c.prim, raw.subarray(offs[j] * c.size, offs[j + 1] * c.size), count) };
           }
           return out;

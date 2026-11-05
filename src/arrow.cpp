@@ -77,6 +77,29 @@ bool valid_utf8(ByteView s) {
 
 bool is_number(Prim p) { return p != Prim::Bool; }
 
+/// Elementos de un tensor con forma `shape` (dimensiones ya revisadas ≥ 0) y
+/// elementos de `elem_size` bytes, con la cuenta exacta. false si la forma es
+/// imposible: como en NumPy (y en Python y agmen.js), las dimensiones, contando
+/// un 0 como 1, por el tamaño del elemento deben caber en 63 bits, aunque haya
+/// un 0 y el tensor no traiga datos.
+template <class Shape>
+bool shape_elems(const Shape& shape, std::size_t elem_size, std::uint64_t& out) {
+    constexpr auto kMax = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+    std::uint64_t nominal = elem_size;
+    bool zero = false;
+    for (const auto d : shape) {
+        const auto u = static_cast<std::uint64_t>(d);
+        if (u == 0) {
+            zero = true;
+            continue;
+        }
+        if (nominal > kMax / u) return false;
+        nominal *= u;
+    }
+    out = zero ? 0 : nominal / elem_size;
+    return true;
+}
+
 const char* prim_label(Prim p) {
     static thread_local std::string s;
     s = std::string(schema::prim_name(p));
@@ -225,6 +248,10 @@ struct Writer {
                     }
                     x = static_cast<std::int64_t>(v.u);
                 } else if (v.kind == Value::Kind::Float) {
+                    // [-2^63, 2^63): fuera de ahí (o NaN) convertir es comportamiento indefinido
+                    if (!(v.f >= -0x1p63 && v.f < 0x1p63) || std::trunc(v.f) != v.f) {
+                        throw SchemaError("'" + where + "' debe ser un entero que quepa en " + prim_label(p));
+                    }
                     x = static_cast<std::int64_t>(v.f);
                 } else {
                     x = v.kind == Value::Kind::Bool ? (v.b ? 1 : 0) : v.i;
@@ -238,6 +265,9 @@ struct Writer {
                     if (v.i < 0) throw SchemaError("'" + where + "' no cabe en u64 (no puede ser negativo)");
                     x = static_cast<std::uint64_t>(v.i);
                 } else if (v.kind == Value::Kind::Float) {
+                    if (!(v.f >= 0 && v.f < 0x1p64) || std::trunc(v.f) != v.f) {  // [0, 2^64)
+                        throw SchemaError("'" + where + "' debe ser un entero que quepa en u64");
+                    }
                     x = static_cast<std::uint64_t>(v.f);
                 } else {
                     x = v.kind == Value::Kind::Bool ? (v.b ? 1u : 0u) : v.u;
@@ -468,17 +498,20 @@ struct Writer {
                         throw SchemaError("'" + w + "' es tensor<" + prim_label(n.prim) + "," + std::to_string(n.ndim) +
                                           "> y llegó con " + std::to_string(v.shape.size()) + " dimensiones");
                     }
-                    std::size_t want = 1;
                     for (auto d : v.shape) {
                         if (d < 0) throw SchemaError("'" + w + "': forma inválida");
-                        want *= static_cast<std::size_t>(d);
                         put(&*shapes.insert(shapes.end(), 4, 0), d);
                     }
-                    if (v.bytes().size() != want * n.size) {
-                        throw SchemaError("'" + w + "' tiene " + std::to_string(want) + " elementos según su forma y trae " +
-                                          std::to_string(v.bytes().size() / n.size) + " datos");
+                    std::uint64_t want = 0;
+                    if (!shape_elems(v.shape, n.size, want)) {
+                        throw SchemaError("'" + w + "': su forma tiene más elementos de los que se pueden contar");
                     }
-                    lens.push_back(want);
+                    const std::size_t got = v.bytes().size() / n.size;
+                    if (want != got || v.bytes().size() % n.size != 0) {
+                        throw SchemaError("'" + w + "' tiene " + std::to_string(want) + " elementos según su forma y trae " +
+                                          std::to_string(got) + " datos");
+                    }
+                    lens.push_back(got);
                 }
                 node(len);  // data: List<T>
                 validity();
@@ -682,11 +715,14 @@ struct Reader {
     std::size_t i_node = 0;
     std::size_t i_buf = 0;
 
+    /// Lo más que puede medir una columna: cada valor ocupa al menos un bit del cuerpo.
+    [[nodiscard]] std::size_t max_len() const { return bt.body.size() * 8 + 64; }
+
     std::size_t node() {
         if (i_node >= bt.nodes.size()) bad("el RecordBatch tiene menos columnas que el esquema");
         const auto [len, nulls] = bt.nodes[i_node++];
         if (nulls != 0) bad("llegaron valores nulos y los esquemas de Agmen no los tienen");
-        if (len < 0 || static_cast<std::uint64_t>(len) > bt.body.size() * 8 + 64) bad("una columna con un largo inválido");
+        if (len < 0 || static_cast<std::uint64_t>(len) > max_len()) bad("una columna con un largo inválido");
         return static_cast<std::size_t>(len);
     }
     void node(std::size_t want) {
@@ -743,17 +779,21 @@ struct Reader {
     std::vector<Value> read(std::uint32_t ni, std::size_t len) {
         const Codec::Node& n = c.nodes_[ni];
         (void)buf();  // validez
+        // `len` lo dice el mensaje: se reserva memoria solo después de revisar
+        // que los buffers de verdad traen esos valores (si no, un mensaje
+        // chico pedía GB).
         std::vector<Value> out;
-        out.reserve(len);
         switch (n.kind) {
             case Codec::Node::Kind::Prim: {
                 if (len > bt.body.size()) bad("una columna con un largo inválido");
                 const ByteView d = buf(len * n.size);
+                out.reserve(len);
                 for (std::size_t j = 0; j < len; ++j) out.push_back(scalar(n.prim, d.data() + j * n.size));
                 break;
             }
             case Codec::Node::Kind::Bool: {
                 const ByteView bits = buf(align_up(len, 8) / 8);
+                out.reserve(len);
                 for (std::size_t j = 0; j < len; ++j) out.push_back(Value::boolean(((bits[j >> 3] >> (j & 7)) & 1) != 0));
                 break;
             }
@@ -761,6 +801,7 @@ struct Reader {
             case Codec::Node::Kind::Binary: {
                 const auto offs = offsets(len);
                 const ByteView d = buf(offs[len]);
+                out.reserve(len);
                 for (std::size_t j = 0; j < len; ++j) {
                     const ByteView part = d.subspan(offs[j], offs[j + 1] - offs[j]);
                     if (n.kind == Codec::Node::Kind::Utf8 && !valid_utf8(part)) bad("un campo string no es UTF-8 válido");
@@ -774,6 +815,8 @@ struct Reader {
                 if (n.kind == Codec::Node::Kind::List) {
                     offs = offsets(len);
                 } else {
+                    // len·n sin desbordes: no puede pasar del largo máximo de una columna
+                    if (n.n != 0 && len > max_len() / n.n) bad("una columna con un largo inválido");
                     offs.resize(len + 1);
                     for (std::size_t j = 0; j <= len; ++j) offs[j] = j * n.n;
                 }
@@ -782,11 +825,13 @@ struct Reader {
                 if (child.kind == Codec::Node::Kind::Prim) {
                     (void)buf();
                     const ByteView d = buf(offs[len] * child.size);
+                    out.reserve(len);
                     for (std::size_t j = 0; j < len; ++j) {
                         out.push_back(Value::raw_bytes(d.subspan(offs[j] * child.size, (offs[j + 1] - offs[j]) * child.size)));
                     }
                 } else {
                     auto vals = read(n.children[0], offs[len]);
+                    out.reserve(len);
                     for (std::size_t j = 0; j < len; ++j) {
                         std::vector<Value> items(std::make_move_iterator(vals.begin() + static_cast<std::ptrdiff_t>(offs[j])),
                                                  std::make_move_iterator(vals.begin() + static_cast<std::ptrdiff_t>(offs[j + 1])));
@@ -801,6 +846,7 @@ struct Reader {
                     node(len);
                     cols.push_back(read(ch, len));
                 }
+                out.reserve(len);
                 for (std::size_t j = 0; j < len; ++j) {
                     std::vector<Value> fields;
                     fields.reserve(cols.size());
@@ -821,21 +867,23 @@ struct Reader {
                 node(len * n.ndim);
                 (void)buf();
                 const ByteView sh = buf(4 * len * n.ndim);
+                out.reserve(len);
                 for (std::size_t j = 0; j < len; ++j) {
                     Value v;
                     v.kind = Value::Kind::Tensor;
-                    std::size_t want = 1;
                     for (std::size_t k = 0; k < n.ndim; ++k) {
                         const auto d = get<std::int32_t>(sh.data() + 4 * (j * n.ndim + k));
                         if (d < 0) bad("un tensor con forma negativa");
                         v.shape.push_back(d);
-                        want *= static_cast<std::size_t>(d);
                     }
-                    if (want != offs[j + 1] - offs[j]) {
-                        bad("un tensor de forma con " + std::to_string(want) + " elementos trae " +
-                            std::to_string(offs[j + 1] - offs[j]) + " datos");
+                    // La cuenta exacta: con una multiplicación que da la vuelta, una forma
+                    // de 65536⁴ pasaba por un tensor sin datos.
+                    std::uint64_t want = 0;
+                    if (!shape_elems(v.shape, n.size, want) || want != offs[j + 1] - offs[j]) {
+                        bad("un tensor trae " + std::to_string(offs[j + 1] - offs[j]) +
+                            " datos y su forma dice otra cosa");
                     }
-                    Value data = Value::raw_bytes(raw.subspan(offs[j] * n.size, want * n.size));
+                    Value data = Value::raw_bytes(raw.subspan(offs[j] * n.size, (offs[j + 1] - offs[j]) * n.size));
                     data.kind = Value::Kind::Tensor;
                     data.shape = std::move(v.shape);
                     out.push_back(std::move(data));

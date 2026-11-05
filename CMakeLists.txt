@@ -31,6 +31,7 @@ option(AGMEN_BUILD_TESTS    "Compilar las pruebas"                ${AGMEN_DEV_DE
 option(AGMEN_PYTHON         "Compilar agmen._core, el núcleo de C++ para Python (necesita nanobind)" ${AGMEN_TOP_LEVEL})
 option(AGMEN_WERROR         "Tratar las advertencias como errores (CI)" OFF)
 option(AGMEN_SANITIZE       "Activar AddressSanitizer + UBSan (solo GCC/Clang)" OFF)
+option(AGMEN_FUZZ           "Compilar los fuzzers de libFuzzer con ASan + UBSan (tests/fuzz; solo Clang)" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -39,6 +40,18 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Tipo de compilación" FORCE)
+endif()
+
+# Fuzzing (tests/fuzz/README.md): todo el código, núcleo incluido, con la
+# cobertura de libFuzzer, ASan y UBSan (un comportamiento indefinido detiene
+# el fuzzer en vez de solo avisar).
+if(AGMEN_FUZZ)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "AGMEN_FUZZ necesita Clang (libFuzzer): -DCMAKE_CXX_COMPILER=clang++")
+    endif()
+    add_compile_options(-fsanitize=fuzzer-no-link,address,undefined -fno-sanitize-recover=undefined
+                        -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=address,undefined)
 endif()
 
 # Todos los ejecutables en build/bin, también con Visual Studio (multi-config).
@@ -117,7 +130,10 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/AgmenMessages.cmake)
 # En el repositorio se compila junto con todo lo demás y queda en python/agmen/,
 # así `python -m unittest discover -s python` ya usa el núcleo de C++. Con
 # `pip install` lo compila scikit-build-core y va dentro de la wheel.
-if(AGMEN_PYTHON OR SKBUILD)
+if(AGMEN_FUZZ AND NOT SKBUILD)
+    # Un módulo con ASan no se puede cargar en un Python normal.
+    message(STATUS "agmen._core: no (AGMEN_FUZZ)")
+elseif(AGMEN_PYTHON OR SKBUILD)
     find_package(Python 3.11 COMPONENTS Interpreter Development.Module
                  OPTIONAL_COMPONENTS Development.SABIModule)
     if(Python_FOUND)
@@ -234,4 +250,21 @@ if(AGMEN_BUILD_TESTS)
         AGMEN_VECTORS_FILE="${CMAKE_CURRENT_SOURCE_DIR}/tests/vectors/v1.txt")
     agmen_set_warnings(test_gen)
     add_test(NAME gen COMMAND test_gen)
+
+    # Fuzzers (tests/fuzz). Las entradas que alguna vez rompieron el
+    # decodificador (tests/fuzz/regresiones/) se vuelven a correr con cualquier
+    # compilador; con AGMEN_FUZZ=ON (Clang) además salen los fuzzers de libFuzzer.
+    foreach(name wire layout arrow)
+        add_executable(replay_${name} tests/fuzz/fuzz_${name}.cpp tests/fuzz/replay.cpp)
+        target_link_libraries(replay_${name} PRIVATE agmen::core)
+        agmen_set_warnings(replay_${name})
+        add_test(NAME fuzz_regresiones_${name}
+                 COMMAND replay_${name} ${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz/regresiones/${name})
+        if(AGMEN_FUZZ)
+            add_executable(fuzz_${name} tests/fuzz/fuzz_${name}.cpp)
+            target_link_libraries(fuzz_${name} PRIVATE agmen::core)
+            target_link_options(fuzz_${name} PRIVATE -fsanitize=fuzzer)
+            agmen_set_warnings(fuzz_${name})
+        endif()
+    endforeach()
 endif()

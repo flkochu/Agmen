@@ -23,7 +23,16 @@ constexpr PrimInfo kPrims[] = {
     {"duration", Prim::Duration, 8},
 };
 
-constexpr std::uint32_t kMaxArray = 1u << 20;
+// Los límites del protocolo, los mismos que wire::schema::check y Python.
+using wire::schema::kMaxArray;
+using wire::schema::kMaxDepth;
+using wire::schema::kMaxFixedSize;
+using wire::schema::kMaxTensorDims;
+
+const std::string kTooBigHint =
+    " y un tipo de tamaño fijo mide como mucho 2 GiB (2147483647 bytes): para datos grandes usa bytes, T[] o "
+    "tensor<T,N>";
+const std::string kTooDeep = "demasiados niveles: un esquema anida como mucho 32 structs y arreglos";
 
 }  // namespace
 
@@ -46,6 +55,8 @@ struct LayoutParser {
     std::string_view s;
     std::size_t i = 0;
     std::vector<Type>& types;
+    std::vector<std::size_t> height{};  ///< por tipo: niveles de structs y arreglos (un primitivo: 0)
+    std::size_t depth = 0;              ///< structs abiertos: la recursión no pasa de kMaxDepth
 
     [[noreturn]] void fail(const std::string& msg, std::size_t at) const {
         throw SchemaError(msg + "\n  " + std::string(s) + "\n  " + std::string(at, ' ') + "^");
@@ -72,18 +83,24 @@ struct LayoutParser {
         ++i;
     }
 
-    std::uint32_t add(Type t) {
+    std::uint32_t add(Type t, std::size_t h) {
         types.push_back(std::move(t));
+        height.push_back(h);
         return static_cast<std::uint32_t>(types.size() - 1);
     }
 
     std::uint32_t parse_struct() {
+        skip();
+        const std::size_t name_pos = i;
+        if (++depth > kMaxDepth) fail(kTooDeep, name_pos);
         Type st;
         st.kind = Type::Kind::Struct;
         st.name = std::string(ident("el nombre del tipo"));
         expect('{', "'{'");
         std::set<std::string> seen;
-        std::size_t offset = 0;
+        // En 64 bits y sin pasar de kMaxFixedSize + 1: sin desbordes, ni en 32 bits.
+        std::uint64_t offset = 0;
+        std::size_t h = 0;
         for (;;) {
             if (peek() == '}') {
                 if (st.fields.empty()) fail("'" + st.name + "' no tiene campos", i);
@@ -96,11 +113,12 @@ struct LayoutParser {
             const std::string fname(ident("el nombre del campo"));
             if (!seen.insert(fname).second) fail("el campo '" + fname + "' está repetido en '" + st.name + "'", name_at);
             const Type& f = types[ft];
+            h = std::max(h, height[ft] + 1);
             if (!f.fixed) st.fixed = false;
             if (st.fixed) {
                 offset = (offset + f.align - 1) / f.align * f.align;
-                st.fields.push_back(Type::Field{fname, ft, offset});
-                offset += f.size;
+                st.fields.push_back(Type::Field{fname, ft, static_cast<std::size_t>(offset)});
+                offset = std::min<std::uint64_t>(offset + f.size, kMaxFixedSize + 1);
                 st.align = std::max(st.align, f.align);
             } else {
                 st.fields.push_back(Type::Field{fname, ft, 0});
@@ -112,14 +130,22 @@ struct LayoutParser {
                 fail("se esperaba ';' o '}' después del campo", i);
             }
         }
+        if (h > kMaxDepth) fail(kTooDeep, name_pos);
+        --depth;
         if (st.fixed) {
-            st.size = (offset + st.align - 1) / st.align * st.align;
+            const std::uint64_t size = (offset + st.align - 1) / st.align * st.align;
+            if (size > kMaxFixedSize) {
+                fail("'" + st.name + "' mediría " + (offset > kMaxFixedSize ? "más de 2 GiB" : std::to_string(size) + " bytes") +
+                         kTooBigHint,
+                     name_pos);
+            }
+            st.size = static_cast<std::size_t>(size);
         } else {  // variable: sin offsets (va en arrow)
             st.size = 0;
             st.align = 1;
             for (auto& fl : st.fields) fl.offset = 0;
         }
-        return add(std::move(st));
+        return add(std::move(st), h);
     }
 
     static bool is_number(Prim p) { return p != Prim::Bool && p != Prim::Time && p != Prim::Duration; }
@@ -146,7 +172,7 @@ struct LayoutParser {
         while (i < s.size() && digit(s[i])) {
             n = n * 10 + static_cast<std::uint32_t>(s[i] - '0');
             ++i;
-            if (n > 32) fail("número de dimensiones inválido (de 1 a 32)", nat);
+            if (n > kMaxTensorDims) fail("número de dimensiones inválido (de 1 a 32)", nat);
         }
         expect('>', "'>'");
         Type t;
@@ -154,7 +180,7 @@ struct LayoutParser {
         t.prim = info->prim;
         t.count = n;
         t.fixed = false;
-        return add(std::move(t));
+        return add(std::move(t), 0);
     }
 
     std::uint32_t parse_type() {
@@ -169,7 +195,7 @@ struct LayoutParser {
             Type t;
             t.kind = name == "string" ? Type::Kind::String : Type::Kind::Bytes;
             t.fixed = false;
-            base = add(std::move(t));
+            base = add(std::move(t), 0);
         } else if (name == "tensor") {
             base = parse_tensor();
         } else if (name == "optional") {
@@ -191,14 +217,20 @@ struct LayoutParser {
             t.kind = Type::Kind::Prim;
             t.prim = info->prim;
             t.size = t.align = info->size;
-            base = add(std::move(t));
+            base = add(std::move(t), 0);
         }
-        std::vector<std::uint32_t> dims;  // 0 = T[] (tamaño variable)
+        struct Dim {
+            std::uint32_t n;  // 0 = T[] (tamaño variable)
+            std::size_t at;
+        };
+        std::vector<Dim> dims;
         while (peek() == '[') {
+            if (height[base] + dims.size() + 1 > kMaxDepth) fail(kTooDeep, i);
+            const std::size_t open = i;
             ++i;
             if (peek() == ']') {
                 ++i;
-                dims.push_back(0);
+                dims.push_back({0, open});
                 continue;
             }
             skip();
@@ -214,23 +246,26 @@ struct LayoutParser {
             }
             if (n == 0) fail("tamaño de arreglo inválido (de 1 a 1048576)", at);
             expect(']', "']'");
-            dims.push_back(static_cast<std::uint32_t>(n));
+            dims.push_back({static_cast<std::uint32_t>(n), at});
         }
         // f32[2][3] = 2 arreglos de f32[3]; f32[][3] = lista de f32[3]
         for (auto it = dims.rbegin(); it != dims.rend(); ++it) {
             Type a;
             a.elem = base;
-            if (*it == 0) {
+            if (it->n == 0) {
                 a.kind = Type::Kind::List;
                 a.fixed = false;
             } else {
                 a.kind = Type::Kind::Array;
-                a.count = *it;
+                a.count = it->n;
                 a.fixed = types[base].fixed;
-                a.size = a.fixed ? types[base].size * *it : 0;
+                if (a.fixed && types[base].size > kMaxFixedSize / it->n) {
+                    fail("el arreglo mediría más de 2 GiB" + kTooBigHint, it->at);
+                }
+                a.size = a.fixed ? types[base].size * it->n : 0;
                 a.align = a.fixed ? types[base].align : 1;
             }
-            base = add(std::move(a));
+            base = add(std::move(a), height[base] + 1);
         }
         return base;
     }
@@ -250,7 +285,7 @@ Layout::Layout(std::string_view text) {
         }
         body.remove_prefix(prefix.size());
     }
-    LayoutParser p{body, 0, types_};
+    LayoutParser p{body, 0, types_, {}, 0};
     root_ = p.parse_struct();
     if (p.peek() != '\0') p.fail("sobra texto después del esquema", p.i);
     text_ = std::string(wire::kSchemaPrefix) + canonical(root_);

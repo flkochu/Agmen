@@ -104,3 +104,69 @@ jobs:
           cmake --build build --parallel
       - name: Pruebas
         run: ctest --test-dir build --output-on-failure
+
+  # Fuzzing corto del decodificador (tests/fuzz/README.md): cada fuzzer parte de
+  # los vectores de prueba y de las regresiones guardadas, y corre un minuto con
+  # ASan y UBSan. Si encuentra algo, la entrada queda en los artefactos del job.
+  fuzz:
+    name: ubuntu + fuzzing (libFuzzer y atheris)
+    runs-on: ubuntu-24.04
+    env:
+      CXX: clang++-18
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: libFuzzer (viene con Clang; si falta, se instala)
+        run: |
+          echo 'extern "C" int LLVMFuzzerTestOneInput(const char*, unsigned long) { return 0; }' > /tmp/f.cpp
+          if ! $CXX -fsanitize=fuzzer /tmp/f.cpp -o /tmp/f; then
+            sudo apt-get update && sudo apt-get install -y clang-18 libclang-rt-18-dev
+          fi
+
+      - name: Compilar los fuzzers (Clang, ASan + UBSan)
+        run: |
+          cmake -S . -B build-fuzz -DAGMEN_FUZZ=ON -DAGMEN_WERROR=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo -DAGMEN_BUILD_EXAMPLES=OFF
+          cmake --build build-fuzz --parallel
+
+      - name: Regresiones y pruebas del formato, con ASan y UBSan
+        run: ctest --test-dir build-fuzz --output-on-failure -R "fuzz_regresiones|wire|layout|arrow"
+
+      - name: Corpus inicial (tests/vectors y tests/fuzz/regresiones)
+        run: |
+          python tests/fuzz/semillas.py build-fuzz/corpus
+          for t in wire layout arrow; do
+            cp tests/fuzz/regresiones/$t/* build-fuzz/corpus/$t/
+            mkdir -p build-fuzz/corpus-py/$t && cp build-fuzz/corpus/$t/* build-fuzz/corpus-py/$t/
+          done
+          mkdir -p build-fuzz/fallas
+
+      - name: libFuzzer, 60 s por fuzzer
+        run: |
+          for t in wire layout arrow; do
+            echo "::group::fuzz_$t"
+            build-fuzz/bin/fuzz_$t build-fuzz/corpus/$t -max_total_time=60 -max_len=16384 -timeout=10 \
+              -rss_limit_mb=2048 -dict=tests/fuzz/esquemas.dict -artifact_prefix=build-fuzz/fallas/$t- -print_final_stats=1
+            echo "::endgroup::"
+          done
+
+      - name: atheris (Python puro), 30 s por blanco
+        run: |
+          python -m pip install atheris
+          for t in wire layout arrow; do
+            echo "::group::python $t"
+            python tests/fuzz/fuzz_python.py $t build-fuzz/corpus-py/$t -max_total_time=30 -max_len=16384 -timeout=10 \
+              -rss_limit_mb=2048 -dict=tests/fuzz/esquemas.dict -artifact_prefix=build-fuzz/fallas/python-$t-
+            echo "::endgroup::"
+          done
+
+      - name: Guardar lo que encontraron los fuzzers
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: fuzz-fallas
+          path: build-fuzz/fallas/
+          if-no-files-found: ignore

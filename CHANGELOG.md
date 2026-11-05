@@ -7,6 +7,86 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 
 ## [Sin publicar]
 
+Auditoría de robustez del decodificador con fuzzing (`tests/fuzz/`). Todo lo
+de abajo se podía provocar con **un solo paquete** desde la red: un anuncio de
+esquema o un mensaje `arrow`.
+
+### Corregido
+- **Un anuncio con structs anidados tumbaba a cualquier `Subscriber` de C++**
+  (desbordamiento de pila): `read_announcement` leía el esquema con
+  `wire::schema::check`, recursivo y con 4 KB de pila por nivel, y ~1 500
+  niveles (un anuncio de 8 KB, un datagrama) bastaban. Lo encontró
+  `fuzz_layout`. Ahora el anuncio se lee con `agmen::schema::Layout`, como en
+  Python, y `check()` ya no guarda los nombres de los campos en la pila (eso
+  también quita su límite de 256 campos por struct, que hacía que C++ rechazara
+  anuncios válidos de Python).
+- **En Python, el mismo anuncio (~500 niveles, 2.5 KB) lanzaba `RecursionError`**
+  en vez de `WireError`, y `agmen echo`, el panel y `Subscriber` se caían. Y
+  `agmen::schema::Layout` (C++) también desbordaba la pila, con ~3 000 niveles.
+- **Límites de esquema iguales en C++, Python y JavaScript** (`docs/PROTOCOLO.md`):
+  como mucho 32 niveles de structs y arreglos anidados, y un tipo de tamaño fijo
+  mide como mucho 2 GiB − 1. Sin ellos:
+  - en C++ el tamaño de `u8[1000000][1000000][1000000][1000000]` **daba la vuelta**
+    (10²⁴ mod 2⁶⁴): el tamaño y los offsets salían mal, y decodificar podía leer
+    fuera del payload;
+  - en Python, `Layout("A{u8[1048576][64] x}")` tardaba **18 s** (armaba un formato
+    con una letra por elemento) y lo pagaba cualquiera que recibiera el anuncio;
+    `atriz{f32[6][1024288][3] m}`, de 27 bytes, lo encontró atheris. Ahora el
+    formato se arma la primera vez que llega un dato y los arreglos de números
+    van con su cuenta (`"307200f"`).
+- `check()` aceptaba `tensor<f32,18446744073709551617>` (el número daba la
+  vuelta a 1).
+- Python: el tamaño de un arreglo anidado costaba **2^niveles** (`Array.size`
+  llamaba dos veces al de su elemento): `u8[1][1]…` de 24 niveles tardaba
+  2.5 s y uno de 40 colgaba al receptor.
+- Python: un tamaño de arreglo o de tensor de más de 4 300 cifras lanzaba
+  `ValueError` (de `int()`), no `SchemaError`.
+- **arrow (C++): la forma de un tensor daba la vuelta**: 65536⁴ = 2⁶⁴ se
+  contaba como 0 y pasaba un tensor "de 2⁶⁴ elementos" sin datos, al leer y al
+  escribir. Ahora se cuenta exacto.
+- arrow (Python): un tensor sin datos con una forma enorme
+  (`(469762048, 402653184, 0, 67108864)`) lanzaba `ValueError` de NumPy, que no
+  puede tener esa forma. Lo encontró atheris. En C++, Python y `agmen.js` vale
+  ahora la regla de NumPy, al leer y al escribir: las dimensiones (un 0 cuenta
+  como 1) por el tamaño del elemento caben en 63 bits.
+- arrow (C++): al leer una columna se reservaba memoria para sus valores
+  **antes** de revisar que el mensaje trajera los datos: 131 072 `bool` sin
+  sus bits (33 KB) pedían 15 MB, y un mensaje de 64 MiB, decenas de GB
+  (`std::bad_alloc`, que no es `WireError`). Ahora se reserva después.
+- arrow (C++): codificar un `f64` fuera de rango (`1e30`, NaN) en un `i64`,
+  `time`, `duration` o `u64` era comportamiento indefinido; ahora es un
+  `SchemaError`, como en los demás enteros (también si no es entero).
+- arrow (Python y `agmen.js`): **offsets negativos se aceptaban en silencio**
+  (`data[-2:2]` toma bytes del final) y llegaba un texto equivocado; filas o
+  columnas con largo negativo terminaban en `IndexError`, `struct.error` o
+  `RangeError`. Ahora se rechazan como en C++ (y un cuerpo de largo negativo,
+  que ya se rechazaba de rebote, se revisa de frente). `agmen.js` también
+  rechaza tensores con dimensiones negativas (`[-1, -2]` "medía" 2).
+
+### Agregado
+- **Fuzzers** en `tests/fuzz/` (README ahí): `fuzz_wire`, `fuzz_layout` y
+  `fuzz_arrow` con libFuzzer, ASan y UBSan (`-DAGMEN_FUZZ=ON`, Clang), y
+  `fuzz_python.py` con atheris para los mismos tres blancos en Python. Parten
+  de los vectores de `tests/vectors/` (`semillas.py`) y, además de buscar
+  caídas, revisan que `check()` y `Layout` acepten lo mismo y que lo
+  decodificado cumpla su esquema y se vuelva a codificar igual.
+- **CI**: job `fuzz`, un minuto por fuzzer de C++ y 30 s por blanco de Python
+  en cada push; si encuentra algo, la entrada queda en los artefactos.
+- Constantes `wire::schema::kMaxDepth`, `kMaxFixedSize`, `kMaxArray` y
+  `kMaxTensorDims`; en Python, `schema.MAX_DEPTH` y `schema.MAX_FIXED_SIZE`.
+
+### Pruebas
+- `tests/fuzz/regresiones/`: cada entrada que rompió un decodificador (las
+  hechas a mano salen de `generar.py`). Las corren `ctest`
+  (`fuzz_regresiones_*`, en los tres sistemas y sin Clang, con `replay.cpp`),
+  `python/test_fuzz.py` y `python/test_panel_js.py` (por `agmen.js`).
+- Una prueba con nombre por cada arreglo: `test_wire` (anuncios anidados y de
+  300 campos, `check()` y `Layout` con los mismos límites, `static_assert` de
+  los tamaños), `test_layout`, `test_arrow` (tensores, `f64` en enteros de 64
+  bits, la memoria que pide una columna sin datos) y `python/test_fuzz.py`.
+  Todas fallan (o se cuelgan) con el código anterior, menos la del cuerpo
+  negativo.
+
 ### Planeado (nivel 8, versión 0.11.0)
 - Memoria compartida para no copiar imágenes y tensores entre procesos.
 

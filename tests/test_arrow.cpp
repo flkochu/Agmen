@@ -5,9 +5,13 @@
 #include <agmen/layout.hpp>
 #include <agmen/wire.hpp>
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
+#include <limits>
+#include <new>
 #include <random>
 #include <sstream>
 #include <string>
@@ -16,6 +20,17 @@
 #ifndef AGMEN_VECTORS_FILE
 #error "CMake debe definir AGMEN_VECTORS_FILE"
 #endif
+
+// La reserva de memoria más grande desde la última vez que se puso en 0 (ver
+// memoria_acotada_con_datos_que_faltan). Este programa es de un solo hilo.
+static std::size_t g_biggest_alloc = 0;
+void* operator new(std::size_t n) {
+    if (n > g_biggest_alloc) g_biggest_alloc = n;
+    if (void* p = std::malloc(n == 0 ? 1 : n)) return p;
+    throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 
 namespace {
 
@@ -41,6 +56,12 @@ std::vector<std::string> split_tabs(const std::string& line) {
     std::string part;
     while (std::getline(ss, part, '\t')) out.push_back(part);
     return out;
+}
+
+std::int64_t get_le_i64(const Bytes& b, std::size_t at) {
+    std::uint64_t v = 0;
+    for (std::size_t k = 0; k < 8; ++k) v |= static_cast<std::uint64_t>(b[at + k]) << (8 * k);
+    return static_cast<std::int64_t>(v);
 }
 
 Bytes from_hex(const std::string& h) {
@@ -225,6 +246,103 @@ void test_broken_payloads() {
     CHECK(rejected > 1000);
 }
 
+bool throws_wire(const Codec& c, const Bytes& b, const char* contains) {
+    try {
+        (void)c.decode(b);
+    } catch (const WireError& e) {
+        if (std::string(e.what()).find(contains) != std::string::npos) return true;
+        std::fprintf(stderr, "  mensaje: %s\n", e.what());
+    }
+    return false;
+}
+
+// Reemplaza la única aparición de `from` en `b` por `to` (mismo tamaño).
+bool patch(Bytes& b, const Bytes& from, const Bytes& to) {
+    std::size_t found = 0;
+    std::size_t at = 0;
+    for (std::size_t k = 0; k + from.size() <= b.size(); ++k) {
+        if (std::memcmp(b.data() + k, from.data(), from.size()) == 0) {
+            ++found;
+            at = k;
+        }
+    }
+    if (found != 1) return false;
+    std::memcpy(b.data() + at, to.data(), to.size());
+    return true;
+}
+
+Bytes i32s(std::initializer_list<std::int32_t> v) {
+    Bytes out;
+    for (const auto x : v) {
+        for (int k = 0; k < 4; ++k) out.push_back(static_cast<std::uint8_t>(static_cast<std::uint32_t>(x) >> (8 * k)));
+    }
+    return out;
+}
+
+void forma_de_tensor_que_da_la_vuelta() {
+    // Antes: los elementos de la forma se multiplicaban en size_t; 65536⁴ = 2^64
+    // daba 0 y un tensor "de 2^64 elementos" pasaba sin datos (al leer y al escribir).
+    const agmen::schema::Layout l("A{tensor<u8,4> t}");
+    const Codec c(l);
+    const std::span<const std::uint8_t> none{};
+    Bytes b = c.encode(Value::structure({Value::tensor<std::uint8_t>({0, 3, 5, 7}, none)}));
+    CHECK(c.decode(b).items[0].shape.size() == 4);
+    CHECK(patch(b, i32s({0, 3, 5, 7}), i32s({65536, 65536, 65536, 65536})));
+    CHECK(throws_wire(c, b, "su forma dice otra cosa"));
+    CHECK(schema_error([&] { (void)c.encode(Value::structure({Value::tensor<std::uint8_t>({65536, 65536, 65536, 65536}, none)})); },
+                       "se pueden contar"));
+    CHECK(schema_error([&] { (void)c.encode(Value::structure({Value::tensor<std::uint8_t>({65536, 65536, 65535, 1}, none)})); },
+                       "elementos según su forma y trae 0 datos"));
+    // Una dimensión 0 da 0 elementos; las demás, como en NumPy, deben caber en
+    // 63 bits (contando el 0 como 1). Lo encontró atheris: NumPy lanzaba
+    // ValueError con (469762048, 402653184, 0, 67108864).
+    Bytes zero = c.encode(Value::structure({Value::tensor<std::uint8_t>({0, 65536, 65536, 65536}, none)}));
+    CHECK((c.decode(zero).items[0].shape == std::vector<std::int32_t>{0, 65536, 65536, 65536}));
+    CHECK(schema_error([&] { (void)c.encode(Value::structure({Value::tensor<std::uint8_t>({469762048, 402653184, 0, 67108864}, none)})); },
+                       "se pueden contar"));
+    CHECK(patch(zero, i32s({0, 65536, 65536, 65536}), i32s({469762048, 402653184, 0, 67108864})));
+    CHECK(throws_wire(c, zero, "su forma dice otra cosa"));
+}
+
+void flotante_fuera_de_rango_en_entero_de_64_bits() {
+    // Antes: static_cast<int64_t>(1e30) es comportamiento indefinido (UBSan).
+    const agmen::schema::Layout l("A{string s;i64 a;u64 b;time t}");
+    const Codec c(l);
+    const auto row = [](Value a, Value b, Value t) {
+        return Value::structure({Value::text("x"), std::move(a), std::move(b), std::move(t)});
+    };
+    const Value ok = c.decode(c.encode(row(Value::real(-9.2e18), Value::real(1.8e19), Value::real(1e18))));
+    CHECK(ok.items[1].i == static_cast<std::int64_t>(-9.2e18) && ok.items[2].u == static_cast<std::uint64_t>(1.8e19));
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    for (const double bad : {1e30, -1e30, 0x1p63, nan, 1.5}) {
+        CHECK(schema_error([&] { (void)c.encode(row(Value::real(bad), Value::uinteger(0), Value::integer(0))); }, "i64"));
+        CHECK(schema_error([&] { (void)c.encode(row(Value::integer(0), Value::uinteger(0), Value::real(bad))); }, "time"));
+    }
+    for (const double bad : {-1.0, 0x1p64, 1e30, nan, 0.5}) {
+        CHECK(schema_error([&] { (void)c.encode(row(Value::integer(0), Value::real(bad), Value::integer(0))); }, "u64"));
+    }
+}
+
+void memoria_acotada_con_datos_que_faltan() {
+    // Antes: al leer una columna se reservaba lugar para sus valores ANTES de
+    // revisar que el mensaje trajera los datos: 131072 bool sin sus bits (un
+    // mensaje de 33 KB) pedían ~15 MB, y uno de 64 MiB, decenas de GB.
+    const agmen::schema::Layout l("A{bool[131072] b;bytes pad}");
+    const Codec c(l);
+    std::vector<Value> bits(131072, Value::boolean(true));
+    const std::vector<std::uint8_t> pad(16384, 7);
+    Bytes b = c.encode(Value::structure({Value::list(std::move(bits)), Value::blob(pad)}));
+    // Metadatos de Agmen: 3 FieldNode y luego los Buffer (offset, largo); el
+    // tercero son los bits. Se dice que mide 0.
+    const std::size_t bits_len_at = 8 + (80 + 16 * 3) + 16 + 16 * 2;
+    CHECK(get_le_i64(b, bits_len_at) == 16384);
+    for (std::size_t k = 0; k < 8; ++k) b[bits_len_at + k] = 0;
+    g_biggest_alloc = 0;
+    CHECK(throws_wire(c, b, "se necesitan 16384"));
+    CHECK(g_biggest_alloc < (std::size_t{1} << 20));
+    if (g_biggest_alloc >= (std::size_t{1} << 20)) std::fprintf(stderr, "  pidió %zu bytes\n", g_biggest_alloc);
+}
+
 void test_envelope() {
     std::ifstream in(AGMEN_VECTORS_FILE);
     std::string line;
@@ -251,6 +369,9 @@ int main() {
     test_values();
     test_errors();
     test_broken_payloads();
+    forma_de_tensor_que_da_la_vuelta();
+    flotante_fuera_de_rango_en_entero_de_64_bits();
+    memoria_acotada_con_datos_que_faltan();
     test_envelope();
     if (g_failures != 0) {
         std::printf("%d fallas\n", g_failures);
