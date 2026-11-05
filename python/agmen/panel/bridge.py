@@ -243,8 +243,10 @@ class Bridge:
     def _stop_driving(self, c: AgmenClient, why: str) -> None:
         c.teleop_at = 0.0
         if self.panel.teleop:
-            self.panel.teleop.send(0.0, 0.0)
+            # Primero el aviso y luego el alto: quien ya recibió el alto también
+            # ve por qué (antes, en una máquina lenta, el log llegaba después).
             self.panel.logs.add("agmen", f"panel: {why} ({c.peer}) mientras manejaba → ALTO", "agmen")
+            self.panel.teleop.send(0.0, 0.0)
 
     def _agmen_op(self, c: AgmenClient, text: str) -> str | None:
         try:
