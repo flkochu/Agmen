@@ -231,7 +231,7 @@ def announcement(levels):
     return wire.Envelope(wire.ENC_SCHEMA, 0, schema.fnv1a64(text.encode()), wire.topic_id("/t"), 7, 0, 0, 0,
                          len(payload), wire.CLOCK_REAL).pack() + payload
 
-udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+udp = wire.udp_socket()             # en macOS, sin esto un datagrama de más de 9 KB no sale
 for levels in (300, 2500):
     udp.sendto(announcement(levels), ("127.0.0.1", port))
 udp.sendto(b"\xab" * 100, ("127.0.0.1", port))
