@@ -30,8 +30,8 @@ jobs:
       - name: Versión consistente
         run: python scripts/check_version.py
 
-      - name: nanobind (para agmen._core), NumPy y pyarrow (el juez de la codificación arrow)
-        run: python -m pip install nanobind numpy pyarrow
+      - name: nanobind (para agmen._core), NumPy, pyarrow (el juez de arrow) y mcap (el juez de las grabaciones)
+        run: python -m pip install nanobind numpy pyarrow mcap
 
       - name: include/agmen/msgs.hpp al día con python/agmen/msgs.agmen
         run: python -m agmen gen python/agmen/msgs.agmen --cpp include/agmen --check-files
