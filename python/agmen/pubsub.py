@@ -125,13 +125,16 @@ class _HubLink:
 
 
 class _PurePublisher:
-    def __init__(self, msg_type, to: str, topic: str | None = None) -> None:
+    def __init__(self, msg_type, to: str, topic: str | None = None, *, source_id: int | None = None) -> None:
         """`to` = topic ("/cmd") o dirección ("127.0.0.1:7500"). Con dirección,
-        `topic` es solo una etiqueta (default "/" + nombre del tipo)."""
+        `topic` es solo una etiqueta (default "/" + nombre del tipo). `source_id`:
+        el de una grabación (agmen play); si no, uno al azar."""
         _backend.notice_pure_once()
         self.type = msg_type
         self.to = to
-        self.source_id = wire.new_source_id()
+        # Antes de cualquier hilo: el hub, la conexión TCP y los bloques de memoria
+        # compartida (su dueño) nacen ya con este source_id.
+        self.source_id = source_id or wire.new_source_id()
         self.seq = 0
         self._sock = wire.udp_socket()
         self._announced_at: float | None = None

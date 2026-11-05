@@ -50,10 +50,10 @@ class _ReplayPublisher(_PurePublisher):
     source_id que tenían. Uno por (topic, source_id) grabado."""
 
     def __init__(self, rtype: _RecordedType, topic: str, source_id: int) -> None:
-        super().__init__(rtype, topic)
-        self.source_id = source_id
-        if self._tcp is not None:
-            self._tcp.source_id = source_id   # el dueño de sus bloques de memoria compartida (RFC 0009)
+        # El source_id va desde el constructor: si se cambiara después, un suscriptor
+        # que ya se conectó (en los 0.1 s que se espera al hub) tendría bloques de
+        # memoria compartida con otro dueño, y los rechazaría (RFC 0009).
+        super().__init__(rtype, topic, source_id=source_id)
 
     def send_packet(self, data) -> bool:
         if self._link is not None:

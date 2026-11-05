@@ -29,6 +29,7 @@ mismos nombres y los mismos bytes.
 
 from __future__ import annotations
 
+import itertools
 import mmap
 import os
 import struct
@@ -229,8 +230,16 @@ def _windows_name(name: str) -> str:
 def create(name: str, size: int) -> mmap.mmap:
     """Un bloque nuevo de lectura y escritura, solo para tu usuario. Lanza ShmError."""
     if _WINDOWS:
+        # mmap con tagname ABRE el bloque si ya existe (CreateFileMapping): dos
+        # publicadores escribirían en la misma memoria. Como O_EXCL en Linux (y
+        # ERROR_ALREADY_EXISTS en C++): si el nombre ya existe, error y otro nombre.
+        tag = _windows_name(name)
+        handle = _k32.OpenFileMappingW(_FILE_MAP_READ, False, tag)
+        if handle:
+            _k32.CloseHandle(handle)
+            raise ShmError(f"la memoria compartida '{name}' ya existe")
         try:
-            return mmap.mmap(-1, size, tagname=_windows_name(name))
+            return mmap.mmap(-1, size, tagname=tag)
         except OSError as e:
             raise ShmError(f"no se pudo crear la memoria compartida '{name}': {_os_error(e)}") from None
     if _posixshmem is None:
@@ -368,6 +377,9 @@ class _Block:
             pass   # alguien de este proceso todavía lo ve: se libera al soltarlo
 
 
+_NAMES = itertools.count()
+
+
 class Pool:
     """Los bloques de un publicador. Las cuentas de quién tiene prestado qué
     viven aquí, en la memoria del publicador, no en la memoria compartida. No
@@ -395,7 +407,9 @@ class Pool:
 
     def _name(self) -> str:
         # "/agm" + pid + 8 hex del publicador + contador = 24 caracteres (macOS acepta 31).
-        name = f"/agm{os.getpid() & 0xFFFFFFFF:08x}{self.owner & 0xFFFFFFFF:08x}{self.counter & 0xFFFF:04x}"
+        # El contador es del proceso, no del Pool: dos publicadores con el mismo dueño
+        # (agmen play reproduce los source_id grabados) no se pisan los nombres.
+        name = f"/agm{os.getpid() & 0xFFFFFFFF:08x}{self.owner & 0xFFFFFFFF:08x}{next(_NAMES) & 0xFFFF:04x}"
         self.counter += 1
         return name
 

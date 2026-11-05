@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import agmen
-from agmen import _mcap, clock, play, wire
+from agmen import _mcap, _shm, _tcp, clock, play, wire
 from agmen import hub as hubmod
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -121,6 +121,10 @@ class TestReproducir(PlayCase):
         self.assertTrue(p.wait(5))
         for t in threads:
             t.join()
+        cam_pub = p._pubs[("/camara", SRC_CAM)]
+        if _shm.enabled():   # RFC 0009: los bloques son del source_id grabado, y el suscriptor nunca cae a TCP
+            self.assertEqual(cam_pub._tcp.pool.owner, SRC_CAM)
+            self.assertEqual(cam_pub.shm_subscribers, 1)
         stats = p.stop()
         self.assertEqual(stats.messages, 25)
         self.assertEqual([s.message.accel[0] for _, s in imus], [float(i) for i in range(20)])
@@ -159,6 +163,25 @@ class TestReproducir(PlayCase):
         self.assertEqual(t_data, sorted(t_data), "el tiempo nunca regresa entre vueltas")
         self.assertGreater(len(got), 20)
         self.assertEqual(got[20][1].message.accel[0], 0.0, "la segunda vuelta empieza otra vez")
+
+    def test_el_source_id_grabado_desde_el_principio(self):
+        # Si se cambiara después de crear el publicador, un suscriptor que se conecte en
+        # ese momento recibiría bloques de memoria compartida de otro dueño (pasó en Windows).
+        seen = []
+        orig = _tcp.Fanout.__init__
+
+        def spy(fan, topic="", source_id=0, topic_id=0):
+            seen.append(source_id)
+            orig(fan, topic, source_id, topic_id)
+
+        _tcp.Fanout.__init__ = spy
+        try:
+            pub = play._ReplayPublisher(play._RecordedType(Img.SCHEMA_TEXT), "/camara", SRC_CAM)
+        finally:
+            _tcp.Fanout.__init__ = orig
+        self.closers.append(pub.close)
+        self.assertEqual(seen, [SRC_CAM])
+        self.assertEqual((pub.source_id, pub._tcp.source_id), (SRC_CAM, SRC_CAM))
 
     def test_un_nodo_en_reloj_real_lo_avisa(self):
         # Un nodo aparte (otro proceso), con reloj real: el de este proceso ya es el de la grabación.
