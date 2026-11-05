@@ -88,6 +88,26 @@ de tu editor) y `agmen gen arca9.agmen` muestra cada tipo con su esquema.
 El panel también acepta a [Foxglove](https://foxglove.dev) (solo lectura):
 conéctate a `ws://127.0.0.1:8080/ws`.
 
+## Grabar y reproducir: tu robot como dataset (desde 0.12)
+
+```bash
+agmen run robot.toml --record                  # graba todos los topics en grabaciones/*.mcap
+agmen run robot.toml --play vuelta1.mcap --skip camara   # la grabación en vez del sensor, con su tiempo
+agmen web vuelta1.mcap                         # verla en el navegador, con barra de tiempo
+agmen export vuelta1.mcap --parquet vuelta1/   # una tabla por topic (pip install agmen[datasets])
+```
+
+```python
+rec = agmen.Recording("vuelta1.mcap")
+for s in rec.messages("/imu"):                 # como Subscriber.receive()
+    print(s.envelope.t_data, s.message.accel)
+df = rec.table("/imu").to_pandas()             # t_data, t_pub, log_time, source_id, seq, ax, ay, …
+```
+
+Las grabaciones son archivos MCAP (los abre Foxglove con
+`agmen export --foxglove`). `pip install agmen[grabar]` agrega la compresión
+(`agmen record --compress zstd`).
+
 > ⚠ Versión 0.x: la API todavía va a cambiar entre versiones menores.
 
 Documentación, tutorial y código: <https://github.com/flkochu/Agmen>

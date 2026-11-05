@@ -132,7 +132,7 @@ source = "agmen"      # quién manda el tiempo: "agmen" o el nombre de tu nodo s
 |---|---|---|---|
 | `real` | La hora de la computadora (como hoy) | Tiempo real | `real` |
 | `sim` | El tiempo de la simulación, que puede ir más rápido, más lento o pausado | Sigue al tiempo de la simulación: a `speed = 2`, un `every(1s)` se dispara cada medio segundo real; en pausa, no se dispara | `sim` |
-| `replay` (nivel 9) | El tiempo de la grabación | Igual que `sim` | `replay` |
+| `replay` (nivel 9, desde 0.12.0: [RFC 0010](0010-grabar-y-reproducir.md)) | El tiempo de la grabación | Igual que `sim` | `replay` |
 
 - **`source = "agmen"`:** `agmen run` publica el tiempo en el topic `/clock`
   (`Clock{time t;f64 speed;bool paused}`), unas 50 veces por segundo. Entre un
@@ -189,7 +189,8 @@ node.subscribe<Evento>("/eventos", on_evento, {.queue = 100});
   de núcleo): se pueden agregar después como opción del grupo.
 - Servicios (pedir y responder).
 - Sincronizar relojes entre varias máquinas: nivel 11.
-- Grabar y reproducir: nivel 9 (este RFC deja listo el modo `replay`).
+- Grabar y reproducir: nivel 9 (este RFC deja listo el modo `replay`; se
+  implementó en 0.12.0, [RFC 0010](0010-grabar-y-reproducir.md)).
 
 ## 5. Decisiones
 
@@ -270,7 +271,9 @@ node.subscribe<Evento>("/eventos", on_evento, {.queue = 100});
   0.1 s simulados y deja la pausa.
 - **Velocidad**: entre 0 y 1000 (`[clock] speed` y el panel). `speed` y
   `paused` solo valen con `source = "agmen"`; con un simulador, el tiempo lo
-  decide él. `mode = "replay"` se rechaza con un mensaje que apunta al nivel 9.
+  decide él. `mode = "replay"` se rechaza con un mensaje que apunta al nivel 9
+  (desde 0.12.0, a `agmen run --play archivo.mcap`, que pone a todos los nodos
+  en `replay`).
 - **Cuentas**: cada `Node` manda al hub sus temporizadores y colas una vez
   por segundo (operación `stat`; un hub viejo la ignora). Las usan `agmen
   node list` y el panel.

@@ -263,7 +263,7 @@ class Writer:
         """Escribe el chunk en curso (y el índice de sus mensajes)."""
         if self._chunk_msgs == 0:
             return
-        raw = bytes(self._buf)
+        raw = memoryview(self._buf)                 # sin copiar el chunk (una imagen 4K son 25 MB)
         crc = zlib.crc32(raw)
         data = self._compress(raw) if self._compress else raw
         body = (struct.pack("<QQQI", self._chunk_t0, self._chunk_t1, len(raw), crc) + _str(self.compression)
@@ -284,6 +284,8 @@ class Writer:
             + _U32.pack(len(offsets_body)) + offsets_body + _U64.pack(self._pos - index_start)
             + _str(self.compression) + struct.pack("<QQ", len(data), len(raw))))
         self._chunk_count += 1
+        data = None
+        raw.release()
         self._buf = bytearray()
         self._index = {}
         self._chunk_msgs = 0

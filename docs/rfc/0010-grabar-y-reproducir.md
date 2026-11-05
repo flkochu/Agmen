@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Estado** | ✅ **Aceptado** (2026-11-05, D1–D9 = a). Se implementa en Agmen 0.12.0. Decisiones en la [sección 5](#5-decisiones) |
+| **Estado** | ✅ **Aceptado** (2026-11-05, D1–D9 = a) e **implementado en Agmen 0.12.0** ([sección 8](#8-lo-que-se-implementó-en-0120)). Decisiones en la [sección 5](#5-decisiones) |
 | **Depende de** | RFC 0001 (el sobre: `t_data`, `t_pub`, `source_id`, `seq` y el campo `clock`; pregunta abierta 1 de §13), RFC 0002 (panel y Foxglove), RFC 0004 (hub y topics), RFC 0006 (el reloj de Agmen y el modo `replay`), RFC 0008 (`arrow`, `agmen.msgs.Imagen`, D3), RFC 0009 (memoria compartida) |
 | **Versión** | Agmen 0.12.0 |
 | **Requisitos** | c (todo mensaje con marca de tiempo; las grabaciones sirven como datasets), d (misma interfaz para simulación, robot real y grabación), h (interfaz web), i (un solo comando) |
@@ -274,6 +274,107 @@ df = tabla.to_pandas()
 8. Medición: `bench/grabar.py`.
 9. Tutorial, capítulo 16: "Grabar y reproducir: tu robot como dataset".
    README, VISION, PROTOCOLO (el perfil `agmen` de MCAP) y CHANGELOG.
+
+## 8. Lo que se implementó en 0.12.0
+
+| Pieza | Dónde |
+|---|---|
+| Lector y escritor de MCAP sin dependencias (D1, D9): chunks con su índice y CRC, resumen, metadatos y adjuntos; un archivo sin resumen se lee de corrido hasta el último chunk completo; `repair()` | `python/agmen/_mcap.py` |
+| `agmen record` y `agmen info` (D2–D4): un suscriptor más (por memoria compartida cuando puede), la cola con tope, las pérdidas por topic y motivo en `agmen.perdidos`, `--split`, `--compress`, `--reparar` | `python/agmen/record.py` |
+| El reloj `replay` (D6) en C++ y en Python, y el aviso al nodo que recibe otro reloj | `include/agmen/clock.hpp`, `src/clock.cpp`, `src/node.cpp`, `src/pubsub.cpp`; `python/agmen/clock.py`, `python/src/core.cpp` |
+| `agmen play` (D6): los mismos bytes con `clock` = replay, `/clock` con la hora de la grabación, `--rate`, `--loop`, `--start`, `--end` | `python/agmen/play.py` |
+| `agmen run --record`, `[record]`, `--play`, `--play-topic`, `--skip`; el botón ⏺ del panel (`RecordingControl`) | `python/agmen/cli.py`, `run.py`, `record.py`, `panel/server.py` |
+| `agmen.Recording` y `agmen export --parquet` (D7) | `python/agmen/recording.py` |
+| `agmen export --foxglove` (D8): el JSON del puente en vivo (`foxglove_schema`, `foxglove_row`) | `python/agmen/recording.py`, `panel/bridge.py` |
+| El panel abre grabaciones (D8): `mcap.js` lee por partes con el índice; barra de tiempo; `agmen web archivo.mcap` (con Range, y los chunks de zstd descomprimidos) | `python/agmen/panel/mcap.js`, `index.html`, `server.py` |
+| El vector de prueba de §6.6 | `tests/vectors/grabacion.mcap` y `generar_mcap.py` |
+| Pruebas | `python/test_mcap.py` (la biblioteca oficial, en los dos sentidos; cortar en cada byte; dañar al azar), `test_record.py`, `test_play.py`, `test_recording.py` (pyarrow y la biblioteca oficial como jueces), `test_panel_js.py` (`mcap.js` contra Python: el vector, lz4, cortadas, 60 dañadas), `test_web.py`, `tests/test_node.cpp` (reloj replay); `scripts/grabar_smoke.py` (de punta a punta con `agmen run`) y el capítulo 16 en `scripts/tutorial_check.py`, todo en el CI de los 3 sistemas y con los dos núcleos de Python |
+| Medición | `bench/grabar.py` |
+| Tutorial | Capítulo 16; `examples/tutorial/dataset.py` |
+
+### Medido
+
+`python bench/grabar.py` en el contenedor de desarrollo (Linux, 4 núcleos,
+Python 3.13, núcleo de C++, el disco de la máquina). La cámara (RGB a 30 fps,
+5 s) y el grabador son procesos distintos; el grabador recibe por memoria
+compartida.
+
+| Imagen | MB | Llegan | Grabadas | Se escriben | Perdidas | CPU del grabador por imagen | `publish()` de la cámara, mediana / p99 |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 640×480 | 0.9 | 28 MB/s | 150 de 150 | 28 MB/s | 0 | 1.6 ms | 0.22 / 0.45 ms |
+| 1280×720 | 2.8 | 83 MB/s | 150 de 150 | 83 MB/s | 0 | 10.6 ms | 0.45 / 1.08 ms |
+| 1920×1080 | 6.2 | 187 MB/s | 150 de 150 | 187 MB/s | 0 | 23.1 ms | 1.01 / 2.84 ms |
+| 3840×2160 | 24.9 | 747 MB/s | 55 de 150 | 274 MB/s | 95 (disco) | 139.9 ms | 3.82 / 18.47 ms |
+
+Lo que dice la tabla:
+
+- Hasta **1080p a 30 fps (187 MB/s) se graba todo**. Una cámara 4K a 30 fps
+  son 747 MB/s: no cabe, el grabador descarta (y lo cuenta, lo avisa y lo deja
+  escrito), y **la cámara no se frena**: `publish()` nunca espera al
+  grabador. Su p99 sube porque el grabador tiene bloques de memoria
+  compartida prestados mientras esperan en la cola (la cámara usa otros,
+  nuevos) y por la competencia por los 4 núcleos.
+- En esta máquina, escribir cuesta: un `write()` de Python solo, sin Agmen,
+  gasta **4.6 ms de CPU por MB** (el kernel, en una máquina virtual). Eso es
+  casi toda la CPU del grabador; lo de Agmen encima (CRC, juntar el chunk) es
+  menos de 1 ms por MB. En una computadora sin virtualizar, escribir es varias
+  veces más barato; en la microSD de una Raspberry Pi, el disco manda (decenas
+  de MB/s). Por eso el tutorial dice: para grabar la cámara en un robot chico,
+  publica `ImagenComprimida`.
+- Los números cambian de una corrida a otra (±30 %); lo que no cambia es
+  que nada se pierde sin contarse, y que la cámara sigue a su ritmo.
+
+### Reglas que se fijaron al implementarlo
+
+- **`log_time` es la hora del reloj del grabador** (real, sim o replay), no la
+  de la computadora: así una simulación o una reproducción grabada se vuelve a
+  reproducir con su propio tiempo. Si un topic llega con otro reloj (un robot
+  en simulación y `agmen record` en reloj real), el grabador lo avisa una vez
+  (`corre el grabador con AGMEN_CLOCK=sim`).
+- **`agmen run` detiene los nodos antes de cerrar la grabación**: se guarda
+  hasta el último mensaje, y el resumen sale antes del "listo".
+- **El `/clock` grabado no se reproduce**: el tiempo lo manda el reproductor.
+  Al terminar (sin `--loop`) el reloj queda **en pausa** donde acabó la
+  grabación, para que los nodos no sigan en un tiempo que ya no tiene datos.
+- **`--loop` y el reloj que nunca regresa**: cada vuelta le suma a `t_data` y
+  `t_pub` lo que dura la grabación (más un hueco de 1/1000), y el reloj salta
+  hacia adelante. Los mensajes de la segunda vuelta ya no son byte por byte
+  los grabados (cambian esos dos campos).
+- **El reproductor publica con el `source_id` grabado desde que nace**: en el
+  CI de Windows, un suscriptor alcanzó a conectarse antes de que se cambiara,
+  y los bloques de memoria compartida tenían otro dueño (el suscriptor los
+  rechazó, con razón, RFC 0009). De ahí también: en Windows, crear un bloque
+  cuyo nombre ya existe es un error (antes abría el ajeno), como en C++.
+- **Un paquete con N filas** (RFC 0001 §6) da N mensajes en
+  `Recording.messages()` y N filas en la tabla, con el mismo sobre.
+- **Las columnas del sobre** se llaman `t_data`, `t_pub`, `log_time`,
+  `source_id` y `seq`; si un campo del mensaje se llama igual, la del sobre
+  lleva `_` adelante (`_seq`).
+- **El panel, viendo una grabación, no maneja el robot**: los datos no son de
+  ahora. La tarjeta *Manejar* (y el reloj del robot) se esconden hasta que la
+  cierras.
+- **El panel no trae zstd**: los chunks sin comprimir o con lz4 los lee el
+  navegador (lz4 en unas 50 líneas); los de zstd, solo con
+  `agmen web archivo.mcap`, que los descomprime en el servidor.
+
+### Diferencias con la propuesta
+
+- **Tensores en Parquet** (§3.5 decía "lista de largo fijo con su forma en los
+  metadatos"): se usa el mapeo canónico del RFC 0008 que ya tenía
+  `msg.to_arrow()`: un arreglo fijo de números de varias dimensiones va como
+  `fixed_shape_tensor` (la forma va en el tipo), y un `tensor<T,N>` (forma
+  distinta en cada mensaje) como `variable_shape_tensor`, o `struct{data,
+  shape}` si tu pyarrow no lo tiene. Una lista de largo fijo no sirve para
+  formas que cambian.
+- **Adjuntos**: solo el `robot.toml`, no los `.agmen` (§3.3): los esquemas ya
+  van en los registros `Schema` de MCAP.
+- **El botón para volver al principio** con `agmen run --play` (§6, reto 3) no
+  entró: para regresar, se detiene y se vuelve a correr. En el panel, sin
+  nodos, sí se salta a cualquier punto.
+- **Tamaño**: el lector y escritor de Python son unas 760 líneas (con la
+  reparación, la compresión y los mensajes de error en español) y el lector de
+  JavaScript unas 380, no 300 cada uno.
+- Lo demás, como se propuso.
 
 ## Fuentes
 

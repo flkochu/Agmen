@@ -167,6 +167,34 @@ computadora, por la conexión TCP de los mensajes grandes (RFC 0008):
 sentido contrario): `"AGB"`, `op` (u8: 1 = puedo, 2 = la prueba salió bien, 3 =
 la prueba falló, 4 = suelto el bloque), `slot` (u32) y `generation` (u64).
 
+## Grabaciones (MCAP, desde Agmen 0.12)
+
+Diseño y razones en el [RFC 0010](rfc/0010-grabar-y-reproducir.md). Una
+grabación de Agmen es un archivo [MCAP](https://mcap.dev/spec) con el perfil
+`agmen` y la codificación de mensajes `agmen`. Cualquier biblioteca de MCAP lo
+abre, lo recorta y lo junta; para entender los mensajes basta este documento.
+
+| En MCAP | Qué guarda Agmen |
+|---|---|
+| `Header` | `profile = "agmen"`, `library = "agmen 0.12.0"` |
+| `Schema` | `name` = el nombre del tipo (`Imagen`), `encoding = "agmen"`, `data` = el esquema canónico en UTF-8 (`agmen/1 Imagen{…}`), el mismo texto que viaja en el anuncio |
+| `Channel` | uno por topic: `topic = "/camara"`, `message_encoding = "agmen"`; en sus metadatos, `schema_id` (16 cifras hexadecimales) y `encoding` (`compact` o `arrow`) |
+| `Message` | `data` = **el paquete de Agmen completo** (sobre de 64 bytes + payload, como arriba); `publish_time` = `t_pub`; `log_time` = cuándo lo recibió el grabador (en el reloj del robot: real, sim o replay); `sequence` = los 32 bits bajos de `seq` |
+| `Metadata` | `agmen.grabacion`: `version`, `computadora`, `reloj` (real, sim, replay), `inicio`, `topics` y, con `agmen run`, `robot` y `comando`. `agmen.perdidos`: `"<topic> <motivo>"` → cuántos se perdieron (`disco`, `antes de llegar` = huecos de `seq`, `sin anuncio`) y `total` |
+| `Attachment` | con `agmen run`, el `robot.toml` (`text/plain`) |
+| *Chunks* | de unos 4 MiB o 1 s, con `MessageIndex`; sin comprimir o con `zstd`/`lz4`; resumen completo (`ChunkIndex`, `Statistics`, `MetadataIndex`…) al cerrar |
+
+- Lo que llegó por memoria compartida se guarda con su payload de verdad y sin
+  la bandera `SHM`: queda igual que si hubiera llegado por TCP.
+- Un `Message` no lleva el `/clock` que manda `agmen play`: al reproducir, el
+  tiempo lo publica el reproductor.
+- Al reproducir, `agmen play` manda los mismos bytes con el campo `clock` del
+  sobre = 2 (`replay`).
+- Hay tres lectores de referencia: Python (`python/agmen/_mcap.py`),
+  JavaScript (`python/agmen/panel/mcap.js`, el del panel) y la biblioteca
+  oficial de MCAP. Los tres leen igual el vector
+  [`tests/vectors/grabacion.mcap`](../tests/vectors/grabacion.mcap).
+
 ## Ejemplo completo
 
 `MotorCommand{left = 0.5, right = -0.25}`, topic `/cmd`, `source_id =

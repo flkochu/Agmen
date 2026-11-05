@@ -216,5 +216,5 @@ if (auto raw = sub.receive_raw(std::chrono::milliseconds(100))) {
 - Una imagen está prestada mientras la uses; guarda copias (`np.array`) si
   quieres muchas.
 
-**Siguiente (Agmen 0.12.0):** grabar y reproducir, y exportar a Parquet para
-entrenar (nivel 9).
+**Siguiente:** [capítulo 16 — Grabar y reproducir: tu robot como
+dataset](16-grabar-y-reproducir.md).

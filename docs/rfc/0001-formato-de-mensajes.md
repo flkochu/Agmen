@@ -282,8 +282,8 @@ espacio para todo, así que cada nivel agrega sin romper:
 1. **Formato del archivo de grabación**: ¿MCAP (formato abierto con
    herramientas como Foxglove) con mensajes de Agmen adentro, o un formato
    propio basado en Arrow IPC? Se decide en el nivel 9. El sobre funciona con
-   ambos. → [RFC 0010](0010-grabar-y-reproducir.md) (aceptado: MCAP con los
-   mensajes de Agmen adentro).
+   ambos. → [RFC 0010](0010-grabar-y-reproducir.md) (aceptado e implementado
+   en 0.12.0: MCAP con los mensajes de Agmen adentro).
 2. **Hash de 64 bits vs 128 bits** para `schema_id`. 64 es suficiente para
    uso personal; si Agmen crece a un ecosistema público, se puede pasar a 128
    usando `header_len`.

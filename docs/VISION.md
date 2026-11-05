@@ -27,7 +27,7 @@ opcionales que se conectan al núcleo:
 | Paquete | Qué es | Cuándo |
 |---|---|---|
 | `agmen-core` | Núcleo en C++20: `#include <agmen/agmen.hpp>`, `namespace agmen::` | Desde ya |
-| `agmen` (comando) | `agmen run robot.toml` (todo el robot + panel), `agmen web`, `agmen mux`, `agmen echo`, `agmen hub`, `agmen topic list/info/echo/hz`, `agmen node list`, `agmen gen` | 0.2.0 (run, web); `mux` en 0.3.0; `echo` en 0.4.0; hub y topics en 0.5.0; `--red` en 0.6.0; `gen` en 0.7.0 |
+| `agmen` (comando) | `agmen run robot.toml` (todo el robot + panel), `agmen web`, `agmen mux`, `agmen echo`, `agmen hub`, `agmen topic list/info/echo/hz`, `agmen node list`, `agmen gen`, `agmen record/info/play/export` | 0.2.0 (run, web); `mux` en 0.3.0; `echo` en 0.4.0; hub y topics en 0.5.0; `--red` en 0.6.0; `gen` en 0.7.0; grabaciones en 0.12.0 |
 | Archivos `.agmen` | Los mensajes de un robot en un archivo; genera C++ (`agmen_add_messages`) y Python (`agmen.load`) (RFC 0005). Desde 0.10.0 con `string`, `bytes`, `T[]` y `tensor<T,N>` (RFC 0008) | 0.7.0; tipos variables en 0.10.0 |
 | `agmen.msgs` | Mensajes estándar: `Imagen` e `ImagenComprimida`, con los campos de Foxglove (RFC 0008 D4) | 0.10.0 |
 | Memoria compartida | Imágenes y tensores sin copiar entre procesos de la misma computadora; entre computadoras, TCP. Sin cambiar el código de los nodos (RFC 0009) | 0.11.0 |
@@ -169,8 +169,13 @@ Agmen deja de tener soporte oficial en macOS: se prueba y se publica para
 - ✅ Misma computadora se **prueba**, no se adivina (D4): si el suscriptor no puede abrir la memoria del publicador (otra computadora, otro contenedor, otro usuario), todo sigue por TCP y se avisa una vez. Con dirección fija, el suscriptor escucha TCP en la IP que pide: las imágenes ya cruzan la red.
 - ✅ Nadie frena a nadie y la memoria tiene tope (D6): hasta 4 mensajes (o 64 MiB) prestados por suscriptor; hasta 8 (o 128 MiB) sin devolver por conexión, y luego D3 del RFC 0008; un pool por publicador de hasta 512 MiB, ¼ de la RAM o ½ de `/dev/shm` (lo menor; 0.11.1), que se encoge solo: un bloque sin usar 5 s se libera. Los bloques de un nodo que se cayó los borra el siguiente que arranca.
 
+### Cambió en 0.12.0 (RFC 0010, nivel 9)
+- ✅ Requisito c, grabar y reproducir: `agmen record` (un suscriptor más, por memoria compartida cuando puede) guarda los topics en **MCAP** con el paquete de Agmen completo adentro, sin cambiar un byte; nunca frena a nadie (cola con tope; las pérdidas se cuentan y quedan escritas) y, si se cae, pierde como mucho el último segundo. `agmen run --record`, `[record]` y el botón ⏺ del panel.
+- ✅ `agmen play` y `agmen run --play` reproducen con **el tiempo de la grabación** (el reloj `replay` del RFC 0006, en C++ y Python): los nodos no notan la diferencia, y `--skip` sustituye a los sensores (como dora). El panel lee el `.mcap` en el navegador, por partes, con barra de tiempo; `agmen export --foxglove` lo prepara para Foxglove.
+- ✅ Datasets: `agmen.Recording` (mensajes como `Sample`, tablas de pyarrow con el mapeo canónico) y `agmen export --parquet`. Tres lectores de MCAP (Python, JavaScript y la biblioteca oficial) leen igual el mismo vector de prueba.
+
 ### Falta (siguientes niveles)
-- Grabación y reproducción; exportar a Parquet (nivel 9).
+- El formato LeRobot (Parquet + MP4, por episodios), encima de esto (nivel 13).
 - Que la cámara escriba directo en la memoria compartida (préstamo para escribir, RFC 0009 §4): quitaría la copia que queda en el publicador.
 
 ### Se rehace
@@ -225,7 +230,7 @@ iceoryx2).
 | 6 ✅ (0.9.0) | Python de primera clase (RFC 0007): `agmen._core` compilado con nanobind (formato, topics, `Node`, reloj), wheels para 5 sistemas y Python puro de respaldo, NumPy sin copias | b |
 | **7 ✅** (0.10.0) | **Datos grandes (RFC 0008): codificación `arrow` (`string`, `bytes`, `T[]`, `tensor<T,N>`) por TCP con descarte por suscriptor lento; `agmen.msgs.Imagen`; cámara en el panel y en Foxglove. El puente del panel se quedó en Python: medido, cumple** | a, b, h |
 | **8 ✅** (0.11.0) | **Memoria compartida (RFC 0009): imágenes y tensores sin copiar entre procesos de la misma computadora, en C++ y Python, Linux y Windows (y macOS hasta 0.11.0); se prueba si se puede y si no, TCP; préstamos que se devuelven solos y con tope; `bench/shm_vs_tcp.py`** | a, b, g |
-| 9 | Grabación y reproducción; exportar a Parquet; reproducir en la web ([RFC 0010](rfc/0010-grabar-y-reproducir.md), aceptado) | c |
+| **9 ✅** (0.12.0) | **Grabar y reproducir (RFC 0010): `agmen record` en MCAP sin frenar a nadie, `agmen play` con el reloj `replay` y sustitución de nodos, el `.mcap` en el panel con barra de tiempo y en Foxglove, `agmen.Recording` y `agmen export --parquet`; `bench/grabar.py`** | c |
 | 10 | Abstracción sim/real; `robot.toml` con nodos en varias máquinas (el lanzador básico ya existe desde 0.2.0) | d, i |
 | 11 | Red multi-máquina, sincronización de relojes y **`agmen-web` en la nube** (relay con autenticación) | c, h |
 | 12 | Puentes (`agmen-iot` MQTT, ROS 2) y `agmen-micro` | f |

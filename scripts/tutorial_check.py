@@ -109,6 +109,47 @@ def run_vision() -> bool:
     return ok
 
 
+def run_dataset() -> bool:
+    """Capítulo 16 (RFC 0010): la IMU de C++ → agmen record → dataset.py (agmen.Recording y Parquet)."""
+    import tempfile
+    import threading
+
+    from agmen import hub as hubmod
+
+    h = hubmod.Hub("127.0.0.1:0", log=lambda t: None)
+    env = {**ENV, "AGMEN_HUB": f"127.0.0.1:{h.sock.getsockname()[1]}"}
+    stop = threading.Event()
+    threading.Thread(target=h.serve, args=(stop,), daemon=True).start()
+    work = Path(tempfile.mkdtemp(prefix="agmen-cap16-"))
+    rec = subprocess.Popen([sys.executable, "-m", "agmen", "record", "-o", str(work / "vuelta1.mcap"), "--duration", "6s",
+                            "/imu"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                           errors="replace", env=env)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and not any(e.kind == "sub" and e.topic == "/imu"
+                                                  for e in list(h.endpoints.values())):
+        time.sleep(0.05)
+    subprocess.run([str(BIN / f"publisher{EXE}"), "--rate", "100", "--to", "/imu", "--count", "200"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, timeout=30)
+    rec_out, _ = rec.communicate(timeout=30)
+    stop.set()
+    r = subprocess.run([sys.executable, str(ROOT / "examples" / "tutorial" / "dataset.py"), "vuelta1.mcap"], cwd=work,
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, timeout=60)
+    out = r.stdout + r.stderr
+    m = re.search(r"/imu: (\d+) mensajes de ImuSample", out)
+    n = int(m.group(1)) if m else 0
+    try:
+        import pyarrow  # noqa: F401
+        tables = "huecos en seq: 0" in out and (work / "dataset" / "imu.parquet").is_file()
+    except ImportError:
+        tables = "pip install agmen[datasets]" in out
+    ok = r.returncode == 0 and rec.returncode == 0 and n >= 180 and "az promedio 9.81" in out and tables
+    print(f"{'OK  ' if ok else 'FALLA'} capítulo 16: IMU C++ -> agmen record -> dataset.py: {n} mensajes de 200, "
+          f"{'tabla y Parquet' if tables else 'SIN tabla'}")
+    if not ok:
+        print(rec_out, out)
+    return ok
+
+
 def main():
     sys.path.insert(0, str(ROOT / "python"))
     results = [
@@ -117,6 +158,7 @@ def main():
         run_case("capítulo 3: cerebro Python -> motor C++",
                  [sys.executable, str(ROOT / "examples" / "tutorial" / "cerebro.py"), "40"], 40),
         run_vision(),
+        run_dataset(),
     ]
     sys.exit(0 if all(results) else 1)
 

@@ -513,7 +513,8 @@ class Recorder:
             return
         self._last_warn[topic] = now
         st = self.summary.topics[topic]
-        self._say(f"⚠ grabación: se perdieron {st.lost_disk} mensajes de {topic}: el disco no alcanza "
+        lost = "se perdió 1 mensaje" if st.lost_disk == 1 else f"se perdieron {st.lost_disk} mensajes"
+        self._say(f"⚠ grabación: {lost} de {topic}: el disco no alcanza "
                   f"(escribe {mib(self._rate(self._rate_out, now))} MB/s y llegan "
                   f"{mib(self._rate(self._rate_in, now))} MB/s). Graba menos topics o publica "
                   f"ImagenComprimida")

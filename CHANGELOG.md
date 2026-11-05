@@ -7,10 +7,79 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 
 ## [Sin publicar]
 
-### Planeado (nivel 9, versión 0.12.0)
-- Grabación y reproducción; exportar a Parquet. Diseño en el
-  [RFC 0010](docs/rfc/0010-grabar-y-reproducir.md), aceptado el 2026-11-05
-  (D1–D9 = a): MCAP con los mensajes de Agmen adentro.
+## [0.12.0] — 2026-11-05
+
+**Nivel 9: grabar y reproducir; tu robot como dataset.** Implementa el
+[RFC 0010](docs/rfc/0010-grabar-y-reproducir.md) (D1–D9 = a): las grabaciones
+son archivos MCAP con los mensajes de Agmen adentro, sin cambiar un byte. Los
+bytes de la red no cambian: un nodo de 0.12.0 habla con uno de 0.11.x.
+
+### Agregado
+- **`agmen record`**: graba topics en un `.mcap` (todos, o los que digas) como
+  un suscriptor más, por memoria compartida cuando puede. **Nunca frena a
+  nadie**: una cola con tope (lo menor entre 256 MiB y ⅛ de la RAM; `--queue`
+  la cambia); si el disco no alcanza, descarta, lo avisa y deja escritas las
+  pérdidas por topic y por qué (disco, huecos de `seq`, topic sin anuncio).
+  Chunks de ~4 MiB o 1 s: si el grabador se cae, se pierde como mucho el
+  último segundo. `--split 1GiB|10min`, `--compress zstd|lz4`, `--duration`.
+- **`agmen info`**: resume una grabación (duración, topics, tipos, mensajes,
+  pérdidas, adjuntos); `--reparar` le reescribe el índice a una cortada.
+- **`agmen play`**: reproduce cada mensaje a su tiempo (`--rate`, `--loop`,
+  `--start`, `--end`) con los mismos bytes, salvo el campo `clock` = replay,
+  y publica `/clock` con la hora de la grabación. Al terminar, el tiempo
+  queda en pausa al final.
+- **El reloj `replay`** (RFC 0006) en C++ y en Python: como `sim` (sigue
+  `/clock`, interpola, nunca va hacia atrás) con el tiempo de una grabación.
+  Un nodo con reloj real que recibe un mensaje de una grabación lo avisa.
+- **`agmen run`**: `--record`, `[record]` en `robot.toml` (`topics`, `dir`,
+  `split`, `compress`, `auto`) y el **botón ⏺ grabar** del panel;
+  `--play ARCHIVO.mcap` (todos los nodos en `replay`), `--play-topic` y
+  `--skip NODO` (la grabación sustituye al sensor). El panel muestra el reloj
+  de la reproducción, con pausa, paso y velocidad.
+- **El panel abre grabaciones**: `agmen web vuelta1.mcap`, o arrastrar el
+  archivo (o *Grabación → abrir .mcap…*). El navegador lo lee **por partes**
+  con el índice de MCAP (`mcap.js`, sin comprimir o lz4; zstd lo descomprime
+  `agmen web`) y lo decodifica con `agmen.js`: gráficas, cámara, inspector y
+  una barra de tiempo para reproducir, pausar, cambiar la velocidad y saltar.
+- **`agmen.Recording`**: una grabación en Python. `messages()` da cada mensaje
+  como un `agmen.Sample` (con `.topic` y `.log_time`) con su clase (la tuya, o
+  una armada con el esquema grabado); `table(topic)` da una `pyarrow.Table`
+  (`t_data`, `t_pub`, `log_time`, `source_id`, `seq` y los campos con su tipo
+  de Arrow); `info`, `lost`, `attachments`, `duration`.
+- **`agmen export`**: `--parquet CARPETA` (una tabla por topic, escrita por
+  partes) y `--foxglove SALIDA.mcap` (los mensajes en JSON, las imágenes como
+  `foxglove.RawImage`/`CompressedImage`, como el puente en vivo).
+- `agmen._mcap`: lector y escritor de MCAP en Python puro, sin dependencias.
+  La biblioteca oficial de MCAP los juzga en el CI (en los dos sentidos), y un
+  archivo cortado en cualquier byte se lee hasta el último chunk completo.
+- Extras de pip: `agmen[grabar]` (zstandard y lz4) y `agmen[datasets]`
+  (pyarrow).
+- `tests/vectors/grabacion.mcap` (y `generar_mcap.py`): la leen igual Python,
+  JavaScript y la biblioteca oficial. `docs/PROTOCOLO.md` documenta el perfil
+  `agmen` de MCAP.
+- `bench/grabar.py`: MB/s, pérdidas y CPU del grabador con una cámara de
+  640×480 a 4K. `scripts/grabar_smoke.py` en el CI: grabar con `agmen run
+  --record` y el botón, `agmen info`, y reproducir con `agmen run --play
+  --skip imu`.
+- Tutorial, [capítulo 16](docs/tutorial/16-grabar-y-reproducir.md): grabar y
+  reproducir, tu robot como dataset.
+
+### Cambiado
+- Las herramientas de Agmen se anuncian en el hub con su nombre (`agmen run`,
+  `agmen play`, `agmen record`…). Con el núcleo de C++ aparecían como `-m`.
+- `[clock] mode = "replay"` en `robot.toml` dice que se usa
+  `agmen run --play` (antes decía "llega en el nivel 9").
+- `agmen run` detiene los nodos **antes** de cerrar la grabación (se guarda
+  hasta el último mensaje) y el resumen sale antes del "listo".
+
+### Corregido
+- Windows: crear un bloque de memoria compartida con un nombre que ya existía
+  **abría el ajeno** (CreateFileMapping), y dos publicadores podían escribir en
+  la misma memoria. Ahora es un error y se usa otro nombre, como `O_EXCL` en
+  Linux y `ERROR_ALREADY_EXISTS` en C++. El contador de los nombres es del
+  proceso, no de cada publicador.
+- `agmen.arrow`: los tipos de extensión de C++ de pyarrow
+  (`fixed_shape_tensor`) no se reconocían con `pa.ExtensionType`.
 
 ## [0.11.1] — 2026-11-05
 
