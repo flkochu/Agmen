@@ -29,10 +29,10 @@ opcionales que se conectan al núcleo:
 | `agmen-core` | Núcleo en C++20: `#include <agmen/agmen.hpp>`, `namespace agmen::` | Desde ya |
 | `agmen` (comando) | `agmen run robot.toml` (todo el robot + panel), `agmen web`, `agmen mux`, `agmen echo`, `agmen hub`, `agmen topic list/info/echo/hz`, `agmen node list`, `agmen gen`, `agmen record/info/play/export` | 0.2.0 (run, web); `mux` en 0.3.0; `echo` en 0.4.0; hub y topics en 0.5.0; `--red` en 0.6.0; `gen` en 0.7.0; grabaciones en 0.12.0 |
 | Archivos `.agmen` | Los mensajes de un robot en un archivo; genera C++ (`agmen_add_messages`) y Python (`agmen.load`) (RFC 0005). Desde 0.10.0 con `string`, `bytes`, `T[]` y `tensor<T,N>` (RFC 0008) | 0.7.0; tipos variables en 0.10.0 |
-| `agmen.msgs` | Mensajes estándar: `Imagen` e `ImagenComprimida`, con los campos de Foxglove (RFC 0008 D4) | 0.10.0 |
+| `agmen.msgs` | Mensajes estándar: `Imagen` e `ImagenComprimida`, con los campos de Foxglove (RFC 0008 D4); `MuxEstado`, quién manda en un mux (RFC 0012) | 0.10.0; `MuxEstado` en 0.13.0 |
 | Memoria compartida | Imágenes y tensores sin copiar entre procesos de la misma computadora; entre computadoras, TCP. Sin cambiar el código de los nodos (RFC 0009) | 0.11.0 |
 | `agmen::Node` / `agmen.Node` | Varias frecuencias en un nodo (`every`, `subscribe`/`on`, colas, grupos con su propio hilo) y el reloj de Agmen (real y simulación, `/clock`) (RFC 0006) | 0.8.0 |
-| Panel web | Nodos, logs, sensores, inspector, cámara y manejo desde el navegador; el robot no dibuja (RFC 0002, 0003) | 0.2.0; WebSocket, red con clave y Foxglove en 0.6.0; cámara en 0.10.0. El puente sigue en Python: medido, no frena al robot (RFC 0008 D6) |
+| Panel web | Nodos, logs, sensores, inspector, cámara y manejo desde el navegador; el robot no dibuja (RFC 0002, 0003). Mandos de cualquier tipo y quién manda en cada mux (RFC 0012) | 0.2.0; WebSocket, red con clave y Foxglove en 0.6.0; cámara en 0.10.0; mandos en 0.13.0. El puente sigue en Python: medido, no frena al robot (RFC 0008 D6) |
 | `agmen` (Python, PyPI) | `pip install agmen` / `import agmen`. Desde 0.9.0 trae el núcleo de C++ compilado (`agmen._core`, nanobind) para 5 sistemas; Python puro como respaldo y referencia | 0.1.0; compilado en 0.9.0 |
 | `agmen-micro` | Cliente ligero para microcontroladores | Nivel 12 |
 | `agmen-iot` | Puentes MQTT y similares | Nivel 12 |
@@ -174,6 +174,10 @@ Agmen deja de tener soporte oficial en macOS: se prueba y se publica para
 - ✅ `agmen play` y `agmen run --play` reproducen con **el tiempo de la grabación** (el reloj `replay` del RFC 0006, en C++ y Python): los nodos no notan la diferencia, y `--skip` sustituye a los sensores (como dora). El panel lee el `.mcap` en el navegador, por partes, con barra de tiempo; `agmen export --foxglove` lo prepara para Foxglove.
 - ✅ Datasets: `agmen.Recording` (mensajes como `Sample`, tablas de pyarrow con el mapeo canónico) y `agmen export --parquet`. Tres lectores de MCAP (Python, JavaScript y la biblioteca oficial) leen igual el mismo vector de prueba.
 
+### Cambió en 0.13.0 (RFC 0012, para Arca9)
+- ✅ El panel manda **cualquier tipo `compact`** (`[[web.command]]`): botones con un mensaje fijo y deslizadores y casillas armados con el esquema, con hombre muerto (manda solo mientras se mantiene presionado; al soltar se calla). El servidor arma el mensaje y revisa tipos y rangos: nunca reenvía bytes del navegador. Arca9 ya no necesita un nodo que traduzca `MotorCommand`.
+- ✅ El mux publica **quién manda** en `/mux/<nombre>` (`agmen.msgs.MuxEstado`), y el panel lo muestra y avisa cuando la entrada que mandaba se calla. `[[topic]] max_gap_ms` avisa cuando un topic deja de llegar.
+
 ### Falta (siguientes niveles)
 - El formato LeRobot (Parquet + MP4, por episodios), encima de esto (nivel 13).
 - Que la cámara escriba directo en la memoria compartida (préstamo para escribir, RFC 0009 §4): quitaría la copia que queda en el publicador.
@@ -259,6 +263,7 @@ iceoryx2).
 | ~~¿Seguir probando y publicando para macOS?~~ | ✅ No, desde 0.11.1 (2026-11-05, §4): Windows y Linux, x86-64 y ARM64; en macOS, Python puro |
 | ~~Formato de grabación: MCAP o propio sobre Arrow IPC~~ | ✅ [RFC 0010](rfc/0010-grabar-y-reproducir.md) aceptado el 2026-11-05 (D1–D9 = a): MCAP con los mensajes de Agmen adentro, sin cambiar un byte |
 | Simulación y real; nodos y topics en varias computadoras | Nivel 10: [RFC 0011](rfc/0011-sim-real-y-varias-computadoras.md) propuesto el 2026-11-05 (recomienda perfiles en `robot.toml`, un mundo de MuJoCo y `agmen agent` en cada computadora); falta decidir D1–D10 |
+| Mandos del panel de cualquier tipo; quién manda en el mux; `max_gap_ms` | [RFC 0012](rfc/0012-mandos-del-panel-y-quien-manda.md): implementado en 0.13.0 con las recomendadas (D1–D6 = a), a pedido de Arca9; falta que Adán lo confirme |
 
 ## Fuentes
 

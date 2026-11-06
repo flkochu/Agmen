@@ -74,6 +74,7 @@ class WebConfig:
     teleop: TeleopConfig | None = None
     token: str | None = None         # clave del modo red (si no, se genera una al arrancar)
     allow_origins: list[str] = field(default_factory=list)   # visores en otra página (Foxglove propio, etc.)
+    commands: list = field(default_factory=list)   # [[web.command]]: mandos de cualquier tipo (RFC 0012)
 
 
 @dataclass
@@ -84,6 +85,7 @@ class TopicConfig:
     name: str
     type: str = ""
     required: bool = False
+    max_gap_ms: float | None = None   # avisar si pasa más que esto sin llegar (RFC 0012)
 
 
 @dataclass
@@ -112,6 +114,15 @@ class RecordConfig:
 
 
 @dataclass
+class MuxConfig:
+    """Un [[mux]] de robot.toml (corre como el nodo `name`: python -m agmen mux)."""
+    name: str
+    output: str                                    # topic o dirección
+    inputs: list[tuple[str, str, int]]             # (nombre, topic o dirección, prioridad)
+    hold_ms: float = 300.0
+
+
+@dataclass
 class RobotConfig:
     name: str
     base_dir: Path
@@ -123,6 +134,25 @@ class RobotConfig:
     clock: ClockConfig = field(default_factory=ClockConfig)
     record: RecordConfig | None = None  # [record]
     path: Path | None = None            # el robot.toml
+    muxes: list[MuxConfig] = field(default_factory=list)   # [[mux]] (también están en nodes, como nodos)
+
+    def topics_used(self) -> set[str]:
+        """Los topics que este robot.toml dice que usa: [[topic]], los de los [[mux]],
+        el de [web.teleop] y /clock si el tiempo es simulado. Los nodos pueden usar
+        más (eso solo lo sabe el hub cuando corren)."""
+        from .mux import state_topic
+
+        out = {t.name for t in self.topics}
+        for m in self.muxes:
+            out.update(x for x in [m.output, *(i[1] for i in m.inputs)] if x.startswith("/"))
+            if self.hub:
+                out.add(state_topic(m.name))
+        if self.web.teleop and self.web.teleop.target.startswith("/"):
+            out.add(self.web.teleop.target)
+        out.update(c.target for c in self.web.commands if c.target.startswith("/"))
+        if self.clock.mode != "real":
+            out.add("/clock")
+        return out
 
 
 def _check_keys(table: dict, allowed: set[str], where: str) -> None:
@@ -194,11 +224,16 @@ def load_config(path: str | Path) -> RobotConfig:
             env={str(k): str(v) for k, v in env.items()},
         ))
 
+    hub_raw = data.get("hub", {})
+    _check_keys(hub_raw, {"enabled"}, "[hub]")
+    hub_enabled = bool(hub_raw.get("enabled", True))
+
     # [[mux]]: prioridad de comandos. Cada mux es un nodo más (python -m agmen mux).
     raw_muxes = data.get("mux", [])
     if not isinstance(raw_muxes, list):
         raise ConfigError("'mux' se declara como [[mux]] (puede haber varios)")
     muxes: list[NodeConfig] = []
+    mux_configs: list[MuxConfig] = []
     for i, raw in enumerate(raw_muxes, start=1):
         where = f"[[mux]] #{i}"
         _check_keys(raw, {"name", "output", "hold_ms", "input"}, where)
@@ -221,6 +256,7 @@ def load_config(path: str | Path) -> RobotConfig:
                               "  priority = 10")
         args = ["--out", str(raw["output"]), "--hold-ms", str(hold_ms)]
         names, prios, listens = set(), set(), {str(raw["output"])}
+        mux_inputs: list[tuple[str, str, int]] = []
         for inp in inputs:
             _check_keys(inp, {"name", "listen", "topic", "priority"}, f"{where} [[mux.input]]")
             if ("listen" in inp) == ("topic" in inp):
@@ -245,6 +281,12 @@ def load_config(path: str | Path) -> RobotConfig:
             prios.add(inp["priority"])
             listens.add(inp["listen"])
             args += ["--in", f"{inp['name']}={inp['listen']}@{inp['priority']}"]
+            mux_inputs.append((str(inp["name"]), str(inp["listen"]), int(inp["priority"])))
+        mux_configs.append(MuxConfig(name, str(raw["output"]), mux_inputs, float(hold_ms)))
+        if hub_enabled:   # quién manda, en /mux/<nombre> (RFC 0012): necesita el hub, como todo topic
+            from .mux import state_topic
+
+            args += ["--name", name, "--state", state_topic(name)]
         muxes.append(NodeConfig(
             name=name,
             cmd=[sys.executable, "-m", "agmen", "mux", *args],
@@ -262,21 +304,24 @@ def load_config(path: str | Path) -> RobotConfig:
     topics: list[TopicConfig] = []
     for i, raw in enumerate(raw_topics, start=1):
         where = f"[[topic]] #{i}"
-        _check_keys(raw, {"name", "type", "required"}, where)
+        _check_keys(raw, {"name", "type", "required", "max_gap_ms"}, where)
         if "name" not in raw:
             raise ConfigError(f"{where}: falta 'name', ej. name = \"/imu\"")
+        gap = raw.get("max_gap_ms")
+        if gap is not None and (isinstance(gap, bool) or not isinstance(gap, (int, float)) or not 1 <= gap <= 3_600_000):
+            raise ConfigError(f"[[topic]] '{raw['name']}': max_gap_ms son los milisegundos que puede pasar sin "
+                              f"llegar (ej. max_gap_ms = 200), entre 1 y 3600000")
         try:
             hp.check_topic(str(raw["name"]))
         except hp.ProtocolError as e:
             raise ConfigError(f"{where}: {e}") from None
         if any(t.name == raw["name"] for t in topics):
             raise ConfigError(f"el topic '{raw['name']}' está declarado dos veces")
-        topics.append(TopicConfig(raw["name"], str(raw.get("type", "")), bool(raw.get("required", False))))
-    hub_raw = data.get("hub", {})
-    _check_keys(hub_raw, {"enabled"}, "[hub]")
-
+        topics.append(TopicConfig(raw["name"], str(raw.get("type", "")), bool(raw.get("required", False)),
+                                  float(gap) if gap is not None else None))
     web_raw = data.get("web", {})
-    _check_keys(web_raw, {"enabled", "http", "listen", "open_browser", "teleop", "token", "allow_origins"}, "[web]")
+    _check_keys(web_raw, {"enabled", "http", "listen", "open_browser", "teleop", "token", "allow_origins", "command"},
+                "[web]")
     token = web_raw.get("token")
     if token is not None and (not isinstance(token, str) or len(token) < 8):
         raise ConfigError("[web] token: debe ser un texto de al menos 8 caracteres (o quítalo y se genera uno solo)")
@@ -290,8 +335,24 @@ def load_config(path: str | Path) -> RobotConfig:
         if "target" not in t:
             raise ConfigError("[web.teleop]: falta 'target', ej. target = \"/cmd/teleop\"")
         if t.get("type", "MotorCommand") != "MotorCommand":
-            raise ConfigError("[web.teleop]: por ahora el único tipo soportado es 'MotorCommand'")
+            raise ConfigError("[web.teleop] maneja con W A S D y manda MotorCommand. Para otro tipo usa "
+                              "[[web.command]]: botones y deslizadores de cualquier tipo de tu .agmen (RFC 0012)")
         teleop = TeleopConfig(target=t["target"], max_speed=float(t.get("max_speed", 1.0)))
+    commands = []
+    raw_commands = web_raw.get("command", [])
+    if not isinstance(raw_commands, list):
+        raise ConfigError("los mandos del panel se declaran como [[web.command]] (uno por tarjeta)")
+    from .panel.command import CommandError, parse_command
+
+    for k, raw in enumerate(raw_commands):
+        try:
+            commands.append(parse_command(raw, k, base_dir))
+        except CommandError as e:
+            raise ConfigError(str(e)) from None
+    names_seen = [c.name for c in commands]
+    dup = next((n for n in names_seen if names_seen.count(n) > 1), None)
+    if dup:
+        raise ConfigError(f"hay dos [[web.command]] llamados '{dup}': ponles name distintos (es el título de su tarjeta)")
     web = WebConfig(
         enabled=bool(web_raw.get("enabled", True)),
         http=web_raw.get("http", "127.0.0.1:8080"),
@@ -300,6 +361,7 @@ def load_config(path: str | Path) -> RobotConfig:
         teleop=teleop,
         token=token,
         allow_origins=origins,
+        commands=commands,
     )
 
     clock = _parse_clock(data.get("clock", {}), nodes)
@@ -310,7 +372,8 @@ def load_config(path: str | Path) -> RobotConfig:
     record = _parse_record(data["record"]) if "record" in data else None
     return RobotConfig(name=robot.get("name", path.stem), base_dir=base_dir,
                        nodes=nodes, web=web, before=before, topics=topics,
-                       hub=bool(hub_raw.get("enabled", True)), clock=clock, record=record, path=path)
+                       hub=hub_enabled, clock=clock, record=record, path=path,
+                       muxes=mux_configs)
 
 
 def _parse_record(raw) -> RecordConfig:
@@ -383,7 +446,7 @@ def prepare_hub(config: RobotConfig, ping=None) -> tuple[RobotConfig, str]:
     if alive is not None:
         note = " (los [[topic]] de este robot.toml no se revisan)" if config.topics else ""
         return config, f"usando el agmen hub {alive} que ya corre en {hub_address()}{note}"
-    args = ["-m", "agmen", "hub", "--listen", hub_address()]
+    args = ["-m", "agmen", "hub", "--listen", hub_address(), "--robot", config.name]
     for t in config.topics:
         args += ["--expect", f"{t.name}={t.type}" if t.type else t.name]
         if t.required:
@@ -396,6 +459,35 @@ def prepare_hub(config: RobotConfig, ping=None) -> tuple[RobotConfig, str]:
         raise ConfigError("hay un nodo llamado 'hub': ese nombre lo usa Agmen para el directorio de topics")
     from dataclasses import replace
     return replace(config, nodes=[hub_node, *config.nodes]), f"agmen hub en {hub_address()}"
+
+
+def other_robot(config: RobotConfig, query=None) -> list[str]:
+    """Si este agmen run va a compartir el hub con otro robot que ya corre en esta
+    máquina (PENDIENTES de Arca9, #7): de quién es y qué topics usan los dos. Dos
+    robots con los mismos topics se mezclan (lo que publica uno le llega al otro).
+    Devuelve los avisos (vacío si no hay nada que decir)."""
+    from .pubsub import hub_address
+
+    if query is None:
+        from .hub import query
+    try:
+        msgs = query(hub_address(), timeout=0.5)
+    except (ConnectionError, OSError):
+        return []
+    state = next((f for op, f in msgs if op == "state"), {})
+    theirs = {f["name"] for op, f in msgs if op == "topic"
+              and (f.get("pubs", "0") != "0" or f.get("subs", "0") != "0" or f.get("expected", "no") != "no")}
+    shared = sorted(config.topics_used() & theirs)
+    name = state.get("robot", "")
+    if not shared:
+        return [f"en esta máquina ya corre el robot '{name}': comparten el agmen hub, pero no usan los mismos "
+                f"topics"] if name else []
+    shown = ", ".join(shared[:4]) + (f" y {len(shared) - 4} más" if len(shared) > 4 else "")
+    who = (f"ya hay otro robot en esta máquina, '{name}' (su agmen hub está en {hub_address()}), y los dos usan"
+           if name else f"en esta máquina ya hay otros nodos con su agmen hub en {hub_address()} (¿otro robot?), "
+                        f"y usan los mismos topics que este:")
+    return [f"⚠ {who} {shown}: sus mensajes se van a mezclar (lo que publica uno le llega al otro). Detén el "
+            f"otro robot (Ctrl+C en su terminal) o usa otros nombres de topic"]
 
 
 # ---------------------------------------------------------------------------

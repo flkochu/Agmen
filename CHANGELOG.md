@@ -15,6 +15,80 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   ejemplo y `agmen agent` en cada computadora); falta decidir antes de
   implementar.
 
+## [0.13.0] — 2026-11-06
+
+**El panel manda cualquier tipo, y el mux dice quién manda.** Implementa el
+[RFC 0012](docs/rfc/0012-mandos-del-panel-y-quien-manda.md) con las opciones
+recomendadas (D1–D6 = a), a pedido de Arca9 (los puntos 1 y 2 de su
+`pc/agmen/PENDIENTES_AGMEN.md`). Los bytes de la red no cambian: un nodo de
+0.13.0 habla con uno de 0.12.x, y el mux reenvía lo mismo que antes.
+
+### Agregado
+- **Mandos del panel para cualquier tipo `compact`** (`[[web.command]]` en
+  `robot.toml`): una tarjeta con botones que mandan un mensaje fijo y, si
+  quieres, deslizadores y casillas de los campos que digas (`[web.command.fields]`,
+  con `min` y `max`). El tipo sale del mismo `.agmen` que usan los nodos
+  (`messages = "arca9.agmen"`), o es uno de Agmen (`MotorCommand`, `ImuSample`).
+  - **Hombre muerto**: el navegador manda solo mientras mantienes presionado
+    (20 por segundo); al soltar, cambiar de pestaña o perder la conexión, se
+    calla. No se inventa un "alto": el receptor aplica su watchdog.
+  - **El panel arma el mensaje**: el navegador pide "el botón 1" o "estos
+    campos", y el panel revisa cada valor contra el esquema y su rango (NaN,
+    infinitos, decimales en un entero, campos sin control: no). Nunca reenvía
+    bytes del navegador.
+  - Un botón siempre manda un mensaje completo: lo que no dice sale de
+    `[web.command.default]`, y si falta un campo, `agmen run` no arranca.
+  - La misma seguridad que el teleop (clave en `--red`, `X-Agmen`, `Origin`,
+    máx. ~60 Hz); también por `POST /api/command`, para scripts.
+  - La tarjeta dice a qué entrada del mux va y, mientras mandas, si te gana
+    otra entrada. El robot del tutorial trae una (**Movimientos**).
+- **El mux publica quién manda** en `/mux/<nombre>` (`agmen.msgs.MuxEstado`,
+  también en C++): la entrada que manda, su topic y prioridad, desde cuándo,
+  la anterior y si se calló (`callada`), el `source_id` que manda y cuántos
+  cambios van. Cada vez que cambia y una vez por segundo. `agmen run` lo
+  arranca así (`agmen mux --state /mux/<nombre>`); es un topic de Agmen, como
+  `/clock`: no hace falta declararlo.
+- **El panel muestra quién manda** (tarjeta *¿Quién manda?*) y avisa cuando la
+  entrada que mandaba se calla: `⚠ ruedas: 'teleop' se calló → manda 'cerebro'`.
+- **`[[topic]] max_gap_ms`**: `agmen run` avisa cuando un topic deja de llegar
+  y cuando vuelve, en la terminal y en el panel (`required` solo ve si nadie
+  lo publica). Lo mide con el reloj de Agmen: en pausa no avisa.
+- `/api/state` trae `commands`, `muxes` y `gaps`.
+
+### Cambiado
+- `examples/tutorial/robot.toml`: la tarjeta **Movimientos** y
+  `max_gap_ms = 100` en `/imu`. Tutorial: capítulos 5, 6 y 10.
+
+## [0.12.1] — 2026-11-06
+
+Parche: dos errores que encontró Arca9 al usar Agmen (los puntos 4 y 7 de su
+`pc/agmen/PENDIENTES_AGMEN.md`). Los bytes de la red no cambian: un nodo de
+0.12.1 habla con uno de 0.12.0.
+
+### Corregido
+- **NaN e infinitos salen como `null` en el JSON** (`schema.jsonable`): en lo
+  que el panel le manda a Foxglove (en vivo y con `agmen export --foxglove`) y
+  en `agmen echo --json`. Antes salía `[NaN, 1.0]`, que no es JSON: un lector
+  estricto (el `JSON.parse` del navegador, Foxglove) rechazaba el mensaje
+  completo, no solo ese número. Arca9 pone NaN en un servo sin lectura
+  creíble. Vale también para arreglos de NumPy y tensores.
+- **Dos `agmen run` en la misma máquina**: si el `[web] listen` del panel
+  (`127.0.0.1:7400`) ya lo usa otro robot o un `agmen web`, el panel lo dice
+  con palabras y sigue con los topics. Antes su hilo tronaba con
+  `OSError: [Errno 98] Address already in use` y el panel se quedaba sin datos.
+- Y el segundo `agmen run` **dice de quién es el hub que reusa y avisa si los
+  dos robots usan los mismos topics**, porque sus mensajes se mezclan (el
+  `poses.py` de uno le mandaba al puente del otro):
+
+  ```
+  ⚠ ya hay otro robot en esta máquina, 'Arca9 (simulado)' (su agmen hub está en 127.0.0.1:7390),
+    y los dos usan /arca9/comando, /arca9/estado: sus mensajes se van a mezclar …
+  ```
+
+  Para eso `agmen run` arranca el hub con su nombre (`agmen hub --robot`), y
+  la línea `state` del hub lo dice (`robot=`). Un hub de 0.12.0 no lo dice: el
+  aviso sale igual, sin el nombre.
+
 ## [0.12.0] — 2026-11-05
 
 **Nivel 9: grabar y reproducir; tu robot como dataset.** Implementa el

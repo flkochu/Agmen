@@ -28,6 +28,14 @@ from ._version import __version__
 
 # Topics que pone Agmen mismo: no hace falta declararlos en robot.toml.
 BUILTIN_TOPICS = {"/clock": "Clock"}   # el tiempo de la simulación (RFC 0006)
+BUILTIN_PREFIXES = {"/mux/": "MuxEstado"}   # quién manda en cada [[mux]] (RFC 0012)
+
+
+def builtin_type(topic: str) -> str | None:
+    """El tipo de un topic de Agmen (/clock, /mux/<nombre>), o None si es de tu robot."""
+    if topic in BUILTIN_TOPICS:
+        return BUILTIN_TOPICS[topic]
+    return next((t for p, t in BUILTIN_PREFIXES.items() if topic.startswith(p)), None)
 
 
 @dataclass
@@ -54,9 +62,10 @@ class Expected:
 
 class Hub:
     def __init__(self, listen: str = hp.DEFAULT_HUB, expected: list[Expected] | None = None,
-                 log=print, grace_s: float = 5.0) -> None:
+                 log=print, grace_s: float = 5.0, robot: str = "") -> None:
         host, port = listen.rsplit(":", 1)
         self.listen = listen
+        self.robot = robot        # el robot que lo arrancó (agmen run): así otro agmen run sabe de quién es
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             self.sock.bind((host, int(port)))
@@ -112,11 +121,11 @@ class Hub:
     def _check_expected(self, e: Endpoint) -> None:
         if not self.expected or e.topic == "*":
             return
-        if e.topic in BUILTIN_TOPICS:
-            if e.type and e.type != BUILTIN_TOPICS[e.topic]:
+        builtin = builtin_type(e.topic)
+        if builtin is not None:
+            if e.type and e.type != builtin:
                 self._warn_once(("tipo", e.topic, e.type),
-                                f"'{e.topic}' es de Agmen y es de tipo {BUILTIN_TOPICS[e.topic]}; "
-                                f"'{e.node}' usa {e.type}")
+                                f"'{e.topic}' es de Agmen y es de tipo {builtin}; '{e.node}' usa {e.type}")
             return
         exp = self.expected.get(e.topic)
         if exp is None:
@@ -226,7 +235,7 @@ class Hub:
 
     # --- estado (para agmen topic list / info, node list) ---
     def state_text(self) -> str:
-        lines = [hp.line("state", version=__version__, hub=self.listen)]
+        lines = [hp.line("state", version=__version__, hub=self.listen, robot=self.robot)]
         topics = sorted({e.topic for e in self.endpoints.values() if e.topic != "*"} | set(self.expected))
         for t in topics:
             eps = [e for e in self.endpoints.values() if e.topic == t]
@@ -324,7 +333,8 @@ def main(args) -> int:
         print(f"[hub] {text}", flush=True)
 
     try:
-        hub = Hub(args.listen, parse_expected(args.expect or [], args.require or []), log)
+        hub = Hub(args.listen, parse_expected(args.expect or [], args.require or []), log,
+                  robot=getattr(args, "robot", "") or "")
     except (OSError, hp.ProtocolError) as e:
         print(f"[hub] error: {e}", file=sys.stderr)
         return 2

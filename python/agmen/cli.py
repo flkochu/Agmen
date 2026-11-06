@@ -66,6 +66,11 @@ def cmd_run(args) -> int:
     launcher = Launcher(config)
     out = _SayTo(launcher)
     launcher.say(f"Agmen {__version__} · robot '{config.name}' · {len(config.nodes)} nodos · {hub_note}")
+    if config.hub and not any(n.name == "hub" for n in config.nodes):   # se reusa el hub de otro robot
+        from .run import other_robot
+
+        for line in other_robot(config):
+            launcher.say(line)
     if not launcher.run_before():
         launcher.printer.close()
         return 1
@@ -95,15 +100,22 @@ def cmd_run(args) -> int:
         if err:
             launcher.say(f"⚠ no se pudo grabar: {err}")
     launcher.recording = recording
+    stop = threading.Event()
+    watch = _watch_for(config, launcher, stop)    # [[topic]] max_gap_ms (RFC 0012)
+    launcher.watch = watch
 
     panel = None
     if config.web.enabled and not args.no_web:
         teleop = Teleop(config.web.teleop.target, config.web.teleop.max_speed) if config.web.teleop else None
+        commands = _commands_for(config)
         http = _http_for(args.http or config.web.http, args.red)
         try:
             panel = Panel(http, config.web.listen, config.name, launcher, teleop,
-                          token=config.web.token, allow_origins=config.web.allow_origins, clock=clock_server)
+                          token=config.web.token, allow_origins=config.web.allow_origins, clock=clock_server,
+                          commands=commands)
         except OSError as e:
+            for c in commands:
+                c.close()
             launcher.printer.close()
             print(f"no se pudo abrir el panel web en {http}: {e}. "
                   f"¿Ya hay otro 'agmen run' corriendo? Usa --http 127.0.0.1:8081", file=sys.stderr)
@@ -111,12 +123,18 @@ def cmd_run(args) -> int:
         panel.start(open_browser=config.web.open_browser and not args.no_browser)
         for line in _panel_lines(panel):
             launcher.say(line)
+        if panel.listen_error:
+            launcher.say(f"⚠ {panel.listen_error}")
+        for c in commands:
+            to = f" (entrada '{c.mux['input']}' del mux '{c.mux['mux']}', prioridad {c.mux['priority']})" if c.mux else ""
+            what = ", ".join(label for label, _ in c.cfg.buttons) or "sin botones"
+            ctl = f" · {len(c.cfg.controls)} controles" if c.cfg.controls else ""
+            launcher.say(f"mando '{c.cfg.name}' en el panel: {c.cfg.layout.name} → {c.cfg.target}{to} · {what}{ctl}")
 
     launcher.start_all()
     launcher.say("todo arrancado. Ctrl+C para detener todo.")
     if player is not None:   # que los nodos alcancen a suscribirse antes del primer mensaje
         threading.Timer(2.0, player.resume).start()
-    stop = threading.Event()
 
     def close_recording():
         if recording.rec is not None:
@@ -133,6 +151,45 @@ def cmd_run(args) -> int:
         elif clock_server:
             clock_server.close()
     return 0
+
+
+def _commands_for(config) -> list:
+    """Los mandos del panel ([[web.command]], RFC 0012), cada uno con su entrada del mux si va a una."""
+    from .mux import state_topic
+    from .panel.command import Command
+    from .panel.server import panel_node_name
+
+    out = []
+    for cfg in config.web.commands:
+        c = Command(cfg, node=panel_node_name())
+        for m in config.muxes:
+            inp = next((i for i in m.inputs if i[1] == cfg.target), None)
+            if inp is not None:
+                c.mux = {"mux": m.name, "input": inp[0], "priority": inp[2],
+                         "state": state_topic(m.name) if config.hub else ""}
+        out.append(c)
+    return out
+
+
+def _watch_for(config, launcher, stop):
+    """El vigilante de [[topic]] max_gap_ms (RFC 0012): avisa cuando un topic deja de llegar y cuando vuelve."""
+    gaps = {t.name: t.max_gap_ms for t in config.topics if t.max_gap_ms}
+    if not gaps:
+        return None
+    if not config.hub:
+        launcher.say("⚠ max_gap_ms necesita el agmen hub ([hub] enabled = false): no se vigila ningún topic")
+        return None
+    from .watch import TopicWatch
+
+    try:
+        watch = TopicWatch(gaps, log=launcher.say)
+    except OSError as e:
+        launcher.say(f"⚠ no se pudo vigilar {', '.join(gaps)} (max_gap_ms): {e}")
+        return None
+    threading.Thread(target=watch.run, args=(stop,), daemon=True, name="agmen-watch").start()
+    shown = ", ".join(f"{t} ({ms:g} ms)" for t, ms in gaps.items())
+    launcher.say(f"vigilo que lleguen: {shown}")
+    return watch
 
 
 class _SayTo:
@@ -260,7 +317,11 @@ def cmd_web(args) -> int:
     panel.start(open_browser=not args.no_browser)
     if rec_note:
         print(f"[agmen web] {rec_note}")
-    print(f"[agmen web] recibiendo Agmen de todos los topics y de udp://{args.listen}")
+    if panel.listen_error:
+        print(f"[agmen web] ⚠ {panel.listen_error}")
+        print("[agmen web] recibiendo Agmen de todos los topics")
+    else:
+        print(f"[agmen web] recibiendo Agmen de todos los topics y de udp://{args.listen}")
     for line in _panel_lines(panel):
         print(f"[agmen web] {line}")
     stop = threading.Event()
@@ -336,6 +397,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="una entrada; repítelo por cada fuente (más alto = manda más)")
     p.add_argument("--hold-ms", type=float, default=300.0,
                    help="tras cuántos ms sin mensajes una fuente suelta el mando (default 300)")
+    p.add_argument("--state", metavar="TOPIC",
+                   help="publicar quién manda (agmen.msgs.MuxEstado) en este topic, ej. /mux/ruedas (RFC 0012)")
+    p.add_argument("--name", default="", help="el nombre del mux en su estado (default: el del nodo)")
     p.set_defaults(func=cmd_mux)
 
     p = sub.add_parser("echo", help="muestra cualquier mensaje que llegue a un puerto")
@@ -355,6 +419,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="topic esperado (de robot.toml); avisa si alguien usa otro parecido o de otro tipo")
     p.add_argument("--require", action="append", metavar="TOPIC",
                    help="topic obligatorio: avisa si nadie lo publica")
+    p.add_argument("--robot", default="", metavar="NOMBRE",
+                   help="el robot al que pertenece (lo pone agmen run: así otro agmen run sabe de quién es)")
     p.set_defaults(func=cmd_hub)
 
     from .topic import add_parsers as add_topic_parsers

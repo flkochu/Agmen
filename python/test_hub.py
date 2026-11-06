@@ -173,6 +173,17 @@ class TestHub(unittest.TestCase):
         self.assertEqual(len([1 for op, _ in msgs if op == "ep"]), 2)
         self.assertIsNotNone(H.ping(self.h.addr))
 
+    def test_el_hub_dice_de_que_robot_es(self):
+        """agmen run arranca el hub con --robot: otro agmen run sabe de quién es (0.12.1)."""
+        self.assertEqual(next(f for op, f in H.query(self.h.addr) if op == "state")["robot"], "")
+        h2 = HubFixture()
+        h2.hub.robot = "Arca9 (simulado)"
+        try:
+            self.assertEqual(next(f for op, f in H.query(h2.addr) if op == "state")["robot"], "Arca9 (simulado)")
+        finally:
+            h2.close()
+            os.environ["AGMEN_HUB"] = self.h.addr
+
 
 class TestLatidos(unittest.TestCase):
     def test_nodo_que_muere_sin_avisar_se_quita(self):
@@ -234,6 +245,26 @@ class TestTopicsEsperados(unittest.TestCase):
             self.assertIn("ya hay quien publique '/imu'", "\n".join(h.logs))
             for p in (p1, p2, p3):
                 p.close()
+        finally:
+            h.close()
+
+    def test_el_estado_de_los_mux_es_de_agmen(self):
+        """/mux/<nombre> (RFC 0012) no se declara en robot.toml, como /clock; con otro tipo, sí avisa."""
+        from agmen.msgs import MuxEstado
+
+        h = HubFixture(H.parse_expected(["/cmd=MotorCommand"], []))
+        try:
+            p1 = agmen.Publisher(MuxEstado, "/mux/ruedas")
+            p2 = agmen.Publisher(Cmd, "/mux/brazo")
+            time.sleep(0.5)
+            logs = "\n".join(h.logs)
+            self.assertNotIn("'/mux/ruedas', que no está declarado", logs)
+            self.assertIn("'/mux/brazo' es de Agmen y es de tipo MuxEstado", logs)
+            self.assertEqual(H.builtin_type("/mux/x"), "MuxEstado")
+            self.assertEqual(H.builtin_type("/clock"), "Clock")
+            self.assertIsNone(H.builtin_type("/muxes"))
+            p1.close()
+            p2.close()
         finally:
             h.close()
 

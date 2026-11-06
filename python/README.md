@@ -49,7 +49,13 @@ agmen web                # solo el panel: grafica cualquier mensaje que le llegu
 agmen echo 127.0.0.1:7400   # muestra cualquier mensaje en la terminal
 agmen topic list            # qué topics hay, de qué tipo, quién manda y quién escucha
 agmen topic echo /imu       # los mensajes de un topic, sin quitarle el puerto a nadie
+agmen topic echo /mux/ruedas   # quién manda en un [[mux]] (desde 0.13)
 ```
+
+Desde la 0.13, el panel también manda **cualquier tipo** de tu `.agmen`: en
+`robot.toml`, `[[web.command]]` arma una tarjeta con botones que mandan un
+mensaje fijo (y deslizadores con sus rangos), solo mientras los mantienes
+presionados.
 
 Tus mensajes también pueden vivir en un archivo `.agmen`, el mismo que usa
 C++ para generar su código:

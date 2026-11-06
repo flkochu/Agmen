@@ -142,6 +142,102 @@ priority = 1
 '''
 
 
+class TestQuienManda(unittest.TestCase):
+    """El mux dice quién manda (RFC 0012): agmen.msgs.MuxEstado en /mux/<nombre>."""
+
+    def setUp(self):
+        self.rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.rx.bind(("127.0.0.1", 0))
+        self.logs = []
+        self.mux = Mux([MuxInput("cerebro", "127.0.0.1:0", 1), MuxInput("teleop", "127.0.0.1:0", 10)],
+                       f"127.0.0.1:{self.rx.getsockname()[1]}", hold_ms=300, log=self.logs.append, name="ruedas")
+        self.teleop = next(i for i in self.mux.inputs if i.name == "teleop")
+        self.cerebro = next(i for i in self.mux.inputs if i.name == "cerebro")
+
+    def tearDown(self):
+        self.mux.close()
+        self.rx.close()
+
+    def send(self, inp, t, source):
+        return self.mux.handle(inp, wire.encode(Cmd(0.5, 0.5), 1, 123, source_id=source), t)
+
+    def test_cambios_y_quien_se_callo(self):
+        st = self.mux.state()
+        self.assertEqual((st["mux"], st["entrada"], st["prioridad"], st["cambios"], st["fuente"]), ("ruedas", "", 0, 0, 0))
+        self.send(self.cerebro, 0.0, 0xC0)
+        st = self.mux.state()
+        self.assertEqual((st["entrada"], st["topic"], st["prioridad"], st["antes"], st["callada"], st["fuente"],
+                          st["cambios"]), ("cerebro", "127.0.0.1:0", 1, "", False, 0xC0, 1))
+        self.send(self.teleop, 0.05, 0x7E)               # entra el de más prioridad: nadie se calló
+        st = self.mux.state()
+        self.assertEqual((st["entrada"], st["antes"], st["callada"], st["fuente"], st["cambios"]),
+                         ("teleop", "cerebro", False, 0x7E, 2))
+        desde = st["desde"]
+        self.send(self.teleop, 0.10, 0x7E)               # sigue hablando: no es un cambio
+        self.assertEqual((self.mux.state()["cambios"], self.mux.state()["desde"]), (2, desde))
+        self.send(self.cerebro, 0.50, 0xC0)              # teleop lleva 400 ms callado: regresa al cerebro
+        st = self.mux.state()
+        self.assertEqual((st["entrada"], st["antes"], st["callada"], st["cambios"]), ("cerebro", "teleop", True, 3))
+        self.mux._update_active(1.0)                     # y el cerebro también se calla
+        st = self.mux.state()
+        self.assertEqual((st["entrada"], st["topic"], st["prioridad"], st["antes"], st["callada"], st["fuente"]),
+                         ("", "", 0, "cerebro", True, 0))
+        # El log no cambia (Arca9 lo busca en sus pruebas).
+        self.assertEqual(self.logs.count("manda 'cerebro' (prioridad 1)"), 2)
+        self.assertIn("manda 'teleop' (prioridad 10)", self.logs)
+
+    def test_lo_que_reenvia_no_cambia(self):
+        """El estado es un topic aparte: la salida sigue siendo la misma, byte por byte, que en 0.12."""
+        self.send(self.cerebro, 0.0, 0xC0)
+        self.rx.settimeout(0.5)
+        data = self.rx.recv(65536)
+        env, payload = wire.parse(data)
+        self.assertEqual((env.source_id, env.seq), (self.mux.source_id, 0))
+        self.assertEqual(payload, Cmd(0.5, 0.5).encode_payload())
+
+    def test_nombre_del_topic(self):
+        from agmen.mux import state_topic
+
+        self.assertEqual(state_topic("ruedas"), "/mux/ruedas")
+        self.assertEqual(state_topic("Ruedas traseras"), "/mux/Ruedas_traseras")
+        self.assertEqual(state_topic("ñandú-2"), "/mux/_and__2")
+
+
+class TestQuienMandaPorTopic(unittest.TestCase):
+    """Con hub: el estado llega a un Subscriber de verdad (arrow, por TCP)."""
+
+    def test_llega_por_el_topic(self):
+        import time
+
+        from agmen import Subscriber
+        from agmen.msgs import MuxEstado
+        from test_hub import HubFixture
+
+        h = HubFixture()
+        rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        rx.bind(("127.0.0.1", 0))
+        mux = Mux([MuxInput("panel", "127.0.0.1:0", 10), MuxInput("poses", "127.0.0.1:0", 1)],
+                  f"127.0.0.1:{rx.getsockname()[1]}", log=lambda t: None, state="/mux/mando", name="mando")
+        sub = Subscriber(MuxEstado, "/mux/mando")
+        try:
+            panel = next(i for i in mux.inputs if i.name == "panel")
+            mux.handle(panel, wire.encode(Cmd(1, 1), 1, 123, source_id=0xAB), time.monotonic())
+            got, end = None, time.monotonic() + 5
+            while got is None and time.monotonic() < end:
+                mux.publish_state(time.monotonic())      # lo que hace run() una vez por segundo
+                got = sub.receive(0.2)
+            self.assertIsNotNone(got, "no llegó el estado del mux")
+            m = got.message
+            self.assertEqual((m.mux, m.entrada, m.topic, m.prioridad, m.fuente, m.cambios),
+                             ("mando", "panel", "127.0.0.1:0", 10, 0xAB, 1))
+            self.assertEqual(got.envelope.encoding, wire.ENC_ARROW)
+        finally:
+            sub.close()
+            mux.close()
+            rx.close()
+            h.close()
+
+
 class TestMuxConfig(unittest.TestCase):
     def load(self, text):
         with tempfile.TemporaryDirectory() as d:
@@ -157,6 +253,10 @@ class TestMuxConfig(unittest.TestCase):
         self.assertIn("teleop=127.0.0.1:7510@10", cmd)
         self.assertIn("cerebro=127.0.0.1:7511@1", cmd)
         self.assertEqual(cfg.nodes[0].restart, "always")
+        self.assertEqual(cmd[cmd.index("--state") + 1], "/mux/ruedas")      # quién manda (RFC 0012)
+        self.assertEqual(cmd[cmd.index("--name") + 1], "ruedas")
+        sin_hub = self.load(BASE + MUX + "\n[hub]\nenabled = false\n")
+        self.assertNotIn("--state", sin_hub.nodes[0].cmd)                    # sin hub no hay topics
 
     def test_errores(self):
         casos = [

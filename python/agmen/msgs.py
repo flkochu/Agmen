@@ -1,7 +1,8 @@
-"""agmen.msgs — los mensajes estándar de Agmen (RFC 0008, D4): `Imagen` e
-`ImagenComprimida`, con los mismos campos que los tipos de Foxglove.
+"""agmen.msgs — los mensajes estándar de Agmen: `Imagen` e `ImagenComprimida`,
+con los mismos campos que los tipos de Foxglove (RFC 0008, D4), y `MuxEstado`,
+quién tiene el mando de un `[[mux]]` (RFC 0012).
 
-    from agmen.msgs import Imagen, ImagenComprimida
+    from agmen.msgs import Imagen, ImagenComprimida, MuxEstado
 
     img = Imagen.from_array(frame, encoding="bgr8")     # desde OpenCV / NumPy
     arr = img.as_array()                                 # (alto, ancho, 3) sin copiar
@@ -107,9 +108,10 @@ def types(numpy: bool = False):
 _mod = types()
 Imagen = _mod.Imagen
 ImagenComprimida = _mod.ImagenComprimida
+MuxEstado = _mod.MuxEstado
 # Que se llamen agmen.msgs.Imagen (en repr y en pickle) y no agmen_msgs.msgs.Imagen:
 # así otro proceso los encuentra con solo importar agmen.
-for _cls in (Imagen, ImagenComprimida):
+for _cls in (Imagen, ImagenComprimida, MuxEstado):
     _cls.__module__ = __name__
 
-__all__ = ["ENCODINGS", "Imagen", "ImagenComprimida", "PATH", "types"]
+__all__ = ["ENCODINGS", "Imagen", "ImagenComprimida", "MuxEstado", "PATH", "types"]

@@ -207,6 +207,49 @@ class TestSchema(unittest.TestCase):
         self.assertEqual(schema.flatten_numbers({"p": {"x": 1}, "q": [2, 3]}),
                          {"p.x": 1.0, "q[0]": 2.0, "q[1]": 3.0})
 
+    def test_json_sin_nan(self):
+        """NaN e infinitos van como null (0.12.1, PENDIENTES de Arca9 #4): antes salía
+        '[NaN, 1.0]', que no es JSON, y Foxglove perdía el mensaje completo."""
+        import json
+        import math
+
+        from agmen.panel.bridge import foxglove_row
+
+        layout = schema.Layout("agmen/1 A{f32[2] q;f64 x;f32 y;u8 n}")
+        row = layout.unpack(layout.pack({"q": [math.nan, 1.0], "x": math.inf, "y": -math.inf, "n": 3}))
+        texto = json.dumps(foxglove_row(layout, row), allow_nan=False)      # sin NaN: no truena
+        self.assertEqual(json.loads(texto), {"q": [None, 1.0], "x": None, "y": None, "n": 3})
+        self.assertEqual(schema.jsonable({"a": [[math.nan], (1.5, math.inf)], "b": "nan", "c": True}),
+                         {"a": [[None], [1.5, None]], "b": "nan", "c": True})
+        try:
+            import numpy as np
+        except ImportError:
+            return
+        d = {"q": np.array([[1.0, np.nan], [np.inf, 2.0]], dtype=np.float32), "e": np.float64("nan"),
+             "i": np.array([1, 2], dtype=np.int16), "z": np.array(np.inf)}
+        self.assertEqual(json.loads(json.dumps(schema.jsonable(d), allow_nan=False)),
+                         {"q": [[1.0, None], [None, 2.0]], "e": None, "i": [1, 2], "z": None})
+
+    def test_echo_json_sin_nan(self):
+        """agmen echo --json escribe JSON de verdad aunque llegue un NaN."""
+        import json
+        import math
+
+        from agmen.echo import Echo
+
+        layout = schema.Layout("agmen/1 Arca9Articulaciones{f32[12] q}")
+        lines = []
+        echo = Echo("127.0.0.1:0", [layout.text], 0, True, out=lines.append)
+        try:
+            env = wire.Envelope(encoding=wire.ENC_COMPACT, schema_id=layout.schema_id, topic_id=wire.topic_id("/q"),
+                                source_id=1, seq=0, t_data=0, t_pub=0, payload_len=layout.size)
+            echo.handle(env.pack() + layout.pack({"q": [math.nan] + [1.0] * 11}), "127.0.0.1:1", 0)
+        finally:
+            echo.rx.close()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0])["data"]["q"], [None] + [1.0] * 11)
+        self.assertNotIn("NaN", lines[0])
+
 
 if __name__ == "__main__":
     unittest.main()
