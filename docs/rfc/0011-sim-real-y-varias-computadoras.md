@@ -4,7 +4,7 @@
 |---|---|
 | **Estado** | 📝 **Propuesto** (2026-11-05). Falta que Adán decida D1–D10 ([sección 5](#5-decisiones)); no se implementa nada antes |
 | **Depende de** | RFC 0003 (`agmen run`, `robot.toml` y el panel), RFC 0004 (el hub, los topics esperados y el diseño de varias máquinas de §3.6), RFC 0006 (el reloj de simulación y `/clock`), RFC 0008 (TCP para datos grandes; un suscriptor lento no frena a nadie), RFC 0009 (la memoria compartida se prueba, no se adivina), RFC 0010 (`--play` y `--skip`) |
-| **Versión** | Agmen 0.13.0 |
+| **Versión** | Agmen 0.14.0 |
 | **Requisitos** | d (misma interfaz para simulación y robot real), i (un solo comando levanta todo el robot), g (Windows y Linux, x86-64 y ARM64) |
 
 ## 1. El problema
@@ -253,7 +253,7 @@ agmen run examples/tutorial/robot.toml
 ```
 
 ```
-agmen │ robot (192.168.1.20): conectado · Agmen 0.13.0 · reloj +2.1 ms
+agmen │ robot (192.168.1.20): conectado · Agmen 0.14.0 · reloj +2.1 ms
 robot/imu   │ publicando /imu a 100 Hz
 robot/motor │ esperando /cmd
 cerebro     │ ...
@@ -339,7 +339,7 @@ de topics viajan por la conexión del agente, que ya tiene clave.
   guarda en la grabación (`agmen.grabacion`) para quien quiera corregir
   después. Sincronizar de verdad es del nivel 11.
 
-## 4. Lo que NO entra en 0.13.0
+## 4. Lo que NO entra en 0.14.0
 
 - **Sincronizar los relojes** (corregir `t_data`, PTP): nivel 11. Aquí solo se
   mide y se avisa.
@@ -393,7 +393,7 @@ de topics viajan por la conexión del agente, que ya tiene clave.
 | 9 | **Probarlo en el CI sin dos computadoras** | Los runners de GitHub son una sola máquina | En Linux, dos contenedores con su propia red y su propio `/dev/shm` (dos computadoras de verdad para Agmen); en Windows, el agente y `agmen run` en dos IP de loopback (`127.0.0.1` y `127.0.0.2`), sin memoria compartida (`AGMEN_SHM=0`). `scripts/maquinas_smoke.py`, en el CI de los 3 sistemas |
 | 10 | **C++ y Python** | Los nodos de los dos escuchan hoy solo en `127.0.0.1` | Los dos aprenden lo mismo: escuchar en la red cuando `agmen run` lo pide (o, si el nodo corre aparte, como `agmen record` en otra terminal, cuando su hub se lo dice) y aceptar datos solo de las computadoras declaradas. El agente y `agmen run` son de Python, como hoy el lanzador |
 
-## 7. Plan para Agmen 0.13.0 (si se acepta con las recomendadas)
+## 7. Plan para Agmen 0.14.0 (si se acepta con las recomendadas)
 
 1. **Perfiles**: `profile` en `[[node]]`, `[[mux]]` y `[[topic]]`;
    `[profile.X]`; `--profile` y `--sim`; `--play` con el perfil `replay`;
