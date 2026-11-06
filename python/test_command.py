@@ -167,7 +167,7 @@ class TestServidor(MandoCase):
     def test_boton_por_numero_y_por_letrero(self):
         cmd, pub = self.mando()
         self.assertTrue(cmd.button(1))
-        time.sleep(0.02)
+        time.sleep(0.05)   # más que el tope de ~60 Hz aun con el reloj de Windows (de a ~15 ms)
         self.assertTrue(cmd.button("parado"))
         echado, parado = (self.unpack(cmd, p) for p in pub.payloads)
         self.assertEqual([round(x, 1) for x in echado["q"]], ECHADO)
@@ -224,7 +224,7 @@ class TestServidor(MandoCase):
         self.assertAlmostEqual(m["punta"]["y"], 0.2, places=6)   # sin control: el de robot.toml
         with self.assertRaisesRegex(CommandError, re.escape("no tiene control")):
             cmd.fields({"fuerza": 100.0})                        # sin control en robot.toml: no se toca
-        time.sleep(0.02)
+        time.sleep(0.05)   # más que el tope de ~60 Hz aun con el reloj de Windows (de a ~15 ms)
         with self.assertRaisesRegex(CommandError, re.escape("debe ser un entero")):
             cmd.fields({"modo": 1.5})
 

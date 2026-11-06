@@ -630,7 +630,7 @@ class TestMandos(unittest.TestCase):
         c.send_text(json.dumps({"op": "command", "id": 0, "button": 0}))
         m = self.recibido()
         self.assertEqual((m.left, m.right), (0.25, -0.5))
-        time.sleep(0.03)
+        time.sleep(0.06)        # más que el tope de ~60 Hz aun con el reloj de Windows (de a ~15 ms)
         c.send_text(json.dumps({"op": "command", "id": 0, "fields": {"left": -0.75}}))
         m = self.recibido()
         self.assertEqual((m.left, m.right), (-0.75, -0.5))          # right: del botón (el inicio)
