@@ -211,6 +211,57 @@ class TestGrabar(HubCase):
         self.assertEqual(seen, list(range(8)), "nada se repite ni se pierde entre archivos")
 
 
+class TestControl(HubCase):
+    """RecordingControl: el botón ⏺ del panel y `agmen run --record`."""
+
+    def test_mientras_cierra_no_dice_cero(self):
+        # Cerrar el archivo puede tardar (en el CI de Windows, más de 0.2 s). Antes, mientras
+        # tanto, info() decía "no graba" y 0 mensajes, y el panel mostraba eso. Ahora sigue
+        # diciendo "grabando" con sus cuentas, y "no graba" con el resumen al quedar cerrado.
+        rc = record.RecordingControl(["/imu"], directory=self.dir, out=io.StringIO())
+        self.assertIsNone(rc.start())
+        self.closers.append(lambda: rc.stop())
+        a = self.pub(wire.ImuSample, "/imu")
+        self.wait_subscribers(a)
+        for i in range(10):
+            a.publish(imu(i))
+        end = time.monotonic() + 5
+        while rc.info()["messages"] < 10 and time.monotonic() < end:
+            time.sleep(0.02)
+        rec = rc.rec
+        close = rec.stop
+        closing, go_on = threading.Event(), threading.Event()
+
+        def slow_stop():                  # el archivo tarda en cerrarse hasta que la prueba diga
+            closing.set()
+            go_on.wait(5)
+            return close()
+
+        rec.stop = slow_stop
+        panel = threading.Thread(target=rc.stop)             # el panel cierra en su propio hilo
+        panel.start()
+        self.assertTrue(closing.wait(5))
+        info = rc.info()
+        self.assertTrue(info["recording"], "mientras cierra, sigue diciendo que graba")
+        self.assertEqual(info["messages"], 10)
+        self.assertEqual(rc.start(), "todavía estoy cerrando la grabación anterior: prueba en un momento")
+        seen = []
+        ctrl_c = threading.Thread(target=lambda: (rc.stop(), seen.append(rc.info())))   # Ctrl+C a la vez
+        ctrl_c.start()
+        time.sleep(0.1)
+        self.assertTrue(ctrl_c.is_alive(), "el segundo stop() espera a que el archivo quede cerrado")
+        go_on.set()
+        panel.join(5)
+        ctrl_c.join(5)
+        for info in (rc.info(), seen[0]):
+            self.assertFalse(info["recording"])
+            self.assertEqual(info["messages"], 10)
+            self.assertTrue(Path(info["file"]).is_file())
+        got, _, _ = self.read(seen[0]["file"])
+        self.assertEqual(len(got), 10)
+        self.assertEqual(rc.stop(), "no está grabando")
+
+
 class TestInfo(HubCase):
     def test_info_y_reparar(self):
         path = os.path.join(self.dir, "f.mcap")

@@ -549,12 +549,15 @@ class RecordingControl:
         self.compression, self.attachments, self.info_extra = compression, list(attachments), dict(info or {})
         self.out = out
         self._lock = threading.Lock()
-        self.rec: Recorder | None = None
+        self.rec: Recorder | None = None          # sigue aquí mientras se cierra el archivo
         self.last: Summary | None = None
+        self._closing: threading.Event | None = None   # se pone cuando el archivo quedó cerrado
 
     def start(self) -> str | None:
         """Empieza a grabar. Devuelve un error (texto) o None."""
         with self._lock:
+            if self._closing is not None:
+                return "todavía estoy cerrando la grabación anterior: prueba en un momento"
             if self.rec is not None:
                 return "ya está grabando"
             try:
@@ -569,11 +572,29 @@ class RecordingControl:
             return None
 
     def stop(self) -> str | None:
+        """Deja de grabar y cierra el archivo (escribe lo que quedó en la cola).
+
+        Mientras se cierra, info() sigue diciendo "grabando" con las cuentas de esta
+        grabación; dice "no graba" cuando el archivo ya quedó cerrado, con su resumen.
+        Antes soltaba la grabación primero y, mientras cerraba, info() decía "no graba"
+        y 0 mensajes (o los de la anterior): en el CI de Windows cerrar tardó más de 0.2 s.
+        Si otro hilo ya la está cerrando (el panel, y Ctrl+C), espera a que termine."""
         with self._lock:
-            rec, self.rec = self.rec, None
-        if rec is None:
-            return "no está grabando"
-        s = self.last = rec.stop()
+            rec, closing = self.rec, self._closing
+            if rec is None:
+                return "no está grabando"
+            mine = closing is None
+            if mine:
+                closing = self._closing = threading.Event()
+        if not mine:
+            closing.wait()
+            return None
+        try:
+            s = self.last = rec.stop()          # el resumen, antes de soltar la grabación
+        finally:
+            with self._lock:
+                self.rec, self._closing = None, None
+            closing.set()
         self._say(f"⏹ {', '.join(s.files)}: {s.messages} mensajes, {size_text(s.bytes)}, {s.seconds:.1f} s"
                   + (f" · ⚠ {s.lost} perdidos" if s.lost else ""))
         return None

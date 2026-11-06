@@ -58,6 +58,18 @@ recomendadas (D1–D6 = a), a pedido de Arca9 (los puntos 1 y 2 de su
 ### Cambiado
 - `examples/tutorial/robot.toml`: la tarjeta **Movimientos** y
   `max_gap_ms = 100` en `/imu`. Tutorial: capítulos 5, 6 y 10.
+- `scripts/check_version.py` también revisa la línea "Versión actual" del
+  README (decía 0.12.0).
+
+### Corregido
+- **Al detener una grabación desde el panel (⏹), mientras se cerraba el
+  archivo el panel decía "no graba" y 0 mensajes** (o los de la grabación
+  anterior), desde 0.12.0. `RecordingControl.stop()` soltaba la grabación
+  antes de cerrarla. Ahora sigue diciendo "grabando" hasta que el archivo
+  queda cerrado y después da su resumen. Si `agmen run` se detiene (Ctrl+C)
+  mientras el panel cierra, espera a que termine en vez de salir con el
+  archivo a medias. Lo encontró `test_web` en el CI de Windows, donde cerrar
+  tardó más de 0.2 s.
 
 ## [0.12.1] — 2026-11-06
 

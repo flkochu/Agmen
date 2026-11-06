@@ -46,6 +46,7 @@ El archivo **`VERSION`** de la raíz manda. De él salen:
 | C++ | CMake lo lee y genera `agmen/version.hpp` (`agmen::kVersion`) |
 | Python | `python/agmen/_version.py` (`agmen.__version__`), verificado por script |
 | CHANGELOG | La última sección `## [X.Y.Z]` debe coincidir |
+| README | La línea **Versión actual: X.Y.Z** |
 | Tag de git | `vX.Y.Z` debe coincidir al publicar |
 
 `scripts/check_version.py` revisa todo y corre en el CI en cada push.
@@ -53,7 +54,8 @@ El archivo **`VERSION`** de la raíz manda. De él salen:
 ## Cómo sacar una versión nueva
 
 1. Termina el nivel y asegúrate de que el CI esté en verde.
-2. Cambia el número en `VERSION` y en `python/agmen/_version.py`.
+2. Cambia el número en `VERSION`, en `python/agmen/_version.py` y en la línea
+   **Versión actual** del `README.md`.
 3. En `CHANGELOG.md`, renombra `[Sin publicar]` a `[X.Y.Z] — AAAA-MM-DD` y
    abre una sección `[Sin publicar]` nueva arriba.
 4. Verifica: `python scripts/check_version.py`
