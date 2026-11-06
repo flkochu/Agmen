@@ -7,6 +7,14 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 
 ## [Sin publicar]
 
+### Planeado (nivel 10, versión 0.14.0)
+- El mismo robot en simulación y en el mundo real, y nodos en varias
+  computadoras. Diseño propuesto en el
+  [RFC 0011](docs/rfc/0011-sim-real-y-varias-computadoras.md) (recomienda
+  perfiles en `robot.toml` con `agmen run --sim`, un mundo de MuJoCo de
+  ejemplo y `agmen agent` en cada computadora); falta decidir antes de
+  implementar.
+
 ## [0.13.0] — 2026-11-06
 
 **El panel manda cualquier tipo, y el mux dice quién manda.** Implementa el
