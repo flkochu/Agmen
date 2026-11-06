@@ -72,6 +72,7 @@ priority = 1
 name = "/imu"
 type = "ImuSample"                        # opcional: avisa si llega con otro tipo
 required = true                           # opcional: avisa si nadie lo publica
+max_gap_ms = 100                          # opcional (0.13.0): avisa si pasa más que esto sin llegar, y cuando vuelve
 
 [hub]
 enabled = true                            # false = no arrancar el agmen hub (sin topics)
@@ -87,11 +88,29 @@ allow_origins = []                        # opcional (0.6.0): otros visores que 
 [web.teleop]                              # opcional: manejar el robot desde el panel
 target = "/cmd/teleop"                    # topic o "ip:puerto" de quien recibe MotorCommand
 max_speed = 1.0                           # límite que el panel nunca excede
+
+[[web.command]]                           # opcional (0.13.0, RFC 0012): una tarjeta de mandos de cualquier tipo compact
+name = "Brazo"                            # el título de la tarjeta (default: el target)
+target = "/cmd/brazo"                     # topic o "ip:puerto" (con mux, su entrada)
+type = "Brazo"                            # MotorCommand, ImuSample o un mensaje de `messages`
+messages = "brazo.agmen"                  # el .agmen de los nodos, relativo a robot.toml
+
+[web.command.default]                     # opcional: los campos que no dice un botón
+pinza = false
+
+[[web.command.button]]                    # mientras lo mantienes presionado, manda este mensaje (~20 Hz)
+label = "guardar"
+value = { codo = 90.0, hombro = 10.0 }    # con default, el mensaje completo; si falta un campo, no arranca
+
+[web.command.fields]                      # opcional: armarlo a mano
+codo = { min = 0, max = 180 }             # un deslizador por número (min y max obligatorios; step y label opcionales)
+pinza = {}                                # una casilla por bool
 ```
 
 Desde 0.5.0, `agmen run` agrega un nodo **`hub`** (el directorio de topics,
 RFC 0004) antes que los demás, o reutiliza uno que ya esté vivo en la
-máquina. Le pasa los `[[topic]]` para que avise de errores.
+máquina. Le pasa los `[[topic]]` para que avise de errores. Desde 0.13.0,
+cada `[[mux]]` publica quién manda en `/mux/<nombre>` (RFC 0012).
 
 **Reglas:**
 - Las rutas son relativas a `robot.toml` en todos los sistemas operativos.
@@ -187,10 +206,11 @@ de nodos. Para scripts y pruebas sigue habiendo HTTP:
 | Método | Ruta | Qué hace |
 |---|---|---|
 | GET | `/ws` | WebSocket del panel (`agmen.ws.v1`) y de Foxglove (`foxglove.websocket.v1`) |
-| GET | `/api/state` | Robot, versión, nodos, estadísticas por topic, teleoperación, `cpu_s` del puente |
+| GET | `/api/state` | Robot, versión, nodos, estadísticas por topic, teleoperación, `cpu_s` del puente; desde 0.13.0, `commands` (los mandos), `muxes` (quién manda en cada mux) y `gaps` (los topics de `max_gap_ms`) |
 | GET | `/agmen.js` | El decodificador del formato en JavaScript |
 | POST | `/api/node/<nombre>/start\|stop\|restart` | Controlar un nodo |
 | POST | `/api/teleop` `{"left": x, "right": y}` | Mandar un `MotorCommand` (a `[web.teleop] target`; con mux, a su entrada `teleop`) |
+| POST | `/api/command` `{"command": "Brazo", "button": "guardar"}` o `{"command": 0, "fields": {"codo": 45}}` | Un mando de `[[web.command]]` (0.13.0, RFC 0012): el panel revisa los valores contra el esquema y sus rangos, y arma el mensaje |
 
 `/api/stream` (Server-Sent Events, 0.2–0.5) se quitó en 0.6.0: lo reemplaza el WebSocket.
 
@@ -219,7 +239,9 @@ siguen en C++ (o en el lenguaje que quieras).
 |---|---|
 | El mux está en Python (sobra para comandos de 20–100 Hz como los del tutorial; agrega un salto local de UDP) | Pasarlo al núcleo C++ si se usa en lazos de control más rápidos |
 | Grafica cualquier tipo de varios topics a la vez, con inspector (0.6.0) | Cámara (nivel 7), 3D y grabaciones (nivel 9); topics de otras máquinas (nivel 11) |
-| La teleoperación manda `MotorCommand` a un topic | Cualquier tipo de comando con esquema; publicar desde Foxglove |
+| La teleoperación manda `MotorCommand` a un topic. Desde 0.13.0, `[[web.command]]` manda **cualquier tipo `compact`** desde el panel: botones con un mensaje fijo y deslizadores y casillas con sus rangos, con hombre muerto ([RFC 0012](0012-mandos-del-panel-y-quien-manda.md)) | Publicar desde Foxglove; tipos `arrow` (textos) desde el panel; atajos de teclado para los botones |
+| El mux solo dice quién manda en su log. Desde 0.13.0 lo publica en `/mux/<nombre>` (`agmen.msgs.MuxEstado`) y el panel lo muestra, con un aviso cuando la entrada que mandaba se calla (RFC 0012) | — |
+| `[[topic]] required` avisa si nadie publica un topic. Desde 0.13.0, `max_gap_ms` avisa si deja de llegar y cuando vuelve (RFC 0012) | — |
 | Un solo robot y una sola máquina | Nodos en varias máquinas (`host = "raspberry"`); varios robots en un panel (modo nube, RFC 0002) |
 | Clave para la red local (sin cifrar) | Usuarios, permisos y TLS para el modo nube (nivel 11) |
 | CPU y memoria por nodo: no se muestran | Agregarlos sin dependencias externas |

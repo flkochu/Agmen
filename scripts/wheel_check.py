@@ -142,6 +142,35 @@ def main() -> int:
     panel = Path(agmen.__file__).with_name("panel")
     check("el panel trae mcap.js (abrir grabaciones)", (panel / "mcap.js").is_file() and (panel / "agmen.js").is_file())
 
+    # Mandos del panel y quién manda (RFC 0012): agmen.msgs.MuxEstado, los mandos y el vigilante.
+    from agmen.msgs import MuxEstado
+    from agmen.panel.command import Command, parse_command
+    from agmen.watch import TopicWatch
+
+    est = MuxEstado(mux="ruedas", entrada="teleop", topic="/cmd/teleop", prioridad=10, desde=1, antes="", callada=False,
+                    fuente=7, cambios=1)
+    check("agmen.msgs.MuxEstado (arrow)", MuxEstado.LAYOUT.encoding == wire.ENC_ARROW
+          and MuxEstado.decode_payload(est.encode_payload()) == est)
+
+    class _Pub:
+        def __init__(self):
+            self.n = 0
+
+        def publish(self, m):
+            self.n += 1
+
+        def close(self):
+            pass
+
+    mando = Command(parse_command({"target": "/cmd/teleop", "type": "MotorCommand",
+                                   "button": [{"label": "girar", "value": {"left": 0.5, "right": -0.5}}]}, 0, Path(".")),
+                    publisher=_Pub())
+    check("un mando del panel ([[web.command]])", mando.button("girar") and mando.pub.n == 1)
+    vig = TopicWatch({"/imu": 100}, log=lambda t: None, subscribe=False)
+    vig.seen("/imu", 0.0)
+    vig.check(0.5)
+    check("max_gap_ms (agmen.watch)", vig.info()[0]["late"])
+
     exe = Path(sys.executable).with_name("agmen.exe" if os.name == "nt" else "agmen")
     cmd = [str(exe)] if exe.exists() else [sys.executable, "-m", "agmen"]
     # agmen siempre escribe en UTF-8 (agmen/__init__.py); en Windows el

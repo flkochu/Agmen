@@ -1,5 +1,5 @@
 // msgs.agmen
-// Generado por `agmen gen` (Agmen 0.12.0) desde msgs.agmen.
+// Generado por `agmen gen` (Agmen 0.13.0) desde msgs.agmen.
 // No lo edites: cambia msgs.agmen y vuelve a generar.
 #pragma once
 
@@ -141,6 +141,81 @@ struct ImagenComprimida {
 static_assert(agmen::wire::Message<ImagenComprimida>);
 static_assert(agmen::wire::is_arrow_v<ImagenComprimida>);
 static_assert(agmen::wire::schema_id_v<ImagenComprimida> == 0xaa4de10b3019dd92ULL,
+              "el schema_id de C++ no coincide con el de agmen gen");
+
+/// Quién tiene el mando de un [[mux]] (RFC 0012). El mux lo publica en
+/// /mux/<nombre> cada vez que cambia y una vez por segundo. Un nodo que cede el
+/// mando (como un modo autónomo) lo lee para saber cuándo retomar.
+/// MuxEstado · tamaño variable (arrow, por TCP) · Un mensaje: se puede publicar.
+/// agmen/1 MuxEstado{string mux;string entrada;string topic;i32 prioridad;time desde;string antes;bool callada;u64 fuente;u32 cambios}
+struct MuxEstado {
+    static constexpr std::string_view kName = "MuxEstado";
+    static constexpr std::string_view kSchema = "MuxEstado{string mux;string entrada;string topic;i32 prioridad;time desde;string antes;bool callada;u64 fuente;u32 cambios}";
+    static constexpr std::size_t kPayloadLen = 0;  // arrow: no es fijo
+
+    std::string mux{};  ///< el nombre del [[mux]] (ej. "ruedas")
+    std::string entrada{};  ///< la entrada que manda (ej. "teleop"), o "" si nadie manda
+    std::string topic{};  ///< el topic de esa entrada (ej. "/cmd/teleop") o su dirección
+    std::int32_t prioridad{};  ///< su prioridad (0 si nadie manda)
+    std::int64_t desde{};  ///< desde cuándo manda (o desde cuándo nadie manda), con el reloj de Agmen
+    std::string antes{};  ///< la que mandaba antes ("" si nadie)
+    bool callada{};  ///< el cambio fue porque 'antes' dejó de hablar (pasaron hold_ms sin mensajes)
+    std::uint64_t fuente{};  ///< source_id del publicador que manda (0 si nadie manda)
+    std::uint32_t cambios{};  ///< cuántas veces cambió el mando desde que arrancó el mux
+
+    /// El struct como valor arrow. Presta los textos, bytes y arreglos: úsalo de inmediato.
+    [[nodiscard]] agmen::arrow::Value to_value() const {
+        return agmen::arrow::Value::structure({
+            agmen::arrow::Value::text(mux),
+            agmen::arrow::Value::text(entrada),
+            agmen::arrow::Value::text(topic),
+            agmen::arrow::Value::integer(prioridad),
+            agmen::arrow::Value::integer(desde),
+            agmen::arrow::Value::text(antes),
+            agmen::arrow::Value::boolean(callada),
+            agmen::arrow::Value::uinteger(fuente),
+            agmen::arrow::Value::uinteger(cambios),
+        });
+    }
+
+    /// De un valor arrow (lo que decodifica agmen::arrow::Codec) a MuxEstado.
+    [[nodiscard]] static MuxEstado from_value(const agmen::arrow::Value& _v) {
+        if (_v.kind != agmen::arrow::Value::Kind::Struct || _v.items.size() != 9) {
+            throw agmen::wire::WireError(agmen::wire::WireError::Kind::BadArrow,
+                                         "'MuxEstado' debía traer 9 campos");
+        }
+        MuxEstado _m;
+        _m.mux = std::string(_v.items[0].text());
+        _m.entrada = std::string(_v.items[1].text());
+        _m.topic = std::string(_v.items[2].text());
+        _m.prioridad = _v.items[3].as<std::int32_t>();
+        _m.desde = _v.items[4].as<std::int64_t>();
+        _m.antes = std::string(_v.items[5].text());
+        _m.callada = _v.items[6].as<bool>();
+        _m.fuente = _v.items[7].as<std::uint64_t>();
+        _m.cambios = _v.items[8].as<std::uint32_t>();
+        return _m;
+    }
+
+    /// El codificador arrow de este tipo (se arma una vez).
+    static const agmen::arrow::Codec& codec() {
+        static const agmen::schema::Layout _layout(kSchema);
+        static const agmen::arrow::Codec _codec(_layout);
+        return _codec;
+    }
+
+    void encode_payload(agmen::wire::Bytes& _out) const { codec().encode(to_value(), _out); }
+
+    [[nodiscard]] static MuxEstado decode_payload(agmen::wire::ByteView _p) {
+        return from_value(codec().decode(_p));
+    }
+
+    friend bool operator==(const MuxEstado&, const MuxEstado&) = default;
+};
+
+static_assert(agmen::wire::Message<MuxEstado>);
+static_assert(agmen::wire::is_arrow_v<MuxEstado>);
+static_assert(agmen::wire::schema_id_v<MuxEstado> == 0x3697f7c84d120900ULL,
               "el schema_id de C++ no coincide con el de agmen gen");
 
 }  // namespace agmen::msgs

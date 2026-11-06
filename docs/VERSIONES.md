@@ -24,6 +24,8 @@
 | **0.11.0** | 8 | Memoria compartida (RFC 0009): imágenes y tensores sin copiar entre procesos de la misma computadora; TCP entre computadoras |
 | 0.11.1 | — | Parche: auditoría del decodificador con fuzzing (un paquete mal hecho ya no tumba ni detiene a nadie); memoria compartida con tope según la RAM y que se encoge sola (RFC 0009, D6 a′); pickle de lo que llega por memoria compartida; macOS sin soporte oficial (ahí se instala Python puro) |
 | **0.12.0** | 9 | Grabar y reproducir: `agmen record`, `agmen play` con el tiempo de la grabación (reloj `replay`), `agmen run --record/--play`, el `.mcap` en el panel y en Foxglove, y `agmen export --parquet` / `agmen.Recording` para entrenar |
+| 0.12.1 | — | Parche: NaN e infinitos como `null` en el JSON (Foxglove, `agmen echo --json`); dos `agmen run` en la misma máquina: el panel ya no truena si su puerto está ocupado, y el segundo avisa de quién es el hub y qué topics comparten |
+| **0.13.0** | — | El panel manda cualquier tipo (`[[web.command]]`: botones y deslizadores, con hombre muerto), el mux publica quién manda en `/mux/<nombre>` y `[[topic]] max_gap_ms` avisa cuando un topic deja de llegar (RFC 0012, para Arca9) |
 | … | … | Un nivel por versión menor |
 | 1.0.0 | — | API estable: a partir de aquí romper la API exige subir MAYOR |
 

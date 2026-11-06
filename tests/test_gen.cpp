@@ -150,6 +150,28 @@ int main() {
     CHECK(im.frame_id == "camara" && im.width == 2 && im.encoding == "rgb8" && im.data.size() == 12);
     CHECK(agmen::wire::schema_id_v<Imagen> == agmen::wire::schema_id_v<agmen::msgs::Imagen>);
 
+    // agmen::msgs::MuxEstado (RFC 0012): quién manda en un [[mux]]; lo publica el mux en /mux/<nombre>.
+    {
+        agmen::msgs::MuxEstado e;
+        e.mux = "mando";
+        e.entrada = "panel";
+        e.topic = "/arca9/comando/panel";
+        e.prioridad = 10;
+        e.desde = 1700000000123456789LL;
+        e.antes = "poses";
+        e.callada = true;
+        e.fuente = 0xABCDEF0123456789ULL;
+        e.cambios = 3;
+        agmen::wire::Bytes buf;
+        e.encode_payload(buf);
+        const auto d = agmen::msgs::MuxEstado::decode_payload(buf);
+        CHECK(d == e);
+        CHECK(agmen::wire::schema_text<agmen::msgs::MuxEstado>() ==
+              "agmen/1 MuxEstado{string mux;string entrada;string topic;i32 prioridad;time desde;string antes;"
+              "bool callada;u64 fuente;u32 cambios}");
+        std::printf("  ok %-14s %3zu bytes  (arrow, agmen::msgs)\n", "MuxEstado", buf.size());
+    }
+
     const auto mx = check_type<Mixto>(vectors);
     CHECK(mx.pts.size() == 2 && mx.pts[1].x == -1.0 && mx.tags.size() == 3 && mx.tags[2] == "ñ");
     CHECK(mx.m[1][1] == 4.0f && mx.c[2] == 9 && mx.pares[1].a == 2 && mx.pares[1].b == "dos" && mx.d == -5);

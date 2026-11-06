@@ -96,11 +96,60 @@ agmen run examples/tutorial/robot.toml
    Esos 35 `descartados` son los comandos del cerebro que **no** llegaron al
    motor mientras tú manejabas.
 
-## 4. Experimentos
+## 4. ¿Quién tiene el mando? Pregúntale al mux
+
+*Desde Agmen 0.13 ([RFC 0012](../rfc/0012-mandos-del-panel-y-quien-manda.md))*
+
+El mux no solo lo escribe en su log: lo **publica** en el topic
+`/mux/ruedas` (`/mux/` + el nombre del `[[mux]]`), cada vez que cambia y una
+vez por segundo. Así cualquier nodo lo puede saber:
+
+```bash
+agmen topic echo /mux/ruedas --count 1
+```
+
+Con el cerebro prendido, justo después de manejar con W A S D y soltar:
+
+```
+--- /mux/ruedas · MuxEstado · seq 10 · t_data 03:43:41.512 · 127.0.0.1:47758 · latencia 0.54 ms
+  mux: 'ruedas'
+  entrada: 'cerebro'
+  topic: '/cmd/cerebro'
+  prioridad: 1
+  desde: 1793936620512184768
+  antes: 'teleop'
+  callada: true
+  fuente: 1370401768130783952
+  cambios: 3
+```
+
+- `entrada`: quién manda (`''` si nadie), desde cuándo (`desde`, en ns, con
+  el reloj de Agmen) y con qué prioridad. `antes`: quién mandaba antes, y
+  `callada: true` dice que cambió porque esa entrada **dejó de hablar** (no
+  porque llegó una de más prioridad). `fuente` es el `source_id` del nodo que
+  manda.
+- El panel lo muestra en la tarjeta **¿Quién manda?**, y cuando la entrada
+  que mandaba se calla, avisa: `⚠ ruedas: 'teleop' se calló → manda 'cerebro'`.
+- El tipo es `agmen.msgs.MuxEstado` (en C++, `agmen::msgs::MuxEstado`). Un
+  modo autónomo que quiera retomar **sin salto** desde donde lo dejó el
+  humano lo escucha así:
+
+  ```python
+  from agmen.msgs import MuxEstado
+
+  @node.on(MuxEstado, "/mux/ruedas")
+  def mando(s):
+      cedido = s.message.entrada not in ("cerebro", "")   # manda otro: no publico lo mío
+  ```
+
+  No hace falta copiar el `hold_ms` ni saber qué entrada le gana: el mux lo
+  dice.
+
+## 5. Experimentos
 
 🧪 **Apaga el cerebro y suelta las teclas.** El mux dice
-`nadie manda (sin mensajes en 300 ms)` y el motor, medio segundo después,
-`⛔ ALTO`. El mux no "rellena" con el último comando: el freno sigue
+`nadie manda (sin mensajes en 300 ms)` (y en `/mux/ruedas`, `entrada: ''`) y
+el motor, medio segundo después, `⛔ ALTO`. El mux no "rellena" con el último comando: el freno sigue
 funcionando.
 
 🧪 **Cambia las prioridades** (cerebro 20, teleop 10). Ahora el cerebro
@@ -130,6 +179,8 @@ agmen mux --out /cmd --in teleop=/cmd/teleop@10 --in cerebro=/cmd/cerebro@1
   del motor ni del cerebro.
 - Que un buen árbitro **nunca inventa** comandos: la seguridad la sigue
   poniendo el receptor.
+- Que el mux dice quién manda en `/mux/<nombre>`: un nodo lo lee en vez de
+  adivinarlo.
 
 💡 Si conoces ROS: es lo mismo que `twist_mux`, pero funciona con
 **cualquier** tipo de mensaje, no solo con velocidades.

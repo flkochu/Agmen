@@ -1,8 +1,8 @@
-# Mensajes estándar de Agmen (RFC 0008, D4).
+# Mensajes estándar de Agmen (RFC 0008, D4; MuxEstado: RFC 0012).
 #
-# Tienen los mismos campos que los tipos de Foxglove (foxglove.RawImage y
-# foxglove.CompressedImage), así una cámara, una IA, el panel, Foxglove y las
-# grabaciones hablan el mismo tipo sin ponerse de acuerdo.
+# Las imágenes tienen los mismos campos que los tipos de Foxglove
+# (foxglove.RawImage y foxglove.CompressedImage), así una cámara, una IA, el
+# panel, Foxglove y las grabaciones hablan el mismo tipo sin ponerse de acuerdo.
 #
 #   import "agmen/msgs.agmen"          # en tu .agmen
 #   from agmen.msgs import Imagen      # en Python
@@ -28,4 +28,19 @@ message ImagenComprimida {
     string frame_id               # el marco de referencia (ej. "camara")
     string format = "jpeg"        # jpeg, png, webp
     bytes  data                   # el archivo comprimido, tal cual
+}
+
+# Quién tiene el mando de un [[mux]] (RFC 0012). El mux lo publica en
+# /mux/<nombre> cada vez que cambia y una vez por segundo. Un nodo que cede el
+# mando (como un modo autónomo) lo lee para saber cuándo retomar.
+message MuxEstado {
+    string mux                    # el nombre del [[mux]] (ej. "ruedas")
+    string entrada                # la entrada que manda (ej. "teleop"), o "" si nadie manda
+    string topic                  # el topic de esa entrada (ej. "/cmd/teleop") o su dirección
+    i32    prioridad              # su prioridad (0 si nadie manda)
+    time   desde                  # desde cuándo manda (o desde cuándo nadie manda), con el reloj de Agmen
+    string antes                  # la que mandaba antes ("" si nadie)
+    bool   callada                # el cambio fue porque 'antes' dejó de hablar (pasaron hold_ms sin mensajes)
+    u64    fuente                 # source_id del publicador que manda (0 si nadie manda)
+    u32    cambios                # cuántas veces cambió el mando desde que arrancó el mux
 }

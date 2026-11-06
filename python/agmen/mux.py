@@ -23,6 +23,11 @@ Reglas de seguridad:
   - Los anuncios de esquema no cuentan como "hablar" (no roban el mando); el
     mux reenvía uno por segundo para que el receptor siga sabiendo el tipo.
 
+Quién manda (RFC 0012): con `--state /mux/<nombre>` (agmen run lo pone solo),
+el mux publica un agmen.msgs.MuxEstado cada vez que cambia el mando y una vez
+por segundo: la entrada que manda, su prioridad, desde cuándo y si la anterior
+se calló. Lo que reenvía no cambia.
+
 Uso directo (agmen run lo arma solo desde [[mux]] en robot.toml):
 
     agmen mux --out 127.0.0.1:7500 --hold-ms 300 \\
@@ -31,6 +36,7 @@ Uso directo (agmen run lo arma solo desde [[mux]] en robot.toml):
 
 from __future__ import annotations
 
+import os
 import selectors
 import struct
 import sys
@@ -72,8 +78,19 @@ def _addr(text: str) -> tuple[str, int]:
     return host, int(port)
 
 
+STATE_EVERY_S = 1.0      # el estado se repite cada segundo: quien llega tarde lo sabe en ~1 s
+
+
+def state_topic(name: str) -> str:
+    """El topic del estado de un [[mux]]: /mux/<nombre>, con las letras que no
+    valen en un topic cambiadas por '_' (ej. "ruedas traseras" → /mux/ruedas_traseras)."""
+    seg = "".join(c if (c.isascii() and c.isalnum()) or c == "_" else "_" for c in name) or "mux"
+    return f"/mux/{seg}"
+
+
 class Mux:
-    def __init__(self, inputs: list[MuxInput], output: str, hold_ms: float = 300.0, log=print) -> None:
+    def __init__(self, inputs: list[MuxInput], output: str, hold_ms: float = 300.0, log=print,
+                 state: str | None = None, name: str = "") -> None:
         if not inputs:
             raise ValueError("el mux necesita al menos una entrada")
         names = [i.name for i in inputs]
@@ -111,6 +128,22 @@ class Mux:
         self.dropped = {i.name: 0 for i in self.inputs}
         self.errors = {i.name: 0 for i in self.inputs}
         self._last_error_log = 0.0
+        # Quién manda (RFC 0012): agmen.msgs.MuxEstado en `state` (ej. /mux/ruedas).
+        self.name = name or "mux"
+        self.since_ns = wire.now_ns()           # desde cuándo manda la activa (o nadie)
+        self.previous: MuxInput | None = None   # la que mandaba antes
+        self.quiet = False                      # el último cambio fue porque 'previous' se calló
+        self.changes = 0
+        self.last_source: dict[str, int] = {}   # entrada → source_id de su último mensaje
+        self._state_at: float | None = None
+        self.state_pub = None
+        if state:
+            from .msgs import MuxEstado
+            from .pubsub import Publisher
+
+            hp.check_topic(state)
+            self._state_cls = MuxEstado
+            self.state_pub = Publisher(MuxEstado, state)
 
     # --- decisión ---
     def _who_commands(self, now: float) -> MuxInput | None:
@@ -124,13 +157,44 @@ class Mux:
         who = self._who_commands(now)
         name = who.name if who else None
         if name != self.active:
+            before = next((i for i in self.inputs if i.name == self.active), None)
             if who is None:
                 self.log(f"nadie manda (sin mensajes en {self.hold * 1000:.0f} ms): "
                          f"no se reenvía nada y el receptor aplica su freno de seguridad")
             else:
                 self.log(f"manda '{who.name}' (prioridad {who.priority})")
             self.active = name
+            # La anterior "se calló" si el mando pasó a una de menos prioridad (o a nadie):
+            # si hubiera seguido hablando, seguiría mandando ella.
+            self.previous = before
+            self.quiet = before is not None and (who is None or who.priority < before.priority)
+            self.since_ns = wire.now_ns()
+            self.changes += 1
+            self.publish_state(now)
         return who
+
+    def state(self) -> dict:
+        """El estado de ahora, con los campos de agmen.msgs.MuxEstado."""
+        who = next((i for i in self.inputs if i.name == self.active), None)
+        return {"mux": self.name, "entrada": who.name if who else "", "topic": who.listen if who else "",
+                "prioridad": who.priority if who else 0, "desde": self.since_ns,
+                "antes": self.previous.name if self.previous else "", "callada": self.quiet,
+                "fuente": self.last_source.get(who.name, 0) if who else 0, "cambios": self.changes}
+
+    def publish_state(self, now: float) -> None:
+        if self.state_pub is None:
+            return
+        self._state_at = now
+        try:
+            self.state_pub.publish(self._state_cls(**self.state()))
+        except (OSError, wire.WireError) as e:      # sin hub o sin red: el mux sigue arbitrando igual
+            self._error_state(e)
+
+    def _error_state(self, e: Exception) -> None:
+        now = time.monotonic()
+        if now - self._last_error_log > 5.0:
+            self.log(f"⚠ no pude publicar quién manda: {e}")
+            self._last_error_log = now
 
     def _error(self, inp: MuxInput, text: str) -> None:
         self.errors[inp.name] += 1
@@ -186,6 +250,7 @@ class Mux:
             return False
 
         self.last_rx[inp.name] = now
+        self.last_source[inp.name] = env.source_id
         who = self._update_active(now)
         if who is None or who.name != inp.name:
             self.dropped[inp.name] += 1
@@ -198,6 +263,9 @@ class Mux:
     def run(self, stop: threading.Event) -> None:
         names = ", ".join(f"{i.name}={i.listen} (prioridad {i.priority})" for i in self.inputs)
         self.log(f"entradas: {names} → salida {self.output} · soltar el mando tras {self.hold * 1000:.0f} ms")
+        if self.state_pub is not None:
+            self.log(f"quién manda: en {self.state_pub.topic} (agmen.msgs.MuxEstado)")
+            self.publish_state(time.monotonic())
         while not stop.is_set():
             for key, _ in self.sel.select(timeout=0.05):
                 inp: MuxInput = key.data
@@ -213,7 +281,10 @@ class Mux:
                     self.handle(inp, got[0], time.monotonic())
             if self.pub is not None:
                 self.pub._drain()                     # receptores nuevos de la salida
-            self._update_active(time.monotonic())   # detecta cuando la fuente activa se calla
+            now = time.monotonic()
+            self._update_active(now)                  # detecta cuando la fuente activa se calla
+            if self.state_pub is not None and (self._state_at is None or now - self._state_at >= STATE_EVERY_S):
+                self.publish_state(now)               # y una vez por segundo, para quien llega tarde
 
     def summary(self) -> str:
         parts = [f"{i.name}: reenviados={self.forwarded[i.name]} descartados={self.dropped[i.name]} "
@@ -229,6 +300,8 @@ class Mux:
             rx.close()
         if getattr(self, "pub", None) is not None:
             self.pub.close()
+        if getattr(self, "state_pub", None) is not None:
+            self.state_pub.close()
         if hasattr(self, "out"):
             self.out.close()
         self.sel.close()
@@ -245,7 +318,8 @@ def main(args) -> int:
 
     try:
         inputs = [parse_input(t) for t in args.inputs]
-        mux = Mux(inputs, args.out, args.hold_ms, log)
+        mux = Mux(inputs, args.out, args.hold_ms, log, state=getattr(args, "state", None),
+                  name=getattr(args, "name", "") or os.environ.get("AGMEN_NODE", ""))
     except (ValueError, OSError) as e:
         print(f"[mux] error: {e}", file=sys.stderr)
         return 2

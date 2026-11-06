@@ -290,6 +290,10 @@ class Bridge:
                 return "left/right deben ser números"
             c.teleop_at = time.monotonic() if (left, right) != (0.0, 0.0) else 0.0
             return None
+        if op == "command":
+            # Un mando del panel (RFC 0012): el navegador pide un botón o unos campos; el
+            # panel arma el mensaje. Si el navegador se calla, no se manda nada más.
+            return self.panel.command(m.get("id"), m.get("button"), m.get("fields"), m.get("base"))
         if op == "clock":
             return self.panel.clock_action(str(m.get("action", "")), m.get("value"))
         if op == "record":

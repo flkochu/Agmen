@@ -336,7 +336,11 @@ class _Receiver:
         else:
             self.topic = ""
             self.listen = where
-            self._sock.bind(_addr(where))
+            try:
+                self._sock.bind(_addr(where))
+            except OSError:           # puerto ocupado (otro robot, otro agmen web): sin dejar el socket abierto
+                self._sock.close()
+                raise
             if tcp:   # con dirección fija, la misma IP y el mismo puerto en TCP
                 self._tcp = self._same_port_tcp(where, shm)
 
