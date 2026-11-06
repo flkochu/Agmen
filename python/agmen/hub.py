@@ -28,6 +28,14 @@ from ._version import __version__
 
 # Topics que pone Agmen mismo: no hace falta declararlos en robot.toml.
 BUILTIN_TOPICS = {"/clock": "Clock"}   # el tiempo de la simulación (RFC 0006)
+BUILTIN_PREFIXES = {"/mux/": "MuxEstado"}   # quién manda en cada [[mux]] (RFC 0012)
+
+
+def builtin_type(topic: str) -> str | None:
+    """El tipo de un topic de Agmen (/clock, /mux/<nombre>), o None si es de tu robot."""
+    if topic in BUILTIN_TOPICS:
+        return BUILTIN_TOPICS[topic]
+    return next((t for p, t in BUILTIN_PREFIXES.items() if topic.startswith(p)), None)
 
 
 @dataclass
@@ -113,11 +121,11 @@ class Hub:
     def _check_expected(self, e: Endpoint) -> None:
         if not self.expected or e.topic == "*":
             return
-        if e.topic in BUILTIN_TOPICS:
-            if e.type and e.type != BUILTIN_TOPICS[e.topic]:
+        builtin = builtin_type(e.topic)
+        if builtin is not None:
+            if e.type and e.type != builtin:
                 self._warn_once(("tipo", e.topic, e.type),
-                                f"'{e.topic}' es de Agmen y es de tipo {BUILTIN_TOPICS[e.topic]}; "
-                                f"'{e.node}' usa {e.type}")
+                                f"'{e.topic}' es de Agmen y es de tipo {builtin}; '{e.node}' usa {e.type}")
             return
         exp = self.expected.get(e.topic)
         if exp is None:

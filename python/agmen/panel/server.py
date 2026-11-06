@@ -157,6 +157,33 @@ class SchemaBook:
         return topic, self.layouts[env.schema_id]
 
 
+class MuxBoard:
+    """Quién manda en cada [[mux]] (RFC 0012): lo último que llegó de /mux/<nombre>."""
+
+    STALE_S = 3.0     # el mux publica cada segundo: 3 s sin nada es que se detuvo
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.states: dict[str, tuple[dict, float]] = {}
+
+    def update(self, topic: str, row: dict) -> None:
+        with self.lock:
+            self.states[topic] = (row, time.monotonic())
+
+    def info(self) -> list[dict]:
+        now, agmen_now = time.monotonic(), wire.now_ns()
+        with self.lock:
+            items = sorted(self.states.items())
+        out = []
+        for topic, (row, at) in items:
+            out.append({"state_topic": topic, "mux": row["mux"], "entrada": row["entrada"], "topic": row["topic"],
+                        "prioridad": row["prioridad"], "antes": row["antes"], "callada": row["callada"],
+                        "fuente": f"{row['fuente']:016x}" if row["fuente"] else "", "cambios": row["cambios"],
+                        "hace_s": round(max(0, agmen_now - row["desde"]) / 1e9, 1),
+                        "stale": now - at > self.STALE_S})
+        return out
+
+
 def panel_node_name() -> str:
     """El nombre del panel en el hub: "panel" (o el AGMEN_NODE con que lo corriste)."""
     return os.environ.get("AGMEN_NODE") or "panel"
@@ -176,7 +203,7 @@ def open_listen(listen: str) -> RawSubscriber:
 
 
 def udp_receiver(hub: SensorHub, bridge: Bridge | None, listen: str | None, stop: threading.Event,
-                 topics: bool = True, fixed: RawSubscriber | None = None) -> None:
+                 topics: bool = True, fixed: RawSubscriber | None = None, muxes: MuxBoard | None = None) -> None:
     """Recibe de su dirección fija (`listen`, para nodos sin hub como un puente
     de microcontrolador) y de TODOS los topics, como un receptor más
     registrado en el hub ("*"). Cuenta estadísticas y le pasa cada paquete,
@@ -225,10 +252,15 @@ def udp_receiver(hub: SensorHub, bridge: Bridge | None, listen: str | None, stop
             return
         if bridge:
             bridge.on_data(data, env, payload, layout)
+        topic = book.topics.get((source, env.topic_id), "")
+        if muxes is not None and layout.name == "MuxEstado" and topic.startswith("/mux/"):
+            try:
+                muxes.update(topic, layout.unpack(payload))       # quién manda (RFC 0012), una vez por segundo
+            except (wire.WireError, schema.SchemaError, KeyError, ValueError):
+                pass
         now = time.monotonic()
         window_rx += 1
         last_seen[source] = now
-        topic = book.topics.get((source, env.topic_id), "")
         key = topic or source
         st = per_topic.setdefault(key, {"count": 0, "bytes": 0, "rate_hz": 0.0, "bytes_s": 0.0, "lost": 0, "sources": {}})
         st["count"] += 1
@@ -323,7 +355,7 @@ class Panel:
     def __init__(self, http: str, listen: str | None, robot_name: str = "",
                  launcher=None, teleop: Teleop | None = None, topics: bool = True,
                  token: str | None = None, allow_origins: list[str] | None = None, clock=None,
-                 recording_file: str | None = None) -> None:
+                 recording_file: str | None = None, commands: list | None = None) -> None:
         self.http = http
         self.clock = clock            # agmen.clock.ClockServer si agmen run manda el tiempo
         # agmen web vuelta1.mcap (RFC 0010): el navegador la lee por partes de /api/recording.
@@ -337,6 +369,8 @@ class Panel:
         self.robot_name = robot_name
         self.launcher = launcher
         self.teleop = teleop
+        self.commands = list(commands or [])     # [[web.command]] (RFC 0012): agmen.panel.command.Command
+        self.muxes = MuxBoard()
         self.hub = SensorHub()
         self.bridge = Bridge(self)
         self.stop = threading.Event()
@@ -377,7 +411,8 @@ class Panel:
                 self.hub.update(last_error=str(e))   # y el panel, en su aviso de errores
         if fixed is not None or self.topics:
             threading.Thread(target=udp_receiver,
-                             args=(self.hub, self.bridge, self.listen if fixed else None, self.stop, self.topics, fixed),
+                             args=(self.hub, self.bridge, self.listen if fixed else None, self.stop, self.topics, fixed,
+                                   self.muxes),
                              daemon=True, name="panel-udp").start()
         threading.Thread(target=self.server.serve_forever, daemon=True, name="panel-http").start()
         threading.Thread(target=self.bridge.ticker, args=(self.stop,), daemon=True, name="panel-ticker").start()
@@ -398,6 +433,8 @@ class Panel:
             w.close(1001, "el panel se cerró")
         self.server.shutdown()
         self.server.server_close()
+        for c in self.commands:
+            c.close()
 
     def snapshot(self) -> dict:
         return {
@@ -406,6 +443,9 @@ class Panel:
             "nodes": self.launcher.nodes_info() if self.launcher else [],
             "managed": self.launcher is not None,
             "teleop": self.teleop.info() if self.teleop else None,
+            "commands": [c.info() for c in self.commands],
+            "muxes": self.muxes.info(),
+            "gaps": self.gap_info(),
             "clock": self.clock_info(),
             "rhythm": self.rhythm,
             "recording": self.recording_info(),
@@ -413,6 +453,39 @@ class Panel:
                                 "size": os.path.getsize(self.recording_file)}
                                if self.recording_file and os.path.isfile(self.recording_file) else None),
         }
+
+    def command(self, which, button=None, fields=None, base=None) -> str | None:
+        """Un mando del panel (RFC 0012): `which` es su número o su nombre. Devuelve
+        un error en palabras, o None. Más de ~60 por segundo se descartan sin error."""
+        from .command import CommandError
+
+        if not self.commands:
+            return "este panel no tiene mandos ([[web.command]] en robot.toml, con agmen run)"
+        if isinstance(which, str):
+            cmd = next((c for c in self.commands if c.cfg.name == which), None)
+        elif isinstance(which, int) and not isinstance(which, bool) and 0 <= which < len(self.commands):
+            cmd = self.commands[which]
+        else:
+            cmd = None
+        if cmd is None:
+            names = ", ".join(f"{c.cfg.index} = '{c.cfg.name}'" for c in self.commands)
+            return f"no hay un mando {which!r} (hay: {names})"
+        if (button is None) == (fields is None):
+            return "di qué mandar: button (el número o el letrero del botón) o fields (los deslizadores)"
+        try:
+            if button is not None:
+                cmd.button(button)
+            else:
+                cmd.fields(fields, base)
+        except CommandError as e:
+            return str(e)
+        except (OSError, wire.WireError) as e:
+            return f"no se pudo publicar en {cmd.cfg.target}: {e}"
+        return None
+
+    def gap_info(self) -> list[dict]:
+        watch = getattr(self.launcher, "watch", None) if self.launcher is not None else None
+        return watch.info() if watch is not None else []
 
     # --- grabar (RFC 0010): el botón ⏺ del panel, con agmen run ---
     def _recording_control(self):
@@ -704,6 +777,12 @@ class Panel:
                 elif parts == ["api", "record"]:
                     err = panel.record_action(str(body.get("action", "")))
                     self._json({"error": err} if err else {"ok": True, "recording": panel.recording_info()},
+                               HTTPStatus.BAD_REQUEST if err else HTTPStatus.OK)
+                elif parts == ["api", "command"]:
+                    # Para scripts: {"command": "Poses" (o 0), "button": "parado"} o {..., "fields": {...}}
+                    err = panel.command(body.get("command", body.get("id")), body.get("button"), body.get("fields"),
+                                        body.get("base"))
+                    self._json({"error": err} if err else {"ok": True},
                                HTTPStatus.BAD_REQUEST if err else HTTPStatus.OK)
                 elif parts == ["api", "teleop"]:
                     if panel.teleop is None:

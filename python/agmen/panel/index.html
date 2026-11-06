@@ -137,6 +137,23 @@
   .rec .row:first-child { margin-top: 0; }
   .rec .t { font: 600 18px/1.3 var(--mono); }
   .rec .file { font: 600 13px var(--mono); word-break: break-all; }
+  /* mandos de cualquier tipo y quién manda (RFC 0012) */
+  #commands { display: grid; gap: 16px; }
+  .cmdbtns { display: flex; flex-wrap: wrap; gap: 8px; touch-action: none; user-select: none; -webkit-user-select: none; }
+  .cmdbtns button, .cmd button.hold { padding: 10px 14px; font-weight: 600; border-radius: 10px; touch-action: none; }
+  .cmdbtns button.on, .cmd button.hold.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .cmd .cmdto { margin: -4px 0 10px; }
+  .cmd details { margin-top: 10px; }
+  .cmd summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  .cmd .ctls { display: grid; grid-template-columns: auto 1fr auto; gap: 4px 8px; align-items: center; margin: 8px 0;
+               font: 12px var(--mono); max-height: 360px; overflow: auto; }
+  .cmd .ctls input[type=range] { width: 100%; touch-action: none; }
+  .cmd .ctls output { min-width: 4.5em; text-align: right; }
+  .cmd .ctls .bools { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 4px 12px; }
+  .cmd .warn, .mux .warn { color: var(--warn); }
+  .mux + .mux { border-top: 1px solid var(--line); margin-top: 6px; padding-top: 6px; }
+  .mux .who { font: 600 13px var(--mono); }
+  .toast.warn { background: var(--warn); color: #1b1f24; }
   .rec input[type=range] { width: 100%; margin: 10px 0 0; }
   .rec select, .clock select { background: var(--panel); color: inherit; border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; }
   .rec .warn { color: var(--warn); }
@@ -181,6 +198,13 @@
       <h2>Manejar <span class="hint" id="drivetarget"></span></h2>
       <div id="drive"></div>
     </section>
+
+    <section class="panel" id="muxpanel" style="display:none">
+      <h2>¿Quién manda? <span class="right hint" id="muxsum"></span></h2>
+      <div id="muxes"></div>
+    </section>
+
+    <div id="commands"></div>
   </div>
 
   <div class="data">
@@ -194,6 +218,7 @@
     </section>
     <div class="banner warn" id="warnbox"></div>
     <div class="banner error" id="errbox"></div>
+    <div class="banner warn" id="gapbox"></div>
     <div class="chips topics" id="topicchips"></div>
     <div class="schema" id="schema"></div>
     <div class="note" id="topichint"></div>
@@ -244,8 +269,8 @@ const camRate = {};                     // topic → imágenes por segundo pedid
 function rateFor(topic) { return camRate[topic] || MAX_HZ; }
 
 // ---------- utilidades ----------
-function toast(msg) {
-  const t = $("toast"); t.textContent = msg; t.style.display = "block";
+function toast(msg, kind) {
+  const t = $("toast"); t.textContent = msg; t.style.display = "block"; t.className = "toast" + (kind ? " " + kind : "");
   clearTimeout(toast.h); toast.h = setTimeout(() => (t.style.display = "none"), 3500);
 }
 function fmtUptime(s) {
@@ -534,6 +559,7 @@ function allStop() {
   if (driveTimer) { clearInterval(driveTimer); driveTimer = null; }
   if (state.teleop) send({ op: "teleop", left: 0, right: 0 });
   showCmd([0, 0], false);
+  stopCommands();                                           // los mandos se callan (no hay ALTO que inventar)
 }
 const KEYMAP = { w: "up", arrowup: "up", s: "down", arrowdown: "down", a: "left", arrowleft: "left", d: "right", arrowright: "right" };
 addEventListener("keydown", (e) => {
@@ -546,6 +572,169 @@ addEventListener("keydown", (e) => {
 addEventListener("keyup", (e) => { const k = KEYMAP[e.key.toLowerCase()]; if (k) press(k, false); });
 addEventListener("blur", allStop);                        // si cambias de ventana, se frena
 document.addEventListener("visibilitychange", () => { if (document.hidden) allStop(); });
+
+// ---------- mandos de cualquier tipo (RFC 0012) ----------
+// [[web.command]] en robot.toml: botones con un mensaje fijo y deslizadores/casillas de los campos
+// que digas. Se manda SOLO mientras mantienes presionado (20 por segundo); al soltar, cambiar de
+// pestaña o perder la conexión, se deja de mandar y el robot aplica su watchdog. El navegador no
+// arma bytes: pide "el botón 1" o "estos campos", y el panel los revisa y arma el mensaje.
+const cmdState = {};                       // id → { info, values, base, timer, sending }
+function renderCommands(list) {
+  const box = $("commands");
+  const key = JSON.stringify(list.map((c) => [c.id, c.name, c.target, c.type, c.buttons, c.controls, c.start, c.mux]));
+  if (key !== renderCommands.key) {
+    renderCommands.key = key;
+    stopCommands();
+    for (const id in cmdState) delete cmdState[id];
+    box.innerHTML = "";
+    for (const c of list) box.appendChild(commandCard(c));
+  }
+  for (const c of list) { if (cmdState[c.id]) cmdState[c.id].info = c; updateCommandUi(c.id); }
+}
+function holdable(el, start, stop) {
+  el.addEventListener("pointerdown", (e) => { e.preventDefault(); el.setPointerCapture(e.pointerId); start(); });
+  for (const ev of ["pointerup", "pointercancel", "lostpointercapture"]) el.addEventListener(ev, stop);
+}
+function commandCard(c) {
+  const st = cmdState[c.id] = { info: c, values: { ...c.start }, base: null, timer: null, sending: null };
+  const sec = document.createElement("section");
+  sec.className = "panel cmd"; sec.id = "cmd" + c.id;
+  const to = c.mux ? ` · entrada '${esc(c.mux.input)}' (prioridad ${c.mux.priority}) del mux '${esc(c.mux.mux)}'` : "";
+  sec.innerHTML = `<h2>${esc(c.name)} <span class="right hint">${esc(c.type)}</span></h2>
+    <div class="note cmdto">→ ${esc(c.target)}${to}</div>
+    <div class="cmdbtns"></div>
+    ${c.controls.length ? `<details class="cmdfields"><summary>armar el mensaje a mano (${c.controls.length} controles)</summary>
+      <div class="ctls"></div><button class="hold">mantén para mandar</button></details>` : ""}
+    <div class="drive-state cmdstate"></div>`;
+  const btns = sec.querySelector(".cmdbtns");
+  c.buttons.forEach((b, k) => {
+    const el = document.createElement("button");
+    el.textContent = b.label; el.dataset.k = k;
+    el.title = "mantén presionado: manda este mensaje 20 veces por segundo; suelta = se calla";
+    holdable(el, () => startCommand(c.id, k), () => stopCommand(c.id));
+    btns.appendChild(el);
+  });
+  if (c.controls.length) {
+    const ctls = sec.querySelector(".ctls");
+    let bools = null;
+    for (const ctl of c.controls) {
+      if (ctl.kind === "bool") {
+        if (!bools) { bools = document.createElement("div"); bools.className = "bools"; ctls.appendChild(bools); }
+        const lab = document.createElement("label");
+        lab.innerHTML = `<input type="checkbox" data-path="${esc(ctl.path)}"> ${esc(ctl.label)}`;
+        const box = lab.querySelector("input");
+        box.checked = !!st.values[ctl.path];
+        box.addEventListener("change", () => { st.values[ctl.path] = box.checked; });
+        bools.appendChild(lab);
+        continue;
+      }
+      bools = null;
+      const name = document.createElement("span"); name.textContent = ctl.label;
+      const range = document.createElement("input");
+      Object.assign(range, { type: "range", min: ctl.min, max: ctl.max, step: ctl.step });
+      range.dataset.path = ctl.path;
+      range.value = st.values[ctl.path];
+      const out = document.createElement("output");
+      // Lo que se manda es st.values (exacto): el deslizador solo lo muestra. Un botón con 130.55 no
+      // se redondea al paso del deslizador por cargarlo; solo cambia si tú lo mueves.
+      range._show = (v) => { out.textContent = ctl.int ? String(Math.round(v)) : Number(v).toFixed(2); };
+      range._show(st.values[ctl.path]);
+      range.addEventListener("input", () => {
+        st.values[ctl.path] = ctl.int ? Math.round(range.value) : Number(range.value);
+        range._show(st.values[ctl.path]);
+      });
+      // Arrastrar un deslizador también es "mantener presionado": manda mientras lo arrastras.
+      range.addEventListener("pointerdown", () => {
+        startCommand(c.id, "fields");
+        const up = () => { stopCommand(c.id); removeEventListener("pointerup", up); removeEventListener("pointercancel", up); };
+        addEventListener("pointerup", up); addEventListener("pointercancel", up);
+      });
+      ctls.append(name, range, out);
+    }
+    holdable(sec.querySelector(".hold"), () => startCommand(c.id, "fields"), () => stopCommand(c.id));
+  }
+  return sec;
+}
+// Al presionar un botón, los deslizadores toman sus valores: si luego armas a mano, partes de ahí.
+function loadButton(id, k) {
+  const st = cmdState[id];
+  Object.assign(st.values, st.info.buttons[k].values);
+  st.base = k;
+  for (const el of $("cmd" + id).querySelectorAll("[data-path]")) {
+    const v = st.values[el.dataset.path];
+    if (el.type === "checkbox") el.checked = !!v; else { el.value = v; el._show(v); }
+  }
+}
+function startCommand(id, what) {
+  const st = cmdState[id];
+  if (!st || rec) return;                              // viendo una grabación no se manda nada: los datos no son de ahora
+  stopCommand(id);
+  if (what !== "fields") loadButton(id, what);
+  st.sending = what;
+  const tick = () => {
+    if (!send(what === "fields" ? { op: "command", id, fields: st.values, base: st.base } : { op: "command", id, button: what }))
+      stopCommand(id);                                  // sin conexión: se calla
+  };
+  tick(); st.timer = setInterval(tick, 50);            // 20 Hz mientras se mantiene
+  updateCommandUi(id);
+}
+function stopCommand(id) {
+  const st = cmdState[id];
+  if (!st) return;
+  if (st.timer) { clearInterval(st.timer); st.timer = null; }
+  if (st.sending !== null) { st.sending = null; updateCommandUi(id); }
+}
+function stopCommands() { for (const id in cmdState) stopCommand(id); }
+function updateCommandUi(id) {
+  const st = cmdState[id], sec = $("cmd" + id);
+  if (!st || !sec) return;
+  for (const b of sec.querySelectorAll(".cmdbtns button")) b.classList.toggle("on", st.sending === Number(b.dataset.k));
+  const hold = sec.querySelector("button.hold"); if (hold) hold.classList.toggle("on", st.sending === "fields");
+  const line = sec.querySelector(".cmdstate");
+  if (st.sending === null) {
+    line.className = "drive-state cmdstate";
+    line.innerHTML = "Mantén presionado para mandar. Suelta = se calla y el robot aplica su watchdog.";
+    return;
+  }
+  const what = st.sending === "fields" ? "lo armado a mano" : `'${esc(st.info.buttons[st.sending].label)}'`;
+  let extra = "";
+  const mx = st.info.mux && (state.muxes || []).find((m) => m.mux === st.info.mux.mux);
+  if (mx && mx.entrada && mx.entrada !== st.info.mux.input) {
+    extra = ` · <span class="warn">⚠ no tienes el mando: manda '${esc(mx.entrada)}' (prioridad ${mx.prioridad})</span>`;
+  }
+  line.className = "drive-state cmdstate on";
+  line.innerHTML = `● mandando ${what} a ${esc(st.info.target)}${extra}`;
+}
+
+// ---------- ¿quién manda? (el estado de cada [[mux]], RFC 0012) ----------
+function ago(s) { return s < 60 ? `${s.toFixed(1)} s` : fmtUptime(s); }
+function renderMuxes(list) {
+  $("muxpanel").style.display = list.length && !rec ? "" : "none";
+  if (!list.length) return;
+  const seen = renderMuxes.seen || (renderMuxes.seen = {});
+  const rows = list.map((m) => {
+    const prev = seen[m.state_topic];
+    if (prev !== undefined && m.cambios > prev && m.callada && m.antes) {     // se calló la que mandaba
+      toast(`⚠ ${m.mux}: '${m.antes}' se calló → ${m.entrada ? `manda '${m.entrada}'` : "nadie manda"}`, "warn");
+    }
+    seen[m.state_topic] = m.cambios;
+    const who = m.entrada ? `'${esc(m.entrada)}' · prioridad ${m.prioridad}` : "nadie manda";
+    const quiet = m.callada && m.antes && m.hace_s < 5
+      ? `<div class="warn">⚠ '${esc(m.antes)}' se calló hace ${ago(m.hace_s)} → ${m.entrada ? `manda '${esc(m.entrada)}'` : "nadie manda"}</div>` : "";
+    const stale = m.stale ? ` · <span class="warn">⚠ el mux no da noticias</span>` : "";
+    return `<div class="mux"><span class="who">${esc(m.mux)}</span>: ${who} <span class="note">· desde hace ${ago(m.hace_s)}${stale}</span>${quiet}</div>`;
+  });
+  $("muxes").innerHTML = rows.join("");
+  $("muxsum").textContent = `${list.length} mux · ${list.map((m) => m.state_topic).join(", ")}`;
+  for (const id in cmdState) updateCommandUi(id);
+}
+
+// ---------- topics que dejan de llegar ([[topic]] max_gap_ms, RFC 0012) ----------
+function renderGaps(list) {
+  const late = list.filter((g) => g.late);
+  $("gapbox").style.display = late.length && !rec ? "block" : "none";
+  $("gapbox").textContent = late.map((g) => `⚠ '${g.topic}' no llega desde hace ${ago(g.since_s)} (max_gap_ms = ${g.max_gap_ms})`).join("\n");
+}
 
 // ---------- topics: varios a la vez ----------
 // selected: topics con gráfica (se suscribe a cada uno); focus: el de las tarjetas y el inspector.
@@ -602,7 +791,8 @@ function onState(m) {
   $("ver").textContent = "v" + m.version;
   document.title = `Agmen · ${m.robot || "panel"}`;
   const prevTeleop = !!state.teleop;
-  state = { nodes: m.nodes, teleop: m.teleop, managed: m.managed, recording: m.recording || null };
+  state = { nodes: m.nodes, teleop: m.teleop, managed: m.managed, recording: m.recording || null,
+            commands: m.commands || [], muxes: m.muxes || [], gaps: m.gaps || [] };
   document.querySelector(".logs").style.display = m.managed ? "" : "none";  // agmen web: no hay nodos que mostrar
   const key = JSON.stringify(m.nodes.map((n) => [n.name, n.state, n.restarts, n.pid, Math.floor((n.uptime || 0))]));
   if (key !== onState.nodesKey) {
@@ -611,6 +801,9 @@ function onState(m) {
     onState.nodesKey = key; onState.names = names; renderNodes(); if (namesChanged) renderChips();
   }
   if (!!state.teleop !== prevTeleop || !$("drive").dataset.ready) renderDrive();
+  renderMuxes(state.muxes);
+  renderCommands(state.commands);
+  renderGaps(state.gaps);
   renderClock(m.clock || { mode: "real" });
   renderRhythm(m.rhythm || []);
   renderRec();
@@ -1019,9 +1212,12 @@ function closeRecording() {
   resetTopics(); renderRec(); updateStats(stats);   // de vuelta a lo que llega en vivo
   livePanels(true);
 }
-// Manejar y el reloj son del robot de ahora: mientras se ve una grabación se esconden (y no se maneja).
+// Manejar, los mandos y el reloj son del robot de ahora: mientras se ve una grabación se esconden
+// (y no se maneja ni se manda nada).
 function livePanels(on) {
-  for (const id of ["drivepanel", "clockpanel"]) $(id).style.display = on ? "" : "none";
+  if (!on) allStop();
+  for (const id of ["drivepanel", "clockpanel", "commands"]) $(id).style.display = on ? "" : "none";
+  $("muxpanel").style.display = on && (state.muxes || []).length ? "" : "none";
 }
 function recIds() {
   const ids = new Set();

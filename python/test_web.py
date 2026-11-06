@@ -579,6 +579,120 @@ class TestPuertoOcupado(unittest.TestCase):
             otro.close()
 
 
+class TestMandos(unittest.TestCase):
+    """Los mandos del panel para cualquier tipo (RFC 0012): el navegador pide un botón
+    o unos campos; el panel revisa, arma el mensaje y lo publica. Si el navegador se
+    calla, no se publica nada más (no hay un ALTO que inventar)."""
+
+    def setUp(self):
+        from agmen.panel.command import Command, parse_command
+
+        self.rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.rx.bind(("127.0.0.1", 0))
+        self.rx.settimeout(2)
+        cfg = parse_command({"name": "Brazo", "target": f"127.0.0.1:{self.rx.getsockname()[1]}", "type": "MotorCommand",
+                             "button": [{"label": "abre", "value": {"left": 0.25, "right": -0.5}}],
+                             "fields": {"left": {"min": -1, "max": 1}}}, 0, Path("."))
+        self.panel = Panel("127.0.0.1:0", None, "prueba", None, None, topics=False, commands=[Command(cfg)])
+        self.panel.start()
+        self.base = f"127.0.0.1:{self.panel.port}"
+        self.clients = []
+
+    def tearDown(self):
+        for c in self.clients:
+            c.close()
+            c.wait_closed()
+        self.panel.shutdown()
+        self.rx.close()
+
+    def connect(self):
+        c = ws.connect(f"ws://{self.base}/ws", protocols=["agmen.ws.v1"])
+        c.sock.settimeout(5)
+        self.clients.append(c)
+        return c
+
+    def recibido(self):
+        while True:
+            env, payload = wire.parse(self.rx.recv(65536))
+            if env.encoding != wire.ENC_SCHEMA:
+                return MotorCommand.decode_payload(payload)
+
+    def post(self, body, headers=None):
+        req = urllib.request.Request(f"http://{self.base}/api/command", data=json.dumps(body).encode(), method="POST",
+                                     headers=headers if headers is not None else {"X-Agmen": "1"})
+        try:
+            return json.load(urllib.request.urlopen(req, timeout=5))
+        except urllib.error.HTTPError as e:
+            return {"status": e.code, **json.load(e)}
+
+    def test_websocket_boton_y_campos(self):
+        c = self.connect()
+        c.send_text(json.dumps({"op": "command", "id": 0, "button": 0}))
+        m = self.recibido()
+        self.assertEqual((m.left, m.right), (0.25, -0.5))
+        time.sleep(0.03)
+        c.send_text(json.dumps({"op": "command", "id": 0, "fields": {"left": -0.75}}))
+        m = self.recibido()
+        self.assertEqual((m.left, m.right), (-0.75, -0.5))          # right: del botón (el inicio)
+        c.send_text(json.dumps({"op": "command", "id": 0, "fields": {"left": 3}}))
+        err = json.loads(self.recv_text(c, lambda m: m.get("op") == "error"))
+        self.assertIn("fuera de su rango", err["msg"])
+        c.send_text(json.dumps({"op": "command", "id": 0, "fields": {"right": 0.1}}))
+        err = json.loads(self.recv_text(c, lambda m: m.get("op") == "error"))
+        self.assertIn("'right' no tiene control", err["msg"])
+
+    def recv_text(self, c, pred):
+        end = time.monotonic() + 5
+        while time.monotonic() < end:
+            m = c.recv()
+            if isinstance(m, str) and pred(json.loads(m)):
+                return m
+        self.fail("no llegó la respuesta")
+
+    def test_si_el_navegador_se_calla_no_se_manda_nada_mas(self):
+        c = self.connect()
+        c.send_text(json.dumps({"op": "command", "id": 0, "button": "abre"}))
+        self.recibido()
+        c.close()
+        c.wait_closed()
+        self.rx.settimeout(0.6)
+        with self.assertRaises(socket.timeout):     # ni un ALTO inventado: el receptor aplica su watchdog
+            self.recibido()
+
+    def test_post_para_scripts(self):
+        self.assertEqual(self.post({"command": "Brazo", "button": "abre"}), {"ok": True})
+        self.assertEqual((self.recibido().left), 0.25)
+        r = self.post({"command": "Brazo", "button": "abre"}, headers={})
+        self.assertEqual(r["status"], 403)                             # sin X-Agmen: CSRF
+        self.assertIn("no hay un mando 'Pinza'", self.post({"command": "Pinza", "button": 0})["error"])
+        self.assertIn("di qué mandar", self.post({"command": 0})["error"])
+        state = json.load(urllib.request.urlopen(f"http://{self.base}/api/state", timeout=5))
+        (cmd,) = state["commands"]
+        self.assertEqual((cmd["name"], cmd["type"], [b["label"] for b in cmd["buttons"]]), ("Brazo", "MotorCommand", ["abre"]))
+        self.assertEqual(cmd["controls"][0]["path"], "left")
+
+
+class TestQuienMandaEnElPanel(PanelCase):
+    def test_el_estado_del_mux_llega_al_panel(self):
+        from agmen.msgs import MuxEstado
+
+        pub = self.pub(MuxEstado, "/mux/mando")
+        st = None
+        for _ in range(50):
+            pub.publish(MuxEstado(mux="mando", entrada="panel", topic="/arca9/comando/panel", prioridad=10,
+                                  desde=wire.now_ns() - 2_000_000_000, antes="poses", callada=False, fuente=0xAB,
+                                  cambios=4))
+            time.sleep(0.05)
+            st = json.load(urllib.request.urlopen(f"http://{self.base}/api/state", timeout=5))
+            if st["muxes"]:
+                break
+        (m,) = st["muxes"]
+        self.assertEqual((m["state_topic"], m["mux"], m["entrada"], m["prioridad"], m["antes"], m["fuente"], m["cambios"]),
+                         ("/mux/mando", "mando", "panel", 10, "poses", "00000000000000ab", 4))
+        self.assertGreaterEqual(m["hace_s"], 2.0)
+        self.assertFalse(m["stale"])
+
+
 class TestFoxglove(PanelCase):
     def test_protocolo_foxglove(self):
         pub = self.pub(Articulaciones, "/arca9/q")

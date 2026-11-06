@@ -54,6 +54,7 @@ priority = 1
 name = "/imu"
 type = "ImuSample"
 required = true
+max_gap_ms = 100                               # llega a 100 Hz: si pasan 0.1 s sin nada, agmen run lo avisa (Agmen 0.13)
 
 [[topic]]
 name = "/cmd"
@@ -74,3 +75,25 @@ listen = "127.0.0.1:7400"                      # además de los topics: para nod
 [web.teleop]
 target = "/cmd/teleop"                         # tus teclas W A S D van a la entrada "teleop" del mux
 max_speed = 1.0
+
+# Botones del panel (capítulo 10, Agmen 0.13): mientras mantienes presionado
+# "girar", el panel manda ese MotorCommand a la entrada "teleop" del mux, 20 veces
+# por segundo; al soltar, se calla (y el motor frena solo). Con [web.command.fields]
+# armas el mensaje a mano, con un deslizador por campo.
+[[web.command]]
+name = "Movimientos"
+target = "/cmd/teleop"
+type = "MotorCommand"
+messages = "motor_command.agmen"               # el mismo .agmen que usan cerebro.py y el motor
+
+[[web.command.button]]
+label = "girar ↻"
+value = { left = 0.5, right = -0.5 }
+
+[[web.command.button]]
+label = "avanzar despacio"
+value = { left = 0.3, right = 0.3 }
+
+[web.command.fields]
+left = { min = -1, max = 1, label = "rueda izq" }
+right = { min = -1, max = 1, label = "rueda der" }

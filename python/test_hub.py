@@ -248,6 +248,26 @@ class TestTopicsEsperados(unittest.TestCase):
         finally:
             h.close()
 
+    def test_el_estado_de_los_mux_es_de_agmen(self):
+        """/mux/<nombre> (RFC 0012) no se declara en robot.toml, como /clock; con otro tipo, sí avisa."""
+        from agmen.msgs import MuxEstado
+
+        h = HubFixture(H.parse_expected(["/cmd=MotorCommand"], []))
+        try:
+            p1 = agmen.Publisher(MuxEstado, "/mux/ruedas")
+            p2 = agmen.Publisher(Cmd, "/mux/brazo")
+            time.sleep(0.5)
+            logs = "\n".join(h.logs)
+            self.assertNotIn("'/mux/ruedas', que no está declarado", logs)
+            self.assertIn("'/mux/brazo' es de Agmen y es de tipo MuxEstado", logs)
+            self.assertEqual(H.builtin_type("/mux/x"), "MuxEstado")
+            self.assertEqual(H.builtin_type("/clock"), "Clock")
+            self.assertIsNone(H.builtin_type("/muxes"))
+            p1.close()
+            p2.close()
+        finally:
+            h.close()
+
 
 if __name__ == "__main__":
     unittest.main()

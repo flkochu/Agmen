@@ -96,8 +96,48 @@ def main():
         check("teleoperación aceptada", post("/api/teleop", {"left": 0, "right": 0}) == 200)
         time.sleep(1.5)  # al soltar, el mando regresa al cerebro
 
+        # RFC 0012: quién manda, en /mux/ruedas, y en el panel.
+        check("el panel dice quién manda (/mux/ruedas): el cerebro",
+              wait_for(lambda: any(m["mux"] == "ruedas" and m["entrada"] == "cerebro" for m in get_state()["muxes"]), 5),
+              str(get_state()["muxes"]))
+        echo = subprocess.run([sys.executable, "-m", "agmen", "topic", "echo", "/mux/ruedas", "--count", "1"],
+                              capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, timeout=20).stdout
+        check("agmen topic echo /mux/ruedas: MuxEstado con la entrada que manda",
+              "MuxEstado" in echo and "entrada: 'cerebro'" in echo and "prioridad: 1" in echo, echo)
+        # Un botón del panel (mantenerlo presionado = mandarlo a ~20 Hz): MotorCommand fijo por el mux.
+        cmd = next(c for c in get_state()["commands"] if c["name"] == "Movimientos")
+        check("mando 'Movimientos' en el panel, a la entrada 'teleop' del mux",
+              [b["label"] for b in cmd["buttons"]] == ["girar ↻", "avanzar despacio"]
+              and cmd["mux"] == {"mux": "ruedas", "input": "teleop", "priority": 10, "state": "/mux/ruedas"}, str(cmd))
+        statuses, during = [], None
+        for i in range(30):
+            statuses.append(post("/api/command", {"command": "Movimientos", "button": "girar ↻"}))
+            if i == 20:
+                during = get_state()["muxes"]
+            time.sleep(0.05)
+        check("el botón 'girar ↻' se acepta mientras se mantiene", set(statuses) == {200}, str(statuses))
+        check("mientras se mantiene, el panel tiene el mando (manda 'teleop')",
+              any(m["entrada"] == "teleop" for m in during or []), str(during))
+        check("un valor fuera de rango se rechaza (el servidor revisa)",
+              post("/api/command", {"command": "Movimientos", "fields": {"left": 3}}) == 400)
+        check("un mando sin X-Agmen → 403", post("/api/command", {"command": 0, "button": 0},
+                                                headers={"Content-Type": "application/json"}) == 403)
+        check("al soltar, la entrada se calla y el mando regresa al cerebro (callada)",
+              wait_for(lambda: any(m["entrada"] == "cerebro" and m["antes"] == "teleop" and m["callada"]
+                                   for m in get_state()["muxes"]), 5), str(get_state()["muxes"]))
+
         post("/api/node/cerebro/stop")
         check("detener 'cerebro' desde el panel", wait_for(lambda: node(get_state(), "cerebro")["state"] == "detenido", 8))
+
+        # RFC 0012: [[topic]] max_gap_ms = 100 en /imu. Se apaga el sensor y se vuelve a prender.
+        post("/api/node/imu/stop")
+        check("max_gap_ms: el panel avisa que /imu dejó de llegar",
+              wait_for(lambda: any(g["topic"] == "/imu" and g["late"] for g in get_state()["gaps"]), 6),
+              str(get_state()["gaps"]))
+        post("/api/node/imu/start")
+        check("max_gap_ms: y cuando vuelve",
+              wait_for(lambda: any(g["topic"] == "/imu" and not g["late"] for g in get_state()["gaps"]), 10),
+              str(get_state()["gaps"]))
         check("protección CSRF: sin encabezado → 403",
               post("/api/node/motor/stop", headers={"Content-Type": "application/json"}) == 403)
         check("protección CSRF: otro sitio → 403",
@@ -125,6 +165,9 @@ def main():
     check("prioridad: al soltar, el mando regresa al cerebro",
           bool(manual) and any(v in cerebro for v in motor[manual[-1] + 1:]), f"motor: {motor}")
     check("el mux avisa quién manda", "manda 'teleop'" in out and "manda 'cerebro'" in out)
+    check("el motor obedeció al botón 'girar ↻' (izq=+0.50 der=-0.50)", "izq=+0.50  der=-0.50" in out)
+    check("agmen run avisó que /imu dejó de llegar y que volvió (max_gap_ms)",
+          "⚠ '/imu' no llega desde hace" in out and "✔ '/imu' volvió" in out)
     check("el motor frenó solo al soltar", "ALTO" in out)
     check("Ctrl+C detiene todo de forma ordenada", agmen.returncode == 0 and "listo" in out,
           f"código {agmen.returncode}")

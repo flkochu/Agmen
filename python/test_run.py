@@ -156,7 +156,8 @@ class TestOtroRobot(unittest.TestCase):
 
     def test_topics_que_usa(self):
         self.assertEqual(self.config().topics_used(),
-                         {"/arca9/estado", "/arca9/q", "/arca9/comando", "/arca9/comando/panel", "/arca9/teleop"})
+                         {"/arca9/estado", "/arca9/q", "/arca9/comando", "/arca9/comando/panel", "/arca9/teleop",
+                          "/mux/mando"})     # el estado del mux (RFC 0012): dos mux 'mando' también chocan
 
     def test_mismos_topics(self):
         from agmen.run import other_robot
