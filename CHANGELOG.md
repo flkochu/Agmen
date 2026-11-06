@@ -7,6 +7,50 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 
 ## [Sin publicar]
 
+## [0.13.0] — 2026-11-06
+
+**El panel manda cualquier tipo, y el mux dice quién manda.** Implementa el
+[RFC 0012](docs/rfc/0012-mandos-del-panel-y-quien-manda.md) con las opciones
+recomendadas (D1–D6 = a), a pedido de Arca9 (los puntos 1 y 2 de su
+`pc/agmen/PENDIENTES_AGMEN.md`). Los bytes de la red no cambian: un nodo de
+0.13.0 habla con uno de 0.12.x, y el mux reenvía lo mismo que antes.
+
+### Agregado
+- **Mandos del panel para cualquier tipo `compact`** (`[[web.command]]` en
+  `robot.toml`): una tarjeta con botones que mandan un mensaje fijo y, si
+  quieres, deslizadores y casillas de los campos que digas (`[web.command.fields]`,
+  con `min` y `max`). El tipo sale del mismo `.agmen` que usan los nodos
+  (`messages = "arca9.agmen"`), o es uno de Agmen (`MotorCommand`, `ImuSample`).
+  - **Hombre muerto**: el navegador manda solo mientras mantienes presionado
+    (20 por segundo); al soltar, cambiar de pestaña o perder la conexión, se
+    calla. No se inventa un "alto": el receptor aplica su watchdog.
+  - **El panel arma el mensaje**: el navegador pide "el botón 1" o "estos
+    campos", y el panel revisa cada valor contra el esquema y su rango (NaN,
+    infinitos, decimales en un entero, campos sin control: no). Nunca reenvía
+    bytes del navegador.
+  - Un botón siempre manda un mensaje completo: lo que no dice sale de
+    `[web.command.default]`, y si falta un campo, `agmen run` no arranca.
+  - La misma seguridad que el teleop (clave en `--red`, `X-Agmen`, `Origin`,
+    máx. ~60 Hz); también por `POST /api/command`, para scripts.
+  - La tarjeta dice a qué entrada del mux va y, mientras mandas, si te gana
+    otra entrada. El robot del tutorial trae una (**Movimientos**).
+- **El mux publica quién manda** en `/mux/<nombre>` (`agmen.msgs.MuxEstado`,
+  también en C++): la entrada que manda, su topic y prioridad, desde cuándo,
+  la anterior y si se calló (`callada`), el `source_id` que manda y cuántos
+  cambios van. Cada vez que cambia y una vez por segundo. `agmen run` lo
+  arranca así (`agmen mux --state /mux/<nombre>`); es un topic de Agmen, como
+  `/clock`: no hace falta declararlo.
+- **El panel muestra quién manda** (tarjeta *¿Quién manda?*) y avisa cuando la
+  entrada que mandaba se calla: `⚠ ruedas: 'teleop' se calló → manda 'cerebro'`.
+- **`[[topic]] max_gap_ms`**: `agmen run` avisa cuando un topic deja de llegar
+  y cuando vuelve, en la terminal y en el panel (`required` solo ve si nadie
+  lo publica). Lo mide con el reloj de Agmen: en pausa no avisa.
+- `/api/state` trae `commands`, `muxes` y `gaps`.
+
+### Cambiado
+- `examples/tutorial/robot.toml`: la tarjeta **Movimientos** y
+  `max_gap_ms = 100` en `/imu`. Tutorial: capítulos 5, 6 y 10.
+
 ## [0.12.1] — 2026-11-06
 
 Parche: dos errores que encontró Arca9 al usar Agmen (los puntos 4 y 7 de su

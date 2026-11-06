@@ -42,7 +42,97 @@ topics con su tipo y su frecuencia:
 cambia `left` y `right`, y en los logs, cómo el mux le da el mando a
 `teleop` y se lo regresa a `cerebro` al soltar.
 
-## 2. Desde tu celular
+## 2. Botones que mandan cualquier mensaje
+
+*Desde Agmen 0.13 ([RFC 0012](../rfc/0012-mandos-del-panel-y-quien-manda.md))*
+
+W A S D manda un `MotorCommand`, pensado para un robot de ruedas. Para todo
+lo demás (un brazo, un perro, una pinza) el panel tiene **mandos**: botones
+que mandan un mensaje fijo y deslizadores armados a partir del esquema. El
+`robot.toml` del tutorial trae una tarjeta, **Movimientos**:
+
+```toml
+[[web.command]]
+name = "Movimientos"                 # el título de la tarjeta
+target = "/cmd/teleop"               # a dónde publica: la entrada "teleop" del mux
+type = "MotorCommand"
+messages = "motor_command.agmen"     # el mismo .agmen que usan cerebro.py y el motor
+
+[[web.command.button]]
+label = "girar ↻"
+value = { left = 0.5, right = -0.5 }
+
+[[web.command.button]]
+label = "avanzar despacio"
+value = { left = 0.3, right = 0.3 }
+
+[web.command.fields]                 # armar el mensaje a mano: un deslizador por campo
+left = { min = -1, max = 1, label = "rueda izq" }
+right = { min = -1, max = 1, label = "rueda der" }
+```
+
+![Las tarjetas ¿Quién manda? y Movimientos](../img/agmen-panel-mandos.png)
+
+- **Mantén presionado** "girar ↻": el panel manda ese `MotorCommand`, 20
+  veces por segundo, y en los logs ves `[motor] rueda izq=+0.50 der=-0.50`.
+  **Al soltar se calla**: no manda un "alto" (para un brazo o un perro no hay
+  uno que sirva siempre); el que recibe aplica su freno (el motor del
+  capítulo 2, a los 0.5 s). Lo mismo si cambias de pestaña o se corta la red.
+- **Armar el mensaje a mano**: abre la sección de los deslizadores, muévelos
+  y mantén presionado *mantén para mandar* (o arrastra un deslizador: mientras
+  lo arrastras, también manda). Al presionar un botón, los deslizadores
+  toman sus valores.
+- **Pasa por el mux** como cualquier otra entrada: la tarjeta dice a qué
+  entrada va (`entrada 'teleop' (prioridad 10) del mux 'ruedas'`) y, mientras
+  mandas, si de verdad tienes el mando. La tarjeta **¿Quién manda?** lo
+  muestra para cada mux ([capítulo 6](06-quien-manda.md)).
+- **El navegador no arma los bytes**: pide "el botón 1" o "estos campos", y
+  el panel revisa cada valor contra el esquema y el rango de `robot.toml`
+  antes de publicar. Un valor fuera de rango, un NaN o un campo sin
+  deslizador se rechazan. La clave (`--red`) y el resto de la seguridad son
+  los del manejo.
+
+🧪 **Un mando para tu robot.** Cualquier mensaje de tamaño fijo de tu
+`.agmen` sirve. Arca9, un perro de 12 servos, tendría un botón por pose:
+
+```toml
+[[web.command]]
+name = "Poses"
+target = "/arca9/comando/panel"      # la entrada del mux que le gana al modo autónomo
+type = "Arca9Comando"                # Arca9Comando{f32[12] q; bool[12] activo}
+messages = "arca9.agmen"
+
+[web.command.default]
+activo = [true, true, true, true, true, true, true, true, true, true, true, true]
+
+[[web.command.button]]
+label = "parado"
+value = { q = [87.8, 123.7, 83.9, 87.8, 123.7, 83.9, 87.8, 123.7, 83.9, 87.8, 123.7, 83.9] }
+
+[web.command.fields]
+q = { min = 20, max = 160 }          # 12 deslizadores (min y max pueden ser una lista, uno por servo)
+activo = {}                          # 12 casillas
+```
+
+Si a un botón le falta un campo (y no está en `default`), `agmen run` no
+arranca y te dice cuál: un campo olvidado nunca se manda como 0.
+
+🧪 **Desde un script**, igual que el navegador (mientras el robot corre):
+
+```python
+import json, time, urllib.request
+
+pedido = json.dumps({"command": "Movimientos", "button": "girar ↻"}).encode()
+for _ in range(40):                      # 2 s "presionado": cada llamada manda un mensaje
+    urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:8080/api/command", data=pedido,
+                                                  headers={"X-Agmen": "1"}, method="POST"))
+    time.sleep(0.05)
+```
+
+Sin el encabezado `X-Agmen` el panel contesta 403: así una página de otro
+sitio abierta en tu navegador no puede mover tu robot.
+
+## 3. Desde tu celular
 
 Con la computadora y el celular **en la misma red WiFi**:
 
@@ -93,7 +183,7 @@ por timeout (capítulo 2): dos capas de seguridad.
 internet. El acceso desde internet (con usuarios y cifrado) es el modo nube
 del nivel 11.
 
-## 3. Foxglove
+## 4. Foxglove
 
 [Foxglove](https://foxglove.dev) es un visualizador de robótica muy usado con
 ROS. Agmen habla su protocolo, así que puedes usarlo para lo que el panel
@@ -119,7 +209,7 @@ Notas:
 - [Lichtblick](https://github.com/lichtblick-suite/lichtblick) es una versión
   libre de Foxglove Studio y funciona igual.
 
-## 4. Habla con el puente tú mismo
+## 5. Habla con el puente tú mismo
 
 El panel no tiene nada de magia: cualquier programa puede hacer lo mismo que
 el navegador. Con el robot corriendo:
@@ -154,6 +244,8 @@ seq   5253 · 88 bytes · {'ax': -0.46, 'ay': -0.19, 'az': 9.81, 'gx': 0.0, 'gy'
   por campo en el **inspector**.
 - `--red` abre el panel a tu red **con clave**, y si se corta la señal
   mientras manejas, el panel manda ALTO.
+- Con `[[web.command]]`, botones y deslizadores mandan **cualquier tipo** de
+  tu `.agmen`, solo mientras los mantienes presionados.
 - Foxglove (y Lichtblick) se conectan al mismo panel, en solo lectura.
 
 **Siguiente:** [capítulo 11](11-mensajes-agmen.md), tus mensajes en un archivo `.agmen`: Agmen escribe el

@@ -43,8 +43,9 @@ target = "/cmd/teleop"           # a dónde mandar los comandos de manejo
 Nadie escribe IPs ni puertos; los nodos se encuentran solos con el
 `agmen hub` que arranca `agmen run` ([capítulo 9](09-topics.md)). El
 `robot.toml` del repo trae además un `[[mux]]`, la prioridad de comandos del
-[capítulo 6](06-quien-manda.md), y una lista de `[[topic]]` esperados; por
-ahora puedes ignorarlos.
+[capítulo 6](06-quien-manda.md), una lista de `[[topic]]` esperados y una
+tarjeta de botones (`[[web.command]]`, [capítulo 10](10-panel-celular-y-foxglove.md));
+por ahora puedes ignorarlos.
 
 - Cada `[[node]]` es un programa: C++, Python o lo que sea.
 - Las rutas son **relativas al archivo**, así que funciona desde cualquier carpeta.
@@ -93,6 +94,8 @@ El navegador se abre solo en el panel:
 |---|---|
 | **Nodos** | Ver si cada nodo está corriendo, desde cuándo y cuántas veces se ha reiniciado. Botones **▶** iniciar, **■** detener y **↻** reiniciar. Clic en el nombre = ver solo sus logs |
 | **Manejar** | Mover el robot con **W A S D** o las flechas del teclado, o con los botones (también en el celular). Las barras muestran la velocidad de cada rueda |
+| **¿Quién manda?** (0.13) | Qué entrada del `[[mux]]` tiene el mando, y un aviso cuando la que mandaba se calla ([capítulo 6](06-quien-manda.md)) |
+| **Movimientos** (0.13) | Botones que mandan un mensaje fijo mientras los mantienes presionados ([capítulo 10](10-panel-celular-y-foxglove.md)) |
 | **Datos** | Lo mismo del capítulo 4: Hz, latencia, pérdidas y una gráfica por grupo de campos del mensaje que llegue |
 | **Logs** | Lo que imprimen **todos** los nodos, en un solo lugar, con un color por nodo |
 
@@ -108,7 +111,15 @@ Detén el cerebro (■), suelta las teclas y en medio segundo el motor dice
 2 también te protege aquí.
 
 🧪 **Tumba un nodo:** detén el `imu` con ■. Las gráficas se congelan y el
-indicador de arriba dice "sin datos". Préndelo con ▶.
+indicador de arriba dice "sin datos". Como el `robot.toml` dice
+`max_gap_ms = 100` para `/imu` (desde Agmen 0.13), `agmen run` también lo
+avisa, en la terminal y en el panel:
+```
+agmen   │ ⚠ '/imu' no llega desde hace 0.1 s (robot.toml: max_gap_ms = 100)
+```
+Préndelo con ▶ y dice `✔ '/imu' volvió (estuvo 4.2 s sin llegar)`. Sirve
+para lo que `required = true` no ve: un nodo que sigue vivo pero dejó de
+mandar (un sensor desconectado, un nodo trabado).
 
 🧪 **Rompe el archivo a propósito:** cambia `name` por `nmae` en un nodo y
 corre otra vez:

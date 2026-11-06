@@ -195,6 +195,19 @@ abre, lo recorta y lo junta; para entender los mensajes basta este documento.
   oficial de MCAP. Los tres leen igual el vector
   [`tests/vectors/grabacion.mcap`](../tests/vectors/grabacion.mcap).
 
+## Topics de Agmen
+
+Algunos topics los publica Agmen mismo. No hace falta declararlos en
+`robot.toml`, y el hub avisa si alguien los usa con otro tipo.
+
+| Topic | Tipo | Quién lo publica |
+|---|---|---|
+| `/clock` | `Clock{time t;f64 speed;bool paused}` | `agmen run` (`[clock] source = "agmen"`), tu simulador o `agmen play`: el tiempo de la simulación o de la grabación ([RFC 0006](rfc/0006-executor-y-reloj.md)) |
+| `/mux/<nombre>` (desde 0.13) | `agmen.msgs.MuxEstado{string mux;string entrada;string topic;i32 prioridad;time desde;string antes;bool callada;u64 fuente;u32 cambios}` (`arrow`) | Cada `[[mux]]`: quién manda, cada vez que cambia y una vez por segundo ([RFC 0012](rfc/0012-mandos-del-panel-y-quien-manda.md)). `entrada = ""` si nadie manda; `callada = true` si el cambio fue porque `antes` dejó de hablar |
+
+El nombre de `/mux/<nombre>` sale del nombre del `[[mux]]`, con las letras
+que no valen en un topic cambiadas por `_`.
+
 ## Ejemplo completo
 
 `MotorCommand{left = 0.5, right = -0.25}`, topic `/cmd`, `source_id =
