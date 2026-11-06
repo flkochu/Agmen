@@ -564,12 +564,15 @@ function allStop() {
 const KEYMAP = { w: "up", arrowup: "up", s: "down", arrowdown: "down", a: "left", arrowleft: "left", d: "right", arrowright: "right" };
 addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT" && e.target.type !== "range" && e.target.type !== "checkbox") return;
+  if (e.target.type === "range" && e.target.closest(".cmd")) return;   // las flechas mueven el deslizador del mando, no las ruedas
   const k = e.key.toLowerCase();
   if (k === " ") { e.preventDefault(); allStop(); return; }
   if (KEYMAP[k] && !e.repeat) { e.preventDefault(); press(KEYMAP[k], true); }
   else if (KEYMAP[k]) e.preventDefault();
 });
-addEventListener("keyup", (e) => { const k = KEYMAP[e.key.toLowerCase()]; if (k) press(k, false); });
+// Soltar solo cuenta si esa tecla estaba manejando: si no, no se manda un ALTO de más (al
+// escribir, o al mover con las flechas el deslizador de un mando).
+addEventListener("keyup", (e) => { const k = KEYMAP[e.key.toLowerCase()]; if (k && keys.has(k)) press(k, false); });
 addEventListener("blur", allStop);                        // si cambias de ventana, se frena
 document.addEventListener("visibilitychange", () => { if (document.hidden) allStop(); });
 
@@ -1215,7 +1218,7 @@ function closeRecording() {
 // Manejar, los mandos y el reloj son del robot de ahora: mientras se ve una grabación se esconden
 // (y no se maneja ni se manda nada).
 function livePanels(on) {
-  if (!on) allStop();
+  if (!on) { stopCommands(); if (driveTimer) allStop(); }     // ALTO solo si estabas manejando
   for (const id of ["drivepanel", "clockpanel", "commands"]) $(id).style.display = on ? "" : "none";
   $("muxpanel").style.display = on && (state.muxes || []).length ? "" : "none";
 }
