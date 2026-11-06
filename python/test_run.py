@@ -136,6 +136,56 @@ class TerminalBloqueada(io.StringIO):
         return super().write(text)
 
 
+class TestOtroRobot(unittest.TestCase):
+    """Dos agmen run en la misma máquina (0.12.1, PENDIENTES de Arca9 #7): el segundo
+    dice de quién es el hub que reusa y qué topics usan los dos."""
+
+    TOML = (MINIMO + '\n[[topic]]\nname = "/arca9/estado"\n\n[[topic]]\nname = "/arca9/q"\n'
+            '\n[[mux]]\nname = "mando"\noutput = "/arca9/comando"\n'
+            '[[mux.input]]\nname = "panel"\ntopic = "/arca9/comando/panel"\npriority = 10\n'
+            '\n[web.teleop]\ntarget = "/arca9/teleop"\n')
+
+    def config(self):
+        return TestConfig.load(self, self.TOML)
+
+    @staticmethod
+    def hub(robot, topics):
+        lines = [("state", {"version": "0.12.1", "hub": "127.0.0.1:7390", **({"robot": robot} if robot else {})})]
+        lines += [("topic", {"name": t, "pubs": pubs, "subs": "0", "expected": exp}) for t, pubs, exp in topics]
+        return lambda hub, timeout: lines
+
+    def test_topics_que_usa(self):
+        self.assertEqual(self.config().topics_used(),
+                         {"/arca9/estado", "/arca9/q", "/arca9/comando", "/arca9/comando/panel", "/arca9/teleop"})
+
+    def test_mismos_topics(self):
+        from agmen.run import other_robot
+
+        avisos = other_robot(self.config(), query=self.hub("Arca9 (simulado)", [
+            ("/arca9/comando", "1", "no"), ("/arca9/estado", "0", "yes"), ("/otro", "1", "no"),
+            ("/arca9/q", "0", "no")]))     # declarado allá pero sin nadie: no cuenta como compartido
+        self.assertEqual(len(avisos), 1)
+        self.assertIn("ya hay otro robot en esta máquina, 'Arca9 (simulado)'", avisos[0])
+        self.assertIn("/arca9/comando, /arca9/estado: sus mensajes se van a mezclar", avisos[0])
+        self.assertNotIn("/otro", avisos[0])
+
+    def test_hub_sin_nombre_y_sin_topics_compartidos(self):
+        from agmen.run import other_robot
+
+        self.assertIn("¿otro robot?", other_robot(self.config(), query=self.hub("", [("/arca9/q", "2", "no")]))[0])
+        self.assertEqual(other_robot(self.config(), query=self.hub("", [("/imu", "1", "no")])), [])
+        self.assertIn("no usan los mismos topics",
+                      other_robot(self.config(), query=self.hub("Otro", [("/imu", "1", "no")]))[0])
+
+    def test_sin_hub_no_dice_nada(self):
+        from agmen.run import other_robot
+
+        def no_hay(hub, timeout):
+            raise ConnectionError("no hay hub")
+
+        self.assertEqual(other_robot(self.config(), query=no_hay), [])
+
+
 class TestPrinter(unittest.TestCase):
     def test_una_terminal_atorada_no_frena_a_quien_escribe(self):
         term = TerminalBloqueada()

@@ -35,6 +35,7 @@ f32[3]. Si un esquema tiene un solo campo variable, todo el mensaje va en
 
 from __future__ import annotations
 
+import math
 import re
 import struct
 from dataclasses import dataclass
@@ -600,24 +601,49 @@ def _is_ndarray(v) -> bool:
     return hasattr(v, "dtype") and hasattr(v, "shape") and hasattr(v, "tobytes")
 
 
+def _finite_list(values: list) -> list:
+    """Una lista de NumPy (tolist()) con NaN o infinitos → los mismos valores, con None en su lugar."""
+    return [_finite_list(v) if isinstance(v, list) else (v if not isinstance(v, float) or math.isfinite(v) else None)
+            for v in values]
+
+
+def _array_jsonable(a) -> list:
+    """Un numpy.ndarray como lista; si es de punto flotante y trae NaN o infinitos, van como None."""
+    import numpy as np
+
+    out = a.tolist()
+    if a.dtype.kind == "f" and a.size and not bool(np.isfinite(a).all()):
+        out = _finite_list(out) if isinstance(out, list) else None
+    return out
+
+
 def jsonable(value):
     """Un mensaje decodificado → algo que json.dumps acepta (para --json y Foxglove):
-    bytes y memoryview en base64, tensores como {"shape", "data"}, NumPy como listas."""
+    bytes y memoryview en base64, tensores como {"shape", "data"}, NumPy como listas.
+
+    NaN e infinitos van como None (`null` en el JSON): JSON no los tiene, y un
+    lector estricto (el `JSON.parse` del navegador, Foxglove) rechazaría el
+    mensaje completo, no solo ese número."""
     import base64
 
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
     if isinstance(value, dict):
         return {k: jsonable(v) for k, v in value.items()}
     if isinstance(value, (bytes, bytearray, memoryview)):
         return base64.b64encode(bytes(value)).decode("ascii")
     if _is_ndarray(value):
-        return value.tolist()
+        return _array_jsonable(value)
     if hasattr(value, "shape") and hasattr(value, "data"):          # agmen.Tensor
         data = value.data
-        return {"shape": list(value.shape), "data": data.tolist() if hasattr(data, "tolist") else list(data)}
+        return {"shape": list(value.shape),
+                "data": _array_jsonable(data) if _is_ndarray(data) else [jsonable(v) for v in data]}
     if isinstance(value, (list, tuple)):
         return [jsonable(v) for v in value]
-    if isinstance(value, (bool, int, float, str)) or value is None:
+    if isinstance(value, (bool, int, str)) or value is None:
         return value
+    if hasattr(value, "dtype") and hasattr(value, "item"):           # un escalar de NumPy (np.float32…)
+        return jsonable(value.item())
     return str(value)
 
 

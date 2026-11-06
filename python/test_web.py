@@ -555,6 +555,30 @@ class TestClave(PanelCase):
         self.assertTrue(self.panel.url.endswith("?t=clave-de-prueba-123"))
 
 
+class TestPuertoOcupado(unittest.TestCase):
+    """[web] listen ocupado por otro robot (0.12.1, PENDIENTES de Arca9 #7): antes el
+    hilo del panel tronaba con 'OSError: Address already in use' y el panel se quedaba
+    sin datos. Ahora lo dice con palabras y sigue."""
+
+    def test_lo_dice_y_sigue(self):
+        otro = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        otro.bind(("127.0.0.1", 0))
+        listen = f"127.0.0.1:{otro.getsockname()[1]}"
+        panel = Panel("127.0.0.1:0", listen, "prueba", None, None, topics=False)
+        try:
+            panel.start()
+            self.assertIn(f"el panel no puede escuchar en {listen} ([web] listen)", panel.listen_error)
+            self.assertIn("otro robot", panel.listen_error)
+            state = json.load(urllib.request.urlopen(f"http://127.0.0.1:{panel.port}/api/state", timeout=5))
+            self.assertIn("no puede escuchar", state["stats"]["last_error"])
+            time.sleep(0.3)
+            names = {t.name for t in threading.enumerate()}
+            self.assertNotIn("panel-udp", names)            # sin topics ni dirección: no hay nada que escuchar
+        finally:
+            panel.shutdown()
+            otro.close()
+
+
 class TestFoxglove(PanelCase):
     def test_protocolo_foxglove(self):
         pub = self.pub(Articulaciones, "/arca9/q")

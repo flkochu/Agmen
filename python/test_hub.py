@@ -173,6 +173,17 @@ class TestHub(unittest.TestCase):
         self.assertEqual(len([1 for op, _ in msgs if op == "ep"]), 2)
         self.assertIsNotNone(H.ping(self.h.addr))
 
+    def test_el_hub_dice_de_que_robot_es(self):
+        """agmen run arranca el hub con --robot: otro agmen run sabe de quién es (0.12.1)."""
+        self.assertEqual(next(f for op, f in H.query(self.h.addr) if op == "state")["robot"], "")
+        h2 = HubFixture()
+        h2.hub.robot = "Arca9 (simulado)"
+        try:
+            self.assertEqual(next(f for op, f in H.query(h2.addr) if op == "state")["robot"], "Arca9 (simulado)")
+        finally:
+            h2.close()
+            os.environ["AGMEN_HUB"] = self.h.addr
+
 
 class TestLatidos(unittest.TestCase):
     def test_nodo_que_muere_sin_avisar_se_quita(self):

@@ -54,9 +54,10 @@ class Expected:
 
 class Hub:
     def __init__(self, listen: str = hp.DEFAULT_HUB, expected: list[Expected] | None = None,
-                 log=print, grace_s: float = 5.0) -> None:
+                 log=print, grace_s: float = 5.0, robot: str = "") -> None:
         host, port = listen.rsplit(":", 1)
         self.listen = listen
+        self.robot = robot        # el robot que lo arrancó (agmen run): así otro agmen run sabe de quién es
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             self.sock.bind((host, int(port)))
@@ -226,7 +227,7 @@ class Hub:
 
     # --- estado (para agmen topic list / info, node list) ---
     def state_text(self) -> str:
-        lines = [hp.line("state", version=__version__, hub=self.listen)]
+        lines = [hp.line("state", version=__version__, hub=self.listen, robot=self.robot)]
         topics = sorted({e.topic for e in self.endpoints.values() if e.topic != "*"} | set(self.expected))
         for t in topics:
             eps = [e for e in self.endpoints.values() if e.topic == t]
@@ -324,7 +325,8 @@ def main(args) -> int:
         print(f"[hub] {text}", flush=True)
 
     try:
-        hub = Hub(args.listen, parse_expected(args.expect or [], args.require or []), log)
+        hub = Hub(args.listen, parse_expected(args.expect or [], args.require or []), log,
+                  robot=getattr(args, "robot", "") or "")
     except (OSError, hp.ProtocolError) as e:
         print(f"[hub] error: {e}", file=sys.stderr)
         return 2

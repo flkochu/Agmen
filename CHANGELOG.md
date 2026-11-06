@@ -7,6 +7,36 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 
 ## [Sin publicar]
 
+## [0.12.1] — 2026-11-06
+
+Parche: dos errores que encontró Arca9 al usar Agmen (los puntos 4 y 7 de su
+`pc/agmen/PENDIENTES_AGMEN.md`). Los bytes de la red no cambian: un nodo de
+0.12.1 habla con uno de 0.12.0.
+
+### Corregido
+- **NaN e infinitos salen como `null` en el JSON** (`schema.jsonable`): en lo
+  que el panel le manda a Foxglove (en vivo y con `agmen export --foxglove`) y
+  en `agmen echo --json`. Antes salía `[NaN, 1.0]`, que no es JSON: un lector
+  estricto (el `JSON.parse` del navegador, Foxglove) rechazaba el mensaje
+  completo, no solo ese número. Arca9 pone NaN en un servo sin lectura
+  creíble. Vale también para arreglos de NumPy y tensores.
+- **Dos `agmen run` en la misma máquina**: si el `[web] listen` del panel
+  (`127.0.0.1:7400`) ya lo usa otro robot o un `agmen web`, el panel lo dice
+  con palabras y sigue con los topics. Antes su hilo tronaba con
+  `OSError: [Errno 98] Address already in use` y el panel se quedaba sin datos.
+- Y el segundo `agmen run` **dice de quién es el hub que reusa y avisa si los
+  dos robots usan los mismos topics**, porque sus mensajes se mezclan (el
+  `poses.py` de uno le mandaba al puente del otro):
+
+  ```
+  ⚠ ya hay otro robot en esta máquina, 'Arca9 (simulado)' (su agmen hub está en 127.0.0.1:7390),
+    y los dos usan /arca9/comando, /arca9/estado: sus mensajes se van a mezclar …
+  ```
+
+  Para eso `agmen run` arranca el hub con su nombre (`agmen hub --robot`), y
+  la línea `state` del hub lo dice (`robot=`). Un hub de 0.12.0 no lo dice: el
+  aviso sale igual, sin el nombre.
+
 ## [0.12.0] — 2026-11-05
 
 **Nivel 9: grabar y reproducir; tu robot como dataset.** Implementa el

@@ -66,6 +66,11 @@ def cmd_run(args) -> int:
     launcher = Launcher(config)
     out = _SayTo(launcher)
     launcher.say(f"Agmen {__version__} · robot '{config.name}' · {len(config.nodes)} nodos · {hub_note}")
+    if config.hub and not any(n.name == "hub" for n in config.nodes):   # se reusa el hub de otro robot
+        from .run import other_robot
+
+        for line in other_robot(config):
+            launcher.say(line)
     if not launcher.run_before():
         launcher.printer.close()
         return 1
@@ -111,6 +116,8 @@ def cmd_run(args) -> int:
         panel.start(open_browser=config.web.open_browser and not args.no_browser)
         for line in _panel_lines(panel):
             launcher.say(line)
+        if panel.listen_error:
+            launcher.say(f"⚠ {panel.listen_error}")
 
     launcher.start_all()
     launcher.say("todo arrancado. Ctrl+C para detener todo.")
@@ -260,7 +267,11 @@ def cmd_web(args) -> int:
     panel.start(open_browser=not args.no_browser)
     if rec_note:
         print(f"[agmen web] {rec_note}")
-    print(f"[agmen web] recibiendo Agmen de todos los topics y de udp://{args.listen}")
+    if panel.listen_error:
+        print(f"[agmen web] ⚠ {panel.listen_error}")
+        print("[agmen web] recibiendo Agmen de todos los topics")
+    else:
+        print(f"[agmen web] recibiendo Agmen de todos los topics y de udp://{args.listen}")
     for line in _panel_lines(panel):
         print(f"[agmen web] {line}")
     stop = threading.Event()
@@ -355,6 +366,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="topic esperado (de robot.toml); avisa si alguien usa otro parecido o de otro tipo")
     p.add_argument("--require", action="append", metavar="TOPIC",
                    help="topic obligatorio: avisa si nadie lo publica")
+    p.add_argument("--robot", default="", metavar="NOMBRE",
+                   help="el robot al que pertenece (lo pone agmen run: así otro agmen run sabe de quién es)")
     p.set_defaults(func=cmd_hub)
 
     from .topic import add_parsers as add_topic_parsers

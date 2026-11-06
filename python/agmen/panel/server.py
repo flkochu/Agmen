@@ -162,20 +162,36 @@ def panel_node_name() -> str:
     return os.environ.get("AGMEN_NODE") or "panel"
 
 
+def open_listen(listen: str) -> RawSubscriber:
+    """La dirección fija del panel ([web] listen), para nodos sin hub como un
+    puente de microcontrolador. Si ya la usa otro programa (casi siempre otro
+    robot o un agmen web en esta máquina), el error lo dice con palabras."""
+    try:
+        return RawSubscriber(listen, node=panel_node_name())
+    except OSError as e:
+        raise OSError(f"el panel no puede escuchar en {listen} ([web] listen): ese puerto ya lo usa otro programa, "
+                      f"casi seguro otro robot (agmen run) o un 'agmen web' en esta máquina ({e.strerror or e}). "
+                      f"El panel sigue con los topics; lo que un nodo sin hub mande a {listen} le llega al otro. "
+                      f"Para correr los dos, pon otro puerto en [web] listen (ej. \"127.0.0.1:7401\")") from None
+
+
 def udp_receiver(hub: SensorHub, bridge: Bridge | None, listen: str | None, stop: threading.Event,
-                 topics: bool = True) -> None:
+                 topics: bool = True, fixed: RawSubscriber | None = None) -> None:
     """Recibe de su dirección fija (`listen`, para nodos sin hub como un puente
     de microcontrolador) y de TODOS los topics, como un receptor más
     registrado en el hub ("*"). Cuenta estadísticas y le pasa cada paquete,
-    sin decodificar, al puente."""
+    sin decodificar, al puente. `fixed`: la dirección fija ya abierta
+    (Panel.start la abre antes, para avisar con claridad si está ocupada)."""
     import select
 
     # Se llama "panel" en el hub sin cambiar el nombre del proceso: en agmen run, el
     # grabador y el reproductor viven en el mismo proceso y no son el panel.
     name = panel_node_name()
     receivers: list[RawSubscriber] = []
-    if listen:
-        receivers.append(RawSubscriber(listen, node=name))
+    if fixed is not None:
+        receivers.append(fixed)
+    elif listen:
+        receivers.append(open_listen(listen))
     if topics:
         receivers.append(RawSubscriber("*", node=name))
     hub.update(listening=", ".join(filter(None, [listen, "todos los topics" if topics else None])))
@@ -312,6 +328,7 @@ class Panel:
         self.clock = clock            # agmen.clock.ClockServer si agmen run manda el tiempo
         # agmen web vuelta1.mcap (RFC 0010): el navegador la lee por partes de /api/recording.
         self.recording_file = os.path.abspath(recording_file) if recording_file else None
+        self.listen_error: str | None = None    # [web] listen ocupado: el panel sigue sin esa dirección
         self._rec_reader = None
         self._rec_lock = threading.Lock()
         self.rhythm: list[dict] = []  # cuentas de los agmen.Node (del hub)
@@ -350,8 +367,17 @@ class Panel:
         return [f"http://{ip}:{self.port}/?t={self.token}" for ip in ips]
 
     def start(self, open_browser: bool = False) -> None:
-        if self.listen or self.topics:
-            threading.Thread(target=udp_receiver, args=(self.hub, self.bridge, self.listen, self.stop, self.topics),
+        fixed = None
+        if self.listen:
+            try:
+                fixed = open_listen(self.listen)
+            except OSError as e:
+                # Antes esto tronaba dentro del hilo (un traceback y el panel sin datos).
+                self.listen_error = str(e)          # agmen run y agmen web lo dicen en la terminal
+                self.hub.update(last_error=str(e))   # y el panel, en su aviso de errores
+        if fixed is not None or self.topics:
+            threading.Thread(target=udp_receiver,
+                             args=(self.hub, self.bridge, self.listen if fixed else None, self.stop, self.topics, fixed),
                              daemon=True, name="panel-udp").start()
         threading.Thread(target=self.server.serve_forever, daemon=True, name="panel-http").start()
         threading.Thread(target=self.bridge.ticker, args=(self.stop,), daemon=True, name="panel-ticker").start()
