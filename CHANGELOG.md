@@ -58,6 +58,8 @@ recomendadas (D1–D6 = a), a pedido de Arca9 (los puntos 1 y 2 de su
 ### Cambiado
 - `examples/tutorial/robot.toml`: la tarjeta **Movimientos** y
   `max_gap_ms = 100` en `/imu`. Tutorial: capítulos 5, 6 y 10.
+- `scripts/check_version.py` también revisa la línea "Versión actual" del
+  README (decía 0.12.0).
 
 ### Corregido
 - **Al detener una grabación desde el panel (⏹), mientras se cerraba el

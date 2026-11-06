@@ -3,6 +3,7 @@
 La fuente de verdad es el archivo VERSION. Este script revisa que coincidan:
   - python/agmen/_version.py
   - la última versión publicada en CHANGELOG.md
+  - la línea "Versión actual" del README.md
   - el tag de git, si se pasa (ej. en el workflow de release)
 
     python scripts/check_version.py            # en el CI normal
@@ -38,6 +39,12 @@ def main() -> int:
         errors.append(f"CHANGELOG.md: la última versión publicada es {released[0] if released else '?'}, "
                       f"VERSION dice {version}. Agrega la sección '## [{version}] — AAAA-MM-DD'")
 
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    current = re.search(r"^\*\*Versión actual: ([^*]+)\*\*", readme, re.M)
+    if not current or current.group(1).strip() != version:
+        errors.append(f"README.md dice 'Versión actual: {current.group(1).strip() if current else '?'}', "
+                      f"VERSION dice {version}")
+
     if len(sys.argv) > 1:
         tag = sys.argv[1].removeprefix("refs/tags/")
         if tag != f"v{version}":
@@ -47,8 +54,8 @@ def main() -> int:
         for e in errors:
             print(f"ERROR: {e}")
         return 1
-    print(f"OK   versión {version} consistente en VERSION, Python y CHANGELOG"
-          + (f" y tag {sys.argv[1]}" if len(sys.argv) > 1 else ""))
+    places = ["VERSION", "Python", "CHANGELOG", "README"] + ([f"tag {sys.argv[1]}"] if len(sys.argv) > 1 else [])
+    print(f"OK   versión {version} consistente en {', '.join(places[:-1])} y {places[-1]}")
     return 0
 
 
