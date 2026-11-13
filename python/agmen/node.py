@@ -107,10 +107,14 @@ class _Timer:
         self.win_skipped = 0
         self.win_worst_late = 0
         self.last_warn = -10 * _SEC
-        # Saltos del reloj (clock.mono_jumps): el último `jumped` que vio y hasta
-        # qué hora de Agmen los ciclos se deben al salto y no al nodo.
-        self.seen_jumped = 0
-        self.excuse_until = 0
+
+
+def _in_jump(first: int, k: int, period: int, jump_from: int, jump_to: int) -> int:
+    """Cuántos de los plazos first + i·period (0 <= i < k) caen dentro del salto
+    del reloj (jump_from, jump_to]. Espejo de in_jump (src/node.cpp)."""
+    lo = 0 if jump_from < first else (jump_from - first) // period + 1
+    hi = min(k - 1, (jump_to - first) // period) if jump_to >= first else -1
+    return max(0, hi - lo + 1)
 
 
 class _Invalid:
@@ -392,10 +396,9 @@ class _PureNode:
             if stop.is_set() or (end is not None and time.monotonic_ns() >= end):
                 return
             clock.wait_change(0.05)
-        start, jumped = clock.mono_jumps()
+        start = clock.mono_ns()
         for t in g.timers:
             t.next = start + t.period
-            t.seen_jumped, t.excuse_until = jumped, start
         last_beat = win_start = time.monotonic_ns()
 
         while not stop.is_set():
@@ -406,15 +409,13 @@ class _PureNode:
 
             # 1. Temporizadores que ya tocan.
             for t in g.timers:
-                now, jumped = clock.mono_jumps()
+                now, _, jump_from, jump_to = clock.mono_jumps()
                 if now < t.next:
                     continue
                 # Tras un salto del reloj (el botón *paso* del panel), los ciclos
-                # que tocaban antes de verlo no son atraso del nodo: corren igual,
-                # pero no se cuentan como tarde ni como saltados, ni se avisan.
-                if jumped != t.seen_jumped:
-                    t.seen_jumped, t.excuse_until = jumped, now
-                excused = t.next <= t.excuse_until
+                # cuyo plazo cayó DENTRO del salto no son atraso del nodo: corren
+                # igual que siempre, pero no cuentan como tarde ni como saltados.
+                excused = jump_from < t.next <= jump_to
                 late = now - t.next
                 t0 = time.perf_counter_ns()
                 t.fn()
@@ -430,16 +431,14 @@ class _PureNode:
                 if run > g.slow_ns:
                     g.slow_ns, g.slow_label = run, t.label
                 t.next += t.period
-                after, jumped = clock.mono_jumps()
-                if jumped != t.seen_jumped:     # saltó mientras corría la función
-                    t.seen_jumped, t.excuse_until, excused = jumped, after, True
+                after, _, jump_from, jump_to = clock.mono_jumps()
                 if after > t.next:
                     k = (after - t.next) // t.period
                     if k > 0:
+                        own = k - _in_jump(t.next, k, t.period, jump_from, jump_to)
                         t.next += k * t.period
-                        if not excused:
-                            st.skipped += k
-                            t.win_skipped += k
+                        st.skipped += own
+                        t.win_skipped += own
                 if stop.is_set():
                     break
 

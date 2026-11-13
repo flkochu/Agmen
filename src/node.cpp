@@ -188,11 +188,20 @@ struct Timer {
     std::uint64_t win_skipped = 0;
     std::int64_t win_worst_late = 0;
     std::int64_t last_warn = std::numeric_limits<std::int64_t>::min() / 2;
-    // Saltos del reloj (clock::mono_reading): el último `jumped` que vio y hasta
-    // qué hora de Agmen los ciclos se deben al salto y no al nodo.
-    std::int64_t seen_jumped = 0;
-    std::int64_t excuse_until = 0;
 };
+
+namespace {
+
+// Cuántos de los plazos first + i·period (0 <= i < k) caen dentro del salto del
+// reloj (jump_from, jump_to]. Espejo de _in_jump (python/agmen/node.py).
+std::int64_t in_jump(std::int64_t first, std::int64_t k, std::int64_t period, std::int64_t jump_from,
+                     std::int64_t jump_to) {
+    const std::int64_t lo = jump_from < first ? 0 : (jump_from - first) / period + 1;
+    const std::int64_t hi = jump_to >= first ? std::min(k - 1, (jump_to - first) / period) : -1;
+    return std::max<std::int64_t>(0, hi - lo + 1);
+}
+
+}  // namespace
 
 struct GroupRt {
     std::string name;
@@ -358,12 +367,8 @@ struct NodeImpl {
             if (should_stop() || (end_steady != 0 && steady_now_ns() >= end_steady)) return;
             std::this_thread::sleep_for(milliseconds(5));
         }
-        const clock::MonoReading start = clock::mono_reading();
-        for (auto& t : g.timers) {
-            t->next = start.t + t->period;
-            t->seen_jumped = start.jumped;
-            t->excuse_until = start.t;
-        }
+        const std::int64_t start = clock::mono_ns();
+        for (auto& t : g.timers) t->next = start + t->period;
 
         std::int64_t last_beat = steady_now_ns();
         std::int64_t win_start = last_beat;
@@ -382,13 +387,9 @@ struct NodeImpl {
                 const std::int64_t now = r.t;
                 if (now < t.next) continue;
                 // Tras un salto del reloj (el botón *paso* del panel), los ciclos
-                // que tocaban antes de verlo no son atraso del nodo: corren igual,
-                // pero no se cuentan como tarde ni como saltados, ni se avisan.
-                if (r.jumped != t.seen_jumped) {
-                    t.seen_jumped = r.jumped;
-                    t.excuse_until = now;
-                }
-                bool excused = t.next <= t.excuse_until;
+                // cuyo plazo cayó DENTRO del salto no son atraso del nodo: corren
+                // igual que siempre, pero no cuentan como tarde ni como saltados.
+                const bool excused = r.jump_from < t.next && t.next <= r.jump_to;
                 const std::int64_t late = now - t.next;
                 const std::int64_t t0 = steady_now_ns();
                 t.cb();
@@ -410,19 +411,13 @@ struct NodeImpl {
                 t.next += t.period;
                 const clock::MonoReading a = clock::mono_reading();
                 const std::int64_t after = a.t;
-                if (a.jumped != t.seen_jumped) {   // saltó mientras corría la función
-                    t.seen_jumped = a.jumped;
-                    t.excuse_until = after;
-                    excused = true;
-                }
                 if (after > t.next) {
                     const std::int64_t k = (after - t.next) / t.period;
                     if (k > 0) {
+                        const std::int64_t own = k - in_jump(t.next, k, t.period, a.jump_from, a.jump_to);
                         t.next += k * t.period;
-                        if (!excused) {
-                            t.skipped += static_cast<std::uint64_t>(k);
-                            t.win_skipped += static_cast<std::uint64_t>(k);
-                        }
+                        t.skipped += static_cast<std::uint64_t>(own);
+                        t.win_skipped += static_cast<std::uint64_t>(own);
                     }
                 }
                 if (should_stop()) break;

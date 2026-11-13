@@ -67,6 +67,8 @@ class _Global:
         self.at_wall = 0         # time.monotonic_ns() del último /clock
         self.last_returned = 0
         self.jumped = 0          # tiempo que llegó de golpe (mono_jumps); nunca baja
+        self.jump_from = 0       # el último salto: (jump_from, jump_to]
+        self.jump_to = 0
         self.changed = threading.Condition(self.lock)
 
 
@@ -154,15 +156,18 @@ def mono_ns() -> int:
         return _sim_now_locked()
 
 
-def mono_jumps() -> tuple[int, int]:
-    """Para el executor (Node): (mono_ns(), jumped), leídos a la vez. `jumped`
-    es cuánto tiempo de Agmen ha llegado "de golpe" en este proceso: lo que el
-    reloj saltó con un /clock en pausa (el botón *paso* del panel) en vez de
-    correr. En real y con un simulador paso a paso es siempre 0."""
+def mono_jumps() -> tuple[int, int, int, int]:
+    """Para el executor (Node) y el vigilante de max_gap_ms: (mono_ns(), jumped,
+    jump_from, jump_to), leídos a la vez. Un salto es lo que avanza un /clock
+    cuando el reloj YA estaba en pausa (el botón *paso* del panel): ese tiempo
+    no corrió. `jumped` es el total de este proceso (ns, nunca baja) y el último
+    salto es (jump_from, jump_to], en tiempo de Agmen; saltos seguidos en la
+    misma pausa se unen. En real, con un simulador paso a paso y con el primer
+    /clock no hay saltos. Espejo de clock::mono_reading()."""
     if mode() == REAL:
-        return time.monotonic_ns(), 0
+        return time.monotonic_ns(), 0, 0, 0
     with _g.lock:
-        return _sim_now_locked(), _g.jumped
+        return _sim_now_locked(), _g.jumped, _g.jump_from, _g.jump_to
 
 
 def wall_until(t: int) -> float | None:
@@ -208,6 +213,7 @@ def configure(m: str, stepped: bool = False, listen: bool = True) -> None:
         _g.st = State()
         _g.at_wall = time.monotonic_ns()
         _g.last_returned = 0
+        _g.jump_from = _g.jump_to = 0   # el tiempo vuelve a empezar; `jumped` no baja
         _start_listener_locked()
 
 
@@ -215,14 +221,17 @@ def update(m: Clock) -> None:
     """Alimenta el reloj con un /clock."""
     with _g.changed:
         _ensure_configured_locked()
-        # Si el reloj estaba (o queda) en pausa, no estaba corriendo: lo que avanza
-        # este /clock llegó de golpe (el botón *paso*). Corriendo, la diferencia es
-        # solo la corrección de la interpolación y se trata como hoy. Un simulador
-        # paso a paso no interpola nunca: tampoco se cuenta. Igual que clock.cpp.
-        if not _g.stepped and (not _g.st.received or _g.st.paused or bool(m.paused)):
+        # Si el reloj YA estaba en pausa, no corría: lo que avanza este /clock llegó
+        # de golpe (el botón *paso*). Corriendo (también al pausar), la diferencia es
+        # solo la corrección de la interpolación. No cuentan el primer /clock ni un
+        # simulador paso a paso (no interpola nunca). Igual que clock.cpp.
+        if not _g.stepped and _g.st.received and _g.st.paused:
             before = _sim_now_locked()
             if int(m.t) > before:
                 _g.jumped += int(m.t) - before
+                if before != _g.jump_to:     # seguido del anterior: se unen
+                    _g.jump_from = before
+                _g.jump_to = int(m.t)
         _g.st = State(int(m.t), float(m.speed), bool(m.paused), True)
         _g.at_wall = time.monotonic_ns()
         _g.changed.notify_all()
@@ -251,7 +260,7 @@ if _backend.NATIVE:
     def mono_ns() -> int:  # noqa: F811
         return _c.clock_mono_ns()
 
-    def mono_jumps() -> tuple[int, int]:  # noqa: F811
+    def mono_jumps() -> tuple[int, int, int, int]:  # noqa: F811
         return _c.clock_mono_jumps()
 
     def wall_until(t: int) -> float | None:  # noqa: F811
