@@ -87,6 +87,10 @@ examples/tutorial/grabaciones/agmen-2026-11-05_15-30-12.mcap  (192 kB, 12.0 s)
   con **los mismos bytes** que viajaron por la red (sobre y payload): cualquier
   lector de Agmen (C++, Python, el panel) los entiende.
 - Trae tu `robot.toml` adjunto: la grabación se explica sola.
+- Desde Agmen 0.14.0, si la grabación la hizo `agmen run`, la línea de
+  `agmen info` dice también el perfil (`reloj real, perfil real, …`). Con
+  `agmen record` suelto no aparece, y las grabaciones de versiones anteriores
+  se leen igual.
 - Si el grabador se cayó a la mitad (un corte de luz), se pierde como mucho el
   último segundo y el archivo se lee igual. `agmen info` te dice que le falta
   el índice y `agmen info --reparar` se lo vuelve a escribir.
@@ -116,6 +120,35 @@ agmen run examples/tutorial/robot.toml --play vuelta1.mcap --skip imu
   motor, el cerebro, el mux y el panel corren de verdad, con los datos de ayer.
 - En el panel, la tarjeta *Reloj* dice **reproducción**, cuánto va y cuánto
   dura, con pausa, paso y velocidad.
+
+> **Cambio desde Agmen 0.14.0.** En la 0.13.0, `--play` arrancaba **todos**
+> los nodos. Ahora usa el perfil `replay`, y los nodos con `profile = "real"`
+> **no arrancan**. La razón: un motor no debe moverse con los datos de ayer.
+> Los `robot.toml` sin perfiles no cambian: `--play` arranca los mismos nodos
+> que antes.
+>
+> Con el archivo del [capítulo 5, sección 6](05-un-solo-comando.md#6-perfiles-el-mismo-robottoml-para-el-robot-y-para-simulación):
+>
+> ```bash
+> agmen run examples/tutorial/perfiles.toml --play vuelta1.mcap
+> ```
+>
+> ```
+> agmen │ perfil replay · reloj de la grabación · no corren: imu, motor (perfil real), imu (perfil sim)
+> ```
+>
+> Si de verdad quieres los nodos `real` (por ejemplo, para probar tu cerebro
+> con el motor de verdad), dilo con `--profile real`:
+>
+> ```bash
+> agmen run examples/tutorial/perfiles.toml --play vuelta1.mcap --profile real
+> ```
+>
+> Agmen avisa, para que no te sorprenda:
+>
+> ```
+> agmen │ ⚠ corren nodos del perfil real con el reloj de la grabación: imu, motor. Si tocan hardware, se van a mover con datos grabados; sin --profile real no arrancan (o quítalos con --skip)
+> ```
 
 🧪 **Prueba tu IA nueva con los datos de ayer.** Graba `/imu` y `/cmd`; luego
 reproduce solo la IMU (`--play-topic /imu`) y corre tu cerebro nuevo: compara
@@ -241,6 +274,8 @@ Si el disco no alcanza, el grabador descarta (y lo cuenta), pero la cámara
   barra de tiempo; `agmen export --foxglove`, en Foxglove.
 - `agmen.Recording` y `agmen export --parquet` la convierten en tablas para
   entrenar.
+- Con perfiles (desde 0.14.0), `--play` usa el perfil `replay`: los nodos
+  `real` no arrancan, salvo que pidas `--profile real`.
 
 **Siguiente (nivel 10):** el mismo robot en la simulación y en el mundo real,
 y un `robot.toml` con nodos en varias computadoras.

@@ -12,7 +12,42 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   computadoras. Diseño aceptado el 2026-11-13 en el
   [RFC 0011](docs/rfc/0011-sim-real-y-varias-computadoras.md) (D1–D10 = a:
   perfiles en `robot.toml` con `agmen run --sim`, un mundo de MuJoCo de
-  ejemplo y `agmen agent` en cada computadora); aún sin implementar.
+  ejemplo y `agmen agent` en cada computadora). Hecho: los perfiles (bloque 1,
+  abajo). Falta: el mundo de MuJoCo (`examples/sim/`, `agmen[sim]`),
+  `[[machine]]` y `agmen agent`, con el capítulo 17.
+
+### Agregado
+- **Perfiles en `robot.toml`** (RFC 0011 §3.2): `profile = "real"`, `"sim"`,
+  `"replay"` o un nombre propio (`"mesa"`) en `[[node]]`, `[[mux]]` y
+  `[[topic]]`. Sin `profile`, corren en todos. Un perfil puede ser una lista
+  (`profile = ["real", "mesa"]`). Dos nodos pueden llamarse igual si nunca
+  corren juntos (una `imu` real y una `imu` falsa).
+- **`[profile.X]`** con `clock`, `web` y `record`: cada una reemplaza la de
+  arriba, solo en ese perfil. `local` se acepta, pero todavía no hace nada
+  (llega con varias computadoras).
+- **`[robot] profile`**: el perfil por defecto de `agmen run`. Por omisión,
+  `real`.
+- **Banderas de `agmen run`**: `--sim` (lo mismo que `--profile sim`, con el
+  reloj de simulación sin escribir `[clock]`) y `--profile PERFIL`.
+- **Letrero del perfil**: la terminal dice `perfil sim · reloj de simulación
+  (×1) · no corren: …` cuando el perfil no es `real` o hay nodos que no
+  corren. El panel muestra en grande SIMULACIÓN, REPRODUCCIÓN o PERFIL X;
+  `/api/state` trae `profile` y `playing`.
+- **Avisos y errores con sugerencia**: un perfil que no existe (con la lista
+  de los conocidos), un error de dedo (`profile = "rael"` → `¿Quisiste decir
+  'real'?`), `--skip` de un nodo de otro perfil (aviso), `--sim` con `--play`
+  (error) y el perfil `replay` sin `--play` (error).
+- **`perfil` en las grabaciones**: `agmen run --record` lo guarda en
+  `agmen.grabacion`, y `agmen info` lo muestra. `agmen record` suelto no lo
+  escribe. Las grabaciones sin el campo se leen igual.
+
+### Cambiado
+- **`--play` ya no arranca los nodos `profile = "real"`.** Usa el perfil
+  `replay`: un motor no debe moverse con los datos de una grabación. Para
+  correrlos, `agmen run robot.toml --play ARCHIVO.mcap --profile real`
+  (con el reloj de la grabación, y `agmen run` avisa). Los `robot.toml` sin
+  perfiles no cambian: `--play` arranca los mismos nodos que en 0.13.0, y
+  `--skip` funciona igual.
 
 ## [0.13.0] — 2026-11-06
 

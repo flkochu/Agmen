@@ -139,6 +139,11 @@ speed = 1.0         # 0.5 = la mitad de rápido, 2.0 = el doble
 agmen run examples/nodos/robot.toml
 ```
 
+💡 Con `agmen run --sim` no hace falta escribir `[clock]`: el perfil `sim`
+ya usa el reloj de simulación. Lo explicamos en el
+[capítulo 5, sección 6](05-un-solo-comando.md#6-perfiles-el-mismo-robottoml-para-el-robot-y-para-simulación).
+Sin `--sim`, este bloque sigue mandando en el perfil `real`.
+
 En el panel aparece la tarjeta **Reloj**: **⏸ pausar**, **paso** (avanza 0.1 s
 simulados) y la **velocidad**. Pruébalo:
 

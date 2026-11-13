@@ -170,9 +170,195 @@ restart = "always"
 La referencia completa de `robot.toml` está en el
 [RFC 0003](../rfc/0003-lanzador-y-panel.md#3-formato-de-robottoml).
 
+## 6. Perfiles: el mismo `robot.toml` para el robot y para simulación
+
+*Disponible desde Agmen 0.14.0 (aún sin publicar)*
+
+Hasta ahora, cada `[[node]]` corre siempre. Pero un robot tiene piezas que
+mueven cosas de verdad (un motor, un sensor conectado a la computadora), y
+quieres probar el resto sin el robot. Un **perfil** es un nombre que dice en
+qué modo corre cada nodo. Así no copias el archivo: tienes uno solo.
+
+Esta sección funciona hoy, sin simulador. La "IMU falsa" es el mismo
+`publisher` de antes, con otra velocidad. El simulador de física (MuJoCo)
+llega después en la versión 0.14.0, y el capítulo 17 mostrará el mismo robot
+con física.
+
+### Paso 1: el archivo
+
+Crea `examples/tutorial/perfiles.toml`. No cambies `robot.toml`:
+
+```toml
+[robot]
+name = "robot del tutorial, con perfiles"
+
+[[node]]
+name = "imu"                                   # el sensor de verdad (en el tutorial, un publicador hace de sensor)
+cmd = "../../build/bin/publisher --rate 100 --to /imu"
+profile = "real"
+
+[[node]]
+name = "imu"                                   # la IMU falsa: mismo nombre, otro perfil
+cmd = "../../build/bin/publisher --rate 50 --to /imu"
+profile = "sim"
+
+[[node]]
+name = "motor"                                 # toca el hardware: solo en real
+cmd = "../../build/bin/tutorial_motor --escuchar /cmd"
+profile = "real"
+restart = "on-failure"
+
+[[topic]]
+name = "/imu"
+type = "ImuSample"
+required = true
+
+[[topic]]
+name = "/cmd"
+type = "MotorCommand"
+```
+
+Lo nuevo es esto:
+
+- `profile = "real"` dice que el nodo solo corre en el robot de verdad. Si un
+  nodo no tiene `profile`, corre en todos los perfiles.
+- Los dos `imu` se llaman igual. Se puede porque nunca corren juntos: uno es
+  del perfil `real` y el otro del perfil `sim`.
+- Los `[[topic]]` también pueden tener `profile`. Aquí no lo ponemos, así que
+  `/imu` y `/cmd` se esperan en los dos perfiles.
+
+> **Regla de seguridad:** marca con `profile = "real"` todo nodo que toque
+> hardware (motores, servos, sensores conectados). Así la simulación nunca lo
+> arranca, aunque se te olvide quitarlo. Un nodo de hardware sin `profile` sí
+> corre en simulación, y la simulación podría mover el robot de verdad.
+
+### Paso 2: córrelo en los dos modos
+
+```bash
+agmen run examples/tutorial/perfiles.toml
+```
+
+```
+agmen │ perfil real · reloj real · no corren: imu (perfil sim)
+hub   │ ▶ iniciado (pid 14045)
+imu   │ ▶ iniciado (pid 14047)
+...
+```
+
+El perfil `real` no muestra letrero especial, pero la terminal dice qué
+nodos no corren. Ahora en simulación:
+
+```bash
+agmen run examples/tutorial/perfiles.toml --sim
+```
+
+```
+agmen │ perfil sim · reloj de simulación (×1) · no corren: imu, motor (perfil real)
+agmen │ reloj: simulación ×1, lo manda agmen run en /clock (pausa, paso y velocidad en el panel)
+hub   │ ▶ iniciado (pid 14073)
+...
+```
+
+- `--sim` es lo mismo que `--profile sim`.
+- No hace falta escribir `[clock]`: el perfil `sim` ya usa el reloj de
+  simulación. En el panel puedes pausarlo, dar un paso o acelerarlo.
+- El motor no corre en simulación. Eso es lo que queremos.
+
+### Paso 3: el panel y la terminal dicen en qué perfil estás
+
+En el panel, el perfil aparece en grande, arriba:
+
+- **SIMULACIÓN** con `--sim`.
+- **REPRODUCCIÓN** con `--play` (capítulo 16).
+- **PERFIL MESA** si inventas un perfil (lo vemos abajo). En amarillo, para
+  que no se te olvide.
+
+Con el perfil `real` no hay letrero, porque es lo normal. Los programas que
+consultan `/api/state` del panel reciben los campos `profile` y `playing`.
+
+### Paso 4: más de un perfil
+
+Puedes cambiar el perfil por defecto en `robot.toml`:
+
+```toml
+[robot]
+name = "robot del tutorial, con perfiles"
+profile = "sim"                  # sin --sim ni --profile, corre el perfil sim
+```
+
+Y puedes cambiar algo solo en un perfil. Por ejemplo, el panel de la
+simulación en otro puerto, para no chocar con el robot de verdad:
+
+```toml
+[profile.sim.web]
+http = "127.0.0.1:8098"          # en simulación, el panel usa este puerto
+```
+
+Lo que pones en `[profile.X]` reemplaza lo de arriba, pero solo en ese
+perfil. Las claves que puedes poner ahí son `clock`, `web` y `record`. La
+clave `local` ya se acepta, pero todavía no hace nada: sirve para varias
+computadoras, y llega más adelante en 0.14.0.
+
+Un perfil puede tener cualquier nombre (letras sin acento, números, `_` o
+`-`). Por ejemplo, el robot sobre la mesa, sin ruedas. Pon `profile = "mesa"`
+en los nodos que quieras, y corre:
+
+```bash
+agmen run examples/tutorial/perfiles.toml --profile mesa
+```
+
+Agmen corre los nodos de `mesa` y los que no tienen `profile`. La terminal
+dice `perfil mesa · reloj real`.
+
+### Paso 5: errores y avisos comunes
+
+Estos son los mensajes reales que verás. Agmen no arranca nada si el error
+es de archivo o de bandera, así que lo puedes corregir sin miedo.
+
+Un perfil que no existe (`--profile mesa` sin ningún nodo `mesa`):
+
+```
+error en examples/tutorial/perfiles.toml: el perfil 'mesa' no existe en perfiles.toml. Perfiles conocidos: real, sim, replay. Un perfil existe si algún [[node]], [[mux]] o [[topic]] lo nombra en su profile, o si tiene su tabla [profile.mesa]
+```
+
+Un error de dedo (escribiste `profile = "rael"` en vez de `"real"`). Es un
+aviso, no un error: si el perfil `rael` es a propósito, declara `[profile.rael]`
+y el aviso desaparece.
+
+```
+agmen │ ⚠ [[node]] 'imu': profile = "rael" y ningún otro lugar nombra ese perfil. ¿Quisiste decir 'real'? Así, 'imu' solo corre con --profile rael. Si el perfil es a propósito, declara [profile.rael] y este aviso se quita
+```
+
+Reproducir y simular a la vez no tiene sentido: los dos quieren mandar el reloj.
+
+```
+error: --play reproduce una grabación y --sim corre el simulador: los dos quieren mandar el reloj. Elige uno (para reproducir con otros nodos: --play ARCHIVO.mcap --profile real)
+```
+
+El perfil `replay` es solo para `--play`:
+
+```
+error: el perfil replay es el de --play: agmen run examples/tutorial/perfiles.toml --play ARCHIVO.mcap
+```
+
+Un `--skip` de un nodo que no corre en tu perfil no es error. Agmen solo te
+avisa que no hace falta:
+
+```
+agmen │ --skip motor: no hace falta, 'motor' es del perfil real y no corre en el perfil 'sim'
+```
+
+Pero un `--skip` con un nombre que no existe sí es error, y te dice cuáles hay:
+
+```
+error: --skip nada: no hay un nodo con ese nombre (hay: hub, imu, motor)
+```
+
 ## Lo que aprendiste
 
 - A describir tu robot en un archivo y levantarlo con **un comando**.
+- A tener un solo `robot.toml` para el robot y para simulación, con perfiles
+  (`profile`, `--sim` y `--profile`), y a marcar el hardware con `profile = "real"`.
 - A controlar y depurar todo **desde el navegador**: nodos, logs, sensores y manejo.
 - Que Agmen te avisa claro cuando algo está mal, en el archivo o en un nodo.
 
