@@ -188,6 +188,10 @@ struct Timer {
     std::uint64_t win_skipped = 0;
     std::int64_t win_worst_late = 0;
     std::int64_t last_warn = std::numeric_limits<std::int64_t>::min() / 2;
+    // Saltos del reloj (clock::mono_reading): el último `jumped` que vio y hasta
+    // qué hora de Agmen los ciclos se deben al salto y no al nodo.
+    std::int64_t seen_jumped = 0;
+    std::int64_t excuse_until = 0;
 };
 
 struct GroupRt {
@@ -354,8 +358,12 @@ struct NodeImpl {
             if (should_stop() || (end_steady != 0 && steady_now_ns() >= end_steady)) return;
             std::this_thread::sleep_for(milliseconds(5));
         }
-        const std::int64_t start = clock::mono_ns();
-        for (auto& t : g.timers) t->next = start + t->period;
+        const clock::MonoReading start = clock::mono_reading();
+        for (auto& t : g.timers) {
+            t->next = start.t + t->period;
+            t->seen_jumped = start.jumped;
+            t->excuse_until = start.t;
+        }
 
         std::int64_t last_beat = steady_now_ns();
         std::int64_t win_start = last_beat;
@@ -370,17 +378,28 @@ struct NodeImpl {
             // 1. Temporizadores que ya tocan (cada uno una vez por vuelta).
             for (auto& tp : g.timers) {
                 Timer& t = *tp;
-                const std::int64_t now = clock::mono_ns();
+                const clock::MonoReading r = clock::mono_reading();
+                const std::int64_t now = r.t;
                 if (now < t.next) continue;
+                // Tras un salto del reloj (el botón *paso* del panel), los ciclos
+                // que tocaban antes de verlo no son atraso del nodo: corren igual,
+                // pero no se cuentan como tarde ni como saltados, ni se avisan.
+                if (r.jumped != t.seen_jumped) {
+                    t.seen_jumped = r.jumped;
+                    t.excuse_until = now;
+                }
+                bool excused = t.next <= t.excuse_until;
                 const std::int64_t late = now - t.next;
                 const std::int64_t t0 = steady_now_ns();
                 t.cb();
                 const std::int64_t run = steady_now_ns() - t0;
                 ++t.runs;
                 note_max(t.worst_run, run);
-                note_max(t.worst_late, late);
-                if (late > std::max<std::int64_t>(t.period / 10, kMs)) ++t.late;
-                t.win_worst_late = std::max(t.win_worst_late, late);
+                if (!excused) {
+                    note_max(t.worst_late, late);
+                    if (late > std::max<std::int64_t>(t.period / 10, kMs)) ++t.late;
+                    t.win_worst_late = std::max(t.win_worst_late, late);
+                }
                 if (run > g.slow_ns) {
                     g.slow_ns = run;
                     g.slow_label = t.label;
@@ -389,13 +408,21 @@ struct NodeImpl {
                 // tocaba, no de ahora. Si ya pasó más de un periodo completo,
                 // esos ciclos se saltan (no se recuperan de golpe).
                 t.next += t.period;
-                const std::int64_t after = clock::mono_ns();
+                const clock::MonoReading a = clock::mono_reading();
+                const std::int64_t after = a.t;
+                if (a.jumped != t.seen_jumped) {   // saltó mientras corría la función
+                    t.seen_jumped = a.jumped;
+                    t.excuse_until = after;
+                    excused = true;
+                }
                 if (after > t.next) {
                     const std::int64_t k = (after - t.next) / t.period;
                     if (k > 0) {
                         t.next += k * t.period;
-                        t.skipped += static_cast<std::uint64_t>(k);
-                        t.win_skipped += static_cast<std::uint64_t>(k);
+                        if (!excused) {
+                            t.skipped += static_cast<std::uint64_t>(k);
+                            t.win_skipped += static_cast<std::uint64_t>(k);
+                        }
                     }
                 }
                 if (should_stop()) break;

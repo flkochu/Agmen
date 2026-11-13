@@ -57,6 +57,7 @@ struct Global {
     State st{};
     std::int64_t at_wall = 0;
     std::int64_t last_returned = 0;   // para no ir nunca hacia atrás
+    std::int64_t jumped = 0;          // tiempo que llegó de golpe (mono_reading); nunca baja
 };
 
 Global& g() {
@@ -157,6 +158,13 @@ std::int64_t mono_ns() {
     return sim_now_locked(s);
 }
 
+MonoReading mono_reading() {
+    if (mode() == Mode::Real) return {steady_ns(), 0};
+    auto& s = g();
+    std::lock_guard lk(s.mu);
+    return {sim_now_locked(s), s.jumped};
+}
+
 std::chrono::nanoseconds wall_until(std::int64_t t) {
     if (mode() == Mode::Real) return std::chrono::nanoseconds(t - steady_ns());
     auto& s = g();
@@ -196,6 +204,14 @@ void update(const ClockMsg& m) {
     auto& s = g();
     std::lock_guard lk(s.mu);
     ensure_configured_locked(s);
+    // Si el reloj estaba (o queda) en pausa, no estaba corriendo: lo que avanza
+    // este /clock llegó de golpe (el botón *paso*). Corriendo, la diferencia es
+    // solo la corrección de la interpolación y se trata como hoy. Un simulador
+    // paso a paso no interpola nunca: tampoco se cuenta (eso lo decide él).
+    if (!s.stepped && (!s.st.received || s.st.paused || m.paused)) {
+        const std::int64_t before = sim_now_locked(s);
+        if (m.t > before) s.jumped += m.t - before;
+    }
     s.st.t = m.t;
     s.st.speed = m.speed;
     s.st.paused = m.paused;

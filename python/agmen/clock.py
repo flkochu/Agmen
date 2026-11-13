@@ -66,6 +66,7 @@ class _Global:
         self.st = State()
         self.at_wall = 0         # time.monotonic_ns() del último /clock
         self.last_returned = 0
+        self.jumped = 0          # tiempo que llegó de golpe (mono_jumps); nunca baja
         self.changed = threading.Condition(self.lock)
 
 
@@ -153,6 +154,17 @@ def mono_ns() -> int:
         return _sim_now_locked()
 
 
+def mono_jumps() -> tuple[int, int]:
+    """Para el executor (Node): (mono_ns(), jumped), leídos a la vez. `jumped`
+    es cuánto tiempo de Agmen ha llegado "de golpe" en este proceso: lo que el
+    reloj saltó con un /clock en pausa (el botón *paso* del panel) en vez de
+    correr. En real y con un simulador paso a paso es siempre 0."""
+    if mode() == REAL:
+        return time.monotonic_ns(), 0
+    with _g.lock:
+        return _sim_now_locked(), _g.jumped
+
+
 def wall_until(t: int) -> float | None:
     """Cuántos segundos REALES faltan para que mono_ns() llegue a `t`. None si el
     tiempo está en pausa o avanza paso a paso (hay que volver a preguntar)."""
@@ -203,6 +215,14 @@ def update(m: Clock) -> None:
     """Alimenta el reloj con un /clock."""
     with _g.changed:
         _ensure_configured_locked()
+        # Si el reloj estaba (o queda) en pausa, no estaba corriendo: lo que avanza
+        # este /clock llegó de golpe (el botón *paso*). Corriendo, la diferencia es
+        # solo la corrección de la interpolación y se trata como hoy. Un simulador
+        # paso a paso no interpola nunca: tampoco se cuenta. Igual que clock.cpp.
+        if not _g.stepped and (not _g.st.received or _g.st.paused or bool(m.paused)):
+            before = _sim_now_locked()
+            if int(m.t) > before:
+                _g.jumped += int(m.t) - before
         _g.st = State(int(m.t), float(m.speed), bool(m.paused), True)
         _g.at_wall = time.monotonic_ns()
         _g.changed.notify_all()
@@ -230,6 +250,9 @@ if _backend.NATIVE:
 
     def mono_ns() -> int:  # noqa: F811
         return _c.clock_mono_ns()
+
+    def mono_jumps() -> tuple[int, int]:  # noqa: F811
+        return _c.clock_mono_jumps()
 
     def wall_until(t: int) -> float | None:  # noqa: F811
         return _c.clock_wall_until(int(t))

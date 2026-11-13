@@ -107,6 +107,10 @@ class _Timer:
         self.win_skipped = 0
         self.win_worst_late = 0
         self.last_warn = -10 * _SEC
+        # Saltos del reloj (clock.mono_jumps): el último `jumped` que vio y hasta
+        # qué hora de Agmen los ciclos se deben al salto y no al nodo.
+        self.seen_jumped = 0
+        self.excuse_until = 0
 
 
 class _Invalid:
@@ -388,9 +392,10 @@ class _PureNode:
             if stop.is_set() or (end is not None and time.monotonic_ns() >= end):
                 return
             clock.wait_change(0.05)
-        start = clock.mono_ns()
+        start, jumped = clock.mono_jumps()
         for t in g.timers:
             t.next = start + t.period
+            t.seen_jumped, t.excuse_until = jumped, start
         last_beat = win_start = time.monotonic_ns()
 
         while not stop.is_set():
@@ -401,9 +406,15 @@ class _PureNode:
 
             # 1. Temporizadores que ya tocan.
             for t in g.timers:
-                now = clock.mono_ns()
+                now, jumped = clock.mono_jumps()
                 if now < t.next:
                     continue
+                # Tras un salto del reloj (el botón *paso* del panel), los ciclos
+                # que tocaban antes de verlo no son atraso del nodo: corren igual,
+                # pero no se cuentan como tarde ni como saltados, ni se avisan.
+                if jumped != t.seen_jumped:
+                    t.seen_jumped, t.excuse_until = jumped, now
+                excused = t.next <= t.excuse_until
                 late = now - t.next
                 t0 = time.perf_counter_ns()
                 t.fn()
@@ -411,20 +422,24 @@ class _PureNode:
                 st = t.stats
                 st.runs += 1
                 st.worst_run_ns = max(st.worst_run_ns, run)
-                st.worst_late_ns = max(st.worst_late_ns, late)
-                if late > max(t.period // 10, _MS):
-                    st.late += 1
-                t.win_worst_late = max(t.win_worst_late, late)
+                if not excused:
+                    st.worst_late_ns = max(st.worst_late_ns, late)
+                    if late > max(t.period // 10, _MS):
+                        st.late += 1
+                    t.win_worst_late = max(t.win_worst_late, late)
                 if run > g.slow_ns:
                     g.slow_ns, g.slow_label = run, t.label
                 t.next += t.period
-                after = clock.mono_ns()
+                after, jumped = clock.mono_jumps()
+                if jumped != t.seen_jumped:     # saltó mientras corría la función
+                    t.seen_jumped, t.excuse_until, excused = jumped, after, True
                 if after > t.next:
                     k = (after - t.next) // t.period
                     if k > 0:
                         t.next += k * t.period
-                        st.skipped += k
-                        t.win_skipped += k
+                        if not excused:
+                            st.skipped += k
+                            t.win_skipped += k
                 if stop.is_set():
                     break
 

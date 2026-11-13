@@ -66,6 +66,17 @@ enum class Mode { Real, Sim, Replay };
 /// monótono de la computadora; en Sim, el tiempo de la simulación.
 [[nodiscard]] std::int64_t mono_ns();
 
+/// Para el executor (Node): mono_ns() y, leído a la vez, cuánto tiempo de
+/// Agmen ha llegado "de golpe" en este proceso: lo que el reloj saltó con un
+/// /clock en pausa (el botón *paso* del panel) en vez de correr. Los ciclos
+/// que caen en un salto no son atraso del nodo: no se cuentan ni se avisan.
+/// En Real y con un simulador paso a paso, `jumped` es siempre 0.
+struct MonoReading {
+    std::int64_t t = 0;
+    std::int64_t jumped = 0;
+};
+[[nodiscard]] MonoReading mono_reading();
+
 /// Cuánto tiempo REAL falta para que mono_ns() llegue a `t`. Si el tiempo
 /// está en pausa o avanza paso a paso (simulador externo), devuelve
 /// `unknown` (quien espera debe volver a preguntar en un rato).
