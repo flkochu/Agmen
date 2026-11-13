@@ -144,7 +144,7 @@ Ninguna decisión debe cerrar ese camino:
 - **La física va separada del nodo** que la conecta a los topics, para poder
   envolverla después en un entorno de entrenamiento. El ejemplo
   `examples/sim/fisica.py` ya lo hace: la clase `Mundo` no usa Agmen (el nodo
-    `mundo.py` solo la conecta a los topics).
+  `mundo.py` solo la conecta a los topics).
 - **Los topics no dependen de un simulador.** Un simulador publica lo mismo que
   el hardware (`ImuSample`, `Imagen`) y escucha `MotorCommand`.
 
