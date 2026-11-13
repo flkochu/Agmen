@@ -100,8 +100,9 @@ def cmd_run(args) -> int:
         real = [n.name for n in config.nodes if "real" in n.profiles and n.name not in args.skip]
         if real:
             launcher.say(f"⚠ corren nodos del perfil real con el reloj de la grabación: {', '.join(real)}. "
-                         f"Si tocan hardware, se van a mover con datos grabados; sin --profile "
-                         f"{config.profile} no arrancan (o quítalos con --skip)")
+                         f"Si tocan hardware, se van a mover con datos grabados (también si los arrancas "
+                         f"desde el panel): quítalos con --skip"
+                         + (f", o corre sin --profile {args.profile}" if args.profile else ""))
     for warning in config.warnings:
         launcher.say(f"⚠ {warning}")
     for note in skip_notes:

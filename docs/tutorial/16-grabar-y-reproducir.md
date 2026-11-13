@@ -147,7 +147,7 @@ agmen run examples/tutorial/robot.toml --play vuelta1.mcap --skip imu
 > Agmen avisa, para que no te sorprenda:
 >
 > ```
-> agmen │ ⚠ corren nodos del perfil real con el reloj de la grabación: imu, motor. Si tocan hardware, se van a mover con datos grabados; sin --profile real no arrancan (o quítalos con --skip)
+> agmen │ ⚠ corren nodos del perfil real con el reloj de la grabación: imu, motor. Si tocan hardware, se van a mover con datos grabados (también si los arrancas desde el panel): quítalos con --skip, o corre sin --profile real
 > ```
 
 🧪 **Prueba tu IA nueva con los datos de ayer.** Graba `/imu` y `/cmd`; luego

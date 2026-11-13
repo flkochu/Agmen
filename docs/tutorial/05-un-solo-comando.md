@@ -326,7 +326,7 @@ aviso, no un error: si el perfil `rael` es a propósito, declara `[profile.rael]
 y el aviso desaparece.
 
 ```
-agmen │ ⚠ [[node]] 'imu': profile = "rael" y ningún otro lugar nombra ese perfil. ¿Quisiste decir 'real'? Así, 'imu' solo corre con --profile rael. Si el perfil es a propósito, declara [profile.rael] y este aviso se quita
+agmen │ ⚠ [[node]] 'imu': profile = "rael" y ningún otro [[node]], [[mux]] o [[topic]] nombra ese perfil. ¿Quisiste decir 'real'? Así, 'imu' solo corre con --profile rael. Si el perfil es a propósito, declara [profile.rael] y este aviso se quita
 ```
 
 Reproducir y simular a la vez no tiene sentido: los dos quieren mandar el reloj.

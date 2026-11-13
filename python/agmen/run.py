@@ -245,15 +245,16 @@ def _typo_warnings(mentions: list[tuple[str, str, tuple[str, ...]]], tables) -> 
         for p in profiles:
             if p in PROFILES or p in tables or count[p] != 1:
                 continue
-            hint = difflib.get_close_matches(p, PROFILES, n=1, cutoff=0.7)
+            hint = difflib.get_close_matches(p, PROFILES, n=3, cutoff=0.7)
             if not hint:
                 continue
+            meant = " o ".join(f"'{h}'" for h in hint)   # "rela" se parece a real y a replay: se dicen los dos
             verb = "se espera" if where.startswith("[[topic]]") else "corre"
             so = (f"Así, '{name}' solo {verb} con --profile {p}" if len(profiles) == 1
                   else f"Así, '{name}' {verb} con --profile {p}"
-                  + (f" y no con --profile {hint[0]}" if hint[0] not in profiles else ""))
-            out.append(f"{where}: profile = \"{p}\" y ningún otro lugar nombra ese perfil. "
-                       f"¿Quisiste decir '{hint[0]}'? {so}. Si el perfil es a propósito, declara "
+                  + (f" y no con --profile {hint[0]}" if len(hint) == 1 and hint[0] not in profiles else ""))
+            out.append(f"{where}: profile = \"{p}\" y ningún otro [[node]], [[mux]] o [[topic]] nombra ese "
+                       f"perfil. ¿Quisiste decir {meant}? {so}. Si el perfil es a propósito, declara "
                        f"[profile.{p}] y este aviso se quita")
     return out
 
