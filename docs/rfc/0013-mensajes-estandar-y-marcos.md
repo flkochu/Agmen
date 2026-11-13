@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Estado** | 📝 **Propuesto** (2026-11-13). Sin implementar. Faltan las decisiones de la [sección 5](#5-decisiones) (D1–D18) |
-| **Depende de** | RFC 0001 (sobre v1, `compact` y `arrow`), RFC 0005 (archivos `.agmen`), RFC 0006 (el reloj de Agmen y los grupos de un nodo), RFC 0008 (datos grandes; D4: los mismos campos que Foxglove), RFC 0010 (grabaciones), RFC 0011 (`robot.toml` con perfiles; el mundo de MuJoCo), RFC 0012 (`[[mux]]`) |
+| **Depende de** | RFC 0001 (sobre v1, `compact` y `arrow`), RFC 0004 (el hub y su protocolo `agmen-hub/1`), RFC 0005 (archivos `.agmen`), RFC 0006 (el reloj de Agmen y los grupos de un nodo), RFC 0008 (datos grandes; D4: los mismos campos que Foxglove), RFC 0010 (grabaciones), RFC 0011 (`robot.toml` con perfiles; el mundo de MuJoCo), RFC 0012 (`[[mux]]`) |
 | **Versión** | Por decidir (D1). Si D1 = a: Agmen 0.15.0, después del nivel 10 |
 | **Requisitos** | a (datos grandes sin copias), c (grabaciones que sirven como datasets), d (misma interfaz en simulación y en el robot real), f (microcontroladores) |
 
@@ -13,10 +13,17 @@ Este RFC **no cambia el formato de los mensajes**: no toca el sobre, ni
 (`/frames`), `nan` como valor por defecto en el lenguaje `.agmen` y una
 biblioteca para consultar marcos.
 
-Dos opciones tocan algo más, y por eso se dicen aquí: declarar al hub los
-nombres de las articulaciones agrega **un campo opcional al protocolo de
-control del hub** (D6, opción d, la recomendada), y los tipos con tamaño `<N>`
-cambian **el lenguaje `.agmen`** (D5, opción a, no recomendada).
+Tres cosas tocan algo más que los mensajes, y por eso se dicen aquí:
+
+- Declarar al hub los nombres de las articulaciones agrega **un campo opcional
+  al protocolo de control del hub** (`agmen-hub/1`, RFC 0004). Es D6, opción
+  d, la recomendada. Este RFC se pidió sin cambios en la red: aceptar esa
+  opción es una excepción que Adán tiene que aprobar a propósito. Sin ella,
+  D6 = a no toca nada.
+- Comparar el árbol entre dos computadoras agrega **un dato a la conexión del
+  agente** (`agmen-agent/1`, RFC 0011, todavía sin implementar) (§3.7).
+- Los tipos con tamaño `<N>` cambian **el lenguaje `.agmen`** (D5, opción a,
+  no recomendada).
 
 ## 1. El problema
 
@@ -238,8 +245,11 @@ message ComandoArticulaciones<N> {    # 20·N bytes: 240 B con 12
 
 Con la opción recomendada de D5 (**sin cambiar el lenguaje**), cada robot
 tiene esos dos mensajes en su `.agmen`, con su número ya puesto. Los escribe
-un comando (`agmen gen --joints 12`; el nombre exacto se fija al implementar)
-o se copian: son diez líneas.
+**siempre un comando** (`agmen gen --joints 12`; el nombre exacto se fija al
+implementar), no se copian a mano: los valores por defecto no viajan, así que
+un archivo copiado sin `= nan` daría el mismo `schema_id` y un comando que
+empieza en ceros. Por eso `agmen gen` revisa que un tipo que se llama como uno
+estándar tenga sus campos y sus valores por defecto, y si no, lo dice.
 
 ```
 # patas.agmen
@@ -291,6 +301,10 @@ pub.publish(Cmd(position=objetivo))        # lo demás, por defecto
   valores por defecto, quien llena solo `position` obtiene lo que espera: un
   control de posición con esas ganancias. **Los ceros no son un valor por
   defecto**: `kp = kd = 0` es par puro, y un robot de patas se cae.
+- Un microcontrolador no lee `robot.toml` ni `/frames`: su agente en la
+  computadora (`agmen-micro`, nivel 12) cambia los `NaN` por las ganancias de
+  `[[joints]]` antes de pasarle el comando. Si `[[joints]]` no declara
+  ganancias, se usan las del driver y se avisa una vez.
 - **Las ganancias no pueden ser distintas en simulación y en real sin que
   nadie lo diga.** Cada puente y cada driver dice al arrancar qué ganancias
   aplica. Si no puede aplicar las de `[[joints]]` (un servo de hobby solo
@@ -332,14 +346,20 @@ names = ["FR_hip", "FR_thigh", "FR_calf",      # ESTE es el orden, en todos lado
   (`names=[...]`). Va al hub en el registro del topic, que ya se manda una vez
   por segundo: **cero bytes por mensaje**. `agmen run` le pasa al hub la lista
   de `[[joints]]`. Si dos listas del mismo topic no coinciden, el hub
-  **rechaza el registro** y lo dice, igual que hoy con dos tipos distintos:
+  **rechaza el registro** y lo dice:
   `'/patas/cmd': 'politica' declara FR_hip, FR_thigh… y robot.toml dice FL_hip, FL_thigh…`.
-  El robot no se mueve con el orden cambiado, en vez de caerse.
+  El robot no se mueve con el orden cambiado, en vez de caerse. Hoy el hub ya
+  rechaza a un nodo cuyo tipo no coincide con el de otro nodo; contra lo que
+  dice `robot.toml` hoy solo avisa. Rechazar también contra `robot.toml` es
+  una regla nueva, y se propone solo para los nombres de las articulaciones.
 - Quien no declara nada (`agmen topic echo`, la grabadora) entra como hoy.
   `robot.toml` puede exigir la lista a quien publique el comando
   (`require_names = true` en `[[joints]]`).
 - El costo: un campo opcional nuevo en el registro del hub (`agmen-hub/1`), en
-  Python y en C++. Un hub anterior lo ignora. No cambia los mensajes.
+  Python y en C++. No cambia los mensajes. Un hub anterior lo ignora, y
+  entonces **no compara**: para que eso no pase en silencio, `agmen run` avisa
+  si el hub de alguna computadora es anterior, y el hub nuevo avisa cuando un
+  nodo publica en un topic de `[[joints]]` sin declarar su lista.
 - Guardar la lista junto con los pesos de una política es de `agmen-learn`
   (nivel 13).
 - `[[joints]]` y `[[frame]]` aceptan `profile`, como `[[node]]` y `[[topic]]`
@@ -522,6 +542,14 @@ model = "../sim/robot.xml"     # MJCF o URDF
 - `agmen run` lee del modelo, **cada vez que arranca**: los cuerpos (cada uno
   es un marco), dónde está cada articulación, su eje y su tipo, y las cámaras
   y sensores que el modelo declare. No se copia nada a `robot.toml`.
+- **Las cámaras de MuJoCo miran hacia −z, con y hacia arriba**, y la imagen se
+  mide con z al frente y y hacia abajo (§3.2). Cada cámara del modelo da dos
+  marcos: el suyo, tal cual, y `<nombre>_optical`, girado media vuelta sobre
+  x. Se prueba con una imagen de verdad.
+- **Lo que no cabe en "un eje por marco" no se adivina**: una articulación
+  libre (el cuerpo de un robot de patas) es un marco por topic, y hay que
+  decir cuál; una articulación de bola, o dos articulaciones en un mismo
+  cuerpo, son un error que pide un `[[frame]]` explícito.
 - En `robot.toml` queda solo lo que el modelo no sabe: qué topic mueve a
   `base_link`, los marcos `map` y `odom`, el marco de cada topic, y lo que no
   esté en el modelo.
@@ -529,10 +557,12 @@ model = "../sim/robot.xml"     # MJCF o URDF
   `override = true`.
 - Los nombres de `[[joints]]` deben existir en el modelo: se revisa al
   arrancar, no cuando el robot ya se movió.
-- Un URDF es XML y se lee con la biblioteca estándar de Python. Un MJCF tiene
-  valores por defecto, archivos incluidos y varias formas de escribir un giro:
-  se lee con el paquete `mujoco` (el de `agmen[sim]`, RFC 0011), y si no está
-  instalado el error dice cómo instalarlo.
+- Un URDF es XML y se lee con la biblioteca estándar de Python (un `xacro` hay
+  que convertirlo antes a URDF). Un MJCF tiene valores por defecto, archivos
+  incluidos y varias formas de escribir un giro: se lee con el paquete
+  `mujoco` (el de `agmen[sim]`, RFC 0011), y si no está instalado el error
+  dice cómo instalarlo. Eso incluye a la computadora del robot real, aunque
+  ahí no corra ninguna simulación.
 - Solo se lee la cinemática. Las mallas y la apariencia siguen siendo del
   visualizador (§4).
 
@@ -626,7 +656,8 @@ message Marcos {
 - **Dos copias de `robot.toml`** (la laptop y el robot): `Marcos.version`
   resume todo el árbol y los nombres. Al conectarse, el agente compara la suya
   con la de `agmen run`, además de lo que ya compara (RFC 0011 D7), y si son
-  distintas no arranca:
+  distintas no arranca (es un dato nuevo en la conexión del agente; con D18,
+  el agente también lee el modelo para calcularla):
   `robot: su robot.toml tiene otros marcos u otras articulaciones. Haz git pull en el robot`.
 - **Grabaciones**: `/frames` se graba como cualquier topic, así que una
   grabación trae su árbol, sus nombres de articulaciones y sus marcos adentro
@@ -812,7 +843,7 @@ los tres lugares. Lo que cambia entre simulación y real es el nodo marcado con
 
 ## 5. Decisiones
 
-Todas pendientes; las decide Adán. La recomendada está en su columna: casi siempre (a); en D5 y D6 es otra, porque esas opciones se agregaron después de la primera lectura.
+Todas pendientes; las decide Adán. La recomendada está en su columna: casi siempre (a); en D5, D6 y D14 es otra, porque cambiaron después de la primera lectura. Los ejemplos de la sección 3 usan los nombres en español de la opción (a) de D14; con (b) cambian los nombres de los tipos y nada más.
 
 | # | Pregunta | Opciones | Recomendada | Por qué |
 |---|---|---|---|---|
@@ -829,11 +860,11 @@ Todas pendientes; las decide Adán. La recomendada está en su columna: casi sie
 | **D11** | ¿Cómo se consulta y qué pasa cuando no se puede contestar? | (a) **Un resultado con su motivo** (§3.8); `at=` obligatorio y `LATEST` explícito con su edad; 10 s de historial; interpolar entre dos muestras, sin extrapolar; `hold_ms` declarado para los marcos lentos; `lookup` nunca espera y `@frames.on` espera con tope; una muestra que retrocede más de 1 s vacía el historial de su marco, (b) como tf2: una excepción, tiempo cero = lo último, y `lookup` con espera, (c) siempre lo último, sin tiempo | **(a)** | Es la regla 1 aplicada al error más famoso de ROS. (b) es conocido para quien viene de ROS, pero el tiempo cero entrega datos viejos sin decirlo, y esperar dentro de un callback detiene al nodo. (c) es lo más simple y está mal para cualquier sensor en un robot que se mueve: usa la posición de ahora con el dato de hace 80 ms |
 | **D12** | ¿Dónde vive la biblioteca de marcos? | (a) **Un módulo aparte dentro del mismo paquete**, en los tres lenguajes: `agmen.frames` (Python), `<agmen/frames.hpp>` con su propia biblioteca de CMake (C++) y un módulo de JavaScript para el panel; `Node` no cambia, (b) dentro de `Node` (`@node.on(..., frame="odom")`, `node.lookup(...)`), (c) un paquete aparte (`pip install agmen-frames`) | **(a)** | El núcleo sigue sin saber qué es un marco (regla 2), pero se instala y se versiona junto con Agmen: un `pip install` y un CMake. Son tres implementaciones de las mismas cuentas, y se mantienen iguales con vectores de prueba compartidos, como el formato. (b) es lo más cómodo de escribir, pero mete geometría en el núcleo. (c) es lo más limpio, y obliga a mantener dos versiones que deben coincidir |
 | **D13** | ¿Los mensajes llevan incertidumbre (covarianzas)? | (a) **No por ahora.** Cuando un consumidor las use (un filtro que mezcle sensores), tipos aparte: `OdometriaConCovarianza`, (b) siempre, como ROS: dos matrices de 36 `f64` en la odometría, (c) solo la diagonal (6 `f32`) | **(a)** | En ROS son 576 de los 720 bytes de una odometría, la propia documentación de `robot_localization` pide que los usuarios "pongan bien las covarianzas" porque suelen venir en cero, y un microcontrolador no las calcula. Agregar un tipo después no rompe nada. (c) parece un buen punto medio, pero se pierde justo lo que un filtro necesita |
-| **D14** | ¿En qué idioma van los nombres? | (a) **Tipos en español** (`Odometria`, `EscaneoLaser`, como `Imagen`); **campos en inglés, iguales a Foxglove y ROS** (`position`, `velocity`, como `width` en `Imagen`); tablas y claves de `robot.toml` en inglés, como hoy (`[[frame]]`, `[[joints]]`, una tabla por grupo); la biblioteca en inglés, como `Node` (`Frames`, `lookup`); marcos recomendados `map`, `odom`, `base_link` y el sufijo `_optical` (REP-105 y 103), (b) igual, pero los tipos en inglés (`Odometry`, `LaserScan`, `JointState`), (c) todo en español (`posicion`, `velocidad`; marcos `mapa`, `base`) | **(a)** si la comunidad que se busca habla español; **(b)** si se quiere que lo use gente de fuera | **Es la más difícil de deshacer**: el nombre del tipo es parte del texto canónico y del `schema_id` (RFC 0001 §5), así que renombrarlo después lo vuelve incompatible con los nodos y con las grabaciones anteriores. Los campos, las claves de `robot.toml`, la documentación y los errores se pueden cambiar o traducir después; el nombre del tipo, no. Hoy ya hay de los dos: `Imagen`, `ImagenComprimida` y `MuxEstado` en español; `Clock`, `ImuSample` y `MotorCommand` en inglés. (a) sigue a `Imagen` y a un proyecto escrito en español. (b) deja los tipos con el mismo nombre que en Foxglove (`LaserScan` → `foxglove.LaserScan`) y no cierra la puerta a usuarios de otros idiomas; `Imagen` se quedaría como está o se renombraría en una versión que rompa. (c) rompe el criterio del RFC 0008 D4 y obliga al puente a traducir cada campo |
+| **D14** | ¿En qué idioma van los nombres? | (a) **Tipos en español** (`Odometria`, `EscaneoLaser`, como `Imagen`); **campos en inglés, iguales a Foxglove y ROS** (`position`, `velocity`, como `width` en `Imagen`); tablas y claves de `robot.toml` en inglés, como hoy (`[[frame]]`, `[[joints]]`, una tabla por grupo); la biblioteca en inglés, como `Node` (`Frames`, `lookup`); marcos recomendados `map`, `odom`, `base_link` y el sufijo `_optical` (REP-105 y 103), (b) igual, pero los tipos en inglés (`Odometry`, `LaserScan`, `JointState`), (c) todo en español (`posicion`, `velocidad`; marcos `mapa`, `base`) | **(b)** | **Es la más difícil de deshacer**: el nombre del tipo es parte del texto canónico y del `schema_id` (RFC 0001 §5), así que renombrarlo después lo vuelve incompatible con los nodos y con las grabaciones anteriores. Los campos, las claves de `robot.toml`, la documentación y los errores se pueden cambiar o traducir después; el nombre del tipo, no. Hoy ya hay de los dos: `Imagen`, `ImagenComprimida` y `MuxEstado` en español; `Clock`, `ImuSample` y `MotorCommand` en inglés. Se recomienda (b) porque es la que menos se puede lamentar: si después la comunidad resulta ser solo de habla hispana, el costo es leer `LaserScan` junto a `Publisher`, `Node` y `position`, que ya están en inglés; si se elige (a) y después se quiere gente de fuera, no hay vuelta sin romper. (b) deja además los tipos con el mismo nombre que en Foxglove (`LaserScan` → `foxglove.LaserScan`); `Imagen`, `ImagenComprimida` y `MuxEstado` se quedarían como están o se renombrarían en una versión que rompa. (a) sigue a `Imagen` y a un proyecto escrito en español: es la mejor si Agmen es, a propósito, para una comunidad que habla español. Eso solo lo sabe Adán. (c) rompe el criterio del RFC 0008 D4 y obliga al puente a traducir cada campo |
 | **D15** | ¿Qué pasa con `ImuSample`? | (a) **Se agrega `Imu`** (orientación, giro y aceleración en `f32`, 40 B) como mensaje estándar; `ImuSample` se queda como está, para el tutorial, (b) `ImuSample` es el estándar y solo se documentan sus unidades, (c) `Imu` reemplaza a `ImuSample` en el tutorial | **(a)** | Una política necesita la orientación (hacia dónde está la gravedad) y muchas IMU ya la entregan; `ImuSample` solo trae aceleración y giro. No se toca el nivel 0 ni el tutorial. (b) no agrega nada, pero deja a cada política calculando la orientación por su cuenta, distinto en cada robot. (c) se puede hacer después, al reescribir el tutorial con los mensajes estándar |
 | **D16** | ¿Cómo es una trayectoria de articulaciones? | (a) **Un tensor `[T, N]`** por magnitud (`positions`, `velocities`…), con `time_from_start` de T instantes, (b) una lista de puntos, cada uno con sus arreglos, como `trajectory_msgs/JointTrajectory` | **(a)** | Llega a NumPy y a PyTorch sin copiar, y es la misma forma que el bloque de acciones que saca una política de imitación. (b) es lo que espera un puente con ROS, que puede convertirlo |
 | **D17** | ¿Cómo es un mapa de ocupación? | (a) **Una `Rejilla` (los campos de `foxglove.Grid`) con un campo `occupancy` `INT8`: −1 no se sabe, 0 libre, 100 ocupado**, (b) lo mismo con 0 libre, 1 ocupado y −1 no se sabe (lo que el `.msg` de ROS llama "frecuente"), (c) un tipo propio `MapaDeOcupacion` con resolución, ancho, alto y datos, como `nav_msgs/OccupancyGrid` | **(a)** | Foxglove lo dibuja tal cual, y los valores son los que usa Nav2, así que un puente no convierte nada. (b) pierde el "quizá ocupado". (c) es más fácil de leer, pero es un tipo más que Foxglove no conoce |
-| **D18** | Si el robot ya tiene un modelo (MJCF o URDF), ¿de dónde sale el árbol de marcos? | (a) **Del modelo, cada vez que arranca**: `[robot] model = "robot.xml"`; `robot.toml` solo agrega lo que el modelo no sabe, y contradecirlo es un error (§3.6), (b) un comando que lee el modelo **una vez** y escribe las tablas `[[frame]]` en `robot.toml`, (c) siempre a mano en `robot.toml` | **(a)** | El árbol ya existe en el modelo que usa el simulador: con (a) hay una sola fuente y no se pueden separar. (b) es más fácil de hacer y de leer, pero el día que cambie el modelo, `robot.toml` se queda viejo sin que nadie lo note. (c) es escribir dos veces lo mismo. El costo de (a): leer un MJCF bien pide el paquete `mujoco` (el URDF no pide nada), y mete en este RFC una parte de "leer el modelo" que iba con el visualizador |
+| **D18** | Si el robot ya tiene un modelo (MJCF o URDF), ¿de dónde sale el árbol de marcos? | (a) **Del modelo, cada vez que arranca**: `[robot] model = "robot.xml"`; `robot.toml` solo agrega lo que el modelo no sabe, y contradecirlo es un error (§3.6), (b) un comando que lee el modelo **una vez** y escribe las tablas `[[frame]]` en `robot.toml`, (c) siempre a mano en `robot.toml` | **(a)** | El árbol ya existe en el modelo que usa el simulador: con (a) hay una sola fuente y no se pueden separar. (b) es más fácil de hacer y de leer, pero el día que cambie el modelo, `robot.toml` se queda viejo sin que nadie lo note. (c) es escribir dos veces lo mismo. El costo de (a): leer un MJCF bien pide el paquete `mujoco` en cada computadora que arranque nodos, también en la del robot real (el URDF no pide nada), y mete en este RFC una parte de "leer el modelo" que iba con el visualizador |
 
 ## 6. Las partes difíciles
 
