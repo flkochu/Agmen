@@ -195,6 +195,198 @@ class TestSimClock(unittest.TestCase):
         self.assertAlmostEqual(clock.now_ns() / 1e9, time.time(), delta=0.5)
 
 
+_MS = 1_000_000
+
+
+class TestMonoJumps(unittest.TestCase):
+    """clock.mono_jumps() -> (t, jumped): el tiempo que llegó de golpe."""
+
+    def tearDown(self):
+        clock.configure(clock.REAL)
+
+    def test_real_vale_cero(self):
+        clock.configure(clock.REAL)
+        t, j = clock.mono_jumps()
+        self.assertEqual(j, 0)
+        self.assertAlmostEqual(t / 1e9, time.monotonic(), delta=0.5)
+        time.sleep(0.02)
+        self.assertEqual(clock.mono_jumps()[1], 0)
+
+    def test_paso_en_pausa_sube_exacto(self):
+        clock.configure(clock.SIM, listen=False)
+        clock.update(Clock(t=1_000_000_000, speed=1.0, paused=True))
+        t0, j0 = clock.mono_jumps()
+        self.assertEqual(t0, 1_000_000_000)
+        for k in range(1, 6):
+            clock.update(Clock(t=1_000_000_000 + k * 100 * _MS, speed=1.0, paused=True))
+            t, j = clock.mono_jumps()
+            self.assertEqual(t, 1_000_000_000 + k * 100 * _MS)
+            self.assertEqual(j - j0, k * 100 * _MS)
+
+    def test_primer_clock_cuenta_como_salto(self):
+        # "sin /clock" -> el primer /clock llega de golpe.
+        clock.configure(clock.SIM, listen=False)
+        j0 = clock.mono_jumps()[1]
+        clock.update(Clock(t=7_000_000_000, speed=1.0, paused=False))
+        t, j = clock.mono_jumps()
+        self.assertGreaterEqual(t, 7_000_000_000)
+        self.assertEqual(j - j0, 7_000_000_000)
+
+    def test_corriendo_no_sube(self):
+        clock.configure(clock.SIM, listen=False)
+        clock.update(Clock(t=1_000_000_000, speed=1.0, paused=True))
+        clock.update(Clock(t=clock.mono_ns(), speed=1.0, paused=False))   # reanudar sin avanzar
+        j0 = clock.mono_jumps()[1]
+        for speed in (1.0, 1000.0, 2.0):
+            for _ in range(5):
+                now = clock.mono_ns()
+                clock.update(Clock(t=now + 3 * _MS, speed=speed, paused=False))   # corrección de la interpolación
+                time.sleep(0.005)
+            self.assertEqual(clock.mono_jumps()[1], j0, speed)
+
+    def test_stepped_no_sube(self):
+        clock.configure(clock.SIM, stepped=True, listen=False)
+        clock.update(Clock(t=1_000_000_000))
+        j0 = clock.mono_jumps()[1]
+        clock.update(Clock(t=1_500_000_000))
+        clock.update(Clock(t=2_000_000_000, paused=True))
+        self.assertEqual(clock.mono_jumps()[0], 2_000_000_000)
+        self.assertEqual(clock.mono_jumps()[1], j0)
+
+    def test_nunca_baja(self):
+        clock.configure(clock.SIM, listen=False)
+        clock.update(Clock(t=1_000_000_000, speed=1.0, paused=True))
+        last = clock.mono_jumps()[1]
+        seq = [Clock(t=1_100_000_000, paused=True), Clock(t=500_000_000, paused=True),      # hacia atrás
+               Clock(t=1_100_000_000, paused=True), Clock(t=1_300_000_000, paused=True),
+               Clock(t=0, speed=1.0, paused=False), Clock(t=1_400_000_000, speed=1.0, paused=True)]
+        for m in seq:
+            clock.update(m)
+            j = clock.mono_jumps()[1]
+            self.assertGreaterEqual(j, last, m)
+            last = j
+        # lo que saltó de verdad: 100 + 200 ms (+ el que llegó al volver a pausa)
+        self.assertGreaterEqual(last, 300 * _MS)
+
+
+class TestSaltoNoEsAtraso(unittest.TestCase):
+    """Un salto del reloj (el botón *paso* del panel) no es atraso del nodo."""
+
+    def tearDown(self):
+        clock.configure(clock.REAL)
+
+    def _spin(self, node, seconds):
+        th = threading.Thread(target=node.spin_for, args=(seconds,), daemon=True)
+        th.start()
+        return th
+
+    def test_pasos_en_pausa_no_cuentan(self):
+        clock.configure(clock.SIM, listen=False)
+        t = 1_000_000_000
+        clock.update(Clock(t=t, speed=1.0, paused=True))
+        node = agmen.Node("pasos")
+        n = [0]
+        node.every(0.01, lambda: n.__setitem__(0, n[0] + 1))
+        th = self._spin(node, 4.0)
+        time.sleep(0.3)                       # arrancó y espera: el reloj está en pausa
+        self.assertEqual(n[0], 0)
+        per_step = []
+        for _ in range(5):
+            before = n[0]
+            t += 100 * _MS
+            clock.update(Clock(t=t, speed=1.0, paused=True))
+            time.sleep(0.3)
+            per_step.append(n[0] - before)
+        st = node.timers()[0]
+        self.assertEqual(per_step, [2] * 5, per_step)           # 2 por paso, como antes
+        self.assertEqual(st.skipped, 0, st)
+        self.assertEqual(st.late, 0, st)
+        self.assertEqual(st.worst_late_ns, 0, st)
+        self.assertEqual(st.runs, 10, st)
+
+        # Reanuda con una función de 30 ms (periodo 10 ms): ESO sí es atraso.
+        slow = [False]
+
+        def tick():
+            n[0] += 1
+            if slow[0]:
+                time.sleep(0.03)
+
+        node.stop()
+        th.join(5)
+        node.close()
+        clock.update(Clock(t=t, speed=1.0, paused=True))
+        node2 = agmen.Node("lento")
+        node2.every(0.01, tick)
+        th2 = self._spin(node2, 1.5)
+        time.sleep(0.2)
+        t += 100 * _MS
+        clock.update(Clock(t=t, speed=1.0, paused=True))     # un paso: no cuenta
+        time.sleep(0.3)
+        st = node2.timers()[0]
+        self.assertEqual(st.skipped, 0, st)
+        slow[0] = True
+        clock.update(Clock(t=t, speed=1.0, paused=False))    # reanudar
+        th2.join(5)
+        st = node2.timers()[0]
+        self.assertGreater(st.skipped, 5, st)
+        self.assertGreater(st.late, 0, st)
+
+    def test_atraso_de_verdad_despues_de_un_salto(self):
+        clock.configure(clock.SIM, listen=False)
+        t = 1_000_000_000
+        clock.update(Clock(t=t, speed=1.0, paused=True))
+        node = agmen.Node("lento")
+        slow = [False]
+
+        def tick():
+            if slow[0]:
+                time.sleep(0.05)
+
+        node.every(0.01, tick)
+        th = self._spin(node, 2.0)
+        time.sleep(0.2)
+        t += 100 * _MS
+        clock.update(Clock(t=t, speed=1.0, paused=True))
+        time.sleep(0.3)
+        base = node.timers()[0].skipped
+        self.assertEqual(base, 0)
+        slow[0] = True
+        clock.update(Clock(t=t, speed=1.0, paused=False))
+        th.join(5)
+        self.assertGreater(node.timers()[0].skipped, 5, node.timers()[0])
+
+    def test_reloj_real_funcion_lenta(self):
+        clock.configure(clock.REAL)
+        node = agmen.Node("real")
+        node.every(0.01, lambda: time.sleep(0.03))
+        node.spin_for(0.6)
+        st = node.timers()[0]
+        self.assertGreater(st.skipped, 5, st)
+        self.assertGreater(st.late + st.skipped, 0)
+
+    def test_aviso_de_ciclos_saltados(self):
+        import contextlib
+        import io
+
+        clock.configure(clock.SIM, listen=False)
+        t = 1_000_000_000
+        clock.update(Clock(t=t, speed=1.0, paused=True))
+        node = agmen.Node("avisa")
+        node.every(0.01, lambda: None)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            th = self._spin(node, 2.6)
+            time.sleep(0.2)
+            for _ in range(5):
+                t += 100 * _MS
+                clock.update(Clock(t=t, speed=1.0, paused=True))
+                time.sleep(0.1)
+            time.sleep(1.5)                  # que pase la ventana de 1 s del aviso
+            th.join(5)
+        self.assertNotIn("ciclos saltados", out.getvalue())
+
+
 class TestLatestDomainWarning(unittest.TestCase):
     def test_warns_once_on_other_clock(self):
         import contextlib

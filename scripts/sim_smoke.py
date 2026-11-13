@@ -372,6 +372,7 @@ def prueba_sim() -> str:
         print("\n== d) reloj: pausa, paso, ×2 ==", flush=True)
         c = ws.connect(f"ws://{HTTP}/ws", protocols=["agmen.ws.v1"])
         c.sock.settimeout(5)
+        lineas_pausa = len(run.lines)   # desde aquí hasta reanudar: pausa y pasos (no debe salir ningún aviso de atraso)
         ws_op(c, action="pause")
         check("el panel muestra la pausa", wait_for(lambda: get_state()["clock"]["paused"], 5), str(get_state()["clock"]))
         time.sleep(0.8)   # lo que ya venía en camino
@@ -394,6 +395,14 @@ def prueba_sim() -> str:
         check("…y el mundo publicó ~10 /imu en ese paso (uno por cada 10 ms simulados, cada uno con su hora)",
               8 <= len(imu.items) - n0 <= 12, f"{len(imu.items) - n0}")
         check("…y se queda otra vez en pausa", get_state()["clock"]["paused"])
+        for _ in range(4):   # más pasos, como quien aprieta el botón varias veces
+            ws_op(c, action="step", value=0.1)
+            time.sleep(0.5)
+        time.sleep(1.5)      # los avisos de los nodos salen una vez por segundo
+        en_pasos = [l for l in list(run.lines)[lineas_pausa:] if "no llega" in l or "ciclos saltados" in l]
+        check("pausa y 5 pasos: ni '⚠ … no llega desde hace' ni 'ciclos saltados' (un salto del reloj no es atraso)",
+              not en_pasos, "\n".join(en_pasos[:5]))
+        check("…y se queda en pausa tras los pasos", get_state()["clock"]["paused"])
 
         ws_op(c, action="speed", value=2.0)
         ws_op(c, action="resume")
