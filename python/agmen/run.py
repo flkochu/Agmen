@@ -776,11 +776,13 @@ class Node:
     def _resolve_program(self, cwd: Path) -> list[str]:
         """Rutas relativas ('../../build/bin/motor') se toman respecto a robot.toml
         en TODOS los sistemas (en Windows, por defecto se resolverían desde donde
-        corres agmen) y se agrega '.exe' en Windows si hace falta."""
+        corres agmen) y se agrega '.exe' en Windows si hace falta. La ruta se usa
+        tal cual, SIN seguir enlaces simbólicos: el 'python' de un entorno
+        virtual es un enlace al del sistema, y si se sigue, se pierde el venv."""
         args = list(self.cfg.cmd)
         prog = args[0]
         if ("/" in prog or "\\" in prog) and not os.path.isabs(prog):
-            path = (cwd / prog).resolve()
+            path = Path(os.path.abspath(cwd)) / prog   # sin resolve(): seguiría los enlaces
             if os.name == "nt" and not path.suffix and path.with_suffix(".exe").exists():
                 path = path.with_suffix(".exe")
             args[0] = str(path)
