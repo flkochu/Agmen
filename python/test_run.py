@@ -217,10 +217,72 @@ class TestPerfiles(unittest.TestCase):
         msg = self.assertConfigError('[robot]\nprofile = "mesa"\n' + ROBOT_RFC, "mesa")
         self.assertIn("[robot] profile", msg)
 
-    def test_robot_profile_desconocido_pero_argumento_valido(self):
-        # el argumento gana: el [robot] profile roto no se consulta
-        cfg = self.load('[robot]\nprofile = "mesa"\n' + ROBOT_RFC, "sim")
-        self.assertEqual(cfg.profile, "sim")
+    def test_robot_profile_desconocido_se_revisa_aunque_el_argumento_sea_valido(self):
+        # RFC 0011 (corrección B): [robot] profile se valida SIEMPRE, también con --profile / --sim
+        msg = self.assertConfigError('[robot]\nprofile = "mesa"\n' + ROBOT_RFC, "[robot] profile = 'mesa'", profile="sim")
+        self.assertIn("no existe", msg)
+        self.assertConfigError('[robot]\nprofile = "siim"\n' + ROBOT_RFC, "¿Quisiste decir 'sim'?", profile="sim")
+        self.assertConfigError('[robot]\nprofile = "con espacio"\n' + ROBOT_RFC, "[robot] profile", profile="real")
+        self.assertConfigError('[robot]\nprofile = 3\n' + ROBOT_RFC, "[robot] profile", profile="sim")
+
+    def test_robot_profile_valido_el_argumento_gana(self):
+        cfg = self.load('[robot]\nprofile = "sim"\n' + ROBOT_RFC, "real")
+        self.assertEqual(cfg.profile, "real")
+        self.assertEqual(self.names(cfg), ["imu", "motor", "cerebro"])
+
+    # B/D/G/E: correcciones de la tercera ronda
+    def test_web_de_arriba_se_revisa_aunque_el_perfil_traiga_su_web(self):
+        text = nodo("a") + '\n[web]\nhtpp = "127.0.0.1:8000"\n\n[profile.sim]\nweb = { open_browser = false }\n'
+        self.assertConfigError(text, "¿Quisiste decir 'http'?", profile="sim")
+        self.assertConfigError(text, "¿Quisiste decir 'http'?")
+        # y un [web] bueno de arriba con la tabla del perfil sigue valiendo
+        ok = nodo("a") + '\n[web]\nhttp = "127.0.0.1:8000"\n\n[profile.sim]\nweb = { open_browser = false }\n'
+        self.assertFalse(self.load(ok, "sim").web.open_browser)
+
+    def test_reloj_source_gramatica_singular_y_plural(self):
+        base = nodo("c")
+        un = nodo("gazebo", '"sim"') + base + '\n[clock]\nmode = "sim"\nsource = "gazebo"\n'
+        msg = self.assertConfigError(un, "es del perfil 'sim'", profile="real")
+        self.assertNotIn("de los perfiles", msg)
+        varios = nodo("gazebo", '["sim", "mesa2"]') + base + '\n[clock]\nmode = "sim"\nsource = "gazebo"\n'
+        msg = self.assertConfigError(varios, "es de los perfiles 'sim', 'mesa2'", profile="real")
+        self.assertNotIn("del perfiles", msg)
+
+    def test_clock_mode_replay_no_dice_que_play_pone_todos_en_replay(self):
+        msg = self.assertConfigError(nodo("a") + '\n[clock]\nmode = "replay"\n', "--play archivo.mcap")
+        self.assertNotIn("pone a todos los nodos en replay", msg)
+        self.assertNotIn("a todos los nodos", msg)
+
+    # C: aviso de error de dedo en un perfil
+    def test_aviso_perfil_parecido_a_real_con_un_solo_lugar(self):
+        cfg = self.load(nodo("a") + nodo("b", '"rael"'))
+        self.assertEqual(len(cfg.warnings), 1, cfg.warnings)
+        w = cfg.warnings[0]
+        for frag in ("[[node]] 'b'", "rael", "¿Quisiste decir 'real'?"):
+            self.assertIn(frag, w)
+        self.assertEqual(self.load(nodo("a") + nodo("b", '"rael"'), "sim").warnings, cfg.warnings,
+                         "sale sea cual sea el perfil activo")
+
+    def test_aviso_perfil_en_mux_y_topic(self):
+        mux = ('\n[[mux]]\nname = "m"\noutput = "127.0.0.1:7500"\nprofile = "rael"\n'
+               + '\n[[mux.input]]\nname = "t"\nlisten = "127.0.0.1:7510"\npriority = 10\n')
+        w = self.load(nodo("a") + mux).warnings
+        self.assertEqual(len(w), 1, w)
+        self.assertIn("[[mux]] 'm'", w[0])
+        topic = '\n[[topic]]\nname = "/x"\nprofile = "siim"\n'
+        w = self.load(nodo("a") + topic).warnings
+        self.assertEqual(len(w), 1, w)
+        self.assertIn("[[topic]] '/x'", w[0])
+        self.assertIn("¿Quisiste decir 'sim'?", w[0])
+
+    def test_sin_aviso_mesa_tabla_declarada_o_dos_lugares_o_sin_perfiles(self):
+        self.assertEqual(self.load(nodo("a") + nodo("b", '"mesa"')).warnings, [], "mesa no se parece")
+        self.assertEqual(self.load(nodo("a") + nodo("b", '"rael"') + '\n[profile.rael]\nlocal = true\n').warnings, [])
+        self.assertEqual(self.load(nodo("a") + nodo("b", '"rael"') + nodo("c", '"rael"')).warnings, [],
+                         "nombrado en dos lugares: parece a propósito")
+        self.assertEqual(self.load(nodo("a") + nodo("b", '"real"') + nodo("c", '"sim"')).warnings, [])
+        self.assertEqual(self.load(nodo("a")).warnings, [])
+        self.assertEqual(self.load(ROBOT_RFC).warnings, [])
 
     def test_robot_profile_nombre_invalido(self):
         self.assertConfigError('[robot]\nprofile = "con espacio"\n' + ROBOT_RFC, "[robot] profile")

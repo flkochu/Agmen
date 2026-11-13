@@ -353,6 +353,10 @@ class TestPerfilesEnLaLineaDeComandos(PlayCase):
         for flags in (["--sim"], ["--profile", "sim"]):
             r = self.agmen("run", self.toml, "--play", self.path, *flags)
             self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            # F: nombra lo que el usuario escribió, no la otra forma
+            escrito, otro = ("--sim", "--profile sim") if flags == ["--sim"] else ("--profile sim", "--sim")
+            self.assertIn(f"y {escrito} corre el simulador", r.stderr)
+            self.assertNotIn(f"y {otro} corre el simulador", r.stderr)
             self.assertIn("los dos quieren mandar el reloj", r.stderr)
             self.assertIn("Elige uno", r.stderr)
 
@@ -461,6 +465,91 @@ class TestPerfilesEnLaLineaDeComandos(PlayCase):
         self.assertIn("ARRANCO imu reloj=replay", out)
         self.assertIn("ARRANCO motor reloj=replay", out)
         self.assertIn("perfil real · reloj de la grabación", out)
+
+    # --- tercera ronda: A (aviso de nodos real con --play), C (perfil mal escrito), E (gramática)
+    AVISO_REAL = "⚠ corren nodos del perfil real con el reloj de la grabación"
+
+    def robot_mesa(self):
+        nodo = os.path.join(self.dir, "nodo.py")
+        return ('[robot]\nname = "r"\n\n'
+                + "".join(f"[[node]]\nname = \"{n}\"\nprofile = {p}\ncmd = ['python', '{nodo}', '{n}']\n\n"
+                          for n, p in (("imu", '"real"'), ("motor", '["real", "mesa"]'), ("cerebro", '"mesa"')))
+                + '[hub]\nenabled = false\n\n[web]\nenabled = false\n')
+
+    def test_play_siempre_dice_la_linea_del_perfil_y_con_real_avisa(self):
+        code, out = self.corre("--play", self.path, "--profile", "real",
+                               esperar=("ARRANCO imu", "ARRANCO motor", "ARRANCO cerebro"))
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out, r"perfil real · reloj de la grabación")
+        self.assertIn(self.AVISO_REAL + ": imu, motor.", out)
+
+    def test_play_sin_nodos_fuera_igual_dice_la_linea(self):
+        # robot sin perfiles: --play --profile real no deja nodos fuera, y la línea sale igual (A.1)
+        nodo = os.path.join(self.dir, "nodo.py")
+        self.write(f'[robot]\nname = "r"\n\n[[node]]\nname = "cerebro"\ncmd = [\'python\', \'{nodo}\', \'cerebro\']\n\n'
+                   f'[hub]\nenabled = false\n\n[web]\nenabled = false\n')
+        code, out = self.corre("--play", self.path, "--profile", "real")
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out, r"perfil real · reloj de la grabación")
+        self.assertNotIn(self.AVISO_REAL, out, "ningún nodo declara profile real")
+
+    def test_play_solo_no_avisa_de_nodos_real(self):
+        code, out = self.corre("--play", self.path)
+        self.assertEqual(code, 0, out)
+        self.assertIn("perfil replay · reloj de la grabación", out)
+        self.assertNotIn("⚠ corren nodos", out)
+
+    def test_play_con_skip_no_lista_los_quitados(self):
+        code, out = self.corre("--play", self.path, "--profile", "real", "--skip", "imu",
+                               esperar=("ARRANCO motor", "ARRANCO cerebro"))
+        self.assertEqual(code, 0, out)
+        self.assertIn(self.AVISO_REAL + ": motor.", out)
+        self.assertNotIn("ARRANCO imu", out)
+
+    def test_play_con_skip_de_todos_los_real_no_avisa(self):
+        code, out = self.corre("--play", self.path, "--profile", "real", "--skip", "imu", "--skip", "motor",
+                               esperar=("ARRANCO cerebro",))
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("⚠ corren nodos", out)
+
+    def test_play_con_perfil_mesa_avisa_si_un_nodo_incluye_real(self):
+        self.write(self.robot_mesa())
+        code, out = self.corre("--play", self.path, "--profile", "mesa",
+                               esperar=("ARRANCO motor", "ARRANCO cerebro"))
+        self.assertEqual(code, 0, out)
+        self.assertIn(self.AVISO_REAL + ": motor.", out)
+        self.assertNotIn("ARRANCO imu", out)
+
+    def test_play_con_perfil_mesa_sin_nodos_real_no_avisa(self):
+        self.write(self.robot_mesa().replace('profile = ["real", "mesa"]', 'profile = "mesa"'))
+        code, out = self.corre("--play", self.path, "--profile", "mesa", esperar=("ARRANCO motor",))
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("⚠ corren nodos", out)
+
+    def test_perfil_mal_escrito_avisa_en_la_terminal_sin_ser_error(self):
+        self.write(self.robot() + "\n[[node]]\nname = \"extra\"\nprofile = \"rael\"\n"
+                   f"cmd = ['python', '{os.path.join(self.dir, 'nodo.py')}', 'extra']\n")
+        for flags in ((), ("--sim",)):   # sale sea cual sea el perfil activo
+            code, out = self.corre(*flags)
+            self.assertEqual(code, 0, out)
+            self.assertRegex(out, r"⚠ \[\[node\]\] 'extra'.*rael.*¿Quisiste decir 'real'\?")
+            self.assertNotIn("ARRANCO extra", out)
+
+    def test_perfil_inventado_normal_no_avisa(self):
+        self.write(self.robot_mesa())
+        code, out = self.corre("--profile", "mesa", esperar=("ARRANCO cerebro",))
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("Quisiste decir", out)
+
+    def test_skip_gramatica_singular_y_plural(self):
+        self.write(self.robot_mesa() + "\n[[node]]\nname = \"mundo\"\nprofile = \"sim\"\n"
+                   f"cmd = ['python', '{os.path.join(self.dir, 'nodo.py')}', 'mundo']\n")
+        code, out = self.corre("--sim", "--skip", "motor", esperar=("ARRANCO mundo",))
+        self.assertEqual(code, 0, out)
+        self.assertIn("--skip motor: no hace falta, 'motor' es de los perfiles real, mesa y no corre en el perfil 'sim'", out)
+        code, out = self.corre("--sim", "--skip", "imu", esperar=("ARRANCO mundo",))
+        self.assertIn("--skip imu: no hace falta, 'imu' es del perfil real y no corre en el perfil 'sim'", out)
+        self.assertNotIn("de los perfil real", out)
 
 
 class TestRelojReplay(unittest.TestCase):

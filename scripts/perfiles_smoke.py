@@ -274,6 +274,7 @@ def main():
         check("d) /api/state dice profile = replay", get_state()["profile"] == "replay", str(get_state().get("profile")))
         check("d) el reloj del panel es el de la grabación (replay)", get_state()["clock"]["mode"] == "replay",
               str(get_state()["clock"]))
+        check("d) /api/state dice playing = true", get_state().get("playing") is True, str(get_state().get("playing")))
     finally:
         out = stop(p)
         outs.append(out)
@@ -283,6 +284,8 @@ def main():
     check("d) línea del perfil: replay, reloj de la grabación, no corren imu, motor y mundo",
           re.search(r"perfil replay · reloj de la grabación · no corren: imu, motor \(perfil real\), mundo \(perfil sim\)",
                     out) is not None, out[:600])
+    check("d) con --play solo (perfil replay) no sale el aviso de nodos del perfil real",
+          "corren nodos del perfil real" not in out, out[:600])
     check("d) Ctrl+C detiene todo", p.returncode == 0 and "listo" in out, f"código {p.returncode}")
 
     p = start("--play", str(files[0]), "--profile", "real")
@@ -293,6 +296,8 @@ def main():
         check("d) /api/state dice profile = real, y el reloj sigue siendo el de la grabación",
               get_state()["profile"] == "real" and get_state()["clock"]["mode"] == "replay",
               f"{get_state().get('profile')} {get_state()['clock']}")
+        check("d) con --profile real, /api/state dice playing = true", get_state().get("playing") is True,
+              str(get_state().get("playing")))
         time.sleep(1.0)
     finally:
         out = stop(p)
@@ -300,6 +305,9 @@ def main():
     h = huellas()
     check("d) --play --profile real: los nodos real corren con AGMEN_CLOCK=replay",
           h.get("motor") == ["reloj=replay"] and h.get("cerebro") == ["reloj=replay"] and "mundo" not in h, str(h))
+    check("d) --play --profile real avisa: ⚠ corren nodos del perfil real con el reloj de la grabación",
+          re.search(r"⚠ corren nodos del perfil real con el reloj de la grabación: imu, motor\.", out) is not None,
+          out[:800])
     check("d) Ctrl+C detiene todo", p.returncode == 0 and "listo" in out, f"código {p.returncode}")
 
     # e) Los errores de la línea de comandos: código 2 y qué hacer.
