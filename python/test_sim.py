@@ -33,6 +33,25 @@ _mod = cargar_modulo() if HAY_MUJOCO else None
 _gl_cache: list = []   # [motivo]: "" = se puede dibujar
 
 
+def _elegir_gl_como_el_nodo() -> None:
+    """MuJoCo lee MUJOCO_GL al importarse. El nodo lo elige con elegir_gl() ANTES de importar; aquí se hace lo
+    mismo, una vez, y se deja os.environ como estaba (mujoco ya quedó cargado con ese OpenGL)."""
+    if not HAY_MUJOCO or "mujoco" in sys.modules:
+        return
+    antes = dict(os.environ)
+    try:
+        _mod.elegir_gl(False)
+        import mujoco  # noqa: F401
+    except Exception:
+        pass   # si no carga, las pruebas que lo usan lo dirán con su propio error
+    finally:
+        os.environ.clear()
+        os.environ.update(antes)
+
+
+_elegir_gl_como_el_nodo()
+
+
 def sin_opengl() -> str:
     """"" si esta máquina dibuja sin ventana; si no, el motivo (para @skipIf)."""
     if not HAY_MUJOCO:
@@ -210,6 +229,58 @@ class TestMundo(unittest.TestCase):
         self.m.cerrar()
         self.m.cerrar()
 
+    def test_arranca_ya_asentado(self):
+        (ax, ay, az), (gx, gy, gz) = self.m.imu()   # sin avanzar ni un paso
+        self.assertAlmostEqual(az, 9.81, delta=0.05)
+        self.assertLess(abs(ax), 0.01)
+        self.assertLess(abs(ay), 0.01)
+        self.assertTrue(all(g == 0 for g in (gx, gy, gz)))
+        # y se queda asentado: sin comandos, tras 0.2 s sigue igual (no cae ni rebota)
+        self.m.avanzar(100)
+        (ax, ay, az), _ = self.m.imu()
+        self.assertAlmostEqual(az, 9.81, delta=0.05)
+        self.assertLess(abs(ax), 0.01)
+
+    def test_aceleracion_maxima_acotada_y_no_se_levanta(self):
+        z0 = float(self.m.datos.qpos[2])
+        picos = []
+        for _ in range(100):           # 1 s a fondo, mirando la IMU cada 10 ms
+            self.m.comando(1, 1)
+            self.m.avanzar(5)
+            (ax, ay, az), _ = self.m.imu()
+            picos.append((abs(ax), az))
+            self.assertLess(abs(self.m.datos.qpos[2] - z0), 0.005, "el robot no se levanta ni se hunde")
+        self.assertLess(max(p[0] for p in picos), 2.5, "no debe pasar de ~1.5 m/s² (si no, patina)")
+        self.assertGreater(max(p[0] for p in picos), 0.5, "pero sí acelera")
+        self.assertTrue(all(abs(p[1] - 9.81) < 0.6 for p in picos), "az sigue ~9.81 al arrancar a fondo")
+
+    def test_a_los_100_ms_la_velocidad_es_razonable(self):
+        self.m.comando(1, 1)
+        self.m.avanzar(50)             # 0.1 s
+        vx = float(self.m.datos.qvel[0])
+        self.assertGreater(vx, 0.05)
+        self.assertLess(vx, 0.3, "con 1.5 m/s² son ~0.15 m/s")
+
+    def test_el_giro_de_antes_sigue_igual(self):
+        self.m.comando(0.5, -0.5)
+        self.m.avanzar(500)
+        _, (gx, gy, gz) = self.m.imu()
+        self.assertAlmostEqual(gz, -1.9, delta=0.3)
+        self.m.reiniciar()
+        self.m.comando(-0.5, 0.5)      # izquierda = +z
+        self.m.avanzar(500)
+        self.assertGreater(self.m.imu()[1][2], 1.5)
+
+    def test_construir_y_avanzar_no_toca_el_entorno(self):
+        antes = dict(os.environ)
+        m = _mod.Mundo()
+        m.comando(0.5, 0.5)
+        m.avanzar(100)
+        m.imu(), m.pose()
+        m.reiniciar()
+        m.cerrar()
+        self.assertEqual(dict(os.environ), antes, "la clase no cambia variables de entorno")
+
 
 @unittest.skipUnless(HAY_MUJOCO, SIN_MUJOCO)
 class TestModelosRotos(unittest.TestCase):
@@ -238,8 +309,9 @@ class TestModelosRotos(unittest.TestCase):
         _mod.Mundo(self.modelo(self.xml))
 
     def test_no_existe(self):
-        msg = self.falla(self.dir / "nada.xml", "no encuentro el modelo", "--modelo")
+        msg = self.falla(self.dir / "nada.xml", "no encuentro el modelo")
         self.assertIn("nada.xml", msg)
+        self.assertNotIn("--modelo", msg, "la opción es del nodo: la clase no la menciona")
 
     def test_es_una_carpeta(self):
         self.falla(self.dir, "no encuentro el modelo")
@@ -291,6 +363,33 @@ class TestModelosRotos(unittest.TestCase):
     def test_modelo_como_texto_de_ruta_str(self):
         _mod.Mundo(str(self.modelo(self.xml)))   # acepta str y Path
 
+    def test_camara_que_no_existe(self):
+        # se revisa antes de abrir OpenGL: no necesita pantalla ni EGL
+        m = _mod.Mundo(camara="nada")
+        self.addCleanup(m.cerrar)
+        with self.assertRaises(_mod.ErrorDelMundo) as ctx:
+            m.imagen()
+        self.assertIn("no tiene la cámara 'nada'", str(ctx.exception))
+        m.avanzar(10)   # y la física sigue
+
+    def test_tamano_mayor_al_buffer_del_modelo(self):
+        m = _mod.Mundo(ancho=800, alto=600)
+        self.addCleanup(m.cerrar)
+        with self.assertRaises(_mod.ErrorDelMundo) as ctx:
+            m.imagen()
+        msg = str(ctx.exception)
+        self.assertIn("no puede dar 800×600", msg)
+        self.assertIn("640×480", msg)
+
+    def test_tamanos_invalidos(self):
+        for ancho, alto in ((0, 240), (320, 0), (-1, 240), (641, 480), (640, 481)):
+            with self.subTest(ancho=ancho, alto=alto):
+                m = _mod.Mundo(ancho=ancho, alto=alto)
+                self.addCleanup(m.cerrar)
+                with self.assertRaises(_mod.ErrorDelMundo) as ctx:
+                    m.imagen()
+                self.assertIn("no puede dar", str(ctx.exception))
+
 
 @unittest.skipUnless(HAY_MUJOCO, SIN_MUJOCO)
 class TestImagen(unittest.TestCase):
@@ -331,31 +430,42 @@ class TestImagen(unittest.TestCase):
         b = self.m.imagen()
         self.assertTrue((a == b).all())
 
-    def test_otro_tamano_en_el_primer_pedido(self):
-        self.assertEqual(self.m.imagen(ancho=160, alto=120).shape, (120, 160, 3))
+    def test_otro_tamano_al_construir(self):
+        m = _mod.Mundo(ancho=160, alto=120)
+        self.addCleanup(m.cerrar)
+        self.assertEqual(m.imagen().shape, (120, 160, 3))
+
+    def test_tamano_maximo_del_modelo(self):
+        m = _mod.Mundo(ancho=640, alto=480)
+        self.addCleanup(m.cerrar)
+        self.assertEqual(m.imagen().shape, (480, 640, 3))
 
     def test_mas_grande_que_el_buffer_es_un_error_claro(self):
+        m = _mod.Mundo(ancho=2000, alto=2000)
+        self.addCleanup(m.cerrar)
         with self.assertRaises(_mod.ErrorDelMundo) as ctx:
-            self.m.imagen(ancho=2000, alto=2000)
-        self.assertIn("no pude dibujar sin ventana", str(ctx.exception))
+            m.imagen()
+        self.assertIn("no puede dar 2000×2000", str(ctx.exception))
 
-    def test_camara_que_no_existe_antes_de_abrir(self):
+    def test_camara_que_no_existe_al_construir(self):
+        m = _mod.Mundo(camara="nada")
+        self.addCleanup(m.cerrar)
         with self.assertRaises(_mod.ErrorDelMundo) as ctx:
-            self.m.imagen("nada")
+            m.imagen()
         self.assertIn("no tiene la cámara 'nada'", str(ctx.exception))
 
-    def test_camara_que_no_existe_con_la_cámara_ya_abierta(self):
+    def test_imagen_no_cambia_el_entorno(self):
+        antes = dict(os.environ)
         self.m.imagen()
-        with self.assertRaises(_mod.ErrorDelMundo):   # no un ValueError crudo de MuJoCo
-            self.m.imagen("nada")
-
-    def test_pedir_otro_tamano_con_la_camara_ya_abierta(self):
-        self.m.imagen()   # 320×240
-        img = self.m.imagen(ancho=160, alto=120)
-        self.assertEqual(img.shape, (120, 160, 3), "o devuelve lo pedido o dice que no se puede")
+        self.m.cerrar()
+        self.m.imagen()
+        self.assertEqual(dict(os.environ), antes, "dibujar no toca variables de entorno")
 
     def test_cerrar_y_volver_a_pedir(self):
         self.m.imagen()
+        self.m.cerrar()
+        self.m.cerrar()   # idempotente
+        self.assertEqual(self.m.imagen().shape, (240, 320, 3))
         self.m.cerrar()
         self.assertEqual(self.m.imagen().shape, (240, 320, 3))
 
@@ -372,14 +482,33 @@ class TestImagen(unittest.TestCase):
             self.assertIn("la cámara 'camara'", str(ctx.exception))
 
 
+PRELUDIO = (
+    "import importlib.util as u\n"
+    f"s = u.spec_from_file_location('mundo', r'{MUNDO_PY}'); m = u.module_from_spec(s); s.loader.exec_module(m)\n"
+)
+
+
 class TestSinOpenGL(unittest.TestCase):
-    """Sin OpenGL la física sigue y la cámara dice por qué no (subproceso: MUJOCO_GL se lee al importar)."""
+    """Sin OpenGL la física sigue y la cámara dice por qué no (subproceso: MUJOCO_GL se lee al importar).
+    La elección de OpenGL es del NODO (elegir_gl); la clase sola solo avisa."""
 
     @unittest.skipUnless(HAY_MUJOCO, SIN_MUJOCO)
-    def test_gl_invalido_la_fisica_sigue_y_la_camara_avisa(self):
-        codigo = (
-            "import importlib.util as u\n"
-            f"s = u.spec_from_file_location('mundo', r'{MUNDO_PY}'); m = u.module_from_spec(s); s.loader.exec_module(m)\n"
+    def test_clase_con_gl_invalido_da_error_que_menciona_mujoco_gl(self):
+        codigo = PRELUDIO + (
+            "try:\n"
+            "    m.Mundo()\n"
+            "except m.ErrorDelMundo as e:\n"
+            "    print('ERROR', e)\n"
+        )
+        r = correr(codigo, [], {"MUJOCO_GL": "no_existe_este_backend"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("ERROR", r.stdout)
+        self.assertIn("MUJOCO_GL", r.stdout)
+        self.assertNotIn("Traceback", r.stderr)
+
+    @unittest.skipUnless(HAY_MUJOCO and sys.platform.startswith("linux"), "sin pantalla: solo en Linux")
+    def test_clase_sola_en_linux_sin_pantalla_ni_mujoco_gl(self):
+        codigo = PRELUDIO + (
             "w = m.Mundo(); w.comando(0.5, 0.5); w.avanzar(500)\n"
             "print('x>0', w.pose()[0] > 0)\n"
             "try:\n"
@@ -387,11 +516,59 @@ class TestSinOpenGL(unittest.TestCase):
             "except m.ErrorDelMundo as e:\n"
             "    print('ERROR', e)\n"
         )
-        r = correr(codigo, [], {"MUJOCO_GL": "no_existe_este_backend"})
+        r = correr(codigo, [], {"DISPLAY": "", "WAYLAND_DISPLAY": ""})
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("x>0 True", r.stdout)
         self.assertIn("ERROR no pude dibujar sin ventana", r.stdout)
+        self.assertIn("MUJOCO_GL", r.stdout)
+        self.assertRegex(r.stdout, r"egl.*osmesa|osmesa.*egl")
         self.assertNotIn("Traceback", r.stderr)
+
+    @unittest.skipUnless(HAY_MUJOCO, SIN_MUJOCO)
+    def test_nodo_con_gl_invalido_sigue_sin_camara(self):
+        r = correr("", [RAIZ / "python"], {"MUJOCO_GL": "no_existe_este_backend", "AGMEN_HUB": "127.0.0.1:7394"},
+                   args=[str(MUNDO_PY), "--seconds", "1"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("[mundo] sin cámara: MUJOCO_GL=no_existe_este_backend no existe aquí (usa", r.stderr)
+        self.assertIn("sigo sin cámara", r.stderr)
+        self.assertEqual(r.stderr.count("sin cámara:"), 1, "se dice una sola vez")
+        self.assertRegex(r.stdout, r"terminé: .* [5-9]\d /imu y 0 /camara publicados")   # la física sigue
+        self.assertNotIn("Traceback", r.stderr)
+
+    @unittest.skipUnless(HAY_MUJOCO and sys.platform.startswith("linux"), "DISPLAY falso: solo en Linux")
+    def test_nodo_con_ver_sin_pantalla_sigue_sin_ventana(self):
+        for display in ("", ":99"):
+            with self.subTest(DISPLAY=display):
+                r = correr("", [RAIZ / "python"], {"DISPLAY": display, "WAYLAND_DISPLAY": "", "AGMEN_HUB": "127.0.0.1:7394"},
+                           args=[str(MUNDO_PY), "--ver", "--seconds", "1"])
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("[mundo] --ver necesita pantalla", r.stdout + r.stderr)
+                self.assertIn("sigo sin ventana", r.stdout + r.stderr)
+                self.assertIn("terminé:", r.stdout)
+                self.assertNotIn("Traceback", r.stderr)
+
+
+@unittest.skipUnless(HAY_MUJOCO, SIN_MUJOCO)
+class TestNodoCtrlC(unittest.TestCase):
+    def test_ctrl_c_no_deja_traceback(self):
+        if os.name == "nt":
+            self.skipTest("Ctrl+C a un subproceso en Windows se prueba en sim_smoke (agmen run)")
+        import signal
+
+        env = {**os.environ, "PYTHONPATH": str(RAIZ / "python"), "PYTHONIOENCODING": "utf-8", "NO_COLOR": "1",
+               "AGMEN_HUB": "127.0.0.1:7394"}
+        env.pop("MUJOCO_GL", None)
+        p = subprocess.Popen([sys.executable, str(MUNDO_PY)], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, encoding="utf-8", errors="replace", cwd=tempfile.gettempdir())
+        self.addCleanup(p.kill)
+        primera = p.stdout.readline()                # ya cargó MuJoCo y se presentó
+        self.assertIn("[mundo] Agmen", primera)
+        p.send_signal(signal.SIGINT)
+        salida = primera + p.communicate(timeout=30)[0]
+        self.assertNotIn("Traceback", salida)
+        self.assertIn(p.returncode, (0, 130), salida)
+        if p.returncode == 130:
+            self.assertIn("[mundo] interrumpido (Ctrl+C)", salida)
 
 
 class TestSinAgmen(unittest.TestCase):
@@ -475,6 +652,7 @@ class TestNodoArgumentos(unittest.TestCase):
         r = self.corre("--modelo", "no_existe.xml", "--seconds", "1")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("[mundo] no encuentro el modelo", r.stderr)
+        self.assertIn("revisa --modelo", r.stderr, "la opción la agrega el nodo, no la clase")
         self.assertNotIn("Traceback", r.stderr)
 
     def test_modelo_roto(self):

@@ -391,8 +391,8 @@ def prueba_sim() -> str:
         time.sleep(1.0)
         despues = imu.items[-1][1] if imu.items else 0
         check("'paso' avanza 0.1 s del reloj", 0.07 <= despues - antes <= 0.13, f"{(despues - antes) * 1e3:.0f} ms")
-        check("…y el mundo publicó /imu en ese paso (con la hora nueva)", 1 <= len(imu.items) - n0 <= 14,
-              f"{len(imu.items) - n0}")
+        check("…y el mundo publicó ~10 /imu en ese paso (uno por cada 10 ms simulados, cada uno con su hora)",
+              8 <= len(imu.items) - n0 <= 12, f"{len(imu.items) - n0}")
         check("…y se queda otra vez en pausa", get_state()["clock"]["paused"])
 
         ws_op(c, action="speed", value=2.0)
@@ -419,6 +419,10 @@ def prueba_sim() -> str:
             hz = len(cam.entre(t0, time.monotonic())) / 2.0
             check("a ×1 de nuevo, /camara sigue a ~15 Hz", 11 <= hz <= 18, f"{hz:.1f} Hz")
         ws_op(c, action="speed", value=1.0)
+        ts = [i[1] for i in list(imu.items)]
+        malos = [(a, b) for a, b in zip(ts, ts[1:]) if b <= a]
+        check("t_data de /imu estrictamente creciente en toda la corrida", len(ts) > 500 and not malos,
+              f"{len(ts)} mensajes; {len(malos)} que no crecen, p. ej. {malos[:3]}")
         if cam.errores or imu.errores or cmd.errores:
             check("ningún suscriptor del script vio un error de tipo", False, str((cam.errores + imu.errores + cmd.errores)[:3]))
     finally:
@@ -460,12 +464,27 @@ def prueba_real() -> str:
     return out
 
 
+def prueba_ver_sin_pantalla() -> None:
+    """mundo.py --ver con un DISPLAY que no existe: avisa en una línea, sigue sin ventana, código 0."""
+    print("\n== g) --ver sin pantalla (DISPLAY=:99) ==", flush=True)
+    env = {**ENV, "DISPLAY": ":99", "WAYLAND_DISPLAY": ""}
+    r = subprocess.run([sys.executable, str(ROOT / "examples" / "sim" / "mundo.py"), "--ver", "--seconds", "2"], env=env,
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, cwd=WORK)
+    todo = r.stdout + r.stderr
+    check("--ver sin pantalla: código 0", r.returncode == 0, f"código {r.returncode}\n{todo[-500:]}")
+    check("…dice '--ver necesita pantalla' una vez y sigue sin ventana",
+          todo.count("[mundo] --ver necesita pantalla") == 1 and "sigo sin ventana" in todo, todo[-500:])
+    check("…y el mundo termina su corrida sin traceback", "terminé:" in r.stdout and "Traceback" not in todo, todo[-500:])
+
+
 def main():
     if not hay_mujoco():
         saltar("no está instalado MuJoCo (o NumPy): pip install mujoco")
     shutil.rmtree(WORK, ignore_errors=True)
     WORK.mkdir(parents=True)
     outs = [prueba_sim(), prueba_real()]
+    if sys.platform.startswith("linux"):
+        prueba_ver_sin_pantalla()
     total, bien = len(results), sum(results)
     if bien != total:
         for i, out in enumerate(outs, 1):

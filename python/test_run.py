@@ -4,6 +4,7 @@
 """
 
 import io
+import os
 import sys
 import tempfile
 import threading
@@ -717,6 +718,92 @@ class TestOtroRobot(unittest.TestCase):
             raise ConnectionError("no hay hub")
 
         self.assertEqual(other_robot(self.config(), query=no_hay), [])
+
+
+class TestResolverPrograma(unittest.TestCase):
+    """Node._resolve_program (c49bd35): la ruta de 'cmd' se usa tal cual, sin seguir enlaces simbólicos
+    (el 'python' de un entorno virtual es un enlace al del sistema: si se sigue, se pierde el venv)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+
+    def nodo(self, cmd: str, base: Path | None = None):
+        from agmen.run import Node
+
+        base = base or self.dir
+        (base / "robot.toml").write_text(f'[robot]\nname = "r"\n\n[[node]]\nname = "n"\ncmd = "{cmd}"\n',
+                                         encoding="utf-8")
+        cfg = load_config(base / "robot.toml")
+        return Node(cfg.nodes[0], cfg.base_dir, None, None), base
+
+    def enlace(self, destino: Path, objetivo: Path) -> None:
+        try:
+            destino.symlink_to(objetivo)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"aquí no se pueden crear enlaces simbólicos ({e})")
+
+    def test_ruta_relativa_con_enlace_no_se_resuelve(self):
+        (self.dir / "real").mkdir()
+        (self.dir / "real" / "programa").write_text("#!/bin/sh\n", encoding="utf-8")
+        (self.dir / "bin").mkdir()
+        self.enlace(self.dir / "bin" / "enlace", Path("..") / "real" / "programa")
+        nodo, base = self.nodo("bin/enlace --x 1")
+        args = nodo._resolve_program(base)
+        self.assertEqual(args[1:], ["--x", "1"])
+        self.assertEqual(args[0], str(Path(os.path.abspath(base)) / "bin" / "enlace"))
+        self.assertTrue(args[0].endswith("enlace"), "no debe acabar en el destino del enlace")
+        self.assertTrue(os.path.isabs(args[0]))
+
+    def test_ruta_con_punto_punto_y_enlace(self):
+        (self.dir / "venv" / "bin").mkdir(parents=True)
+        (self.dir / "robot").mkdir()
+        (self.dir / "real").mkdir()
+        (self.dir / "real" / "py").write_text("", encoding="utf-8")
+        self.enlace(self.dir / "venv" / "bin" / "python", self.dir / "real" / "py")
+        nodo, base = self.nodo("../venv/bin/python nodo.py", self.dir / "robot")
+        args = nodo._resolve_program(base)
+        self.assertEqual(os.path.basename(args[0]), "python")
+        self.assertNotIn("real", Path(args[0]).parts)
+        self.assertEqual(os.path.realpath(args[0]), os.path.realpath(self.dir / "real" / "py"))   # sí apunta ahí
+        self.assertEqual(args[1], "nodo.py")
+
+    def test_ruta_absoluta_se_respeta(self):
+        absoluta = str(self.dir / "bin" / "algo")
+        nodo, base = self.nodo(absoluta.replace("\\", "/") + " a b")
+        self.assertEqual(nodo._resolve_program(base), [absoluta.replace("\\", "/"), "a", "b"])
+
+    def test_python_a_secas_es_el_interprete_actual(self):
+        for nombre in ("python", "python3", "py"):
+            with self.subTest(nombre=nombre):
+                nodo, base = self.nodo(f"{nombre} cerebro.py --n 2")
+                self.assertEqual(nodo._resolve_program(base), [sys.executable, "cerebro.py", "--n", "2"])
+
+    def test_nombre_sin_ruta_no_se_toca(self):
+        nodo, base = self.nodo("echo hola")
+        self.assertEqual(nodo._resolve_program(base), ["echo", "hola"])
+
+    def test_de_punta_a_punta_con_un_venv_de_verdad(self):
+        import subprocess
+        import venv
+
+        (self.dir / "robot").mkdir()
+        try:
+            venv.EnvBuilder(with_pip=False, symlinks=True).create(self.dir / "venv")
+        except Exception as e:
+            self.skipTest(f"no se pudo crear un entorno virtual ({e})")
+        exe = self.dir / "venv" / ("Scripts" if os.name == "nt" else "bin") / ("python.exe" if os.name == "nt" else "python")
+        if not exe.exists():
+            self.skipTest("el entorno virtual no trae python")
+        rel = "../venv/" + ("Scripts/python" if os.name == "nt" else "bin/python")
+        nodo, base = self.nodo(f"{rel} -c 'import sys; print(sys.prefix)'", self.dir / "robot")
+        args = nodo._resolve_program(base)
+        r = subprocess.run([*args[:1], "-c", "import sys; print(sys.prefix)"], capture_output=True, text=True,
+                           timeout=60, cwd=base)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(os.path.realpath(r.stdout.strip()), os.path.realpath(self.dir / "venv"),
+                         "el nodo debe correr dentro del entorno virtual, no en el Python del sistema")
 
 
 class TestPrinter(unittest.TestCase):
