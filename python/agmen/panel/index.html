@@ -21,6 +21,12 @@
   .logo { font-weight: 700; font-size: 16px; letter-spacing: .02em; }
   .logo .robot { font-weight: 500; }
   .logo span.dim { color: var(--muted); font-weight: 400; }
+  /* el perfil de agmen run (RFC 0011 §3.2): SIMULACIÓN, REPRODUCCIÓN… en grande; en "real" no se ve */
+  .profile { padding: 3px 12px; border-radius: 8px; background: var(--warn); color: #1b1f24; font-weight: 800;
+             font-size: 15px; letter-spacing: .08em; white-space: nowrap; }
+  .profile.replay { background: var(--accent); color: #fff; }
+  .profile[hidden] { display: none; }
+  @media (max-width: 600px) { header.con-perfil { flex-wrap: wrap; gap: 8px; padding: 10px 12px; } .profile { order: 3; flex: 1 0 100%; text-align: center; } }
   .pill { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; padding: 4px 10px;
           border: 1px solid var(--line); border-radius: 999px; font-size: 12px; color: var(--muted); white-space: nowrap; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
@@ -168,6 +174,7 @@
 <body>
 <header>
   <div class="logo">Agmen <span class="robot" id="robot"></span> <span class="dim" id="ver"></span></div>
+  <div class="profile" id="profile" hidden></div>
   <div class="pill"><span class="dot" id="dot"></span><span id="status">conectando…</span></div>
 </header>
 
@@ -792,10 +799,11 @@ function renderTopics(topics) {
 function onState(m) {
   $("robot").textContent = m.robot ? "· " + m.robot : "";
   $("ver").textContent = "v" + m.version;
-  document.title = `Agmen · ${m.robot || "panel"}`;
   const prevTeleop = !!state.teleop;
   state = { nodes: m.nodes, teleop: m.teleop, managed: m.managed, recording: m.recording || null,
-            commands: m.commands || [], muxes: m.muxes || [], gaps: m.gaps || [] };
+            commands: m.commands || [], muxes: m.muxes || [], gaps: m.gaps || [],
+            profile: m.profile || "real", playing: !!m.playing, robot: m.robot || "" };
+  renderProfile(!rec);
   document.querySelector(".logs").style.display = m.managed ? "" : "none";  // agmen web: no hay nodos que mostrar
   const key = JSON.stringify(m.nodes.map((n) => [n.name, n.state, n.restarts, n.pid, Math.floor((n.uptime || 0))]));
   if (key !== onState.nodesKey) {
@@ -1158,7 +1166,7 @@ function renderRecPlayer() {
   const i = rec.info, lost = Number(rec.lostMeta.total || 0);
   $("recmeta").textContent = `${rec.dur.toFixed(1)} s · ${Object.keys(rec.topics).length} topics` +
     (i.version ? ` · grabado con Agmen ${i.version}` + (i.computadora ? ` en ${i.computadora}` : "") : "") +
-    (i.reloj && i.reloj !== "real" ? ` · reloj ${i.reloj}` : "") + (rec.reader.complete ? "" : " · sin índice (se leyó completa)");
+    (i.reloj && i.reloj !== "real" ? ` · reloj ${i.reloj}` : "") + (i.perfil ? ` · perfil ${i.perfil}` : "") + (rec.reader.complete ? "" : " · sin índice (se leyó completa)");
   $("recwarn").textContent = (lost ? `⚠ se perdieron ${lost} mensajes al grabar (agmen info dice cuáles). ` : "") + (rec.lastErr ? `⚠ ${rec.lastErr}` : "");
   $("recwarn").className = "note warn";
   $("recplay").textContent = rec.playing ? "⏸ pausar" : rec.pos >= rec.dur ? "↺ otra vez" : "▶ reproducir";
@@ -1218,9 +1226,30 @@ function closeRecording() {
 // Manejar, los mandos y el reloj son del robot de ahora: mientras se ve una grabación se esconden
 // (y no se maneja ni se manda nada).
 function livePanels(on) {
+  renderProfile(on);                                          // el perfil es del robot de ahora, no de la grabación
   if (!on) { stopCommands(); if (driveTimer) allStop(); }     // ALTO solo si estabas manejando
   for (const id of ["drivepanel", "clockpanel", "commands"]) $(id).style.display = on ? "" : "none";
   $("muxpanel").style.display = on && (state.muxes || []).length ? "" : "none";
+}
+// El letrero del perfil (RFC 0011 §3.2): "sim" → SIMULACIÓN, "replay" → REPRODUCCIÓN, otro → PERFIL MESA;
+// "real" no lleva letrero. Con --play siempre dice REPRODUCCIÓN, y el perfil si no es replay
+// (REPRODUCCIÓN · PERFIL REAL: corren nodos del robot de verdad con datos grabados). También va en
+// el título de la pestaña.
+function profileLabel(p, playing) {
+  if (playing) return "REPRODUCCIÓN" + (p && p !== "replay" ? " · PERFIL " + p.toUpperCase() : "");
+  if (!p || p === "real") return "";
+  return p === "sim" ? "SIMULACIÓN" : p === "replay" ? "REPRODUCCIÓN" : "PERFIL " + p.toUpperCase();
+}
+function renderProfile(live) {
+  const label = live ? profileLabel(state.profile, state.playing) : "";
+  const el = $("profile");
+  el.textContent = label;
+  el.hidden = !label;
+  el.parentElement.classList.toggle("con-perfil", !!label);   // en celular, el letrero va en su propio renglón
+  el.className = "profile" + (state.profile === "replay" ? " replay" : "");   // con otro perfil, en amarillo: ojo
+  el.title = !label ? "" : state.playing ? `agmen run reproduce una grabación en el perfil '${state.profile}'`
+                                         : `agmen run corre en el perfil '${state.profile}'`;
+  document.title = `Agmen · ${state.robot || "panel"}` + (label ? ` · ${label}` : "");
 }
 function recIds() {
   const ids = new Set();

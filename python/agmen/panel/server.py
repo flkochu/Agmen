@@ -355,8 +355,11 @@ class Panel:
     def __init__(self, http: str, listen: str | None, robot_name: str = "",
                  launcher=None, teleop: Teleop | None = None, topics: bool = True,
                  token: str | None = None, allow_origins: list[str] | None = None, clock=None,
-                 recording_file: str | None = None, commands: list | None = None) -> None:
+                 recording_file: str | None = None, commands: list | None = None,
+                 profile: str = "real", playing: bool = False) -> None:
         self.http = http
+        self.profile = profile        # el perfil de agmen run (RFC 0011 §3.2): el panel lo dice en grande
+        self.playing = playing        # agmen run --play: el panel dice REPRODUCCIÓN, sea cual sea el perfil
         self.clock = clock            # agmen.clock.ClockServer si agmen run manda el tiempo
         # agmen web vuelta1.mcap (RFC 0010): el navegador la lee por partes de /api/recording.
         self.recording_file = os.path.abspath(recording_file) if recording_file else None
@@ -439,6 +442,8 @@ class Panel:
     def snapshot(self) -> dict:
         return {
             "robot": self.robot_name,
+            "profile": self.profile,
+            "playing": self.playing,
             "version": __version__,
             "nodes": self.launcher.nodes_info() if self.launcher else [],
             "managed": self.launcher is not None,

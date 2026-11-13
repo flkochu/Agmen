@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Estado** | ✅ **Implementado en Agmen 0.13.0** (2026-11-06) con las opciones recomendadas (D1–D6 = a), a pedido de Arca9. Si Adán prefiere otra opción, se cambia antes de publicar. Decisiones en la [sección 5](#5-decisiones) |
+| **Estado** | ✅ **Aceptado** (2026-11-13, D1–D6 = a) e **implementado en Agmen 0.13.0** (2026-11-06), a pedido de Arca9. Decisiones en la [sección 5](#5-decisiones) |
 | **Depende de** | RFC 0002 (el panel, el WebSocket, la clave y `Origin`), RFC 0003 (`agmen run`, `[web.teleop]`, `[[mux]]` y el hombre muerto), RFC 0004 (topics y `[[topic]]`), RFC 0005 (archivos `.agmen` y `agmen.load`), RFC 0006 (el reloj de Agmen), RFC 0008 (codificación `arrow`) |
 | **Versión** | Agmen 0.13.0 |
 | **Requisitos** | h (interfaz web que no le cuesta al robot), i (un solo comando; se controla desde el navegador) |

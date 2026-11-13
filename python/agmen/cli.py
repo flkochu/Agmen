@@ -42,22 +42,50 @@ def cmd_run(args) -> int:
     from .panel import Panel, Teleop
     from .run import ConfigError, Launcher, load_config, prepare_hub
 
+    # El perfil (RFC 0011 §3.2): --profile X, --sim (= --profile sim) o, con --play, "replay".
+    if args.sim and args.profile not in (None, "sim"):
+        print(f"error: --sim es lo mismo que --profile sim, y también pusiste --profile {args.profile}: "
+              f"elige uno", file=sys.stderr)
+        return 2
+    profile = "sim" if args.sim else args.profile
+    if args.play and profile == "sim":
+        sim = "--sim" if args.sim else "--profile sim"   # lo que escribiste
+        print(f"error: --play reproduce una grabación y {sim} corre el simulador: los dos quieren mandar el reloj. "
+              f"Elige uno (para reproducir con otros nodos: --play ARCHIVO.mcap --profile real)", file=sys.stderr)
+        return 2
+    if args.play and profile is None:
+        profile = "replay"                  # en reproducción no corren los nodos 'real'
+
     try:
-        config = load_config(args.archivo)
+        config = load_config(args.archivo, profile)
     except ConfigError as e:
         print(f"error en {args.archivo}: {e}", file=sys.stderr)
         return 2
+    if config.profile == "replay" and not args.play:
+        print(f"error: el perfil replay es el de --play: agmen run {args.archivo} --play ARCHIVO.mcap",
+              file=sys.stderr)
+        return 2
 
     try:
+        if config.hub and any(name == "hub" for name, _ in config.skipped):   # igual en todos los perfiles
+            raise ConfigError("hay un nodo llamado 'hub': ese nombre lo usa Agmen para el directorio de topics")
         config, hub_note = prepare_hub(config)
     except ConfigError as e:
         print(f"error en {args.archivo}: {e}", file=sys.stderr)
         return 2
     names = [n.name for n in config.nodes]
-    for name in args.skip:
-        if name not in names:
-            print(f"error: --skip {name}: no hay un nodo con ese nombre (hay: {', '.join(names)})", file=sys.stderr)
-            return 2
+    skipped = dict(config.skipped)
+    skip_notes = []
+    for name in dict.fromkeys(args.skip):
+        if name in names:
+            continue
+        if name in skipped:                 # existe, pero no corre en este perfil: no hace falta
+            where = _of_profiles(tuple(p for n, ps in config.skipped if n == name for p in ps))
+            skip_notes.append(f"--skip {name}: no hace falta, '{name}' es {_del(where)} "
+                              f"y no corre en el perfil '{config.profile}'")
+            continue
+        print(f"error: --skip {name}: no hay un nodo con ese nombre (hay: {', '.join(names)})", file=sys.stderr)
+        return 2
     for n in config.nodes:
         if n.name in args.skip:
             n.autostart = False             # se puede arrancar desde el panel
@@ -66,6 +94,19 @@ def cmd_run(args) -> int:
     launcher = Launcher(config)
     out = _SayTo(launcher)
     launcher.say(f"Agmen {__version__} · robot '{config.name}' · {len(config.nodes)} nodos · {hub_note}")
+    if args.play or config.profile != "real" or config.skipped:   # un robot.toml sin perfiles se ve como antes
+        launcher.say(_profile_line(config, bool(args.play)))
+    if args.play:   # RFC 0011, reto 1: los nodos 'real' con datos grabados, que se note
+        real = [n.name for n in config.nodes if "real" in n.profiles and n.name not in args.skip]
+        if real:
+            launcher.say(f"⚠ corren nodos del perfil real con el reloj de la grabación: {', '.join(real)}. "
+                         f"Si tocan hardware, se van a mover con datos grabados (también si los arrancas "
+                         f"desde el panel): quítalos con --skip"
+                         + (f", o corre sin --profile {args.profile}" if args.profile else ""))
+    for warning in config.warnings:
+        launcher.say(f"⚠ {warning}")
+    for note in skip_notes:
+        launcher.say(note)
     if config.hub and not any(n.name == "hub" for n in config.nodes):   # se reusa el hub de otro robot
         from .run import other_robot
 
@@ -112,7 +153,7 @@ def cmd_run(args) -> int:
         try:
             panel = Panel(http, config.web.listen, config.name, launcher, teleop,
                           token=config.web.token, allow_origins=config.web.allow_origins, clock=clock_server,
-                          commands=commands)
+                          commands=commands, profile=config.profile, playing=bool(args.play))
         except OSError as e:
             for c in commands:
                 c.close()
@@ -151,6 +192,36 @@ def cmd_run(args) -> int:
         elif clock_server:
             clock_server.close()
     return 0
+
+
+def _of_profiles(profiles: tuple[str, ...]) -> str:
+    """("real",) → "perfil real"; ("real", "mesa") → "perfiles real, mesa"."""
+    profiles = tuple(dict.fromkeys(profiles))
+    return ("perfil " if len(profiles) == 1 else "perfiles ") + ", ".join(profiles)
+
+
+def _del(of_profiles: str) -> str:
+    """"perfil real" → "del perfil real"; "perfiles real, mesa" → "de los perfiles real, mesa"."""
+    return ("del " if of_profiles.startswith("perfil ") else "de los ") + of_profiles
+
+
+def _profile_line(config, playing: bool) -> str:
+    """En qué perfil corre agmen run, con qué reloj y qué no corre (RFC 0011 §3.2)."""
+    if playing:
+        clock = "reloj de la grabación"
+    elif config.clock.mode == "sim":
+        who = "" if config.clock.source == "agmen" else f", lo manda '{config.clock.source}'"
+        clock = f"reloj de simulación (×{config.clock.speed:g}{who})"
+    else:
+        clock = "reloj real"
+    parts = [f"perfil {config.profile}", clock]
+    if config.skipped:
+        groups: dict[tuple[str, ...], list[str]] = {}
+        for name, profiles in config.skipped:
+            groups.setdefault(profiles, []).append(name)
+        parts.append("no corren: " + ", ".join(f"{', '.join(names)} ({_of_profiles(profiles)})"
+                                               for profiles, names in groups.items()))
+    return " · ".join(parts)
 
 
 def _commands_for(config) -> list:
@@ -223,7 +294,8 @@ def _recording_for(config, args, out):
     attachments = []
     if config.path is not None:
         attachments.append((config.path.name, "text/plain", config.path.read_bytes()))
-    info = {"robot": config.name, "comando": " ".join(["agmen", *sys.argv[1:]])}
+    # El perfil queda escrito en cada grabación (RFC 0011 §3.2), también cuando es "real".
+    info = {"robot": config.name, "comando": " ".join(["agmen", *sys.argv[1:]]), "perfil": config.profile}
     if args.play:
         info["reproduciendo"] = args.play
     return RecordingControl(rc.topics, directory=str(config.base_dir / rc.dir), split=rc.split,
@@ -371,6 +443,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="con --play: reproducir solo este topic (se puede repetir)")
     p.add_argument("--skip", action="append", default=[], metavar="NODO",
                    help="no arrancar este nodo (ej. el de la cámara, si --play la reproduce)")
+    p.add_argument("--profile", metavar="PERFIL",
+                   help="correr en este perfil: solo los nodos de ese perfil y los que no tienen profile "
+                        "(default: [robot] profile o real; con --play, replay)")
+    p.add_argument("--sim", action="store_true",
+                   help="lo mismo que --profile sim: el simulador en vez del robot, con reloj de simulación")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("web", help="solo el panel web (sin administrar nodos); o una grabación: agmen web vuelta1.mcap")

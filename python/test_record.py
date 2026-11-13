@@ -298,6 +298,99 @@ class TestInfo(HubCase):
         self.assertGreater(d["topics"][0]["messages"], 50)
 
 
+class TestPerfilEnLaGrabacion(HubCase):
+    """El perfil de agmen run queda en agmen.grabacion y agmen info lo dice (RFC 0011 §3.2)."""
+
+    def grabar(self, nombre, **kw):
+        path = os.path.join(self.dir, nombre)
+        rec = record.Recorder(path, ["*"], quiet=True, **kw).start()
+        a = self.pub(wire.ImuSample, "/imu")
+        self.wait_subscribers(a)
+        for i in range(10):
+            a.publish(imu(i))
+            time.sleep(0.005)
+        time.sleep(0.3)
+        rec.stop()
+        return path
+
+    def info(self, path):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(record.cmd_info(type("A", (), {"archivo": path, "reparar": False})()), 0)
+        return out.getvalue()
+
+    def linea_de_grabado(self, texto):
+        return next(line for line in texto.splitlines() if "grabado con Agmen" in line)
+
+    def test_con_perfil(self):
+        for perfil in ("sim", "real", "replay", "mesa"):
+            with self.subTest(perfil=perfil):
+                path = self.grabar(f"{perfil}.mcap", info={"perfil": perfil, "robot": "r"})
+                _, meta, _ = self.read(path)
+                self.assertEqual(meta["agmen.grabacion"]["perfil"], perfil)
+                self.assertEqual(record.describe(path)["recording"]["perfil"], perfil)
+                self.assertRegex(self.linea_de_grabado(self.info(path)), rf", reloj real, perfil {perfil}(,|$)")
+
+    def test_info_lo_dice_con_reloj_y_antes_del_inicio(self):
+        path = self.grabar("o.mcap", info={"perfil": "sim"})
+        linea = self.linea_de_grabado(self.info(path))
+        self.assertRegex(linea, r"reloj \w+, perfil sim, 20\d\d-")
+
+    def test_sin_perfil_la_salida_es_la_de_antes(self):
+        path = self.grabar("s.mcap", info={"robot": "r"})
+        _, meta, _ = self.read(path)
+        self.assertNotIn("perfil", meta["agmen.grabacion"])
+        linea = self.linea_de_grabado(self.info(path))
+        self.assertNotIn("perfil", linea)
+        self.assertRegex(linea, r"^  grabado con Agmen \S+ en \S+, reloj real, 20\d\d-")
+
+    def test_perfil_vacio_no_sale(self):
+        path = self.grabar("v.mcap", info={"perfil": ""})
+        self.assertNotIn("perfil", self.linea_de_grabado(self.info(path)))
+
+    def test_recording_for_escribe_el_perfil_de_la_configuracion(self):
+        from agmen import cli
+        from agmen.run import load_config
+
+        toml = os.path.join(self.dir, "robot.toml")
+        with open(toml, "w", encoding="utf-8") as f:
+            f.write('[robot]\nname = "r"\n\n[[node]]\nname = "imu"\nprofile = "real"\ncmd = "x"\n\n'
+                    '[[node]]\nname = "mundo"\nprofile = "sim"\ncmd = "y"\n\n[hub]\nenabled = false\n')
+        args = type("A", (), {"play": None})()
+        for perfil in (None, "sim"):
+            with self.subTest(perfil=perfil):
+                rc = cli._recording_for(load_config(toml, perfil), args, io.StringIO())
+                self.assertEqual(rc.info_extra["perfil"], perfil or "real", "también en real")
+                self.assertEqual(rc.info_extra["robot"], "r")
+
+    def test_play_deja_perfil_replay(self):
+        from agmen import cli
+        from agmen.run import load_config
+
+        toml = os.path.join(self.dir, "robot.toml")
+        with open(toml, "w", encoding="utf-8") as f:
+            f.write('[robot]\nname = "r"\n\n[[node]]\nname = "imu"\nprofile = "real"\ncmd = "x"\n\n[hub]\nenabled = false\n')
+        args = type("A", (), {"play": "vuelta.mcap"})()
+        rc = cli._recording_for(load_config(toml, "replay"), args, io.StringIO())
+        self.assertEqual((rc.info_extra["perfil"], rc.info_extra["reproduciendo"]), ("replay", "vuelta.mcap"))
+
+    def test_agmen_record_suelto_no_escribe_perfil(self):
+        path = os.path.join(self.dir, "suelto.mcap")
+        env = {**os.environ, "PYTHONPATH": str(ROOT / "python"), "PYTHONIOENCODING": "utf-8"}
+        p = subprocess.Popen([sys.executable, "-m", "agmen", "record", "-o", path, "--duration", "2s", "/imu"],
+                             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+        a = self.pub(wire.ImuSample, "/imu")
+        self.wait_subscribers(a, timeout=5)
+        for i in range(10):
+            a.publish(imu(i))
+            time.sleep(0.01)
+        _, err = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, 0, err)
+        _, meta, _ = self.read(path)
+        self.assertNotIn("perfil", meta["agmen.grabacion"])
+        self.assertNotIn("perfil", self.linea_de_grabado(self.info(path)))
+
+
 class TestComando(HubCase):
     def test_agmen_record_y_agmen_info(self):
         path = os.path.join(self.dir, "g.mcap")

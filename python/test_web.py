@@ -461,6 +461,122 @@ class TestBotonGrabar(unittest.TestCase):
                 os.environ["AGMEN_HUB"] = old
 
 
+class TestPerfilEnElPanel(unittest.TestCase):
+    """El perfil de agmen run (RFC 0011 §3.2): el panel lo trae en /api/state y lo dice en grande."""
+
+    def estado(self, **kw):
+        panel = Panel("127.0.0.1:0", None, "prueba", None, None, topics=False, **kw)
+        panel.start()
+        try:
+            snap = panel.snapshot()
+            http = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{panel.port}/api/state", timeout=5).read())
+        finally:
+            panel.shutdown()
+        return snap, http
+
+    def test_sin_perfil_es_real(self):
+        snap, http = self.estado()
+        self.assertEqual(snap["profile"], "real")
+        self.assertEqual(http["profile"], "real")
+
+    def test_el_perfil_activo_sale_en_snapshot_y_en_api_state(self):
+        for perfil in ("sim", "replay", "mesa", "real"):
+            snap, http = self.estado(profile=perfil)
+            self.assertEqual(snap["profile"], perfil)
+            self.assertEqual(http["profile"], perfil)
+            self.assertEqual(http["robot"], "prueba", "lo demás del estado sigue igual")
+
+    def test_el_perfil_se_ve_en_el_snapshot_por_websocket(self):
+        panel = Panel("127.0.0.1:0", None, "prueba", None, None, topics=False, profile="sim")
+        panel.start()
+        try:
+            c = ws.connect(f"ws://127.0.0.1:{panel.port}/ws", protocols=["agmen.ws.v1"])
+            c.sock.settimeout(5)
+            try:
+                states = []
+                end = time.monotonic() + 5
+                while not states and time.monotonic() < end:
+                    m = c.recv()
+                    if m is None:
+                        break
+                    if isinstance(m, str) and m.startswith("{") and '"profile"' in m:
+                        states.append(json.loads(m))
+                self.assertTrue(states, "el estado que empuja el panel trae el perfil")
+                self.assertEqual(states[0]["profile"], "sim")
+            finally:
+                c.close()
+        finally:
+            panel.shutdown()
+
+    def test_index_html_tiene_el_letrero(self):
+        # Sin navegador: se revisa el código de la página (el letrero real hay que verlo en un navegador).
+        html = (Path(__file__).resolve().parent / "agmen" / "panel" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="profile"', html)
+        self.assertIn("SIMULACIÓN", html)
+        self.assertIn("REPRODUCCIÓN", html)
+        self.assertIn('"PERFIL "', html, "los demás perfiles: PERFIL MESA")
+        self.assertIn("m.profile", html, "lee el perfil del estado")
+        self.assertRegex(html, r'\$\("profile"\)')
+        self.assertIn("el.textContent = label", html, "el nombre del perfil es texto, nunca HTML")
+        # Ninguna línea mete el perfil o el letrero con innerHTML / insertAdjacentHTML / document.write.
+        for line in html.splitlines():
+            if "innerHTML" in line or "insertAdjacentHTML" in line or "document.write" in line:
+                self.assertNotRegex(line, r"state\.profile|m\.profile|profileLabel|\$\(\"profile\"\)", line.strip())
+        # "real" no lleva letrero.
+        self.assertRegex(html, r'p === "real"\) return ""')
+
+    def test_sin_playing_es_false(self):
+        snap, http = self.estado()
+        self.assertIs(snap["playing"], False)
+        self.assertIs(http["playing"], False)
+        snap, http = self.estado(profile="sim")
+        self.assertIs(http["playing"], False)
+
+    def test_playing_sale_en_snapshot_y_en_api_state_con_cualquier_perfil(self):
+        for perfil in ("replay", "real", "mesa"):
+            snap, http = self.estado(profile=perfil, playing=True)
+            self.assertIs(snap["playing"], True, perfil)
+            self.assertIs(http["playing"], True, perfil)
+            self.assertEqual(http["profile"], perfil)
+
+    def test_playing_va_por_websocket(self):
+        panel = Panel("127.0.0.1:0", None, "prueba", None, None, topics=False, profile="real", playing=True)
+        panel.start()
+        try:
+            c = ws.connect(f"ws://127.0.0.1:{panel.port}/ws", protocols=["agmen.ws.v1"])
+            c.sock.settimeout(5)
+            try:
+                states = []
+                end = time.monotonic() + 5
+                while not states and time.monotonic() < end:
+                    m = c.recv()
+                    if m is None:
+                        break
+                    if isinstance(m, str) and m.startswith("{") and '"playing"' in m:
+                        states.append(json.loads(m))
+                self.assertTrue(states, "el estado que empuja el panel trae playing")
+                self.assertIs(states[0]["playing"], True)
+            finally:
+                c.close()
+        finally:
+            panel.shutdown()
+
+    def test_index_html_letrero_con_playing(self):
+        html = (Path(__file__).resolve().parent / "agmen" / "panel" / "index.html").read_text(encoding="utf-8")
+        self.assertIn("m.playing", html, "lee playing del estado")
+        self.assertIn("playing: !!m.playing", html)
+        self.assertIn("function profileLabel(p, playing)", html)
+        self.assertIn("profileLabel(state.profile, state.playing)", html)
+        # con playing: REPRODUCCIÓN, y el perfil si no es replay (PERFIL REAL / PERFIL MESA)
+        self.assertRegex(html, r'if \(playing\) return "REPRODUCCIÓN" \+ \(p && p !== "replay" \? " · PERFIL " \+ p\.toUpperCase\(\) : ""\)')
+        # sin playing sigue como antes
+        self.assertIn('p === "sim" ? "SIMULACIÓN"', html)
+
+    def test_index_html_muestra_el_perfil_de_la_grabacion_al_abrirla(self):
+        html = (Path(__file__).resolve().parent / "agmen" / "panel" / "index.html").read_text(encoding="utf-8")
+        self.assertRegex(html, r'\(i\.perfil \? ` · perfil \$\{i\.perfil\}` : ""\)')
+
+
 class TestNombreDelPanel(unittest.TestCase):
     def test_el_panel_no_cambia_el_nombre_del_proceso(self):
         # En agmen run, el grabador y el reproductor viven en el proceso del panel: lo que

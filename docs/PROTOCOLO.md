@@ -180,7 +180,7 @@ abre, lo recorta y lo junta; para entender los mensajes basta este documento.
 | `Schema` | `name` = el nombre del tipo (`Imagen`), `encoding = "agmen"`, `data` = el esquema canónico en UTF-8 (`agmen/1 Imagen{…}`), el mismo texto que viaja en el anuncio |
 | `Channel` | uno por topic: `topic = "/camara"`, `message_encoding = "agmen"`; en sus metadatos, `schema_id` (16 cifras hexadecimales) y `encoding` (`compact` o `arrow`) |
 | `Message` | `data` = **el paquete de Agmen completo** (sobre de 64 bytes + payload, como arriba); `publish_time` = `t_pub`; `log_time` = cuándo lo recibió el grabador (en el reloj del robot: real, sim o replay); `sequence` = los 32 bits bajos de `seq` |
-| `Metadata` | `agmen.grabacion`: `version`, `computadora`, `reloj` (real, sim, replay), `inicio`, `topics` y, con `agmen run`, `robot` y `comando`. `agmen.perdidos`: `"<topic> <motivo>"` → cuántos se perdieron (`disco`, `antes de llegar` = huecos de `seq`, `sin anuncio`) y `total` |
+| `Metadata` | `agmen.grabacion`: `version`, `computadora`, `reloj` (real, sim, replay), `inicio`, `topics` y, con `agmen run`, `robot`, `comando` y `perfil` (opcional, desde 0.14.0: el perfil con que corrió `agmen run`, ej. `real`, `sim`, `replay`; `agmen record` suelto no lo escribe, y las grabaciones sin este campo se leen igual). `agmen.perdidos`: `"<topic> <motivo>"` → cuántos se perdieron (`disco`, `antes de llegar` = huecos de `seq`, `sin anuncio`) y `total` |
 | `Attachment` | con `agmen run`, el `robot.toml` (`text/plain`) |
 | *Chunks* | de unos 4 MiB o 1 s, con `MessageIndex`; sin comprimir o con `zstd`/`lz4`; resumen completo (`ChunkIndex`, `Statistics`, `MetadataIndex`…) al cerrar |
 

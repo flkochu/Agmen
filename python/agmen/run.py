@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import difflib
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -56,6 +57,7 @@ class NodeConfig:
     autostart: bool = True
     cwd: Path | None = None
     env: dict[str, str] = field(default_factory=dict)
+    profiles: tuple[str, ...] = ()   # en qué perfiles corre (RFC 0011); vacía = en todos
 
 
 @dataclass
@@ -86,6 +88,7 @@ class TopicConfig:
     type: str = ""
     required: bool = False
     max_gap_ms: float | None = None   # avisar si pasa más que esto sin llegar (RFC 0012)
+    profiles: tuple[str, ...] = ()    # en qué perfiles se espera (RFC 0011); vacía = en todos
 
 
 @dataclass
@@ -120,6 +123,7 @@ class MuxConfig:
     output: str                                    # topic o dirección
     inputs: list[tuple[str, str, int]]             # (nombre, topic o dirección, prioridad)
     hold_ms: float = 300.0
+    profiles: tuple[str, ...] = ()                 # en qué perfiles corre (RFC 0011); vacía = en todos
 
 
 @dataclass
@@ -135,6 +139,12 @@ class RobotConfig:
     record: RecordConfig | None = None  # [record]
     path: Path | None = None            # el robot.toml
     muxes: list[MuxConfig] = field(default_factory=list)   # [[mux]] (también están en nodes, como nodos)
+    # Perfiles (RFC 0011): nodes, muxes y topics ya traen solo lo que corre en `profile`.
+    profile: str = "real"                                    # el perfil activo
+    profiles: tuple[str, ...] = ("real", "sim", "replay")   # los perfiles conocidos
+    skipped: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)   # (nodo o mux, perfiles) que no corren
+    local: bool = False                                      # [profile.X] local (RFC 0011 §3.4)
+    warnings: list[str] = field(default_factory=list)        # avisos (no errores) de robot.toml, ej. un perfil mal escrito
 
     def topics_used(self) -> set[str]:
         """Los topics que este robot.toml dice que usa: [[topic]], los de los [[mux]],
@@ -177,7 +187,111 @@ def _parse_cmd(value, where: str) -> list[str]:
     return args
 
 
-def load_config(path: str | Path) -> RobotConfig:
+# Perfiles (RFC 0011): los tres de Agmen se llaman como los tres relojes.
+PROFILES = ("real", "sim", "replay")
+_PROFILE_NAME = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def _check_profile_name(name, where: str) -> str:
+    if not isinstance(name, str) or not _PROFILE_NAME.fullmatch(name):
+        raise ConfigError(f"{where}: {name!r} no es un nombre de perfil válido. Usa letras (sin acentos), dígitos, "
+                          f"'_' o '-', ej. \"real\", \"sim\" o \"mesa\"")
+    return name
+
+
+def _parse_profiles(raw: dict, where: str) -> tuple[str, ...]:
+    """El `profile` de un [[node]], [[mux]] o [[topic]]: vacía = corre en todos."""
+    if "profile" not in raw:
+        return ()
+    value = raw["profile"]
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list) or not value:
+        raise ConfigError(f"{where}: profile es un perfil (profile = \"real\") o una lista no vacía "
+                          f"(profile = [\"real\", \"mesa\"]). Sin profile, corre en todos los perfiles")
+    out: list[str] = []
+    for v in value:
+        _check_profile_name(v, f"{where} profile")
+        if v not in out:
+            out.append(v)
+    return tuple(out)
+
+
+def _runs_in(profiles: tuple[str, ...], profile: str) -> bool:
+    return not profiles or profile in profiles
+
+
+def _fmt_profiles(profiles: tuple[str, ...]) -> str:
+    if not profiles:
+        return "sin profile, corre en todos los perfiles"
+    return ("perfil " if len(profiles) == 1 else "perfiles ") + ", ".join(f"'{p}'" for p in profiles)
+
+
+def _of_profiles(profiles: tuple[str, ...]) -> str:
+    """("sim",) → "del perfil 'sim'"; ("sim", "mesa") → "de los perfiles 'sim', 'mesa'"."""
+    return ("del " if len(profiles) == 1 else "de los ") + _fmt_profiles(profiles)
+
+
+def _typo_warnings(mentions: list[tuple[str, str, tuple[str, ...]]], tables) -> list[str]:
+    """Avisos (RFC 0011 §3.2, reto 1) para un perfil que parece un error de dedo
+    de real/sim/replay: no es de Agmen, no tiene [profile.P] y solo lo nombra un
+    lugar del archivo. No es error: inventar perfiles se vale (ej. "mesa")."""
+    count: dict[str, int] = {}
+    for _, _, profiles in mentions:
+        for p in profiles:
+            count[p] = count.get(p, 0) + 1
+    out = []
+    for where, name, profiles in mentions:
+        for p in profiles:
+            if p in PROFILES or p in tables or count[p] != 1:
+                continue
+            hint = difflib.get_close_matches(p, PROFILES, n=3, cutoff=0.7)
+            if not hint:
+                continue
+            meant = " o ".join(f"'{h}'" for h in hint)   # "rela" se parece a real y a replay: se dicen los dos
+            verb = "se espera" if where.startswith("[[topic]]") else "corre"
+            so = (f"Así, '{name}' solo {verb} con --profile {p}" if len(profiles) == 1
+                  else f"Así, '{name}' {verb} con --profile {p}"
+                  + (f" y no con --profile {hint[0]}" if len(hint) == 1 and hint[0] not in profiles else ""))
+            out.append(f"{where}: profile = \"{p}\" y ningún otro [[node]], [[mux]] o [[topic]] nombra ese "
+                       f"perfil. ¿Quisiste decir {meant}? {so}. Si el perfil es a propósito, declara "
+                       f"[profile.{p}] y este aviso se quita")
+    return out
+
+
+def _shared(a: tuple[str, ...], b: tuple[str, ...]) -> str | None:
+    """Dónde corren juntos dos perfiles (en texto), o None si nunca."""
+    if not a and not b:
+        return "en todos los perfiles"
+    both = [p for p in a if p in b] if a and b else list(a or b)
+    if not both:
+        return None
+    return ("en el perfil " if len(both) == 1 else "en los perfiles ") + ", ".join(f"'{p}'" for p in both)
+
+
+def _claim(declared: dict, name: str, kind: str, profiles: tuple[str, ...]) -> None:
+    """Revisa (en todo el archivo, no solo en el perfil activo) que dos nodos o
+    mux con el mismo nombre nunca corran juntos, y lo anota."""
+    for other_kind, other in declared.get(name, []):
+        where = _shared(profiles, other)
+        if where is None:
+            continue
+        if not profiles and not other:   # el caso de siempre: sin perfiles
+            if kind == other_kind == "nodo":
+                raise ConfigError(f"hay dos nodos llamados '{name}': los nombres deben ser únicos (o, si nunca "
+                                  f"corren juntos, ponles perfiles distintos: profile = \"real\" en uno y "
+                                  f"profile = \"sim\" en el otro)")
+            raise ConfigError(f"el mux '{name}' se llama igual que otro nodo: los nombres deben ser únicos")
+        raise ConfigError(f"hay dos nodos llamados '{name}' que corren juntos {where} (uno es {other_kind}, "
+                          f"{_fmt_profiles(other)}; el otro es {kind}, {_fmt_profiles(profiles)}). Dos nodos pueden "
+                          f"llamarse igual solo si sus perfiles no se repiten: cambia el nombre de uno o su profile")
+    declared.setdefault(name, []).append((kind, profiles))
+
+
+def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
+    """Lee robot.toml y lo resuelve para un perfil (RFC 0011): nodes, muxes y
+    topics traen solo lo que corre en él. Sin `profile`, usa [robot] profile o
+    "real"."""
     path = Path(path).resolve()
     if not path.exists():
         raise ConfigError(f"no existe el archivo {path}")
@@ -186,9 +300,9 @@ def load_config(path: str | Path) -> RobotConfig:
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{path.name} no es TOML válido: {e}") from None
 
-    _check_keys(data, {"robot", "node", "mux", "topic", "hub", "web", "clock", "record"}, path.name)
+    _check_keys(data, {"robot", "node", "mux", "topic", "hub", "web", "clock", "record", "profile"}, path.name)
     robot = data.get("robot", {})
-    _check_keys(robot, {"name", "before"}, "[robot]")
+    _check_keys(robot, {"name", "before", "profile"}, "[robot]")
     base_dir = path.parent
 
     nodes: list[NodeConfig] = []
@@ -196,17 +310,18 @@ def load_config(path: str | Path) -> RobotConfig:
     if not isinstance(raw_nodes, list) or not raw_nodes:
         raise ConfigError(f"{path.name} no declara ningún nodo. Agrega al menos uno:\n\n"
                           "  [[node]]\n  name = \"motor\"\n  cmd = \"./build/bin/motor\"")
-    seen: set[str] = set()
+    declared: dict[str, list[tuple[str, tuple[str, ...]]]] = {}
+    mentions: list[tuple[str, str, tuple[str, ...]]] = []   # (dónde, nombre, perfiles): para los avisos
     for i, raw in enumerate(raw_nodes, start=1):
         where = f"[[node]] #{i}"
-        _check_keys(raw, {"name", "cmd", "restart", "autostart", "cwd", "env"}, where)
+        _check_keys(raw, {"name", "cmd", "restart", "autostart", "cwd", "env", "profile"}, where)
         name = raw.get("name")
         if not isinstance(name, str) or not name.strip():
             raise ConfigError(f"{where}: falta 'name' (el nombre del nodo)")
         where = f"[[node]] '{name}'"
-        if name in seen:
-            raise ConfigError(f"hay dos nodos llamados '{name}': los nombres deben ser únicos")
-        seen.add(name)
+        profiles = _parse_profiles(raw, where)
+        _claim(declared, name, "nodo", profiles)
+        mentions.append((where, name, profiles))
         if "cmd" not in raw:
             raise ConfigError(f"{where}: falta 'cmd' (el comando que arranca el nodo)")
         restart = raw.get("restart", "never")
@@ -222,6 +337,7 @@ def load_config(path: str | Path) -> RobotConfig:
             autostart=bool(raw.get("autostart", True)),
             cwd=(base_dir / raw["cwd"]).resolve() if "cwd" in raw else None,
             env={str(k): str(v) for k, v in env.items()},
+            profiles=profiles,
         ))
 
     hub_raw = data.get("hub", {})
@@ -236,14 +352,14 @@ def load_config(path: str | Path) -> RobotConfig:
     mux_configs: list[MuxConfig] = []
     for i, raw in enumerate(raw_muxes, start=1):
         where = f"[[mux]] #{i}"
-        _check_keys(raw, {"name", "output", "hold_ms", "input"}, where)
+        _check_keys(raw, {"name", "output", "hold_ms", "input", "profile"}, where)
         name = raw.get("name")
         if not isinstance(name, str) or not name.strip():
             raise ConfigError(f"{where}: falta 'name', ej. name = \"ruedas\"")
         where = f"[[mux]] '{name}'"
-        if name in seen:
-            raise ConfigError(f"el mux '{name}' se llama igual que otro nodo: los nombres deben ser únicos")
-        seen.add(name)
+        profiles = _parse_profiles(raw, where)
+        _claim(declared, name, "mux", profiles)
+        mentions.append((where, name, profiles))
         if "output" not in raw:
             raise ConfigError(f"{where}: falta 'output' (a dónde reenviar), ej. output = \"127.0.0.1:7500\"")
         hold_ms = raw.get("hold_ms", 300)
@@ -282,7 +398,7 @@ def load_config(path: str | Path) -> RobotConfig:
             listens.add(inp["listen"])
             args += ["--in", f"{inp['name']}={inp['listen']}@{inp['priority']}"]
             mux_inputs.append((str(inp["name"]), str(inp["listen"]), int(inp["priority"])))
-        mux_configs.append(MuxConfig(name, str(raw["output"]), mux_inputs, float(hold_ms)))
+        mux_configs.append(MuxConfig(name, str(raw["output"]), mux_inputs, float(hold_ms), profiles))
         if hub_enabled:   # quién manda, en /mux/<nombre> (RFC 0012): necesita el hub, como todo topic
             from .mux import state_topic
 
@@ -293,6 +409,7 @@ def load_config(path: str | Path) -> RobotConfig:
             restart="always",
             env={"PYTHONPATH": os.pathsep.join(
                 [str(Path(__file__).resolve().parent.parent), *filter(None, [os.environ.get("PYTHONPATH")])])},
+            profiles=profiles,
         ))
     nodes = muxes + nodes   # los mux arrancan primero: ya escuchan cuando llegan comandos
 
@@ -304,7 +421,7 @@ def load_config(path: str | Path) -> RobotConfig:
     topics: list[TopicConfig] = []
     for i, raw in enumerate(raw_topics, start=1):
         where = f"[[topic]] #{i}"
-        _check_keys(raw, {"name", "type", "required", "max_gap_ms"}, where)
+        _check_keys(raw, {"name", "type", "required", "max_gap_ms", "profile"}, where)
         if "name" not in raw:
             raise ConfigError(f"{where}: falta 'name', ej. name = \"/imu\"")
         gap = raw.get("max_gap_ms")
@@ -315,45 +432,138 @@ def load_config(path: str | Path) -> RobotConfig:
             hp.check_topic(str(raw["name"]))
         except hp.ProtocolError as e:
             raise ConfigError(f"{where}: {e}") from None
-        if any(t.name == raw["name"] for t in topics):
-            raise ConfigError(f"el topic '{raw['name']}' está declarado dos veces")
+        profiles = _parse_profiles(raw, f"[[topic]] '{raw['name']}'")
+        mentions.append((f"[[topic]] '{raw['name']}'", str(raw["name"]), profiles))
+        for t in topics:
+            shared = _shared(profiles, t.profiles) if t.name == raw["name"] else None
+            if shared is None:
+                continue
+            if not profiles and not t.profiles:
+                raise ConfigError(f"el topic '{raw['name']}' está declarado dos veces")
+            raise ConfigError(f"el topic '{raw['name']}' está declarado dos veces y los dos se esperan {shared} "
+                              f"(uno: {_fmt_profiles(t.profiles)}; el otro: {_fmt_profiles(profiles)}). "
+                              f"Deja uno, o ponles perfiles que no se repitan")
         topics.append(TopicConfig(raw["name"], str(raw.get("type", "")), bool(raw.get("required", False)),
-                                  float(gap) if gap is not None else None))
-    web_raw = data.get("web", {})
+                                  float(gap) if gap is not None else None, profiles))
+
+    # Perfiles conocidos y el activo (RFC 0011 §3.2).
+    raw_tables = data.get("profile", {})
+    if not isinstance(raw_tables, dict) or not all(isinstance(v, dict) for v in raw_tables.values()):
+        raise ConfigError("los perfiles se declaran como tablas, ej.\n\n  [profile.sim]\n  local = true")
+    for x, table in raw_tables.items():
+        _check_profile_name(x, f"[profile.{x}]")
+        _check_keys(table, {"clock", "web", "record", "local"}, f"[profile.{x}]")
+        if "local" in table and not isinstance(table["local"], bool):
+            raise ConfigError(f"[profile.{x}] local: true o false (true = todo corre en esta computadora)")
+    named = {p for n in nodes for p in n.profiles} | {p for t in topics for p in t.profiles} | set(raw_tables)
+    known = PROFILES + tuple(sorted(named - set(PROFILES)))
+
+    def check_known(name: str, source_of: str) -> None:
+        if name not in known:
+            hint = difflib.get_close_matches(name, known, n=1)
+            extra = (f" ¿Quisiste decir '{hint[0]}'?" if hint
+                     else f" Perfiles conocidos: {', '.join(known)}.")
+            raise ConfigError(f"{source_of}{extra} Un perfil existe si "
+                              f"algún [[node]], [[mux]] o [[topic]] lo nombra en su profile, o si tiene su tabla "
+                              f"[profile.{name}]")
+
+    # [robot] profile se revisa siempre, aunque --profile o --sim lo reemplacen.
+    default = robot.get("profile", "real")
+    _check_profile_name(default, "[robot] profile")
+    check_known(default, f"[robot] profile = '{default}': ese perfil no existe en {path.name}.")
+    if profile is None:
+        profile = default
+    else:
+        check_known(profile, f"el perfil '{profile}' no existe en {path.name}.")
+
+    # Las tablas [profile.X] se revisan todas (un error de dedo en 'sim' no espera
+    # a que corras --sim); la del perfil activo reemplaza a las de arriba.
+    for x, table in raw_tables.items():
+        if x != profile:
+            run_x = [n for n in nodes if _runs_in(n.profiles, x)]
+            if "clock" in table:
+                _parse_clock(table["clock"], run_x, f"[profile.{x}.clock]",
+                             [n for n in nodes if not _runs_in(n.profiles, x)], x)
+            if "web" in table:
+                _parse_web(table["web"], base_dir, f"[profile.{x}.web]")
+            if "record" in table:
+                _parse_record(table["record"], f"[profile.{x}.record]")
+    active = raw_tables.get(profile, {})
+    skipped_nodes = [n for n in nodes if not _runs_in(n.profiles, profile)]
+    nodes = [n for n in nodes if _runs_in(n.profiles, profile)]
+    mux_configs = [m for m in mux_configs if _runs_in(m.profiles, profile)]
+    topics = [t for t in topics if _runs_in(t.profiles, profile)]
+
+    web = _parse_web(data.get("web", {}), base_dir)   # con [profile.X] web no se usa, pero se revisa
+    if "web" in active:
+        web = _parse_web(active["web"], base_dir, f"[profile.{profile}.web]")
+
+    top_clock = data.get("clock", {})
+    if "clock" in active:
+        _parse_clock(top_clock, nodes + skipped_nodes)   # no se usa en este perfil, pero se revisa
+        clock = _parse_clock(active["clock"], nodes, f"[profile.{profile}.clock]", skipped_nodes, profile)
+    elif profile == "sim" and not (isinstance(top_clock, dict) and top_clock.get("mode") == "sim"):
+        _parse_clock(top_clock, nodes + skipped_nodes)
+        clock = ClockConfig(mode="sim")   # el perfil sim usa el reloj de simulación sin que lo escribas
+    else:
+        clock = _parse_clock(top_clock, nodes, "[clock]", skipped_nodes, profile)
+    for n in nodes:
+        n.env.update(clock.env())   # todos con el mismo reloj: nadie lo olvida
+
+    before = [_parse_cmd(c, "[robot] before") for c in robot.get("before", [])]
+    if "record" in active:
+        if "record" in data:
+            _parse_record(data["record"])   # no se usa en este perfil, pero se revisa
+        record = _parse_record(active["record"], f"[profile.{profile}.record]")
+    else:
+        record = _parse_record(data["record"]) if "record" in data else None
+    return RobotConfig(name=robot.get("name", path.stem), base_dir=base_dir,
+                       nodes=nodes, web=web, before=before, topics=topics,
+                       hub=hub_enabled, clock=clock, record=record, path=path,
+                       muxes=mux_configs, profile=profile, profiles=known,
+                       skipped=[(n.name, n.profiles) for n in skipped_nodes],
+                       local=bool(active.get("local", False)),
+                       warnings=_typo_warnings(mentions, raw_tables))
+
+
+def _parse_web(web_raw, base_dir: Path, where: str = "[web]") -> WebConfig:
+    if not isinstance(web_raw, dict):
+        raise ConfigError(f"{where} es una tabla, ej.\n\n  {where}\n  http = \"127.0.0.1:8080\"")
+    sub = where[:-1]   # "[web" → "[web.teleop]"
     _check_keys(web_raw, {"enabled", "http", "listen", "open_browser", "teleop", "token", "allow_origins", "command"},
-                "[web]")
+                where)
     token = web_raw.get("token")
     if token is not None and (not isinstance(token, str) or len(token) < 8):
-        raise ConfigError("[web] token: debe ser un texto de al menos 8 caracteres (o quítalo y se genera uno solo)")
+        raise ConfigError(f"{where} token: debe ser un texto de al menos 8 caracteres (o quítalo y se genera uno solo)")
     origins = web_raw.get("allow_origins", [])
     if not isinstance(origins, list) or not all(isinstance(o, str) for o in origins):
-        raise ConfigError('[web] allow_origins: una lista de textos, ej. ["https://mi-visor.local"]')
+        raise ConfigError(f'{where} allow_origins: una lista de textos, ej. ["https://mi-visor.local"]')
     teleop = None
     if "teleop" in web_raw:
         t = web_raw["teleop"]
-        _check_keys(t, {"target", "type", "max_speed"}, "[web.teleop]")
+        _check_keys(t, {"target", "type", "max_speed"}, f"{sub}.teleop]")
         if "target" not in t:
-            raise ConfigError("[web.teleop]: falta 'target', ej. target = \"/cmd/teleop\"")
+            raise ConfigError(f"{sub}.teleop]: falta 'target', ej. target = \"/cmd/teleop\"")
         if t.get("type", "MotorCommand") != "MotorCommand":
-            raise ConfigError("[web.teleop] maneja con W A S D y manda MotorCommand. Para otro tipo usa "
+            raise ConfigError(f"{sub}.teleop] maneja con W A S D y manda MotorCommand. Para otro tipo usa "
                               "[[web.command]]: botones y deslizadores de cualquier tipo de tu .agmen (RFC 0012)")
         teleop = TeleopConfig(target=t["target"], max_speed=float(t.get("max_speed", 1.0)))
     commands = []
     raw_commands = web_raw.get("command", [])
     if not isinstance(raw_commands, list):
-        raise ConfigError("los mandos del panel se declaran como [[web.command]] (uno por tarjeta)")
+        raise ConfigError(f"los mandos del panel se declaran como [{sub}.command]] (uno por tarjeta)")
     from .panel.command import CommandError, parse_command
 
     for k, raw in enumerate(raw_commands):
         try:
             commands.append(parse_command(raw, k, base_dir))
         except CommandError as e:
-            raise ConfigError(str(e)) from None
+            raise ConfigError(str(e) if where == "[web]" else f"{where}: {e}") from None
     names_seen = [c.name for c in commands]
     dup = next((n for n in names_seen if names_seen.count(n) > 1), None)
     if dup:
-        raise ConfigError(f"hay dos [[web.command]] llamados '{dup}': ponles name distintos (es el título de su tarjeta)")
-    web = WebConfig(
+        raise ConfigError(f"hay dos [{sub}.command]] llamados '{dup}': ponles name distintos (es el título de su tarjeta)")
+    return WebConfig(
         enabled=bool(web_raw.get("enabled", True)),
         http=web_raw.get("http", "127.0.0.1:8080"),
         listen=web_raw.get("listen", "127.0.0.1:7400"),
@@ -364,30 +574,19 @@ def load_config(path: str | Path) -> RobotConfig:
         commands=commands,
     )
 
-    clock = _parse_clock(data.get("clock", {}), nodes)
-    for n in nodes:
-        n.env.update(clock.env())   # todos con el mismo reloj: nadie lo olvida
 
-    before = [_parse_cmd(c, "[robot] before") for c in robot.get("before", [])]
-    record = _parse_record(data["record"]) if "record" in data else None
-    return RobotConfig(name=robot.get("name", path.stem), base_dir=base_dir,
-                       nodes=nodes, web=web, before=before, topics=topics,
-                       hub=hub_enabled, clock=clock, record=record, path=path,
-                       muxes=mux_configs)
-
-
-def _parse_record(raw) -> RecordConfig:
+def _parse_record(raw, where: str = "[record]") -> RecordConfig:
     if not isinstance(raw, dict):
-        raise ConfigError("[record] es una tabla, ej.\n\n  [record]\n  topics = [\"/camara\", \"/imu\"]")
-    _check_keys(raw, {"topics", "dir", "split", "compress", "auto"}, "[record]")
+        raise ConfigError(f"{where} es una tabla, ej.\n\n  {where}\n  topics = [\"/camara\", \"/imu\"]")
+    _check_keys(raw, {"topics", "dir", "split", "compress", "auto"}, where)
     topics = raw.get("topics", "*")
     if isinstance(topics, str):
         topics = [topics]
     if not isinstance(topics, list) or not all(isinstance(t, str) and (t == "*" or t.startswith("/")) for t in topics):
-        raise ConfigError("[record] topics: una lista de topics (\"/camara\") o \"*\" para todos")
+        raise ConfigError(f"{where} topics: una lista de topics (\"/camara\") o \"*\" para todos")
     compress = raw.get("compress")
     if compress not in (None, "zstd", "lz4"):
-        raise ConfigError("[record] compress: \"zstd\" o \"lz4\" (o quítalo para no comprimir)")
+        raise ConfigError(f"{where} compress: \"zstd\" o \"lz4\" (o quítalo para no comprimir)")
     split = raw.get("split")
     if split is not None:
         from .record import parse_split
@@ -395,41 +594,51 @@ def _parse_record(raw) -> RecordConfig:
         try:
             parse_split(str(split))
         except ValueError as e:
-            raise ConfigError(f"[record] split: {e}") from None
+            raise ConfigError(f"{where} split: {e}") from None
     return RecordConfig(topics=topics or ["*"], dir=str(raw.get("dir", "grabaciones")),
                         split=str(split) if split is not None else None, compress=compress,
                         auto=bool(raw.get("auto", True)))
 
 
-def _parse_clock(raw, nodes: list[NodeConfig]) -> ClockConfig:
+def _parse_clock(raw, nodes: list[NodeConfig], where: str = "[clock]",
+                 skipped: list[NodeConfig] | tuple = (), profile: str = "") -> ClockConfig:
+    """`nodes` son los que corren; `skipped`, los de otros perfiles (para decir
+    por qué `source` no sirve en `profile`)."""
     if not isinstance(raw, dict):
-        raise ConfigError("[clock] es una tabla, ej.\n\n  [clock]\n  mode = \"sim\"")
-    _check_keys(raw, {"mode", "speed", "source", "paused"}, "[clock]")
+        raise ConfigError(f"{where} es una tabla, ej.\n\n  {where}\n  mode = \"sim\"")
+    _check_keys(raw, {"mode", "speed", "source", "paused"}, where)
     mode = raw.get("mode", "real")
     if mode not in ("real", "sim"):
-        hint = (" (para reproducir una grabación no se toca robot.toml: agmen run robot.toml --play "
-                "archivo.mcap pone a todos los nodos en replay)") if mode == "replay" else ""
-        raise ConfigError(f"[clock] mode = '{mode}' no es válido. Usa \"real\" o \"sim\"{hint}")
+        hint = (" (para reproducir una grabación no se toca robot.toml: con agmen run robot.toml --play "
+                "archivo.mcap corren los nodos sin profile y los del perfil replay, con el reloj de la "
+                "grabación)") if mode == "replay" else ""
+        raise ConfigError(f"{where} mode = '{mode}' no es válido. Usa \"real\" o \"sim\"{hint}")
     speed = raw.get("speed", 1.0)
     if isinstance(speed, bool) or not isinstance(speed, (int, float)) or not (0 < speed <= 1000):
-        raise ConfigError("[clock] speed debe ser un número mayor que 0 (0.5 = la mitad de rápido, 2.0 = el doble)")
+        raise ConfigError(f"{where} speed debe ser un número mayor que 0 (0.5 = la mitad de rápido, 2.0 = el doble)")
     source = raw.get("source", "agmen")
     if not isinstance(source, str) or not source:
-        raise ConfigError("[clock] source: \"agmen\" o el nombre del nodo que simula")
+        raise ConfigError(f"{where} source: \"agmen\" o el nombre del nodo que simula")
     if mode == "real":
         extra = [k for k in ("speed", "source", "paused") if k in raw]
         if extra:
-            raise ConfigError(f"[clock] {', '.join(extra)} solo aplica con mode = \"sim\" "
+            raise ConfigError(f"{where} {', '.join(extra)} solo aplica con mode = \"sim\" "
                               f"(el tiempo real no se puede acelerar ni pausar)")
     if source != "agmen":
         names = [n.name for n in nodes]
+        other = next((n for n in skipped if n.name == source), None)
+        if source not in names and other is not None:
+            first = other.profiles[0]
+            raise ConfigError(f"{where} source = '{source}': el nodo '{source}' es {_of_profiles(other.profiles)} "
+                              f"y no corre en '{profile}'. Pon ese reloj en su perfil, ej. [profile.{first}] "
+                              f"clock = {{ mode = \"sim\", source = \"{source}\" }}")
         if source not in names:
             hint = difflib.get_close_matches(source, names, n=1)
             extra = f" ¿Quisiste decir '{hint[0]}'?" if hint else ""
-            raise ConfigError(f"[clock] source = '{source}': no hay un [[node]] con ese nombre.{extra} "
+            raise ConfigError(f"{where} source = '{source}': no hay un [[node]] con ese nombre.{extra} "
                               f"Usa \"agmen\" para que agmen run mande el tiempo, o el nombre de tu nodo simulador")
         if "speed" in raw or "paused" in raw:
-            raise ConfigError(f"[clock] speed y paused son para source = \"agmen\": con '{source}', "
+            raise ConfigError(f"{where} speed y paused son para source = \"agmen\": con '{source}', "
                               f"el tiempo lo decide tu simulador")
     return ClockConfig(mode=mode, speed=float(speed), source=source, paused=bool(raw.get("paused", False)))
 
