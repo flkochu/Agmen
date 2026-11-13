@@ -53,8 +53,8 @@ class TopicWatch:
         self.last: dict[str, float] = {}         # topic → cuándo llegó el último (s, reloj de Agmen)
         self.late: dict[str, float] = {}         # topic → desde cuándo no llega
         self.jumped = clock.mono_jumps()[1]      # el último total de saltos del reloj que vio (ns)
-        self.hold_s = 0.0                        # el salto NUEVO (s), mientras dura el margen
-        self.hold_until = 0.0                    # hasta cuándo (self.wall(), pared)
+        # Los saltos cuyo margen sigue vigente: (vence en self.wall(), cuánto saltó en s).
+        self.holds: list[tuple[float, float]] = []
         self.rx: dict[str, RawSubscriber] = {}
         try:
             for t in topics if subscribe else ():
@@ -88,13 +88,13 @@ class TopicWatch:
         with self.lock:
             wall = self.wall()
             if jumped != self.jumped:        # el reloj saltó: el lote de ese tiempo viene en camino
-                # Solo se disculpa el salto NUEVO (lo que saltó desde la última
-                # revisión), no todos los pasos de la misma pausa: si no, dando
-                # pasos seguidos un topic muerto no se avisaría nunca.
-                self.hold_s = (jumped - self.jumped) / 1e9
+                # Cada salto con su propio margen: un paso nuevo no le quita el
+                # suyo al anterior (doble clic) ni lo alarga (un topic muerto se
+                # avisa igual, a lo más JUMP_MARGIN_S de pared más tarde).
+                self.holds.append((wall + JUMP_MARGIN_S, (jumped - self.jumped) / 1e9))
                 self.jumped = jumped
-                self.hold_until = wall + JUMP_MARGIN_S
-            t_eval = t - self.hold_s if wall < self.hold_until else t
+            self.holds = [h for h in self.holds if wall < h[0]]   # se podan los vencidos
+            t_eval = t - sum(dj for _, dj in self.holds)
             for topic, last in self.last.items():
                 gap = self.max_gap[topic]
                 if topic not in self.late and t_eval - last > gap:
