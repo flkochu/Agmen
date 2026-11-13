@@ -1,0 +1,491 @@
+"""Pruebas de la clase `Mundo` (examples/sim/mundo.py, RFC 0011 §3.3): la física sola, sin Agmen.
+
+mundo.py no es un paquete: se carga por ruta. Se saltan si no hay MuJoCo (pip install mujoco);
+las de la cámara se saltan además si esta máquina no puede dibujar sin ventana (OpenGL).
+El nodo completo (freno, reloj, /imu, /camara) se prueba en scripts/sim_smoke.py.
+
+    python -m unittest discover -s python
+"""
+
+import importlib.util
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+RAIZ = Path(__file__).resolve().parent.parent
+MUNDO_PY = RAIZ / "examples" / "sim" / "mundo.py"
+ROBOT_XML = RAIZ / "examples" / "sim" / "robot.xml"
+HAY_MUJOCO = importlib.util.find_spec("mujoco") is not None
+SIN_MUJOCO = "falta MuJoCo: pip install mujoco (o pip install agmen[sim])"
+
+
+def cargar_modulo():
+    spec = importlib.util.spec_from_file_location("agmen_ejemplo_mundo", MUNDO_PY)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_mod = cargar_modulo() if HAY_MUJOCO else None
+_gl_cache: list = []   # [motivo]: "" = se puede dibujar
+
+
+def sin_opengl() -> str:
+    """"" si esta máquina dibuja sin ventana; si no, el motivo (para @skipIf)."""
+    if not HAY_MUJOCO:
+        return SIN_MUJOCO
+    if not _gl_cache:
+        m = _mod.Mundo()
+        try:
+            m.imagen()
+            _gl_cache.append("")
+        except _mod.ErrorDelMundo as e:
+            _gl_cache.append(f"no hay OpenGL sin ventana aquí: {e}")
+        finally:
+            m.cerrar()
+    return _gl_cache[0]
+
+
+def correr(codigo: str, pythonpath: list, extra_env=None, args=None):
+    """Corre Python aparte con PYTHONPATH controlado."""
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(str(p) for p in pythonpath), "PYTHONIOENCODING": "utf-8",
+           "NO_COLOR": "1"}
+    env.pop("MUJOCO_GL", None)
+    env.update(extra_env or {})
+    cmd = [sys.executable, "-c", codigo] if args is None else [sys.executable, *args]
+    return subprocess.run(cmd, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                          timeout=120, cwd=tempfile.gettempdir())
+
+
+@unittest.skipUnless(HAY_MUJOCO, SIN_MUJOCO)
+class TestMundo(unittest.TestCase):
+    def setUp(self):
+        self.m = _mod.Mundo()
+        self.addCleanup(self.m.cerrar)
+
+    def test_en_reposo_la_gravedad(self):
+        self.m.avanzar(250)   # 0.5 s para que se asiente
+        (ax, ay, az), (gx, gy, gz) = self.m.imu()
+        self.assertAlmostEqual(az, 9.81, delta=0.1)
+        self.assertAlmostEqual(ax, 0.0, delta=0.3)
+        self.assertAlmostEqual(ay, 0.0, delta=0.3)
+        for g in (gx, gy, gz):
+            self.assertAlmostEqual(g, 0.0, delta=0.01)
+        x, y, rumbo = self.m.pose()
+        self.assertAlmostEqual(x, 0.0, delta=0.01)
+        self.assertAlmostEqual(y, 0.0, delta=0.01)
+        self.assertAlmostEqual(rumbo, 0.0, delta=0.01)
+
+    def test_imu_devuelve_dos_tuplas_de_tres_floats(self):
+        acel, giro = self.m.imu()
+        for t in (acel, giro):
+            self.assertIsInstance(t, tuple)
+            self.assertEqual(len(t), 3)
+            self.assertTrue(all(type(v) is float for v in t))
+
+    def test_cero_cero_se_queda_quieto(self):
+        self.m.comando(0, 0)
+        self.m.avanzar(1000)
+        x, y, rumbo = self.m.pose()
+        self.assertLess(abs(x) + abs(y), 0.01)
+        self.assertLess(abs(rumbo), 0.01)
+
+    def test_avanza_en_mas_x(self):
+        self.m.comando(0.5, 0.5)
+        self.m.avanzar(1000)   # 2 s
+        x, y, rumbo = self.m.pose()
+        self.assertGreater(x, 0.1)
+        self.assertLess(abs(y), 0.05)
+        self.assertLess(abs(rumbo), 0.05)
+        _, (gx, gy, gz) = self.m.imu()
+        self.assertLess(abs(gz), 0.05)
+
+    def test_hacia_atras_con_negativos(self):
+        self.m.comando(-0.5, -0.5)
+        self.m.avanzar(1000)
+        self.assertLess(self.m.pose()[0], -0.1)
+
+    def test_gira_en_su_lugar(self):
+        self.m.comando(0.5, -0.5)
+        self.m.avanzar(500)   # 1 s
+        x, y, rumbo = self.m.pose()
+        _, (_, _, gz) = self.m.imu()
+        self.assertGreater(abs(gz), 0.1)
+        self.assertGreater(abs(rumbo), 0.1)
+        self.assertLess((x * x + y * y) ** 0.5, 0.15, "al girar casi no se traslada")
+        # el rumbo y el giroscopio cuentan la misma historia (mismo signo)
+        self.assertGreater(gz * rumbo, 0)
+        # y gira al revés con el comando al revés
+        m2 = _mod.Mundo()
+        self.addCleanup(m2.cerrar)
+        m2.comando(-0.5, 0.5)
+        m2.avanzar(500)
+        self.assertLess(m2.pose()[2] * rumbo, 0)
+
+    def test_frenar_con_comando_cero(self):
+        self.m.comando(0.5, 0.5)
+        self.m.avanzar(500)
+        self.m.comando(0, 0)
+        self.m.avanzar(500)      # que frene
+        x1 = self.m.pose()[0]
+        self.m.avanzar(500)
+        self.assertAlmostEqual(self.m.pose()[0], x1, delta=1e-3)
+
+    def test_comando_recorta_a_menos1_mas1(self):
+        self.m.comando(5, -7)
+        self.assertEqual(self.m.ruedas, (1.0, -1.0))
+        self.m.comando(-1e30, 1e30)
+        self.assertEqual(self.m.ruedas, (-1.0, 1.0))
+        # recortar es igual a mandar el tope: el mismo movimiento, bit a bit
+        otro = _mod.Mundo()
+        self.addCleanup(otro.cerrar)
+        self.m.comando(3, 3)
+        otro.comando(1, 1)
+        self.m.avanzar(300)
+        otro.avanzar(300)
+        self.assertEqual(self.m.pose(), otro.pose())
+
+    def test_el_actuador_recibe_rad_s_de_la_rueda(self):
+        self.m.comando(0.5, -1)
+        ctrl = [float(v) for v in self.m.datos.ctrl]
+        self.assertAlmostEqual(ctrl[0], 5.0)
+        self.assertAlmostEqual(ctrl[1], -10.0)
+
+    def test_nan_e_infinito_son_esa_rueda_en_cero(self):
+        nan, inf = float("nan"), float("inf")
+        self.m.comando(nan, 0.5)
+        self.assertEqual(self.m.ruedas, (0.0, 0.5))
+        self.m.comando(0.5, inf)
+        self.assertEqual(self.m.ruedas, (0.5, 0.0))
+        self.m.comando(-inf, nan)
+        self.assertEqual(self.m.ruedas, (0.0, 0.0))
+        self.assertTrue(all(v == v for v in self.m.datos.ctrl), "el actuador nunca recibe NaN")
+        # y la simulación no se rompe
+        self.m.comando(nan, nan)
+        self.m.avanzar(100)
+        self.assertTrue(all(v == v for v in self.m.pose()))
+        self.assertTrue(all(v == v for t in self.m.imu() for v in t))
+
+    def test_avanzar_cuenta_el_tiempo(self):
+        self.assertEqual(self.m.t, 0.0)
+        self.assertAlmostEqual(self.m.dt, 0.002)
+        self.m.avanzar(500)
+        self.assertAlmostEqual(self.m.t, 1.0, places=6)
+        self.m.avanzar(1)
+        self.assertAlmostEqual(self.m.t, 1.002, places=6)
+
+    def test_avanzar_cero_o_negativo_no_hace_nada(self):
+        self.m.avanzar(0)
+        self.m.avanzar(-10)
+        self.assertEqual(self.m.t, 0.0)
+
+    def test_reiniciar_deja_todo_como_al_inicio(self):
+        inicial = (self.m.pose(), self.m.imu())
+        self.m.comando(0.5, -0.5)
+        self.m.avanzar(500)
+        self.assertNotEqual(self.m.pose(), inicial[0])
+        self.m.reiniciar()
+        self.assertEqual(self.m.t, 0.0)
+        self.assertEqual(self.m.ruedas, (0.0, 0.0))
+        self.assertTrue(all(v == 0 for v in self.m.datos.ctrl))
+        self.assertEqual((self.m.pose(), self.m.imu()), inicial)
+        # sigue quieto después de reiniciar (no heredó el comando)
+        self.m.avanzar(500)
+        x, y, rumbo = self.m.pose()
+        self.assertLess(abs(x) + abs(y) + abs(rumbo), 0.01)
+
+    def test_determinista(self):
+        otro = _mod.Mundo()
+        self.addCleanup(otro.cerrar)
+        for w in (self.m, otro):
+            w.comando(0.4, 0.1)
+            w.avanzar(400)
+        self.assertEqual(self.m.pose(), otro.pose())
+        self.assertEqual(self.m.imu(), otro.imu())
+
+    def test_cerrar_sin_haber_dibujado_no_truena(self):
+        self.m.cerrar()
+        self.m.cerrar()
+
+
+@unittest.skipUnless(HAY_MUJOCO, SIN_MUJOCO)
+class TestModelosRotos(unittest.TestCase):
+    """Un modelo malo da un ErrorDelMundo que dice qué pasó y qué hacer; nunca un traceback."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        self.xml = ROBOT_XML.read_text(encoding="utf-8")
+
+    def modelo(self, texto: str, nombre="m.xml") -> Path:
+        p = self.dir / nombre
+        p.write_text(texto, encoding="utf-8")
+        return p
+
+    def falla(self, ruta, *fragmentos) -> str:
+        with self.assertRaises(_mod.ErrorDelMundo) as ctx:
+            _mod.Mundo(ruta)
+        msg = str(ctx.exception)
+        for f in fragmentos:
+            self.assertIn(f, msg)
+        return msg
+
+    def test_el_modelo_original_carga(self):
+        _mod.Mundo(self.modelo(self.xml))
+
+    def test_no_existe(self):
+        msg = self.falla(self.dir / "nada.xml", "no encuentro el modelo", "--modelo")
+        self.assertIn("nada.xml", msg)
+
+    def test_es_una_carpeta(self):
+        self.falla(self.dir, "no encuentro el modelo")
+
+    def test_xml_roto(self):
+        self.falla(self.modelo("<mujoco><worldbody>"), "MuJoCo no pudo leer")
+
+    def test_archivo_vacio(self):
+        self.falla(self.modelo(""), "MuJoCo no pudo leer")
+
+    def test_no_es_mjcf(self):
+        self.falla(self.modelo("<html><body>hola</body></html>"), "MuJoCo no pudo leer")
+
+    def test_include_que_no_existe(self):
+        self.falla(self.modelo('<mujoco><include file="no_existe.xml"/></mujoco>'), "MuJoCo no pudo leer")
+
+    def test_falta_un_actuador(self):
+        malo = self.xml.replace('<velocity name="rueda_der"', '<velocity name="otra"')
+        self.falla(self.modelo(malo), "no tiene el actuador 'rueda_der'")
+
+    def test_faltan_los_dos_actuadores(self):
+        a = self.xml.index("<actuator>")
+        b = self.xml.index("</actuator>") + len("</actuator>")
+        self.falla(self.modelo(self.xml[:a] + self.xml[b:]), "el actuador 'rueda_izq'")
+
+    def test_falta_un_sensor(self):
+        for sensor in ("acel", "giro"):
+            with self.subTest(sensor=sensor):
+                malo = self.xml.replace(f'name="{sensor}"', 'name="otro"')
+                self.falla(self.modelo(malo), f"no tiene el sensor '{sensor}'")
+
+    def test_sensor_que_no_mide_tres_ejes(self):
+        malo = self.xml.replace('<gyro name="giro" site="imu"/>',
+                                '<jointpos name="giro" joint="rueda_izq"/>')
+        self.falla(self.modelo(malo), "'giro'", "3 ejes")
+
+    def test_sin_ctrlrange_en_las_ruedas(self):
+        malo = self.xml.replace(' ctrlrange="-10 10"', "")
+        self.falla(self.modelo(malo), "ctrlrange")
+
+    def test_sin_junta_libre_base(self):
+        malo = self.xml.replace('<freejoint name="base"/>', '<joint name="base" type="slide" axis="1 0 0"/>')
+        self.falla(self.modelo(malo), "'base'", "freejoint")
+
+    def test_sin_la_junta_base(self):
+        malo = self.xml.replace('<freejoint name="base"/>', '<freejoint name="otra"/>')
+        self.falla(self.modelo(malo), "la junta libre 'base'")
+
+    def test_modelo_como_texto_de_ruta_str(self):
+        _mod.Mundo(str(self.modelo(self.xml)))   # acepta str y Path
+
+
+@unittest.skipUnless(HAY_MUJOCO, SIN_MUJOCO)
+class TestImagen(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        motivo = sin_opengl()
+        if motivo:
+            raise unittest.SkipTest(motivo)
+
+    def setUp(self):
+        self.m = _mod.Mundo()
+        self.addCleanup(self.m.cerrar)
+
+    def test_forma_y_tipo_por_defecto(self):
+        img = self.m.imagen()
+        self.assertEqual(img.shape, (240, 320, 3))   # alto × ancho × 3
+        self.assertEqual(str(img.dtype), "uint8")
+
+    def test_no_es_toda_negra_ni_toda_igual(self):
+        img = self.m.imagen()
+        self.assertGreater(int(img.max()), 50)
+        self.assertGreater(float(img.std()), 5.0)
+
+    def test_ve_la_caja_roja_de_frente(self):
+        img = self.m.imagen().astype(int)
+        rojos = ((img[..., 0] > 150) & (img[..., 1] < 90) & (img[..., 2] < 90)).sum()
+        self.assertGreater(int(rojos), 100, "la caja roja está 1.5 m al frente")
+
+    def test_cambia_cuando_el_robot_se_mueve(self):
+        antes = self.m.imagen().copy()
+        self.m.comando(0.5, -0.5)
+        self.m.avanzar(500)
+        despues = self.m.imagen()
+        self.assertTrue((antes != despues).any())
+
+    def test_dos_fotos_sin_avanzar_son_iguales(self):
+        a = self.m.imagen().copy()
+        b = self.m.imagen()
+        self.assertTrue((a == b).all())
+
+    def test_otro_tamano_en_el_primer_pedido(self):
+        self.assertEqual(self.m.imagen(ancho=160, alto=120).shape, (120, 160, 3))
+
+    def test_mas_grande_que_el_buffer_es_un_error_claro(self):
+        with self.assertRaises(_mod.ErrorDelMundo) as ctx:
+            self.m.imagen(ancho=2000, alto=2000)
+        self.assertIn("no pude dibujar sin ventana", str(ctx.exception))
+
+    def test_camara_que_no_existe_antes_de_abrir(self):
+        with self.assertRaises(_mod.ErrorDelMundo) as ctx:
+            self.m.imagen("nada")
+        self.assertIn("no tiene la cámara 'nada'", str(ctx.exception))
+
+    def test_camara_que_no_existe_con_la_cámara_ya_abierta(self):
+        self.m.imagen()
+        with self.assertRaises(_mod.ErrorDelMundo):   # no un ValueError crudo de MuJoCo
+            self.m.imagen("nada")
+
+    def test_pedir_otro_tamano_con_la_camara_ya_abierta(self):
+        self.m.imagen()   # 320×240
+        img = self.m.imagen(ancho=160, alto=120)
+        self.assertEqual(img.shape, (120, 160, 3), "o devuelve lo pedido o dice que no se puede")
+
+    def test_cerrar_y_volver_a_pedir(self):
+        self.m.imagen()
+        self.m.cerrar()
+        self.assertEqual(self.m.imagen().shape, (240, 320, 3))
+
+    def test_modelo_sin_camara(self):
+        xml = ROBOT_XML.read_text(encoding="utf-8").replace('<camera name="camara"', '<camera name="otra"')
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "m.xml"
+            p.write_text(xml, encoding="utf-8")
+            m = _mod.Mundo(p)
+            self.addCleanup(m.cerrar)
+            m.avanzar(10)                              # la física no necesita la cámara
+            with self.assertRaises(_mod.ErrorDelMundo) as ctx:
+                m.imagen()
+            self.assertIn("la cámara 'camara'", str(ctx.exception))
+
+
+class TestSinOpenGL(unittest.TestCase):
+    """Sin OpenGL la física sigue y la cámara dice por qué no (subproceso: MUJOCO_GL se lee al importar)."""
+
+    @unittest.skipUnless(HAY_MUJOCO, SIN_MUJOCO)
+    def test_gl_invalido_la_fisica_sigue_y_la_camara_avisa(self):
+        codigo = (
+            "import importlib.util as u\n"
+            f"s = u.spec_from_file_location('mundo', r'{MUNDO_PY}'); m = u.module_from_spec(s); s.loader.exec_module(m)\n"
+            "w = m.Mundo(); w.comando(0.5, 0.5); w.avanzar(500)\n"
+            "print('x>0', w.pose()[0] > 0)\n"
+            "try:\n"
+            "    w.imagen()\n"
+            "except m.ErrorDelMundo as e:\n"
+            "    print('ERROR', e)\n"
+        )
+        r = correr(codigo, [], {"MUJOCO_GL": "no_existe_este_backend"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("x>0 True", r.stdout)
+        self.assertIn("ERROR no pude dibujar sin ventana", r.stdout)
+        self.assertNotIn("Traceback", r.stderr)
+
+
+class TestSinAgmen(unittest.TestCase):
+    @unittest.skipUnless(HAY_MUJOCO, SIN_MUJOCO)
+    def test_mundo_no_importa_agmen(self):
+        # python/ en el PYTHONPATH: si Mundo importara agmen, lo cargaría y se vería en sys.modules.
+        codigo = (
+            "import sys, importlib.util as u\n"
+            f"s = u.spec_from_file_location('mundo', r'{MUNDO_PY}'); m = u.module_from_spec(s); s.loader.exec_module(m)\n"
+            "w = m.Mundo(); w.comando(0.3, 0.3); w.avanzar(50); w.imu(); w.pose(); w.reiniciar()\n"
+            "try:\n"
+            "    w.imagen()\n"
+            "except m.ErrorDelMundo:\n"
+            "    pass\n"
+            "w.cerrar()\n"
+            "print('AGMEN_CARGADO', any(k == 'agmen' or k.startswith('agmen.') for k in sys.modules))\n"
+        )
+        r = correr(codigo, [RAIZ / "python"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("AGMEN_CARGADO False", r.stdout)
+
+
+class TestFaltaDependencia(unittest.TestCase):
+    """Sin MuJoCo (o sin NumPy) el mensaje dice cómo instalarlo. Un paquete falso delante en PYTHONPATH
+    que lanza ImportError simula que no están instalados."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.falsos = Path(self._tmp.name)
+
+    def falso(self, nombre: str):
+        d = self.falsos / nombre
+        d.mkdir()
+        (d / "__init__.py").write_text(f'raise ImportError("{nombre} falso: no instalado")\n', encoding="utf-8")
+
+    def test_falta_mujoco_en_la_clase(self):
+        self.falso("mujoco")
+        codigo = (
+            "import importlib.util as u\n"
+            f"s = u.spec_from_file_location('mundo', r'{MUNDO_PY}'); m = u.module_from_spec(s); s.loader.exec_module(m)\n"
+            "try:\n"
+            "    m.Mundo()\n"
+            "except m.ErrorDelMundo as e:\n"
+            "    print('MENSAJE', e)\n"
+        )
+        r = correr(codigo, [self.falsos, RAIZ / "python"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("MENSAJE falta MuJoCo: instálalo con  pip install agmen[sim]", r.stdout)
+
+    def test_falta_mujoco_en_el_nodo(self):
+        self.falso("mujoco")
+        r = correr("", [self.falsos, RAIZ / "python"], args=[str(MUNDO_PY), "--seconds", "1"])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("[mundo] falta MuJoCo: instálalo con  pip install agmen[sim]", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_falta_numpy(self):
+        self.falso("numpy")
+        codigo = (
+            "import importlib.util as u\n"
+            f"s = u.spec_from_file_location('mundo', r'{MUNDO_PY}'); m = u.module_from_spec(s); s.loader.exec_module(m)\n"
+            "try:\n"
+            "    m.Mundo()\n"
+            "except m.ErrorDelMundo as e:\n"
+            "    print('MENSAJE', e)\n"
+        )
+        r = correr(codigo, [self.falsos])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("MENSAJE falta NumPy: instálalo con  pip install agmen[sim]", r.stdout)
+
+
+@unittest.skipUnless(HAY_MUJOCO, SIN_MUJOCO)
+class TestNodoArgumentos(unittest.TestCase):
+    """Errores de la línea de comandos del nodo (no necesitan hub)."""
+
+    def corre(self, *args):
+        return correr("", [RAIZ / "python"], args=[str(MUNDO_PY), *args])
+
+    def test_modelo_que_no_existe(self):
+        r = self.corre("--modelo", "no_existe.xml", "--seconds", "1")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("[mundo] no encuentro el modelo", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_modelo_roto(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "roto.xml"
+            p.write_text("<mujoco><worldbody>", encoding="utf-8")
+            r = self.corre("--modelo", str(p), "--seconds", "1")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("[mundo] MuJoCo no pudo leer", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

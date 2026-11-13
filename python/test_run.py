@@ -616,8 +616,44 @@ class TestPerfiles(unittest.TestCase):
             with self.subTest(rel=rel):
                 cfg = load_config(path)
                 vistos += 1
-                self.assertEqual((cfg.profile, cfg.skipped, cfg.local), ("real", [], False))
+                # El robot del tutorial tiene un nodo `mundo` (perfil sim): en `real` no corre.
+                esperado = [("mundo", ("sim",))] if rel == "examples/tutorial/robot.toml" else []
+                self.assertEqual((cfg.profile, cfg.skipped, cfg.local), ("real", esperado, False))
         self.assertGreater(vistos, 0)
+
+    # 14. el robot del tutorial por perfil (RFC 0011 §3.3, reto 1)
+    def test_tutorial_por_perfil(self):
+        path = Path(__file__).resolve().parent.parent / "examples" / "tutorial" / "robot.toml"
+        real, sim = load_config(path, "real"), load_config(path, "sim")
+
+        # real: el hardware de verdad; el mundo no corre.
+        self.assertTrue({"imu", "motor", "cerebro"} <= set(self.names(real)))
+        self.assertNotIn("mundo", self.names(real))
+        self.assertEqual(real.clock.mode, "real")
+
+        # sim: corren ruedas (el mux), mundo y cerebro; imu y motor NUNCA (no se mueve el robot de verdad).
+        self.assertEqual(sim.profile, "sim")
+        self.assertTrue({"mundo", "cerebro"} <= set(self.names(sim)))
+        self.assertNotIn("imu", self.names(sim))
+        self.assertNotIn("motor", self.names(sim))
+        self.assertEqual(sorted(n for n, _ in sim.skipped), ["imu", "motor"])
+        self.assertTrue(all(p == ("real",) for _, p in sim.skipped))
+        self.assertEqual([m.name for m in real.muxes], ["ruedas"])
+        self.assertEqual([m.name for m in sim.muxes], ["ruedas"])
+        self.assertEqual(sim.clock.mode, "sim")
+
+        # el cerebro empieza apagado en los dos perfiles
+        for cfg in (real, sim):
+            self.assertFalse(next(n for n in cfg.nodes if n.name == "cerebro").autostart)
+
+        # topics: /camara solo se espera en sim; /imu es obligatorio en los dos
+        for cfg in (real, sim):
+            imu = next(t for t in cfg.topics if t.name == "/imu")
+            self.assertTrue(imu.required)
+        self.assertNotIn("/camara", [t.name for t in real.topics])
+        camara = next(t for t in sim.topics if t.name == "/camara")
+        self.assertEqual(camara.type, "Imagen")
+        self.assertFalse(camara.required)
 
 
 class TerminalBloqueada(io.StringIO):
