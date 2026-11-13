@@ -40,19 +40,21 @@ def _secs(s: float) -> str:
 
 class TopicWatch:
     def __init__(self, topics: dict[str, float], log=print, node: str = "agmen run", now_ns=None,
-                 subscribe: bool = True) -> None:
+                 subscribe: bool = True, wall=None) -> None:
         """`topics`: topic → max_gap_ms. `log`: a dónde van los avisos. `subscribe=False`:
-        sin suscribirse (las pruebas llaman a seen() y check() a mano)."""
+        sin suscribirse (las pruebas llaman a seen() y check() a mano). `wall`: el
+        reloj DE PARED del margen tras un salto (s; por defecto time.monotonic)."""
         self.max_gap = {t: ms / 1000.0 for t, ms in topics.items()}
         self.log = log
         self.now = now_ns or wire.now_ns
+        self.wall = wall or time.monotonic
         self._own_clock = now_ns is None
         self.lock = threading.Lock()
         self.last: dict[str, float] = {}         # topic → cuándo llegó el último (s, reloj de Agmen)
         self.late: dict[str, float] = {}         # topic → desde cuándo no llega
         self.jumped = clock.mono_jumps()[1]      # el último total de saltos del reloj que vio (ns)
-        self.hold_s = 0.0                        # el último salto (s), mientras dura el margen
-        self.hold_until = 0.0                    # hasta cuándo (time.monotonic(), pared)
+        self.hold_s = 0.0                        # el salto NUEVO (s), mientras dura el margen
+        self.hold_until = 0.0                    # hasta cuándo (self.wall(), pared)
         self.rx: dict[str, RawSubscriber] = {}
         try:
             for t in topics if subscribe else ():
@@ -61,14 +63,14 @@ class TopicWatch:
             self.close()
             raise
 
-    def _now_and_jump(self, t: float | None) -> tuple[float, tuple[int, int, int]]:
-        """La hora (s) y (jumped, jump_from, jump_to) del reloj, leídos a la vez
-        si la hora es la del reloj de Agmen en simulación (en real no hay saltos)."""
+    def _now_and_jumped(self, t: float | None) -> tuple[float, int]:
+        """La hora (s) y el total de saltos del reloj (ns), leídos a la vez si la
+        hora es la del reloj de Agmen en simulación (en real no hay saltos)."""
         if t is None and self._own_clock and clock.mode() != clock.REAL:
-            now, *jump = clock.mono_jumps()   # en simulación, mono_ns() == now_ns()
-            return now / 1e9, tuple(jump)
+            now, jumped, _, _ = clock.mono_jumps()   # en simulación, mono_ns() == now_ns()
+            return now / 1e9, jumped
         t = self.now() / 1e9 if t is None else t
-        return t, tuple(clock.mono_jumps()[1:])
+        return t, clock.mono_jumps()[1]
 
     def seen(self, topic: str, t: float | None = None) -> None:
         """Llegó un mensaje de `topic` (lo llama run(); las pruebas, directo)."""
@@ -81,13 +83,16 @@ class TopicWatch:
 
     def check(self, t: float | None = None) -> None:
         """¿Alguno lleva más de su max_gap_ms sin llegar?"""
-        t, (jumped, jump_from, jump_to) = self._now_and_jump(t)
+        t, jumped = self._now_and_jumped(t)
         news = []
         with self.lock:
-            wall = time.monotonic()
+            wall = self.wall()
             if jumped != self.jumped:        # el reloj saltó: el lote de ese tiempo viene en camino
+                # Solo se disculpa el salto NUEVO (lo que saltó desde la última
+                # revisión), no todos los pasos de la misma pausa: si no, dando
+                # pasos seguidos un topic muerto no se avisaría nunca.
+                self.hold_s = (jumped - self.jumped) / 1e9
                 self.jumped = jumped
-                self.hold_s = (jump_to - jump_from) / 1e9
                 self.hold_until = wall + JUMP_MARGIN_S
             t_eval = t - self.hold_s if wall < self.hold_until else t
             for topic, last in self.last.items():
