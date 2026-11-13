@@ -404,6 +404,21 @@ def prueba_sim() -> str:
               not en_pasos, "\n".join(en_pasos[:5]))
         check("…y se queda en pausa tras los pasos", get_state()["clock"]["paused"])
 
+        # Un paso LARGO (1 s) con el reloj en pausa: el mundo lo simula entero (~100 /imu) y no es lentitud.
+        lineas_largo = len(run.lines)
+        n0, antes = len(imu.items), imu.items[-1][1] if imu.items else 0
+        ws_op(c, action="step", value=1.0)
+        time.sleep(2.0)
+        nuevos = len(imu.items) - n0
+        avance = (imu.items[-1][1] - antes) if imu.items else 0
+        check("paso de 1 s con el reloj en pausa: ~100 /imu (el mundo lo simula entero)", 90 <= nuevos <= 110,
+              f"{nuevos} /imu")
+        check("…y el t_data avanza ~1 s", 0.9 <= avance <= 1.1, f"{avance:.3f} s")
+        check("…sin ningún aviso '% del reloj' ni 'simulo solo los últimos'",
+              not any("% del reloj" in l or "simulo solo" in l for l in list(run.lines)[lineas_largo:]),
+              "\n".join(l for l in list(run.lines)[lineas_largo:] if "% del reloj" in l or "simulo solo" in l))
+        check("…y se queda en pausa", get_state()["clock"]["paused"])
+
         ws_op(c, action="speed", value=2.0)
         ws_op(c, action="resume")
         check("el panel muestra ×2 corriendo", wait_for(lambda: get_state()["clock"]["speed"] == 2.0

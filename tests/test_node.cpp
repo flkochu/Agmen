@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -234,6 +235,7 @@ void test_mono_reading_real() {
     std::this_thread::sleep_for(10ms);
     const auto b = ck::mono_reading();
     CHECK(a.jumped == 0 && b.jumped == 0);
+    CHECK(a.jump_from == 0 && a.jump_to == 0 && b.jump_from == 0 && b.jump_to == 0);
     CHECK(b.t > a.t);
 }
 
@@ -277,6 +279,156 @@ void test_mono_reading_sim() {
     ck::update(ClockMsg{.t = 2'000'000'000, .paused = true});
     CHECK(ck::mono_reading().t == 2'000'000'000);
     CHECK(ck::mono_reading().jumped == s0);
+}
+
+// Solo es salto lo que avanza un /clock cuando el estado ANTERIOR ya estaba recibido y en pausa.
+// `jumped` es del proceso entero y nunca baja: se compara contra lo que valía al empezar.
+void test_mono_reading_first_clock() {
+    namespace ck = agmen::clock;
+    for (const bool paused : {false, true}) {
+        ck::configure(ck::Mode::Sim, /*stepped=*/false, /*listen=*/false);
+        const auto base = ck::mono_reading().jumped;
+        ck::update(ClockMsg{.t = 7'000'000'000, .speed = 1.0, .paused = paused});
+        const auto r = ck::mono_reading();
+        CHECK(r.t >= 7'000'000'000);
+        CHECK(r.jumped == base);                  // el PRIMER /clock no es un salto
+        CHECK(r.jump_from == 0 && r.jump_to == 0);
+    }
+    // Replay: la primera hora es la de una grabación (~1.7e18) y varios configure() seguidos no cambian nada.
+    constexpr std::int64_t rec = 1'700'000'000'000'000'000;
+    ck::configure(ck::Mode::Sim, false, false);
+    ck::update(ClockMsg{.t = 1'000'000'000, .speed = 1.0, .paused = true});
+    ck::update(ClockMsg{.t = 1'100'000'000, .speed = 1.0, .paused = true});
+    const auto j0 = ck::mono_reading().jumped;
+    for (int i = 0; i < 3; ++i) {
+        ck::configure(ck::Mode::Replay, false, false);
+        CHECK(ck::mono_reading().jumped >= j0);
+    }
+    const auto j1 = ck::mono_reading().jumped;
+    ck::update(ClockMsg{.t = rec, .speed = 1.0, .paused = false});
+    CHECK(ck::mono_reading().jumped == j1);
+    ck::configure(ck::Mode::Replay, false, false);
+    ck::configure(ck::Mode::Replay, false, false);
+    ck::update(ClockMsg{.t = rec, .speed = 2.0, .paused = true});
+    const auto r = ck::mono_reading();
+    CHECK(r.t >= rec);
+    CHECK(r.jumped == j1);
+    CHECK(r.jump_from == 0 && r.jump_to == 0);
+    ck::configure(ck::Mode::Real, false, false);
+}
+
+// Pausar con el reloj corriendo (también a ×1000) no sube `jumped`, aunque el t del mensaje se adelante.
+void test_mono_reading_pause_while_running() {
+    namespace ck = agmen::clock;
+    constexpr std::int64_t kMs = 1'000'000;
+    for (const double speed : {1.0, 1000.0}) {
+        ck::configure(ck::Mode::Sim, false, false);
+        const auto base = ck::mono_reading().jumped;
+        ck::update(ClockMsg{.t = 1'000'000'000, .speed = speed, .paused = false});
+        std::this_thread::sleep_for(30ms);
+        ck::update(ClockMsg{.t = ck::mono_ns() + 50 * kMs, .speed = speed, .paused = true});
+        auto r = ck::mono_reading();
+        CHECK(r.jumped == base && r.jump_from == 0 && r.jump_to == 0);
+        ck::update(ClockMsg{.t = r.t + 40 * kMs, .speed = speed, .paused = true});   // ahora sí: un paso
+        CHECK(ck::mono_reading().jumped - base == 40 * kMs);
+    }
+    ck::configure(ck::Mode::Real, false, false);
+}
+
+// Un paso de 0.1 s en pausa sube exactamente 100 000 000 y deja el intervalo (t, t + 0.1 s]; dos pasos en la
+// misma pausa son UN intervalo; pausa → paso → reanudar → pausa → paso deja solo el intervalo nuevo.
+void test_mono_reading_interval() {
+    namespace ck = agmen::clock;
+    constexpr std::int64_t kMs = 1'000'000;
+    ck::configure(ck::Mode::Sim, false, false);
+    const auto base = ck::mono_reading().jumped;
+    ck::update(ClockMsg{.t = 1'000'000'000, .speed = 1.0, .paused = true});
+    ck::update(ClockMsg{.t = 1'100'000'000, .speed = 1.0, .paused = true});
+    auto r = ck::mono_reading();
+    CHECK(r.t == 1'100'000'000);
+    CHECK(r.jumped - base == 100'000'000);
+    CHECK(r.jump_from == 1'000'000'000 && r.jump_to == 1'100'000'000);
+    ck::update(ClockMsg{.t = 1'200'000'000, .speed = 1.0, .paused = true});   // segundo paso, misma pausa
+    r = ck::mono_reading();
+    CHECK(r.jumped - base == 200'000'000);
+    CHECK(r.jump_from == 1'000'000'000 && r.jump_to == 1'200'000'000);       // UN intervalo de 0.2 s
+    // reanudar, correr un poco, pausar, otro paso
+    ck::update(ClockMsg{.t = 1'200'000'000, .speed = 1.0, .paused = false});
+    std::this_thread::sleep_for(50ms);
+    const std::int64_t t_pausa = ck::mono_ns();
+    ck::update(ClockMsg{.t = t_pausa, .speed = 1.0, .paused = true});
+    CHECK(ck::mono_reading().jumped - base == 200'000'000);                   // reanudar y pausar no son saltos
+    ck::update(ClockMsg{.t = t_pausa + 100 * kMs, .speed = 1.0, .paused = true});
+    r = ck::mono_reading();
+    CHECK(r.jumped - base == 300'000'000);
+    CHECK(r.jump_from == t_pausa && r.jump_to == t_pausa + 100 * kMs);        // solo el intervalo nuevo
+    // Con un simulador paso a paso no hay saltos ni intervalo.
+    ck::configure(ck::Mode::Sim, /*stepped=*/true, false);
+    const auto b2 = ck::mono_reading().jumped;
+    ck::update(ClockMsg{.t = 1'000'000'000});
+    ck::update(ClockMsg{.t = 2'000'000'000, .paused = true});
+    ck::update(ClockMsg{.t = 2'100'000'000, .paused = true});
+    r = ck::mono_reading();
+    CHECK(r.t == 2'100'000'000 && r.jumped == b2 && r.jump_from == 0 && r.jump_to == 0);
+    ck::configure(ck::Mode::Real, false, false);
+}
+
+// El caso de referencia: sim ×1, every(0.5 s) A y every(10 ms) B en el mismo grupo. Un paso de 0.1 s cuando a A
+// no le toca; luego B tarda 400 ms de verdad y A corre ~150 ms tarde: late = 1, igual que sin el paso.
+struct ResAB {
+    std::uint64_t late = 0, skipped = 0, runs = 0;
+    std::int64_t worst = 0;
+};
+
+ResAB run_case_ab(bool with_step) {
+    namespace ck = agmen::clock;
+    constexpr std::int64_t kMs = 1'000'000;
+    const std::int64_t t0 = 1'000'000'000;
+    ck::configure(ck::Mode::Sim, false, false);
+    ck::update(ClockMsg{.t = t0, .speed = 1.0, .paused = with_step});
+    std::atomic<int> a_runs{0};
+    std::atomic<bool> slow_done{false};
+    agmen::Node node("ab");
+    node.every(500ms, [&] { ++a_runs; });
+    node.every(10ms, [&] {
+        if (!slow_done && ck::mono_ns() >= t0 + 250 * kMs) {
+            slow_done = true;
+            std::this_thread::sleep_for(400ms);
+        }
+    });
+    std::thread spinner([&] { node.spin_for(30s); });
+    if (with_step) {
+        std::this_thread::sleep_for(300ms);
+        ck::update(ClockMsg{.t = t0 + 100 * kMs, .speed = 1.0, .paused = true});    // el paso: a A no le toca
+        std::this_thread::sleep_for(300ms);
+        ck::update(ClockMsg{.t = t0 + 100 * kMs, .speed = 1.0, .paused = false});   // reanudar
+    }
+    const auto end = std::chrono::steady_clock::now() + 8s;
+    while (a_runs < 1 && std::chrono::steady_clock::now() < end) std::this_thread::sleep_for(5ms);
+    const auto ts = node.timers();
+    node.stop();
+    spinner.join();
+    ResAB r;
+    for (const auto& t : ts) {
+        if (t.name == "every(500 ms)") r = {t.late, t.skipped, t.runs, t.worst_late_ns};
+    }
+    ck::configure(ck::Mode::Real, false, false);
+    return r;
+}
+
+void test_late_after_a_jump_still_counts() {
+    constexpr std::int64_t kMs = 1'000'000;
+    const ResAB sin = run_case_ab(false);
+    const ResAB con = run_case_ab(true);
+    std::printf("  A/B sin paso: late=%llu peor=%.0f ms · con paso: late=%llu peor=%.0f ms\n",
+                static_cast<unsigned long long>(sin.late), static_cast<double>(sin.worst) / 1e6, static_cast<unsigned long long>(con.late),
+                static_cast<double>(con.worst) / 1e6);
+    for (const ResAB& r : {sin, con}) {
+        CHECK(r.runs >= 1);
+        CHECK(r.late == 1);
+        CHECK(r.worst >= 80 * kMs && r.worst <= 300 * kMs);   // ~150 ms
+    }
+    CHECK(std::llabs(con.worst - sin.worst) < 100 * kMs);
 }
 
 // every(10 ms) con el reloj en pausa y 5 pasos de 100 ms: corre 2 veces por paso
@@ -454,7 +606,11 @@ int main() {
     test_sim_clock();
     test_replay_clock();
     test_mono_reading_sim();
+    test_mono_reading_first_clock();
+    test_mono_reading_pause_while_running();
+    test_mono_reading_interval();
     test_jump_is_not_late();
+    test_late_after_a_jump_still_counts();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_node: %d fallas\n", g_failures);
         return 1;

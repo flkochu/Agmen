@@ -9,7 +9,7 @@ import time
 import unittest
 
 import agmen
-from agmen import clock, wire
+from agmen import clock, watch, wire
 from agmen.clock import Clock
 from agmen.watch import TopicWatch
 from test_hub import HubFixture
@@ -53,6 +53,9 @@ class TestSaltoDelReloj(unittest.TestCase):
 
     def setUp(self):
         self.logs = []
+        self.margen = watch.JUMP_MARGIN_S       # se baja para que las pruebas no tarden; se restaura
+        watch.JUMP_MARGIN_S = 0.15
+        self.addCleanup(setattr, watch, "JUMP_MARGIN_S", self.margen)
         clock.configure(clock.SIM, listen=False)
         clock.update(Clock(t=10_000_000_000, speed=1.0, paused=True))
         self.w = TopicWatch({"/imu": 100}, log=self.logs.append, subscribe=False)
@@ -60,7 +63,11 @@ class TestSaltoDelReloj(unittest.TestCase):
     def tearDown(self):
         clock.configure(clock.REAL)
 
+    def test_el_margen_por_defecto_es_0_3_s(self):
+        self.assertEqual(self.margen, 0.3)
+
     def test_paso_mayor_que_max_gap_no_avisa(self):
+        watch.JUMP_MARGIN_S = 5.0              # que la prueba no dependa de la velocidad de la máquina
         self.w.seen("/imu")
         t = 10_000_000_000
         for _ in range(5):                      # 5 pasos de 0.5 s (5× max_gap_ms)
@@ -95,16 +102,90 @@ class TestSaltoDelReloj(unittest.TestCase):
         self.w.seen("/imu")
         self.assertTrue(self.logs[-1].startswith("✔ '/imu' volvió (estuvo"), self.logs)
 
-    def test_paso_no_agranda_un_hueco_de_verdad(self):
+    def test_hueco_de_verdad_antes_de_un_salto_se_avisa_con_el_hueco_completo(self):
+        # Antes ("el paso no agranda un hueco"), el salto se borraba del aviso; ahora se avisa con todo.
+        watch.JUMP_MARGIN_S = 5.0
         self.w.seen("/imu")
         clock.update(Clock(t=clock.now_ns(), speed=1.0, paused=False))
-        time.sleep(0.3)
+        time.sleep(0.3)                          # un hueco de verdad: 0.3 s corriendo (3× max_gap_ms)
         clock.update(Clock(t=clock.now_ns(), speed=1.0, paused=True))     # pausa
         clock.update(Clock(t=clock.now_ns() + 5_000_000_000, speed=1.0, paused=True))   # y un salto de 5 s
         self.w.check()
         self.assertEqual(len(self.logs), 1, self.logs)
         gap = float(self.logs[0].split("desde hace ")[1].split(" s")[0])
-        self.assertLess(gap, 1.0, self.logs)    # los 5 s del salto no cuentan
+        self.assertTrue(5.2 <= gap < 6.0, self.logs)    # 0.3 s + los 5 s del salto
+
+    def test_caso_de_referencia_50_pasos_y_correr_0_1_s(self):
+        watch.JUMP_MARGIN_S = 5.0                # el margen no ha vencido: el hueco ya es real (0.1 s > 50 ms)
+        w = TopicWatch({"/imu": 50}, log=self.logs.append, subscribe=False)
+        w.seen("/imu")
+        t = 10_000_000_000
+        for _ in range(50):                      # 50 pasos de 0.1 s sin mensajes
+            t += 100_000_000
+            clock.update(Clock(t=t, speed=1.0, paused=True))
+            w.check()
+        self.assertEqual(self.logs, [], "dentro del margen, el tiempo saltado no se cuenta")
+        clock.update(Clock(t=t, speed=1.0, paused=False))      # reanudar
+        time.sleep(0.1)                                          # y correr 0.1 s
+        w.check()
+        self.assertEqual(len(self.logs), 1, self.logs)
+        self.assertRegex(self.logs[0], r"^⚠ '/imu' no llega desde hace 5\.[12] s \(robot\.toml: max_gap_ms = 50\)$")
+
+    def test_topic_muerto_mientras_se_avanza_por_pasos_se_avisa_al_vencer_el_margen(self):
+        self.w.seen("/imu")
+        t = 10_000_000_000
+        for _ in range(5):                       # 5 pasos de 0.1 s: 0.5 s = 5× max_gap_ms
+            t += 100_000_000
+            clock.update(Clock(t=t, speed=1.0, paused=True))
+            self.w.check()
+        self.assertEqual(self.logs, [], "dentro del margen, no")
+        time.sleep(watch.JUMP_MARGIN_S + 0.1)
+        self.w.check()                           # el reloj sigue en pausa, pero el margen venció
+        self.assertEqual(len(self.logs), 1, self.logs)
+        self.assertRegex(self.logs[0], r"^⚠ '/imu' no llega desde hace 0\.5 s ")
+        self.w.check()
+        self.assertEqual(len(self.logs), 1, "una sola vez")
+        self.w.seen("/imu")
+        self.assertTrue(self.logs[-1].startswith("✔ '/imu' volvió (estuvo 0.5 s sin llegar)"), self.logs)
+
+    def test_lote_que_llega_dentro_del_margen_no_avisa(self):
+        self.w.seen("/imu")
+        t = 10_000_000_000
+        for _ in range(5):
+            t += 500_000_000                     # pasos de 0.5 s
+            clock.update(Clock(t=t, speed=1.0, paused=True))
+            self.w.check()
+            self.w.seen("/imu")                  # el lote del paso llega enseguida
+            self.w.check()
+        time.sleep(watch.JUMP_MARGIN_S + 0.1)    # y vence el margen: ya no hay nada que avisar
+        self.w.check()
+        self.assertEqual(self.logs, [])
+        self.assertFalse(next(x for x in self.w.info() if x["topic"] == "/imu")["late"])
+
+    def test_cada_salto_nuevo_vuelve_a_dar_su_margen(self):
+        self.w.seen("/imu")
+        t = 10_000_000_000
+        t += 500_000_000
+        clock.update(Clock(t=t, speed=1.0, paused=True))
+        self.w.check()                                           # lo nota: aquí empieza el margen
+        self.assertEqual(self.logs, [])
+        time.sleep(watch.JUMP_MARGIN_S + 0.1)
+        self.w.check()
+        self.assertEqual(len(self.logs), 1, self.logs)          # venció: avisa
+        self.w.seen("/imu")                                      # vuelve
+        t += 500_000_000
+        clock.update(Clock(t=t, speed=1.0, paused=True))        # otro paso: otro margen
+        self.w.check()
+        self.assertEqual(len(self.logs), 2, self.logs)          # solo el "volvió"
+        self.assertTrue(self.logs[-1].startswith("✔"), self.logs)
+        time.sleep(watch.JUMP_MARGIN_S + 0.1)
+        self.w.check()
+        self.assertEqual(len(self.logs), 3, self.logs)
+        self.assertTrue(self.logs[-1].startswith("⚠ '/imu' no llega"), self.logs)
+
+    def test_la_prueba_restaura_el_margen(self):
+        # setUp lo baja a 0.15 s; el valor original se restaura al terminar (addCleanup).
+        self.assertEqual(watch.JUMP_MARGIN_S, 0.15)
 
     def test_corriendo_rapido_cuenta_en_tiempo_simulado(self):
         self.w.seen("/imu")

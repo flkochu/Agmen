@@ -8,10 +8,13 @@ El nodo completo (freno, reloj, /imu, /camara) se prueba en scripts/sim_smoke.py
 """
 
 import importlib.util
+import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -33,17 +36,22 @@ _mod = cargar_modulo() if HAY_MUJOCO else None
 _gl_cache: list = []   # [motivo]: "" = se puede dibujar
 
 
+_PREPARACION_FALLO: list = []   # si elegir_gl()/import mujoco falla aquí: el motivo (TestPreparacion lo reporta)
+
+
 def _elegir_gl_como_el_nodo() -> None:
     """MuJoCo lee MUJOCO_GL al importarse. El nodo lo elige con elegir_gl() ANTES de importar; aquí se hace lo
-    mismo, una vez, y se deja os.environ como estaba (mujoco ya quedó cargado con ese OpenGL)."""
+    mismo, una vez, y se deja os.environ como estaba (mujoco ya quedó cargado con ese OpenGL). Si falla, NO se
+    traga en silencio: se imprime y TestPreparacion falla con el mismo motivo."""
     if not HAY_MUJOCO or "mujoco" in sys.modules:
         return
     antes = dict(os.environ)
     try:
-        _mod.elegir_gl(False)
+        _mod.elegir_gl()
         import mujoco  # noqa: F401
-    except Exception:
-        pass   # si no carga, las pruebas que lo usan lo dirán con su propio error
+    except Exception as e:
+        _PREPARACION_FALLO.append(f"{type(e).__name__}: {e}")
+        print(f"[test_sim] ⚠ falló la preparación de OpenGL/MuJoCo: {_PREPARACION_FALLO[-1]}", file=sys.stderr, flush=True)
     finally:
         os.environ.clear()
         os.environ.update(antes)
@@ -548,6 +556,23 @@ class TestSinOpenGL(unittest.TestCase):
                 self.assertNotIn("Traceback", r.stderr)
 
 
+    @unittest.skipUnless(HAY_MUJOCO and sys.platform.startswith("linux"), "DISPLAY falso: solo en Linux")
+    def test_ver_sin_pantalla_la_camara_se_intenta_normalmente(self):
+        # Si la ventana no abre, no hay choque de GLFW: la cámara funciona o dice su causa real.
+        r = correr("", [RAIZ / "python"], {"DISPLAY": ":99", "WAYLAND_DISPLAY": "", "AGMEN_HUB": "127.0.0.1:7394",
+                                          "AGMEN_CLOCK": "real"}, args=[str(MUNDO_PY), "--ver", "--seconds", "2"])
+        todo = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, todo)
+        self.assertIn("sigo sin ventana", todo)
+        self.assertNotIn("la cámara y la ventana usarían GLFW a la vez", todo)
+        m = re.search(r"terminé: .* (\d+) /camara publicados", r.stdout)
+        self.assertIsNotNone(m, todo)
+        if int(m[1]) == 0:                       # no dibujó: debe decir por qué (la causa real, no un choque)
+            self.assertRegex(r.stderr, r"\[mundo\] sin cámara: (no pude dibujar sin ventana|MUJOCO_GL)")
+        self.assertEqual(r.stderr.count("sin cámara:"), 1 if int(m[1]) == 0 else 0, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+
 @unittest.skipUnless(HAY_MUJOCO, SIN_MUJOCO)
 class TestNodoCtrlC(unittest.TestCase):
     def test_ctrl_c_no_deja_traceback(self):
@@ -569,6 +594,250 @@ class TestNodoCtrlC(unittest.TestCase):
         self.assertIn(p.returncode, (0, 130), salida)
         if p.returncode == 130:
             self.assertIn("[mundo] interrumpido (Ctrl+C)", salida)
+
+
+class TestPreparacion(unittest.TestCase):
+    @unittest.skipUnless(HAY_MUJOCO, SIN_MUJOCO)
+    def test_elegir_gl_y_cargar_mujoco_no_fallaron(self):
+        self.assertEqual(_PREPARACION_FALLO, [], "elegir_gl() o 'import mujoco' fallaron al preparar estas pruebas")
+
+
+@unittest.skipUnless(HAY_MUJOCO, SIN_MUJOCO)
+class TestWithYCerrar(unittest.TestCase):
+    def test_with_devuelve_el_mundo_y_cierra(self):
+        with _mod.Mundo() as m:
+            self.assertIsInstance(m, _mod.Mundo)
+            m.comando(0.5, 0.5)
+            m.avanzar(10)
+            self.assertGreater(m.t, 0)
+        self.assertIsNone(m._dibujo)
+        self.assertNotIn(m, _mod._ABIERTOS)
+
+    def test_with_cierra_aunque_haya_una_excepcion(self):
+        with self.assertRaises(RuntimeError):
+            with _mod.Mundo() as m:
+                raise RuntimeError("x")
+        self.assertIsNone(m._dibujo)
+
+    def test_with_cierra_la_camara_abierta(self):
+        motivo = sin_opengl()
+        if motivo:
+            self.skipTest(motivo)
+        with _mod.Mundo() as m:
+            m.imagen()
+            self.assertIsNotNone(m._dibujo)
+            self.assertIn(m, _mod._ABIERTOS)
+        self.assertIsNone(m._dibujo)
+        self.assertNotIn(m, _mod._ABIERTOS)
+
+    def test_salir_sin_cerrar_no_deja_exception_ignored(self):
+        codigo = (
+            "import importlib.util as u, sys\n"
+            f"s = u.spec_from_file_location('mundo', r'{MUNDO_PY}'); m = u.module_from_spec(s); s.loader.exec_module(m)\n"
+            "m.elegir_gl()\n"
+            "w = m.Mundo()\n"
+            "try:\n"
+            "    w.imagen()\n"
+            "except m.ErrorDelMundo as e:\n"
+            "    print('SIN_GL', e); sys.exit(0)\n"
+            "print('DIBUJO_OK')\n"
+            "# se sale SIN w.cerrar()\n"
+        )
+        probados = 0
+        for gl in ("osmesa", "egl"):
+            with self.subTest(MUJOCO_GL=gl):
+                r = correr(codigo, [], {"MUJOCO_GL": gl})
+                if "SIN_GL" in r.stdout:
+                    continue                    # este OpenGL no dibuja aquí
+                probados += 1
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("DIBUJO_OK", r.stdout)
+                self.assertNotIn("Exception ignored", r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertEqual(r.stderr.strip(), "", r.stderr)
+        if not probados:
+            self.skipTest("ni osmesa ni egl dibujan aquí")
+
+
+def _modelo_con_timestep(dir_: Path, ms: float) -> Path:
+    txt = ROBOT_XML.read_text(encoding="utf-8")
+    assert 'timestep="0.002"' in txt
+    p = dir_ / f"robot_{ms:g}ms.xml"
+    p.write_text(txt.replace('timestep="0.002"', f'timestep="{ms / 1000:.6f}"'), encoding="utf-8")
+    return p
+
+
+@unittest.skipUnless(HAY_MUJOCO, SIN_MUJOCO)
+class TestNodoTimestep(unittest.TestCase):
+    """/imu cada 10 ms simulados sea cual sea el timestep del modelo."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+
+    def corre(self, ms, *extra, seconds="2"):
+        modelo = _modelo_con_timestep(self.dir, ms)
+        return correr("", [RAIZ / "python"], {"AGMEN_HUB": "127.0.0.1:7394"},
+                      args=[str(MUNDO_PY), "--modelo", str(modelo), "--seconds", seconds, "--sin-camara", *extra])
+
+    def test_cien_hz_con_timesteps_que_caben(self):
+        for ms in (1.0, 2.5, 5.0, 10.0):
+            with self.subTest(timestep_ms=ms):
+                r = self.corre(ms)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                m = re.search(r"terminé: ([\d.]+) s simulados · (\d+) /imu", r.stdout)
+                self.assertIsNotNone(m, r.stdout)
+                imus, seg = int(m[2]), float(m[1])
+                self.assertTrue(150 <= imus <= 210, f"{imus} /imu en ~2 s")     # 100 Hz, no 1 kHz
+                self.assertAlmostEqual(seg, imus / 100, delta=0.02)               # y cada uno son 10 ms simulados
+                self.assertIn(f"pasos de {ms:g} ms", r.stdout)
+                self.assertNotIn("Traceback", r.stderr)
+
+    def test_timestep_que_no_cabe_es_un_error_claro(self):
+        for ms in (3.0, 4.0, 20.0, 0.7):
+            with self.subTest(timestep_ms=ms):
+                r = self.corre(ms, seconds="1")
+                self.assertNotEqual(r.returncode, 0, r.stdout)
+                self.assertIn(f"[mundo] el timestep de", r.stderr)
+                self.assertIn(f"({ms:g} ms) no cabe un número entero de veces en 10 ms", r.stderr)
+                self.assertIn("usa 1, 2, 2.5, 5 o 10 ms", r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertNotIn("terminé", r.stdout)
+
+
+@unittest.skipUnless(HAY_MUJOCO, SIN_MUJOCO)
+class TestNodoRelojReal(unittest.TestCase):
+    AVISO = ("[mundo] ⚠ corro con reloj real (sin --sim): no me juntes con el robot de verdad; "
+             "publico /imu{y} simulados")
+
+    def corre(self, *extra, clock_mode=None):
+        env = {"AGMEN_HUB": "127.0.0.1:7394", "AGMEN_CLOCK": clock_mode or "real"}
+        return correr("", [RAIZ / "python"], env, args=[str(MUNDO_PY), "--seconds", "1", *extra])
+
+    def test_con_camara_una_linea(self):
+        r = self.corre()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stderr.count("corro con reloj real"), 1, r.stderr)
+        self.assertIn(self.AVISO.format(y=" y /camara"), r.stderr.splitlines())
+
+    def test_sin_camara_solo_imu(self):
+        r = self.corre("--sin-camara")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stderr.count("corro con reloj real"), 1, r.stderr)
+        self.assertIn(self.AVISO.format(y=""), r.stderr.splitlines())
+        self.assertNotIn("/camara simulados", r.stderr)
+
+    def test_con_reloj_de_simulacion_no_sale(self):
+        for extra in ((), ("--sin-camara",)):
+            with self.subTest(extra=extra):
+                r = self.corre(*extra, clock_mode="sim")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertNotIn("corro con reloj real", r.stdout + r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+
+
+_DRIVER_HORA = r"""
+import json, runpy, sys, time
+import agmen
+from agmen import clock
+P = agmen.Publisher
+rec, orig = [], P.publish
+def publish(self, msg, t_data=None):
+    if type(msg).__name__ == "ImuSample":
+        rec.append(t_data)
+    return orig(self, msg, t_data=t_data)
+P.publish = publish
+real_now, T0 = clock.now_ns, time.monotonic()
+def now_ns():                                   # la hora del sistema: +5 s a los 0.8 s; -0.3 s a los 1.4 s
+    e = time.monotonic() - T0
+    return real_now() + (0 if e < 0.8 else 5_000_000_000 if e < 1.4 else 4_700_000_000)
+clock.now_ns = now_ns
+sys.argv = ["mundo.py", "--seconds", "3", "--sin-camara"]
+try:
+    runpy.run_path(sys.argv_mundo, run_name="__main__")
+except SystemExit:
+    pass
+print("REC " + json.dumps(rec))
+"""
+
+_DRIVER_PASOS = r"""
+import json, runpy, sys, threading, time
+import agmen
+from agmen import clock
+from agmen.clock import Clock
+P = agmen.Publisher
+rec, orig = [], P.publish
+def publish(self, msg, t_data=None):
+    if type(msg).__name__ == "ImuSample":
+        rec.append(t_data)
+    return orig(self, msg, t_data=t_data)
+P.publish = publish
+cuentas = []
+def mando():
+    time.sleep(1.0)
+    clock.update(Clock(t=1_000_000_000, speed=1.0, paused=False))   # el mundo ya corre: tiene su hora
+    time.sleep(0.6)
+    t = clock.mono_ns()
+    clock.update(Clock(t=t, speed=1.0, paused=True))
+    time.sleep(0.6)
+    cuentas.append(len(rec))
+    for seg in (1, 60, 90):                                          # pasos del panel con el reloj en pausa
+        t += seg * 1_000_000_000
+        clock.update(Clock(t=t, speed=1.0, paused=True))
+        time.sleep(0.6 + seg / 40)
+        cuentas.append(len(rec))
+threading.Thread(target=mando, daemon=True).start()
+sys.argv = ["mundo.py", "--seconds", "11", "--sin-camara"]
+try:
+    runpy.run_path(sys.argv_mundo, run_name="__main__")
+except SystemExit:
+    pass
+print("CUENTAS " + json.dumps(cuentas))
+"""
+
+
+def _driver(codigo: str, extra_env: dict):
+    """Corre un driver de Python que sustituye agmen.clock.now_ns o manda /clock y ejecuta mundo.py."""
+    pre = f"import sys; sys.argv_mundo = r'{MUNDO_PY}'\n"
+    return correr(pre + codigo, [RAIZ / "python"], {"AGMEN_HUB": "127.0.0.1:7394", **extra_env})
+
+
+@unittest.skipUnless(HAY_MUJOCO, SIN_MUJOCO)
+class TestNodoHoraDelSistema(unittest.TestCase):
+    """Con reloj real, t_data sigue la escala de agmen.clock.now_ns() aunque la hora del sistema se ajuste
+    después de arrancar. Se sustituye clock.now_ns en un proceso de prueba (no se toca el reloj del sistema)."""
+
+    def test_adelanta_y_retrocede(self):
+        r = _driver(_DRIVER_HORA, {"AGMEN_CLOCK": "real"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        rec = json.loads(next(l for l in r.stdout.splitlines() if l.startswith("REC "))[4:])
+        self.assertGreater(len(rec), 200, len(rec))
+        difs = [b - a for a, b in zip(rec, rec[1:])]
+        self.assertEqual([d for d in difs if d <= 0], [], "t_data nunca se repite ni baja")
+        self.assertLess(abs(rec[0] - time.time_ns()), 60 * 10**9, "en la escala de now_ns")
+        self.assertTrue(any(4.9e9 <= d <= 5.2e9 for d in difs), "la hora adelantada se sigue de golpe")
+        self.assertGreaterEqual(sum(1 for d in difs if d == 1), 10, "al retroceder, avanza de 1 ns en 1 ns")
+        self.assertEqual(r.stderr.count("la hora del sistema retrocedió: t_data avanza de 1 ns en 1 ns"), 1, r.stderr)
+        self.assertEqual((r.stdout + r.stderr).count("t_data ya va otra vez con la hora del sistema"), 1, r.stdout)
+        self.assertNotIn("Traceback", r.stderr)
+
+
+@unittest.skipUnless(HAY_MUJOCO, SIN_MUJOCO)
+class TestNodoPasoLargo(unittest.TestCase):
+    def test_paso_largo_en_pausa_se_simula_entero(self):
+        r = _driver(_DRIVER_PASOS, {"AGMEN_CLOCK": "sim"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        c = json.loads(next(l for l in r.stdout.splitlines() if l.startswith("CUENTAS "))[8:])
+        self.assertEqual(len(c), 4, c)
+        paso1, paso60, paso90 = c[1] - c[0], c[2] - c[1], c[3] - c[2]
+        self.assertTrue(90 <= paso1 <= 110, f"un paso de 1 s: {paso1} /imu")
+        self.assertTrue(5900 <= paso60 <= 6100, f"un paso de 60 s: {paso60} /imu")
+        self.assertTrue(5900 <= paso90 <= 6100, f"un paso de 90 s: se simulan los últimos 60 s: {paso90} /imu")
+        todo = r.stdout + r.stderr
+        self.assertIn("⚠ un paso de 90 s: simulo solo los últimos 60 s", todo)
+        self.assertNotIn("% del reloj", todo, "un paso en pausa no cuenta para el aviso de lentitud")
+        self.assertNotIn("Traceback", r.stderr)
 
 
 class TestSinAgmen(unittest.TestCase):
