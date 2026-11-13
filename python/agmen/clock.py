@@ -304,6 +304,9 @@ class ClockServer:
             raise ValueError(f"ClockServer: modo '{mode}' (usa sim o replay)")
         self.mode = mode
         self._lock = threading.Lock()
+        # Armar, aplicar y publicar cada /clock en orden: sin esto, el hilo de
+        # 50 Hz podía mandar un "corriendo" viejo DESPUÉS de una pausa o un paso.
+        self._send_lock = threading.Lock()
         self.t = int(t)                  # ns simulados (o de la grabación)
         self.speed = float(speed)
         self.paused = bool(paused)
@@ -326,6 +329,10 @@ class ClockServer:
         return Clock(t=self.t, speed=self.speed, paused=self.paused)
 
     def _feed(self) -> Clock:
+        with self._send_lock:
+            return self._feed_ordered()
+
+    def _feed_ordered(self) -> Clock:
         with self._lock:
             self._advance_locked()
             m = self._msg_locked()
@@ -333,9 +340,10 @@ class ClockServer:
         return m
 
     def _send(self) -> None:
-        m = self._feed()
-        if self._pub is not None:
-            self._pub.publish(m, t_data=m.t)
+        with self._send_lock:
+            m = self._feed_ordered()
+            if self._pub is not None:
+                self._pub.publish(m, t_data=m.t)
 
     # --- controles (panel) ---
     def pause(self) -> None:
@@ -359,12 +367,20 @@ class ClockServer:
         self._send()
 
     def step(self, seconds: float = 0.1) -> None:
-        """En pausa: avanza `seconds` de tiempo simulado y se queda en pausa."""
+        """Avanza `seconds` de tiempo simulado y se queda en pausa. Si el reloj
+        corría, primero publica la pausa y luego el paso (dos /clock): así los
+        nodos ven el paso con el reloj ya en pausa, como un salto, y no como
+        atraso suyo."""
         if not (0 < seconds <= 60):
             raise ValueError("el paso debe estar entre 0 y 60 s")
         with self._lock:
             self._advance_locked()
+            was_running = not self.paused
             self.paused = True
+        if was_running:
+            self._send()
+        with self._lock:
+            self._advance_locked()
             self.t += int(seconds * 1e9)
         self._send()
 
