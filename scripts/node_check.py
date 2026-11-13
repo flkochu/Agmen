@@ -14,6 +14,10 @@
      Ni el nodo de Python ni el C++ (doble_ritmo) suman ciclos saltados ni
      imprimen "ciclos saltados". Y un atraso de verdad (una función más lenta
      que su periodo), antes y después de los pasos, sí se cuenta y se avisa.
+  7. Lo mismo con el reloj CORRIENDO (seguir -> paso, sin pausar antes, 5 veces):
+     ClockServer.step() publica la pausa y luego el paso. El nodo de Python
+     every(10 ms) no suma saltados ni avisa; el C++ every(1 ms) queda en el
+     mismo orden que un control sin pasos.
 
 Funciona en Windows y Linux. Usa build/bin/doble_ritmo si existe.
 
@@ -438,13 +442,90 @@ cmd = "python {(TMP / 'lento.py').as_posix()} {flag.as_posix()}"
     check("agmen run (pasos) se detiene limpio", run.p.returncode == 0, f"código {run.p.returncode}")
 
 
+def prueba_pasos_con_el_reloj_corriendo() -> None:
+    """El botón *paso* con el reloj CORRIENDO (sin pausar antes): ClockServer.step() publica la pausa y luego el
+    paso, así que el paso es un salto y no atraso de los nodos."""
+    exe = doble_ritmo()
+    cpp = f'\n[[node]]\nname = "doble_ritmo"\ncmd = "{exe.as_posix()}"\n' if exe else ""
+    run = Run(f"""
+[robot]
+name = "pasos_corriendo"
+
+[clock]
+mode = "sim"
+speed = 1.0
+
+[[node]]
+name = "fino"
+cmd = "python {(TMP / 'fino.py').as_posix()}"
+{cpp}""")
+    c = None
+    py = ("fino", "every(10 ms)")
+    claves = [py] + ([("doble_ritmo", "every(1 ms)")] if exe else [])
+
+    def campo(k, nombre) -> int:
+        f = stats().get(k)
+        return int(f.get(nombre, 0)) if f else -1
+
+    try:
+        check("agmen run (reloj corriendo) dice qué reloj usa", run.wait_for(r"reloj: simulación ×1"), run.text()[-400:])
+        check("los nodos mandan sus cuentas al hub (reloj corriendo)", wait_runs("fino", "every(10 ms)", 20) >= 20
+              and (not exe or wait_runs("doble_ritmo", "every(1 ms)", 100) >= 100))
+        c = ws.connect(f"ws://{HTTP}/ws", protocols=["agmen.ws.v1"])
+        c.sock.settimeout(5)
+        time.sleep(2.5)
+
+        # Control: 5 s con el reloj corriendo y SIN pasos.
+        c0 = {k: campo(k, "skipped") for k in claves}
+        time.sleep(5.0)
+        time.sleep(1.5)
+        ctrl = {k: campo(k, "skipped") - c0[k] for k in claves}
+
+        # Variante: 5 veces seguir -> paso (sin pausar antes), 1 s cada una.
+        desde = len(run.out)
+        s0 = {k: campo(k, "skipped") for k in claves}
+        l0 = {k: campo(k, "late") for k in claves}
+        r0 = {k: ran(*k) for k in claves}
+        for _ in range(5):
+            clock_op(c, action="resume")
+            time.sleep(0.6)
+            clock_op(c, action="step", value=0.1)          # el reloj corría: pausa + paso
+            time.sleep(0.4)
+        time.sleep(2.5)                                    # las cuentas y los avisos salen una vez por segundo
+        paso = {k: campo(k, "skipped") - s0[k] for k in claves}
+        tarde = {k: campo(k, "late") - l0[k] for k in claves}
+        avisos = [l for l in run.out[desde:] if "ciclos saltados" in l]
+        avisos_py = [l for l in avisos if l.startswith("[fino]")]
+        print(f"  reloj corriendo, 5 s sin pasos (control): saltados {ctrl}", flush=True)
+        print(f"  reloj corriendo, 5 x (seguir -> paso):    saltados {paso}, tarde {tarde}", flush=True)
+        check("seguir -> paso, 5 veces: el nodo de Python every(10 ms) no suma ciclos saltados",
+              paso[py] <= ctrl[py] + 1 and paso[py] >= 0, f"control {ctrl[py]}, con pasos {paso[py]}")
+        check("…y no sale el aviso de 'ciclos saltados' del nodo de Python", not avisos_py, "\n".join(avisos_py[:3]))
+        check("…y corrió", ran(*py) > r0[py], f"{r0[py]} -> {ran(*py)}")
+        if exe:
+            k = ("doble_ritmo", "every(1 ms)")
+            # A 1 kHz el jitter normal ya suma algunos saltados: se exige el mismo orden que el control.
+            # Sin el arreglo, cada paso se llevaba ~100 ciclos de 1 ms como saltados (~500 en 5 pasos).
+            check("seguir -> paso, 5 veces: el C++ every(1 ms) suma lo mismo que sin pasos (mismo orden)",
+                  0 <= paso[k] <= 3 * ctrl[k] + 50, f"control {ctrl[k]}, con pasos {paso[k]}")
+            print(f"  (info) avisos de 'ciclos saltados' en la variante: {len(avisos)} "
+                  f"({len(avisos_py)} del nodo de Python)", flush=True)
+    finally:
+        if c is not None:
+            c.close()
+        run.stop()
+    check("agmen run (pasos con el reloj corriendo) se detiene limpio", run.p.returncode == 0,
+          f"código {run.p.returncode}")
+
+
 def main() -> int:
     (TMP / "fino.py").write_text(FINO, encoding="utf-8")
     (TMP / "lento.py").write_text(LENTO, encoding="utf-8")
     (TMP / "contador.py").write_text(CONTADOR, encoding="utf-8")
     (TMP / "simulador.py").write_text(SIMULADOR, encoding="utf-8")
     print(f"Agmen {agmen.__version__} · Node y reloj con agmen run · {sys.platform}\n", flush=True)
-    for prueba in (prueba_agmen_manda_el_tiempo, prueba_simulador_manda_el_tiempo, prueba_pasos_no_son_atraso):
+    for prueba in (prueba_agmen_manda_el_tiempo, prueba_simulador_manda_el_tiempo, prueba_pasos_no_son_atraso,
+                   prueba_pasos_con_el_reloj_corriendo):
         try:
             prueba()
         except Exception as e:

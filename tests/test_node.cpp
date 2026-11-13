@@ -431,6 +431,84 @@ void test_late_after_a_jump_still_counts() {
     CHECK(std::llabs(con.worst - sin.worst) < 100 * kMs);
 }
 
+// Cuánto del atraso lo cubre el salto: late = now - next - max(0, min(now, jump_to) - max(next, jump_from)).
+// sim x1, A = every(0.5 s) (plazo exacto t0 + 0.5 s: el reloj arranca en pausa en t0) y B = every(10 ms) en el
+// mismo grupo; B se queda dormido en cuanto el reloj llega a t0 + 0.45 s, así que A no puede correr. Mientras
+// B duerme, el reloj se mueve con mensajes de t exacto:
+//   durante: B tarda 400 ms. Pausa (en t = ahora), paso de 0.1 s (el plazo de A cae DENTRO del salto) y
+//            reanudar enseguida. Atraso real de A: ~400 ms (no 0).
+//   antes:   B tarda 300 ms. Pausa en plazo + 3 ms (el plazo cae ANTES del salto) y un paso de 0.1 s; el reloj
+//            se queda en pausa. Atraso real de A: 3 ms (no los 100 ms del paso).
+enum class Jump { During, Before };
+
+ResAB run_case_jump(Jump kind) {
+    namespace ck = agmen::clock;
+    constexpr std::int64_t kMs = 1'000'000;
+    const std::int64_t t0 = 1'000'000'000;
+    const std::int64_t deadline = t0 + 500 * kMs;
+    ck::configure(ck::Mode::Sim, false, false);
+    ck::update(ClockMsg{.t = t0, .speed = 1.0, .paused = true});
+    std::atomic<int> a_runs{0};
+    std::atomic<bool> slow_done{false}, started{false};
+    const auto sleep_for = kind == Jump::During ? 400ms : 300ms;
+    agmen::Node node("salto");
+    node.every(500ms, [&] { ++a_runs; });
+    node.every(10ms, [&] {
+        if (!slow_done && ck::mono_ns() >= t0 + 450 * kMs) {
+            slow_done = true;
+            started = true;
+            std::this_thread::sleep_for(sleep_for);
+        }
+    });
+    std::thread spinner([&] { node.spin_for(30s); });
+    std::this_thread::sleep_for(300ms);                                         // arrancó y espera en pausa
+    ck::update(ClockMsg{.t = t0, .speed = 1.0, .paused = false});               // el reloj corre
+    const auto limit = std::chrono::steady_clock::now() + 8s;
+    while (!started && std::chrono::steady_clock::now() < limit) std::this_thread::sleep_for(1ms);
+    CHECK(started);
+    const std::int64_t p = ck::mono_ns();
+    CHECK(p < deadline - 3 * kMs);   // si no, la máquina despertó tarde: el plazo de A ya pasó
+    if (kind == Jump::During) {
+        ck::update(ClockMsg{.t = p, .speed = 1.0, .paused = true});                    // pausa
+        ck::update(ClockMsg{.t = p + 100 * kMs, .speed = 1.0, .paused = true});       // paso: (p, p + 0.1] contiene el plazo
+        ck::update(ClockMsg{.t = p + 100 * kMs, .speed = 1.0, .paused = false});       // reanudar
+    } else {
+        ck::update(ClockMsg{.t = deadline + 3 * kMs, .speed = 1.0, .paused = true});   // pausa 3 ms después del plazo
+        ck::update(ClockMsg{.t = deadline + 103 * kMs, .speed = 1.0, .paused = true}); // y el paso
+    }
+    const auto end = std::chrono::steady_clock::now() + 8s;
+    while (a_runs < 1 && std::chrono::steady_clock::now() < end) std::this_thread::sleep_for(2ms);
+    const auto ts = node.timers();
+    node.stop();
+    spinner.join();
+    ResAB r;
+    for (const auto& t : ts) {
+        if (t.name == "every(500 ms)") r = {t.late, t.skipped, t.runs, t.worst_late_ns};
+    }
+    ck::configure(ck::Mode::Real, false, false);
+    return r;
+}
+
+void test_real_delay_during_a_step_counts() {
+    constexpr std::int64_t kMs = 1'000'000;
+    const ResAB r = run_case_jump(Jump::During);
+    std::printf("  atraso real durante un paso: late=%llu peor=%.0f ms (esperado ~400)\n",
+                static_cast<unsigned long long>(r.late), static_cast<double>(r.worst) / 1e6);
+    CHECK(r.runs >= 1);
+    CHECK(r.late == 1);
+    CHECK(r.worst >= 300 * kMs && r.worst <= 700 * kMs);   // ~400 ms, no 0
+}
+
+void test_timer_due_before_the_jump_does_not_inherit_it() {
+    constexpr std::int64_t kMs = 1'000'000;
+    const ResAB r = run_case_jump(Jump::Before);
+    std::printf("  plazo justo antes del salto: late=%llu peor=%.1f ms (esperado ~3)\n",
+                static_cast<unsigned long long>(r.late), static_cast<double>(r.worst) / 1e6);
+    CHECK(r.runs >= 1);
+    CHECK(r.late == 0);
+    CHECK(r.worst < 10 * kMs);   // ~3 ms, no los 100 ms del paso
+}
+
 // every(10 ms) con el reloj en pausa y 5 pasos de 100 ms: corre 2 veces por paso
 // y no se cuenta como saltado ni como tarde. Después, con una función lenta, sí.
 void test_jump_is_not_late() {
@@ -611,6 +689,8 @@ int main() {
     test_mono_reading_interval();
     test_jump_is_not_late();
     test_late_after_a_jump_still_counts();
+    test_real_delay_during_a_step_counts();
+    test_timer_due_before_the_jump_does_not_inherit_it();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_node: %d fallas\n", g_failures);
         return 1;

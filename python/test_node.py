@@ -9,6 +9,7 @@ está en scripts/node_check.py.
 import threading
 import time
 import unittest
+import unittest.mock
 
 import agmen
 from agmen import clock, wire
@@ -614,6 +615,98 @@ class TestExecutorSaltos(unittest.TestCase):
                 self.assertEqual(res[True].late, res[False].late)
                 self.assertLess(abs(res[True].worst_late_ns - res[False].worst_late_ns), 100 * _MS, res)
 
+    # --- cuánto del atraso lo cubre el salto: late = now - next - max(0, min(now, jump_to) - max(next, jump_from)) ---
+    def _caso_plazo_y_salto(self, cls, caso: str):
+        """sim ×1, A = every(0.5 s) (plazo exacto t0 + 0.5 s: el reloj arranca en pausa en t0) y B = every(10 ms)
+        en el mismo grupo; B se queda dormido en cuanto el reloj llega a t0 + 0.45 s, así que A no puede correr.
+        Mientras B duerme, el reloj se mueve con mensajes de t exacto:
+          "durante": B tarda 400 ms. Pausa (en t = ahora), paso de 0.1 s (el plazo de A cae DENTRO del salto)
+                     y reanudar enseguida. Atraso real de A: ~400 ms.
+          "antes":   B tarda 300 ms. Pausa en plazo + 3 ms (el plazo cae ANTES del salto) y un paso de 0.1 s; el
+                     reloj se queda en pausa. Atraso real de A: 3 ms (no los 100 ms del paso).
+        Regresa las estadísticas de A."""
+        t0 = 1_000_000_000
+        plazo = t0 + 500 * _MS
+        clock.configure(clock.SIM, listen=False)
+        clock.update(Clock(t=t0, speed=1.0, paused=True))       # el nodo arranca aquí: next de A = t0 + 0.5 s exacto
+        node = cls("salto")
+        arranco = threading.Event()
+        lento = [False]
+        corridas_a = [0]
+        duerme = 0.4 if caso == "durante" else 0.3
+
+        def a():
+            corridas_a[0] += 1
+
+        def b():
+            if not lento[0] and clock.mono_ns() >= t0 + 450 * _MS:
+                lento[0] = True
+                arranco.set()
+                time.sleep(duerme)
+
+        node.every(0.5, a)
+        node.every(0.01, b)
+        th = self._spin(node)
+        time.sleep(0.3)                                             # arrancó y espera en pausa
+        clock.update(Clock(t=t0, speed=1.0, paused=False))          # el reloj corre
+        self.assertTrue(arranco.wait(8), "B no llegó a t0 + 0.45 s")
+        p = clock.mono_ns()
+        self.assertLess(p, plazo - 3 * _MS, "la máquina despertó tarde: el plazo de A ya pasó")
+        if caso == "durante":
+            clock.update(Clock(t=p, speed=1.0, paused=True))                # pausa
+            clock.update(Clock(t=p + 100 * _MS, speed=1.0, paused=True))    # paso de 0.1 s: (p, p + 0.1] contiene el plazo
+            clock.update(Clock(t=p + 100 * _MS, speed=1.0, paused=False))   # reanudar
+        else:
+            clock.update(Clock(t=plazo + 3 * _MS, speed=1.0, paused=True))  # pausa 3 ms después del plazo
+            clock.update(Clock(t=plazo + 103 * _MS, speed=1.0, paused=True))   # y el paso: (plazo + 3 ms, plazo + 103 ms]
+        fin = time.monotonic() + 8
+        while corridas_a[0] < 1 and time.monotonic() < fin:
+            time.sleep(0.005)
+        ts = {x.name: x for x in node.timers()}
+        node.stop()
+        th.join(5)
+        node.close()
+        self.assertGreaterEqual(corridas_a[0], 1)
+        return ts["every(500 ms)"]
+
+    def test_atraso_real_durante_un_paso_se_cuenta(self):
+        # ANTES de 79b7b06 esto daba late = 0 y peor atraso = 0 (un plazo dentro del salto se disculpaba entero).
+        for cls in _nodos():
+            with self.subTest(executor=cls.__name__):
+                st = self._caso_plazo_y_salto(cls, "durante")
+                self.assertEqual(st.late, 1, st)
+                self.assertTrue(300 * _MS <= st.worst_late_ns <= 700 * _MS, st)     # ~400 ms, no 0
+
+    def test_temporizador_que_ya_tocaba_al_pausar_no_hereda_el_paso(self):
+        for cls in _nodos():
+            with self.subTest(executor=cls.__name__):
+                st = self._caso_plazo_y_salto(cls, "antes")
+                self.assertEqual(st.late, 0, st)
+                self.assertLess(st.worst_late_ns, 10 * _MS, st)    # ~3 ms, no los 100 ms del paso
+
+    def test_clockserver_step_con_el_reloj_corriendo_no_es_atraso(self):
+        # El botón paso con el reloj corriendo (ClockServer.step) tampoco: every(10 ms), 4 veces seguir -> paso.
+        # Con un solo /clock (antes de 75563d2) cada paso daba ~9 saltados y ~100 ms de atraso.
+        for cls in _nodos():
+            with self.subTest(executor=cls.__name__):
+                srv = clock.ClockServer(speed=1.0, paused=False, publish=False)
+                node = cls("srvpaso")
+                node.every(0.01, lambda: None)
+                th = self._spin(node, 30.0)
+                time.sleep(0.4)
+                for _ in range(4):
+                    srv.step(0.1)                 # con el reloj corriendo: pausa + paso
+                    self.assertTrue(srv.paused)
+                    time.sleep(0.3)
+                    srv.resume()
+                    time.sleep(0.3)
+                st = node.timers()[0]
+                node.stop()
+                th.join(5)
+                node.close()
+                self.assertLessEqual(st.skipped, 2, st)               # sin el arreglo: ~9 por paso
+                self.assertLess(st.worst_late_ns, 80 * _MS, st)       # sin el arreglo: ~100 ms
+
     def test_reloj_real_nada_cambia(self):
         for cls in _nodos():
             with self.subTest(executor=cls.__name__):
@@ -656,6 +749,113 @@ class TestExecutorSaltos(unittest.TestCase):
                 node.close()
                 self.assertTrue(sin_aviso, out.getvalue())
                 self.assertIn("ciclos saltados", out.getvalue())
+
+
+class TestClockServerPaso(unittest.TestCase):
+    """ClockServer.step() (también lo usa `agmen play`): con el reloj corriendo publica primero la pausa y
+    luego el paso (dos /clock), de modo que el paso cuenta como salto. Se espía clock.update, por donde
+    pasa cada /clock en el orden en que se arma (publish=False: sin red)."""
+
+    def setUp(self):
+        self.msgs = []
+        self.lock = threading.Lock()
+        self.real_update = clock.update
+
+        def espia(m):
+            with self.lock:
+                self.msgs.append(m)
+            self.real_update(m)
+
+        patcher = unittest.mock.patch.object(clock, "update", espia)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(clock.configure, clock.REAL)
+
+    def test_paso_con_el_reloj_corriendo_publica_pausa_y_luego_paso(self):
+        srv = clock.ClockServer(speed=1.0, paused=False, publish=False)
+        j0 = clock.mono_jumps()[1]
+        self.msgs.clear()
+        time.sleep(0.05)
+        srv.step(0.1)
+        self.assertEqual(len(self.msgs), 2, self.msgs)
+        pausa, paso = self.msgs
+        self.assertTrue(pausa.paused and paso.paused, self.msgs)
+        self.assertEqual(paso.t - pausa.t, 100_000_000, self.msgs)
+        self.assertEqual(pausa.speed, paso.speed)
+        self.assertEqual(clock.mono_jumps()[1] - j0, 100_000_000)      # exacto: el paso es salto, la pausa no
+        self.assertTrue(srv.paused)
+        self.assertTrue(clock.state().paused)
+        self.assertEqual(srv.now(), paso.t)
+
+    def test_paso_con_el_reloj_en_pausa_publica_uno_solo(self):
+        srv = clock.ClockServer(speed=1.0, paused=True, publish=False)
+        j0 = clock.mono_jumps()[1]
+        self.msgs.clear()
+        srv.step(0.1)
+        self.assertEqual(len(self.msgs), 1, self.msgs)
+        self.assertTrue(self.msgs[0].paused)
+        self.assertEqual(clock.mono_jumps()[1] - j0, 100_000_000)
+        srv.step(0.1)
+        self.assertEqual(clock.mono_jumps()[1] - j0, 200_000_000)
+
+    def test_paso_con_el_reloj_corriendo_rapido(self):
+        srv = clock.ClockServer(speed=1000.0, paused=False, publish=False)
+        j0 = clock.mono_jumps()[1]
+        time.sleep(0.02)                       # 20 s simulados corriendo: no son salto
+        srv.step(0.1)
+        self.assertEqual(clock.mono_jumps()[1] - j0, 100_000_000)      # solo los 0.1 s del paso
+        self.assertTrue(srv.paused)
+
+    def test_paso_invalido_no_publica_nada(self):
+        srv = clock.ClockServer(publish=False)
+        self.msgs.clear()
+        for malo in (0, -1, 61, 1e9):
+            with self.assertRaises(ValueError, msg=str(malo)):
+                srv.step(malo)
+        self.assertEqual(self.msgs, [])
+        self.assertFalse(srv.paused)
+
+    def test_orden_con_pausa_paso_y_seguir_desde_otro_hilo_y_el_hilo_de_50_hz(self):
+        # El hilo de 50 Hz publica sin parar mientras otro hilo hace seguir -> paso una y otra vez.
+        # Los /clock salen en el orden en que se arman: t nunca baja y, desde que sale la pausa del
+        # paso hasta que vuelve el siguiente seguir, no sale ningun paused=False.
+        srv = clock.ClockServer(speed=2.0, paused=False, publish=False)
+        srv.RATE_HZ = 500.0                    # mucho mas apretado que los 50 Hz del panel
+        srv.start()
+        ventanas = []
+
+        def controlador():
+            for _ in range(60):
+                srv.resume()
+                time.sleep(0.003)
+                with self.lock:
+                    ini = len(self.msgs)
+                srv.step(0.1)
+                with self.lock:
+                    fin = len(self.msgs)
+                ventanas.append((ini, fin))
+                time.sleep(0.003)
+
+        th = threading.Thread(target=controlador, daemon=True)
+        th.start()
+        th.join(30)
+        self.assertFalse(th.is_alive())
+        srv.close()
+        with self.lock:
+            msgs = list(self.msgs)
+        ts = [m.t for m in msgs]
+        self.assertEqual(ts, sorted(ts), "t bajó entre dos /clock")
+        self.assertEqual(len(ventanas), 60)
+        for ini, fin in ventanas:
+            pausado = False
+            for m in msgs[ini:fin]:
+                if m.paused:
+                    pausado = True
+                self.assertFalse(pausado and not m.paused, f"paused=False tras la pausa del paso: {msgs[ini:fin]}")
+            self.assertTrue(msgs[fin - 1].paused)         # y el último de la ventana (el paso) quedó en pausa
+        # Y cada paso se vio como salto de 0.1 s exacto: 60 pasos, el reloj nunca "retrocedió".
+        saltos = [b.t - a.t for a, b in zip(msgs, msgs[1:]) if a.paused and b.paused and b.t != a.t]
+        self.assertEqual(saltos, [100_000_000] * 60, saltos[:5])
 
 
 class TestLatestDomainWarning(unittest.TestCase):
