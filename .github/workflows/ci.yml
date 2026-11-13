@@ -79,6 +79,9 @@ jobs:
       - name: Grabar y reproducir (agmen run --record, agmen info, agmen run --play)
         run: python scripts/grabar_smoke.py
 
+      - name: Perfiles (agmen run --sim, --profile, --play con perfil replay)
+        run: python scripts/perfiles_smoke.py
+
       - name: ¿Paralelo o en serie? (nodos, terminal, apagado, panel y grupos de un Node)
         run: python scripts/paralelo_check.py
 

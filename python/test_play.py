@@ -9,6 +9,7 @@ replay (también una imagen que va por memoria compartida), a su tiempo, con
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -267,6 +268,199 @@ class TestComando(PlayCase):
         r = self.agmen("run", toml, "--play", os.path.join(self.dir, "no-existe.mcap"))
         self.assertEqual(r.returncode, 2)
         self.assertIn("error: --play: no existe", r.stderr)
+
+
+NODO = """\
+import os, sys, time
+print(f"ARRANCO {sys.argv[1]} reloj={os.environ.get('AGMEN_CLOCK', '-')}", flush=True)
+time.sleep(120)
+"""
+
+
+class TestPerfilesEnLaLineaDeComandos(PlayCase):
+    """agmen run --profile / --sim / --play con perfiles (RFC 0011 §3.2): códigos de salida,
+    avisos y qué nodos corren de verdad (subprocesos, sin hub ni panel)."""
+
+    def setUp(self):
+        super().setUp()
+        self.toml = os.path.join(self.dir, "robot.toml")
+        with open(os.path.join(self.dir, "nodo.py"), "w", encoding="utf-8") as f:
+            f.write(NODO)
+        self.write(self.robot())
+
+    def robot(self, extra="", hub=False):
+        nodo = os.path.join(self.dir, "nodo.py")
+
+        def node(name, profile=None):
+            prof = f"profile = \"{profile}\"\n" if profile else ""
+            return f"[[node]]\nname = \"{name}\"\n{prof}cmd = ['python', '{nodo}', '{name}']\n\n"
+
+        return ('[robot]\nname = "r"\n\n' + node("imu", "real") + node("motor", "real") + node("mundo", "sim")
+                + node("cerebro") + f"[hub]\nenabled = {str(hub).lower()}\n\n[web]\nenabled = false\n" + extra)
+
+    def write(self, text):
+        with open(self.toml, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def env(self):
+        return {**os.environ, "PYTHONPATH": str(ROOT / "python"), "PYTHONIOENCODING": "utf-8", "NO_COLOR": "1"}
+
+    def agmen(self, *args):
+        return subprocess.run([sys.executable, "-m", "agmen", *args], env=self.env(), capture_output=True,
+                              text=True, encoding="utf-8", timeout=60, check=False)
+
+    def corre(self, *args, esperar=("ARRANCO cerebro",), seg=30.0):
+        """agmen run en vivo hasta que aparezcan los textos de `esperar`; Ctrl+C. Devuelve (código, salida)."""
+        kw = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
+        p = subprocess.Popen([sys.executable, "-m", "agmen", "run", self.toml, "--no-browser", *args],
+                             env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                             encoding="utf-8", errors="replace", **kw)
+        lines = []
+        reader = threading.Thread(target=lambda: lines.extend(iter(p.stdout.readline, "")), daemon=True)
+        reader.start()
+        end = time.monotonic() + seg
+        while time.monotonic() < end and p.poll() is None:
+            text = "".join(lines)
+            if all(w in text for w in esperar) and "todo arrancado" in text:
+                break
+            time.sleep(0.1)
+        time.sleep(0.7)   # que se vea si arranca algo que no debía
+        if p.poll() is None:
+            p.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
+        try:
+            p.wait(30)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+        reader.join(5)
+        p.stdout.close()
+        return p.returncode, "".join(lines)
+
+    # --- errores: código 2 y qué hacer
+    def test_sim_con_otro_profile_es_error(self):
+        r = self.agmen("run", self.toml, "--sim", "--profile", "real")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("--sim", r.stderr)
+        self.assertIn("--profile real", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_sim_con_profile_sim_es_lo_mismo_y_no_es_error(self):
+        code, out = self.corre("--sim", "--profile", "sim")
+        self.assertEqual(code, 0, out)
+        self.assertIn("ARRANCO mundo", out)
+
+    def test_play_con_sim_es_error(self):
+        for flags in (["--sim"], ["--profile", "sim"]):
+            r = self.agmen("run", self.toml, "--play", self.path, *flags)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("los dos quieren mandar el reloj", r.stderr)
+            self.assertIn("Elige uno", r.stderr)
+
+    def test_perfil_replay_sin_play_es_error(self):
+        r = self.agmen("run", self.toml, "--profile", "replay")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("--play", r.stderr)
+        self.assertNotIn("ARRANCO", r.stdout)
+        # y también si lo dice el robot.toml
+        self.write(self.robot().replace('name = "r"\n', 'name = "r"\nprofile = "replay"\n', 1))
+        r = self.agmen("run", self.toml)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("--play", r.stderr)
+
+    def test_perfil_desconocido_sugiere(self):
+        r = self.agmen("run", self.toml, "--profile", "siim")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("error en", r.stderr)
+        self.assertIn("el perfil 'siim' no existe", r.stderr)
+        self.assertIn("¿Quisiste decir 'sim'?", r.stderr)
+        r = self.agmen("run", self.toml, "--profile", "")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_perfil_desconocido_en_el_robot_toml(self):
+        self.write(self.robot().replace('name = "r"\n', 'name = "r"\nprofile = "siim"\n', 1))
+        r = self.agmen("run", self.toml)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("[robot] profile = 'siim'", r.stderr)
+        self.assertIn("¿Quisiste decir 'sim'?", r.stderr)
+
+    def test_skip_de_un_nodo_que_no_existe_sigue_siendo_error(self):
+        r = self.agmen("run", self.toml, "--sim", "--skip", "camara")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("--skip camara: no hay un nodo con ese nombre", r.stderr)
+
+    def test_nodo_hub_en_otro_perfil_es_error(self):
+        nodo = os.path.join(self.dir, "nodo.py")
+        self.write(self.robot(hub=True) + f"\n[[node]]\nname = \"hub\"\nprofile = \"real\"\n"
+                   f"cmd = ['python', '{nodo}', 'hub']\n")
+        for flags in (("--sim",), ("--play", self.path)):   # el nodo 'hub' es del perfil real
+            r = self.agmen("run", self.toml, *flags)
+            self.assertEqual(r.returncode, 2, f"{flags}: {r.stdout}{r.stderr}")
+            self.assertIn("'hub'", r.stderr)
+
+    # --- avisos y qué corre
+    def test_sin_banderas_corre_real_y_no_dice_nada_del_perfil_si_no_falta_nadie(self):
+        code, out = self.corre(esperar=("ARRANCO imu", "ARRANCO motor", "ARRANCO cerebro"))
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("ARRANCO mundo", out)
+        self.assertIn("perfil real", out, "hay un nodo de otro perfil: sí se dice")
+        self.assertIn("no corren: mundo (perfil sim)", out)
+        self.assertIn("reloj real", out)
+
+    def test_sin_perfiles_la_salida_es_la_de_siempre(self):
+        nodo = os.path.join(self.dir, "nodo.py")
+        self.write(f'[robot]\nname = "r"\n\n[[node]]\nname = "cerebro"\ncmd = [\'python\', \'{nodo}\', \'cerebro\']\n\n'
+                   f'[hub]\nenabled = false\n\n[web]\nenabled = false\n')
+        code, out = self.corre()
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("perfil", out, "sin perfiles y sin banderas no sale la línea del perfil")
+        self.assertIn("ARRANCO cerebro reloj=real", out)
+
+    def test_sim_corre_mundo_y_nunca_el_hardware(self):
+        code, out = self.corre("--sim", esperar=("ARRANCO mundo", "ARRANCO cerebro"))
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("ARRANCO imu", out)
+        self.assertNotIn("ARRANCO motor", out)
+        self.assertRegex(out, r"agmen\s+│ perfil sim · reloj de simulación \(×1\) · no corren: imu, motor \(perfil real\)")
+        self.assertIn("ARRANCO mundo reloj=sim", out, "el reloj de simulación sin escribir [clock]")
+        self.assertIn("ARRANCO cerebro reloj=sim", out)
+
+    def test_profile_sim_es_igual_que_sim(self):
+        code, out = self.corre("--profile", "sim", esperar=("ARRANCO mundo",))
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("ARRANCO imu", out)
+        self.assertIn("perfil sim · reloj de simulación", out)
+
+    def test_skip_de_otro_perfil_no_es_error_y_avisa(self):
+        code, out = self.corre("--sim", "--skip", "imu", esperar=("ARRANCO mundo",))
+        self.assertEqual(code, 0, out)
+        self.assertIn("--skip imu: no hace falta, 'imu' es del perfil real y no corre en el perfil 'sim'", out)
+        self.assertNotIn("ARRANCO imu", out)
+
+    def test_skip_de_un_nodo_que_corre_sigue_como_siempre(self):
+        code, out = self.corre("--sim", "--skip", "mundo", esperar=("ARRANCO cerebro",))
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("ARRANCO mundo", out)
+        self.assertNotIn("no hace falta", out)
+
+    def test_play_sin_profile_usa_replay(self):
+        code, out = self.corre("--play", self.path, esperar=("ARRANCO cerebro",))
+        self.assertEqual(code, 0, out)
+        self.assertIn("perfil replay · reloj de la grabación", out)
+        self.assertIn("no corren: imu, motor (perfil real), mundo (perfil sim)", out)
+        self.assertNotIn("ARRANCO imu", out)
+        self.assertNotIn("ARRANCO motor", out)
+        self.assertNotIn("ARRANCO mundo", out)
+        self.assertIn("ARRANCO cerebro reloj=replay", out)
+
+    def test_play_con_profile_real_corre_los_real_con_el_reloj_de_la_grabacion(self):
+        code, out = self.corre("--play", self.path, "--profile", "real",
+                               esperar=("ARRANCO imu", "ARRANCO motor", "ARRANCO cerebro"))
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("ARRANCO mundo", out)
+        self.assertIn("ARRANCO imu reloj=replay", out)
+        self.assertIn("ARRANCO motor reloj=replay", out)
+        self.assertIn("perfil real · reloj de la grabación", out)
 
 
 class TestRelojReplay(unittest.TestCase):
