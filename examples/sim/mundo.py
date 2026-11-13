@@ -1,22 +1,18 @@
 """El mundo de MuJoCo: el robot del tutorial con física (RFC 0011 §3.3).
 
-Es un nodo más: publica lo mismo que publicaría el hardware (/imu y /camara)
-y escucha los mismos comandos (/cmd). El cerebro, el mux y el panel no cambian.
+Es un nodo más: publica lo mismo que el hardware (/imu y /camara) y escucha los
+mismos comandos (/cmd). El cerebro, el mux y el panel no cambian.
 
     pip install agmen[sim]                                  # agmen + mujoco
     agmen run examples/tutorial/robot.toml --sim            # con un nodo `mundo` de perfil "sim"
-    python examples/sim/mundo.py --seconds 5                # solo, 5 s (para las pruebas)
-    python examples/sim/mundo.py --ver                      # y la ventana de MuJoCo, para verlo
+    python examples/sim/mundo.py --seconds 5 [--ver]        # solo, 5 s [y la ventana de MuJoCo]
 
-El archivo tiene dos partes:
-  1. `Mundo`: la física sola, SIN Agmen. Sirve igual para otras cosas (por
-     ejemplo, un entorno de aprendizaje por refuerzo):
-         m = Mundo(); m.comando(0.5, 0.5); m.avanzar(500); print(m.pose(), m.imagen().shape)
-  2. `main()`: el nodo de Agmen que conecta el Mundo con los topics.
+Dos partes: `Mundo`, la física sola, sin Agmen ni hilos (sirve igual para, por
+ejemplo, un entorno de aprendizaje por refuerzo), y `main()`, el nodo:
+    m = Mundo(); m.comando(0.5, 0.5); m.avanzar(500); print(m.pose(), m.imagen().shape)
 
-El tiempo lo manda el reloj de Agmen (RFC 0011, D4): el mundo da pasos fijos
-de 2 ms hasta alcanzar a node.now(). Así la pausa, el paso y la velocidad del
-panel funcionan sin tocar nada.
+El tiempo lo manda el reloj de Agmen (RFC 0011, D4): el mundo da pasos fijos de
+2 ms hasta alcanzarlo. Así la pausa, el paso y la velocidad del panel funcionan.
 """
 
 import argparse
@@ -32,119 +28,90 @@ from types import SimpleNamespace
 AQUI = Path(__file__).resolve().parent
 MODELO = AQUI / "robot.xml"
 MENSAJES = AQUI.parent / "tutorial" / "motor_command.agmen"   # el mismo que usan el motor y el cerebro
+LINUX = sys.platform.startswith("linux")
+REMEDIO_GL = ("instala libegl1 o libosmesa6 (y prueba MUJOCO_GL=egl u osmesa)" if LINUX else
+              "revisa que OpenGL funcione en esta Mac (prueba MUJOCO_GL=cgl o glfw)" if sys.platform == "darwin"
+              else "instala o actualiza el controlador de video (MuJoCo dibuja con OpenGL)")
+_GL_FALLO = ""   # si OpenGL ya falló en este proceso, por qué: MuJoCo aborta si se reintenta
 
 
 class ErrorDelMundo(Exception):
-    """Algo falta para simular (MuJoCo, el modelo…). El mensaje dice qué hacer."""
+    """Algo falta para simular (MuJoCo, el modelo, OpenGL…). El mensaje dice qué hacer."""
 
 
-_SIN_GL = ""   # por qué no se puede dibujar sin ventana ("" = sí se puede)
-
-
-def _elegir_gl() -> None:
-    """Con qué dibuja MuJoCo la cámara sin ventana (MUJOCO_GL). MuJoCo lo lee al
-    importarse, así que va antes del import. Si tú fijaste MUJOCO_GL, se respeta.
-      - Linux: EGL (la GPU, o Mesa en software) si está libEGL; si no, OSMesa.
-        Ni con pantalla se usa GLFW: su ventana oculta, en el hilo de la cámara,
-        choca con la ventana de --ver y X11 aborta el proceso.
-      - Windows y macOS: lo que MuJoCo elige solo (GLFW con una ventana oculta; CGL).
-    """
-    global _SIN_GL
-    if sys.platform.startswith("linux") and not os.environ.get("MUJOCO_GL"):
-        gl = "egl" if ctypes.util.find_library("EGL") else "osmesa" if ctypes.util.find_library("OSMesa") else ""
-        os.environ["MUJOCO_GL"] = gl or "disable"
-        _SIN_GL = "" if gl else "no encontré libEGL ni libOSMesa"
-
-
-def _importar_mujoco():
-    try:
-        import numpy  # noqa: F401  (MuJoCo lo necesita)
-    except ImportError:
-        raise ErrorDelMundo("falta NumPy: instálalo con  pip install agmen[sim]") from None
-    global _SIN_GL
-    _elegir_gl()
-    try:
-        import mujoco
-    except ImportError:
-        raise ErrorDelMundo("falta MuJoCo: instálalo con  pip install agmen[sim]") from None
-    except Exception as e:      # el OpenGL de MUJOCO_GL no carga: la física sí, sin cámara
-        _SIN_GL = f"MUJOCO_GL={os.environ.get('MUJOCO_GL')}: {_corto(e)}"
-        os.environ["MUJOCO_GL"] = "disable"
-        for k in [k for k in sys.modules if k.startswith(("mujoco.rendering", "mujoco.egl", "mujoco.osmesa",
-                                                          "mujoco.glfw", "mujoco.cgl", "OpenGL"))]:
-            del sys.modules[k]  # lo que quedó a medias; el núcleo de MuJoCo ya cargó bien
-        try:
-            import mujoco
-        except Exception as e2:
-            raise ErrorDelMundo(f"MuJoCo no carga ({_corto(e2)}): reinstálalo con  pip install agmen[sim]") from None
-    return mujoco
-
-
-def _corto(e: Exception) -> str:
+def _corto(e) -> str:
     """El motivo de un error en una línea corta."""
     txt = (str(e).strip().splitlines() or [type(e).__name__])[0]
     return txt if len(txt) <= 90 else txt[:87] + "..."
 
 
+def _importar_mujoco():
+    try:
+        import numpy  # noqa: F401  (MuJoCo lo necesita)
+        import mujoco
+        return mujoco
+    except Exception as e:
+        if "KeyboardInterrupt" in repr(e):                  # Ctrl+C mientras carga (ctypes lo envuelve)
+            raise KeyboardInterrupt from None
+        if "mujoco._structs" in sys.modules:                # el núcleo cargó: falló su OpenGL (MUJOCO_GL)
+            raise ErrorDelMundo(f"MuJoCo no carga con MUJOCO_GL={os.environ.get('MUJOCO_GL')!r} ({_corto(e)}): "
+                                f"quita esa variable o usa una que funcione aquí; {REMEDIO_GL}") from None
+        if isinstance(e, ImportError):
+            que = "NumPy" if "numpy" not in sys.modules else "MuJoCo"
+            motivo = "" if getattr(e, "name", None) in ("numpy", "mujoco") else f" ({_corto(e)})"
+            raise ErrorDelMundo(f"falta {que}: instálalo con  pip install agmen[sim]{motivo}") from None
+        raise ErrorDelMundo(f"MuJoCo no carga ({_corto(e)}): reinstálalo con  pip install agmen[sim]") from None
+
+
 # --- 1. La física, sin Agmen ------------------------------------------------
 
 class Mundo:
-    """El robot de robot.xml: dos ruedas, una IMU y una cámara."""
+    """El robot de robot.xml: dos ruedas, una IMU y una cámara (`camara`, de ancho × alto)."""
 
-    def __init__(self, modelo=MODELO) -> None:
+    def __init__(self, modelo=MODELO, camara: str = "camara", ancho: int = 320, alto: int = 240) -> None:
         self.mj = mj = _importar_mujoco()
-        ruta = Path(modelo)
+        self.ruta = ruta = Path(modelo)
         if not ruta.is_file():
-            raise ErrorDelMundo(f"no encuentro el modelo '{ruta}': revisa --modelo "
-                                f"(el del ejemplo es examples/sim/robot.xml)")
+            raise ErrorDelMundo(f"no encuentro el modelo '{ruta}' (el del ejemplo es examples/sim/robot.xml)")
         try:
             self.modelo = mj.MjModel.from_xml_path(str(ruta))
         except ValueError as e:
             raise ErrorDelMundo(f"MuJoCo no pudo leer '{ruta}': {e}") from None
-        self.ruta = ruta
         self.datos = mj.MjData(self.modelo)
         self.dt = float(self.modelo.opt.timestep)          # 0.002 s en robot.xml
 
-        # Lo que este nodo necesita del modelo, por nombre (como en robot.xml).
+        # Lo que se necesita del modelo, por nombre (como en robot.xml).
         self._motor = [self._buscar(mj.mjtObj.mjOBJ_ACTUATOR, n, "el actuador") for n in ("rueda_izq", "rueda_der")]
         self._vel_max = [float(self.modelo.actuator_ctrlrange[i][1]) for i in self._motor]
         if min(self._vel_max) <= 0:
             raise ErrorDelMundo(f"en '{ruta}', los actuadores de las ruedas necesitan ctrlrange "
                                 f"(la velocidad máxima de la rueda, en rad/s)")
-        self._acel = self._sensor("acel")
-        self._giro = self._sensor("giro")
+        self._acel, self._giro = self._sensor("acel"), self._sensor("giro")
         base = self._buscar(mj.mjtObj.mjOBJ_JOINT, "base", "la junta libre")
         if self.modelo.jnt_type[base] != mj.mjtJoint.mjJNT_FREE:
             raise ErrorDelMundo(f"en '{ruta}', 'base' debe ser un <freejoint> (el robot se mueve libre)")
         self._qpos = int(self.modelo.jnt_qposadr[base])
-        # La cámara se abre la primera vez que alguien la pide (imagen() o mirar()).
-        self._dibujo = None
-        # Quien lea el estado desde otro hilo (la cámara, la ventana) lo toma: así
-        # nunca ve un paso a medias. avanzar() y reiniciar() ya lo toman solos.
-        self.candado = threading.RLock()
+        self.camara, self.ancho, self.alto = camara, int(ancho), int(alto)
+        self._dibujo = None                                 # OpenGL se abre con la primera imagen()
         self.reiniciar()
 
     def _buscar(self, tipo, nombre: str, que: str) -> int:
         i = self.mj.mj_name2id(self.modelo, tipo, nombre)
         if i < 0:
-            raise ErrorDelMundo(f"el modelo '{self.ruta}' no tiene {que} '{nombre}': el nodo lo necesita "
-                                f"(mira examples/sim/robot.xml)")
+            raise ErrorDelMundo(f"el modelo '{self.ruta}' no tiene {que} '{nombre}' (mira examples/sim/robot.xml)")
         return i
 
     def _sensor(self, nombre: str) -> slice:
         i = self._buscar(self.mj.mjtObj.mjOBJ_SENSOR, nombre, "el sensor")
         if self.modelo.sensor_dim[i] != 3:
             raise ErrorDelMundo(f"en '{self.ruta}', el sensor '{nombre}' debe medir 3 ejes")
-        a = int(self.modelo.sensor_adr[i])
-        return slice(a, a + 3)
+        return slice(int(self.modelo.sensor_adr[i]), int(self.modelo.sensor_adr[i]) + 3)
 
     def reiniciar(self) -> None:
-        """El robot de vuelta al inicio, quieto."""
-        with self.candado:
-            self.mj.mj_resetData(self.modelo, self.datos)
-            self.ruedas = (0.0, 0.0)
-            self.datos.ctrl[:] = 0.0
-            self.mj.mj_forward(self.modelo, self.datos)    # para que imu() y pose() ya valgan
+        """El robot de vuelta al inicio, quieto (robot.xml lo pone ya asentado en el piso)."""
+        self.mj.mj_resetData(self.modelo, self.datos)
+        self.ruedas = (0.0, 0.0)
+        self.mj.mj_forward(self.modelo, self.datos)        # para que imu() y pose() ya valgan
 
     def comando(self, left: float, right: float) -> None:
         """Como el motor del tutorial: de -1 a +1 por rueda (se recorta; NaN = 0)."""
@@ -159,8 +126,7 @@ class Mundo:
     def avanzar(self, pasos: int = 1) -> None:
         """Avanza `pasos` pasos fijos de física (de self.dt cada uno)."""
         if pasos > 0:
-            with self.candado:
-                self.mj.mj_step(self.modelo, self.datos, nstep=int(pasos))
+            self.mj.mj_step(self.modelo, self.datos, nstep=int(pasos))
 
     @property
     def t(self) -> float:
@@ -177,36 +143,34 @@ class Mundo:
         x, y, _, qw, qx, qy, qz = (float(v) for v in self.datos.qpos[self._qpos:self._qpos + 7])
         return x, y, math.atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
 
-    # La cámara, en dos tiempos: mirar() copia la escena (rápido, con el candado)
-    # y dibujar() la pinta (lento, sin el candado: la física sigue mientras).
-    def imagen(self, camara: str = "camara", ancho: int = 320, alto: int = 240):
-        """Lo que ve la cámara ahora: arreglo de NumPy alto × ancho × 3 (RGB, uint8)."""
-        self.mirar(camara, ancho, alto)
-        return self.dibujar()
-
-    def mirar(self, camara: str = "camara", ancho: int = 320, alto: int = 240) -> None:
-        """Copia lo que ve la cámara en este instante. La primera vez abre OpenGL
-        sin ventana; si no se puede, ErrorDelMundo con el motivo."""
+    def imagen(self):
+        """Lo que ve la cámara ahora: NumPy alto × ancho × 3 (RGB, uint8). La primera vez abre
+        OpenGL sin ventana (con el MUJOCO_GL que haya); si no se puede, ErrorDelMundo."""
+        global _GL_FALLO
         if self._dibujo is None:
-            self._buscar(self.mj.mjtObj.mjOBJ_CAMERA, camara, "la cámara")
-            if _SIN_GL:
-                raise ErrorDelMundo(f"no pude dibujar sin ventana ({_SIN_GL})")
+            self._buscar(self.mj.mjtObj.mjOBJ_CAMERA, self.camara, "la cámara")
+            g = self.modelo.vis.global_
+            if not (0 < self.ancho <= g.offwidth and 0 < self.alto <= g.offheight):
+                raise ErrorDelMundo(f"la cámara no puede dar {self.ancho}×{self.alto}: '{self.ruta}' dibuja a lo más "
+                                    f"{g.offwidth}×{g.offheight} (súbelo en <visual><global offwidth offheight>)")
+            if _GL_FALLO:
+                raise ErrorDelMundo(_GL_FALLO)
+            gl = f"MUJOCO_GL={os.environ['MUJOCO_GL']}" if os.environ.get("MUJOCO_GL") else "MUJOCO_GL sin fijar: GLFW"
             try:
+                r = self.mj.Renderer.__new__(self.mj.Renderer)
+                r._gl_context = r._mjr_context = None       # MuJoCo < 3.9: si OpenGL falla, su __del__ truena
                 with warnings.catch_warnings():             # GLFW avisa con warnings; aquí basta el error
                     warnings.simplefilter("ignore")
-                    self._dibujo = self.mj.Renderer(self.modelo, height=alto, width=ancho)
+                    r.__init__(self.modelo, height=self.alto, width=self.ancho)
             except Exception as e:                          # cada sistema falla distinto: se dice el motivo
-                gl = os.environ.get("MUJOCO_GL") or "por defecto"
-                raise ErrorDelMundo(f"no pude dibujar sin ventana (MUJOCO_GL={gl}: {_corto(e)})") from None
-        with self.candado:
-            self._dibujo.update_scene(self.datos, camera=camara)
-
-    def dibujar(self):
-        """Pinta lo último que copió mirar()."""
+                _GL_FALLO = f"no pude dibujar sin ventana ({gl}; {_corto(e)}); {REMEDIO_GL}"
+                raise ErrorDelMundo(_GL_FALLO) from None
+            self._dibujo = r
+        self._dibujo.update_scene(self.datos, camera=self.camara)
         return self._dibujo.render()
 
     def cerrar(self) -> None:
-        """Suelta OpenGL (si la cámara se abrió)."""
+        """Suelta OpenGL (si la cámara se abrió). Se puede volver a pedir imagen()."""
         if self._dibujo is not None:
             self._dibujo.close()
             self._dibujo = None
@@ -215,31 +179,60 @@ class Mundo:
 # --- 2. El nodo de Agmen ------------------------------------------------------
 
 SEG = 1_000_000_000
-TOPE = 100              # pasos por tick, a lo más (0.2 s): cabe entero el "paso" del panel (0.1 s = 50 pasos)
+PASOS = 5               # pasos de física por /imu: 5 × 2 ms = 10 ms (100 Hz)
+TOPE = 20               # tramos de 10 ms por tick, a lo más (0.2 s): cabe entero el "paso" del panel (0.1 s)
 FRENO = SEG // 2        # 0.5 s sin comandos → ruedas en 0, como el motor del tutorial
-VENTANA = 5 * SEG       # cada cuánto se revisa si el mundo alcanza al reloj
 FPS = 15                # la cámara, a su propio ritmo (RFC 0011, reto 8)
 
 
-def abrir_ventana(mundo):
-    """--ver: la ventana de MuJoCo y su hilo (lo abre MuJoCo). (None, []) si no se puede."""
-    if sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-        print("[mundo] --ver necesita pantalla (no hay DISPLAY ni WAYLAND_DISPLAY); sigo sin ventana", flush=True)
-        return None, []
-    antes = set(threading.enumerate())
+def di(txt: str, error: bool = False) -> None:
+    print(f"[mundo] {txt}", file=sys.stderr if error else sys.stdout, flush=True)
+
+
+def elegir_gl(ver: bool) -> str:
+    """Con qué dibuja la cámara (MUJOCO_GL; MuJoCo lo lee al importarse, así que va antes).
+    Si tú lo fijaste, se respeta. Devuelve "" o por qué no habrá cámara."""
+    gl = os.environ.get("MUJOCO_GL", "").strip().lower()
+    validos = ("egl", "osmesa", "glx", "glfw") if LINUX else ("cgl", "glfw") if sys.platform == "darwin" else ("wgl", "glfw")
+    if gl in ("disable", "disabled", "off", "false", "0"):
+        return f"MUJOCO_GL={gl} la apaga"
+    if gl and gl not in (*validos, "enable", "enabled", "on", "true", "1"):
+        os.environ["MUJOCO_GL"] = "disable"                 # si no, MuJoCo no carga ni para la física
+        return f"MUJOCO_GL={gl} no existe aquí (usa {', '.join(validos)})"
+    if LINUX and not gl:                                    # EGL (la GPU, o Mesa) u OSMesa; si no, GLFW
+        gl = "egl" if ctypes.util.find_library("EGL") else "osmesa" if ctypes.util.find_library("OSMesa") else ""
+        if gl:
+            os.environ["MUJOCO_GL"] = gl
+    if ver and gl not in ("egl", "osmesa"):                 # GLFW en dos hilos (cámara y ventana) truena
+        return ("con --ver, la cámara y la ventana usarían GLFW a la vez y chocan; "
+                + ("para tener las dos, " + REMEDIO_GL if LINUX else "quita --ver para tener cámara"))
+    return ""
+
+
+def abrir_ventana(mundo, candado):
+    """--ver: la ventana de MuJoCo y sus hilos. (None, []) si no se puede."""
     try:
+        import glfw                                         # viene con MuJoCo
+        with warnings.catch_warnings(record=True) as avisos:
+            warnings.simplefilter("always")
+            if not glfw.init():                             # sin pantalla dice False (la ventana abortaría)
+                motivo = str(avisos[-1].message).split(" ", 1)[-1].strip("b'\"") if avisos else "sin motivo"
+                di(f"--ver necesita pantalla (GLFW: {motivo}); sigo sin ventana")
+                return None, []
         import mujoco.viewer
-        with mundo.candado:
+        antes = set(threading.enumerate())
+        with candado:
             ventana = mujoco.viewer.launch_passive(mundo.modelo, mundo.datos)
     except Exception as e:                                  # en macOS pide correr con mjpython
-        print(f"[mundo] --ver no pudo abrir la ventana ({_corto(e)}); sigo sin ventana", flush=True)
+        di(f"--ver no pudo abrir la ventana ({_corto(e)}); sigo sin ventana")
         return None, []
-    print("[mundo] ventana abierta: si la cierras, el robot sigue (sin ventana)", flush=True)
+    di("ventana abierta: si la cierras, el robot sigue (sin ventana)")
     return ventana, list(set(threading.enumerate()) - antes)
 
 
 def main() -> int:
     import agmen   # aquí adentro: la clase Mundo sirve sin Agmen
+    reloj = agmen.clock
 
     agmen.ensure_utf8_output()
     ap = argparse.ArgumentParser(description="el mundo de MuJoCo del tutorial")
@@ -252,157 +245,162 @@ def main() -> int:
     ap.add_argument("--seconds", type=float, default=0.0, help="detenerse después de tanto tiempo (0 = nunca)")
     args = ap.parse_args()
 
+    camara = None if args.sin_camara else args.camara
+    sin_cam = elegir_gl(args.ver)                           # antes de importar MuJoCo
     try:
         mundo = Mundo(args.modelo)
+        espejo = Mundo(args.modelo) if camara and not sin_cam else None   # la cámara dibuja una copia
         if not MENSAJES.is_file():
             raise ErrorDelMundo(f"no encuentro {MENSAJES}: el mundo usa el MotorCommand del tutorial")
     except ErrorDelMundo as e:
-        print(f"[mundo] {e}", file=sys.stderr, flush=True)
+        di(f"{e}{'' if Path(args.modelo).is_file() else ' · revisa --modelo'}", error=True)
         return 1
     MotorCommand = agmen.load(MENSAJES).MotorCommand
     from agmen.msgs import Imagen
 
     node = agmen.Node("mundo")
     pub = node.publisher(agmen.wire.ImuSample, args.imu)
-    paso = round(mundo.dt * 1e9)                            # ns por paso de física
-    # t: hasta dónde llegó el mundo, en tiempo de Agmen (None = aún no empieza).
-    s = SimpleNamespace(t=None, antes=0, ultimo_cmd=0, alto=True, nan=False, impreso=0,
-                        v_reloj=0, v_mundo=0, lento=False, saltado=0, imus=0, fotos=0)
-    camara = None if args.sin_camara else args.camara
-    print(f"[mundo] Agmen {agmen.__version__} · MuJoCo {mundo.mj.__version__} · {mundo.ruta.name} · "
-          f"pasos de {mundo.dt * 1e3:g} ms · escucho {args.cmd} · publico {args.imu}"
-          f"{' y ' + camara if camara else ''}", flush=True)
-    ventana, hilos_ventana = abrir_ventana(mundo) if args.ver else (None, [])
-    if camara and ventana and os.environ.get("MUJOCO_GL", "").lower() not in ("egl", "osmesa", "disable") \
-            and sys.platform.startswith("linux"):
-        print("[mundo] sin cámara: con --ver y MUJOCO_GL=glfw las dos ventanas chocan; "
-              "usa MUJOCO_GL=egl u osmesa; sigo sin cámara", file=sys.stderr, flush=True)
-        camara = None
+    tramo = round(PASOS * mundo.dt * 1e9)                   # ns por /imu
+    candado = threading.Lock()                              # la física escribe; la cámara y la ventana copian
+    # t: hasta dónde llegó el mundo, en el reloj de Agmen que no salta (mono_ns; en sim, el tiempo
+    # simulado). desfase: de ese reloj a la hora de t_data (0 en sim; en real, la del sistema al empezar).
+    s = SimpleNamespace(t=None, desfase=0, antes=0, ultimo_cmd=0, alto=True, nan=False, impreso=0, sync=0,
+                        v_reloj=0, v_mundo=0, lento=False, saltado=0, imus=0, fotos=0, camara=bool(camara))
+    di(f"Agmen {agmen.__version__} · MuJoCo {mundo.mj.__version__} · {mundo.ruta.name} · pasos de "
+       f"{mundo.dt * 1e3:g} ms · escucho {args.cmd} · publico {args.imu}{' y ' + camara if camara else ''}")
+
+    def sin_camara(motivo: str) -> None:                    # una vez, en una línea
+        if s.camara:
+            s.camara = False
+            di(f"sin cámara: {motivo}; sigo sin cámara", error=True)
+
+    if sin_cam:
+        sin_camara(sin_cam)
+    s.ventana, hilos_ventana = abrir_ventana(mundo, candado) if args.ver else (None, [])
 
     @node.on(MotorCommand, args.cmd)
     def comando(m):
         c = m.message
         if not (math.isfinite(c.left) and math.isfinite(c.right)) and not s.nan:
-            print("[mundo] ⚠ llegó un MotorCommand con NaN o infinito: esa rueda va a 0", file=sys.stderr, flush=True)
+            di("⚠ llegó un MotorCommand con NaN o infinito: esa rueda va a 0", error=True)
             s.nan = True
         mundo.comando(c.left, c.right)
-        s.ultimo_cmd = node.now()
+        s.ultimo_cmd = reloj.mono_ns()
         if s.alto:
-            print("[mundo] ✅ recibiendo comandos, ruedas activas", flush=True)
+            di("✅ recibiendo comandos, ruedas activas")
             s.alto = False
 
     @node.every(0.01)                                       # 100 Hz de Agmen: en pausa no corre
     def tick():
-        ahora = node.now()
+        ahora, vel = reloj.mono_ns(), reloj.state().speed or 1.0
         if s.t is None:
-            s.t = s.antes = s.impreso = ahora
+            s.t = s.antes = s.impreso = s.sync = ahora
+            s.desfase = reloj.now_ns() - ahora if reloj.mode() == reloj.REAL else 0
 
-        # El freno de seguridad (el del motor del tutorial): sin órdenes recientes → alto total.
-        if not s.alto and ahora - s.ultimo_cmd > FRENO:
-            mundo.comando(0.0, 0.0)
-            s.alto = True
-            print("[mundo] ⛔ ALTO: sin comandos desde hace 0.5 s (timeout de seguridad)", flush=True)
-
-        # Ponerse al día con el reloj, en pasos fijos. Si falta demasiado, se salta (y se cuenta).
-        # Con el candado: la cámara lee juntos el estado y su hora (s.t).
-        falta = max(0, (ahora - s.t) // paso)
-        pasos = min(falta, TOPE)
-        with mundo.candado:
-            mundo.avanzar(pasos)
-            s.t += pasos * paso
-            if falta > TOPE:
-                s.t += (falta - TOPE) * paso
-                s.saltado += (falta - TOPE) * paso
-            if pasos and s.ventana:
-                if s.ventana.is_running():
-                    s.ventana.sync()                       # la ventana se pone al día con el mundo
-                else:
-                    print("[mundo] cerraste la ventana: el robot sigue, sin ventana", flush=True)
-                    s.ventana = None
-
-        if pasos or not s.imus:                             # el mundo no avanzó: nada nuevo que medir
+        # Ponerse al día en tramos de 10 ms, un /imu por tramo. Si falta mucho, lo viejo se salta (y se cuenta).
+        tramos = (ahora - s.t) // tramo
+        if tramos > TOPE:
+            s.saltado += (tramos - TOPE) * tramo
+            s.t += (tramos - TOPE) * tramo
+            tramos = TOPE
+        for _ in range(tramos):
+            if not s.alto and s.t - s.ultimo_cmd > FRENO:   # el freno del motor del tutorial
+                mundo.comando(0.0, 0.0)
+                s.alto = True
+                di("⛔ ALTO: sin comandos desde hace 0.5 s (timeout de seguridad)")
+            with candado:                                   # la cámara copia juntos el estado y su hora
+                mundo.avanzar(PASOS)
+                s.t += tramo
             accel, gyro = mundo.imu()
-            pub.publish(agmen.wire.ImuSample(accel=accel, gyro=gyro), t_data=s.t)   # la hora del mundo
+            pub.publish(agmen.wire.ImuSample(accel=accel, gyro=gyro), t_data=s.t + s.desfase)
             s.imus += 1
 
-        # ¿El mundo alcanza al reloj? Se mide cada ~5 s de Agmen, y se avisa solo si cambia.
-        s.v_reloj += ahora - s.antes
-        s.v_mundo += pasos * paso
-        s.antes = ahora
-        if s.v_reloj >= VENTANA:
+        if s.ventana and tramos and ahora - s.sync >= SEG / 30 * vel:   # la ventana, a ~30 Hz de pared
+            s.sync = ahora
+            if s.ventana.is_running():
+                with candado:
+                    s.ventana.sync()
+            else:
+                di("cerraste la ventana: el robot sigue, sin ventana")
+                s.ventana = None
+
+        # ¿El mundo alcanza al reloj? Cada ~5 s de pared; avisa bajo 90 % y lo quita sobre 98 %.
+        s.v_reloj, s.v_mundo, s.antes = s.v_reloj + ahora - s.antes, s.v_mundo + tramos * tramo, ahora
+        if s.v_reloj >= 5 * SEG * vel:
             pct = 100 * s.v_mundo / s.v_reloj
-            if pct < 95 and not s.lento:
-                que = ("la computadora no alcanza" if agmen.clock.mode() == agmen.clock.REAL
-                       else "baja la velocidad")
-                print(f"[mundo] ⚠ el mundo va al {pct:.0f} % del reloj: {que} "
-                      f"(se saltó {s.saltado / SEG:.1f} s sin simular)", file=sys.stderr, flush=True)
-                s.lento = True
-            elif pct >= 95 and s.lento:
-                print("[mundo] el mundo ya alcanza al reloj", flush=True)
-                s.lento = False
+            if pct < 90 and not s.lento:
+                que = "la computadora no alcanza" if reloj.mode() == reloj.REAL else "baja la velocidad"
+                di(f"⚠ el mundo va al {pct:.0f} % del reloj: {que} (se saltó {s.saltado / SEG:.1f} s sin simular)",
+                   error=True)
+            elif pct > 98 and s.lento:
+                di("el mundo ya alcanza al reloj")
+            s.lento = pct < 90 or (s.lento and pct <= 98)
             s.v_reloj = s.v_mundo = 0
 
-        # Una línea de estado por segundo (a ×5, cada 5 s simulados: así no inunda el log).
-        if s.t - s.impreso >= SEG * max(1.0, agmen.clock.state().speed):
+        if s.t - s.impreso >= SEG * max(1.0, vel):          # una línea por segundo (a ×5, cada 5 s simulados)
             s.impreso = s.t
-            x, y, rumbo = mundo.pose()
-            izq, der = mundo.ruedas
-            print(f"[mundo] t={mundo.t:6.1f} s · ruedas izq={izq:+.2f} der={der:+.2f} · "
-                  f"x={x:+.2f} m y={y:+.2f} m rumbo={math.degrees(rumbo):+4.0f}°", flush=True)
+            (x, y, rumbo), (izq, der) = mundo.pose(), mundo.ruedas
+            di(f"t={mundo.t:6.1f} s · ruedas izq={izq:+.2f} der={der:+.2f} · "
+               f"x={x:+.2f} m y={y:+.2f} m rumbo={math.degrees(rumbo):+4.0f}°")
 
-    if camara:
+    if s.camara:
         pub_cam = node.publisher(Imagen, camara)
         pedido, abierta = threading.Event(), threading.Event()
 
-        # La cámara, en su propio hilo: dibujar tarda (~35 ms en software) y la física
-        # no espera (MuJoCo suelta el GIL mientras pinta). Es un hilo aparte y no un
+        # La cámara, en su propio hilo: dibujar tarda (~35 ms en software). Copia el estado con el
+        # candado (microsegundos) y dibuja la copia sin él: la física no espera. Es un hilo y no un
         # node.group() porque OpenGL es de un solo hilo: el que lo abre lo cierra.
         def hilo_camara():
+            etapa = "dibujar"
             try:
-                mundo.mirar()                               # abre OpenGL: tarda, y va antes de spin()
+                espejo.imagen()                             # abre OpenGL: tarda, y va antes de spin()
                 abierta.set()
                 while pedido.wait() and s.camara:
                     pedido.clear()
-                    with mundo.candado:                     # el estado y su hora, del mismo instante
-                        t = s.t
-                        mundo.mirar()
-                    img = mundo.dibujar()
-                    pub_cam.publish(Imagen.from_array(img, encoding="rgb8", timestamp=t, frame_id="camara"),
-                                    t_data=t)
+                    etapa = "copiar el estado"
+                    with candado:
+                        t = s.t + s.desfase
+                        espejo.datos.qpos[:] = mundo.datos.qpos
+                    mundo.mj.mj_forward(espejo.modelo, espejo.datos)   # dónde queda cada pieza
+                    etapa = "dibujar"
+                    img = espejo.imagen()
+                    etapa = f"publicar en {camara}"
+                    pub_cam.publish(Imagen.from_array(img, encoding="rgb8", timestamp=t, frame_id="camara"), t_data=t)
                     s.fotos += 1
-            except Exception as e:                          # nunca un traceback: se dice y se sigue
-                motivo = e if isinstance(e, ErrorDelMundo) else f"falló al dibujar ({_corto(e)})"
-                print(f"[mundo] sin cámara: {motivo}. En Linux instala libegl1 o libosmesa6 "
-                      f"(y prueba MUJOCO_GL=egl u osmesa); sigo sin cámara", file=sys.stderr, flush=True)
+            except ErrorDelMundo as e:                      # nunca un traceback: se dice y se sigue
+                sin_camara(str(e))
+            except Exception as e:
+                sin_camara(f"falló al dibujar ({_corto(e)}); {REMEDIO_GL}" if etapa == "dibujar" else
+                           f"falló al {etapa} ({_corto(e)}); es un error de mundo.py: repórtalo con esta línea")
             finally:
                 abierta.set()
-                mundo.cerrar()
+                espejo.cerrar()
 
         hilo = threading.Thread(target=hilo_camara, name="mundo-camara", daemon=True)
+        hilo.start()
+        if not abierta.wait(20):
+            sin_camara(f"OpenGL no respondió en 20 s al abrir la cámara; {REMEDIO_GL}")
 
         @node.every(1 / FPS)                                # el ritmo lo pone el reloj de Agmen
         def foto():
             if s.t is not None:
                 pedido.set()                                # si aún dibuja la anterior, esta se salta
 
-    s.camara, s.ventana = bool(camara), ventana
-    if camara:
-        hilo.start()
-        abierta.wait()
     try:
         if args.seconds > 0:
             node.spin_for(args.seconds)
             x, y, rumbo = mundo.pose()
-            print(f"[mundo] terminé: {mundo.t:.2f} s simulados · {s.imus} /imu y {s.fotos} /camara publicados · "
-                  f"se saltó {s.saltado / SEG:.2f} s · x={x:+.2f} m y={y:+.2f} m rumbo={math.degrees(rumbo):+.0f}°",
-                  flush=True)
+            di(f"terminé: {mundo.t:.2f} s simulados · {s.imus} /imu y {s.fotos} /camara publicados · se saltó "
+               f"{s.saltado / SEG:.2f} s · x={x:+.2f} m y={y:+.2f} m rumbo={math.degrees(rumbo):+.0f}°")
         else:
             node.spin()
     finally:
-        if camara:
+        if espejo is not None:
             s.camara = False
             pedido.set()
-            hilo.join()
+            hilo.join(5)
+            if hilo.is_alive():
+                di("⚠ la cámara no se cerró en 5 s (¿OpenGL colgado?); salgo sin esperarla", error=True)
         if s.ventana:
             s.ventana.close()
         for h in hilos_ventana:                             # salir con la ventana a medio cerrar truena
@@ -411,4 +409,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:                               # Ctrl+C antes de spin() (al cargar MuJoCo, OpenGL…)
+        di("interrumpido (Ctrl+C)", error=True)
+        sys.exit(130)

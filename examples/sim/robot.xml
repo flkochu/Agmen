@@ -32,9 +32,10 @@
     <geom name="caja_azul"     type="box" pos="-1.2 -0.8 0.20" size="0.20 0.20 0.20" rgba="0.2 0.4 0.9 1"/>
     <geom name="caja_amarilla" type="box" pos=" 1.0 -1.2 0.10" size="0.10 0.10 0.10" rgba="0.95 0.85 0.2 1"/>
 
-    <!-- El robot, apoyado en el piso: ruedas de 3.5 cm de radio, que en MuJoCo se hunden
-         0.3 mm (así simula el contacto). Si empieza en el aire, la IMU marca 0 al caer. -->
-    <body name="robot" pos="0 0 0.0347">
+    <!-- El robot, ya asentado en el piso: ruedas de 3.5 cm de radio, que en MuJoCo se hunden
+         0.5 mm (así simula el contacto). Si empieza en el aire, la IMU marca 0 al caer y la
+         primera lectura no es la de un robot quieto. -->
+    <body name="robot" pos="0 0 0.03449">
       <freejoint name="base"/>
       <!-- Chassis: 20 × 15 × 4 cm, 1 kg. -->
       <geom name="chassis" type="box" size="0.10 0.075 0.02" mass="1" rgba="0.95 0.5 0.1 1"/>
@@ -62,8 +63,9 @@
 
       <!-- Rueda loca: una bolita atrás que gira libre hacia donde sea (junta "ball"),
            con poca fricción. Si la pegas al chassis sin junta, resbala a saltitos y la
-           IMU vibra de más. -->
-      <body name="rueda_loca" pos="-0.07 0 -0.02">
+           IMU vibra de más. Va 0.25 mm más arriba que las ruedas porque carga menos y se
+           hunde menos: así el chassis queda derecho (en reposo, ax = 0 y no -0.02). -->
+      <body name="rueda_loca" pos="-0.07 0 -0.01975">
         <joint name="rueda_loca" type="ball" damping="0.0001"/>
         <geom name="rueda_loca" type="sphere" size="0.015" mass="0.02" friction="0.01 0.001 0.0001"
               rgba="0.6 0.6 0.6 1"/>
@@ -72,10 +74,12 @@
   </worldbody>
 
   <!-- Motores de velocidad: ctrl = rad/s deseados en la rueda (±10 rad/s ≈ ±0.35 m/s).
-       mundo.py convierte el MotorCommand (-1 … +1) a este rango. -->
+       mundo.py convierte el MotorCommand (-1 … +1) a este rango. forcerange es el par
+       máximo del motor (N·m): con 0.12, de 0 a fondo acelera a ~1.5 m/s² (llega en ~0.2 s)
+       sin que las ruedas patinen, como un robot de escuela. -->
   <actuator>
-    <velocity name="rueda_izq" joint="rueda_izq" kv="0.5" ctrlrange="-10 10" forcerange="-1 1"/>
-    <velocity name="rueda_der" joint="rueda_der" kv="0.5" ctrlrange="-10 10" forcerange="-1 1"/>
+    <velocity name="rueda_izq" joint="rueda_izq" kv="0.5" ctrlrange="-10 10" forcerange="-0.12 0.12"/>
+    <velocity name="rueda_der" joint="rueda_der" kv="0.5" ctrlrange="-10 10" forcerange="-0.12 0.12"/>
   </actuator>
 
   <sensor>
