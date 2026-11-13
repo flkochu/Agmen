@@ -235,7 +235,7 @@ iceoryx2).
 | **7 ✅** (0.10.0) | **Datos grandes (RFC 0008): codificación `arrow` (`string`, `bytes`, `T[]`, `tensor<T,N>`) por TCP con descarte por suscriptor lento; `agmen.msgs.Imagen`; cámara en el panel y en Foxglove. El puente del panel se quedó en Python: medido, cumple** | a, b, h |
 | **8 ✅** (0.11.0) | **Memoria compartida (RFC 0009): imágenes y tensores sin copiar entre procesos de la misma computadora, en C++ y Python, Linux y Windows (y macOS hasta 0.11.0); se prueba si se puede y si no, TCP; préstamos que se devuelven solos y con tope; `bench/shm_vs_tcp.py`** | a, b, g |
 | **9 ✅** (0.12.0) | **Grabar y reproducir (RFC 0010): `agmen record` en MCAP sin frenar a nadie, `agmen play` con el reloj `replay` y sustitución de nodos, el `.mcap` en el panel con barra de tiempo y en Foxglove, `agmen.Recording` y `agmen export --parquet`; `bench/grabar.py`** | c |
-| 10 | Abstracción sim/real; `robot.toml` con nodos en varias máquinas (el lanzador básico ya existe desde 0.2.0) ([RFC 0011](rfc/0011-sim-real-y-varias-computadoras.md), propuesto) | d, i |
+| 10 | Abstracción sim/real; `robot.toml` con nodos en varias máquinas (el lanzador básico ya existe desde 0.2.0) ([RFC 0011](rfc/0011-sim-real-y-varias-computadoras.md), aceptado el 2026-11-13) | d, i |
 | 11 | Red multi-máquina, sincronización de relojes y **`agmen-web` en la nube** (relay con autenticación) | c, h |
 | 12 | Puentes (`agmen-iot` MQTT, ROS 2) y `agmen-micro` | f |
 | 13 | Paquetes de IA: `agmen-vision`, `agmen-learn` | — |
@@ -262,8 +262,8 @@ iceoryx2).
 | Préstamo para escribir directo en la memoria compartida (la cámara llena el bloque) | Cuando se mida que la copia del publicador estorba (RFC 0009 §4) |
 | ~~¿Seguir probando y publicando para macOS?~~ | ✅ No, desde 0.11.1 (2026-11-05, §4): Windows y Linux, x86-64 y ARM64; en macOS, Python puro |
 | ~~Formato de grabación: MCAP o propio sobre Arrow IPC~~ | ✅ [RFC 0010](rfc/0010-grabar-y-reproducir.md) aceptado el 2026-11-05 (D1–D9 = a): MCAP con los mensajes de Agmen adentro, sin cambiar un byte |
-| Simulación y real; nodos y topics en varias computadoras | Nivel 10: [RFC 0011](rfc/0011-sim-real-y-varias-computadoras.md) propuesto el 2026-11-05 (recomienda perfiles en `robot.toml`, un mundo de MuJoCo y `agmen agent` en cada computadora); falta decidir D1–D10 |
-| Mandos del panel de cualquier tipo; quién manda en el mux; `max_gap_ms` | [RFC 0012](rfc/0012-mandos-del-panel-y-quien-manda.md): implementado en 0.13.0 con las recomendadas (D1–D6 = a), a pedido de Arca9; falta que Adán lo confirme |
+| ~~Simulación y real; nodos y topics en varias computadoras~~ | ✅ [RFC 0011](rfc/0011-sim-real-y-varias-computadoras.md) aceptado el 2026-11-13 (D1–D10 = a): perfiles en `robot.toml`, un mundo de MuJoCo y `agmen agent` en cada computadora; sin implementar, se hace en 0.14.0 |
+| ~~Mandos del panel de cualquier tipo; quién manda en el mux; `max_gap_ms`~~ | ✅ [RFC 0012](rfc/0012-mandos-del-panel-y-quien-manda.md) aceptado el 2026-11-13 (D1–D6 = a), implementado en 0.13.0 a pedido de Arca9 |
 
 ## Fuentes
 
