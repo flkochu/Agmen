@@ -451,10 +451,12 @@ funcionan igual.
 
    Verás unos 100 por segundo a ×1, 0 en pausa y unos 200 a ×2. Al
    arrancarlo, verás además un aviso: `⚠ '/imu' llega con reloj simulación
-   y este nodo usa reloj real…`. Para contar no afecta. **No lo resuelvas con
-   `AGMEN_CLOCK=sim`**: con esa variable, en nuestras dos pruebas la pausa
-   dejó de frenar al mundo, y todavía no sabemos por qué. Con el reloj de la
-   computadora, la pausa sí frena (la tabla de la sección 5 es de esa prueba).
+   y este nodo usa reloj real…`. Para contar no afecta (la tabla de la sección 5 es de esa prueba).
+   Si en cambio lo arrancas con `AGMEN_CLOCK=sim`, el nodo sigue el reloj de la
+   simulación: en pausa su `node.now()` y sus `every` se detienen junto con el
+   mundo. Por eso, para contar lo que llega **durante** una pausa, mide con el
+   reloj de la computadora (`time.monotonic()`), no con un `every` del nodo en
+   simulación: ese `every` también se pausa.
 
 3. **Pasa el cerebro a `agmen.Node`.** El cerebro del tutorial usa su propio
    ritmo. Reescríbelo con `node.every(...)` y comprueba si, en pausa, deja de
