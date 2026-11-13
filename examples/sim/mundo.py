@@ -40,8 +40,8 @@ def _cerrar_abiertos() -> None:
     for m in list(_ABIERTOS):
         try:
             m.cerrar()
-        except Exception:   # al salir, con OpenGL en otro hilo o colgado: sin traceback
-            pass
+        except Exception as e:   # al salir, con OpenGL en otro hilo o colgado: una línea, sin traceback
+            print(f"[mundo] al salir no pude cerrar la cámara ({e})", file=sys.stderr)
 
 
 atexit.register(_cerrar_abiertos)
