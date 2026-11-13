@@ -11,8 +11,8 @@ Dos partes: `Mundo`, la física sola, sin Agmen ni hilos (sirve igual para, por
 ejemplo, un entorno de aprendizaje por refuerzo), y `main()`, el nodo:
     m = Mundo(); m.comando(0.5, 0.5); m.avanzar(500); print(m.pose(), m.imagen().shape)
 
-El tiempo lo manda el reloj de Agmen (RFC 0011, D4): el mundo da pasos fijos de
-2 ms hasta alcanzarlo. Así la pausa, el paso y la velocidad del panel funcionan.
+El tiempo lo manda el reloj de Agmen (RFC 0011, D4): el mundo avanza por tramos de
+10 ms simulados (con el paso de física del modelo) hasta alcanzarlo. Así la pausa, el paso y la velocidad del panel funcionan.
 """
 
 import argparse
@@ -36,7 +36,15 @@ REMEDIO_GL = ("instala libegl1 o libosmesa6 (y prueba MUJOCO_GL=egl u osmesa)" i
               else "instala o actualiza el controlador de video (MuJoCo dibuja con OpenGL)")
 _GL_FALLO = ""   # si OpenGL ya falló en este proceso, por qué: MuJoCo aborta si se reintenta
 _ABIERTOS = weakref.WeakSet()   # los Mundo con la cámara abierta: se cierran al salir (si no, MuJoCo truena)
-atexit.register(lambda: [m.cerrar() for m in list(_ABIERTOS)])
+def _cerrar_abiertos() -> None:
+    for m in list(_ABIERTOS):
+        try:
+            m.cerrar()
+        except Exception:   # al salir, con OpenGL en otro hilo o colgado: sin traceback
+            pass
+
+
+atexit.register(_cerrar_abiertos)
 
 
 class ErrorDelMundo(Exception):
@@ -204,10 +212,9 @@ def di(txt: str, error: bool = False) -> None:
     print(f"[mundo] {txt}", file=sys.stderr if error else sys.stdout, flush=True)
 
 
-def elegir_gl(ver: bool = False) -> str:
+def elegir_gl() -> str:
     """Con qué dibuja la cámara (MUJOCO_GL; MuJoCo lo lee al importarse, así que va antes).
-    Si tú lo fijaste, se respeta. Devuelve "" o por qué no habrá cámara. (`ver` ya no cuenta:
-    si la cámara choca con la ventana se sabe al abrirla, en main().)"""
+    Si tú lo fijaste, se respeta. Devuelve "" o por qué no habrá cámara."""
     gl = os.environ.get("MUJOCO_GL", "").strip().lower()
     validos = ("egl", "osmesa", "glx", "glfw") if LINUX else ("cgl", "glfw") if sys.platform == "darwin" else ("wgl", "glfw")
     if gl in ("disable", "disabled", "off", "false", "0"):
@@ -300,7 +307,7 @@ def main() -> int:
     if sin_cam:
         sin_camara(sin_cam)
     s.ventana, hilos_ventana = abrir_ventana(mundo, candado) if args.ver else (None, [])
-    if s.ventana and os.environ.get("MUJOCO_GL", "").lower() not in ("egl", "osmesa"):   # la ventana sí abrió
+    if s.ventana and os.environ.get("MUJOCO_GL", "").strip().lower() not in ("egl", "osmesa"):   # la ventana sí abrió
         sin_camara("con --ver, la cámara y la ventana usarían GLFW a la vez y chocan; "
                    + ("para tener las dos, " + REMEDIO_GL if LINUX else "quita --ver para tener cámara"))
 
