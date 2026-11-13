@@ -45,9 +45,12 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   que el hardware. `agmen run examples/tutorial/robot.toml --sim` lo corre; el
   cerebro, el mux y el panel no cambian. El mundo sigue al reloj de Agmen, así
   que la pausa, el paso y la velocidad del panel funcionan.
+  - Tres archivos: `mundo.py` (el nodo), `fisica.py` (la clase `Mundo`, sin
+    Agmen) y `ver.py` (la ventana de `--ver`).
   - `--ver` abre la ventana de MuJoCo. Sin pantalla, avisa y sigue.
   - Sin OpenGL, el mundo sigue sin cámara y lo dice en una línea.
-  - La clase `Mundo` se puede usar sola, sin Agmen (pensada para entrenar IA).
+  - La clase `Mundo` (`fisica.py`) se puede usar sola, sin Agmen (pensada para
+    entrenar IA).
 - **`agmen[sim]`**: extra de `pip` que trae MuJoCo (`mujoco>=3.2.7`).
 - **Capítulo 17 del tutorial**: el mismo robot en simulación y en el mundo
   real.
@@ -73,7 +76,9 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   `⚠ every(…): N ciclos saltados…`. Los atrasos de verdad se siguen contando y
   avisando. Sin cambio en los bytes de la red.
 - **El vigilante de `max_gap_ms`** ya no da la alarma falsa `'/imu' no llega`
-  al dar pasos: un paso ya no cuenta como hueco.
+  al dar pasos: tras cada paso, el topic tiene 0.3 s de reloj real para
+  ponerse al día antes de avisar. Un topic que de verdad dejó de llegar se
+  avisa como mucho 0.3 s más tarde.
 
 ## [0.13.0] — 2026-11-06
 

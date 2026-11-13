@@ -194,6 +194,8 @@ examples/sim/
   mundo.py      el nodo: avanza la física, publica /imu (ImuSample) y /camara (Imagen), escucha /cmd (MotorCommand)
 ```
 
+> **Nota de implementación:** al implementarlo, la física y la ventana quedaron en `fisica.py` (la clase `Mundo`) y `ver.py` (decisión de Adán del 2026-11-13); `mundo.py` queda como el nodo.
+
 ```bash
 pip install agmen[sim]                              # agmen + mujoco
 agmen run examples/tutorial/robot.toml --sim        # el tutorial entero, con física

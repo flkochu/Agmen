@@ -318,20 +318,31 @@ Dos cosas para notar:
 La grabación incluye `/clock`: el reloj de la simulación también se graba,
 así que al reproducirla el tiempo queda igual.
 
-## 10. Un vistazo a `mundo.py`
+## 10. Un vistazo al código del mundo
 
-El archivo [`examples/sim/mundo.py`](../../examples/sim/mundo.py) tiene dos
-partes. Conviene leerlas por separado.
+El mundo son **tres archivos** en [`examples/sim/`](../../examples/sim/).
+Cada uno hace una sola cosa:
 
-**La física, sin Agmen.** La clase `Mundo` carga el modelo, mueve las
-ruedas y mide la IMU y la pose. No sabe nada de topics ni de relojes. Por eso
-puedes usarla sola (sección 12) o envolverla en un entorno para entrenar
-una IA. Sus métodos son los que usarías en cualquier simulador: `comando()`
-manda velocidad a las ruedas, `avanzar()` da pasos de física, `imu()` y
-`pose()` leen el estado, e `imagen()` dibuja la cámara.
+| Archivo | Qué tiene | ¿Cuándo leerlo? |
+|---|---|---|
+| [`mundo.py`](../../examples/sim/mundo.py) | El **nodo**: sigue al reloj de Agmen, publica `/imu` y `/camara`, escucha `/cmd`. | **Primero.** Es lo que corre `agmen run`. |
+| [`fisica.py`](../../examples/sim/fisica.py) | La clase `Mundo`: la física de MuJoCo, **sin Agmen**. | Cuando quieras usar la física sola (sección 12). |
+| [`ver.py`](../../examples/sim/ver.py) | La ventana de MuJoCo de `--ver`. | Solo si te interesa la ventana. |
 
-**El nodo de Agmen.** La función `main()` conecta esa física con los topics.
-Lo que hace, en orden:
+Conviene leerlos en ese orden. Empieza por `mundo.py`: es corto, y se
+entiende sin saber nada de MuJoCo.
+
+**La física, sin Agmen.** La clase `Mundo`, en `fisica.py`, carga el modelo,
+mueve las ruedas y mide la IMU y la pose. No sabe nada de topics ni de
+relojes. Por eso puedes usarla sola (sección 12) o envolverla en un entorno
+para entrenar una IA. Sus métodos son los que usarías en cualquier
+simulador: `comando()` manda velocidad a las ruedas, `avanzar()` da pasos de
+física, `imu()` y `pose()` leen el estado, e `imagen()` dibuja la cámara.
+Al final de `fisica.py` hay un apéndice con la plomería de MuJoCo y OpenGL;
+no hace falta leerlo para usar `Mundo`.
+
+**El nodo de Agmen.** La función `main()`, en `mundo.py`, conecta esa física
+con los topics. Lo que hace, en orden:
 
 1. **Espera al reloj de Agmen, no al suyo.** Cada 10 ms (100 veces por
    segundo de Agmen) pregunta cuánto tiempo pasó en el reloj de Agmen y
@@ -374,7 +385,8 @@ robot en MuJoCo (formato MJCF, en texto). Tiene:
   ```
 
   `ctrlrange` es la velocidad máxima de la rueda (±10 rad/s, unos 0.35 m/s).
-  `mundo.py` convierte el `MotorCommand` (de -1 a +1) a ese rango.
+  `fisica.py` convierte el `MotorCommand` (de -1 a +1) a ese rango, en
+  `Mundo.comando()`.
 - **Cajas de colores** alrededor, para que la cámara tenga algo que ver.
 
 Para cambiar el robot, edita este archivo. El topic no cambia: mientras
@@ -384,10 +396,11 @@ del robot no se entera.
 ## 12. Usa `Mundo` sola, en Python
 
 Puedes usar la física sin Agmen, por ejemplo para probar una política de
-aprendizaje por refuerzo. Desde la carpeta `examples/sim/`:
+aprendizaje por refuerzo. La clase `Mundo` vive en `fisica.py`, así que
+importa de ahí. Desde la carpeta `examples/sim/`:
 
 ```python
-from mundo import Mundo
+from fisica import Mundo
 
 with Mundo() as m:
     m.comando(0.5, 0.5)     # las dos ruedas a media velocidad
@@ -415,6 +428,18 @@ Dentro de `agmen run` esto lo elige Agmen solo. Cuando usas `Mundo` sola, lo
 eliges tú. Si no pones la variable, `m.imagen()` falla con un mensaje que
 dice qué hacer. Sin cámara, `avanzar()`, `comando()`, `pose()` e `imu()`
 funcionan igual.
+
+¿Tu código está en otra carpeta? Agrega la de `examples/sim/` a la lista de
+donde Python busca, antes de importar (ajusta la ruta a tu repositorio):
+
+```python
+import sys
+sys.path.insert(0, "examples/sim")     # la carpeta donde están fisica.py y robot.xml
+
+from fisica import Mundo
+```
+
+`fisica.py` no necesita Agmen: en ese código no hace falta `import agmen`.
 
 ## 13. Ejercicios
 

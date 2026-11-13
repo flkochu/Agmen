@@ -143,7 +143,8 @@ Ninguna decisión debe cerrar ese camino:
 - **El simulador es un nodo más.** Se cambia sin tocar los demás nodos (RFC 0011 §3.3).
 - **La física va separada del nodo** que la conecta a los topics, para poder
   envolverla después en un entorno de entrenamiento. El ejemplo
-  `examples/sim/mundo.py` ya lo hace: la clase `Mundo` no usa Agmen.
+  `examples/sim/fisica.py` ya lo hace: la clase `Mundo` no usa Agmen (el nodo
+    `mundo.py` solo la conecta a los topics).
 - **Los topics no dependen de un simulador.** Un simulador publica lo mismo que
   el hardware (`ImuSample`, `Imagen`) y escucha `MotorCommand`.
 
