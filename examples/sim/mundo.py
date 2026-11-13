@@ -16,12 +16,14 @@ El tiempo lo manda el reloj de Agmen (RFC 0011, D4): el mundo da pasos fijos de
 """
 
 import argparse
+import atexit
 import ctypes.util
 import math
 import os
 import sys
 import threading
 import warnings
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,6 +35,8 @@ REMEDIO_GL = ("instala libegl1 o libosmesa6 (y prueba MUJOCO_GL=egl u osmesa)" i
               "revisa que OpenGL funcione en esta Mac (prueba MUJOCO_GL=cgl o glfw)" if sys.platform == "darwin"
               else "instala o actualiza el controlador de video (MuJoCo dibuja con OpenGL)")
 _GL_FALLO = ""   # si OpenGL ya falló en este proceso, por qué: MuJoCo aborta si se reintenta
+_ABIERTOS = weakref.WeakSet()   # los Mundo con la cámara abierta: se cierran al salir (si no, MuJoCo truena)
+atexit.register(lambda: [m.cerrar() for m in list(_ABIERTOS)])
 
 
 class ErrorDelMundo(Exception):
@@ -139,7 +143,9 @@ class Mundo:
         return tuple(float(v) for v in s[self._acel]), tuple(float(v) for v in s[self._giro])
 
     def pose(self) -> tuple[float, float, float]:
-        """(x, y, rumbo): metros en el piso y radianes (0 = mirando a +x, positivo = a la izquierda)."""
+        """(x, y, rumbo): el centro del chassis, en metros, y radianes (0 = mirando a +x, positivo = a la
+        izquierda). Al girar en su lugar, (x, y) se mueve unos cm: el robot gira sobre el eje de sus
+        ruedas, que está 4 cm adelante del centro (robot.xml)."""
         x, y, _, qw, qx, qy, qz = (float(v) for v in self.datos.qpos[self._qpos:self._qpos + 7])
         return x, y, math.atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
 
@@ -166,21 +172,30 @@ class Mundo:
                 _GL_FALLO = f"no pude dibujar sin ventana ({gl}; {_corto(e)}); {REMEDIO_GL}"
                 raise ErrorDelMundo(_GL_FALLO) from None
             self._dibujo = r
+            _ABIERTOS.add(self)
         self._dibujo.update_scene(self.datos, camera=self.camara)
         return self._dibujo.render()
 
     def cerrar(self) -> None:
         """Suelta OpenGL (si la cámara se abrió). Se puede volver a pedir imagen()."""
+        _ABIERTOS.discard(self)
         if self._dibujo is not None:
             self._dibujo.close()
             self._dibujo = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.cerrar()
 
 
 # --- 2. El nodo de Agmen ------------------------------------------------------
 
 SEG = 1_000_000_000
-PASOS = 5               # pasos de física por /imu: 5 × 2 ms = 10 ms (100 Hz)
-TOPE = 20               # tramos de 10 ms por tick, a lo más (0.2 s): cabe entero el "paso" del panel (0.1 s)
+TRAMO = SEG // 100      # 10 ms simulados por /imu (100 Hz), sea cual sea el timestep del modelo
+TOPE = 20               # tramos por tick, a lo más, corriendo (0.2 s): si falta más, la computadora no alcanza
+TOPE_PASO = 6000        # en pausa, un "paso" del panel se simula entero, hasta 60 s
 FRENO = SEG // 2        # 0.5 s sin comandos → ruedas en 0, como el motor del tutorial
 FPS = 15                # la cámara, a su propio ritmo (RFC 0011, reto 8)
 
@@ -189,9 +204,10 @@ def di(txt: str, error: bool = False) -> None:
     print(f"[mundo] {txt}", file=sys.stderr if error else sys.stdout, flush=True)
 
 
-def elegir_gl(ver: bool) -> str:
+def elegir_gl(ver: bool = False) -> str:
     """Con qué dibuja la cámara (MUJOCO_GL; MuJoCo lo lee al importarse, así que va antes).
-    Si tú lo fijaste, se respeta. Devuelve "" o por qué no habrá cámara."""
+    Si tú lo fijaste, se respeta. Devuelve "" o por qué no habrá cámara. (`ver` ya no cuenta:
+    si la cámara choca con la ventana se sabe al abrirla, en main().)"""
     gl = os.environ.get("MUJOCO_GL", "").strip().lower()
     validos = ("egl", "osmesa", "glx", "glfw") if LINUX else ("cgl", "glfw") if sys.platform == "darwin" else ("wgl", "glfw")
     if gl in ("disable", "disabled", "off", "false", "0"):
@@ -203,9 +219,6 @@ def elegir_gl(ver: bool) -> str:
         gl = "egl" if ctypes.util.find_library("EGL") else "osmesa" if ctypes.util.find_library("OSMesa") else ""
         if gl:
             os.environ["MUJOCO_GL"] = gl
-    if ver and gl not in ("egl", "osmesa"):                 # GLFW en dos hilos (cámara y ventana) truena
-        return ("con --ver, la cámara y la ventana usarían GLFW a la vez y chocan; "
-                + ("para tener las dos, " + REMEDIO_GL if LINUX else "quita --ver para tener cámara"))
     return ""
 
 
@@ -246,10 +259,14 @@ def main() -> int:
     args = ap.parse_args()
 
     camara = None if args.sin_camara else args.camara
-    sin_cam = elegir_gl(args.ver)                           # antes de importar MuJoCo
+    sin_cam = elegir_gl()                                   # antes de importar MuJoCo
     try:
         mundo = Mundo(args.modelo)
         espejo = Mundo(args.modelo) if camara and not sin_cam else None   # la cámara dibuja una copia
+        pasos = round(TRAMO / 1e9 / mundo.dt)               # pasos de física por tramo de 10 ms
+        if pasos < 1 or abs(pasos * mundo.dt - TRAMO / 1e9) > 1e-12:
+            raise ErrorDelMundo(f"el timestep de '{mundo.ruta}' ({mundo.dt * 1e3:g} ms) no cabe un número entero "
+                                f"de veces en 10 ms (un /imu): usa 1, 2, 2.5, 5 o 10 ms en <option timestep>")
         if not MENSAJES.is_file():
             raise ErrorDelMundo(f"no encuentro {MENSAJES}: el mundo usa el MotorCommand del tutorial")
     except ErrorDelMundo as e:
@@ -260,23 +277,32 @@ def main() -> int:
 
     node = agmen.Node("mundo")
     pub = node.publisher(agmen.wire.ImuSample, args.imu)
-    tramo = round(PASOS * mundo.dt * 1e9)                   # ns por /imu
+    real = reloj.mode() == reloj.REAL
     candado = threading.Lock()                              # la física escribe; la cámara y la ventana copian
     # t: hasta dónde llegó el mundo, en el reloj de Agmen que no salta (mono_ns; en sim, el tiempo
-    # simulado). desfase: de ese reloj a la hora de t_data (0 en sim; en real, la del sistema al empezar).
-    s = SimpleNamespace(t=None, desfase=0, antes=0, ultimo_cmd=0, alto=True, nan=False, impreso=0, sync=0,
-                        v_reloj=0, v_mundo=0, lento=False, saltado=0, imus=0, fotos=0, camara=bool(camara))
+    # simulado): con él se avanza y se frena. t_data: la hora de Agmen (now_ns) de ese instante.
+    s = SimpleNamespace(t=None, t_data=0, atras=False, antes=0, ultimo_cmd=0, alto=True, nan=False, impreso=0,
+                        sync=0, v_reloj=0, v_mundo=0, lento=False, saltado=0, imus=0, fotos=0, camara=bool(camara))
     di(f"Agmen {agmen.__version__} · MuJoCo {mundo.mj.__version__} · {mundo.ruta.name} · pasos de "
        f"{mundo.dt * 1e3:g} ms · escucho {args.cmd} · publico {args.imu}{' y ' + camara if camara else ''}")
+    if real:                                                # reto 1 del RFC 0011: una IMU falsa en un robot real
+        di(f"⚠ corro con reloj real (sin --sim): no me juntes con el robot de verdad; publico {args.imu}"
+           f"{' y ' + camara if camara else ''} simulados", error=True)
+    aviso = threading.Lock()                                # sin_camara() se llama desde dos hilos
 
     def sin_camara(motivo: str) -> None:                    # una vez, en una línea
-        if s.camara:
+        with aviso:
+            if not s.camara:
+                return
             s.camara = False
-            di(f"sin cámara: {motivo}; sigo sin cámara", error=True)
+        di(f"sin cámara: {motivo}; sigo sin cámara", error=True)
 
     if sin_cam:
         sin_camara(sin_cam)
     s.ventana, hilos_ventana = abrir_ventana(mundo, candado) if args.ver else (None, [])
+    if s.ventana and os.environ.get("MUJOCO_GL", "").lower() not in ("egl", "osmesa"):   # la ventana sí abrió
+        sin_camara("con --ver, la cámara y la ventana usarían GLFW a la vez y chocan; "
+                   + ("para tener las dos, " + REMEDIO_GL if LINUX else "quita --ver para tener cámara"))
 
     @node.on(MotorCommand, args.cmd)
     def comando(m):
@@ -292,27 +318,37 @@ def main() -> int:
 
     @node.every(0.01)                                       # 100 Hz de Agmen: en pausa no corre
     def tick():
-        ahora, vel = reloj.mono_ns(), reloj.state().speed or 1.0
+        ahora, st = reloj.mono_ns(), reloj.state()
+        vel, pausa = st.speed or 1.0, not real and st.paused   # en pausa, el tick solo corre si hubo un "paso"
+        desfase = reloj.now_ns() - ahora if real else 0     # cada tick: si la hora del sistema cambia, se sigue
         if s.t is None:
             s.t = s.antes = s.impreso = s.sync = ahora
-            s.desfase = reloj.now_ns() - ahora if reloj.mode() == reloj.REAL else 0
 
         # Ponerse al día en tramos de 10 ms, un /imu por tramo. Si falta mucho, lo viejo se salta (y se cuenta).
-        tramos = (ahora - s.t) // tramo
-        if tramos > TOPE:
-            s.saltado += (tramos - TOPE) * tramo
-            s.t += (tramos - TOPE) * tramo
-            tramos = TOPE
+        tramos, tope = (ahora - s.t) // TRAMO, TOPE_PASO if pausa else TOPE
+        if tramos > tope:
+            if pausa:
+                di(f"⚠ un paso de {tramos * TRAMO / SEG:.0f} s: simulo solo los últimos {tope * TRAMO / SEG:.0f} s",
+                   error=True)
+            s.saltado += (tramos - tope) * TRAMO
+            s.t += (tramos - tope) * TRAMO
+            tramos = tope
         for _ in range(tramos):
             if not s.alto and s.t - s.ultimo_cmd > FRENO:   # el freno del motor del tutorial
                 mundo.comando(0.0, 0.0)
                 s.alto = True
                 di("⛔ ALTO: sin comandos desde hace 0.5 s (timeout de seguridad)")
             with candado:                                   # la cámara copia juntos el estado y su hora
-                mundo.avanzar(PASOS)
-                s.t += tramo
+                mundo.avanzar(pasos)
+                s.t += TRAMO
+                atras = s.t + desfase <= s.t_data           # la hora del sistema retrocedió: t_data no
+                s.t_data = s.t_data + 1 if atras else s.t + desfase
+            if atras != s.atras:
+                s.atras = atras
+                di("⚠ la hora del sistema retrocedió: t_data avanza de 1 ns en 1 ns hasta alcanzarla" if atras
+                   else "t_data ya va otra vez con la hora del sistema", error=atras)
             accel, gyro = mundo.imu()
-            pub.publish(agmen.wire.ImuSample(accel=accel, gyro=gyro), t_data=s.t + s.desfase)
+            pub.publish(agmen.wire.ImuSample(accel=accel, gyro=gyro), t_data=s.t_data)
             s.imus += 1
 
         if s.ventana and tramos and ahora - s.sync >= SEG / 30 * vel:   # la ventana, a ~30 Hz de pared
@@ -324,8 +360,11 @@ def main() -> int:
                 di("cerraste la ventana: el robot sigue, sin ventana")
                 s.ventana = None
 
-        # ¿El mundo alcanza al reloj? Cada ~5 s de pared; avisa bajo 90 % y lo quita sobre 98 %.
-        s.v_reloj, s.v_mundo, s.antes = s.v_reloj + ahora - s.antes, s.v_mundo + tramos * tramo, ahora
+        # ¿El mundo alcanza al reloj? Cada ~5 s de pared, sin contar los pasos en pausa; avisa bajo 90 % y
+        # lo quita sobre 98 %.
+        if not pausa:
+            s.v_reloj, s.v_mundo = s.v_reloj + ahora - s.antes, s.v_mundo + tramos * TRAMO
+        s.antes = ahora
         if s.v_reloj >= 5 * SEG * vel:
             pct = 100 * s.v_mundo / s.v_reloj
             if pct < 90 and not s.lento:
@@ -343,6 +382,7 @@ def main() -> int:
             di(f"t={mundo.t:6.1f} s · ruedas izq={izq:+.2f} der={der:+.2f} · "
                f"x={x:+.2f} m y={y:+.2f} m rumbo={math.degrees(rumbo):+4.0f}°")
 
+    hilo = None
     if s.camara:
         pub_cam = node.publisher(Imagen, camara)
         pedido, abierta = threading.Event(), threading.Event()
@@ -351,7 +391,7 @@ def main() -> int:
         # candado (microsegundos) y dibuja la copia sin él: la física no espera. Es un hilo y no un
         # node.group() porque OpenGL es de un solo hilo: el que lo abre lo cierra.
         def hilo_camara():
-            etapa = "dibujar"
+            etapa, ultima = "dibujar", 0
             try:
                 espejo.imagen()                             # abre OpenGL: tarda, y va antes de spin()
                 abierta.set()
@@ -359,19 +399,19 @@ def main() -> int:
                     pedido.clear()
                     etapa = "copiar el estado"
                     with candado:
-                        t = s.t + s.desfase
+                        t = s.t_data
                         espejo.datos.qpos[:] = mundo.datos.qpos
+                    if t <= ultima:                         # el mundo no avanzó desde la foto anterior
+                        continue
                     mundo.mj.mj_forward(espejo.modelo, espejo.datos)   # dónde queda cada pieza
                     etapa = "dibujar"
                     img = espejo.imagen()
                     etapa = f"publicar en {camara}"
                     pub_cam.publish(Imagen.from_array(img, encoding="rgb8", timestamp=t, frame_id="camara"), t_data=t)
-                    s.fotos += 1
-            except ErrorDelMundo as e:                      # nunca un traceback: se dice y se sigue
-                sin_camara(str(e))
-            except Exception as e:
-                sin_camara(f"falló al dibujar ({_corto(e)}); {REMEDIO_GL}" if etapa == "dibujar" else
-                           f"falló al {etapa} ({_corto(e)}); es un error de mundo.py: repórtalo con esta línea")
+                    ultima, s.fotos = t, s.fotos + 1
+            except Exception as e:                          # nunca un traceback: se dice la causa y se sigue
+                sin_camara(str(e) if isinstance(e, ErrorDelMundo) else f"falló al {etapa} ({_corto(e)}); " +
+                           (REMEDIO_GL if etapa == "dibujar" else "es un error de mundo.py: repórtalo con esta línea"))
             finally:
                 abierta.set()
                 espejo.cerrar()
@@ -395,7 +435,7 @@ def main() -> int:
         else:
             node.spin()
     finally:
-        if espejo is not None:
+        if hilo is not None:
             s.camara = False
             pedido.set()
             hilo.join(5)

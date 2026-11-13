@@ -48,8 +48,12 @@
            mira hacia su -z: con xyaxes, su x apunta a la derecha del robot y su y arriba. -->
       <camera name="camara" pos="0.105 0 0.02" xyaxes="0 -1 0 0 0 1" fovy="60"/>
 
-      <!-- Ruedas motrices: 3.5 cm de radio, un poco adelante del centro. Giran en el eje y.
-           armature = la inercia del motor y su caja de engranes (sin ella, vibran). -->
+      <!-- Ruedas motrices: 3.5 cm de radio, 4 cm adelante del centro. Giran en el eje y.
+           armature = la inercia del motor y su caja de engranes (sin ella, vibran).
+           Al girar en su lugar, el robot gira sobre el eje de estas ruedas: el centro del
+           chassis (lo que da Mundo.pose()) describe un círculo de 4 cm de radio. Es lo que
+           haría el robot de verdad; con el eje al centro, el peso quedaría sobre las ruedas
+           y el robot cabecearía hacia adelante al frenar (no hay rueda loca al frente). -->
       <body name="rueda_izq" pos="0.04 0.09 0">
         <joint name="rueda_izq" type="hinge" axis="0 1 0" damping="0.001" armature="0.002"/>
         <geom type="cylinder" size="0.035 0.01" zaxis="0 1 0" mass="0.05" friction="1.5 0.005 0.0001"
