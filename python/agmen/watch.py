@@ -13,7 +13,8 @@ llegar y otra al volver, en la terminal y en el panel.
 - Empieza a contar con el primer mensaje: al arrancar no avisa (para eso está
   `required`).
 - Mide con el reloj de Agmen (regla 5): en simulación en pausa no avisa, y a
-  velocidad ×2 los ms son simulados.
+  velocidad ×2 los ms son simulados. El tiempo que el reloj salta de golpe
+  (el botón *paso* del panel) no cuenta como hueco.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from __future__ import annotations
 import select
 import threading
 
-from . import wire
+from . import clock, wire
 from .pubsub import RawSubscriber
 
 
@@ -40,6 +41,7 @@ class TopicWatch:
         self.lock = threading.Lock()
         self.last: dict[str, float] = {}         # topic → cuándo llegó el último (s, reloj de Agmen)
         self.late: dict[str, float] = {}         # topic → desde cuándo no llega
+        self.jumped = clock.mono_jumps()[1]      # lo que el reloj ya había saltado (ns)
         self.rx: dict[str, RawSubscriber] = {}
         try:
             for t in topics if subscribe else ():
@@ -48,10 +50,22 @@ class TopicWatch:
             self.close()
             raise
 
+    def _absorb_jumps_locked(self) -> None:
+        """Un salto del reloj no es un hueco: corre las horas guardadas lo que
+        saltó. Se llama DESPUÉS de leer la hora: si el reloj salta entre las dos
+        lecturas, el hueco sale más chico, nunca un aviso falso."""
+        jumped = clock.mono_jumps()[1]
+        dj, self.jumped = (jumped - self.jumped) / 1e9, jumped
+        if dj > 0:
+            for d in (self.last, self.late):
+                for topic in d:
+                    d[topic] += dj
+
     def seen(self, topic: str, t: float | None = None) -> None:
         """Llegó un mensaje de `topic` (lo llama run(); las pruebas, directo)."""
         t = self.now() / 1e9 if t is None else t
         with self.lock:
+            self._absorb_jumps_locked()
             since = self.late.pop(topic, None)
             self.last[topic] = t
         if since is not None:
@@ -62,6 +76,7 @@ class TopicWatch:
         t = self.now() / 1e9 if t is None else t
         news = []
         with self.lock:
+            self._absorb_jumps_locked()
             for topic, last in self.last.items():
                 gap = self.max_gap[topic]
                 if topic not in self.late and t - last > gap:
