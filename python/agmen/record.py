@@ -672,7 +672,8 @@ def cmd_info(args) -> int:
         print(f"  MCAP de otra herramienta (perfil '{d['profile']}', {d['library']})")
     if rec:
         print(f"  grabado con Agmen {rec.get('version', '?')} en {rec.get('computadora', '?')}, "
-              f"reloj {rec.get('reloj', '?')}" + (f", {rec['inicio']}" if rec.get("inicio") else ""))
+              f"reloj {rec.get('reloj', '?')}" + (f", perfil {rec['perfil']}" if rec.get("perfil") else "")
+              + (f", {rec['inicio']}" if rec.get("inicio") else ""))
     rows = []
     for t in d["topics"]:
         rate = t["messages"] / d["seconds"] if d["seconds"] > 0 else 0.0

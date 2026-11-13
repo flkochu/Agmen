@@ -143,7 +143,7 @@ def cmd_run(args) -> int:
         try:
             panel = Panel(http, config.web.listen, config.name, launcher, teleop,
                           token=config.web.token, allow_origins=config.web.allow_origins, clock=clock_server,
-                          commands=commands)
+                          commands=commands, profile=config.profile)
         except OSError as e:
             for c in commands:
                 c.close()
@@ -279,7 +279,8 @@ def _recording_for(config, args, out):
     attachments = []
     if config.path is not None:
         attachments.append((config.path.name, "text/plain", config.path.read_bytes()))
-    info = {"robot": config.name, "comando": " ".join(["agmen", *sys.argv[1:]])}
+    # El perfil queda escrito en cada grabación (RFC 0011 §3.2), también cuando es "real".
+    info = {"robot": config.name, "comando": " ".join(["agmen", *sys.argv[1:]]), "perfil": config.profile}
     if args.play:
         info["reproduciendo"] = args.play
     return RecordingControl(rc.topics, directory=str(config.base_dir / rc.dir), split=rc.split,
