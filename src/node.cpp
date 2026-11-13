@@ -386,21 +386,21 @@ struct NodeImpl {
                 const clock::MonoReading r = clock::mono_reading();
                 const std::int64_t now = r.t;
                 if (now < t.next) continue;
-                // Tras un salto del reloj (el botón *paso* del panel), los ciclos
-                // cuyo plazo cayó DENTRO del salto no son atraso del nodo: corren
-                // igual que siempre, pero no cuentan como tarde ni como saltados.
-                const bool excused = r.jump_from < t.next && t.next <= r.jump_to;
-                const std::int64_t late = now - t.next;
+                // Tras un salto del reloj (el botón *paso* del panel), el tiempo que
+                // saltó no es atraso del nodo: al atraso se le resta lo que el salto
+                // cubre de (plazo, ahora], y los ciclos cuyo plazo cayó DENTRO del
+                // salto corren igual que siempre pero no cuentan como saltados.
+                const std::int64_t covered =
+                    std::max<std::int64_t>(0, std::min(now, r.jump_to) - std::max(t.next, r.jump_from));
+                const std::int64_t late = now - t.next - covered;
                 const std::int64_t t0 = steady_now_ns();
                 t.cb();
                 const std::int64_t run = steady_now_ns() - t0;
                 ++t.runs;
                 note_max(t.worst_run, run);
-                if (!excused) {
-                    note_max(t.worst_late, late);
-                    if (late > std::max<std::int64_t>(t.period / 10, kMs)) ++t.late;
-                    t.win_worst_late = std::max(t.win_worst_late, late);
-                }
+                note_max(t.worst_late, late);
+                if (late > std::max<std::int64_t>(t.period / 10, kMs)) ++t.late;
+                t.win_worst_late = std::max(t.win_worst_late, late);
                 if (run > g.slow_ns) {
                     g.slow_ns = run;
                     g.slow_label = t.label;

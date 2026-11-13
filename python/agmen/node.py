@@ -412,22 +412,21 @@ class _PureNode:
                 now, _, jump_from, jump_to = clock.mono_jumps()
                 if now < t.next:
                     continue
-                # Tras un salto del reloj (el botón *paso* del panel), los ciclos
-                # cuyo plazo cayó DENTRO del salto no son atraso del nodo: corren
-                # igual que siempre, pero no cuentan como tarde ni como saltados.
-                excused = jump_from < t.next <= jump_to
-                late = now - t.next
+                # Tras un salto del reloj (el botón *paso* del panel), el tiempo que
+                # saltó no es atraso del nodo: al atraso se le resta lo que el salto
+                # cubre de (plazo, ahora], y los ciclos cuyo plazo cayó DENTRO del
+                # salto corren igual que siempre pero no cuentan como saltados.
+                late = now - t.next - max(0, min(now, jump_to) - max(t.next, jump_from))
                 t0 = time.perf_counter_ns()
                 t.fn()
                 run = time.perf_counter_ns() - t0
                 st = t.stats
                 st.runs += 1
                 st.worst_run_ns = max(st.worst_run_ns, run)
-                if not excused:
-                    st.worst_late_ns = max(st.worst_late_ns, late)
-                    if late > max(t.period // 10, _MS):
-                        st.late += 1
-                    t.win_worst_late = max(t.win_worst_late, late)
+                st.worst_late_ns = max(st.worst_late_ns, late)
+                if late > max(t.period // 10, _MS):
+                    st.late += 1
+                t.win_worst_late = max(t.win_worst_late, late)
                 if run > g.slow_ns:
                     g.slow_ns, g.slow_label = run, t.label
                 t.next += t.period
