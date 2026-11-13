@@ -265,7 +265,7 @@ iceoryx2).
 | ~~Formato de grabación: MCAP o propio sobre Arrow IPC~~ | ✅ [RFC 0010](rfc/0010-grabar-y-reproducir.md) aceptado el 2026-11-05 (D1–D9 = a): MCAP con los mensajes de Agmen adentro, sin cambiar un byte |
 | ~~Simulación y real; nodos y topics en varias computadoras~~ | ✅ [RFC 0011](rfc/0011-sim-real-y-varias-computadoras.md) aceptado el 2026-11-13 (D1–D10 = a): perfiles en `robot.toml`, un mundo de MuJoCo y `agmen agent` en cada computadora; sin implementar, se hace en 0.14.0 |
 | ~~Mandos del panel de cualquier tipo; quién manda en el mux; `max_gap_ms`~~ | ✅ [RFC 0012](rfc/0012-mandos-del-panel-y-quien-manda.md) aceptado el 2026-11-13 (D1–D6 = a), implementado en 0.13.0 a pedido de Arca9 |
-| Mensajes estándar y marcos de referencia (articulaciones, pose, velocidad, odometría, IMU, láser, nube de puntos, mapa, trayectorias y el equivalente a TF: qué va en `compact` y qué en `arrow`, dónde van los nombres y el orden de las articulaciones, cómo se publican y se consultan los marcos) | [RFC 0013](rfc/0013-mensajes-estandar-y-marcos.md), **propuesto** el 2026-11-13; faltan D1–D14 |
+| Mensajes estándar y marcos de referencia (articulaciones, pose, velocidad, odometría, IMU, láser, nube de puntos, mapa, trayectorias y el equivalente a TF: qué va en `compact` y qué en `arrow`, dónde van los nombres y el orden de las articulaciones, cómo se publican y se consultan los marcos) | [RFC 0013](rfc/0013-mensajes-estandar-y-marcos.md), **propuesto** el 2026-11-13; faltan D1–D17 |
 
 ## Fuentes
 
