@@ -13,17 +13,25 @@ llegar y otra al volver, en la terminal y en el panel.
 - Empieza a contar con el primer mensaje: al arrancar no avisa (para eso está
   `required`).
 - Mide con el reloj de Agmen (regla 5): en simulación en pausa no avisa, y a
-  velocidad ×2 los ms son simulados. El tiempo que el reloj salta de golpe
-  (el botón *paso* del panel) no cuenta como hueco.
+  velocidad ×2 los ms son simulados.
+- Un salto del reloj (el botón *paso* del panel) no es un hueco todavía: los
+  mensajes de ese tiempo vienen en camino. Durante JUMP_MARGIN_S segundos de
+  pared se revisa sin el salto; si no llegaron, se avisa con el hueco completo.
 """
 
 from __future__ import annotations
 
 import select
 import threading
+import time
 
 from . import clock, wire
 from .pubsub import RawSubscriber
+
+
+# Cuánto tiempo DE PARED se espera, tras un salto del reloj, a que lleguen los
+# mensajes de ese tiempo (están en tránsito: no es tiempo del robot).
+JUMP_MARGIN_S = 0.3
 
 
 def _secs(s: float) -> str:
@@ -38,10 +46,13 @@ class TopicWatch:
         self.max_gap = {t: ms / 1000.0 for t, ms in topics.items()}
         self.log = log
         self.now = now_ns or wire.now_ns
+        self._own_clock = now_ns is None
         self.lock = threading.Lock()
         self.last: dict[str, float] = {}         # topic → cuándo llegó el último (s, reloj de Agmen)
         self.late: dict[str, float] = {}         # topic → desde cuándo no llega
-        self.jumped = clock.mono_jumps()[1]      # lo que el reloj ya había saltado (ns)
+        self.jumped = clock.mono_jumps()[1]      # el último total de saltos del reloj que vio (ns)
+        self.hold_s = 0.0                        # el último salto (s), mientras dura el margen
+        self.hold_until = 0.0                    # hasta cuándo (time.monotonic(), pared)
         self.rx: dict[str, RawSubscriber] = {}
         try:
             for t in topics if subscribe else ():
@@ -50,22 +61,19 @@ class TopicWatch:
             self.close()
             raise
 
-    def _absorb_jumps_locked(self) -> None:
-        """Un salto del reloj no es un hueco: corre las horas guardadas lo que
-        saltó. Se llama DESPUÉS de leer la hora: si el reloj salta entre las dos
-        lecturas, el hueco sale más chico, nunca un aviso falso."""
-        jumped = clock.mono_jumps()[1]
-        dj, self.jumped = (jumped - self.jumped) / 1e9, jumped
-        if dj > 0:
-            for d in (self.last, self.late):
-                for topic in d:
-                    d[topic] += dj
+    def _now_and_jump(self, t: float | None) -> tuple[float, tuple[int, int, int]]:
+        """La hora (s) y (jumped, jump_from, jump_to) del reloj, leídos a la vez
+        si la hora es la del reloj de Agmen en simulación (en real no hay saltos)."""
+        if t is None and self._own_clock and clock.mode() != clock.REAL:
+            now, *jump = clock.mono_jumps()   # en simulación, mono_ns() == now_ns()
+            return now / 1e9, tuple(jump)
+        t = self.now() / 1e9 if t is None else t
+        return t, tuple(clock.mono_jumps()[1:])
 
     def seen(self, topic: str, t: float | None = None) -> None:
         """Llegó un mensaje de `topic` (lo llama run(); las pruebas, directo)."""
         t = self.now() / 1e9 if t is None else t
         with self.lock:
-            self._absorb_jumps_locked()
             since = self.late.pop(topic, None)
             self.last[topic] = t
         if since is not None:
@@ -73,13 +81,18 @@ class TopicWatch:
 
     def check(self, t: float | None = None) -> None:
         """¿Alguno lleva más de su max_gap_ms sin llegar?"""
-        t = self.now() / 1e9 if t is None else t
+        t, (jumped, jump_from, jump_to) = self._now_and_jump(t)
         news = []
         with self.lock:
-            self._absorb_jumps_locked()
+            wall = time.monotonic()
+            if jumped != self.jumped:        # el reloj saltó: el lote de ese tiempo viene en camino
+                self.jumped = jumped
+                self.hold_s = (jump_to - jump_from) / 1e9
+                self.hold_until = wall + JUMP_MARGIN_S
+            t_eval = t - self.hold_s if wall < self.hold_until else t
             for topic, last in self.last.items():
                 gap = self.max_gap[topic]
-                if topic not in self.late and t - last > gap:
+                if topic not in self.late and t_eval - last > gap:
                     self.late[topic] = last
                     news.append((topic, t - last, gap))
         for topic, waited, gap in news:
