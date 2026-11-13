@@ -92,6 +92,7 @@ agmen/
 ├── examples/tutorial/       código del tutorial (motor, controlador, cerebro.py, dataset.py)
 ├── examples/nodos/          un nodo con dos ritmos y el reloj de Agmen (capítulo 12)
 ├── examples/vision/         una cámara, una IA que la mira y un contador en C++ (capítulos 14 y 15)
+├── examples/sim/            el mundo de MuJoCo: el robot del tutorial con física (capítulo 17; pip install agmen[sim])
 ├── tests/                   pruebas (ctest)
 ├── examples/tutorial/robot.toml  el robot del tutorial completo, para `agmen run`
 ├── python/agmen/            paquete de Python: import agmen + el comando `agmen`; msgs.agmen (Imagen)

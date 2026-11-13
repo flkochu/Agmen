@@ -8,13 +8,12 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 ## [Sin publicar]
 
 ### Planeado (nivel 10, versión 0.14.0)
-- El mismo robot en simulación y en el mundo real, y nodos en varias
-  computadoras. Diseño aceptado el 2026-11-13 en el
+- Nodos en varias computadoras. Diseño aceptado el 2026-11-13 en el
   [RFC 0011](docs/rfc/0011-sim-real-y-varias-computadoras.md) (D1–D10 = a:
-  perfiles en `robot.toml` con `agmen run --sim`, un mundo de MuJoCo de
-  ejemplo y `agmen agent` en cada computadora). Hecho: los perfiles (bloque 1,
-  abajo). Falta: el mundo de MuJoCo (`examples/sim/`, `agmen[sim]`),
-  `[[machine]]` y `agmen agent`, con el capítulo 17.
+  perfiles en `robot.toml`, un mundo de MuJoCo de ejemplo y `agmen agent` en
+  cada computadora). Hechos: los perfiles (bloque 1, abajo) y el mundo de
+  MuJoCo (bloque 2, abajo). Falta: `[[machine]]`, `agmen agent`, topics entre
+  computadoras y relojes (bloques 3 a 5 del plan del RFC).
 
 ### Agregado
 - **Perfiles en `robot.toml`** (RFC 0011 §3.2): `profile = "real"`, `"sim"`,
@@ -40,14 +39,41 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 - **`perfil` en las grabaciones**: `agmen run --record` lo guarda en
   `agmen.grabacion`, y `agmen info` lo muestra. `agmen record` suelto no lo
   escribe. Las grabaciones sin el campo se leen igual.
+- **El mundo de MuJoCo** (RFC 0011 §3.3, `examples/sim/`): el robot del
+  tutorial con física, como un nodo más con `profile = "sim"`. Publica `/imu`
+  (100 Hz) y `/camara` (`Imagen` de 320 × 240, 15 fps), y escucha `/cmd`, igual
+  que el hardware. `agmen run examples/tutorial/robot.toml --sim` lo corre; el
+  cerebro, el mux y el panel no cambian. El mundo sigue al reloj de Agmen, así
+  que la pausa, el paso y la velocidad del panel funcionan.
+  - `--ver` abre la ventana de MuJoCo. Sin pantalla, avisa y sigue.
+  - Sin OpenGL, el mundo sigue sin cámara y lo dice en una línea.
+  - La clase `Mundo` se puede usar sola, sin Agmen (pensada para entrenar IA).
+- **`agmen[sim]`**: extra de `pip` que trae MuJoCo (`mujoco>=3.2.7`).
+- **Capítulo 17 del tutorial**: el mismo robot en simulación y en el mundo
+  real.
 
 ### Cambiado
+- **El robot del tutorial usa perfiles.** `imu` y `motor` son
+  `profile = "real"`, y `mundo` es `profile = "sim"`. Por eso `agmen run
+  examples/tutorial/robot.toml` imprime `no corren: mundo (perfil sim)`, y
+  `--sim` no arranca el motor.
 - **`--play` ya no arranca los nodos `profile = "real"`.** Usa el perfil
   `replay`: un motor no debe moverse con los datos de una grabación. Para
   correrlos, `agmen run robot.toml --play ARCHIVO.mcap --profile real`
   (con el reloj de la grabación, y `agmen run` avisa). Los `robot.toml` sin
   perfiles no cambian: `--play` arranca los mismos nodos que en 0.13.0, y
   `--skip` funciona igual.
+
+### Corregido
+- **`cmd` con la ruta de un ejecutable** (`cmd = "../venv/bin/python nodo.py"`)
+  se corre tal cual, sin seguir los enlaces simbólicos. Antes acababa en el
+  Python del sistema y no en el del entorno virtual. `python` a secas sigue
+  siendo el Python que corre `agmen`.
+- **El botón "paso" del panel** ya no cuenta como ciclos saltados ni imprime
+  `⚠ every(…): N ciclos saltados…`. Los atrasos de verdad se siguen contando y
+  avisando. Sin cambio en los bytes de la red.
+- **El vigilante de `max_gap_ms`** ya no da la alarma falsa `'/imu' no llega`
+  al dar pasos: un paso ya no cuenta como hueco.
 
 ## [0.13.0] — 2026-11-06
 

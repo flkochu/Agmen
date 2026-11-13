@@ -298,7 +298,7 @@ iceoryx2).
 | Préstamo para escribir directo en la memoria compartida (la cámara llena el bloque) | Cuando se mida que la copia del publicador estorba (RFC 0009 §4) |
 | ~~¿Seguir probando y publicando para macOS?~~ | ✅ No, desde 0.11.1 (2026-11-05, §4): Windows y Linux, x86-64 y ARM64; en macOS, Python puro |
 | ~~Formato de grabación: MCAP o propio sobre Arrow IPC~~ | ✅ [RFC 0010](rfc/0010-grabar-y-reproducir.md) aceptado el 2026-11-05 (D1–D9 = a): MCAP con los mensajes de Agmen adentro, sin cambiar un byte |
-| ~~Simulación y real; nodos y topics en varias computadoras~~ | ✅ [RFC 0011](rfc/0011-sim-real-y-varias-computadoras.md) aceptado el 2026-11-13 (D1–D10 = a): perfiles en `robot.toml`, un mundo de MuJoCo y `agmen agent` en cada computadora; sin implementar, se hace en 0.14.0 |
+| ~~Simulación y real; nodos y topics en varias computadoras~~ | ✅ [RFC 0011](rfc/0011-sim-real-y-varias-computadoras.md) aceptado el 2026-11-13 (D1–D10 = a): perfiles en `robot.toml`, un mundo de MuJoCo y `agmen agent` en cada computadora; en curso en 0.14.0: perfiles y el mundo de MuJoCo hechos; faltan `[[machine]]`, `agmen agent`, topics entre computadoras y relojes |
 | ~~Mandos del panel de cualquier tipo; quién manda en el mux; `max_gap_ms`~~ | ✅ [RFC 0012](rfc/0012-mandos-del-panel-y-quien-manda.md) aceptado el 2026-11-13 (D1–D6 = a), implementado en 0.13.0 a pedido de Arca9 |
 
 ## Fuentes
