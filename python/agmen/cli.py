@@ -49,8 +49,9 @@ def cmd_run(args) -> int:
         return 2
     profile = "sim" if args.sim else args.profile
     if args.play and profile == "sim":
-        print("error: --play reproduce una grabación y --sim corre el simulador: los dos quieren mandar el reloj. "
-              "Elige uno (para reproducir con otros nodos: --play ARCHIVO.mcap --profile real)", file=sys.stderr)
+        sim = "--sim" if args.sim else "--profile sim"   # lo que escribiste
+        print(f"error: --play reproduce una grabación y {sim} corre el simulador: los dos quieren mandar el reloj. "
+              f"Elige uno (para reproducir con otros nodos: --play ARCHIVO.mcap --profile real)", file=sys.stderr)
         return 2
     if args.play and profile is None:
         profile = "replay"                  # en reproducción no corren los nodos 'real'
@@ -80,7 +81,7 @@ def cmd_run(args) -> int:
             continue
         if name in skipped:                 # existe, pero no corre en este perfil: no hace falta
             where = _of_profiles(tuple(p for n, ps in config.skipped if n == name for p in ps))
-            skip_notes.append(f"--skip {name}: no hace falta, '{name}' es del {where} "
+            skip_notes.append(f"--skip {name}: no hace falta, '{name}' es {_del(where)} "
                               f"y no corre en el perfil '{config.profile}'")
             continue
         print(f"error: --skip {name}: no hay un nodo con ese nombre (hay: {', '.join(names)})", file=sys.stderr)
@@ -93,8 +94,16 @@ def cmd_run(args) -> int:
     launcher = Launcher(config)
     out = _SayTo(launcher)
     launcher.say(f"Agmen {__version__} · robot '{config.name}' · {len(config.nodes)} nodos · {hub_note}")
-    if config.profile != "real" or config.skipped:   # un robot.toml sin perfiles se ve como antes
+    if args.play or config.profile != "real" or config.skipped:   # un robot.toml sin perfiles se ve como antes
         launcher.say(_profile_line(config, bool(args.play)))
+    if args.play:   # RFC 0011, reto 1: los nodos 'real' con datos grabados, que se note
+        real = [n.name for n in config.nodes if "real" in n.profiles and n.name not in args.skip]
+        if real:
+            launcher.say(f"⚠ corren nodos del perfil real con el reloj de la grabación: {', '.join(real)}. "
+                         f"Si tocan hardware, se van a mover con datos grabados; sin --profile "
+                         f"{config.profile} no arrancan (o quítalos con --skip)")
+    for warning in config.warnings:
+        launcher.say(f"⚠ {warning}")
     for note in skip_notes:
         launcher.say(note)
     if config.hub and not any(n.name == "hub" for n in config.nodes):   # se reusa el hub de otro robot
@@ -143,7 +152,7 @@ def cmd_run(args) -> int:
         try:
             panel = Panel(http, config.web.listen, config.name, launcher, teleop,
                           token=config.web.token, allow_origins=config.web.allow_origins, clock=clock_server,
-                          commands=commands, profile=config.profile)
+                          commands=commands, profile=config.profile, playing=bool(args.play))
         except OSError as e:
             for c in commands:
                 c.close()
@@ -188,6 +197,11 @@ def _of_profiles(profiles: tuple[str, ...]) -> str:
     """("real",) → "perfil real"; ("real", "mesa") → "perfiles real, mesa"."""
     profiles = tuple(dict.fromkeys(profiles))
     return ("perfil " if len(profiles) == 1 else "perfiles ") + ", ".join(profiles)
+
+
+def _del(of_profiles: str) -> str:
+    """"perfil real" → "del perfil real"; "perfiles real, mesa" → "de los perfiles real, mesa"."""
+    return ("del " if of_profiles.startswith("perfil ") else "de los ") + of_profiles
 
 
 def _profile_line(config, playing: bool) -> str:
