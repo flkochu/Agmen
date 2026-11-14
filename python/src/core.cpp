@@ -43,6 +43,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -650,7 +651,7 @@ public:
     /// Cerrando el núcleo (el programa sale), regresa None sin esperar.
     std::optional<std::tuple<EnvTuple, nb::object, std::string>> receive(std::optional<double> timeout) {
         using namespace std::chrono;
-        auto& c = live();
+        (void)live();
         const auto start = steady_clock::now();
         for (;;) {
             milliseconds slice(200);   // Ctrl+C, latidos y el cierre, aunque el timeout sea largo
@@ -660,11 +661,30 @@ public:
                 slice = std::min(slice, left.count() > 0 ? left : milliseconds(0));
             }
             std::optional<agmen::RawSample> s;
+            bool gone = false;
             {
                 const NoGil nogil(Inside::Receive);
                 if (!nogil.released()) return std::nullopt;
-                s = c.receive_raw(slice);
+                // receive_raw() es de un solo hilo (agmen/pubsub.hpp): los receive() de
+                // varios hilos sobre el mismo Subscriber se turnan, sin el GIL y sin
+                // pasarse de su tramo. El lock se suelta antes de retomar el GIL.
+                std::unique_lock lock(rx_mu_, std::try_to_lock);   // lo normal: un solo hilo, sin esperar
+                milliseconds left = slice;
+                if (!lock.owns_lock()) {
+                    const auto t = steady_clock::now();
+                    if (lock.try_lock_for(slice)) {
+                        left = std::max(milliseconds(0), slice - duration_cast<milliseconds>(steady_clock::now() - t));
+                    }
+                }
+                if (lock.owns_lock()) {
+                    if (core_) {
+                        s = core_->receive_raw(left);
+                    } else {
+                        gone = true;   // otro hilo lo cerró mientras este esperaba su turno
+                    }
+                }
             }
+            if (gone) throw std::logic_error("el Subscriber ya se cerró");
             if (s) return std::make_tuple(env_tuple(s->envelope), payload_object(std::move(s->payload)), s->from);
             if (PyErr_CheckSignals() != 0) throw nb::python_error();
             if (timeout && steady_clock::now() - start >= duration<double>(*timeout)) return std::nullopt;
@@ -681,7 +701,23 @@ public:
         const NoGil nogil(Inside::Heartbeat);
         if (nogil.released()) c.heartbeat();
     }
-    void close() { core_.reset(); }
+    void close() {
+        // Un receive() de otro hilo puede estar dentro (sin el GIL): se espera su
+        // turno sin el GIL. Cerrando, desde otro hilo, con el GIL y con límite: si
+        // un hilo detenido para siempre tiene el turno, el Subscriber se deja vivo.
+        std::unique_lock lock(rx_mu_, std::defer_lock);
+        {
+            const NoGil nogil(Inside::Close);
+            if (nogil.released()) {
+                lock.lock();
+            } else if (!lock.try_lock_for(std::chrono::milliseconds(250))) {
+                return;
+            }
+        }
+        std::unique_ptr<agmen::SubscriberCore> old = std::move(core_);   // con el GIL y el turno
+        lock.unlock();
+        old.reset();   // con el GIL, como siempre
+    }
     [[nodiscard]] bool closed() const { return !core_; }
     [[nodiscard]] std::intptr_t fileno() { return live().native_handle(); }
     [[nodiscard]] std::vector<std::intptr_t> filenos() { return live().native_handles(); }
@@ -695,6 +731,7 @@ private:
         return *core_;
     }
     std::unique_ptr<agmen::SubscriberCore> core_;
+    std::timed_mutex rx_mu_;   // el turno de receive_raw() (y close())
 };
 
 // ---------------------------------------------------------------------------
