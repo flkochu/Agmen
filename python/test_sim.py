@@ -8,7 +8,6 @@ El nodo completo (freno, reloj, /imu, /camara) se prueba en scripts/sim_smoke.py
     python -m unittest discover -s python
 """
 
-import concurrent.futures
 import contextlib
 import importlib
 import importlib.util
@@ -760,18 +759,36 @@ def publish(self, msg, t_data=None):
         rec.append(t_data)
     return orig(self, msg, t_data=t_data)
 P.publish = publish
-real_now, T0 = clock.now_ns, time.monotonic()
+# El tiempo de la prueba se cuenta en /imu publicados (10 ms simulados cada uno), no en reloj de pared: con la
+# máquina cargada el nodo arranca tarde o se traba (y se salta tramos), y dos ajustes que caen en la misma
+# trabazón se verían como uno solo. Así cada ajuste lo ve un tick distinto si van a más de 0.2 s (TOPE).
+def t_imu():
+    return (len(rec) - 1) / 100 if rec else -1.0
+real_now = clock.now_ns
 H = json.loads(os.environ.get("HORA_PRUEBA", "{}"))
 RES, FASE = H.get("res", 1), H.get("fase", 0)   # resolución de la hora del sistema y dónde caen sus saltos (ns)
-# [segundos desde el arranque, ns que se le suman a la hora desde ahí]. Sin HORA_PRUEBA: +5 s a los 0.8 s y
-# luego -0.3 s a los 1.4 s.
+# [s de /imu, ns que se le suman a la hora desde ahí]. Sin HORA_PRUEBA: +5 s a los 0.8 s y luego -0.3 s a
+# los 1.4 s.
 AJUSTES = H.get("ajustes", [[0.8, 5_000_000_000], [1.4, 4_700_000_000]])
+DEMORA = H.get("demora")        # [s, ms]: una vez, el tick se demora dentro del now_ns() con que lee la hora
 def now_ns():
-    e = time.monotonic() - T0
+    global DEMORA
+    e = t_imu()
+    if DEMORA and e >= DEMORA[0] and sys._getframe(1).f_code.co_name in ("tick", "desfase_de_la_hora"):
+        time.sleep(DEMORA[1] / 1000)            # como si el sistema lo dejara sin CPU entre mono_ns y now_ns
+        DEMORA = None
     suma = next((ns for t, ns in reversed(AJUSTES) if e >= t), 0)
     return (real_now() + FASE) // RES * RES - FASE + suma
 clock.now_ns = now_ns
-sys.argv = ["mundo.py", "--seconds", str(H.get("segundos", 3)), "--sin-camara"]
+SEGUNDOS = H.get("segundos", 3)
+spin_for = agmen.Node.spin_for
+def hasta_tener_los_imu(self, seconds):         # corre hasta tener SEGUNDOS de /imu (tope: 4 veces y 5 s más)
+    t0 = time.monotonic()
+    spin_for(self, seconds)
+    while t_imu() < SEGUNDOS - 0.05 and time.monotonic() - t0 < 4 * seconds + 5:
+        spin_for(self, 0.05)
+agmen.Node.spin_for = hasta_tener_los_imu
+sys.argv = ["mundo.py", "--seconds", str(SEGUNDOS), "--sin-camara"]
 try:
     runpy.run_path(sys.argv_mundo, run_name="__main__")
 except SystemExit:
@@ -828,11 +845,15 @@ class TestNodoHoraDelSistema(unittest.TestCase):
 
     # time.time_ns() de Python ≤ 3.12 en Windows: avanza en saltos de 15.625 ms, más que un tramo de 10 ms.
     GRUESA = 15_625_000
-    FASES = (0, 5_200_000, 10_400_000)            # dónde caen los saltos de la hora respecto a los ticks
-    RETROCEDIO = "la hora del sistema retrocedió: t_data avanza de 1 ns en 1 ns"
+    FASES = (0, 5_200_000, 10_400_000)            # dónde caen los saltos de la hora gruesa (en Windows, la
+    RETROCEDIO = "la hora del sistema retrocedió: t_data avanza de 1 ns en 1 ns"   # hora real pone la suya)
     OTRA_VEZ = "t_data ya va otra vez con la hora del sistema"
+    MS = 1_000_000
+    # Los casos cortos: los ajustes a partir de 0.6 s de /imu, para que `ref` ya siga a la hora. Los
+    # tamaños se eligen lejos de los umbrales también con la hora alineada de Windows (múltiplos de 15.625 ms):
+    # 30 y 32 ms se ven como 31.25 o 46.875 ms (< 50); 64 y 80 ms, como 62.5 ms o más (> 50).
 
-    def _correr(self, hora: dict | None = None):
+    def _correr(self, hora: dict | None = None, minimo: int = 50):
         env = {"AGMEN_CLOCK": "real"}
         if hora is not None:
             env["HORA_PRUEBA"] = json.dumps(hora)
@@ -840,7 +861,8 @@ class TestNodoHoraDelSistema(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertNotIn("Traceback", r.stderr)
         rec = json.loads(next(l for l in r.stdout.splitlines() if l.startswith("REC "))[4:])
-        self.assertGreater(len(rec), 100, len(rec))
+        salida = "\n".join(l for l in (r.stdout + r.stderr).splitlines() if not l.startswith("REC "))
+        self.assertGreater(len(rec), minimo, salida)
         difs = [b - a for a, b in zip(rec, rec[1:])]
         self.assertEqual([d for d in difs if d <= 0], [], "t_data nunca se repite ni baja")
         return r, rec, difs
@@ -849,17 +871,17 @@ class TestNodoHoraDelSistema(unittest.TestCase):
         return r.stderr.count(self.RETROCEDIO), (r.stdout + r.stderr).count(self.OTRA_VEZ)
 
     def _en_fases(self, hora: dict):
-        """Corre el mismo ajuste con la hora gruesa en cada una de FASES, a la vez."""
-        with concurrent.futures.ThreadPoolExecutor(len(self.FASES)) as ex:
-            return list(ex.map(lambda f: (f, self._correr({**hora, "res": self.GRUESA, "fase": f})), self.FASES))
+        """Corre el mismo ajuste con la hora gruesa en cada una de FASES, una tras otra."""
+        for f in self.FASES:
+            yield f, self._correr({**hora, "res": self.GRUESA, "fase": f})
 
     def test_adelanta_y_retrocede(self):
-        self._comprobar_un_retroceso(*self._correr())
+        self._comprobar_un_retroceso(*self._correr(minimo=200))
 
     def test_adelanta_y_retrocede_con_hora_de_resolucion_gruesa(self):
         # Lo que falló en el CI de Windows: con la hora en saltos de 15.6 ms, el desfase de un tick a otro baja
         # hasta 15.6 ms y t_data "retrocedía" sin que nadie tocara la hora: un aviso de más por cada vez.
-        self._comprobar_un_retroceso(*self._correr({"res": self.GRUESA}))
+        self._comprobar_un_retroceso(*self._correr({"res": self.GRUESA}, minimo=200))
 
     def _comprobar_un_retroceso(self, r, rec, difs):
         self.assertLess(abs(rec[0] - time.time_ns()), 60 * 10**9, "en la escala de now_ns")
@@ -869,40 +891,52 @@ class TestNodoHoraDelSistema(unittest.TestCase):
         self.assertEqual((r.stdout + r.stderr).count(self.OTRA_VEZ), 1, r.stdout)
 
     def test_paso_de_ntp_o_retroceso_sobre_la_tolerancia_avisa_una_vez_en_toda_fase(self):
-        # 0.128 s: el paso más chico de NTP. 0.06 s: poco más que la tolerancia (50 ms).
-        for retroceso in (128_000_000, 60_000_000):
-            for fase, (r, _, difs) in self._en_fases({"ajustes": [[0.8, -retroceso]], "segundos": 2}):
+        # 128 ms: el paso más chico de NTP. 80 ms: sobre la tolerancia (50 ms) también con la hora alineada.
+        for retroceso in (128 * self.MS, 80 * self.MS):
+            for fase, (r, _, difs) in self._en_fases({"ajustes": [[0.6, -retroceso]], "segundos": 1.1}):
                 with self.subTest(retroceso=retroceso, fase=fase):
                     self.assertEqual(self._avisos(r), (1, 1), r.stdout + r.stderr)
                     self.assertGreaterEqual(sum(1 for d in difs if d == 1), 2)
 
     def test_retroceso_chico_no_avisa(self):
-        for fase, (r, _, difs) in self._en_fases({"ajustes": [[0.8, -30_000_000]], "segundos": 2}):
+        for fase, (r, _, difs) in self._en_fases({"ajustes": [[0.6, -30 * self.MS]], "segundos": 1.1}):
             with self.subTest(fase=fase):
                 self.assertEqual(self._avisos(r), (0, 0), r.stdout + r.stderr)
                 self.assertGreaterEqual(sum(1 for d in difs if d == 1), 1, "se absorbe de 1 ns en 1 ns")
 
     def test_retrocesos_chicos_seguidos_avisan_por_acumulacion(self):
-        # Cinco de 30 ms, uno cada 0.2 s: ninguno solo avisa; el 2.º suma 60 ms y avisa (la cuenta vuelve a 0),
-        # el 3.º no, el 4.º vuelve a sumar 60 ms y avisa, el 5.º no.
-        ajustes = [[0.8 + 0.2 * k, -30_000_000 * (k + 1)] for k in range(5)]
-        for fase, (r, _, _) in self._en_fases({"ajustes": ajustes, "segundos": 2.5}):
+        # Cinco de 32 ms, uno cada 0.2 s: ninguno solo avisa; el 2.º suma 64 ms y avisa (la cuenta vuelve a 0),
+        # el 3.º no, el 4.º vuelve a sumar 64 ms y avisa, el 5.º no.
+        ajustes = [[0.6 + 0.2 * k, -32 * self.MS * (k + 1)] for k in range(5)]
+        for fase, (r, _, _) in self._en_fases({"ajustes": ajustes, "segundos": 1.7}):
             with self.subTest(fase=fase):
                 self.assertEqual(self._avisos(r), (2, 2), r.stdout + r.stderr)
 
+    def test_retrocesos_chicos_espaciados_tambien_avisan(self):
+        # 32 ms y otros 32 ms 3 s después: en 3 s se olvidan 3 ms (OLVIDO_HORA), quedan 61 ms y avisa.
+        r, _, _ = self._correr({"ajustes": [[0.6, -32 * self.MS], [3.6, -64 * self.MS]], "segundos": 3.9,
+                                "res": self.GRUESA}, minimo=300)
+        self.assertEqual(self._avisos(r), (1, 1), r.stdout + r.stderr)
+
     def test_retrocesos_de_80_ms_seguidos_avisan_cada_uno(self):
-        ajustes = [[0.8 + 0.2 * k, -80_000_000 * (k + 1)] for k in range(5)]
-        r, _, _ = self._correr({"ajustes": ajustes, "segundos": 2.5, "res": self.GRUESA})
+        ajustes = [[0.6 + 0.3 * k, -80 * self.MS * (k + 1)] for k in range(5)]
+        r, _, _ = self._correr({"ajustes": ajustes, "segundos": 2.1, "res": self.GRUESA})
         self.assertEqual(self._avisos(r), (5, 5), r.stdout + r.stderr)
 
     def test_segundo_retroceso_antes_de_alcanzar_no_vuelve_a_avisar(self):
-        # -0.3 s a 1.0 s y otros -0.3 s a 1.1 s: el aviso que ya salió sigue siendo cierto; uno y su "otra vez".
-        r, _, _ = self._correr({"ajustes": [[1.0, -300_000_000], [1.1, -600_000_000]], "segundos": 2.5,
+        # -0.3 s y otros -0.3 s 0.1 s después: el aviso que ya salió sigue siendo cierto; uno y su "otra vez".
+        r, _, _ = self._correr({"ajustes": [[0.6, -300 * self.MS], [0.7, -600 * self.MS]], "segundos": 1.7,
                                 "res": self.GRUESA})
         self.assertEqual(self._avisos(r), (1, 1), r.stdout + r.stderr)
 
+    def test_demora_del_hilo_entre_las_lecturas_no_avisa(self):
+        # Con la máquina cargada el hilo se puede quedar sin CPU entre mono_ns() y now_ns(): esa lectura sale
+        # corrida 80 ms. desfase_de_la_hora() la repite; si no, t_data saltaría y luego "retrocedería" 80 ms.
+        r, _, _ = self._correr({"ajustes": [], "demora": [0.6, 80], "segundos": 1.1, "res": self.GRUESA})
+        self.assertEqual(self._avisos(r), (0, 0), r.stdout + r.stderr)
+
     def test_resolucion_gruesa_sin_ajuste_no_avisa_ni_acumulando(self):
-        r, _, difs = self._correr({"ajustes": [], "segundos": 8, "res": self.GRUESA})
+        r, _, difs = self._correr({"ajustes": [], "segundos": 6, "res": self.GRUESA}, minimo=500)
         self.assertNotIn("retrocedió", r.stderr, "la resolución del reloj no es un retroceso")
         self.assertNotIn(self.OTRA_VEZ, r.stdout + r.stderr)
         self.assertLess(max(difs), 10**9, "sin ajuste, t_data no da saltos")

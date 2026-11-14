@@ -39,16 +39,39 @@ FRENO = SEG // 2        # 0.5 s sin comandos → ruedas en 0, como el motor del 
 # retrocedió en neto: `ref` es el desfase más alto visto (sigue a la hora cuando adelanta) y `ref − desfase` es
 # lo retrocedido, que es lo que t_data tiene que absorber de 1 ns en 1 ns. Con solo la resolución gruesa eso
 # nunca pasa de 15.6 ms. Se avisa cuando pasa de TOLERANCIA_HORA (50 ms, más de 3 × 15.6 ms) mientras t_data va
-# adelantada, y suma retrocesos chicos seguidos: tres de 25 ms en un segundo avisan, aunque ninguno solo lo haga.
-# Umbral real de un retroceso R: avisa siempre si R > 50 ms + lo que tarde el tick en despertar tras un salto de
-# la hora (unos ms); nunca si R < 50 − 15.6 = 34.4 ms; en medio, según la fase. Un paso de NTP (≥ 128 ms)
-# avisa siempre. La cuenta se pone en cero al avisar (ref = desfase, hasta alcanzar la hora) y se olvida sola a
-# OLVIDO_HORA: un retroceso chico se borra en ≤ 5 s de hora normal, y un reloj que el sistema frena despacio
-# (NTP corrige así, a 0.5 ms/s) no se confunde con un retroceso. Si la hora retrocede otra vez antes de que
-# t_data la alcance, no hay un segundo aviso: el primero sigue siendo cierto y su "ya va otra vez" sale al
-# alcanzar la hora más vieja de las dos.
+# adelantada, y suma retrocesos chicos: dos de 32 ms avisan, aunque ninguno solo lo haga.
+# Umbral real de un retroceso R: con hora fina, R + lo que falta para el siguiente salto de la hora (0 a 15.6 ms)
+# − lo que tarda el tick en despertar tras un salto (unos ms). Con hora gruesa y ticks alineados a sus saltos
+# (Windows), lo medido es un múltiplo de 15.625 ms: 60 ms puede verse como 46.875 ms. Así que avisa siempre si
+# R > 62.5 ms, nunca si R < 50 − 15.6 = 34.4 ms, y en medio según la fase. Un paso de NTP (≥ 128 ms) avisa
+# siempre. La cuenta se pone en cero al avisar (ref = desfase, hasta alcanzar la hora) y se olvida sola a
+# OLVIDO_HORA, 1 ms por segundo: lo más que se absorbe en silencio es ≈ 1 ms por segundo (más la tolerancia),
+# el doble de lo que NTP frena la hora al corregirla (0.5 ms/s), que así no se confunde con un retroceso.
+# Si el hilo se demora más de ~35–50 ms entre las dos lecturas (mono_ns y now_ns), t_data salta adelante y en
+# el tick siguiente parece que la hora retrocedió: desfase_de_la_hora() repite la lectura para evitarlo; solo
+# si las INTENTOS lecturas se demoran todas puede salir un aviso falso, que se corrige solo al alcanzar.
+# Si la hora retrocede otra vez antes de que t_data la alcance, no hay un segundo aviso: el primero sigue
+# siendo cierto y su "ya va otra vez" sale al alcanzar la hora más vieja de las dos.
 TOLERANCIA_HORA = SEG // 20
-OLVIDO_HORA = 100       # ref baja 1 ns por cada 100 ns de reloj monótono: 10 ms por segundo
+OLVIDO_HORA = 1000      # ref baja 1 ns por cada 1000 ns de reloj monótono: 1 ms por segundo
+PEGADO, INTENTOS = SEG // 1000, 5   # desfase_de_la_hora(): las lecturas a 1 ms o menos; si no, hasta 5 veces
+
+
+def desfase_de_la_hora(reloj) -> int:
+    """now_ns() − mono_ns() de agmen.clock (`reloj`), leídos juntos. Si el hilo se demora entre las dos lecturas
+    (la máquina cargada), el desfase sale corrido por esa demora: t_data saltaría adelante y en el tick
+    siguiente parecería que la hora retrocedió. Por eso now_ns() se lee entre dos mono_ns() y, si quedaron a más de PEGADO, se repite (hasta
+    INTENTOS veces), quedándose con la lectura más pegada."""
+    mejor = None
+    for _ in range(INTENTOS):
+        antes = reloj.mono_ns()
+        hora = reloj.now_ns()
+        despues = reloj.mono_ns()
+        if mejor is None or despues - antes < mejor[0]:
+            mejor = (despues - antes, hora - (antes + despues) // 2)
+        if despues - antes <= PEGADO:
+            break
+    return mejor[1]
 
 
 class Ritmo:
@@ -148,8 +171,8 @@ def main() -> int:
     @node.every(0.01)                                       # 100 Hz de Agmen: en pausa no corre
     def tick():
         ahora = reloj.mono_ns()
-        desfase = reloj.now_ns() - ahora if real else 0     # pegada a mono_ns(): si el hilo se demora en medio,
-        st = reloj.state()                                  # t_data saltaría y luego "retrocedería"
+        desfase = desfase_de_la_hora(reloj) if real else 0
+        st = reloj.state()
         vel, pausa = st.speed or 1.0, not real and st.paused   # en pausa, el tick solo corre si hubo un "paso"
         primero = s.t is None
         if primero:
