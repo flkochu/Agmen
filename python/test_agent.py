@@ -3639,6 +3639,31 @@ class TestCtrlCAlArrancar(E2EBase):
         self.assertNotIn("Traceback", texto)
         self.assertIs(signal.getsignal(signal.SIGINT), antes, "agmen run no dejó el manejador de SIGINT como estaba")
 
+    def test_si_el_panel_no_abre_se_despide_del_agente_y_sale_con_1(self):
+        # un puerto ocupado de verdad (en Windows, exclusivo: SO_REUSEADDR de http.server no se lo salta)
+        ocupado = socket.socket()
+        self.addCleanup(ocupado.close)
+        if os.name == "nt":
+            ocupado.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        ocupado.bind(("127.0.0.1", 0))
+        ocupado.listen()
+        http = f"127.0.0.1:{ocupado.getsockname()[1]}"
+        self.write_toml(web=f'http = "{http}"\n')
+        pa, la, clave = self.agente()
+        pr, lr = self.correr(clave=clave, args=())
+        codigo = self.fin(pr, 60)
+        texto = self.texto(lr)
+        self.assertEqual(codigo, 1, texto)
+        self.assertIn(f"no se pudo abrir el panel web en {http}", texto)
+        self.assertIn(f"robot (127.0.0.1:{self.port}): conectado", texto)
+        self.assertNotIn("Traceback", texto)
+        self.assertNotIn("todo arrancado", texto)
+        # el agente recibió adios (no un corte), y queda esperando otra vez
+        self.assertTrue(self.espera(lambda: any("la laptop (127.0.0.1) se despidió" in l for l in la), 30),
+                        self.texto(la))
+        self.assertTrue(self.espera(lambda: any("(otra vez)" in l for l in la), 30), self.texto(la))
+        self.assertFalse(list(self.marks.glob("arranque_*")), "arrancó algún nodo")
+
     # --- agmen run aquí mismo (en este proceso), con lo lento simulado con mock
 
     def toml_local(self, maquina: bool = False) -> Path:
@@ -3708,6 +3733,8 @@ class TestCtrlCAlArrancar(E2EBase):
         self.assertEqual(codigo, 130, texto)
         self.assertIn("error: no encontré robot (DNS)", texto)
         self.assertIn("cancelado (Ctrl+C) antes de conectarme: no arrancó nada", texto)
+        self.assertNotIn("Traceback", texto)
+        self.assertFalse(list(self.marks.glob("arranque_*")), "arrancó algún nodo")
 
     def test_ctrl_c_anotado_justo_antes_de_una_fase_que_se_puede_cortar_no_se_pierde(self):
         from agmen import cli
@@ -3723,6 +3750,17 @@ class TestCtrlCAlArrancar(E2EBase):
             with c.interruptible():
                 entro.append(True)                # aquí estaría get_key esperando la clave
         self.assertEqual(entro, [], "entró a la fase aunque Ctrl+C ya se había anotado")
+        # al salir vuelve el manejador que solo anota: tras KeyboardInterrupt, tras otra excepción y sin ninguna
+        self.assertEqual(signal.getsignal(signal.SIGINT), c._note)
+        c.pressed = False
+        with self.assertRaises(OSError):
+            with c.interruptible():
+                self.assertIs(signal.getsignal(signal.SIGINT), signal.default_int_handler)
+                raise OSError("otra falla dentro de la fase")
+        self.assertEqual(signal.getsignal(signal.SIGINT), c._note)
+        with c.interruptible():
+            pass
+        self.assertEqual(signal.getsignal(signal.SIGINT), c._note)
 
     def test_fuera_del_hilo_principal_una_sola_traza(self):
         self.toml_local()
@@ -3737,7 +3775,7 @@ class TestCtrlCAlArrancar(E2EBase):
             except BaseException as e:   # noqa: BLE001 - se revisa abajo
                 errores.append(e)
 
-        h = threading.Thread(target=correr)
+        h = threading.Thread(target=correr, daemon=True)
         h.start()
         h.join(30)
         self.assertEqual(len(errores), 1, errores)

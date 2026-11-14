@@ -78,9 +78,9 @@ class _CtrlC:
 
     @contextlib.contextmanager
     def interruptible(self):
-        signal.signal(signal.SIGINT, signal.default_int_handler)
-        _ctrl_break_like_ctrl_c()
-        try:
+        try:   # dentro del try: si Ctrl+C llega recién puesto default_int_handler, el finally pone el que anota
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+            _ctrl_break_like_ctrl_c()
             if self.pressed:   # se anotó justo antes de entrar: que no se pierda
                 raise KeyboardInterrupt
             yield
@@ -185,6 +185,8 @@ def _run(args) -> int:
                 with ctrl_c.interruptible():   # una grabación cortada se recorre entera: puede tardar
                     player = Player(args.play, args.play_topic or None, paused=True)
             except KeyboardInterrupt:
+                if player is not None:
+                    player.stop()
                 return _cancelled("mientras abría la grabación", "no arrancó nada")
             except (ValueError, OSError) as e:
                 print(f"error: --play: {e}", file=sys.stderr)
@@ -274,7 +276,8 @@ def _run(args) -> int:
         launcher.printer.close()
         if player is not None:
             player.stop()
-        return _cancelled_or(1)
+        told = " (les avisé a las otras computadoras)" if remotes else ""
+        return _cancelled_or(1, what=f"no arrancó ningún nodo{told}")
 
     def cancel_before_nodes(when: str) -> int:   # todavía no arrancó ningún nodo: adios a los agentes y sale
         ctrl_c.catch()
@@ -320,6 +323,8 @@ def _run(args) -> int:
             except KeyboardInterrupt:
                 return cancel_before_nodes("mientras abría la grabación")
             except (ValueError, OSError) as e:
+                for link in remotes.values():   # (aquí no hay: con [[machine]] la grabación se abre antes)
+                    link.finish()
                 launcher.printer.close()
                 print(f"error: --play: {e}", file=sys.stderr)
                 return _cancelled_or(2)
@@ -351,9 +356,18 @@ def _run(args) -> int:
             panel = Panel(http, config.web.listen, config.name, launcher, teleop,
                           token=config.web.token, allow_origins=config.web.allow_origins, clock=clock_server,
                           commands=commands, profile=config.profile, playing=bool(args.play))
-        except OSError as e:
+        except OSError as e:   # ningún nodo arrancó aún: se cierra lo que ya estaba abierto, como en los otros caminos
             for c in commands:
                 c.close()
+            stop.set()                      # el vigilante de max_gap_ms
+            for link in remotes.values():   # detener_todo y adios a las otras computadoras
+                link.finish()
+            if recording.rec is not None:
+                recording.stop()
+            if player is not None:
+                player.stop()
+            elif clock_server:
+                clock_server.close()
             launcher.printer.close()
             print(f"no se pudo abrir el panel web en {http}: {e}. "
                   f"¿Ya hay otro 'agmen run' corriendo? Usa --http 127.0.0.1:8081", file=sys.stderr)
