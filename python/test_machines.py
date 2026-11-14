@@ -309,22 +309,36 @@ class TestMaquinasEnLaLineaDeComandos(unittest.TestCase):
         with open(self.toml, "w", encoding="utf-8") as f:
             f.write(t)
 
-    def env(self):
+    def env(self, **extra):
+        # AGMEN_CONFIG_DIR propio: ni keys.toml ni agent.key de la persona que corre las pruebas
         return {**os.environ, "PYTHONPATH": str(ROOT / "python"), "PYTHONIOENCODING": "utf-8", "NO_COLOR": "1",
-                "AGMEN_HUB": f"127.0.0.1:{PUERTO_HUB}"}
+                "AGMEN_HUB": f"127.0.0.1:{PUERTO_HUB}", "AGMEN_CONFIG_DIR": os.path.join(self.dir, "cfg"),
+                "AGMEN_REMOTE_HOSTS": "", "AGMEN_AGENT_KEY": "", **extra}
 
-    def falla(self, *args, seg=60):
+    def remoto(self):
+        """Un host:puerto que SI es de aqui (127.0.0.1) pero AGMEN_REMOTE_HOSTS lo vuelve "otra computadora",
+        con un puerto donde no escucha nadie: agmen run lo intenta y recibe "conexion rechazada"."""
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            self.puerto_cerrado = s.getsockname()[1]
+        return f"127.0.0.1:{self.puerto_cerrado}"
+
+    CLAVE = "kq3f-9xm2-7tdw"
+
+    def falla(self, *args, seg=60, remoto=False, **extra):
+        if remoto:
+            extra = {"AGMEN_REMOTE_HOSTS": "127.0.0.1", "AGMEN_AGENT_KEY": self.CLAVE, **extra}
         t0 = time.monotonic()
         r = subprocess.run([sys.executable, "-m", "agmen", "run", self.toml, "--no-browser", *args],
-                           env=self.env(), capture_output=True, text=True, encoding="utf-8", timeout=seg,
-                           check=False)
+                           env=self.env(**extra), capture_output=True, text=True, encoding="utf-8", timeout=seg,
+                           check=False, stdin=subprocess.DEVNULL)
         return r, time.monotonic() - t0
 
-    def corre(self, *args, esperar=("ARRANCO motor",), seg=30.0):
+    def corre(self, *args, esperar=("ARRANCO motor",), seg=30.0, **env):
         kw = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
         p = subprocess.Popen([sys.executable, "-m", "agmen", "run", self.toml, "--no-browser", *args],
-                             env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                             encoding="utf-8", errors="replace", **kw)
+                             env=self.env(**env), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                             encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, **kw)
         lines = []
         reader = threading.Thread(target=lambda: lines.extend(iter(p.stdout.readline, "")), daemon=True)
         reader.start()
@@ -364,43 +378,83 @@ class TestMaquinasEnLaLineaDeComandos(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn("robot (127.0.0.1:7400): es esta computadora", out)
 
-    def test_otra_computadora_no_arranca_nada_y_sale_con_2(self):
-        self.robot({"robot": AJENA}, self.NODOS, hub=True)
-        r, _ = self.falla()
+    # Parte 3b: una [[machine]] de otra computadora ya no es "todavia no arranco": agmen run se conecta a su
+    # agmen agent. Aqui, con un puerto donde NO hay agente (y AGMEN_REMOTE_HOSTS=127.0.0.1 para que 127.0.0.1
+    # cuente como otra computadora): se comprueba lo que la 3a protegia (nunca arranca nada AQUI) con el
+    # error nuevo. La conexion con un agente real: test_agent.py.
+    def test_otra_computadora_sin_agente_no_arranca_nada_y_sale_con_2(self):
+        self.robot({"robot": self.remoto()}, self.NODOS, hub=True)
+        r, _ = self.falla(remoto=True)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        self.assertIn(f"error: 'motor' e 'imu' corren en 'robot' ({AJENA}) y esta versión todavía no arranca "
-                      f"nodos en otra computadora (llega con agmen agent). Mientras tanto: corre agmen run en "
-                      f"esa computadora. Para probar aquí en simulación: [profile.sim] local = true y "
-                      f"agmen run --sim", r.stderr)
-        self.assertNotIn("[profile.real] local", r.stderr)   # I4: en el perfil real no se sugiere
-        self.assertNotIn("ARRANCO", r.stdout + r.stderr)
-        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn(f"error: robot (127.0.0.1:{self.puerto_cerrado}) no contesta: ¿está corriendo agmen agent "
+                      f"ahí? En robot: agmen agent {self.toml}", r.stderr)
         salida = r.stdout + r.stderr
+        self.assertNotIn("ARRANCO", salida)
+        self.assertNotIn("Traceback", salida)
         self.assertNotIn("iniciado", salida)       # ni el hub ni ningún nodo
-        self.assertNotIn("agmen hub en", salida)
+        self.assertNotIn("todo arrancado", salida)
         self.assertNotIn("directorio de topics", salida)
+        self.assertNotIn(self.CLAVE, salida)       # la clave nunca se imprime
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "cfg", "keys.toml")), "guardó una clave sin conexión")
 
-    def test_un_solo_nodo_remoto_en_singular(self):
-        self.robot({"robot": AJENA}, [("motor", None, "robot"), ("ia", None, None)])
-        r, _ = self.falla()
+    def test_un_solo_nodo_remoto_tambien_falla_sin_agente(self):
+        self.robot({"robot": self.remoto()}, [("motor", None, "robot"), ("ia", None, None)])
+        r, _ = self.falla(remoto=True)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        self.assertIn(f"'motor' corre en 'robot' ({AJENA}) y esta versión", r.stderr)
+        self.assertIn("no contesta", r.stderr)
         self.assertNotIn("ARRANCO", r.stdout)
 
-    def test_dos_computadoras_ajenas_y_una_de_aqui_sigue_siendo_error(self):
-        self.robot({"robot": AJENA, "laptop": "127.0.0.1"},
+    def test_una_computadora_de_aqui_y_una_remota_sin_agente_no_arranca_ni_lo_de_aqui(self):
+        # "laptop" = 127.0.0.2 (loopback, no esta en AGMEN_REMOTE_HOSTS): es de aqui; "robot" no
+        self.robot({"robot": self.remoto(), "laptop": "127.0.0.2"},
                    [("motor", None, "robot"), ("ia", None, "laptop"), ("imu", None, None)])
-        r, _ = self.falla()
+        r, _ = self.falla(remoto=True)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        self.assertIn("'motor' corre en 'robot'", r.stderr)
+        self.assertIn("robot (127.0.0.1:%d) no contesta" % self.puerto_cerrado, r.stderr)
+        self.assertNotIn("ARRANCO", r.stdout + r.stderr)
+
+    def test_skip_del_nodo_remoto_igual_conecta_y_falla_sin_agente(self):
+        # --skip no evita la conexion: el agente tiene que saber de la sesion (no_arrancar)
+        self.robot({"robot": self.remoto()}, self.NODOS)
+        r, _ = self.falla("--skip", "motor", remoto=True)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("no contesta", r.stderr)
         self.assertNotIn("ARRANCO", r.stdout)
 
-    def test_skip_del_nodo_remoto_sigue_siendo_error(self):
-        self.robot({"robot": AJENA}, self.NODOS)
-        r, _ = self.falla("--skip", "motor")
+    def test_remota_en_sim_sin_local_tambien_conecta_y_falla_sin_agente(self):
+        self.robot({"robot": self.remoto()}, [("mundo", "sim", "robot"), ("ia", None, None)])
+        r, _ = self.falla("--sim", remoto=True)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        self.assertIn("corren en 'robot'", r.stderr)
+        self.assertIn("no contesta", r.stderr)
+        for no in ("local = true", "simulación", "quita machine"):
+            self.assertNotIn(no, r.stderr)           # ninguna sugerencia de correrlo aqui
         self.assertNotIn("ARRANCO", r.stdout)
+
+    def test_sin_local_en_real_falla_y_con_local_en_sim_no_conecta(self):
+        self.robot({"robot": self.remoto()}, [("motor", "real", "robot"), ("mundo", "sim", "robot")],
+                   '\n[profile.sim]\nlocal = true\n')
+        r, _ = self.falla(remoto=True)   # perfil real: sin local
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("no contesta", r.stderr)
+        self.assertNotIn("[profile.real] local", r.stderr)
+        self.assertNotIn("ARRANCO", r.stdout)
+        # con local = true (perfil sim) corre todo aqui y NO abre ninguna conexion
+        code, out = self.corre("--sim", esperar=("ARRANCO mundo",), AGMEN_REMOTE_HOSTS="127.0.0.1")
+        self.assertEqual(code, 0, out)
+        self.assertIn("local = true: todo corre en esta computadora", out)
+        self.assertNotIn("conectando", out)
+        self.assertNotIn("no contesta", out)
+
+    def test_nombre_que_no_resuelve_es_error_sin_colgarse(self):
+        self.robot({"robot": "agmen-no-existe.invalid"}, self.NODOS)
+        r, dt = self.falla(seg=60, AGMEN_AGENT_KEY=self.CLAVE)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("no puedo conectarme con 'robot' (agmen-no-existe.invalid): no pude resolver "
+                      "'agmen-no-existe.invalid'", r.stderr)
+        self.assertIn("Corrige host en robot.toml", r.stderr)
+        self.assertNotIn("conectando", r.stdout + r.stderr)      # ni lo intentó
+        self.assertNotIn("ARRANCO", r.stdout)
+        self.assertLess(dt, 25.0, f"agmen run tardó {dt:.1f} s con un nombre que no resuelve")
 
     def test_machine_sin_nodos_en_el_perfil_activo_no_estorba(self):
         self.robot({"robot": AJENA},
@@ -426,23 +480,6 @@ class TestMaquinasEnLaLineaDeComandos(unittest.TestCase):
         self.assertIn("local = true: todo corre en esta computadora", out)
         self.assertNotIn("se ignora machine", out)
 
-    def test_el_mismo_robot_sin_local_falla(self):
-        self.robot({"robot": AJENA}, [("motor", "real", "robot"), ("mundo", "sim", "robot")],
-                   '\n[profile.sim]\nlocal = true\n')
-        r, _ = self.falla()   # perfil real: sin local
-        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        # I4: en el perfil real no se sugiere local = true (serían los drivers del robot aquí)
-        self.assertNotIn("[profile.real] local", r.stderr)
-        self.assertIn("Para probar aquí en simulación: [profile.sim] local = true y agmen run --sim", r.stderr)
-
-    def test_nombre_que_no_resuelve_es_error_sin_colgarse(self):
-        self.robot({"robot": "agmen-no-existe.invalid"}, self.NODOS)
-        r, dt = self.falla(seg=60)
-        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        self.assertIn("corren en 'robot' (agmen-no-existe.invalid)", r.stderr)
-        self.assertNotIn("ARRANCO", r.stdout)
-        self.assertLess(dt, 25.0, f"agmen run tardó {dt:.1f} s con un nombre que no resuelve")
-
     def test_machine_mal_escrita_es_error_de_configuracion(self):
         self.robot({"robot": "127.0.0.1"}, [("motor", None, "robto")])
         r, _ = self.falla()
@@ -464,32 +501,11 @@ class TestMaquinasEnLaLineaDeComandos(unittest.TestCase):
         self.assertNotIn("local = true", out)
         self.assertNotIn("computadora", out)
 
-    def test_remota_en_sim_sin_local_sugiere_local_del_perfil_sim(self):
-        self.robot({"robot": AJENA}, [("mundo", "sim", "robot"), ("ia", None, None)])
-        r, _ = self.falla("--sim")
-        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        self.assertIn("Mientras tanto: corre agmen run en esa computadora, o usa [profile.sim] local = true "
-                      "para correr todo aquí", r.stderr)
-        self.assertNotIn("Para probar aquí en simulación", r.stderr)
-        self.assertNotIn("ARRANCO", r.stdout)
-
-    def test_varias_computadoras_con_hardware_solo_sugiere_simulacion(self):
-        self.robot({"laptop": "127.0.0.1", "robot": AJENA},
-                   [("ia", None, "laptop"), ("motor", None, "robot")])
-        r, _ = self.falla()
-        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        self.assertIn("Con nodos en varias computadoras ('laptop', 'robot') hace falta agmen agent, que llega en "
-                      "una versión próxima. Mientras tanto, para probar aquí en simulación: [profile.sim] local = "
-                      "true y agmen run --sim", r.stderr)
-        for no in ("cada computadora", "quita machine", "[profile.real] local"):
-            self.assertNotIn(no, r.stderr)
-        self.assertNotIn("ARRANCO", r.stdout)
-
     def test_nombre_sin_resolver_dice_que_pongas_la_ip(self):
         self.robot({"robot": "agmen-no-existe.invalid"}, self.NODOS)
         r, _ = self.falla()
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        self.assertIn("No pude resolver 'agmen-no-existe.invalid'", r.stderr)
+        self.assertIn("no pude resolver 'agmen-no-existe.invalid' (la red no lo conoce)", r.stderr)
         self.assertIn("si esta es esa computadora, pon su IP en host.", r.stderr)
 
     def test_ipv6_link_local_sin_zona_dice_que_falta_la_interfaz(self):
@@ -870,58 +886,46 @@ class TestRemoteError(unittest.TestCase):
     def cfg(self, maquinas, nodos, extra="", profile=None):
         return _config(robot_toml(maquinas, nodos, extra), profile)
 
+    # Parte 3b: remote_error ya no dice "todavia no arranca nodos en otra computadora" ni sugiere
+    # correr aqui / quitar machine / simulacion: solo se usa cuando un Launcher se arma SIN la conexion
+    # con el agente (agmen run las abre solo). Dice quien corre alla y que falta.
     def test_una_remota_en_real(self):
         c = self.cfg([("robot", AJENA)], [("motor", None, "robot"), ("imu", None, "robot"), ("ia", None, None)])
         self.assertEqual(remote_error(c, {"robot": self.OTRA}),
-                         f"'motor' e 'imu' corren en 'robot' ({AJENA}) y esta versión todavía no arranca nodos "
-                         f"en otra computadora (llega con agmen agent). Mientras tanto: corre agmen run en esa "
-                         f"computadora. Para probar aquí en simulación: [profile.sim] local = true y "
-                         f"agmen run --sim")
-
-    def test_una_remota_en_real_no_sugiere_local_en_real(self):
-        c = self.cfg([("robot", AJENA)], [("motor", None, "robot")])
-        self.assertNotIn("[profile.real] local", remote_error(c, {"robot": self.OTRA}))
+                         f"'motor' e 'imu' corren en 'robot' ({AJENA}) y no hay conexión con su agmen agent. "
+                         f"Corre agmen agent en 'robot' y agmen run aquí: se conecta solo")
 
     def test_un_solo_nodo_va_en_singular(self):
         c = self.cfg([("robot", AJENA)], [("motor", None, "robot")])
-        self.assertTrue(remote_error(c, {"robot": self.OTRA}).startswith(f"'motor' corre en 'robot' ({AJENA}) y"))
+        self.assertTrue(remote_error(c, {"robot": self.OTRA}).startswith(
+            f"'motor' corre en 'robot' ({AJENA}) y no hay conexión"))
 
-    def test_remota_en_sim_sin_local_sugiere_local_del_perfil(self):
-        c = self.cfg([("robot", AJENA)], [("mundo", "sim", "robot")], profile="sim")
-        e = remote_error(c, {"robot": self.OTRA})
-        self.assertTrue(e.endswith("Mientras tanto: corre agmen run en esa computadora, o usa "
-                                   "[profile.sim] local = true para correr todo aquí"), e)
-        self.assertNotIn("Para probar aquí en simulación", e)
+    def test_en_cualquier_perfil_el_mismo_texto_sin_sugerencias_de_correr_aqui(self):
+        # (antes: "o usa [profile.sim] local = true…" segun el perfil)
+        casos = [("sim", "sim", ""), ("pruebas", "pruebas", "\n[profile.pruebas]\n"), (None, None, "")]
+        for perfil, prof_nodo, extra in casos:
+            with self.subTest(perfil=perfil):
+                c = self.cfg([("robot", AJENA)], [("n", prof_nodo, "robot")], extra, profile=perfil)
+                e = remote_error(c, {"robot": self.OTRA})
+                self.assertTrue(e.endswith("Corre agmen agent en 'robot' y agmen run aquí: se conecta solo"), e)
+                for no in ("local = true", "simulación", "quita machine", "todavía no arranca", "llega con"):
+                    self.assertNotIn(no, e)
 
-    def test_otro_perfil_con_su_nombre(self):
-        c = self.cfg([("robot", AJENA)], [("n", "pruebas", "robot")], '\n[profile.pruebas]\n', profile="pruebas")
-        self.assertTrue(remote_error(c, {"robot": self.OTRA}).endswith(
-            ", o usa [profile.pruebas] local = true para correr todo aquí"))
-
-    def test_varias_computadoras_con_hardware_una_aqui_y_una_remota(self):
+    def test_varias_una_aqui_y_una_remota_solo_nombra_lo_remoto(self):
         c = self.cfg([("laptop", "127.0.0.1"), ("robot", AJENA)],
                      [("ia", None, "laptop"), ("motor", None, "robot")])
         e = remote_error(c, {"laptop": self.AQUI, "robot": self.OTRA})
-        self.assertIn(f"'motor' corre en 'robot' ({AJENA}).", e)
-        self.assertTrue(e.endswith("Con nodos en varias computadoras ('laptop', 'robot') hace falta agmen agent, "
-                                   "que llega en una versión próxima. Mientras tanto, para probar aquí en "
-                                   "simulación: [profile.sim] local = true y agmen run --sim"), e)
-        for no in ("quita machine", "cada computadora", "corre agmen run en", "[profile.real] local", "'ia' corre"):
-            self.assertNotIn(no, e)
+        self.assertEqual(e, f"'motor' corre en 'robot' ({AJENA}) y no hay conexión con su agmen agent. Corre "
+                            f"agmen agent en 'robot' y agmen run aquí: se conecta solo")
+        self.assertNotIn("'ia'", e)
 
     def test_varias_computadoras_dos_remotas(self):
         c = self.cfg([("robot", AJENA), ("brazo", "198.51.100.7:7400")],
                      [("motor", None, "robot"), ("pinza", None, "brazo")])
         e = remote_error(c, {"robot": self.OTRA, "brazo": self.OTRA})
-        self.assertIn(f"'motor' corre en 'robot' ({AJENA}); 'pinza' corre en 'brazo' (198.51.100.7:7400).", e)
-        self.assertIn("('robot', 'brazo')", e)
-
-    def test_varias_en_sim_sin_hardware_sugiere_local_del_perfil(self):
-        c = self.cfg([("a", AJENA), ("b", "198.51.100.7")], [("x", "sim", "a"), ("y", "sim", "b")], profile="sim")
-        e = remote_error(c, {"a": self.OTRA, "b": self.OTRA})
-        self.assertTrue(e.endswith("que llega en una versión próxima. Mientras tanto: usa [profile.sim] local = "
-                                   "true para correr todo aquí"), e)
-        self.assertNotIn("quita machine", e)
+        self.assertEqual(e, f"'motor' corre en 'robot' ({AJENA}); 'pinza' corre en 'brazo' (198.51.100.7:7400) y "
+                            f"no hay conexión con su agmen agent. Corre agmen agent en 'robot' y 'brazo' y agmen "
+                            f"run aquí: se conecta solo")
 
     def test_nombre_que_no_resolvio(self):
         c = self.cfg([("robot", "robot.local")], [("motor", None, "robot")])
@@ -1357,119 +1361,45 @@ class TestNombreConVariasIP(unittest.TestCase):
             self.assertIn(frag, n)
 
 
-class TestAvisosSinHardwareAqui(unittest.TestCase):
-    """Los avisos nunca sugieren correr el hardware en esta computadora."""
+class TestSinSugerenciasDeHardware(unittest.TestCase):
+    """3b: las sugerencias de la 3a (probar en simulacion, [profile.X] local, quitar machine) ya no existen
+    en ningun mensaje: ahora agmen run se conecta al agente. Esto protege que NUNCA reaparezca una que
+    mande el hardware del robot a esta computadora."""
 
     OTRA = Place(False, "other")
     AQUI = Place(True, "loopback")
-    UNA = ("Mientras tanto: corre agmen run en esa computadora")
-    SIM = "[profile.sim] local = true y agmen run --sim"
-    VARIAS = "hace falta agmen agent, que llega en una versión próxima."
 
     def err(self, maquinas, nodos, profile=None, extra="", aqui=()):
         c = _config(robot_toml(maquinas, nodos, extra), profile)
         return remote_error(c, {m[0]: (self.AQUI if m[0] in aqui else self.OTRA) for m in maquinas})
 
-    def test_una_remota_en_real_termina_sugiriendo_simulacion(self):
-        e = self.err([("robot", AJENA)], [("motor", "real", "robot")])
-        self.assertTrue(e.endswith(f"{self.UNA}. Para probar aquí en simulación: {self.SIM}"), e)
-
-    def test_una_remota_en_otro_perfil_sin_hardware_sugiere_local_de_ese_perfil(self):
-        e = self.err([("robot", AJENA)], [("n", "pruebas", "robot")], "pruebas", '\n[profile.pruebas]\n')
-        self.assertTrue(e.endswith(f"{self.UNA}, o usa [profile.pruebas] local = true para correr todo aquí"), e)
-
-    def test_un_nodo_sin_profile_no_cuenta_como_hardware(self):
-        for perfil, extra in (("sim", ""), ("pruebas", '\n[profile.pruebas]\n')):
-            with self.subTest(perfil=perfil):
-                e = self.err([("robot", AJENA)], [("n", None, "robot")], perfil, extra)
-                self.assertTrue(e.endswith(f", o usa [profile.{perfil}] local = true para correr todo aquí"), e)
-
-    def test_una_remota_en_otro_perfil_con_hardware_no_sugiere_nada_mas(self):
-        e = self.err([("robot", AJENA)], [("motor", '["real", "pruebas"]', "robot")], "pruebas",
-                     '\n[profile.pruebas]\n')
-        self.assertTrue(e.endswith("Mientras tanto: corre agmen run en esa computadora."), e)
-        self.assertNotIn("local = true", e)
-
-    def test_hardware_en_el_perfil_sim_con_nodo_real_y_sim(self):
-        # una remota, perfil sim, nodo ["real","sim"]: hay hardware, el perfil ya es sim → solo "corre allá"
-        e = self.err([("robot", AJENA)], [("motor", '["real", "sim"]', "robot")], "sim")
-        self.assertTrue(e.endswith("Mientras tanto: corre agmen run en esa computadora."), e)
-
-    def test_una_remota_en_real_con_nodo_real_y_sim_omite_la_simulacion(self):
-        e = self.err([("robot", AJENA)], [("motor", '["real", "sim"]', "robot")])
-        self.assertTrue(e.endswith("Mientras tanto: corre agmen run en esa computadora."), e)
-        self.assertNotIn("simulación", e)
-
-    def test_varias_con_hardware(self):
-        e = self.err([("laptop", "127.0.0.1"), ("robot", AJENA)], [("ia", None, "laptop"), ("motor", "real", "robot")],
-                     aqui=("laptop",))
-        self.assertTrue(e.endswith(f"{self.VARIAS} Mientras tanto, para probar aquí en simulación: {self.SIM}"), e)
-
-    def test_varias_sin_hardware_sugiere_local_del_perfil(self):
-        e = self.err([("a", AJENA), ("b", "198.51.100.7")], [("x", "pruebas", "a"), ("y", None, "b")], "pruebas",
-                     '\n[profile.pruebas]\n')
-        self.assertTrue(e.endswith(f"{self.VARIAS} Mientras tanto: usa [profile.pruebas] local = true para "
-                                   f"correr todo aquí"), e)
-
-    def test_varias_con_hardware_en_otro_perfil_no_sugiere_simulacion(self):
-        # la simulacion solo se sugiere en el perfil real (donde se ven todos los nodos de hardware)
-        e = self.err([("a", AJENA), ("b", "198.51.100.7")],
-                     [("x", '["real", "pruebas"]', "a"), ("y", "pruebas", "b")], "pruebas", '\n[profile.pruebas]\n')
-        self.assertTrue(e.endswith("que llega en una versión próxima."), e)
-        self.assertNotIn("[profile.sim] local = true", e)
-        self.assertNotIn("simulación", e)
-
-    def test_varias_en_otro_perfil_con_nodo_real_y_sim_fuera_del_perfil_activo(self):
-        # el caso de la tercera revision: motor2 ["real","sim"] no esta en el perfil mesa, pero correria aqui
-        c = _config(robot_toml([("robot", AJENA), ("cam", "192.0.2.11")],
-                               [("motor", '["real", "mesa"]', "robot"), ("c", "mesa", "cam"),
-                                ("motor2", '["real", "sim"]', "robot")], '\n[profile.mesa]\n'), "mesa")
-        e = remote_error(c, {"robot": self.OTRA, "cam": self.OTRA})
-        self.assertEqual(e, "'motor' corre en 'robot' (192.0.2.10); 'c' corre en 'cam' (192.0.2.11). Con nodos en "
-                            "varias computadoras ('robot', 'cam') hace falta agmen agent, que llega en una versión "
-                            "próxima.")
-
-    def test_la_simulacion_solo_se_sugiere_con_varias_en_el_perfil_real(self):
-        real = self.err([("a", AJENA), ("b", "198.51.100.7")], [("x", "real", "a"), ("y", "real", "b")])
-        self.assertIn("[profile.sim] local = true y agmen run --sim", real)
-        for perfil in ("sim", "mesa"):
-            with self.subTest(perfil=perfil):
-                e = self.err([("a", AJENA), ("b", "198.51.100.7")],
-                             [("x", f'["real", "{perfil}"]', "a"), ("y", perfil, "b")], perfil,
-                             f"\n[profile.{perfil}]\n" if perfil != "sim" else "")
-                self.assertNotIn("[profile.sim] local = true", e)
-
-    def test_varias_en_sim_con_nodo_remoto_real_y_sim_omite_la_simulacion(self):
-        e = self.err([("a", AJENA), ("b", "198.51.100.7")],
-                     [("x", '["real", "sim"]', "a"), ("y", "sim", "b")], "sim")
-        self.assertTrue(e.endswith("que llega en una versión próxima."), e)
-
-    def test_varias_en_real_con_nodo_remoto_real_y_sim_omite_la_simulacion(self):
-        e = self.err([("a", AJENA), ("b", "198.51.100.7")],
-                     [("x", '["real", "sim"]', "a"), ("y", "real", "b")])
-        self.assertTrue(e.endswith("que llega en una versión próxima."), e)
-
-    def test_el_nodo_real_y_sim_de_una_computadora_aqui_no_cuenta(self):
-        # solo importan los nodos de las computadoras remotas
-        e = self.err([("laptop", "127.0.0.1"), ("robot", AJENA)],
-                     [("x", '["real", "sim"]', "laptop"), ("motor", "real", "robot")], aqui=("laptop",))
-        self.assertTrue(e.endswith(f"Mientras tanto, para probar aquí en simulación: {self.SIM}"), e)
-
-    def test_nunca_quita_machine_ni_real_local(self):
+    def test_ningun_mensaje_sugiere_correr_el_hardware_aqui(self):
         casos = [
-            ([("robot", AJENA)], [("m", "real", "robot")], None, ""),
-            ([("robot", AJENA)], [("m", None, "robot")], "sim", ""),
-            ([("a", AJENA), ("b", "198.51.100.7")], [("x", None, "a"), ("y", None, "b")], None, ""),
-            ([("a", AJENA), ("b", "198.51.100.7")], [("x", "sim", "a"), ("y", "sim", "b")], "sim", ""),
-            ([("a", AJENA), ("b", "198.51.100.7")], [("x", '["real","sim"]', "a"), ("y", "sim", "b")], "sim", ""),
+            ([("robot", AJENA)], [("m", "real", "robot")], None, "", ()),
+            ([("robot", AJENA)], [("m", None, "robot")], "sim", "", ()),
+            ([("robot", AJENA)], [("motor", '["real", "pruebas"]', "robot")], "pruebas", "\n[profile.pruebas]\n", ()),
+            ([("robot", AJENA)], [("motor", '["real", "sim"]', "robot")], None, "", ()),
+            ([("a", AJENA), ("b", "198.51.100.7")], [("x", None, "a"), ("y", None, "b")], None, "", ()),
+            ([("a", AJENA), ("b", "198.51.100.7")], [("x", "sim", "a"), ("y", "sim", "b")], "sim", "", ()),
+            ([("a", AJENA), ("b", "198.51.100.7")], [("x", '["real","sim"]', "a"), ("y", "sim", "b")], "sim", "", ()),
+            ([("laptop", "127.0.0.1"), ("robot", AJENA)], [("ia", None, "laptop"), ("motor", "real", "robot")],
+             None, "", ("laptop",)),
         ]
-        for maquinas, nodos, perfil, extra in casos:
+        for maquinas, nodos, perfil, extra, aqui in casos:
             with self.subTest(nodos=nodos, perfil=perfil):
-                e = self.err(maquinas, nodos, perfil, extra)
-                self.assertNotIn("quita machine", e)
-                self.assertNotIn("[profile.real] local", e)
+                e = self.err(maquinas, nodos, perfil, extra, aqui)
+                self.assertTrue(e)
+                for no in ("quita machine", "[profile.real] local", "[profile.sim] local", "local = true",
+                           "simulación", "corre agmen run en", "todavía no"):
+                    self.assertNotIn(no, e)
+
+    def test_remote_error_vacio_si_el_launcher_tiene_la_conexion(self):
+        # lo que Launcher hace con remotes: las trata como "aqui" para esta comprobacion
+        c = _config(robot_toml([("robot", AJENA)], [("motor", None, "robot")]))
+        self.assertEqual(remote_error(c, {"robot": Place(True, "agent")}), "")
 
     def test_hardware_remote_funciones(self):
+        # (codigo que ya nadie llama en 3b: se queda cubierto mientras exista; ver el reporte)
         from agmen.machines import hardware_remote
         c = _config(robot_toml([("robot", AJENA), ("laptop", "127.0.0.1")],
                                [("m", '["real", "mesa"]', "robot"), ("ia", "mesa", "laptop")]), "mesa")
@@ -1793,11 +1723,15 @@ class TestOrdenEnAgmenRun(unittest.TestCase):
 
     def test_sin_el_error_del_archivo_si_consulta(self):
         # control: el mismo robot sin --skip malo sí llega a la consulta (la prueba de arriba no es vacua)
-        with mock.patch("agmen.machines.place_machines", return_value={"robot": Place(False, "other")}) as pm:
+        # (3b: ya consultada la red, sigue la clave; sin terminal interactiva ni AGMEN_AGENT_KEY, error que dice como darla)
+        with mock.patch("agmen.machines.place_machines", return_value={"robot": Place(False, "other")}) as pm, \
+                mock.patch.dict(os.environ, {"AGMEN_AGENT_KEY": "", "AGMEN_CONFIG_DIR": os.path.join(self.dir, "cfg")}), \
+                mock.patch("sys.stdin", io.StringIO()):
             code, err = self.run_cli()
         self.assertEqual(code, 2)
         pm.assert_called_once()
-        self.assertIn("'motor' corre en 'robot'", err)
+        self.assertIn("no tengo la clave de agmen agent en 'robot' (robot.local:7391)", err)
+        self.assertIn("AGMEN_AGENT_KEY", err)
 
     def test_el_error_del_archivo_con_dns_lento_no_espera(self):
         liberar = threading.Event()
