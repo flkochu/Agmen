@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import signal
 import sys
@@ -41,18 +42,72 @@ def _wait_for_ctrl_c(stop: threading.Event) -> None:
 
 def _ctrl_break_like_ctrl_c() -> None:
     """Windows: Ctrl+Break (CTRL_BREAK_EVENT, lo único que se le puede mandar a un grupo de
-    procesos) llega como SIGBREAK, y Python no le pone manejador: el manejador por defecto
-    de la consola mata al proceso en el acto (código 0xC000013A), sin adios a los agentes ni
-    aviso. Hasta que _wait_for_ctrl_c ponga el suyo, que sea lo mismo que Ctrl+C."""
+    procesos) llega como SIGBREAK, y Python no le pone manejador: el de la consola termina
+    el proceso en el acto (código 0xC000013A), sin limpiar nada. Con esto Ctrl+Break es lo
+    mismo que Ctrl+C: un KeyboardInterrupt. No hace nada fuera de Windows."""
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, signal.default_int_handler)
 
 
+# Las señales cuyo manejador cambia agmen run (_CtrlC, _wait_for_ctrl_c); cmd_run deja las de antes al salir.
+_RUN_SIGNALS = tuple(getattr(signal, s) for s in ("SIGINT", "SIGTERM", "SIGBREAK") if hasattr(signal, s))
+
+
+class _CtrlC:
+    """Ctrl+C (en Windows también Ctrl+Break) mientras agmen run arranca, hasta que empieza a
+    esperar en _wait_for_ctrl_c (RFC 0011, parte 3b; regla 1).
+
+    Con catch(), Ctrl+C no corta a la mitad lo que se está haciendo (un nodo recién arrancado
+    que nadie anotó quedaría vivo): se anota en `pressed`, se prende `stop` y cmd_run lo revisa
+    entre una fase y otra. Solo lo que puede tardar sin fin y sabe cancelarse (pedir la clave,
+    conectarse, los comandos de [robot] before) corre dentro de interruptible(), donde Ctrl+C es
+    el KeyboardInterrupt de siempre. Un segundo Ctrl+C mientras se limpia solo se anota."""
+
+    def __init__(self, stop: threading.Event) -> None:
+        self.stop = stop
+        self.pressed = False
+
+    def _note(self, signum, frame) -> None:
+        self.pressed = True
+        self.stop.set()
+
+    def catch(self) -> None:
+        signal.signal(signal.SIGINT, self._note)
+        if hasattr(signal, "SIGBREAK"):  # Windows
+            signal.signal(signal.SIGBREAK, self._note)
+
+    @contextlib.contextmanager
+    def interruptible(self):
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        _ctrl_break_like_ctrl_c()
+        try:
+            yield
+        finally:
+            self.catch()
+
+
+def _cancelled(when: str, what: str) -> int:
+    print(f"\nagmen │ cancelado (Ctrl+C) {when}: {what}", file=sys.stderr)
+    return 130
+
+
 def cmd_run(args) -> int:
+    """agmen run. Al salir deja los manejadores de señales como estaban (llamado desde Python,
+    como en las pruebas, el proceso no se queda con los de agmen run)."""
+    saved = [(s, signal.getsignal(s)) for s in _RUN_SIGNALS]
+    try:
+        return _run(args)
+    finally:
+        for s, handler in saved:
+            if handler is not None:
+                signal.signal(s, handler)
+
+
+def _run(args) -> int:
     from .panel import Panel, Teleop
     from .run import ConfigError, Launcher, load_config, prepare_hub
 
-    _ctrl_break_like_ctrl_c()   # mientras pide la clave, se conecta o corre [robot] before
+    _ctrl_break_like_ctrl_c()   # mientras lee el archivo: Ctrl+Break como Ctrl+C (luego, _CtrlC)
 
     # El perfil (RFC 0011 §3.2): --profile X, --sim (= --profile sim) o, con --play, "replay".
     if args.sim and args.profile not in (None, "sim"):
@@ -79,6 +134,9 @@ def cmd_run(args) -> int:
         print(f"error: el perfil replay es el de --play: agmen run {args.archivo} --play ARCHIVO.mcap",
               file=sys.stderr)
         return 2
+    stop = threading.Event()
+    ctrl_c = _CtrlC(stop)
+    ctrl_c.catch()   # desde aquí Ctrl+C se revisa entre fases (y corta lo que puede tardar sin fin)
 
     try:
         if config.hub and any(name == "hub" for name, _ in config.skipped):   # igual en todos los perfiles
@@ -126,8 +184,13 @@ def cmd_run(args) -> int:
         if not remote:
             from .agent import AgentError, KeyPromptCancelled
 
+            if ctrl_c.pressed:   # mientras consultaba dónde está cada [[machine]] (DNS)
+                if player is not None:
+                    player.stop()
+                return _cancelled("antes de conectarme", "no arrancó nada")
             try:
-                remotes, keys = _links_for(config, places, args.archivo)
+                with ctrl_c.interruptible():
+                    remotes, keys = _links_for(config, places, args.archivo)
             except AgentError as e:   # no hay clave, o keys.toml no se puede leer
                 remote = str(e)
             except (KeyboardInterrupt, KeyPromptCancelled) as e:   # Ctrl+C o Ctrl+D mientras pedía la clave
@@ -143,7 +206,6 @@ def cmd_run(args) -> int:
             return 2
 
     lost: list[str] = []
-    stop = threading.Event()
     launcher = Launcher(config, places=places, remotes=remotes)
     out = _SayTo(launcher)
     launcher.say(f"Agmen {__version__} · robot '{config.name}' · {len(config.nodes)} nodos · {hub_note}")
@@ -162,10 +224,18 @@ def cmd_run(args) -> int:
                          f"desde el panel): quítalos con --skip"
                          + (f", o corre sin --profile {args.profile}" if args.profile else ""))
     if remotes:   # ANTES de arrancar nada: si una computadora falla, no arranca nada en ninguna
+        if ctrl_c.pressed:
+            launcher.printer.close()
+            if player is not None:
+                player.stop()
+            return _cancelled("antes de conectarme", "no arrancó nada")
         try:
-            error = _connect(launcher, config, remotes, keys, "replay" if args.play else config.clock.mode, lost,
-                             stop)
-        except KeyboardInterrupt:   # _connect ya mandó adios a todas
+            with ctrl_c.interruptible():
+                error = _connect(launcher, config, remotes, keys, "replay" if args.play else config.clock.mode,
+                                 lost, stop)
+        except KeyboardInterrupt:   # _connect ya mandó adios a todas (si ya había vuelto, se les manda aquí)
+            for link in remotes.values():
+                link.close()
             launcher.printer.close()
             if player is not None:
                 player.stop()
@@ -194,14 +264,32 @@ def cmd_run(args) -> int:
         if player is not None:
             player.stop()
         return 1
+
+    def cancel_before_nodes(when: str) -> int:   # todavía no arrancó ningún nodo: adios a los agentes y sale
+        ctrl_c.catch()
+        for link in remotes.values():
+            link.finish()
+        launcher.printer.close()
+        if player is not None:
+            player.stop()
+        told = " (les avisé a las otras computadoras)" if remotes else ""
+        return _cancelled(when, f"no arrancó ningún nodo{told}")
+
+    if ctrl_c.pressed:
+        return cancel_before_nodes("antes de arrancar los nodos")
     try:
-        ready = launcher.run_before()
-    except BaseException:           # Ctrl+C en un comando de before: la grabación ya abierta se cierra
+        with ctrl_c.interruptible():   # subprocess.run mata al comando que corría antes de relanzarlo
+            ready = launcher.run_before()
+    except KeyboardInterrupt:
+        return cancel_before_nodes("mientras corría [robot] before")
+    except BaseException:           # otro error en before: la grabación ya abierta se cierra, adios a los agentes
         if player is not None:
             player.stop()
         for link in remotes.values():
             link.finish()
         raise
+    if ctrl_c.pressed:
+        return cancel_before_nodes("antes de arrancar los nodos")
     if not ready or lost:
         for link in remotes.values():
             link.finish()
@@ -232,7 +320,7 @@ def cmd_run(args) -> int:
         if clock_note:
             launcher.say(clock_note)
     recording = _recording_for(config, args, out)
-    if not lost and (args.record or (config.record is not None and config.record.auto)):
+    if not lost and not ctrl_c.pressed and (args.record or (config.record is not None and config.record.auto)):
         err = recording.start()
         if err:
             launcher.say(f"⚠ no se pudo grabar: {err}")
@@ -241,7 +329,7 @@ def cmd_run(args) -> int:
     launcher.watch = watch
 
     panel = None
-    if config.web.enabled and not args.no_web and not lost:
+    if config.web.enabled and not args.no_web and not lost and not ctrl_c.pressed:
         teleop = Teleop(config.web.teleop.target, config.web.teleop.max_speed) if config.web.teleop else None
         commands = _commands_for(config)
         http = _http_for(args.http or config.web.http, args.red)
@@ -267,10 +355,11 @@ def cmd_run(args) -> int:
             ctl = f" · {len(c.cfg.controls)} controles" if c.cfg.controls else ""
             launcher.say(f"mando '{c.cfg.name}' en el panel: {c.cfg.layout.name} → {c.cfg.target}{to} · {what}{ctl}")
 
-    if not stop.is_set():   # una computadora se perdió mientras se preparaba lo de aquí: no se arranca
+    if not stop.is_set():   # una computadora se perdió (o Ctrl+C) mientras se preparaba lo de aquí: no se arranca
         launcher.start_all()
-        launcher.say("todo arrancado. Ctrl+C para detener todo.")
-    if player is not None:   # que los nodos alcancen a suscribirse antes del primer mensaje
+        if not ctrl_c.pressed:
+            launcher.say("todo arrancado. Ctrl+C para detener todo.")
+    if player is not None and not ctrl_c.pressed:   # que los nodos alcancen a suscribirse antes del primer mensaje
         threading.Timer(2.0, player.resume).start()
 
     def close_recording():
@@ -287,6 +376,8 @@ def cmd_run(args) -> int:
             player.stop()
         elif clock_server:
             clock_server.close()
+    if ctrl_c.pressed:   # antes de "todo arrancado": lo que alcanzó a arrancar ya se detuvo arriba
+        return _cancelled("mientras arrancaba", "detuve todo lo que alcanzó a arrancar")
     return 1 if lost else 0
 
 

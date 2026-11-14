@@ -455,6 +455,33 @@ class TestObtenerLaClave(ConfigDirCase):
         with mock.patch.object(sys, "stdin", None):
             self.assertFalse(agent._stdin_is_terminal())
 
+    @unittest.skipUnless(os.name == "posix", "una pty solo hay en POSIX")
+    def test_una_terminal_de_verdad_si_es_terminal(self):
+        maestro, esclavo = os.openpty()
+        self.addCleanup(os.close, maestro)
+        with open(esclavo, encoding="utf-8") as tty, mock.patch.object(sys, "stdin", tty):
+            self.assertTrue(agent._stdin_is_terminal())
+
+    def test_sin_ctypes_no_es_terminal_y_no_truena(self):
+        # en Windows, un Python sin ctypes: se trata como "no hay terminal" (el error dice cómo dar la clave)
+        class Consola:
+            def isatty(self):
+                return True
+
+            def fileno(self):
+                return 0
+
+        real_import = __import__
+
+        def sin_ctypes(name, *a, **kw):
+            if name == "ctypes":
+                raise ImportError("No module named 'ctypes'")
+            return real_import(name, *a, **kw)
+
+        with mock.patch.object(sys, "stdin", Consola()), mock.patch.object(agent.os, "name", "nt"), \
+                mock.patch("builtins.__import__", sin_ctypes):
+            self.assertFalse(agent._stdin_is_terminal())
+
     def test_se_pide_en_la_terminal_y_es_escrita(self):
         pedidos = []
         res = agent.get_key("robot", self.ADDR, interactive=True, env={}, ask=lambda p: pedidos.append(p) or "KQ3F-9XM2-7TDW")
@@ -1857,7 +1884,7 @@ class TestSesion(ServerCase):
         # sesion_ok sale ANTES de arrancar los nodos: hay que esperar a que motor esté vivo (en Windows Python
         # tarda en arrancar más de lo que tardan las órdenes de abajo)
         self.assertTrue(self.espera(lambda: self.vivo("motor"), 30), f"motor no arrancó: {cli.msgs}")
-        casos =[({"op": "detener", "nodo": "zzz"}, "no tiene el nodo 'zzz'"),
+        casos = [({"op": "detener", "nodo": "zzz"}, "no tiene el nodo 'zzz'"),
                  ({"op": "arrancar", "nodo": "ia"}, "no tiene el nodo 'ia'"),      # de la laptop
                  ({"op": "reiniciar", "nodo": "x" * 500}, "no tiene el nodo"),
                  ({"op": "arrancar"}, "lleva el nombre del nodo"),
@@ -3239,6 +3266,14 @@ class E2EBase(unittest.TestCase):
     def vivo(self, nodo, ventana=3.0):
         return nodo_vivo(self.marks, nodo, ventana)
 
+    def ninguno_vivo(self, nodos, ventana=3.0) -> bool:
+        """¿Ya no queda vivo ninguno de estos nodos de prueba? En POSIX nodo_vivo mira el pid: se comprueba al
+        instante. En Windows solo ve el latido (cada 0.1 s): un nodo recién detenido sigue "vivo" hasta que vence
+        la ventana, así que se espera la ventana más un margen corto; uno que de verdad quedó vivo sigue latiendo."""
+        if os.name == "posix":
+            return not any(self.vivo(n, ventana) for n in nodos)
+        return self.espera(lambda: not any(self.vivo(n, ventana) for n in nodos), ventana + 2.0)
+
     def fin(self, p: subprocess.Popen, timeout=40) -> int | None:
         """El código de salida de p; None si no salió en `timeout` s (se mata, y la falla muestra su salida en
         vez de un TimeoutExpired sin ella)."""
@@ -3314,9 +3349,7 @@ class E2E(E2EBase):
         # Ctrl+C en el agente
         self.assertEqual(self.detener(pa), 0, self.texto(la))
         self.assertIn("listo. ¡Hasta luego!", self.texto(la))
-        # en Windows nodo_vivo solo ve el latido (cada 0.1 s, ventana de 3 s): un nodo recién detenido sigue
-        # "vivo" hasta 3 s, así que se espera; uno que de verdad quedó vivo sigue latiendo y la espera falla
-        self.assertTrue(self.espera(lambda: not any(self.vivo(n) for n in ("motor", "imu", "ia")), 30),
+        self.assertTrue(self.ninguno_vivo(("motor", "imu", "ia")),
                         "quedaron nodos vivos tras detener las dos puntas: "
                         f"{[n for n in ('motor', 'imu', 'ia') if self.vivo(n)]}; pids {self.pids_de_marcas()}; "
                         f"agmen run: código {pr2.poll()}\n{self.texto(lr2)}\nagmen agent: código {pa.poll()}\n"
@@ -3489,6 +3522,93 @@ class E2E(E2EBase):
         self.assertEqual(post("/api/node/motor/restart"), 200)
         self.assertTrue(self.espera(lambda: len((self.marks / "arranque_motor").read_text().split()) >= 3, 30))
         self.assertEqual(self.detener(pr), 0, self.texto(lr))
+
+
+class TestCtrlCAlArrancar(E2EBase):
+    """Ctrl+C mientras agmen run arranca (RFC 0011, parte 3b; regla 1): sale con 130, sin traceback, dice en qué
+    fase se canceló y no deja vivo nada de lo que ya arrancó."""
+
+    def test_ctrl_c_durante_before_cancela_avisa_al_agente_y_mata_al_before(self):
+        # el before solo en el robot.toml de agmen run (el agente corre el [robot] before de SU robot.toml)
+        antes = json.dumps(["python", str(self.dir / "nodo.py"), "antes", str(self.marks)])
+        toml_run = self.dir / "robot_run.toml"
+        toml_run.write_text(self.toml.read_text(encoding="utf-8").replace(
+            '[robot]\nname = "e2e"\n', f'[robot]\nname = "e2e"\nbefore = [{antes}]\n', 1), encoding="utf-8")
+        pa, la, clave = self.agente()
+        pr, lr = self.correr(clave=clave, toml=toml_run)
+        # el before es un nodo de prueba que late hasta 120 s: corre mientras no lo maten
+        self.assertTrue(self.espera(lambda: self.vivo("antes") or pr.poll() is not None, 60), self.texto(lr))
+        self.assertIsNone(pr.poll(), self.texto(lr))
+        codigo = self.detener(pr)        # SIGINT (en Windows, Ctrl+Break al grupo) en plena fase de before
+        texto = self.texto(lr)
+        self.assertEqual(codigo, 130, texto)
+        self.assertIn(f"robot (127.0.0.1:{self.port}): conectado", texto)
+        self.assertIn("agmen │ cancelado (Ctrl+C) mientras corría [robot] before: no arrancó ningún nodo "
+                      "(les avisé a las otras computadoras)", texto)
+        self.assertNotIn("Traceback", texto)
+        self.assertNotIn("KeyboardInterrupt", texto)
+        self.assertNotIn("todo arrancado", texto)
+        # el comando de before no quedó vivo (aquí se espera: el proceso muerto puede seguir un rato como zombi,
+        # con pid, hasta que alguien lo recoja; su latido sí se detuvo)
+        self.assertTrue(self.espera(lambda: not self.vivo("antes"), 5.0), f"el before quedó vivo: {self.pids_de_marcas()}")
+        # ningún nodo arrancó, ni aquí ni en el agente; y el agente recibió adios: queda esperando otra vez
+        self.assertEqual(sorted(p.name for p in self.marks.glob("arranque_*")), ["arranque_antes"])
+        self.assertTrue(self.espera(lambda: any("(otra vez)" in l for l in la), 30), self.texto(la))
+        self.assertIsNone(pa.poll(), self.texto(la))
+
+    def test_ctrl_c_al_terminar_de_arrancar_los_nodos_los_detiene(self):
+        """Ctrl+C justo después de start_all y antes de esperar en _wait_for_ctrl_c. Esa ventana dura
+        microsegundos: para que sea determinista, agmen run corre aquí (en este proceso) y start_all se envuelve
+        para mandar SIGINT al propio proceso en cuanto arrancó los nodos."""
+        from agmen import cli
+        from agmen import run as runmod
+
+        nodo = json.dumps(str(self.dir / "nodo.py"))
+        marks = json.dumps(str(self.marks))
+        self.toml.write_text(
+            f'[robot]\nname = "e2e"\n\n'
+            f'[[node]]\nname = "ia"\ncmd = ["python", {nodo}, "ia", {marks}]\n\n'
+            f'[[node]]\nname = "cam"\ncmd = ["python", {nodo}, "cam", {marks}]\n\n'
+            f'[hub]\nenabled = false\n\n[web]\nenabled = false\n', encoding="utf-8")
+        original = runmod.Launcher.start_all
+        lanzadores = []
+
+        def start_all_y_ctrl_c(launcher):
+            lanzadores.append(launcher)
+            original(launcher)
+            signal.raise_signal(signal.SIGINT)
+
+        def matar_los_que_queden():   # si la prueba falla, que no queden nodos de este proceso
+            for launcher in lanzadores:
+                for n in launcher.nodes.values():
+                    if n.proc is not None and n.proc.poll() is None:
+                        n.proc.kill()
+                        n.proc.wait()
+
+        self.addCleanup(matar_los_que_queden)
+        antes = signal.getsignal(signal.SIGINT)
+        self.addCleanup(signal.signal, signal.SIGINT, antes)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(runmod.Launcher, "start_all", start_all_y_ctrl_c), \
+                mock.patch.dict(os.environ, {"AGMEN_REMOTE_HOSTS": "", "NO_COLOR": "1"}), \
+                mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            try:
+                codigo = cli.main(["run", str(self.toml), "--no-browser"])
+            except KeyboardInterrupt:
+                codigo = "KeyboardInterrupt sin atrapar"
+        texto = out.getvalue() + err.getvalue()
+        self.assertEqual(codigo, 130, texto)
+        self.assertEqual(len(lanzadores), 1, texto)
+        nodos = lanzadores[0].nodes
+        self.assertEqual(sorted(nodos), ["cam", "ia"])
+        self.assertTrue(all(n.proc is not None for n in nodos.values()), "no arrancó algún nodo: la prueba no prueba nada")
+        self.assertEqual([n for n, x in nodos.items() if x.proc.poll() is None], [], f"quedaron nodos vivos\n{texto}")
+        self.assertTrue(self.ninguno_vivo(("ia", "cam")), f"quedaron nodos vivos: {self.pids_de_marcas()}")
+        self.assertIn("agmen │ cancelado (Ctrl+C) mientras arrancaba: detuve todo lo que alcanzó a arrancar", texto)
+        self.assertIn("listo. ¡Hasta luego!", texto)
+        self.assertNotIn("todo arrancado", texto)
+        self.assertNotIn("Traceback", texto)
+        self.assertIs(signal.getsignal(signal.SIGINT), antes, "agmen run no dejó el manejador de SIGINT como estaba")
 
 
 # ===========================================================================

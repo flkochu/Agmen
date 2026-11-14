@@ -1713,6 +1713,8 @@ def _stdin_is_terminal() -> bool:
         return bool(ctypes.windll.kernel32.GetConsoleMode(ctypes.c_void_p(handle), ctypes.byref(mode)))
     except (OSError, ValueError, AttributeError):   # stdin cerrado, sin descriptor o sin consola
         return False
+    except ImportError:   # un Python sin ctypes: no hay cómo saberlo, y "no hay terminal" dice cómo dar la clave
+        return False
 
 
 def get_key(name: str, address: str, *, interactive: bool | None = None,
