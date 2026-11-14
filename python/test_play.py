@@ -8,6 +8,8 @@ replay (también una imagen que va por memoria compartida), a su tiempo, con
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import signal
 import subprocess
@@ -18,6 +20,7 @@ import time
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from unittest import mock
 
 import agmen
 from agmen import _mcap, _shm, _tcp, clock, play, wire
@@ -268,6 +271,158 @@ class TestComando(PlayCase):
         r = self.agmen("run", toml, "--play", os.path.join(self.dir, "no-existe.mcap"))
         self.assertEqual(r.returncode, 2)
         self.assertIn("error: --play: no existe", r.stderr)
+
+
+class TestPlayConMachines(PlayCase):
+    """agmen run --play con [[machine]] declaradas (RFC 0011 §3.4, parte 3a): los errores de la
+    grabación salen ANTES de la consulta de red; si la red da error, el reproductor se cierra."""
+
+    AJENA = "192.0.2.10"       # TEST-NET-1: nunca es esta computadora
+
+    def setUp(self):
+        super().setUp()
+        self.toml = os.path.join(self.dir, "robot.toml")
+        with open(self.toml, "w", encoding="utf-8") as f:
+            f.write('[robot]\nname = "r"\n\n[[machine]]\nname = "robot"\nhost = "%s"\n\n'
+                    '[[node]]\nname = "motor"\ncmd = "python -c pass"\nmachine = "robot"\n\n'
+                    '[[node]]\nname = "ia"\ncmd = "python -c pass"\n\n[hub]\nenabled = false\n'
+                    '\n[web]\nenabled = false\n' % self.AJENA)
+
+    def run_cli(self, *args):
+        from agmen import cli
+        err, out = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            code = cli.main(["run", self.toml, "--no-browser", *args])
+        return code, err.getvalue()
+
+    def sin_red(self):
+        return mock.patch("agmen.machines.place_machines", side_effect=AssertionError("consultó la red antes"))
+
+    def test_play_que_no_existe(self):
+        with self.sin_red() as pm:
+            code, err = self.run_cli("--play", os.path.join(self.dir, "noexiste.mcap"))
+        self.assertEqual(code, 2)
+        self.assertIn("error: --play: no existe", err)
+        self.assertIn("noexiste.mcap", err)
+        self.assertNotIn("corre en 'robot'", err)
+        pm.assert_not_called()
+
+    def test_topic_que_no_esta(self):
+        with self.sin_red() as pm:
+            code, err = self.run_cli("--play", self.path, "--play-topic", "/nada")
+        self.assertEqual(code, 2)
+        self.assertIn("error: --play: la grabación no tiene el topic /nada (tiene: /camara, /imu)", err)
+        pm.assert_not_called()
+
+    def test_grabacion_que_no_es_de_agmen(self):
+        otro = os.path.join(self.dir, "otro.mcap")
+        w = _mcap.Writer(otro, profile="x")
+        cid = w.add_channel("/a", "json", w.add_schema("S", "jsonschema", b"{}"))
+        w.add_message(cid, 1, 1, 0, b"{}")
+        w.close()
+        with self.sin_red() as pm:
+            code, err = self.run_cli("--play", otro)
+        self.assertEqual(code, 2)
+        self.assertIn("error: --play: otro.mcap no es una grabación de Agmen", err)
+        pm.assert_not_called()
+
+    def test_archivo_sin_mensajes(self):
+        vacio = os.path.join(self.dir, "vacio.mcap")
+        w = _mcap.Writer(vacio, profile="agmen")
+        w.add_channel("/imu", "agmen", w.add_schema("ImuSample", "agmen", wire.ImuSample.SCHEMA_TEXT.encode()))
+        w.close()
+        with self.sin_red() as pm:
+            code, err = self.run_cli("--play", vacio)
+        self.assertEqual(code, 2)
+        self.assertIn("error: --play: vacio.mcap no tiene mensajes que reproducir", err)
+        pm.assert_not_called()
+
+    def test_archivo_que_no_es_un_mcap(self):
+        basura = os.path.join(self.dir, "basura.mcap")
+        with open(basura, "wb") as f:
+            f.write(b"esto no es un mcap" * 10)
+        with self.sin_red() as pm:
+            code, err = self.run_cli("--play", basura)
+        self.assertEqual(code, 2)
+        self.assertIn("error: --play:", err)
+        self.assertNotIn("Traceback", err)
+        pm.assert_not_called()
+
+    def test_play_bueno_y_nodo_remoto_cierra_el_reproductor(self):
+        casos = []
+        original = play.Player
+
+        class Espia(original):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                casos.append(self)
+
+        hilos = {t.ident for t in threading.enumerate()}
+        with mock.patch("agmen.play.Player", Espia):
+            code, err = self.run_cli("--play", self.path)
+        self.assertEqual(code, 2)
+        self.assertIn("'motor' corre en 'robot' (192.0.2.10)", err)     # la consulta de red SÍ se hizo
+        self.assertEqual(len(casos), 1, "el reproductor se crea una sola vez")
+        r = casos[0].reader
+        self.assertTrue(r._file is None or r._file.closed, "el archivo de la grabación quedó abierto")
+        self.assertEqual({t.ident for t in threading.enumerate()} - hilos, set(), "quedaron hilos")
+        self.assertFalse(casos[0]._thread and casos[0]._thread.is_alive())
+        if os.path.isdir("/proc/self/fd"):
+            abiertos = [os.readlink(f"/proc/self/fd/{fd}") for fd in os.listdir("/proc/self/fd")
+                        if os.path.exists(f"/proc/self/fd/{fd}")]
+            self.assertFalse([a for a in abiertos if a.endswith("vuelta.mcap")], abiertos)
+
+    def test_play_bueno_llama_a_stop_una_vez_en_el_error_de_red(self):
+        with mock.patch.object(play.Player, "stop", autospec=True, side_effect=play.Player.stop) as st:
+            code, _ = self.run_cli("--play", self.path)
+        self.assertEqual(code, 2)
+        st.assert_called_once()
+
+    def test_el_orden_con_dns_colgado_no_espera_por_un_error_de_play(self):
+        liberar = threading.Event()
+
+        def colgado(*a, **k):
+            liberar.wait(30)
+            raise OSError
+
+        text = Path(self.toml).read_text(encoding="utf-8").replace(self.AJENA, "robot.local")
+        Path(self.toml).write_text(text, encoding="utf-8")
+        try:
+            with mock.patch("socket.getaddrinfo", colgado):
+                t0 = time.monotonic()
+                code, err = self.run_cli("--play", os.path.join(self.dir, "noexiste.mcap"))
+                dt = time.monotonic() - t0
+        finally:
+            liberar.set()
+        self.assertEqual(code, 2)
+        self.assertIn("error: --play: no existe", err)
+        self.assertLess(dt, 1.0)
+
+    def test_sin_machine_play_se_comporta_como_antes(self):
+        # sin [[machine]] el reproductor se crea una vez, con out=, y la red no se consulta
+        with open(self.toml, "w", encoding="utf-8") as f:
+            f.write('[robot]\nname = "r"\n\n[[node]]\nname = "ia"\ncmd = "python -c pass"\n\n'
+                    '[hub]\nenabled = false\n\n[web]\nenabled = false\n')
+        with self.sin_red() as pm:
+            code, err = self.run_cli("--play", os.path.join(self.dir, "noexiste.mcap"))
+        self.assertEqual(code, 2)
+        self.assertIn("error: --play: no existe", err)
+        pm.assert_not_called()
+        casos = []
+        original = play.Player
+
+        class Espia(original):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                casos.append(k)
+                raise ValueError("para aquí")      # lo que importa es cómo se construye
+
+        with mock.patch("agmen.play.Player", Espia):
+            code, err = self.run_cli("--play", self.path)
+        self.assertEqual(code, 2)
+        self.assertEqual(len(casos), 1)
+        self.assertIn("out", casos[0], "sin [[machine]] el reproductor se crea con out= como siempre")
+        self.assertIn("error: --play: para aquí", err)
 
 
 NODO = """\

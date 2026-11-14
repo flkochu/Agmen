@@ -1409,10 +1409,33 @@ class TestAvisosSinHardwareAqui(unittest.TestCase):
         self.assertTrue(e.endswith(f"{self.VARIAS} Mientras tanto: usa [profile.pruebas] local = true para "
                                    f"correr todo aquí"), e)
 
-    def test_varias_con_hardware_en_otro_perfil_via_profile_lista(self):
+    def test_varias_con_hardware_en_otro_perfil_no_sugiere_simulacion(self):
+        # la simulacion solo se sugiere en el perfil real (donde se ven todos los nodos de hardware)
         e = self.err([("a", AJENA), ("b", "198.51.100.7")],
                      [("x", '["real", "pruebas"]', "a"), ("y", "pruebas", "b")], "pruebas", '\n[profile.pruebas]\n')
-        self.assertTrue(e.endswith(f"{self.VARIAS} Mientras tanto, para probar aquí en simulación: {self.SIM}"), e)
+        self.assertTrue(e.endswith("que llega en una versión próxima."), e)
+        self.assertNotIn("[profile.sim] local = true", e)
+        self.assertNotIn("simulación", e)
+
+    def test_varias_en_otro_perfil_con_nodo_real_y_sim_fuera_del_perfil_activo(self):
+        # el caso de la tercera revision: motor2 ["real","sim"] no esta en el perfil mesa, pero correria aqui
+        c = _config(robot_toml([("robot", AJENA), ("cam", "192.0.2.11")],
+                               [("motor", '["real", "mesa"]', "robot"), ("c", "mesa", "cam"),
+                                ("motor2", '["real", "sim"]', "robot")], '\n[profile.mesa]\n'), "mesa")
+        e = remote_error(c, {"robot": self.OTRA, "cam": self.OTRA})
+        self.assertEqual(e, "'motor' corre en 'robot' (192.0.2.10); 'c' corre en 'cam' (192.0.2.11). Con nodos en "
+                            "varias computadoras ('robot', 'cam') hace falta agmen agent, que llega en una versión "
+                            "próxima.")
+
+    def test_la_simulacion_solo_se_sugiere_con_varias_en_el_perfil_real(self):
+        real = self.err([("a", AJENA), ("b", "198.51.100.7")], [("x", "real", "a"), ("y", "real", "b")])
+        self.assertIn("[profile.sim] local = true y agmen run --sim", real)
+        for perfil in ("sim", "mesa"):
+            with self.subTest(perfil=perfil):
+                e = self.err([("a", AJENA), ("b", "198.51.100.7")],
+                             [("x", f'["real", "{perfil}"]', "a"), ("y", perfil, "b")], perfil,
+                             f"\n[profile.{perfil}]\n" if perfil != "sim" else "")
+                self.assertNotIn("[profile.sim] local = true", e)
 
     def test_varias_en_sim_con_nodo_remoto_real_y_sim_omite_la_simulacion(self):
         e = self.err([("a", AJENA), ("b", "198.51.100.7")],
@@ -1543,6 +1566,29 @@ class TestLauncherMachineNoDeclarada(unittest.TestCase):
         self.assertIn("'robot'", str(ctx.exception))
         self.assertIn("laptop", str(ctx.exception))
 
+    def test_el_error_dice_donde_declararla_y_no_sugiere_quitarla(self):
+        c = _config(robot_toml([("robot", "127.0.0.1")], [("brazo", None, "robot")]))
+        sin = dataclasses.replace(c, machines=[])
+        with self.assertRaises(ConfigError) as ctx:
+            Launcher(sin, io.StringIO())
+        e = str(ctx.exception)
+        self.assertTrue(e.endswith('Declárala en la configuración ([[machine]] name = "robot" y su host)'), e)
+        self.assertNotIn("quita machine", e)
+        self.assertNotIn("(hay:", e)                     # no hay ninguna [[machine]]
+        self.assertNotIn("robot.toml", e)                # puede venir de Python, no de un robot.toml
+
+    def test_con_machines_declaradas_dice_cuales_hay(self):
+        c = _config(robot_toml([("robot", "127.0.0.1"), ("laptop", "127.0.0.1:7400")],
+                               [("a", None, "laptop"), ("b", None, "robot")]))
+        sin = dataclasses.replace(c, machines=[m for m in c.machines if m.name == "robot"])
+        with self.assertRaises(ConfigError) as ctx:
+            Launcher(sin, io.StringIO())
+        e = str(ctx.exception)
+        self.assertIn("el nodo 'a' dice machine = 'laptop'", e)
+        self.assertIn("(hay: robot)", e)
+        self.assertTrue(e.endswith('Declárala en la configuración ([[machine]] name = "laptop" y su host)'), e)
+        self.assertNotIn("quita machine", e)
+
     def test_places_dado_no_salva_una_machine_no_declarada(self):
         c = _config(robot_toml([("robot", "127.0.0.1")], [("motor", None, "robot")]))
         with self.assertRaises(ConfigError):
@@ -1555,6 +1601,44 @@ class TestLauncherMachineNoDeclarada(unittest.TestCase):
                 mock.patch("socket.socket", side_effect=AssertionError("socket")):
             self.assertEqual(Launcher(c, io.StringIO()).places, {})
             self.assertEqual(Launcher(dataclasses.replace(c, machines=[]), io.StringIO()).places, {})
+
+
+class TestZonaEnLasIP(unittest.TestCase):
+    """_distinct_ips: la zona IPv6 es parte de la dirección."""
+
+    @staticmethod
+    def socket_solo_eth0():
+        sock = mock.MagicMock()
+        sock.__enter__.return_value = sock
+        ultimo = {}
+        sock.connect.side_effect = lambda dest: ultimo.update(ip=dest[0])
+        # solo las direcciones de la zona eth0 las tiene esta computadora
+        sock.getsockname.side_effect = lambda: (ultimo["ip"] if ultimo["ip"].endswith("%eth0") else "fe80::99%eth0", 5)
+        return mock.MagicMock(return_value=sock)
+
+    def lugar(self, *ips):
+        with mock.patch("socket.getaddrinfo", return_value=_info(*ips)), \
+                mock.patch("socket.socket", self.socket_solo_eth0()):
+            return check_hosts(["n.local"])["n.local"]
+
+    def test_dos_zonas_de_la_misma_direccion_son_dos_direcciones(self):
+        p = self.lugar("fe80::1%eth0", "fe80::1%wlan0")
+        self.assertEqual((p.here, p.why), (False, "mixed"))
+        self.assertIn("fe80::1%eth0 y fe80::1%wlan0", p.note)
+        self.assertIn("una es de esta computadora y otra no", p.note)
+
+    def test_la_misma_zona_repetida_cuenta_una_vez(self):
+        p = self.lugar("fe80::1%eth0", "fe80::1%eth0")
+        self.assertEqual((p.here, p.why), (True, "mine"))
+        q = self.lugar("fe80::1%wlan0", "fe80::1%wlan0")
+        self.assertEqual((q.here, q.why), (False, "other"))
+        self.assertEqual(q.note.count("fe80::1%wlan0"), 1)
+
+    def test_con_y_sin_zona_siguen_siendo_dos(self):
+        from agmen.machines import _distinct_ips
+        self.assertEqual(_distinct_ips(["fe80::1%eth0", "fe80::1"]), ["fe80::1%eth0", "fe80::1"])
+        self.assertEqual(_distinct_ips(["fe80::1%eth0", "FE80:0::1%eth0"]), ["fe80::1%eth0"])
+        self.assertEqual(_distinct_ips(["1.2.3.4", "::ffff:1.2.3.4", "1.2.3.4"]), ["1.2.3.4"])
 
 
 class TestOrdenEnAgmenRun(unittest.TestCase):
