@@ -7,10 +7,23 @@ ya finalizando; Python 3.12 lo mata con pthread_exit y ese desenrollado aborta e
 que además del bucle probabilístico hay pruebas deterministas que sirven con cualquier Python.
 
     python -m unittest discover -s python
+
+Además (RFC del cierre del núcleo): al terminar el intérprete un atexit de agmen declara el cierre
+ANTES de que CPython empiece a finalizar. Desde entonces, en OTROS hilos, publish() regresa False,
+receive() None, spin() vuelve y crear un Publisher/Subscriber lanza RuntimeError; lo que ya estaba
+dentro del núcleo se espera hasta 2 s (después, UNA línea a stderr y el programa sale igual).
+Las pruebas deterministas sirven con cualquier Python; las probabilísticas solo muerden con 3.12.
+
+Para medir contra otro árbol de agmen (p. ej. el código anterior a la corrección):
+    AGMEN_CIERRE_RAIZ=/ruta/con/agmen python -m unittest python/test_cierre.py
 """
 
+import concurrent.futures
+import json
 import os
 import random
+import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -23,7 +36,8 @@ from pathlib import Path
 from agmen import _backend
 from agmen import hub as H
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(os.environ.get("AGMEN_CIERRE_RAIZ") or Path(__file__).resolve().parent)
+POSIX = os.name == "posix"
 
 try:
     import numpy  # noqa: F401
@@ -52,11 +66,24 @@ def puerto_libre() -> int:
         return s.getsockname()[1]
 
 
-def correr(codigo: str, *args: str, hub: str, timeout: float = 30) -> subprocess.CompletedProcess:
+def dos_nucleos() -> list[str]:
+    """Prefijo para correr en dos CPUs (taskset): con pocos núcleos el aborto del cierre se ve más.
+    En Windows, o sin taskset, no se fija nada."""
+    if not (POSIX and shutil.which("taskset") and hasattr(os, "sched_getaffinity")):
+        return []
+    cpus = sorted(os.sched_getaffinity(0))[:2]
+    return ["taskset", "-c", ",".join(map(str, cpus))] if len(cpus) == 2 else []
+
+
+def entorno(hub: str) -> dict:
     env = {**os.environ, "AGMEN_HUB": hub, "AGMEN_BACKEND": "native"}
     env.pop("AGMEN_CLOCK", None)
-    return subprocess.run([sys.executable, "-c", codigo, str(ROOT), *args], env=env, capture_output=True,
-                          text=True, timeout=timeout)
+    return env
+
+
+def correr(codigo: str, *args: str, hub: str, timeout: float = 30, fijar: bool = False) -> subprocess.CompletedProcess:
+    cmd = [*(dos_nucleos() if fijar else []), sys.executable, "-c", codigo, str(ROOT), *args]
+    return subprocess.run(cmd, env=entorno(hub), capture_output=True, text=True, timeout=timeout)
 
 
 @unittest.skipUnless(_backend.NATIVE, "sin núcleo de C++ (AGMEN_BACKEND=pure o sin compilar)")
@@ -122,13 +149,457 @@ assert any(t.name == "agmen-latidos" for t in threading.enumerate()), "no hay hi
     def test_salir_publicando_no_aborta(self):
         """VECES salidas al azar mientras se publica: ninguna debe terminar con SIGABRT. Con Python 3.12
         y el código anterior a la corrección esto fallaba en la gran mayoría de las corridas de la prueba."""
-        veces = int(os.environ.get("AGMEN_CIERRE_VECES", "10"))
+        veces = int(os.environ.get("AGMEN_CIERRE_VECES", "6"))
         malas = []
         for i in range(veces):
             r = correr(SALE_AL_AZAR, "6", "0.25", "0.6", hub=self.addr)
             if r.returncode != 0 or "terminate called" in r.stderr:
                 malas.append(f"corrida {i}: código {r.returncode}: {r.stderr.strip()[:200]}")
         self.assertFalse(malas, f"{len(malas)} de {veces} salidas fallaron:\n" + "\n".join(malas))
+
+
+# ---------------------------------------------------------------------------------------------------
+# El cierre del núcleo (atexit de agmen): ver el docstring del módulo.
+# ---------------------------------------------------------------------------------------------------
+
+# Cabecera común de los guiones.
+CABECERA = """
+import json, sys, threading, time
+sys.path.insert(0, sys.argv[1])
+"""
+
+# Una imagen chica (sin NumPy) y un publicador/suscriptor del mismo topic.
+PREPARA_PAR = """
+import agmen
+from agmen.msgs import Imagen
+MSG = Imagen(timestamp=0, frame_id="x", width=2, height=2, encoding="mono8", step=0, data=b"\\0" * 4)
+PUB = agmen.Publisher(Imagen, "/cierre/par")
+SUB = agmen.Subscriber(Imagen, "/cierre/par")
+
+def viaja(espera=5.0):
+    \"\"\"Publica hasta que el suscriptor recibe: (algún publish() fue True, llegó algo).\"\"\"
+    fin = time.monotonic() + espera
+    ok = False
+    while time.monotonic() < fin:
+        ok = PUB.publish(MSG) or ok
+        if SUB.receive(0.2) is not None:
+            return ok, True
+    return ok, False
+"""
+
+# Un atexit registrado ANTES de importar agmen corre DESPUÉS del cierre de agmen (van en orden inverso).
+# Ahí se prueba, desde hilos nuevos y desde el principal, lo que dice la especificación.
+DESDE_ATEXIT = CABECERA + """
+import atexit
+R = {}
+
+def en_hilo(f, limite=15.0):
+    salida = []
+    def corre():
+        try:
+            salida.append(["ok", f()])
+        except BaseException as e:
+            salida.append(["exc", type(e).__name__ + ": " + str(e)])
+    t0 = time.monotonic()
+    t = threading.Thread(target=corre)
+    t.start()
+    t.join(limite)
+    return (salida[0] if salida else ["colgado", None]), time.monotonic() - t0
+
+def tarde():
+    try:
+        (R["publish_hilo"], _) = en_hilo(lambda: PUB.publish(MSG))
+        (R["receive_hilo"], R["receive_hilo_s"]) = en_hilo(lambda: SUB.receive(5))
+        (R["spin_hilo"], R["spin_hilo_s"]) = en_hilo(lambda: NODO_LIBRE.spin())
+        (R["spin_for_hilo"], R["spin_for_hilo_s"]) = en_hilo(lambda: NODO_LIBRE.spin_for(5))
+        (R["crear_pub"], _) = en_hilo(lambda: agmen.Publisher(Imagen, "/cierre/nuevo"))
+        (R["crear_sub"], _) = en_hilo(lambda: agmen.Subscriber(Imagen, "/cierre/nuevo"))
+        # el spin() que ya corría salió, y su función ya no se llama
+        R["spin_vivo"] = HILO_SPIN.is_alive()
+        antes = CUENTA[0]
+        time.sleep(0.25)
+        R["funcion_llamada_despues"] = CUENTA[0] - antes
+        # el hilo principal (el que corre los atexit) sigue como siempre
+        R["principal"] = list(viaja(5.0))
+        R["principal_crea"] = type(agmen.Publisher(Imagen, "/cierre/nuevo2")).__name__
+    except BaseException:
+        import traceback
+        R["error_del_atexit"] = traceback.format_exc()
+    print("RESULTADO " + json.dumps(R, default=repr), flush=True)
+
+atexit.register(tarde)
+""" + PREPARA_PAR + """
+CUENTA = [0]
+NODO = agmen.Node("cierre_giro")
+@NODO.every(0.002)
+def tic():
+    CUENTA[0] += 1
+HILO_SPIN = threading.Thread(target=NODO.spin, daemon=True)
+HILO_SPIN.start()
+NODO_LIBRE = agmen.Node("cierre_libre")   # no está girando: un spin() nuevo desde otro hilo
+ok, llego = viaja()
+assert ok and llego, "antes de salir publicar/recibir debía funcionar: %r" % ((ok, llego),)
+time.sleep(0.1)
+assert CUENTA[0] > 0, "la función del Node no corrió antes de salir"
+"""
+
+# El peor caso: una función de un Node que dura 10 s, girando en un hilo daemon.
+FUNCION_LARGA = CABECERA + """
+import agmen
+node = agmen.Node("larga")
+@node.every(0.01)
+def larga():
+    time.sleep(10)
+threading.Thread(target=node.spin, daemon=True).start()
+time.sleep(0.3)
+print("principal termina", flush=True)
+"""
+
+SIN_HILOS = CABECERA + """
+import agmen
+from agmen.msgs import Imagen
+pub = agmen.Publisher(Imagen, "/cierre/solo")
+pub.publish(Imagen(timestamp=0, frame_id="x", width=2, height=2, encoding="mono8", step=0, data=b"\\0" * 4))
+"""
+
+# Las salidas al azar con Python 3.12 (los reproductores de quien implementó el cierre).
+ALEATORIAS = {
+    # un hilo daemon publica sin parar (como el servidor de reloj) y el proceso sale
+    "publicar": CABECERA + """
+import random
+import agmen
+from agmen.msgs import Imagen
+pub = agmen.Publisher(Imagen, "/cierre/p")
+msg = Imagen(timestamp=0, frame_id="x", width=640, height=480, encoding="mono8", step=0, data=bytes(640 * 480))
+def bucle():
+    while True:
+        pub.publish(msg)
+threading.Thread(target=bucle, daemon=True).start()
+time.sleep(0.2 + random.random() * 0.4)
+""",
+    # un hilo daemon dentro de receive() y el proceso sale
+    "recibir": CABECERA + """
+import random
+import agmen
+from agmen.msgs import Imagen
+sub = agmen.Subscriber(Imagen, "/cierre/r")
+def bucle():
+    while True:
+        sub.receive(0.2)
+threading.Thread(target=bucle, daemon=True).start()
+time.sleep(0.05 + random.random() * 0.3)
+""",
+    # node.spin() en un hilo daemon con un every rápido que publica, y otro en un grupo (hilo de C++)
+    "spin": CABECERA + """
+import random
+import agmen
+from agmen.msgs import Imagen
+node = agmen.Node("spinthr")
+pub = node.publisher(Imagen, "/cierre/s")
+msg = Imagen(timestamp=0, frame_id="x", width=640, height=480, encoding="mono8", step=0, data=bytes(640 * 480))
+@node.every(0.001)
+def tick():
+    pub.publish(msg)
+lento = node.group("lento")
+@node.every(0.001, group=lento)
+def tick2():
+    sum(range(2000))
+threading.Thread(target=node.spin, daemon=True).start()
+time.sleep(0.2 + random.random() * 0.4)
+""",
+    # un aviso del núcleo justo al salir: un grupo que se atrasa avisa "ciclos saltados" ~1 s después de
+    # arrancar, con un stderr lento (como una tubería llena), y el principal sale en ese momento
+    "aviso": CABECERA + """
+import random
+import agmen
+class Lento:
+    def write(self, s):
+        time.sleep(0.02)
+        return sys.__stderr__.write(s)
+    def flush(self):
+        sys.__stderr__.flush()
+sys.stderr = Lento()
+node = agmen.Node("logthr")
+g = node.group("lento")
+@node.every(0.002, group=g)
+def tarda():
+    t = time.perf_counter() + 0.005
+    while time.perf_counter() < t:
+        pass
+threading.Thread(target=node.spin, daemon=True).start()
+time.sleep(0.95 + random.random() * 0.15)
+""",
+}
+
+# Formas de salir con un hilo publicando y otro recibiendo.
+FORMAS_DE_SALIR = CABECERA + """
+import os
+import agmen
+from agmen.msgs import Imagen
+modo = sys.argv[2]
+msg = Imagen(timestamp=0, frame_id="x", width=2, height=2, encoding="mono8", step=0, data=b"\\0" * 4)
+pub = agmen.Publisher(Imagen, "/cierre/f")
+sub = agmen.Subscriber(Imagen, "/cierre/f")
+def publica():
+    while True:
+        pub.publish(msg)
+def recibe():
+    while True:
+        sub.receive(0.2)
+for f in (publica, recibe):
+    threading.Thread(target=f, daemon=True).start()
+time.sleep(0.3)
+if modo == "exit3":
+    sys.exit(3)
+elif modo == "raise":
+    raise RuntimeError("a propósito")
+elif modo == "osexit5":
+    os._exit(5)
+elif modo == "sigint":
+    print("listo", flush=True)
+    # sueños cortos: CPython entrega la señal al hilo principal, pero un solo time.sleep(30) no se
+    # interrumpe si el SIGINT cae en otro hilo (el de un receive(), p. ej.); no es del cierre.
+    for _ in range(600):
+        time.sleep(0.05)
+elif modo in ("fork_exit", "fork_osexit"):
+    pid = os.fork()
+    if pid == 0:
+        # el hijo solo tiene el hilo que hizo fork; un Publisher nuevo debe poder crearse y usarse
+        agmen.Publisher(Imagen, "/cierre/hijo").publish(msg)
+        if modo == "fork_osexit":
+            os._exit(6)
+        sys.exit(4)
+    _, estado = os.waitpid(pid, 0)
+    sys.exit(10 + os.waitstatus_to_exitcode(estado))
+"""
+
+# Un atexit registrado antes que agmen forkea cuando el cierre ya se declaró: el hijo empieza de cero.
+FORK_DURANTE_EL_CIERRE = CABECERA + """
+import atexit, os
+def tarde():
+    pid = os.fork()
+    if pid == 0:
+        try:
+            agmen.Publisher(Imagen, "/cierre/hijo2")
+            os._exit(0)
+        except BaseException as e:
+            sys.stderr.write("el hijo no pudo crear un Publisher: %r\\n" % (e,))
+            os._exit(9)
+    _, estado = os.waitpid(pid, 0)
+    print("hijo=%d" % os.waitstatus_to_exitcode(estado), flush=True)
+atexit.register(tarde)
+import agmen
+from agmen.msgs import Imagen
+p = agmen.Publisher(Imagen, "/cierre/padre")
+"""
+
+MALAS = ("terminate called", "Fatal Python error")
+
+
+class _ConHub(unittest.TestCase):
+    """Un hub en este proceso para los subprocesos que publican y reciben."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.addr = f"127.0.0.1:{puerto_libre()}"
+        cls.stop = threading.Event()
+        cls.hub = H.Hub(cls.addr, [], log=lambda _t: None, grace_s=0.3)
+        cls.hilo = threading.Thread(target=cls.hub.serve, args=(cls.stop,), daemon=True)
+        cls.hilo.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.stop.set()
+        cls.hilo.join(2)
+
+
+@unittest.skipUnless(_backend.NATIVE, "sin núcleo de C++ (AGMEN_BACKEND=pure o sin compilar)")
+class TestCierreDelNucleo(_ConHub):
+    """Deterministas: sirven con cualquier Python (con 3.13 no abortaba, pero el comportamiento del
+    cierre es el mismo)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        r = correr(DESDE_ATEXIT, hub=cls.addr)
+        cls.proceso = r
+        cls.r = {}
+        for linea in r.stdout.splitlines():
+            if linea.startswith("RESULTADO "):
+                cls.r = json.loads(linea[len("RESULTADO "):])
+
+    def setUp(self):
+        self.assertEqual(self.proceso.returncode, 0, self.proceso.stderr)
+        self.assertTrue(self.r, f"el atexit de la prueba no llegó a imprimir:\n{self.proceso.stdout}\n{self.proceso.stderr}")
+        self.assertNotIn("error_del_atexit", self.r, self.r.get("error_del_atexit"))
+
+    def test_publish_desde_otro_hilo_devuelve_false(self):
+        self.assertEqual(self.r["publish_hilo"], ["ok", False])
+
+    def test_receive_desde_otro_hilo_devuelve_none_de_inmediato(self):
+        self.assertEqual(self.r["receive_hilo"], ["ok", None])
+        self.assertLess(self.r["receive_hilo_s"], 1.0, "receive(5) debía volver de inmediato, no esperar")
+
+    def test_spin_y_spin_for_desde_otro_hilo_regresan(self):
+        self.assertEqual(self.r["spin_hilo"], ["ok", None])
+        self.assertLess(self.r["spin_hilo_s"], 1.0)
+        self.assertEqual(self.r["spin_for_hilo"], ["ok", None])
+        self.assertLess(self.r["spin_for_hilo_s"], 1.0, "spin_for(5) debía volver de inmediato")
+
+    def test_el_spin_que_ya_corria_salio_y_su_funcion_ya_no_se_llama(self):
+        self.assertFalse(self.r["spin_vivo"], "el hilo con spin() sigue vivo tras el cierre")
+        self.assertEqual(self.r["funcion_llamada_despues"], 0, "la función del Node se siguió llamando tras el cierre")
+
+    def test_crear_publisher_o_subscriber_lanza_runtimeerror_claro(self):
+        for k in ("crear_pub", "crear_sub"):
+            tipo, texto = self.r[k]
+            self.assertEqual(tipo, "exc", f"{k}: debía fallar, no devolver un objeto ({tipo}: {texto})")
+            self.assertTrue(texto.startswith("RuntimeError:"), f"{k}: {texto}")
+            self.assertIn("se está cerrando", texto, k)
+
+    def test_el_hilo_principal_sigue_funcionando(self):
+        publico, llego = self.r["principal"]
+        self.assertTrue(publico, "publish() desde el hilo que cierra debía seguir devolviendo True")
+        self.assertTrue(llego, "receive() desde el hilo que cierra debía seguir recibiendo")
+        self.assertIn("Publisher", self.r["principal_crea"])
+
+    def test_la_salida_no_trae_avisos_ni_abortos(self):
+        self.assertNotIn("al salir no terminaron", self.proceso.stderr)
+        for m in MALAS:
+            self.assertNotIn(m, self.proceso.stderr)
+
+
+@unittest.skipUnless(_backend.NATIVE, "sin núcleo de C++ (AGMEN_BACKEND=pure o sin compilar)")
+class TestCierreSalidas(_ConHub):
+    """Deterministas del tiempo de salida y del silencio (independientes del atexit de prueba)."""
+
+    def test_funcion_de_node_de_10s_el_programa_sale_en_menos_de_3s_con_un_aviso(self):
+        t0 = time.monotonic()
+        r = correr(FUNCION_LARGA, hub=self.addr, timeout=30)
+        dur = time.monotonic() - t0
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertLess(dur, 3.5, f"la salida tardó {dur:.1f} s (límite del cierre: 2 s)")
+        self.assertGreater(dur, 1.5, "el cierre debía esperar a la función (hasta 2 s) antes de rendirse")
+        self.assertEqual(r.stderr.count("al salir no terminaron"), 1, r.stderr)
+        self.assertIn("una función de un Node", r.stderr)
+        self.assertIn("El programa sale igual", r.stderr)
+        for m in MALAS:
+            self.assertNotIn(m, r.stderr)
+        self.assertEqual(len([ln for ln in r.stderr.splitlines() if "[agmen]" in ln]), 1, r.stderr)
+
+    def test_sin_hilos_propios_no_escribe_nada_al_salir(self):
+        t0 = time.monotonic()
+        r = correr(SIN_HILOS, hub=self.addr)
+        dur = time.monotonic() - t0
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stderr, "", "un proceso sin hilos propios no debe escribir nada por el cierre")
+        self.assertEqual(r.stdout, "")
+        self.assertLess(dur, 5.0)
+
+
+@unittest.skipUnless(_backend.NATIVE, "sin núcleo de C++ (AGMEN_BACKEND=pure o sin compilar)")
+class TestCierreAlAzar(_ConHub):
+    """Probabilísticas: el aborto real. Solo muerden con Python 3.12 (con 3.13 nunca abortó) y con pocos
+    núcleos; con el código anterior a la corrección cada una abortaba en una fracción de las corridas
+    (publicar y spin(): casi siempre). AGMEN_CIERRE_VECES cambia las repeticiones."""
+
+    VECES = {"publicar": 6, "recibir": 10, "spin": 6, "aviso": 4}
+
+    def _corre_varias(self, nombre):
+        veces = int(os.environ.get("AGMEN_CIERRE_VECES", self.VECES[nombre]))
+        codigo = ALEATORIAS[nombre]
+
+        def una(i):
+            try:
+                r = correr(codigo, hub=self.addr, timeout=30, fijar=True)
+                return i, r.returncode, r.stderr
+            except subprocess.TimeoutExpired:
+                return i, "colgado", ""
+
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            res = list(pool.map(una, range(veces)))
+        malas = [f"corrida {i}: código {rc}: {(err.strip().splitlines() or [''])[-1][:160]}"
+                 for i, rc, err in res
+                 if rc != 0 or any(m in err for m in MALAS) or "al salir no terminaron" in err]
+        self.assertFalse(malas, f"salir con un hilo que {nombre}: {len(malas)} de {veces} corridas mal:\n" + "\n".join(malas))
+
+    def test_salir_con_un_hilo_publicando(self):
+        self._corre_varias("publicar")
+
+    def test_salir_con_un_hilo_recibiendo(self):
+        self._corre_varias("recibir")
+
+    def test_salir_con_node_spin_en_un_hilo(self):
+        self._corre_varias("spin")
+
+    def test_salir_con_un_aviso_del_nucleo(self):
+        self._corre_varias("aviso")
+
+
+@unittest.skipUnless(_backend.NATIVE, "sin núcleo de C++ (AGMEN_BACKEND=pure o sin compilar)")
+class TestFormasDeSalir(_ConHub):
+    """sys.exit, excepción, Ctrl+C, os._exit y fork, con un hilo publicando y otro recibiendo: los
+    códigos de siempre, sin abortos, sin cuelgues y sin la línea del cierre."""
+
+    def _sin_avisos(self, r):
+        self.assertNotIn("al salir no terminaron", r.stderr)
+        for m in MALAS:
+            self.assertNotIn(m, r.stderr)
+
+    def test_sys_exit(self):
+        r = correr(FORMAS_DE_SALIR, "exit3", hub=self.addr, fijar=True)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self._sin_avisos(r)
+
+    def test_excepcion_no_atrapada(self):
+        r = correr(FORMAS_DE_SALIR, "raise", hub=self.addr, fijar=True)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("RuntimeError: a propósito", r.stderr)
+        self._sin_avisos(r)
+
+    def test_os_exit(self):
+        r = correr(FORMAS_DE_SALIR, "osexit5", hub=self.addr, fijar=True)
+        self.assertEqual(r.returncode, 5, r.stderr)
+        self._sin_avisos(r)
+
+    @unittest.skipUnless(POSIX, "Ctrl+C como señal SIGINT: solo POSIX (en Windows requiere un grupo de procesos)")
+    def test_ctrl_c(self):
+        cmd = [*dos_nucleos(), sys.executable, "-c", FORMAS_DE_SALIR, str(ROOT), "sigint"]
+        p = subprocess.Popen(cmd, env=entorno(self.addr), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(p.stdout.readline().strip(), "listo")
+            p.send_signal(signal.SIGINT)
+            try:
+                out, err = p.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                out, err = p.communicate()
+                self.fail(f"Ctrl+C no terminó el programa en 15 s (colgado): {err}")
+        finally:
+            if p.poll() is None:
+                p.kill()
+        # CPython sale con la señal (-2) o con 130/1 según la versión: lo que no puede ser es -6 ni un cuelgue
+        self.assertIn(p.returncode, (-signal.SIGINT, 130, 1), err)
+        self.assertIn("KeyboardInterrupt", err)
+        self._sin_avisos(subprocess.CompletedProcess([], p.returncode, out, err))
+
+    @unittest.skipUnless(POSIX, "os.fork: solo POSIX")
+    def test_fork_y_salida_del_hijo(self):
+        r = correr(FORMAS_DE_SALIR, "fork_exit", hub=self.addr, fijar=True)
+        self.assertEqual(r.returncode, 14, r.stderr)   # 10 + código del hijo (4)
+        self._sin_avisos(r)
+
+    @unittest.skipUnless(POSIX, "os.fork: solo POSIX")
+    def test_fork_y_os_exit_del_hijo(self):
+        r = correr(FORMAS_DE_SALIR, "fork_osexit", hub=self.addr, fijar=True)
+        self.assertEqual(r.returncode, 16, r.stderr)   # 10 + 6
+        self._sin_avisos(r)
+
+    @unittest.skipUnless(POSIX, "os.fork: solo POSIX")
+    def test_fork_con_el_cierre_ya_declarado_el_hijo_empieza_de_cero(self):
+        r = correr(FORK_DURANTE_EL_CIERRE, hub=self.addr)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("hijo=0", r.stdout, f"el hijo no pudo crear un Publisher: {r.stderr}")
 
 
 if __name__ == "__main__":

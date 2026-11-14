@@ -119,6 +119,33 @@ jobs:
       - name: Pruebas
         run: ctest --test-dir build --output-on-failure
 
+  # El cierre del núcleo de C++ (atexit, python/test_cierre.py) también con Python 3.13: ahí CPython
+  # no aborta al finalizar con hilos vivos, pero las pruebas deterministas del cierre deben seguir
+  # cumpliéndose. Los otros jobs corren con 3.12, donde el aborto sí muerde.
+  cierre-313:
+    name: ubuntu + Python 3.13 (cierre del núcleo)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        id: py
+        with:
+          python-version: "3.13"
+
+      - name: nanobind (para agmen._core) y NumPy
+        run: python -m pip install nanobind numpy
+
+      - name: Configurar y compilar agmen._core (advertencias = errores)
+        run: |
+          cmake -S . -B build -DAGMEN_WERROR=ON -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE="${{ steps.py.outputs.python-path }}"
+          cmake --build build --config Release --parallel
+
+      - name: Pruebas del cierre (con el núcleo de C++)
+        env:
+          AGMEN_BACKEND: native
+        run: python -m unittest discover -s python -p "test_cierre.py" -v
+
   # Fuzzing corto del decodificador (tests/fuzz/README.md): cada fuzzer parte de
   # los vectores de prueba y de las regresiones guardadas, y corre un minuto con
   # ASan y UBSan. Si encuentra algo, la entrada queda en los artefactos del job.
