@@ -833,47 +833,49 @@ if _backend.NATIVE:
     _CIERRE_S = 2.0
     _LATIDOS_MIN_S = 0.2   # el hilo de latidos termina en microsegundos; esto aunque el límite se haya agotado
 
-    def _cierre() -> None:
-        """atexit (corre antes de que el intérprete empiece a finalizar): el núcleo de C++ queda
-        "cerrando". Los demás hilos ya no sueltan ni toman el GIL al entrar al núcleo (publish()
-        devuelve False, receive() None, spin() vuelve), y se espera a los que ya estaban dentro.
-        Así ningún hilo vuelve de C++ durante la finalización, que lo terminaría y abortaría el
-        proceso (Python 3.12: SIGABRT, "terminate called without an active exception").
+    _avisado = False
 
-        Un Ctrl+C a media espera no se salta lo que falta: se termina sin esperar más."""
-        global _cerrando
-        _cerrando = True
+    def _cierre_resto(falta: str, sobra: float, esperado: float, apurado: bool) -> None:
+        """Lo que sigue al cierre del núcleo, que registra atexit como _core._cierre (una función de C:
+        corre antes de que el intérprete empiece a finalizar, y una señal pendiente no se la salta como
+        a una función de Python). _core._cierre ya marcó _cerrando y esperó, con límite, a las llamadas
+        que estaban dentro del núcleo: los demás hilos ya no sueltan ni toman el GIL al entrar
+        (publish() devuelve False, receive() None, spin() vuelve), así que ninguno vuelve de C++
+        durante la finalización, que lo terminaría y abortaría el proceso (Python 3.12: SIGABRT,
+        "terminate called without an active exception").
+
+        Aquí: detener el hilo de latidos y, si algo no terminó, el aviso. Con apurado=True (hubo un
+        Ctrl+C) no se espera más; si un Ctrl+C interrumpe esto, _core._cierre lo vuelve a llamar así."""
+        global _avisado
         inicio = time.monotonic()
-        falta, sobra = "", 0.0
-        try:
-            falta, sobra = _backend.core._shutdown(_CIERRE_S)
-        except KeyboardInterrupt:
-            falta, sobra = _backend.core._shutdown(0.0)   # sin esperar: solo marca lo que quedó dentro
-            sobra = 0.0
-        latidos = True
-        try:
-            latidos = _beats.stop(max(sobra, _LATIDOS_MIN_S))
-        except KeyboardInterrupt:
-            latidos = _beats.stop(0.0)
+        latidos = _beats.stop(0.05 if apurado else max(sobra, _LATIDOS_MIN_S))
         partes = [falta] if falta else []
         if not latidos:
             partes.append("el hilo de latidos")
-        if not partes:
+        if not partes or _avisado:
             return
-        espera = time.monotonic() - inicio
+        espera = esperado + (time.monotonic() - inicio)
         if not falta:
             fin = "El programa sale igual."
         elif _backend.core._PARK_FORCED_UNWIND:
             fin = "El programa sale igual; esos hilos se quedan detenidos hasta que termine."
         else:
             fin = "El programa sale igual, pero puede terminar con un error de Python al salir."
+        _avisado = True
         _stderr(f"[agmen] ⚠ al salir no terminaron (esperé {espera:.1f} s): {'; '.join(partes)}. {fin} "
                 "Para evitarlo, detén tus hilos que usan agmen (o llama a node.stop()) antes de salir, y que las "
                 "funciones de un Node sean cortas.")
 
+    def _despues_de_fork() -> None:
+        """En el hijo de un fork: el cierre empieza de cero (C++ y los locks de aquí)."""
+        global _cerrando, _avisado
+        _backend.core._after_fork_child()
+        _cerrando = False
+        _avisado = False
+
     _backend.core.set_log_sink(_stderr)
     atexit.register(_backend.core.set_log_sink, None)
-    atexit.register(_cierre)
+    atexit.register(_backend.core._cierre, _cierre_resto, sys.modules[__name__], _CIERRE_S)
     if hasattr(os, "register_at_fork"):
-        os.register_at_fork(after_in_child=_backend.core._after_fork_child)
+        os.register_at_fork(after_in_child=_despues_de_fork)
     _backend.core.set_default_node_name(node_name())

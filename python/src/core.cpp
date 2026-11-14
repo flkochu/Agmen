@@ -21,8 +21,16 @@
 #include <agmen/agmen.hpp>
 #include <agmen/shm.hpp>
 
-#if defined(__GLIBCXX__)
+#include <cstddef>   // trae <features.h> con glibc: define __GLIBC__
+
+// Con glibc + libstdc++, pthread_exit desenrolla la pila con abi::__forced_unwind
+// y ese desenrollado se puede atrapar (ver with_python). Con musl, libc++,
+// Windows o macOS no: ahí no se promete nada.
+#if defined(__GLIBCXX__) && defined(__GLIBC__)
+#define AGMEN_PARK_FORCED_UNWIND 1
 #include <cxxabi.h>
+#else
+#define AGMEN_PARK_FORCED_UNWIND 0
 #endif
 
 #include <array>
@@ -84,7 +92,8 @@ PyObject* g_wire_error = nullptr;
 // Si vence el límite, _shutdown() se rinde (g_abandoned): un hilo que vuelve
 // de C++ después se queda dormido en vez de tomar el GIL (park_forever), y
 // _shutdown() no regresa mientras haya un hilo A MEDIO tomar el GIL
-// (g_retaking). Con glibc, una función de Python llamada desde C++ (un Node,
+// (g_retaking). Con glibc + libstdc++ (AGMEN_PARK_FORCED_UNWIND), una función
+// de Python llamada desde C++ (un Node,
 // el destino de avisos) que suelta y retoma el GIL por dentro (time.sleep, E/S,
 // el cambio de hilo cada 5 ms) y es terminada en la finalización también se
 // queda dormida (catch de abi::__forced_unwind en with_python).
@@ -92,7 +101,19 @@ PyObject* g_wire_error = nullptr;
 // Sin cubrir: código de Python que corre DEBAJO de un marco de C++ del núcleo
 // que tiene el GIL y lo suelta por dentro, p. ej. una @property leída por
 // Layout.pack, o un __del__ que corre al soltar una referencia en C++. Si eso
-// coincide con la finalización, el proceso todavía puede abortar.
+// coincide con la finalización, el proceso todavía puede abortar. Además:
+//   - Un hilo detenido para siempre dentro de un aviso puede quedarse con un
+//     mutex de C++ (Fanout::mu_, src/pubsub.cpp: el aviso se emite con mu_
+//     tomado): un pub.close() posterior desde otro atexit esperaría sin límite.
+//   - Un hilo detenido dentro de una función de un Node deja puesto su
+//     SignalScope (src/node.cpp): si además la salida se cuelga, Ctrl+C o kill
+//     no la terminan.
+//   - Con un spin() girando, el primer Ctrl+C lo atiende el manejador de agmen
+//     y Python no lo ve: el cierre no se acorta (espera su límite y sale).
+//
+// El cierre se registra en atexit como una función de C (_cierre): CPython
+// revisa las señales al ENTRAR a una función de Python, así que un Ctrl+C
+// pendiente saltaría un _cierre escrito en Python antes de su primera línea.
 // ---------------------------------------------------------------------------
 
 // Lo que puede estar en curso al salir (para decir qué quedó sin cerrar).
@@ -181,7 +202,7 @@ bool with_python(Inside what, Fn&& fn) {
     retaken();
     try {
         fn();
-#if defined(__GLIBCXX__)
+#if AGMEN_PARK_FORCED_UNWIND
     } catch (abi::__forced_unwind&) {
         park_forever();   // nunca sale del catch: no hay que relanzar
 #endif
@@ -829,8 +850,10 @@ void set_log_sink(nb::object fn) {
 
 /// Declara el núcleo "cerrando", detiene los spin() y espera hasta `limit_s`
 /// segundos a que las llamadas en curso vuelvan a Python. Regresa (qué quedó
-/// sin cerrar o "", segundos que sobraron del límite).
-std::tuple<std::string, double> shutdown(double limit_s) {
+/// sin cerrar o "", segundos que sobraron del límite). Una señal durante la
+/// espera la acorta: KeyboardInterrupt se descarta (el programa ya sale); otra
+/// excepción de un manejador del usuario (p. ej. SystemExit) queda en `pending`.
+std::tuple<std::string, double> shutdown_impl(double limit_s, std::optional<nb::python_error>& pending) {
     using namespace std::chrono;
     const auto deadline = steady_clock::now() + duration_cast<steady_clock::duration>(duration<double>(limit_s));
     t_closer = true;
@@ -841,11 +864,16 @@ std::tuple<std::string, double> shutdown(double limit_s) {
         int total = 0;
         for (const auto& c : g_inside) total += c.n.load();
         if (total <= 0) break;
-        // Ctrl+C a media espera: no se espera más (el programa ya está saliendo).
         bool interrupted = false;
         if (PyErr_CheckSignals() != 0) {
-            PyErr_Clear();
             interrupted = true;
+            if (PyErr_ExceptionMatches(PyExc_KeyboardInterrupt) != 0) {
+                PyErr_Clear();
+            } else if (!pending) {
+                pending.emplace();   // se lleva la excepción actual
+            } else {
+                PyErr_Clear();       // ya hay una: se reporta la primera
+            }
         }
         if (interrupted || steady_clock::now() >= deadline) {
             g_abandoned.store(true);
@@ -876,6 +904,49 @@ std::tuple<std::string, double> shutdown(double limit_s) {
     }
     const double left = duration<double>(deadline - steady_clock::now()).count();
     return {std::string(), left > 0 ? left : 0.0};
+}
+
+std::tuple<std::string, double> shutdown(double limit_s) {
+    std::optional<nb::python_error> pending;
+    auto r = shutdown_impl(limit_s, pending);
+    if (pending) throw std::move(*pending);
+    return r;
+}
+
+/// Lo que agmen registra en atexit (ver arriba: es de C para que una señal
+/// pendiente no se lo salte). Marca `modulo._cerrando`, espera con
+/// shutdown_impl() y luego llama a `resto(falta, sobra, esperado_s, apurado)`
+/// (Python: detener los latidos, el aviso). Si `resto` levanta
+/// KeyboardInterrupt, se vuelve a llamar con apurado=True (sin esperar más).
+void cierre(nb::handle resto, nb::handle modulo, double limit_s) {
+    using namespace std::chrono;
+    if (PyObject_SetAttrString(modulo.ptr(), "_cerrando", Py_True) != 0) PyErr_Clear();
+    const auto t0 = steady_clock::now();
+    std::optional<nb::python_error> pending;
+    const auto [what, left] = shutdown_impl(limit_s, pending);
+    const double waited = duration<double>(steady_clock::now() - t0).count();
+    bool hurry = pending.has_value();
+    bool done = false;
+    for (int i = 0; i < 5 && !done; ++i) {
+        try {
+            resto(what, hurry ? 0.0 : left, waited, hurry);
+            done = true;
+        } catch (nb::python_error& e) {
+            if (!e.matches(PyExc_KeyboardInterrupt)) {
+                if (!pending) pending.emplace(std::move(e));
+                break;
+            }
+            hurry = true;   // Ctrl+C: lo que falta, sin esperar
+        }
+    }
+    if (!done && !pending) {
+        const std::string line = "[agmen] ⚠ al salir: Ctrl+C repetido, el cierre quedó a medias" +
+                                 (what.empty() ? std::string() : " (siguen corriendo: " + what + ")");
+        std::fwrite(line.data(), 1, line.size(), stderr);
+        std::fputc('\n', stderr);
+        std::fflush(stderr);
+    }
+    if (pending) throw std::move(*pending);   // atexit la reporta, como con cualquier otra función
 }
 
 /// En el hijo de un fork (os.register_at_fork): solo existe el hilo que hizo
@@ -1043,12 +1114,9 @@ NB_MODULE(_core, m) {
     m.def("set_default_node_name", [](const std::string& n) { agmen::hub::set_default_node_name(n); });
     m.def("set_log_sink", &set_log_sink, "fn"_a.none());
     m.def("_shutdown", &shutdown, "limit_s"_a);
+    m.def("_cierre", &cierre, "resto"_a, "modulo"_a, "limit_s"_a);
     m.def("_after_fork_child", &after_fork_child);
     // ¿Una función de Python llamada desde C++ que la finalización termina a
-    // medias se queda dormida (glibc) en vez de tumbar el proceso?
-#if defined(__GLIBCXX__)
-    m.attr("_PARK_FORCED_UNWIND") = true;
-#else
-    m.attr("_PARK_FORCED_UNWIND") = false;
-#endif
+    // medias se queda dormida (glibc + libstdc++) en vez de tumbar el proceso?
+    m.attr("_PARK_FORCED_UNWIND") = AGMEN_PARK_FORCED_UNWIND != 0;
 }
