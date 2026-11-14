@@ -1687,12 +1687,18 @@ class LinkError(AgentError):
         self.code = code
 
 
+class KeyPromptCancelled(Exception):
+    """La persona cerró la entrada (Ctrl+D) mientras get_key le pedía la clave. No es un
+    AgentError: agmen run lo trata como el Ctrl+C en ese punto (cancelado, no arranca nada)."""
+
+
 def get_key(name: str, address: str, *, interactive: bool | None = None,
             env: dict | None = None, ask: Callable[[str], str] | None = None) -> tuple[str, str]:
     """La clave para la computadora `name` (en `address`, de machine_address). Devuelve
     (clave, de dónde): "guardada" (keys.toml), "variable" (AGMEN_AGENT_KEY) o "escrita"
     (se pidió en la terminal: hay que guardarla tras una conexión aceptada).
-    AgentKeyError dice cómo darla si no hay manera."""
+    AgentKeyError dice cómo darla si no hay manera; KeyPromptCancelled si al pedirla
+    la entrada se cerró (Ctrl+D)."""
     import getpass
     import sys
 
@@ -1714,8 +1720,11 @@ def get_key(name: str, address: str, *, interactive: bool | None = None,
                             f"la pide y la guarda")
     ask = ask or getpass.getpass
     for attempt in range(3):
-        text = ask(f"clave de agmen agent en '{name}' ({address}); la muestra agmen agent al arrancar, en la "
-                   f"terminal de '{name}': ")
+        try:
+            text = ask(f"clave de agmen agent en '{name}' ({address}); la muestra agmen agent al arrancar, en la "
+                       f"terminal de '{name}': ")
+        except EOFError:   # Ctrl+D (o la terminal se cerró): la persona no quiere seguir
+            raise KeyPromptCancelled() from None
         try:
             return format_key(text), "escrita"
         except AgentKeyError as e:

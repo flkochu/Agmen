@@ -1,0 +1,27 @@
+# robot_dos.toml — el robot del tutorial en DOS computadoras (capítulo 5, sección 7,
+# "agmen agent"): `imu` corre en la Raspberry Pi del robot y `cerebro` en la laptop.
+#
+#   en la Raspberry Pi:  agmen agent examples/tutorial/robot_dos.toml
+#   en la laptop:        agmen run examples/tutorial/robot_dos.toml
+#
+# Cambia `host` por la IP de TU robot (la Raspberry Pi). Tiene que ser el mismo
+# archivo en las dos computadoras. Las rutas de `cmd` son relativas a este archivo.
+
+[robot]
+name = "robot del tutorial, en dos computadoras"
+
+[[machine]]
+name = "robot"                  # la Raspberry Pi
+host = "192.168.1.20"           # puerto por defecto: 7391
+
+[[node]]
+name = "imu"
+cmd = "../../build/bin/publisher --rate 100 --to /imu"
+restart = "on-failure"
+machine = "robot"
+profile = "real"
+
+[[node]]
+name = "cerebro"                # sin machine: corre en la laptop
+cmd = "python cerebro.py --destino /cmd/cerebro"
+autostart = false

@@ -4056,3 +4056,16 @@ class TestTerminalInteractiva(E2EBase):
         self.assertNotIn("KeyboardInterrupt", texto)
         self.assertFalse(list(self.marks.iterdir()))
         self.assertFalse((self.dir / "cfg-run" / "keys.toml").exists())
+
+    def test_ctrl_d_al_pedir_la_clave_cancela_sin_traceback_y_no_arranca_nada(self):
+        pa, la, clave = self.agente()
+        p, maestro, salida = self.run_en_pty()
+        self.assertTrue(self.espera(lambda: "clave de agmen agent en 'robot'" in self.ver(salida), 60), self.ver(salida))
+        os.write(maestro, b"\x04")                                   # Ctrl+D: la terminal cierra la entrada (EOF)
+        self.assertEqual(p.wait(60), 130, self.ver(salida))
+        texto = self.ver(salida)
+        self.assertIn("cancelado (Ctrl+D) antes de conectarme: no arrancó nada", texto)
+        self.assertNotIn("Traceback", texto)
+        self.assertNotIn("EOFError", texto)
+        self.assertFalse(list(self.marks.iterdir()))
+        self.assertFalse((self.dir / "cfg-run" / "keys.toml").exists())

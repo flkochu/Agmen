@@ -113,16 +113,17 @@ def cmd_run(args) -> int:
         remote = address_error(config, places)
         keys = {}
         if not remote:
-            from .agent import AgentError
+            from .agent import AgentError, KeyPromptCancelled
 
             try:
                 remotes, keys = _links_for(config, places, args.archivo)
             except AgentError as e:   # no hay clave, o keys.toml no se puede leer
                 remote = str(e)
-            except KeyboardInterrupt:   # Ctrl+C mientras pedía la clave
+            except (KeyboardInterrupt, KeyPromptCancelled) as e:   # Ctrl+C o Ctrl+D mientras pedía la clave
                 if player is not None:
                     player.stop()
-                print("\nagmen │ cancelado (Ctrl+C) antes de conectarme: no arrancó nada", file=sys.stderr)
+                tecla = "Ctrl+D" if isinstance(e, KeyPromptCancelled) else "Ctrl+C"
+                print(f"\nagmen │ cancelado ({tecla}) antes de conectarme: no arrancó nada", file=sys.stderr)
                 return 130
         if remote:
             if player is not None:
