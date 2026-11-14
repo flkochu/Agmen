@@ -207,6 +207,119 @@ cambiaron: el `Node` es más cómodo, no obligatorio. Lo único nuevo es que
 ahora también ellos usan el reloj de Agmen (en modo real es la misma hora de
 siempre).
 
+## 8. Hilos propios y cómo termina el programa
+
+Puedes crear tu propio hilo (`threading.Thread`) que publique o reciba con
+Agmen. Dos reglas para que el programa termine bien.
+
+**1. Pon `daemon=True` al hilo que espera mensajes.** Python espera a los
+hilos que no son *daemon* antes de salir. Un hilo que espera sin límite no
+termina nunca, así que el programa tampoco.
+
+**2. Revisa `None` en el hilo.** Al salir, Agmen hace que `receive()` regrese
+`None` en los hilos que siguen vivos.
+
+Guarda este ejemplo como `examples/tutorial/hilo_propio.py`, junto a
+`cerebro.py`:
+
+```python
+"""Un hilo propio que recibe comandos. Se queda dentro de receive() al salir."""
+import threading
+import time
+from pathlib import Path
+
+import agmen
+
+MotorCommand = agmen.load(Path(__file__).with_name("motor_command.agmen")).MotorCommand
+sub = agmen.Subscriber(MotorCommand, "127.0.0.1:7500")
+
+
+def escuchar():
+    while True:
+        s = sub.receive()           # sin límite: espera hasta que llega algo
+        if s is None:               # Agmen devuelve None cuando el programa está saliendo
+            break
+        print(f"[hilo] izq={s.message.left:+.2f} der={s.message.right:+.2f}")
+
+
+# daemon=True: Python no espera a este hilo antes de salir.
+threading.Thread(target=escuchar, daemon=True).start()
+
+pub = agmen.Publisher(MotorCommand, "127.0.0.1:7500", topic="/cmd")
+for _ in range(3):
+    pub.publish(MotorCommand(left=0.6, right=0.6))
+    time.sleep(0.1)
+print("[main] fin")
+```
+
+```bash
+python3 examples/tutorial/hilo_propio.py
+```
+
+```
+[hilo] izq=+0.60 der=+0.60
+[hilo] izq=+0.60 der=+0.60
+[hilo] izq=+0.60 der=+0.60
+[main] fin
+```
+
+⚠ Este ejemplo usa el puerto 7500. Si el motor del capítulo 2 sigue
+corriendo, ciérralo antes.
+
+Si quitas el `if s is None`, el hilo falla al salir: `s` es `None` y
+`s.message` lanza `AttributeError: 'NoneType' object has no attribute
+'message'`. El programa termina igual, pero ese error no es lo que querías.
+
+### Qué pasa en los otros hilos al salir
+
+Desde que el programa empieza a salir, las llamadas que hacen otros hilos
+cambian así:
+
+| Qué llamas desde otro hilo | Al salir |
+|---|---|
+| `publish()` | no manda y regresa `False` |
+| `receive()` | regresa `None`, aunque no le hayas puesto límite |
+| `spin()` / `spin_for()` | regresan |
+| crear un `Publisher` o un `Subscriber` | lanza `RuntimeError` (agmen se está cerrando) |
+| una función de un `Node` | ya no se llama |
+
+Crea tus `Publisher` y `Subscriber` **antes** de salir, no en el último momento.
+
+### Si un hilo no termina a tiempo
+
+Agmen espera hasta **2 segundos** a lo que ya estaba dentro de agmen. Si no
+termina, imprime **una** línea y el programa sale igual, con su código de
+salida. Por ejemplo, un `spin()` en un hilo propio, y una función de `Node`
+en su propio grupo que duerme 4 segundos (`time.sleep(4)`). El programa
+termina a los 0.3 s, pero esa función sigue dentro de agmen:
+
+```
+[main] fin
+[agmen] ⚠ al salir no terminaron (esperé 2.0 s): 1 en spin(), 1 en una función de un Node. El programa sale igual; esos hilos se quedan detenidos hasta que termine. Para evitarlo, detén tus hilos que usan agmen (o llama a node.stop()) antes de salir, y que las funciones de un Node sean cortas.
+```
+
+Lee la línea: dice cuánto esperó, qué quedó corriendo y qué hacer. Para
+evitarlo:
+
+- Detén tus hilos (con una bandera, o `node.stop()`) antes de que termine el
+  programa.
+- Haz las funciones de un `Node` cortas. Lo lento va en otro grupo, como en
+  la sección 2.
+
+### Límites que debes saber
+
+- Un hilo que se queda detenido depende de la plataforma. En Linux (con
+  glibc) se queda quieto hasta que termina el programa, y la salida es limpia.
+  Fuera de Linux, por ejemplo en Windows y macOS, el aviso dice que el
+  programa puede terminar con un error de Python al salir.
+- Con un `spin()` girando, el primer Ctrl+C lo usa Agmen para detener los
+  nodos. Por eso no acorta la espera de 2 segundos.
+- Con Python 3.12 y el núcleo de C++ (el que se usa por defecto), un programa
+  así podía abortar al salir con `terminate called without an active
+  exception`. Con Python 3.13 nunca abortó. Esta corrección llega en la versión
+  0.14.0, que aún no se publica; desde ella, el comportamiento al salir es el
+  mismo en los dos.
+
 ## Lo que aprendiste
 
 - `every` para cada ritmo, `subscribe`/`on` para cada mensaje, `spin()` para
@@ -216,5 +329,7 @@ siempre).
 - `queue = 1` te da siempre el dato más reciente.
 - Con `[clock] mode = "sim"` todo el robot corre en tiempo simulado; desde el
   panel lo pausas, lo avanzas o lo aceleras, o tu simulador manda el tiempo.
+- Un hilo propio va como `daemon=True`, y revisa `None` en `receive()`.
+  Al salir, `publish()` regresa `False` y `spin()` regresa.
 
 **Siguiente:** [capítulo 13 — Python rápido y NumPy](13-python-rapido-y-numpy.md).

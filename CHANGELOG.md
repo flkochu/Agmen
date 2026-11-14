@@ -60,6 +60,17 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   `profile = "real"`, y `mundo` es `profile = "sim"`. Por eso `agmen run
   examples/tutorial/robot.toml` imprime `no corren: mundo (perfil sim)`, y
   `--sim` no arranca el motor.
+- **Al salir del programa, los hilos propios ven un cierre.** Desde que el
+  programa empieza a salir, en *otros* hilos: `publish()` no manda y regresa
+  `False`; `receive()` regresa `None`, aunque no le hayas puesto límite;
+  `spin()` y `spin_for()` regresan; crear un `Publisher` o `Subscriber` lanza
+  `RuntimeError`; y las funciones de un `Node` ya no se llaman. Si tu hilo
+  hace `while True: m = sub.receive(); usar(m.algo)`, revisa `if m is None:
+  break`; si no, verás un `AttributeError` de ese hilo al terminar. Lo más
+  limpio: detén tus hilos (o `node.stop()`) antes de salir. Y pon
+  `daemon=True` al hilo que espera mensajes: Python espera a los hilos que no
+  son daemon antes de salir, así que un `receive()` sin límite en uno de ellos
+  nunca deja terminar el programa. Tutorial: capítulo 12, sección 8.
 - **`--play` ya no arranca los nodos `profile = "real"`.** Usa el perfil
   `replay`: un motor no debe moverse con los datos de una grabación. Para
   correrlos, `agmen run robot.toml --play ARCHIVO.mcap --profile real`
@@ -83,8 +94,23 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   `terminate called without an active exception` (pasaba con Python 3.12 y el
   núcleo de C++, desde 0.9.0): el hilo de latidos al hub ahora se detiene
   antes de que el intérprete termine. Si tu programa publica o recibe desde un
-  hilo propio en segundo plano, deténlo y espéralo (`join`) antes de salir:
-  ese caso todavía puede abortar con Python 3.12.
+  hilo propio, al salir ese hilo ya no publica ni recibe (ver *Cambiado*).
+- **Un programa con hilos propios ya no aborta al salir** con
+  `terminate called without an active exception` (Python 3.12 y el núcleo de
+  C++, desde 0.9.0). Pasaba cuando un hilo que publicaba, recibía, giraba un
+  `Node` o avisaba estaba dentro de agmen mientras el intérprete terminaba.
+  Ahora agmen declara el cierre antes de que Python empiece a apagarse y
+  espera hasta 2 s a lo que ya estaba dentro. Si no termina, sale **una**
+  línea de aviso que dice cuánto esperó, qué quedó corriendo y qué hacer; el
+  programa sale igual, con su código de salida.
+  - Límites: en Linux (glibc), una función de un `Node` que tarda más de 2 s
+    al salir se queda detenida y el programa sale limpio. En Windows y macOS
+    puede terminar con un error de Python al salir; el aviso lo dice.
+  - Con un `spin()` girando, el primer Ctrl+C lo usa agmen para detener los
+    nodos, así que no acorta la espera de 2 s.
+  - Con Python 3.13 nunca hubo aborto; el comportamiento al salir es el mismo
+    en 3.12 y 3.13. El CI corre las pruebas del cierre también con 3.13 (job
+    `cierre-313`).
 
 ## [0.13.0] — 2026-11-06
 
