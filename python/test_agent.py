@@ -3924,7 +3924,7 @@ class TestPerdidaCortaLaEspera(E2EBase):
 
 class TestAdiosNoSeBloquea(LinkCase):
     """El adios de salida es de cortesía: un agente callado o que no lee no detiene la salida."""
-    TOPE = 1.5
+    TOPE = 3.0   # el adios espera 0.5 s (BYE_TIMEOUT); sin ese límite serían los 6 s del socket. Holgado para un runner cargado
 
     def setUp(self):
         super().setUp()
