@@ -175,7 +175,7 @@ import agmen
 from agmen.msgs import Imagen
 MSG = Imagen(timestamp=0, frame_id="x", width=2, height=2, encoding="mono8", step=0, data=b"\\0" * 4)
 PUB = agmen.Publisher(Imagen, "/cierre/par")
-SUB = agmen.Subscriber(Imagen, "/cierre/par")
+SUB = agmen.Subscriber(Imagen, "/cierre/par")   # lo usa un hilo a la vez (el principal, o uno que se espera con join)
 
 def viaja(espera=5.0):
     \"\"\"Publica hasta que el suscriptor recibe: (algún publish() fue True, llegó algo).\"\"\"
@@ -430,12 +430,12 @@ FUNCION_ATORADA = CABECERA + """
 import builtins
 class Lento:
     def __del__(self):
-        time.sleep(1.5)
+        time.sleep(2.5)
 builtins._lento = Lento()
 import agmen
 print("PARK=%d" % bool(agmen._backend.core._PARK_FORCED_UNWIND), flush=True)
 node = agmen.Node("atorado")
-node.every(0.01, lambda: time.sleep(2.5))
+node.every(0.01, lambda: time.sleep(3.2))   # vuelve ~1 s después del límite del cierre: margen si el principal sale tarde
 threading.Thread(target=node.spin, daemon=True).start()
 time.sleep(0.3)
 """
@@ -453,12 +453,13 @@ signal.signal(signal.SIGINT, signal.default_int_handler)
 print("principal termina", flush=True)
 """
 
-# Ctrl+C PENDIENTE al entrar al cierre: un atexit escrito en C (sum sobre un range largo: no revisa
-# señales) registrado DESPUÉS de importar agmen corre justo antes del cierre; el SIGINT llega mientras
-# corre. CPython revisa las señales al ENTRAR a una función de Python, así que con el cierre escrito en
-# Python el KeyboardInterrupt salía en su primera línea y el proceso abortaba (rc=134 con 3.12).
+# Ctrl+C PENDIENTE al entrar al cierre, de forma determinista: un atexit escrito en C (kill de libc, vía
+# ctypes) registrado DESPUÉS de importar agmen corre justo antes del cierre de agmen y deja un SIGINT
+# pendiente (os.kill no sirve: revisa señales al volver). CPython revisa las señales al ENTRAR a una
+# función de Python, así que con el cierre escrito en Python el KeyboardInterrupt salía en su primera
+# línea y el proceso abortaba (rc=134 con 3.12). Cada hilo receptor tiene su propio Subscriber.
 CTRL_C_PENDIENTE = CABECERA + """
-import atexit, builtins, os, signal, subprocess
+import atexit, builtins, ctypes, os, signal
 class Lento:
     def __del__(self):
         time.sleep(0.5)
@@ -473,18 +474,130 @@ import agmen
 from agmen.msgs import Imagen
 MSG = Imagen(timestamp=0, frame_id="x", width=2, height=2, encoding="mono8", step=0, data=b"\\0" * 4)
 PUB = agmen.Publisher(Imagen, "/cierre/cc")
-sub = agmen.Subscriber(Imagen, "/cierre/cc")
 def rx():
+    sub = agmen.Subscriber(Imagen, "/cierre/cc")
     while True:
         sub.receive(0.05)
 for _ in range(3):
     threading.Thread(target=rx, daemon=True).start()
-t0 = time.perf_counter(); sum(range(3_000_000)); dt = max(time.perf_counter() - t0, 0.001)
-N = int(3_000_000 * 1.8 / dt)   # ~1.8 s en C, calibrado a esta máquina
-subprocess.Popen([sys.executable, "-c", "import os,time,signal\\ntime.sleep(1.0)\\nos.kill(%d, signal.SIGINT)" % os.getpid()])
-atexit.register(sum, range(N))
 time.sleep(0.6)
+atexit.register(ctypes.CDLL(None).kill, os.getpid(), int(signal.SIGINT))   # corre justo antes del cierre de agmen
 sys.exit(4)
+"""
+
+
+# receive() desde VARIOS hilos sobre el MISMO Subscriber (no es del cierre): 3 hilos en receive(0.05) de un
+# tipo arrow (Imagen: TCP y memoria compartida) mientras un Publisher del mismo topic publica. Sin aborto,
+# y cada mensaje lo recibe a lo más un hilo. Después, close() desde otro hilo mientras reciben.
+RECEIVE_CONCURRENTE = CABECERA + """
+import agmen
+from agmen.msgs import Imagen
+W, H = 320, 240
+pub = agmen.Publisher(Imagen, "/cierre/conc")
+sub = agmen.Subscriber(Imagen, "/cierre/conc")
+parar = threading.Event()
+vistos = [[], [], []]
+errores = []
+def rx(k):
+    while not parar.is_set():
+        try:
+            m = sub.receive(0.05)
+        except BaseException as e:
+            errores.append(type(e).__name__ + ": " + str(e))
+            return
+        if m is not None:
+            vistos[k].append(m.message.timestamp)
+def publica(n, hasta):
+    i = 0
+    while time.monotonic() < hasta:
+        pub.publish(Imagen(timestamp=n + i, frame_id="x", width=W, height=H, encoding="mono8", step=0,
+                           data=bytes(W * H)))
+        i += 1
+        time.sleep(0.004)
+    return i
+hilos = [threading.Thread(target=rx, args=(k,), daemon=True) for k in range(3)]
+for h in hilos:
+    h.start()
+enviados = publica(1, time.monotonic() + float(sys.argv[2]))
+time.sleep(0.4)
+parar.set()
+for h in hilos:
+    h.join(5)
+vivos = sum(h.is_alive() for h in hilos)
+todos = [t for v in vistos for t in v]
+res = {"enviados": enviados, "recibidos": len(todos), "unicos": len(set(todos)), "vivos": vivos,
+       "por_hilo": [len(v) for v in vistos], "errores": errores}
+
+# close() desde otro hilo mientras tres hilos reciben (y se sigue publicando)
+sub2 = agmen.Subscriber(Imagen, "/cierre/conc")
+fin2 = []
+def rx2():
+    try:
+        while True:
+            sub2.receive(0.05)
+            if parar2.is_set():
+                return
+    except BaseException as e:
+        fin2.append(type(e).__name__ + ": " + str(e))
+parar2 = threading.Event()
+hilos2 = [threading.Thread(target=rx2, daemon=True) for _ in range(3)]
+for h in hilos2:
+    h.start()
+t = threading.Thread(target=publica, args=(100000, time.monotonic() + 1.5), daemon=True)
+t.start()
+time.sleep(0.5)
+cierra = threading.Thread(target=sub2.close, daemon=True)
+cierra.start()
+cierra.join(5)
+parar2.set()           # si receive() sigue devolviendo None tras el close(), los hilos salen por aquí
+for h in hilos2:
+    h.join(5)
+t.join(5)
+res["close_colgado"] = cierra.is_alive()
+res["close_hilos_vivos"] = sum(h.is_alive() for h in hilos2)
+res["close_errores"] = fin2
+print("RESULTADO " + json.dumps(res), flush=True)
+"""
+
+# Dos hilos del padre en receive() del MISMO Subscriber y otro publicando; fork; el hijo usa ese Subscriber:
+# el turno de receive() (y los locks) heredados no pueden quedar tomados en el hijo.
+FORK_RECEIVE_HEREDADO = CABECERA + """
+import os
+import agmen
+from agmen.msgs import Imagen
+msg = Imagen(timestamp=0, frame_id="x", width=2, height=2, encoding="mono8", step=0, data=b"\\0" * 4)
+pub = agmen.Publisher(Imagen, "/cierre/frx")
+sub = agmen.Subscriber(Imagen, "/cierre/frx")
+def rx():
+    while True:
+        sub.receive(0.2)
+def tx():
+    while True:
+        pub.publish(msg)
+        time.sleep(0.01)
+for f in (rx, rx, tx):
+    threading.Thread(target=f, daemon=True).start()
+time.sleep(0.5)
+pid = os.fork()
+if pid == 0:
+    t0 = time.monotonic(); got = 0
+    while time.monotonic() - t0 < 3 and not got:
+        if sub.receive(0.1) is not None:
+            got += 1
+    t1 = time.monotonic()
+    sub.close()
+    print("HIJO recibidos=%d t_receive=%.2f t_close=%.2f" % (got, t1 - t0, time.monotonic() - t1), flush=True)
+    os._exit(0)
+for _ in range(150):
+    r, st = os.waitpid(pid, os.WNOHANG)
+    if r:
+        print("hijo=%d" % os.waitstatus_to_exitcode(st), flush=True)
+        break
+    time.sleep(0.1)
+else:
+    os.kill(pid, 9); os.waitpid(pid, 0)
+    print("HIJO COLGADO", flush=True)
+os._exit(0)   # sin cierre: lo que se prueba es el hijo
 """
 
 # Una excepción que NO es KeyboardInterrupt, levantada por un manejador de señales del usuario durante la
@@ -822,6 +935,43 @@ class TestCierreAlAzar(_ConHub):
         self._corre_varias("espera_gil", ESPERA_GIL, permite_aviso=True)
 
 
+class TestReceiveConcurrente(_ConHub):
+    """receive() desde varios hilos sobre el mismo Subscriber (nativo y puro): ver RECEIVE_CONCURRENTE."""
+
+    def test_tres_hilos_reciben_del_mismo_subscriber_y_close_desde_otro_hilo(self):
+        env = {**os.environ, "AGMEN_HUB": self.addr}   # el núcleo que toque (AGMEN_BACKEND del entorno)
+        env.pop("AGMEN_CLOCK", None)
+        veces = int(os.environ.get("AGMEN_CIERRE_VECES_CONC", "1"))
+        for i in range(veces):
+            try:
+                r = subprocess.run([sys.executable, "-c", RECEIVE_CONCURRENTE, str(ROOT), "2.0"], env=env,
+                                   capture_output=True, text=True, timeout=60)
+            except subprocess.TimeoutExpired:
+                self.fail("colgado: receive() desde varios hilos o close() no terminaron en 60 s")
+            self.assertEqual(r.returncode, 0, f"corrida {i}: {r.stderr}")
+            for m in MALAS + ("free()", "Segmentation", "Traceback"):
+                self.assertNotIn(m, r.stderr)
+            linea = [ln for ln in r.stdout.splitlines() if ln.startswith("RESULTADO ")]
+            self.assertTrue(linea, f"{r.stdout}\n{r.stderr}")
+            res = json.loads(linea[0][len("RESULTADO "):])
+            self.assertEqual(res["errores"], [], res)
+            self.assertEqual(res["vivos"], 0, "un hilo en receive(0.05) no volvió")
+            # el contrato: un mensaje lo recibe a lo más un hilo (no hay duplicados), y llega algo
+            self.assertEqual(res["recibidos"], res["unicos"], f"mensajes recibidos dos veces: {res}")
+            self.assertGreater(res["recibidos"], 0, res)
+            self.assertLessEqual(res["recibidos"], res["enviados"], res)
+            # close() desde otro hilo: no se cuelga, y los receive() terminan (None o error "cerr...")
+            self.assertFalse(res["close_colgado"], res)
+            self.assertEqual(res["close_hilos_vivos"], 0, res)
+            for e in res["close_errores"]:
+                if _backend.NATIVE:
+                    self.assertIn("cerr", e, f"error inesperado en receive() tras close(): {e}")
+                else:
+                    # Python puro: el socket se cierra bajo los pies de los demás hilos (EBADF); no se pierde
+                    # nada en silencio, pero el texto no dice que el Subscriber se cerró.
+                    self.assertTrue("cerr" in e or "Bad file descriptor" in e or "closed" in e.lower(), e)
+
+
 @unittest.skipUnless(_backend.NATIVE, "sin núcleo de C++ (AGMEN_BACKEND=pure o sin compilar)")
 class TestFormasDeSalir(_ConHub):
     """sys.exit, excepción, Ctrl+C, os._exit y fork, con un hilo publicando y otro recibiendo: los
@@ -887,6 +1037,16 @@ class TestFormasDeSalir(_ConHub):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("hijo=0", r.stdout, f"el hijo no funcionó normal: {r.stderr}")
         self.assertNotIn("HIJO FALLO", r.stderr)
+
+    @unittest.skipUnless(POSIX, "os.fork: solo POSIX")
+    def test_fork_con_hilos_en_receive_el_hijo_recibe_y_close_no_se_cuelga(self):
+        r = correr(FORK_RECEIVE_HEREDADO, hub=self.addr, timeout=40)
+        self.assertIn("hijo=0", r.stdout, f"{r.stdout}\n{r.stderr}")
+        self.assertNotIn("HIJO COLGADO", r.stdout)
+        m = re.search(r"HIJO recibidos=(\d+) t_receive=([\d.]+) t_close=([\d.]+)", r.stdout)
+        self.assertIsNotNone(m, f"{r.stdout}\n{r.stderr}")
+        self.assertEqual(m.group(1), "1", "el hijo no recibió nada en 3 s")
+        self.assertLess(float(m.group(3)), 2.0, "close() del hijo tardó (el turno heredado quedó tomado)")
 
     @unittest.skipUnless(POSIX, "os.fork: solo POSIX")
     def test_fork_con_el_cierre_ya_declarado_el_hijo_empieza_de_cero(self):
