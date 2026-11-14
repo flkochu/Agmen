@@ -615,6 +615,18 @@ class RawPublisher:
 # Mismo uso, mismos atributos.
 # ---------------------------------------------------------------------------
 
+# True desde que el cierre del núcleo de C++ empezó (_cierre, al salir). Un hilo que se quedó dormido
+# dentro del núcleo puede tener tomado el lock de un Publisher o Subscriber: desde entonces, esos locks
+# se piden con límite, para que la salida nunca se cuelgue.
+_cerrando = False
+_LOCK_AL_CERRAR_S = 0.2
+
+
+def _lock_or_skip(lock) -> bool:
+    """Toma `lock`; al salir (ver _cerrando), con límite: False = no se pudo."""
+    return lock.acquire(timeout=_LOCK_AL_CERRAR_S) if _cerrando else lock.acquire()
+
+
 class _Beats:
     """Late por los Publisher y Subscriber del núcleo de C++ que pasan ratos sin
     publicar o sin llamar receive() (el panel, un nodo que solo manda al cambiar
@@ -686,9 +698,13 @@ class _NativePublisher:
         self._core.announce()
 
     def _beat(self) -> None:
-        with self._lock:
+        if not _lock_or_skip(self._lock):
+            return
+        try:
             if not self._core.closed:
                 self._core.heartbeat()
+        finally:
+            self._lock.release()
 
     @property
     def seq(self) -> int:
@@ -719,8 +735,12 @@ class _NativePublisher:
         return self._core.shm_bytes
 
     def close(self) -> None:
-        with self._lock:
+        if not _lock_or_skip(self._lock):
+            return   # al salir: lo tiene un hilo que se quedó dormido en el núcleo; el proceso ya termina
+        try:
             self._core.close()
+        finally:
+            self._lock.release()
 
 
 class _NativeSubscriber:
@@ -774,13 +794,21 @@ class _NativeSubscriber:
         return self._core.tcp_port
 
     def _beat(self) -> None:
-        with self._lock:
+        if not _lock_or_skip(self._lock):
+            return
+        try:
             if not self._core.closed:
                 self._core.heartbeat()
+        finally:
+            self._lock.release()
 
     def close(self) -> None:
-        with self._lock:
+        if not _lock_or_skip(self._lock):
+            return   # al salir: lo tiene un hilo que se quedó dormido en el núcleo; el proceso ya termina
+        try:
             self._core.close()
+        finally:
+            self._lock.release()
 
 
 # La clase que se usa se elige una vez, al importar: isinstance y herencia funcionan.
@@ -803,20 +831,45 @@ if _backend.NATIVE:
     # Límite total del cierre: lo normal es que tarde nada (o lo que tarda en volver un receive(), a
     # lo más 0.2 s, o un spin(), a lo más 0.1 s); el límite es por si una llamada se atora.
     _CIERRE_S = 2.0
+    _LATIDOS_MIN_S = 0.2   # el hilo de latidos termina en microsegundos; esto aunque el límite se haya agotado
 
     def _cierre() -> None:
         """atexit (corre antes de que el intérprete empiece a finalizar): el núcleo de C++ queda
         "cerrando". Los demás hilos ya no sueltan ni toman el GIL al entrar al núcleo (publish()
         devuelve False, receive() None, spin() vuelve), y se espera a los que ya estaban dentro.
         Así ningún hilo vuelve de C++ durante la finalización, que lo terminaría y abortaría el
-        proceso (Python 3.12: SIGABRT, "terminate called without an active exception")."""
-        falta, sobra = _backend.core._shutdown(_CIERRE_S)
+        proceso (Python 3.12: SIGABRT, "terminate called without an active exception").
+
+        Un Ctrl+C a media espera no se salta lo que falta: se termina sin esperar más."""
+        global _cerrando
+        _cerrando = True
+        inicio = time.monotonic()
+        falta, sobra = "", 0.0
+        try:
+            falta, sobra = _backend.core._shutdown(_CIERRE_S)
+        except KeyboardInterrupt:
+            falta, sobra = _backend.core._shutdown(0.0)   # sin esperar: solo marca lo que quedó dentro
+            sobra = 0.0
+        latidos = True
+        try:
+            latidos = _beats.stop(max(sobra, _LATIDOS_MIN_S))
+        except KeyboardInterrupt:
+            latidos = _beats.stop(0.0)
         partes = [falta] if falta else []
-        if not _beats.stop(sobra):
+        if not latidos:
             partes.append("el hilo de latidos")
-        if partes:
-            _stderr(f"[agmen] ⚠ al salir no terminaron en {_CIERRE_S:g} s: {'; '.join(partes)}. El programa sale "
-                    "igual; si un hilo tuyo usa agmen, detenlo (o cierra lo suyo con close()) antes de salir")
+        if not partes:
+            return
+        espera = time.monotonic() - inicio
+        if not falta:
+            fin = "El programa sale igual."
+        elif _backend.core._PARK_FORCED_UNWIND:
+            fin = "El programa sale igual; esos hilos se quedan detenidos hasta que termine."
+        else:
+            fin = "El programa sale igual, pero puede terminar con un error de Python al salir."
+        _stderr(f"[agmen] ⚠ al salir no terminaron (esperé {espera:.1f} s): {'; '.join(partes)}. {fin} "
+                "Para evitarlo, detén tus hilos que usan agmen (o llama a node.stop()) antes de salir, y que las "
+                "funciones de un Node sean cortas.")
 
     _backend.core.set_log_sink(_stderr)
     atexit.register(_backend.core.set_log_sink, None)

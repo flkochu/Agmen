@@ -21,6 +21,10 @@
 #include <agmen/agmen.hpp>
 #include <agmen/shm.hpp>
 
+#if defined(__GLIBCXX__)
+#include <cxxabi.h>
+#endif
+
 #include <array>
 #include <atomic>
 #include <bit>
@@ -76,6 +80,19 @@ PyObject* g_wire_error = nullptr;
 //   - _shutdown() espera, con límite, a las llamadas que ya estaban dentro,
 //     hasta que hayan vuelto a Python con el GIL.
 // El hilo que cierra (el que corre atexit y luego finaliza) sigue normal.
+//
+// Si vence el límite, _shutdown() se rinde (g_abandoned): un hilo que vuelve
+// de C++ después se queda dormido en vez de tomar el GIL (park_forever), y
+// _shutdown() no regresa mientras haya un hilo A MEDIO tomar el GIL
+// (g_retaking). Con glibc, una función de Python llamada desde C++ (un Node,
+// el destino de avisos) que suelta y retoma el GIL por dentro (time.sleep, E/S,
+// el cambio de hilo cada 5 ms) y es terminada en la finalización también se
+// queda dormida (catch de abi::__forced_unwind en with_python).
+//
+// Sin cubrir: código de Python que corre DEBAJO de un marco de C++ del núcleo
+// que tiene el GIL y lo suelta por dentro, p. ej. una @property leída por
+// Layout.pack, o un __del__ que corre al soltar una referencia en C++. Si eso
+// coincide con la finalización, el proceso todavía puede abortar.
 // ---------------------------------------------------------------------------
 
 // Lo que puede estar en curso al salir (para decir qué quedó sin cerrar).
@@ -85,11 +102,14 @@ constexpr std::array<const char*, static_cast<std::size_t>(Inside::Count)> kInsi
     "publish()", "receive()", "un latido", "spin()", "una función de un Node", "un aviso",
     "close()", "crear un Publisher o Subscriber", "soltar una función de Python"};
 
-struct alignas(64) InsideCount {
+// Un contador por línea de caché (relleno explícito: alignas da el aviso C4324 en MSVC).
+struct InsideCount {
     std::atomic<int> n{0};
+    char pad[64 - sizeof(std::atomic<int>)] = {};
 };
 
 std::array<InsideCount, static_cast<std::size_t>(Inside::Count)> g_inside;
+std::atomic<int> g_retaking{0};         // hilos a medio tomar el GIL (ver _shutdown)
 std::atomic<bool> g_closing{false};     // _shutdown() empezó
 std::atomic<bool> g_abandoned{false};   // _shutdown() se rindió (venció el límite)
 thread_local bool t_closer = false;     // este hilo es el que cierra
@@ -103,6 +123,18 @@ bool closing_for_me() { return g_closing.load() && !t_closer; }
 [[noreturn]] void park_forever() {
     for (;;) std::this_thread::sleep_for(std::chrono::hours(1));
 }
+
+/// Anuncia que este hilo va a tomar el GIL. false = el cierre ya se rindió: no
+/// lo tomes. Con true, llama a retaken() en cuanto lo tengas.
+bool begin_retake() {
+    g_retaking.fetch_add(1);   // antes de mirar g_abandoned: _shutdown() lo ve o nosotros lo vemos
+    if (g_abandoned.load() && !t_closer) {
+        g_retaking.fetch_sub(1);
+        return false;
+    }
+    return true;
+}
+void retaken() { g_retaking.fetch_sub(1); }
 
 /// En lugar de nb::gil_scoped_release, en las llamadas desde Python. Si el
 /// núcleo está cerrando, NO suelta el GIL (`released()` = false) y quien llama
@@ -119,8 +151,9 @@ public:
     }
     ~NoGil() {
         if (state_ == nullptr) return;
-        if (g_abandoned.load() && !t_closer) park_forever();
+        if (!begin_retake()) park_forever();
         PyEval_RestoreThread(state_);
+        retaken();
         n_.fetch_sub(1);   // DESPUÉS de retomar el GIL: si no, _shutdown() podría seguir antes
     }
     NoGil(const NoGil&) = delete;
@@ -132,29 +165,35 @@ private:
     PyThreadState* state_ = nullptr;
 };
 
-/// Antes de que un hilo (de C++ o de Python sin el GIL) tome el GIL para
-/// llamar a Python. Si el núcleo está cerrando, `ok()` = false: no lo tomes.
-/// Declárala ANTES del nb::gil_scoped_acquire: se descuenta después de soltarlo.
-class PyEntry {
-public:
-    explicit PyEntry(Inside what) : n_(g_inside[static_cast<std::size_t>(what)].n) {
-        n_.fetch_add(1);
-        if (closing_for_me()) {
-            n_.fetch_sub(1);
-            ok_ = false;
-        }
+/// Un hilo (de C++, o de Python que soltó el GIL) que va a llamar a Python:
+/// toma el GIL, corre `fn` y lo suelta. Cerrando el núcleo, no corre `fn` y
+/// regresa false. Si `fn` es terminada a medias por la finalización (glibc:
+/// abi::__forced_unwind), el hilo se queda dormido: el proceso termina igual.
+template <class Fn>
+bool with_python(Inside what, Fn&& fn) {
+    std::atomic<int>& n = g_inside[static_cast<std::size_t>(what)].n;
+    n.fetch_add(1);
+    if (closing_for_me() || !begin_retake()) {
+        n.fetch_sub(1);
+        return false;
     }
-    ~PyEntry() {
-        if (ok_) n_.fetch_sub(1);
+    const PyGILState_STATE st = PyGILState_Ensure();
+    retaken();
+    try {
+        fn();
+#if defined(__GLIBCXX__)
+    } catch (abi::__forced_unwind&) {
+        park_forever();   // nunca sale del catch: no hay que relanzar
+#endif
+    } catch (...) {
+        PyGILState_Release(st);
+        n.fetch_sub(1);
+        throw;
     }
-    PyEntry(const PyEntry&) = delete;
-    PyEntry& operator=(const PyEntry&) = delete;
-    [[nodiscard]] bool ok() const { return ok_; }
-
-private:
-    std::atomic<int>& n_;
-    bool ok_ = true;
-};
+    PyGILState_Release(st);
+    n.fetch_sub(1);   // DESPUÉS de soltar el GIL
+    return true;
+}
 
 std::runtime_error closing_error(const char* what) {
     return std::runtime_error(std::string("agmen se está cerrando (el programa está saliendo): ya no se puede crear ") +
@@ -163,21 +202,16 @@ std::runtime_error closing_error(const char* what) {
 
 // Una referencia a un objeto de Python que se puede guardar en C++ y
 // destruir desde cualquier hilo (toma el GIL para el conteo de referencias).
+// No se copia: se comparte con std::shared_ptr.
 struct PyRef {
     PyObject* o = nullptr;
     explicit PyRef(nb::handle h) : o(h.ptr()) { Py_XINCREF(o); }
-    PyRef(const PyRef& r) {
-        nb::gil_scoped_acquire gil;
-        o = r.o;
-        Py_XINCREF(o);
-    }
+    PyRef(const PyRef&) = delete;
     PyRef& operator=(const PyRef&) = delete;
     ~PyRef() {
         if (o == nullptr || Py_IsInitialized() == 0) return;
-        const PyEntry entry(Inside::Release);
-        if (!entry.ok()) return;   // cerrando: se queda la referencia (el proceso ya termina)
-        nb::gil_scoped_acquire gil;
-        Py_DECREF(o);
+        // Cerrando: se queda la referencia (el proceso ya termina).
+        (void)with_python(Inside::Release, [this] { Py_DECREF(o); });
     }
 };
 
@@ -664,42 +698,41 @@ public:
     }
 
     void every(std::int64_t period_ns, nb::handle fn, const std::string& group) {
-        PyRef ref(fn);
+        auto ref = std::make_shared<PyRef>(fn);
         live().every(std::chrono::nanoseconds(period_ns),
                      [ref] {
-                         const PyEntry entry(Inside::Callback);
-                         if (!entry.ok()) return;   // cerrando: ya no se llama a Python
-                         nb::gil_scoped_acquire gil;
-                         PyObject* r = PyObject_CallNoArgs(ref.o);
-                         if (r == nullptr) {
-                             PyErr_WriteUnraisable(ref.o);
-                         } else {
-                             Py_DECREF(r);
-                         }
+                         // Cerrando: ya no se llama a Python.
+                         (void)with_python(Inside::Callback, [&ref] {
+                             PyObject* r = PyObject_CallNoArgs(ref->o);
+                             if (r == nullptr) {
+                                 PyErr_WriteUnraisable(ref->o);
+                             } else {
+                                 Py_DECREF(r);
+                             }
+                         });
                      },
                      agmen::Group{group});
     }
 
     void subscribe(const std::string& where, const std::string& name, const std::string& text, std::uint64_t id,
                    std::size_t size, bool arrow, nb::handle fn, std::size_t queue, const std::string& group) {
-        PyRef ref(fn);
+        auto ref = std::make_shared<PyRef>(fn);
         live().subscribe_raw(
             where, type_info(name, text, id, size, arrow),
             [ref](const agmen::RawSample& s) {
                 std::string invalid;
-                {
-                    const PyEntry entry(Inside::Callback);
-                    if (!entry.ok()) return;   // cerrando: ya no se llama a Python
-                    nb::gil_scoped_acquire gil;
+                // Cerrando: ya no se llama a Python.
+                (void)with_python(Inside::Callback, [&] {
                     try {
                         // Regresa un texto si el payload no se pudo decodificar.
-                        const nb::object r = nb::handle(ref.o)(env_tuple(s.envelope), payload_object(s.payload), s.from);
+                        const nb::object r =
+                            nb::handle(ref->o)(env_tuple(s.envelope), payload_object(s.payload), s.from);
                         if (nb::isinstance<nb::str>(r)) invalid = nb::cast<std::string>(r);
                     } catch (nb::python_error& e) {
                         e.restore();
-                        PyErr_WriteUnraisable(ref.o);
+                        PyErr_WriteUnraisable(ref->o);
                     }
-                }
+                });
                 // Sin el GIL: el Node lo descarta, lo cuenta y lo avisa.
                 if (!invalid.empty()) throw agmen::detail::InvalidPayload(invalid);
             },
@@ -767,26 +800,25 @@ void set_log_sink(nb::object fn) {
     }
     auto ref = std::make_shared<PyRef>(fn);
     agmen::log::set_sink([ref](std::string_view line) {
-        const PyEntry entry(Inside::Log);
-        if (!entry.ok() || Py_IsInitialized() == 0) {
+        const bool sent = Py_IsInitialized() != 0 && with_python(Inside::Log, [&] {
+            PyObject* s = PyUnicode_FromStringAndSize(line.data(), static_cast<Py_ssize_t>(line.size()));
+            if (s == nullptr) {
+                PyErr_Clear();
+                return;
+            }
+            PyObject* r = PyObject_CallFunctionObjArgs(ref->o, s, nullptr);
+            Py_DECREF(s);
+            if (r == nullptr) {
+                PyErr_Clear();
+            } else {
+                Py_DECREF(r);
+            }
+        });
+        if (!sent) {
             // Cerrando (o ya sin intérprete): directo a stderr, sin tomar el GIL.
             std::fwrite(line.data(), 1, line.size(), stderr);
             std::fputc('\n', stderr);
             std::fflush(stderr);
-            return;
-        }
-        nb::gil_scoped_acquire gil;
-        PyObject* s = PyUnicode_FromStringAndSize(line.data(), static_cast<Py_ssize_t>(line.size()));
-        if (s == nullptr) {
-            PyErr_Clear();
-            return;
-        }
-        PyObject* r = PyObject_CallFunctionObjArgs(ref->o, s, nullptr);
-        Py_DECREF(s);
-        if (r == nullptr) {
-            PyErr_Clear();
-        } else {
-            Py_DECREF(r);
         }
     });
 }
@@ -809,8 +841,27 @@ std::tuple<std::string, double> shutdown(double limit_s) {
         int total = 0;
         for (const auto& c : g_inside) total += c.n.load();
         if (total <= 0) break;
-        if (steady_clock::now() >= deadline) {
+        // Ctrl+C a media espera: no se espera más (el programa ya está saliendo).
+        bool interrupted = false;
+        if (PyErr_CheckSignals() != 0) {
+            PyErr_Clear();
+            interrupted = true;
+        }
+        if (interrupted || steady_clock::now() >= deadline) {
             g_abandoned.store(true);
+            // Un hilo que miró g_abandoned antes de que se pusiera puede estar a
+            // medio tomar el GIL: si regresáramos, lo tomaría ya en la
+            // finalización y abortaría. Se le da el GIL hasta que lo haya tomado
+            // y soltado. Esta espera no lleva límite propio: no depende del
+            // código del usuario sino del turno del GIL (el que lo tenga lo suelta
+            // a más tardar en el siguiente cambio de hilo, cada 5 ms, o al volver
+            // de C), y los hilos que llegan después ya ven g_abandoned y no lo
+            // piden. Si alguien retiene el GIL para siempre, este hilo tampoco lo
+            // recuperaría: la salida se colgaría igual sin esta espera.
+            while (g_retaking.load() > 0) {
+                const nb::gil_scoped_release nogil;
+                std::this_thread::sleep_for(milliseconds(1));
+            }
             std::string what;
             for (std::size_t k = 0; k < g_inside.size(); ++k) {
                 const int n = g_inside[k].n.load();
@@ -831,6 +882,7 @@ std::tuple<std::string, double> shutdown(double limit_s) {
 /// fork, así que nada está "dentro" del núcleo y el cierre empieza de cero.
 void after_fork_child() {
     for (auto& c : g_inside) c.n.store(0);
+    g_retaking.store(0);
     g_closing.store(false);
     g_abandoned.store(false);
     t_closer = false;
@@ -992,4 +1044,11 @@ NB_MODULE(_core, m) {
     m.def("set_log_sink", &set_log_sink, "fn"_a.none());
     m.def("_shutdown", &shutdown, "limit_s"_a);
     m.def("_after_fork_child", &after_fork_child);
+    // ¿Una función de Python llamada desde C++ que la finalización termina a
+    // medias se queda dormida (glibc) en vez de tumbar el proceso?
+#if defined(__GLIBCXX__)
+    m.attr("_PARK_FORCED_UNWIND") = true;
+#else
+    m.attr("_PARK_FORCED_UNWIND") = false;
+#endif
 }
