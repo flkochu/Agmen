@@ -25,6 +25,7 @@ import hmac
 import io
 import json
 import os
+import random
 import re
 import secrets
 import shutil
@@ -93,16 +94,46 @@ def ref_line(s: bytes, direction: str, n: int, body: str) -> bytes:
     return f"{n} {body} {ref_mac(s, f'{direction}|{n}|{body}').hex()}\n".encode("utf-8")
 
 
-def free_tcp_port() -> int:
-    with socket.socket() as s:
+_PUERTOS_DADOS: set[tuple[int, int]] = set()
+
+
+def _puerto_libre(tipo: int) -> int:
+    """Un puerto libre FUERA del rango efímero del sistema operativo.
+
+    Con bind(0) el sistema da un puerto efímero y, al soltarlo, cualquier conexión saliente (de esta prueba, de
+    un hilo que quedó de otra o de un subproceso) puede tomarlo como puerto de origen antes de que el agente haga
+    su bind: en el CI salió "Address already in use" en un `agmen agent` recién lanzado. Las conexiones salientes
+    nunca usan puertos por debajo del rango efímero (Linux 32768+, Windows y macOS 49152+), así que se elige uno
+    de ahí, se comprueba que se puede abrir y no se reparte dos veces en el mismo proceso."""
+    bajo = 32768
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+            bajo = int(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        if os.name == "nt" or sys.platform == "darwin":
+            bajo = 49152
+    for _ in range(200):
+        puerto = random.randrange(12000, max(12001, bajo - 1))
+        if (tipo, puerto) in _PUERTOS_DADOS:
+            continue
+        try:
+            with socket.socket(socket.AF_INET, tipo) as s:
+                s.bind(("127.0.0.1", puerto))
+        except OSError:
+            continue
+        _PUERTOS_DADOS.add((tipo, puerto))
+        return puerto
+    with socket.socket(socket.AF_INET, tipo) as s:       # sin hueco abajo: lo de siempre
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def free_tcp_port() -> int:
+    return _puerto_libre(socket.SOCK_STREAM)
 
 
 def free_udp_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    return _puerto_libre(socket.SOCK_DGRAM)
 
 
 def source_ip_available(ip: str) -> bool:
@@ -2810,7 +2841,11 @@ class TestClienteQueNoLee(ServerCase):
             t0 = time.monotonic()
             enviados = 0
             try:
-                while enviados < 40000 and time.monotonic() - t0 < 30:
+                # Sin tope de cantidad: cuántas respuestas caben en los buffers del kernel (hasta tcp_wmem máx.,
+                # 4 MB en Linux por omisión, más en otros) cambia de una máquina a otra; si el tope de pings
+                # cabía entero en ellos, el agente nunca veía "sin leer" y cerraba por silencio. Se manda hasta
+                # que el agente cierra la sesión (el envío falla) o se acaba el tiempo.
+                while time.monotonic() - t0 < 30 and not sesion._ending:
                     cli.ch.send({"op": "ping", "t": "x" * 60})
                     enviados += 1
                     if enviados % 50 == 0 and sesion is not None:
