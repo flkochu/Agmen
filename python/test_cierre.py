@@ -963,13 +963,8 @@ class TestReceiveConcurrente(_ConHub):
             # close() desde otro hilo: no se cuelga, y los receive() terminan (None o error "cerr...")
             self.assertFalse(res["close_colgado"], res)
             self.assertEqual(res["close_hilos_vivos"], 0, res)
-            for e in res["close_errores"]:
-                if _backend.NATIVE:
-                    self.assertIn("cerr", e, f"error inesperado en receive() tras close(): {e}")
-                else:
-                    # Python puro: el socket se cierra bajo los pies de los demás hilos (EBADF); no se pierde
-                    # nada en silencio, pero el texto no dice que el Subscriber se cerró.
-                    self.assertTrue("cerr" in e or "Bad file descriptor" in e or "closed" in e.lower(), e)
+            for e in res["close_errores"]:   # nativo y puro: el mismo texto
+                self.assertIn("ya se cerró", e, f"error inesperado en receive() tras close(): {e}")
 
 
 @unittest.skipUnless(_backend.NATIVE, "sin núcleo de C++ (AGMEN_BACKEND=pure o sin compilar)")
