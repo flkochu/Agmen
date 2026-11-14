@@ -1643,6 +1643,122 @@ class TestZonaEnLasIP(unittest.TestCase):
         self.assertEqual(_distinct_ips(["1.2.3.4", "::ffff:1.2.3.4", "1.2.3.4"]), ["1.2.3.4"])
 
 
+class TestZonaAparteScopeId(unittest.TestCase):
+    """getaddrinfo (Windows y Linux) da la zona de una IPv6 link-local aparte, en
+    sockaddr[3] (scope_id), no en el texto. Todo simulado: no depende de IPv6 real."""
+
+    A = "fe80::b5b0:b67c:bc0d:c98e"
+    B = "fe80::fdee:74f7:bc47:f18c"
+
+    @staticmethod
+    def info(*items):
+        """items: (ip, scope_id). IPv4 con sockaddr de 2 elementos, IPv6 de 4."""
+        out = []
+        for ip, scope in items:
+            if ":" in ip:
+                out.append((socket.AF_INET6, 2, 17, "", (ip, 0, 0, scope)))
+            else:
+                out.append((socket.AF_INET, 2, 17, "", (ip, 0)))
+        return out
+
+    @staticmethod
+    def sockets(origen=None):
+        """Socket falso que elige como origen el mismo destino (IP y scope_id);
+        `origen` = {ip_destino: sockname_de_ipv6} cambia el de ciertos destinos."""
+        origen = origen or {}
+        sock = mock.MagicMock()
+        sock.__enter__.return_value = sock
+        ultimo = {}
+        sock.connect.side_effect = lambda dest: ultimo.update(dest=dest)
+
+        def getsockname():
+            dest = ultimo["dest"]
+            base = dest[0].partition("%")[0]
+            if base in origen:
+                return origen[base]
+            if len(dest) == 4:
+                return (base, 0, 0, dest[3])
+            return (base, 0)
+        sock.getsockname.side_effect = getsockname
+        return mock.MagicMock(return_value=sock), sock
+
+    def lugar(self, items, origen=None):
+        fabrica, sock = self.sockets(origen)
+        with mock.patch("socket.getaddrinfo", return_value=self.info(*items)), \
+                mock.patch("socket.socket", fabrica):
+            return check_hosts(["n.local"])["n.local"], sock
+
+    TODAS = (("10.1.0.111", 0), ("192.168.224.1", 0), (A, 5), (B, 9))
+
+    def test_runner_de_windows_dos_link_local_con_scope_id_es_mine(self):
+        p, _ = self.lugar(self.TODAS)
+        self.assertEqual((p.here, p.why), (True, "mine"))
+
+    def test_una_link_local_con_otro_origen_es_mixed_y_la_nota_trae_la_zona(self):
+        p, _ = self.lugar(self.TODAS, {self.B: ("fe80::99", 0, 0, 9)})
+        self.assertEqual((p.here, p.why), (False, "mixed"))
+        self.assertIn(f"{self.A}%5", p.note)
+        self.assertIn(f"{self.B}%9", p.note)
+
+    def test_scope_id_0_no_cuenta_como_de_aqui(self):
+        p, _ = self.lugar((("10.1.0.111", 0), ("fe80::1", 0)))
+        self.assertEqual((p.here, p.why), (False, "mixed"))
+        solo, _ = self.lugar((("fe80::1", 0),))
+        self.assertFalse(solo.here)
+        self.assertIn(solo.why, ("zone", "other"))
+
+    def test_misma_direccion_pero_otro_scope_id_en_getsockname_no_es_de_aqui(self):
+        p, _ = self.lugar(((self.A, 5),), {self.A: (self.A, 0, 0, 7)})
+        self.assertFalse(p.here)
+        p, _ = self.lugar(((self.A, 5),), {self.A: (self.A, 0, 0, 0)})   # sin zona en el origen
+        self.assertFalse(p.here)
+
+    def test_connect_lleva_el_scope_id_en_el_cuarto_elemento_y_ipv4_dos(self):
+        _, sock = self.lugar(((self.A, 5), ("10.1.0.111", 0)))
+        destinos = [c.args[0] for c in sock.connect.call_args_list]
+        v6 = [d for d in destinos if ":" in d[0]]
+        v4 = [d for d in destinos if ":" not in d[0]]
+        self.assertEqual(v6, [(f"{self.A}%5", 1, 0, 5)])
+        self.assertEqual(v4, [("10.1.0.111", 1)])
+
+    def test_zona_con_nombre_usa_if_nametoindex_simulado(self):
+        fabrica, sock = self.sockets()
+        with mock.patch("socket.if_nametoindex", side_effect=lambda n: {"eth0": 4}[n], create=True), \
+                mock.patch("socket.socket", fabrica):
+            self.assertEqual(check_hosts(["fe80::1%eth0"])["fe80::1%eth0"].why, "mine")
+            self.assertEqual(sock.connect.call_args.args[0], ("fe80::1%eth0", 1, 0, 4))
+            self.assertEqual(check_hosts(["fe80::1%4"])["fe80::1%4"].why, "mine")
+
+    def test_with_zone(self):
+        from agmen.machines import _with_zone
+        self.assertEqual(_with_zone(("fe80::1", 0, 0, 5)), "fe80::1%5")
+        self.assertEqual(_with_zone(("fe80::1", 0, 0, 0)), "fe80::1")
+        self.assertEqual(_with_zone(("fe80::1%eth0", 0, 0, 5)), "fe80::1%eth0")
+        self.assertEqual(_with_zone(("10.0.0.1", 0)), "10.0.0.1")
+        self.assertEqual(_with_zone(("10.0.0.1", 0, 0, 5)[:2]), "10.0.0.1")
+
+    def test_deduplicacion_por_direccion_y_zona(self):
+        from agmen.machines import _distinct_ips
+        p, _ = self.lugar((("fe80::1", 5), ("fe80::1%5", 0)))
+        self.assertEqual((p.here, p.why), (True, "mine"))
+        self.assertEqual(_distinct_ips(["fe80::1%5", "fe80::1%5"]), ["fe80::1%5"])
+        self.assertEqual(_distinct_ips(["fe80::1%5", "fe80::1%9"]), ["fe80::1%5", "fe80::1%9"])
+        p, _ = self.lugar((("fe80::1", 5), ("fe80::1", 9)), {"fe80::1": ("fe80::1", 0, 0, 5)})
+        self.assertEqual((p.here, p.why), (False, "mixed"))
+        self.assertIn("fe80::1%5 y fe80::1%9", p.note)
+
+    def test_lo_que_el_usuario_escribe_no_cambio(self):
+        p = check_hosts(["fe80::1"])["fe80::1"]
+        self.assertEqual((p.here, p.why), (False, "zone"))
+        self.assertIn("sin %interfaz", p.note)
+        self.assertEqual(split_host("fe80::1%eth0"), ("fe80::1%eth0", DEFAULT_PORT))
+        self.assertEqual(split_host("[fe80::1%12]:7391"), ("fe80::1%12", 7391))
+        base = '\n[[machine]]\nname = "{}"\nhost = "{}"\n'
+        c = _config(base.format("a", "fe80::1%eth0") + base.format("b", "[fe80::1%12]:7391")
+                    + '\n[[node]]\nname = "n"\ncmd = "x"\n')
+        self.assertEqual([m.host for m in c.machines], ["fe80::1%eth0", "fe80::1%12"])
+
+
 class TestOrdenEnAgmenRun(unittest.TestCase):
     """Los errores que no dependen de la red salen ANTES de consultarla."""
 
