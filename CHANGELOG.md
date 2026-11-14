@@ -82,8 +82,10 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 - **`agmen run` se conecta con cada agente** antes de arrancar nada (ni hub, ni
   `before`, ni nodos locales). Si una conexión falla, no arranca nada, sale con
   código 2 y dice qué hacer. La primera vez pide la clave en la terminal, o la
-  toma de `AGMEN_AGENT_KEY`. Solo guarda en `keys.toml` la que escribiste a
-  mano, y únicamente después de una conexión aceptada.
+  toma de `AGMEN_AGENT_KEY`. Ctrl+C (y Ctrl+D en Linux) al pedir la clave
+  cancela sin arrancar nada, con código de salida 130. Solo guarda en
+  `keys.toml` la que escribiste a mano, y únicamente después de una conexión
+  aceptada.
 - **`agmen run --forget-key NOMBRE`**: borra la clave guardada de una
   `[[machine]]` y sale.
 - **Logs y Ctrl+C con nodos remotos**: los logs de los nodos de otra

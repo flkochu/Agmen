@@ -547,6 +547,7 @@ agmen     │ sin machine, corren en esta computadora: hub, cerebro
 agmen     │ conectando con robot (192.168.1.20:7391)…
 agmen     │ guardé la clave de robot en tu usuario (agmen run --forget-key robot la borra)
 robot     │ sesión de 192.168.1.7: agmen hub en 127.0.0.1:7390
+…
 agmen     │ robot (192.168.1.20:7391): conectado · Agmen 0.13.0
 …
 agmen     │ 'cerebro' no arranca solo (autostart = false); inícialo desde el panel
@@ -608,15 +609,18 @@ agmen agent │ listo. ¡Hasta luego!
 #### La clave: dónde queda y cómo olvidarla
 
 - **En la Pi**: `agent.key`, en la carpeta de Agmen de tu usuario
-  (`%APPDATA%\agmen\` en Windows, `~/.config/agmen/` en Linux). Solo la lee su dueño.
+  (`%APPDATA%\agmen\` en Windows, `~/.config/agmen/` en Linux). En Linux nace
+  con permisos 0600 (solo la lee su dueño); en Windows no se le ponen permisos
+  y queda en tu carpeta de usuario.
 - **En la laptop**: `keys.toml`, en la misma carpeta de tu usuario, con una
   línea por computadora (`"192.168.1.20:7391" = "haxr-9gh2-ztgz"`). Nunca va en
   `robot.toml` ni en git.
 - La laptop guarda **solo la clave que escribiste a mano**, y solo después de
   una conexión aceptada. Si la pones en la variable `AGMEN_AGENT_KEY`, no se
   guarda.
-- Si pulsas Ctrl+C o Ctrl+D cuando `agmen run` te pide la clave, cancela. No
-  conecta ni arranca nada, y lo dice (salida real de Ctrl+D):
+- Ctrl+C cancela cuando `agmen run` te pide la clave, en cualquier sistema;
+  Ctrl+D, solo en Linux. No conecta ni arranca nada, y lo dice (salida real de
+  Ctrl+D):
 
   ```
   agmen │ cancelado (Ctrl+D) antes de conectarme: no arrancó nada

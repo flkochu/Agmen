@@ -369,8 +369,9 @@ Ejemplo de un `sesion` (la firma va al final de la línea, aquí se omite):
   - `n` cuenta las líneas de cada nodo, de uno en uno. Si hay un hueco, el agente
     descartó líneas (ver Límites).
   - `linea` tiene como máximo 8 KiB: una línea más larga se corta.
-- `error`: `texto`. Una orden que no se pudo cumplir: nodo desconocido, nodo que
-  todavía no arranca, orden desconocida o más de 64 órdenes pendientes.
+- `error`: `texto`. Una orden que no se pudo cumplir: nodo desconocido, orden que
+  llega mientras el agente todavía prepara la sesión, orden desconocida o más de
+  64 órdenes pendientes.
 - `pong`: `t`. Repite el `t` del `ping` si es un número o un texto de hasta 64
   caracteres; si no, `null`.
 
@@ -393,7 +394,7 @@ sí quiere decir que se perdió la conexión.
 | Qué | Valor |
 |---|---|
 | Pruebas malas (`error clave`) por minuto, por IP (en IPv6, por cada /64) | 5 |
-| Pruebas malas por minuto, en total | 60. La IP de la última sesión aceptada no cuenta para este límite |
+| Pruebas malas por minuto, en total | 60. Las pruebas malas de la IP de la última sesión aceptada sí suman, pero a esa IP no se le aplica este bloqueo |
 | Pausa tras una prueba mala, por IP | 1 s |
 | Conexiones sin saludar a la vez, por IP | 4 |
 | Conexiones sin saludar a la vez, en total | 32 (una queda reservada para la IP de la última sesión aceptada) |
