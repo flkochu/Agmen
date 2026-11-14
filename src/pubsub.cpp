@@ -167,15 +167,6 @@ public:
 
     void close() {
         if (closed_.exchange(true)) return;
-        if (hub::process_id() != owner_pid_) {
-            // Heredado por un fork: el hilo no existe en este proceso, mu_ pudo
-            // quedar tomado por un hilo del creador y los bloques de memoria
-            // compartida (y su registro) son del creador, que los sigue usando.
-            // No se toca nada: ni join, ni el candado, ni borrar los bloques.
-            thread_.detach();
-            (void)pool_.release();
-            return;
-        }
         {
             std::lock_guard lock(mu_);
             conns_.clear();
@@ -323,7 +314,6 @@ private:
     net::UdpSocket wake_;              // un byte aquí despierta al hilo (funciona igual en Windows)
     std::thread thread_;
     std::atomic<bool> closed_{false};
-    const std::string owner_pid_ = hub::process_id();   // quién lo creó (tras un fork, el hijo lo hereda)
 
     void wake() {
         const std::uint8_t b = 0;
@@ -816,7 +806,6 @@ struct PublisherCore::State {
     std::uint64_t seq = 0;
     bool announced = false;
     std::chrono::steady_clock::time_point last_announce{};
-    const std::string creator_pid = hub::process_id();   // quién lo creó (tras un fork, el hijo lo hereda)
 
     State(const std::string& to, TypeInfo t, std::string label)
         // Por topic todo es local (nivel 2): 127.0.0.1, así Windows no pregunta por el firewall.
@@ -853,9 +842,7 @@ struct PublisherCore::State {
 
     ~State() {
         if (fanout) fanout->close();
-        // Heredado por un fork: el id en el hub es el del creador, que sigue
-        // publicando con él; un "bye" desde aquí lo daría de baja.
-        if (link && socket.valid() && hub::process_id() == creator_pid) link->bye(socket);
+        if (link && socket.valid()) link->bye(socket);
     }
 
     wire::Bytes announcement() const {
@@ -990,7 +977,6 @@ struct SubscriberCore::State {
     std::string last_from;
     bool clock_warned = false;
     std::mutex link_mu;   // el enlace con el hub (heartbeat() puede venir de otro hilo)
-    const std::string creator_pid = hub::process_id();   // quién lo creó (tras un fork, el hijo lo hereda)
     // Memoria compartida (RFC 0009)
     std::shared_ptr<Lent> lent = std::make_shared<Lent>();
     bool tcp_warned = false;
@@ -1028,8 +1014,7 @@ struct SubscriberCore::State {
     }
 
     ~State() {
-        // Heredado por un fork: el id en el hub es el del creador (ver PublisherCore).
-        if (link && socket.valid() && hub::process_id() == creator_pid) link->bye(socket);
+        if (link && socket.valid()) link->bye(socket);
     }
 
     // El TCP en la misma IP y el mismo puerto que el UDP. Con el puerto 0, el que
