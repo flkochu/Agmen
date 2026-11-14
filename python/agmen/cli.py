@@ -65,10 +65,15 @@ def cmd_run(args) -> int:
         print(f"error: el perfil replay es el de --play: agmen run {args.archivo} --play ARCHIVO.mcap",
               file=sys.stderr)
         return 2
-    machine_lines, remote = _machines_for(config)   # RFC 0011 §3.4: nunca medio robot en silencio
-    if remote:
-        print(f"error: {remote}", file=sys.stderr)
-        return 2
+    places = {}   # RFC 0011 §3.4: dónde corre cada [[machine]]; nunca medio robot en silencio
+    if config.machines:
+        from .machines import place_machines, remote_error
+
+        places = place_machines(config)
+        remote = remote_error(config, places)
+        if remote:
+            print(f"error: {remote}", file=sys.stderr)
+            return 2
 
     try:
         if config.hub and any(name == "hub" for name, _ in config.skipped):   # igual en todos los perfiles
@@ -95,13 +100,16 @@ def cmd_run(args) -> int:
             n.autostart = False             # se puede arrancar desde el panel
         if args.play:                       # RFC 0010: todos con el tiempo de la grabación
             n.env.update({"AGMEN_CLOCK": "replay", "AGMEN_CLOCK_SOURCE": "agmen"})
-    launcher = Launcher(config)
+    launcher = Launcher(config, places=places)
     out = _SayTo(launcher)
     launcher.say(f"Agmen {__version__} · robot '{config.name}' · {len(config.nodes)} nodos · {hub_note}")
     if args.play or config.profile != "real" or config.skipped:   # un robot.toml sin perfiles se ve como antes
         launcher.say(_profile_line(config, bool(args.play)))
-    for line in machine_lines:
-        launcher.say(line)
+    if config.machines:
+        from .machines import placement_lines
+
+        for line in placement_lines(config, places):
+            launcher.say(line)
     if args.play:   # RFC 0011, reto 1: los nodos 'real' con datos grabados, que se note
         real = [n.name for n in config.nodes if "real" in n.profiles and n.name not in args.skip]
         if real:
@@ -228,48 +236,6 @@ def _profile_line(config, playing: bool) -> str:
         parts.append("no corren: " + ", ".join(f"{', '.join(names)} ({_of_profiles(profiles)})"
                                                for profiles, names in groups.items()))
     return " · ".join(parts)
-
-
-def _and(names: list[str]) -> str:
-    """['a'] → "'a'"; ['a', 'b'] → "'a' y 'b'"; ['motor', 'imu'] → "'motor' e 'imu'"."""
-    quoted = [f"'{n}'" for n in names]
-    if len(quoted) == 1:
-        return quoted[0]
-    last = names[-1].lower()
-    conj = "e" if last.startswith("i") or (last.startswith("hi") and last[2:3] not in "aeiou") else "y"
-    return f"{', '.join(quoted[:-1])} {conj} {quoted[-1]}"
-
-
-def _machines_for(config) -> tuple[list[str], str]:
-    """Dónde corre cada nodo (RFC 0011 §3.4). Devuelve las líneas para la terminal
-    y, si algún nodo del perfil activo es de otra computadora, el error (esta
-    versión todavía no arranca nodos allá: eso llega con agmen agent)."""
-    if not config.machines:
-        return [], ""   # un robot.toml sin [[machine]] se ve como antes
-    on = {m.name: [n.name for n in config.nodes if n.machine == m.name] for m in config.machines}
-    if config.local:
-        tagged = [name for names in on.values() for name in names]
-        return ["local = true: todo corre en esta computadora"
-                + (f" (se ignora machine: {', '.join(tagged)})" if tagged else "")], ""
-    from .machines import DEFAULT_PORT, placement
-
-    here = placement(config)
-    lines, remote = [], []
-    for m in config.machines:
-        if m.name not in here:
-            continue   # ningún nodo de este perfil corre en ella
-        where = m.host if m.port == DEFAULT_PORT else f"{m.host}:{m.port}"
-        if here[m.name]:
-            lines.append(f"{m.name} ({where}): es esta computadora; sus nodos corren aquí ({', '.join(on[m.name])})")
-        else:
-            verb = "corre" if len(on[m.name]) == 1 else "corren"
-            remote.append(f"{_and(on[m.name])} {verb} en '{m.name}' ({where})")
-    if not remote:
-        return lines, ""
-    there = "esa computadora" if len(remote) == 1 else "cada computadora"
-    return lines, (f"{'; '.join(remote)} y esta versión todavía no arranca nodos en otra computadora (llega con "
-                   f"agmen agent). Mientras tanto: corre agmen run en {there}, o usa "
-                   f"[profile.{config.profile}] local = true para correr todo aquí")
 
 
 def _commands_for(config) -> list:

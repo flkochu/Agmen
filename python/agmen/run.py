@@ -324,9 +324,13 @@ def _parse_machines(data: dict) -> list[MachineConfig]:
             raise ConfigError(f"{where}: {name!r} no es un nombre de computadora válido. Usa letras (sin acentos), "
                               f"dígitos, '_' o '-', ej. \"robot\" o \"laptop\"")
         where = f"[[machine]] '{name}'"
-        if any(m.name == name for m in out):
-            raise ConfigError(f"hay dos [[machine]] llamadas '{name}': los nombres deben ser únicos "
-                              f"(una [[machine]] por computadora)")
+        same = next((m for m in out if m.name.lower() == name.lower()), None)
+        if same is not None:
+            if same.name == name:
+                raise ConfigError(f"hay dos [[machine]] llamadas '{name}': los nombres deben ser únicos "
+                                  f"(una [[machine]] por computadora)")
+            raise ConfigError(f"hay dos [[machine]] que solo cambian en mayúsculas ('{same.name}' y '{name}'): "
+                              f"así es fácil confundirlas. Ponles nombres distintos, o deja una")
         host = raw.get("host")
         if host is None:
             raise ConfigError(f"{where}: falta 'host' (la IP o el nombre de esa computadora), "
@@ -337,8 +341,23 @@ def _parse_machines(data: dict) -> list[MachineConfig]:
             address, port = split_host(host)
         except ValueError as e:
             raise ConfigError(f"{where}: host {e}") from None
+        twin = next((m for m in out if _same_host(m.host, address) and m.port == port), None)
+        if twin is not None:
+            raise ConfigError(f"[[machine]] '{twin.name}' y '{name}' tienen el mismo host ({host.strip()}): son la "
+                              f"misma computadora. Deja una sola [[machine]] y usa su nombre en machine")
         out.append(MachineConfig(name, address, port))
     return out
+
+
+def _same_host(a: str, b: str) -> bool:
+    """¿Dos host escritos distinto son la misma dirección? ("Robot.local" y "robot.local.",
+    "::1" y "0:0::1"). Sin DNS: dos nombres que resuelven igual no se detectan aquí."""
+    import ipaddress
+
+    try:
+        return ipaddress.ip_address(a) == ipaddress.ip_address(b)
+    except ValueError:
+        return a.lower().rstrip(".") == b.lower().rstrip(".")
 
 
 def _parse_machine(raw: dict, where: str, machines: list[MachineConfig]) -> str:
@@ -1085,13 +1104,37 @@ class Printer:
 # ---------------------------------------------------------------------------
 
 class Launcher:
-    def __init__(self, config: RobotConfig, stream=None) -> None:
+    def __init__(self, config: RobotConfig, stream=None, *, places: dict | None = None) -> None:
+        """`places`: dónde corre cada [[machine]] ({nombre: machines.Place}, de
+        machines.place_machines), si quien construye el Launcher ya lo decidió; si
+        no, se decide aquí. Sin [[machine]] no se consulta nada. Esta versión solo
+        arranca nodos en esta computadora: si alguno es de otra, ConfigError (RFC
+        0011 §3.4: nunca medio robot en silencio)."""
+        self.places = self._check_places(config, places)
         self.config = config
         self.logs = LogBook()
         self.printer = Printer([n.name for n in config.nodes] + ["agmen"], stream=stream)
         self.nodes = {n.name: Node(n, config.base_dir, self.logs, self.printer) for n in config.nodes}
         self.stopping = threading.Event()
         self.recording = None    # el control de grabación (RFC 0010); lo pone agmen run
+
+    @staticmethod
+    def _check_places(config: RobotConfig, places: dict | None) -> dict:
+        if not config.machines:
+            return {}
+        from .machines import place_machines, remote_error
+
+        if places is None:
+            places = place_machines(config)
+        used = {n.machine for n in config.nodes if n.machine}
+        missing = sorted(used - set(places))
+        if missing:
+            raise ValueError(f"Launcher: places no dice dónde corre {', '.join(missing)} "
+                             f"(usa machines.place_machines(config))")
+        error = remote_error(config, places)
+        if error:
+            raise ConfigError(error)
+        return places
 
     def say(self, text: str, kind: str = "agmen") -> None:
         self.logs.add("agmen", text, kind)
