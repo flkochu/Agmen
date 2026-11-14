@@ -3611,6 +3611,19 @@ class TestAgmenRemoteHosts(unittest.TestCase):
                 self.assertIn("AGMEN_REMOTE_HOSTS", str(ctx.exception))
                 self.assertIn("ej. AGMEN_REMOTE_HOSTS=192.168.1.20,robot.local:7391", str(ctx.exception))
 
+    def test_el_mensaje_nombra_la_entrada_una_vez_y_da_el_motivo(self):
+        casos = {"http://robot.local": "http://", "robot.local:99999": "puerto", "robot.local:x": "puerto",
+                 "[robot.local]": "corchetes", "[robot.local]:7391": "corchetes", "a b": "no es una IP ni un nombre"}
+        for malo, motivo in casos.items():
+            with self.subTest(malo=malo):
+                with self.assertRaises(ValueError) as ctx:
+                    self.forzados("127.0.0.1," + malo)
+                msg = str(ctx.exception)
+                self.assertEqual(msg.count(repr(malo)), 1, msg)
+                self.assertEqual(msg.count("AGMEN_REMOTE_HOSTS:"), 1, msg)
+                self.assertIn(motivo, msg)
+                self.assertIn("ej. AGMEN_REMOTE_HOSTS=192.168.1.20,robot.local:7391", msg)
+
     def test_el_puerto_mal_escrito_de_una_ip_tambien_es_error(self):
         for malo in ("127.0.0.1:99999", "127.0.0.1:abc", "127.0.0.1:0", "127.0.0.1:"):
             with self.subTest(malo=malo):
@@ -3737,6 +3750,230 @@ class TestRunConAgentesDeMentira(E2EBase):
         self.assertTrue(links["robot"].lost, "el enlace sí supo que se perdió")
         self.assertTrue(perdidas or parar.is_set() or error,
                         "agmen run no se enteró de que una computadora se perdió mientras se conectaba otra")
+
+
+def sin_control(texto: str, permitir_nl: bool = False) -> bool:
+    """True si el texto no trae ningún carácter de control (ni \\r, \\x1b, \\x07…); \\n solo si se permite."""
+    return all(c.isprintable() or (permitir_nl and c == "\n") for c in texto)
+
+
+def servidor_crudo(respuesta: bytes, despues: float = 0.0):
+    """Un servidor falso (sin clave) que lee el hola del cliente, contesta `respuesta` tal cual y cierra."""
+    def comportamiento(c):
+        buf = b""
+        c.settimeout(10)
+        while b"\n" not in buf:
+            d = c.recv(1024)
+            if not d:
+                return
+            buf += d
+        c.sendall(respuesta)
+        time.sleep(despues)
+    return FakeAgent(comportamiento)
+
+
+class TestSaludoAjenoLimpio(LinkCase):
+    """Quien conteste en el puerto (sin clave) no puede meter caracteres de control ni textos enormes en lo
+    que ve la laptop: el error va en una línea y nombra la computadora."""
+
+    def setUp(self):
+        super().setUp()
+        self.port = free_tcp_port()
+
+    def abrir_contra(self, respuesta: bytes) -> agent.LinkError:
+        falso = servidor_crudo(respuesta)
+        self.addCleanup(falso.close)
+        self.write_toml()
+        cfg, m = self.machine(port=falso.port)
+        with self.assertRaises(agent.LinkError) as ctx:
+            agent.AgentLink(m).open(KEY, agent.session_message(cfg, "robot", "real"))
+        return ctx.exception
+
+    def revisar(self, e, largo=1500):
+        t = str(e)
+        self.assertTrue(sin_control(t), repr(t))
+        self.assertTrue(sin_control(e.code), repr(e.code))
+        self.assertLessEqual(len(t), largo, len(t))
+        self.assertIn("robot", t)
+
+    def test_error_del_saludo_con_retorno_de_carro_y_escape(self):
+        e = self.abrir_contra(b"error version texto\rerror: todo bien\x1b[2J\n")
+        self.revisar(e)
+        self.assertIn("texto", str(e))
+
+    def test_version_del_hola_con_escape(self):
+        e = self.abrir_contra(b"agmen-agent/9\x1b[2J\rX hola 00 v\n")
+        self.revisar(e)
+
+    def test_codigo_de_error_desconocido_no_se_imprime(self):
+        e = self.abrir_contra(b"error loquesea\x1b[31m texto\n")
+        self.revisar(e)
+        self.assertNotIn("loquesea", str(e))
+        self.assertNotIn("loquesea", e.code)
+
+    def test_texto_enorme_se_corta(self):
+        for resp in (b"error version " + b"A" * 10000 + b"\n", b"error loquesea " + b"B\x1b" * 5000 + b"\n",
+                     b"agmen-agent/" + b"9" * 10000 + b" hola 00 v\n"):
+            with self.subTest(resp=resp[:20]):
+                self.revisar(self.abrir_contra(resp), largo=1000)
+
+    def test_agmen_run_de_punta_a_punta_sale_con_2_sin_caracteres_de_control(self):
+        falso = servidor_crudo(b"error version texto\rerror: todo bien\x1b[2J\n")
+        self.addCleanup(falso.close)
+        d = self.dir
+        toml = d / "r2.toml"
+        toml.write_text(f'[robot]\nname = "r"\n[[machine]]\nname = "robot"\nhost = "127.0.0.1:{falso.port}"\n'
+                        '[[node]]\nname = "m"\ncmd = ["python", "x"]\nmachine = "robot"\n[hub]\nenabled = false\n'
+                        '[web]\nenabled = false\n', encoding="utf-8")
+        env = {**os.environ, "PYTHONPATH": str(ROOT / "python"), "PYTHONIOENCODING": "utf-8", "NO_COLOR": "1",
+               "AGMEN_CONFIG_DIR": str(d / "cfg"), "AGMEN_REMOTE_HOSTS": "127.0.0.1", "AGMEN_AGENT_KEY": KEY,
+               "AGMEN_HUB": f"127.0.0.1:{free_udp_port()}"}
+        r = subprocess.run([sys.executable, "-m", "agmen", "run", str(toml), "--no-browser", "--no-web"], env=env,
+                           capture_output=True, text=True, encoding="utf-8", timeout=90, stdin=subprocess.DEVNULL)
+        salida = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 2, salida)
+        self.assertTrue(sin_control(salida, permitir_nl=True), repr(salida))
+        self.assertNotIn("Traceback", salida)
+        self.assertIn("robot", salida)
+
+
+class TestPerdidaCortaLaEspera(E2EBase):
+    """Una computadora que se pierde corta la espera de otra que tarda en preparar su sesión."""
+
+    def falso(self, demora=0.0, cerrar_a: float | None = None):
+        recibidos: list[str] = []
+
+        def script(ch, ses):
+            recibidos.append(ses["op"])
+            fin = time.monotonic() + demora
+            while time.monotonic() < fin:
+                try:
+                    m = ch.recv(0.2)
+                except ChannelTimeout:
+                    continue
+                except ChannelError:
+                    return
+                recibidos.append(m["op"])
+                if m["op"] == "adios":
+                    return
+                if m["op"] == "ping":
+                    ch.send({"op": "pong", "t": m.get("t")})
+            ch.send({"op": "sesion_ok", "maquina": "x", "agmen": __version__, "nodos": list(ses["nodos"])})
+            fin = time.monotonic() + (cerrar_a if cerrar_a is not None else 60)
+            while time.monotonic() < fin:
+                try:
+                    m = ch.recv(0.2)
+                except ChannelTimeout:
+                    continue
+                except ChannelError:
+                    return
+                recibidos.append(m["op"])
+                if m["op"] == "ping":
+                    ch.send({"op": "pong", "t": m.get("t")})
+            ch.close()
+
+        f = FakeAgent(agente_que_saluda_bien(script))
+        self.addCleanup(f.close)
+        return f, recibidos
+
+    def toml_dos(self, puertos: dict) -> Path:
+        return TestRunConAgentesDeMentira.toml_con(self, puertos, before=True)
+
+    def test_agmen_run_no_espera_a_la_lenta_y_no_corre_nada_local(self):
+        a, _ = self.falso(cerrar_a=0.5)
+        robot, rec = self.falso(demora=25)
+        t = self.toml_dos({"a": a.port, "robot": robot.port})
+        t0 = time.monotonic()
+        p, lineas = self.correr(clave=KEY, toml=t)
+        self.assertTrue(self.espera(lambda: p.poll() is not None, 20), "agmen run siguió esperando a robot\n"
+                        + self.texto(lineas))
+        self.assertLess(time.monotonic() - t0, 20)
+        self.assertEqual(p.returncode, 1, self.texto(lineas))
+        self.assertTrue(self.espera(lambda: "adios" in rec, 15), f"robot no recibió adios: {rec}")
+        texto = self.texto(lineas)
+        self.assertNotIn("robot (127.0.0.1:" + str(robot.port) + "): conectado", texto)
+        self.assertNotIn("Traceback", texto)
+        self.assertFalse((self.marks / "before_corrio").exists(), "corrió el [robot] before local")
+        self.assertFalse(list(self.marks.glob("arranque_*")), "arrancó un nodo")
+
+    def test_una_sola_computadora_perdida_tras_sesion_ok_no_dice_conectado(self):
+        from agmen import cli
+        from agmen.run import Launcher
+
+        a, _ = self.falso(cerrar_a=0.0)
+        cfg = load_config(self.toml_dos({"a": a.port}))
+        links = {m.name: agent.AgentLink(m) for m in cfg.machines}
+        salida = io.StringIO()
+        launcher = Launcher(cfg, stream=salida, places={n: Place(False, "other") for n in links}, remotes=links)
+        self.addCleanup(launcher.printer.close)
+        perdidas, parar = [], threading.Event()
+        original = agent.AgentLink.open
+
+        def open_lento(self_, *args, **kw):
+            r = original(self_, *args, **kw)
+            self.espera(lambda: self_.lost, 10)     # la caída se nota antes de que _connect siga
+            return r
+
+        with mock.patch.object(agent.AgentLink, "open", open_lento):
+            cli._connect(launcher, cfg, links, {n: (KEY, "variable") for n in links}, "real", perdidas, parar)
+        launcher.printer.close()
+        self.assertTrue(links["a"].lost)
+        self.assertTrue(perdidas or parar.is_set())
+        self.assertNotIn("conectado", salida.getvalue())
+
+
+class TestAdiosNoSeBloquea(LinkCase):
+    """El adios de salida es de cortesía: un agente callado o que no lee no detiene la salida."""
+    TOPE = 1.5
+
+    def setUp(self):
+        super().setUp()
+        self.port = free_tcp_port()
+
+    def test_close_con_el_buffer_de_envio_lleno(self):
+        def script(ch, ses):
+            ch.send({"op": "sesion_ok", "maquina": "robot", "agmen": __version__, "nodos": list(ses["nodos"])})
+            time.sleep(30)          # deja de leer
+
+        falso = FakeAgent(agente_que_saluda_bien(script))
+        self.addCleanup(falso.close)
+        self.write_toml()
+        cfg, m = self.machine(port=falso.port)
+        link = agent.AgentLink(m)
+        link.open(KEY, agent.session_message(cfg, "robot", "real"))
+        self.addCleanup(link.close)
+        s = link.channel.sock
+        s.setblocking(False)
+        llenos = 0
+        while llenos < 200000:       # se llena el buffer hacia el agente (que no lee)
+            try:
+                s.send(b"x" * 65536)
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError:
+                break
+            llenos += 1
+        s.settimeout(6)
+        t0 = time.monotonic()
+        link.close()
+        self.assertLess(time.monotonic() - t0, self.TOPE)
+
+    def test_open_que_sale_por_stop_con_el_agente_callado(self):
+        falso = FakeAgent(agente_que_saluda_bien(lambda ch, ses: time.sleep(30)))
+        self.addCleanup(falso.close)
+        self.write_toml()
+        cfg, m = self.machine(port=falso.port)
+        stop = threading.Event()
+        threading.Timer(0.5, stop.set).start()
+        link = agent.AgentLink(m)
+        t0 = time.monotonic()
+        with self.assertRaises(agent.LinkError) as ctx:
+            link.open(KEY, agent.session_message(cfg, "robot", "real"), stop=stop)
+        self.assertLess(time.monotonic() - t0, 0.5 + self.TOPE)
+        self.assertEqual(ctx.exception.code, "detenido")
+        t0 = time.monotonic()
+        link.close()
+        self.assertLess(time.monotonic() - t0, self.TOPE)
 
 
 @unittest.skipUnless(os.name == "posix", "necesita una terminal de verdad (pty): solo POSIX")
