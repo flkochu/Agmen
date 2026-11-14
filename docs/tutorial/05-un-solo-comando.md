@@ -295,9 +295,9 @@ http = "127.0.0.1:8098"          # en simulación, el panel usa este puerto
 ```
 
 Lo que pones en `[profile.X]` reemplaza lo de arriba, pero solo en ese
-perfil. Las claves que puedes poner ahí son `clock`, `web` y `record`. La
-clave `local` ya se acepta, pero todavía no hace nada: sirve para varias
-computadoras, y llega más adelante en 0.14.0.
+perfil. Las claves que puedes poner ahí son `clock`, `web`, `record` y `local`.
+Con `local = true`, todo corre en esta computadora, aunque un nodo diga
+`machine` (lo vemos en la [sección 7](#7-decir-en-qué-computadora-corre-cada-nodo-machine)).
 
 Un perfil puede tener cualquier nombre (letras sin acento, números, `_` o
 `-`). Por ejemplo, el robot sobre la mesa, sin ruedas. Pon `profile = "mesa"`
@@ -354,11 +354,148 @@ Pero un `--skip` con un nombre que no existe sí es error, y te dice cuáles hay
 error: --skip nada: no hay un nodo con ese nombre (hay: hub, imu, motor)
 ```
 
+## 7. Decir en qué computadora corre cada nodo (`[[machine]]`)
+
+*Disponible desde Agmen 0.14.0 (aún sin publicar)*
+
+Un robot suele tener dos computadoras. Por ejemplo, Adán tiene una laptop con
+Windows y una Raspberry Pi en el robot, y las dos están en el WiFi de la
+escuela. El motor debe ir en la Raspberry Pi; la IA y el panel, en la laptop.
+
+Con `[[machine]]` le dices a Agmen qué computadoras tienes. Con `machine` en un
+`[[node]]` (o en un `[[mux]]`) dices en cuál corre ese nodo. Sin `machine`, el
+nodo corre donde corres `agmen run`, como hasta ahora.
+
+> **Lo que funciona hoy.** `agmen run` decide dónde corre cada nodo y lo dice
+> en la terminal. Lo que **todavía no** funciona: arrancar un nodo en *otra*
+> computadora. Eso llega con `agmen agent`, en una versión próxima (RFC 0011).
+> Hoy, si un nodo dice que corre en otra computadora, `agmen run` **no arranca
+> nada** y te dice qué hacer.
+
+| | Hoy (0.14.0, sin publicar) | Después (con `agmen agent`) |
+|---|---|---|
+| Declarar `[[machine]]` y `machine` | Sí | Sí |
+| `agmen run` en la computadora de un `machine` arranca sus nodos | Sí | Sí |
+| Arrancar nodos en otra computadora | No: sale con error y no arranca nada | Sí |
+| `[profile.X] local = true` (todo aquí) | Sí | Sí |
+
+### Paso 1: el archivo
+
+Guárdalo como `examples/tutorial/robot_maquinas.toml`. Es el robot del tutorial,
+con una `[[machine]]` para la Raspberry Pi:
+
+```toml
+[robot]
+name = "robot del tutorial, en dos computadoras"
+before = ["cmake --build ../../build --config Release"]
+
+[[machine]]
+name = "robot"                  # la Raspberry Pi del robot
+host = "192.168.1.20"           # su IP: en la Pi, `hostname -I`; en Windows, `ipconfig`
+
+[[node]]
+name = "imu"
+cmd = "../../build/bin/publisher --rate 100 --to /imu"
+restart = "on-failure"
+machine = "robot"               # corre en la Raspberry Pi
+profile = "real"                # toca el sensor de verdad: nunca corre en simulación
+
+[[node]]
+name = "motor"
+cmd = "../../build/bin/tutorial_motor --escuchar /cmd"
+restart = "on-failure"
+machine = "robot"               # corre en la Raspberry Pi
+profile = "real"                # toca el motor: nunca corre en simulación
+
+[[node]]
+name = "cerebro"                # sin machine: corre donde corres agmen run
+cmd = "python cerebro.py --destino /cmd/cerebro"
+autostart = false
+
+[[mux]]
+name = "ruedas"
+output = "/cmd"
+hold_ms = 300
+
+[[mux.input]]
+name = "cerebro"
+topic = "/cmd/cerebro"
+priority = 1
+```
+
+Un `[[mux]]` también puede tener `machine`, igual que un nodo. Si `machine`
+dice un nombre que no declaraste, `agmen run` no arranca y te dice qué falta:
+escribir `machine = "robot"` sin ninguna `[[machine]]` da un error que te pide
+declararla.
+
+### Paso 2: los tres casos
+
+**Caso 1: `agmen run` en la misma Raspberry Pi (sin laptop).** La IP de `host`
+es de esta computadora, y Agmen lo sabe. Los nodos `imu` y `motor` arrancan ahí.
+La terminal dice:
+
+```
+agmen   │ robot (192.168.1.20): es esta computadora; sus nodos corren aquí (imu, motor)
+agmen   │ sin machine, corren en esta computadora: hub, ruedas, cerebro
+```
+
+Así corre todo el robot sin laptop, con el mismo archivo.
+
+**Caso 2: `agmen run` en la laptop.** La IP de `host` es de otra computadora.
+Agmen no arranca nada, ni siquiera el hub. Sale con código de error (2) y el
+mensaje dice cuatro cosas: qué nodos están en la otra computadora, dónde está
+(nombre y dirección), que esta versión todavía no los arranca, y qué hacer.
+Lo que hacer: correr `agmen run` en la Raspberry Pi (caso 1), o probar aquí en
+simulación (caso 3).
+
+**Caso 3: simulación en la laptop con `local = true`.** Agrega esto a tu archivo:
+
+```toml
+[profile.sim]
+local = true
+```
+
+Con `agmen run examples/tutorial/robot_maquinas.toml --sim`, todo corre en la
+laptop. Si un nodo del perfil `sim` dijera `machine`, la terminal lo dice
+(aquí, el nodo `mundo` del [capítulo 17](17-simulacion-y-real.md)):
+
+```
+agmen   │ local = true: todo corre en esta computadora (se ignora machine: mundo)
+```
+
+Los nodos `imu` y `motor` son `profile = "real"`, así que en simulación no
+corren, como en la sección 6.
+
+### ¿Por qué poner la IP y no el nombre?
+
+Si pones un nombre, como `robot.local`, Agmen le pregunta a la red en qué IP
+está. Si la red no lo conoce, o no contesta en 1.5 segundos, Agmen no puede
+saber si esa computadora es la tuya. Ante la duda, supone que es **otra**. Por
+eso el mensaje dice `no pude resolver 'robot.local'` y te pide la IP.
+
+¿Por qué es mejor así? Un error de más (no arranca y lo dice) se arregla en un
+minuto. Un motor que arranca en la computadora equivocada, no. Una IP no depende
+de la red de la escuela: siempre apunta a la misma computadora. Si la Raspberry
+Pi cambia de IP, cámbiala en `host`.
+
+### ¿Por qué `profile = "real"` en el hardware?
+
+Un motor o un sensor de verdad se marca con `profile = "real"`. Así la
+simulación nunca lo arranca, aunque lo olvides. Los avisos de Agmen tampoco
+sugieren correr ese hardware en la laptop: si el motor está en la Raspberry Pi,
+el aviso solo ofrece la simulación (caso 3), donde ese nodo no corre.
+
+Un nodo **sin** `profile` corre en todos los perfiles, incluida la simulación. Si
+es un motor, la simulación en la laptop podría intentar moverlo. Por eso el
+hardware siempre lleva `profile = "real"`.
+
 ## Lo que aprendiste
 
 - A describir tu robot en un archivo y levantarlo con **un comando**.
 - A tener un solo `robot.toml` para el robot y para simulación, con perfiles
   (`profile`, `--sim` y `--profile`), y a marcar el hardware con `profile = "real"`.
+- A decir en qué computadora corre cada nodo con `[[machine]]` y `machine`, qué
+  funciona hoy (sin `agmen agent`) y cómo leer lo que dice la terminal.
 - A controlar y depurar todo **desde el navegador**: nodos, logs, sensores y manejo.
 - Que Agmen te avisa claro cuando algo está mal, en el archivo o en un nodo.
 
