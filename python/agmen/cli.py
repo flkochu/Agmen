@@ -1,6 +1,7 @@
 """El comando `agmen`.
 
     agmen run [robot.toml]     lanza todo el robot + panel web, con un solo comando
+    agmen agent [robot.toml]   en otra computadora del robot: espera a agmen run y corre sus nodos
     agmen web [ARCHIVO.mcap]   solo el panel web (sin administrar nodos), o para ver una grabación
     agmen mux --out ... --in   prioridad de comandos: ¿quién manda al motor?
     agmen echo IP:PUERTO       muestra cualquier mensaje que llegue (sin código del tipo)
@@ -228,6 +229,69 @@ def cmd_run(args) -> int:
             player.stop()
         elif clock_server:
             clock_server.close()
+    return 0
+
+
+def cmd_agent(args) -> int:
+    """agmen agent (RFC 0011 §3.4, D6, D7, D9): en la computadora del robot, espera a
+    agmen run y corre los nodos de SU robot.toml que dicen machine = esta computadora."""
+    from .agent import AgentError, AgentServer, agent_key_path, load_agent_key, pick_machine
+    from .machines import _address
+    from .run import ConfigError, Printer, load_config
+
+    try:
+        config = load_config(args.archivo)
+    except ConfigError as e:
+        print(f"error en {args.archivo}: {e}", file=sys.stderr)
+        return 2
+    try:
+        me = pick_machine(config, args.machine)
+    except AgentError as e:
+        print(f"error en {args.archivo}: {e}", file=sys.stderr)
+        return 2
+    if args.port is not None and not 1 <= args.port <= 65535:
+        print(f"error: --port {args.port}: el puerto es un número entre 1 y 65535", file=sys.stderr)
+        return 2
+    port = args.port if args.port is not None else me.port
+    try:
+        key, created = load_agent_key(new=args.new_key)
+    except AgentError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    host = f"[{me.host}]" if ":" in me.host else me.host
+    printer = Printer(["agmen agent"])
+
+    def say(text: str, kind: str = "agmen") -> None:
+        printer("agmen agent", text, kind)
+
+    server = AgentServer(args.archivo, me.name, key, port=port, shown=f"{host}:{port}", say=say)
+    try:
+        server.bind()
+    except OSError as e:
+        why = str(e.strerror or e).split(" (while")[0]
+        print(f"error: no pude escuchar en el puerto {port} ({why}): ¿ya corre otro agmen agent en esta "
+              f"computadora? Detenlo (Ctrl+C en su terminal), o usa otro con --port N y ponlo también en host de "
+              f"[[machine]] '{me.name}' (ej. host = \"{host}:{port + 1}\")", file=sys.stderr)
+        printer.close()
+        return 2
+    here = [n.name for n in config.nodes if n.machine == me.name]
+    say(f"Agmen {__version__} · robot '{config.name}' · esta computadora es '{me.name}' ({_address(me)}) · "
+        f"nodos de aquí (perfil {config.profile}): {', '.join(here) or 'ninguno'}")
+    if args.port is not None and args.port != me.port:
+        say(f"⚠ --port {args.port}: en tu laptop, host de [[machine]] '{me.name}' debe decir \"{host}:{port}\"")
+    if created:
+        say(f"clave {'nueva' if args.new_key else 'creada'} (guardada en {agent_key_path()}): agmen run te la pide "
+            f"la primera vez que se conecta" + ("; la clave anterior ya no sirve" if args.new_key else ""))
+    say(f"{server.waiting_line()} · clave: {key}", "out")
+    stop = threading.Event()
+    threading.Thread(target=server.serve, args=(stop,), daemon=True, name="agmen-agent").start()
+    try:
+        _wait_for_ctrl_c(stop)
+    finally:
+        say("deteniendo…")
+        server.close()
+        say("listo. ¡Hasta luego!")
+        printer.close()
     return 0
 
 
@@ -486,6 +550,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--sim", action="store_true",
                    help="lo mismo que --profile sim: el simulador en vez del robot, con reloj de simulación")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("agent", help="en otra computadora del robot: espera a agmen run y corre ahí sus nodos")
+    p.add_argument("archivo", nargs="?", default="robot.toml", help="archivo del robot (default: robot.toml)")
+    p.add_argument("--machine", metavar="NOMBRE",
+                   help="qué [[machine]] es esta computadora (default: la única cuyo host es de aquí)")
+    p.add_argument("--port", type=int, metavar="N",
+                   help="dónde escuchar (default: el puerto del host de su [[machine]], 7391)")
+    p.add_argument("--new-key", action="store_true",
+                   help="crear una clave nueva (la anterior deja de servir; la laptop la pide otra vez)")
+    p.set_defaults(func=cmd_agent)
 
     p = sub.add_parser("web", help="solo el panel web (sin administrar nodos); o una grabación: agmen web vuelta1.mcap")
     p.add_argument("archivo", nargs="?", metavar="ARCHIVO.mcap",

@@ -842,12 +842,25 @@ class Node:
         self.printer = printer
         self.lock = threading.RLock()
         self.proc: subprocess.Popen | None = None
+        # Quién quiere saber de cada cambio de estado (agmen agent, RFC 0011 §3.4). Se llama
+        # con el nodo, ya con su proc y exit_code nuevos, y con self.lock tomado: no debe esperar.
+        self.on_state: Callable[[Node], None] | None = None
         self.state = "detenido"          # corriendo | detenido | falló | reiniciando | terminó
         self.started_at: float | None = None
         self.restarts = 0
         self.exit_code: int | None = None
         self.wanted = False              # ¿el usuario quiere que esté corriendo?
         self._generation = 0
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @state.setter
+    def state(self, value: str) -> None:
+        self._state = value
+        if self.on_state is not None:
+            self.on_state(self)
 
     # --- estado para el panel ---
     def info(self) -> dict:
@@ -908,12 +921,12 @@ class Node:
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace", bufsize=1, **kwargs)
         except OSError as e:
-            self.state, self.exit_code = "falló", None
+            self.exit_code, self.state = None, "falló"   # el estado al final: on_state ve todo lo nuevo
             self._log(f"no se pudo arrancar '{self.cfg.cmd[0]}': {e.strerror or e}. "
                       f"¿Compilaste el proyecto y la ruta es correcta (relativa a robot.toml)?", "error")
             return
         self._generation += 1
-        self.state, self.started_at, self.exit_code = "corriendo", time.time(), None
+        self.started_at, self.exit_code, self.state = time.time(), None, "corriendo"
         self._log(f"▶ iniciado (pid {self.proc.pid})", "agmen")
         threading.Thread(target=self._pump, args=(self.proc, self._generation), daemon=True).start()
 
