@@ -92,6 +92,7 @@ class _HubLink:
         self._warned = False
         self._on_warn = on_warn or (lambda t: print(f"[agmen] ⚠ {t}", file=sys.stderr, flush=True))
         self._stop = threading.Event()
+        self._pid = os.getpid()   # quién lo creó (tras un fork, el hijo lo hereda)
         self.beat()
         self._thread = threading.Thread(target=self._loop, name=f"agmen-latido-{self.id[:6]}", daemon=True)
         self._thread.start()
@@ -121,6 +122,8 @@ class _HubLink:
 
     def close(self) -> None:
         self._stop.set()
+        if os.getpid() != self._pid:
+            return   # heredado por un fork: el id es el del creador, que sigue usándolo; un "bye" lo daría de baja
         try:
             self.sock.sendto(hp.encode("bye", id=self.id), self.hub)
         except OSError:
@@ -759,6 +762,10 @@ class RawPublisher:
 # se piden con límite, para que la salida nunca se cuelgue.
 _cerrando = False
 _LOCK_AL_CERRAR_S = 0.2
+# Desde el cierre, publish() y receive() de otros hilos regresan al instante sin soltar el GIL (ver
+# python/src/core.cpp): un hilo que los llama en un bucle acapararía el GIL, y el hilo de latidos (y el
+# que cierra) esperarían turno. Tras una llamada que no hizo nada, se cede el GIL este rato.
+_CORTESIA_S = 0.002
 
 
 # Los Publisher y Subscriber nativos vivos: en el hijo de un fork sus locks se reponen (_despues_de_fork).
@@ -836,13 +843,17 @@ class _NativePublisher:
         """Manda `msg`. t_data = instante al que corresponden los datos (default: ahora).
         Devuelve False si no se pudo entregar a nadie (no es un error)."""
         payload = msg.encode_payload()
-        return self._core.publish(payload, wire.now_ns() if t_data is None else int(t_data))
+        ok = self._core.publish(payload, wire.now_ns() if t_data is None else int(t_data))
+        if not ok and _cerrando:
+            time.sleep(_CORTESIA_S)   # saliendo: no acaparar el GIL (ver _CORTESIA_S)
+        return ok
 
     def announce(self) -> None:
         self._core.announce()
 
     def _beat(self) -> None:
-        if not _lock_or_skip(self._lock):
+        # El latido es de mejor esfuerzo: nunca espera el lock sin límite (lo tiene un close() en curso).
+        if not self._lock.acquire(timeout=_LOCK_AL_CERRAR_S):
             return
         try:
             if not self._core.closed:
@@ -913,6 +924,8 @@ class _NativeSubscriber:
         si no llegó. Lanza wire.WireError si llega algo inválido o de otro tipo."""
         got = self._core.receive(timeout)
         if got is None:
+            if _cerrando:
+                time.sleep(_CORTESIA_S)   # saliendo: no acaparar el GIL (ver _CORTESIA_S)
             return None
         env, payload, sender = got
         return Sample(wire.Envelope(*env), self.type.decode_payload(payload), sender)
@@ -928,10 +941,22 @@ class _NativeSubscriber:
         return self._core.port
 
     def fileno(self) -> int:
+        self._usado_en_el_hijo()
         return self._core.fileno()
 
     def filenos(self) -> list:
+        self._usado_en_el_hijo()
         return self._core.filenos()
+
+    _heredado = False   # True en el hijo de un fork, hasta que lo usa (ver _despues_de_fork)
+
+    def _usado_en_el_hijo(self) -> None:
+        """Heredado de un fork y vigilado con select(): que el hijo lata por él (si el padre muere, el
+        hub lo quitaría y el hijo esperaría sordo). receive() late solo, así que no lo necesita."""
+        if self._heredado:
+            self._heredado = False
+            if self.topic:
+                _beats.add(self)
 
     @property
     def tcp_port(self) -> int:
@@ -939,7 +964,8 @@ class _NativeSubscriber:
         return self._core.tcp_port
 
     def _beat(self) -> None:
-        if not _lock_or_skip(self._lock):
+        # El latido es de mejor esfuerzo: nunca espera el lock sin límite (lo tiene un close() en curso).
+        if not self._lock.acquire(timeout=_LOCK_AL_CERRAR_S):
             return
         try:
             if not self._core.closed:
@@ -983,30 +1009,20 @@ if _backend.NATIVE:
 
     def _donde_esta(t: threading.Thread | None) -> str:
         """Para el aviso: en qué proceso y en qué línea de Python está parado el hilo `t` (los dos
-        marcos de más adentro). Si estaba dentro del núcleo de C++, la línea es la que lo llamó."""
-        import linecache
-
+        marcos de más adentro). Si estaba dentro del núcleo de C++, la línea es la que lo llamó. Sin el
+        texto de la línea: el aviso va a stderr y a los logs, y una línea de código puede tener un secreto."""
         proceso = f"proceso {os.getpid()}" + (", hijo de un fork" if _hijo_de_fork else "")
-        marco = None
-        try:
-            if t is not None and t.ident is not None:
-                marco = sys._current_frames().get(t.ident)
-        except Exception:  # noqa: BLE001 — el aviso sale aunque no se sepa dónde
-            marco = None
-        if marco is None:
-            return f"({proceso})"
-        lugares = []
-        while marco is not None and len(lugares) < 2:
-            co = marco.f_code
-            lugar = f"{os.path.basename(co.co_filename)}:{marco.f_lineno} {co.co_name}"
-            if not lugares:   # el de más adentro: también la instrucción (p. ej. self._core.heartbeat())
-                codigo = linecache.getline(co.co_filename, marco.f_lineno).strip()
-                if codigo:
-                    lugar += f" «{codigo}»"
-            lugares.append(lugar)
-            marco = marco.f_back
-        del marco
-        return f"({proceso}; parado en {' ← '.join(lugares)})"
+        try:   # todo: si algo falla aquí, el aviso sale igual, sin el lugar
+            marco = sys._current_frames().get(t.ident) if t is not None and t.ident is not None else None
+            lugares = []
+            while marco is not None and len(lugares) < 2:
+                co = marco.f_code
+                lugares.append(f"{os.path.basename(co.co_filename)}:{marco.f_lineno} {co.co_name}")
+                marco = marco.f_back
+            del marco
+        except Exception:  # noqa: BLE001
+            lugares = []
+        return f"({proceso}; parado en {' ← '.join(lugares)})" if lugares else f"({proceso})"
 
     def _cierre_resto(falta: str, sobra: float, esperado: float, apurado: bool) -> None:
         """Lo que sigue al cierre del núcleo, que registra atexit como _core._cierre (una función de C:
@@ -1053,11 +1069,15 @@ if _backend.NATIVE:
         _hijo_de_fork = True
         for o in list(_nativos):
             o._lock = threading.Lock()
+            o._heredado = True
         # El hilo de latidos del hijo no late por los objetos heredados: su estado de C++ puede tener
         # tomado un mutex que retenía un hilo del padre (un publish() a medias: el de PublisherCore), y
         # el latido se quedaría esperándolo para siempre (al salir: "1 en un latido; el hilo de latidos").
-        # No hacen falta: llevan el mismo id en el hub que los del padre, que sigue latiendo por ellos, y si
-        # el hijo los usa, publish() y receive() laten solos.
+        # Mientras el padre vive, sobran: llevan el mismo id en el hub que los del padre, que late por
+        # ellos. Si el padre muere, el hub quita a los que nadie usa a los 3 s; publish() y receive()
+        # laten solos (y los vuelven a registrar), y un Subscriber vigilado con fileno()/filenos() vuelve
+        # a la lista de latidos al pedirlos (_usado_en_el_hijo). Límite: si su mutex quedó tomado, ese
+        # objeto no sirve en el hijo (publish() o receive() también se quedarían esperando).
         _beats.pubs = weakref.WeakSet()
         _beats.lock = threading.Lock()
         _beats.stopping = threading.Event()
