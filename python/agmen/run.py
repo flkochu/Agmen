@@ -1134,8 +1134,8 @@ class Launcher:
             raise ConfigError(f"el nodo '{n.name}' dice machine = '{n.machine}', pero no hay ninguna [[machine]] "
                               f"'{n.machine}' en la configuración"
                               + (f" (hay: {', '.join(sorted(declared))})" if declared else "")
-                              + f". Declárala en robot.toml ([[machine]] name = \"{n.machine}\" y su host), "
-                                f"o quita machine para que corra aquí")
+                              + f". Declárala en la configuración ([[machine]] name = \"{n.machine}\" y su "
+                                f"host)")
         from .machines import place_machines, remote_error
 
         if places is None:

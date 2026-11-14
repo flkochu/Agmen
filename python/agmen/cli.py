@@ -93,12 +93,23 @@ def cmd_run(args) -> int:
             n.env.update({"AGMEN_CLOCK": "replay", "AGMEN_CLOCK_SOURCE": "agmen"})
     places = {}   # RFC 0011 §3.4: dónde corre cada [[machine]]; nunca medio robot en silencio.
     # Después de los errores del archivo: esta consulta puede tardar hasta 1.5 s (DNS)
+    player = None
     if config.machines:
         from .machines import place_machines, remote_error
 
+        if args.play:   # la grabación tampoco depende de la red: se revisa antes
+            from .play import Player
+
+            try:
+                player = Player(args.play, args.play_topic or None, paused=True)
+            except (ValueError, OSError) as e:
+                print(f"error: --play: {e}", file=sys.stderr)
+                return 2
         places = place_machines(config)
         remote = remote_error(config, places)
         if remote:
+            if player is not None:
+                player.stop()
             print(f"error: {remote}", file=sys.stderr)
             return 2
 
@@ -130,9 +141,12 @@ def cmd_run(args) -> int:
             launcher.say(line)
     if not launcher.run_before():
         launcher.printer.close()
+        if player is not None:
+            player.stop()
         return 1
-    player = None
-    if args.play:
+    if player is not None:      # ya revisada antes de la consulta de red
+        player.out = out
+    elif args.play:
         from .play import Player
 
         try:

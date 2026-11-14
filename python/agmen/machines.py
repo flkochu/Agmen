@@ -244,11 +244,13 @@ def check_hosts(hosts: list[str], timeout: float = RESOLVE_TIMEOUT) -> dict[str,
 
 
 def _distinct_ips(ips: list[str]) -> list[str]:
-    """Las IP sin repetir: la misma escrita dos veces (o ::ffff:1.2.3.4 y 1.2.3.4) cuenta una vez."""
+    """Las IP sin repetir: la misma escrita dos veces (o ::ffff:1.2.3.4 y 1.2.3.4) cuenta una vez.
+    La zona es parte de la dirección: fe80::1%eth0 y fe80::1%wlan0 son dos."""
     out: dict[str, str] = {}
     for ip in ips:
+        base, sep, zone = ip.partition("%")
         try:
-            key = str(unwrap(ipaddress.ip_address(ip.split("%", 1)[0])))
+            key = str(unwrap(ipaddress.ip_address(base))) + sep + zone
         except ValueError:
             key = ip
         out.setdefault(key, ip)
@@ -311,7 +313,9 @@ def hardware_remote(config, remote: list[str]) -> bool:
 
 def _sim_is_safe(config, remote: list[str]) -> bool:
     """¿Sugerir [profile.sim] local = true no traería aquí hardware de las otras computadoras?
-    No, si algún nodo remoto es a la vez de "real" y de "sim" (ej. profile = ["real", "sim"])."""
+    No, si algún nodo remoto es a la vez de "real" y de "sim" (ej. profile = ["real", "sim"]).
+    Solo ve config.nodes (los del perfil activo): la respuesta es completa solo en el perfil
+    "real", donde están todos los nodos de hardware. Por eso solo se usa en "real"."""
     return config.profile != "sim" and not any(
         n.machine in remote and "real" in n.profiles and "sim" in n.profiles for n in config.nodes)
 
@@ -348,7 +352,7 @@ def remote_error(config, places: dict[str, Place]) -> str:
             f"en una versión próxima.{notes}")
     if not hardware:
         return f"{text} Mientras tanto: usa {local}"
-    if _sim_is_safe(config, remote_names):
+    if config.profile == "real" and _sim_is_safe(config, remote_names):
         return f"{text} Mientras tanto, para probar aquí en simulación: {sim}"
     return text
 
