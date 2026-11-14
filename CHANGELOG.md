@@ -45,8 +45,8 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   que el hardware. `agmen run examples/tutorial/robot.toml --sim` lo corre; el
   cerebro, el mux y el panel no cambian. El mundo sigue al reloj de Agmen, así
   que la pausa, el paso y la velocidad del panel funcionan.
-  - Tres archivos: `mundo.py` (el nodo), `fisica.py` (la clase `Mundo`, sin
-    Agmen) y `ver.py` (la ventana de `--ver`).
+  - Cuatro archivos: `mundo.py` (el nodo), `fisica.py` (la clase `Mundo`, sin
+    Agmen), `camara.py` (la cámara) y `ver.py` (la ventana de `--ver`).
   - `--ver` abre la ventana de MuJoCo. Sin pantalla, avisa y sigue.
   - Sin OpenGL, el mundo sigue sin cámara y lo dice en una línea.
   - La clase `Mundo` (`fisica.py`) se puede usar sola, sin Agmen (pensada para

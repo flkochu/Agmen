@@ -320,13 +320,14 @@ así que al reproducirla el tiempo queda igual.
 
 ## 10. Un vistazo al código del mundo
 
-El mundo son **tres archivos** en [`examples/sim/`](../../examples/sim/).
+El mundo son **cuatro archivos** en [`examples/sim/`](../../examples/sim/).
 Cada uno hace una sola cosa:
 
 | Archivo | Qué tiene | ¿Cuándo leerlo? |
 |---|---|---|
 | [`mundo.py`](../../examples/sim/mundo.py) | El **nodo**: sigue al reloj de Agmen, publica `/imu` y `/camara`, escucha `/cmd`. | **Primero.** Es lo que corre `agmen run`. |
 | [`fisica.py`](../../examples/sim/fisica.py) | La clase `Mundo`: la física de MuJoCo, **sin Agmen**. | Cuando quieras usar la física sola (sección 12). |
+| [`camara.py`](../../examples/sim/camara.py) | La cámara: dibuja en su propio hilo y publica `/camara`. | Si quieres ver cómo se publica una imagen sin frenar la física. |
 | [`ver.py`](../../examples/sim/ver.py) | La ventana de MuJoCo de `--ver`. | Solo si te interesa la ventana. |
 
 Conviene leerlos en ese orden. Empieza por `mundo.py`: es corto, y se
