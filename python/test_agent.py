@@ -3609,7 +3609,7 @@ class TestAgmenRemoteHosts(unittest.TestCase):
                 with self.assertRaises(ValueError) as ctx:
                     self.forzados(malo)
                 self.assertIn("AGMEN_REMOTE_HOSTS", str(ctx.exception))
-                self.assertIn("ej. AGMEN_REMOTE_HOSTS=127.0.0.2,robot.local", str(ctx.exception))
+                self.assertIn("ej. AGMEN_REMOTE_HOSTS=192.168.1.20,robot.local:7391", str(ctx.exception))
 
     def test_el_puerto_mal_escrito_de_una_ip_tambien_es_error(self):
         for malo in ("127.0.0.1:99999", "127.0.0.1:abc", "127.0.0.1:0", "127.0.0.1:"):
