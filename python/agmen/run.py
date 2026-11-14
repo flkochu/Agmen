@@ -13,6 +13,7 @@ Un solo comando en vez de una terminal por nodo:
 
 from __future__ import annotations
 
+import copy
 import difflib
 import os
 import re
@@ -58,6 +59,16 @@ class NodeConfig:
     cwd: Path | None = None
     env: dict[str, str] = field(default_factory=dict)
     profiles: tuple[str, ...] = ()   # en qué perfiles corre (RFC 0011); vacía = en todos
+    machine: str = ""                # en qué [[machine]] corre (RFC 0011 §3.4); vacío = donde corre agmen run
+    raw: dict = field(default_factory=dict)   # la tabla tal como se escribió en robot.toml (para comparar dos copias)
+
+
+@dataclass
+class MachineConfig:
+    """Una [[machine]] de robot.toml (RFC 0011 §3.4): una computadora del robot."""
+    name: str
+    host: str              # IP o nombre, sin el puerto (no se resuelve al leer el archivo)
+    port: int = 7391       # donde escucha agmen agent
 
 
 @dataclass
@@ -124,6 +135,7 @@ class MuxConfig:
     inputs: list[tuple[str, str, int]]             # (nombre, topic o dirección, prioridad)
     hold_ms: float = 300.0
     profiles: tuple[str, ...] = ()                 # en qué perfiles corre (RFC 0011); vacía = en todos
+    machine: str = ""                              # en qué [[machine]] corre (RFC 0011 §3.4)
 
 
 @dataclass
@@ -143,7 +155,8 @@ class RobotConfig:
     profile: str = "real"                                    # el perfil activo
     profiles: tuple[str, ...] = ("real", "sim", "replay")   # los perfiles conocidos
     skipped: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)   # (nodo o mux, perfiles) que no corren
-    local: bool = False                                      # [profile.X] local (RFC 0011 §3.4)
+    local: bool = False                                      # [profile.X] local (RFC 0011 §3.4): se ignora machine
+    machines: list[MachineConfig] = field(default_factory=list)   # [[machine]] (RFC 0011 §3.4)
     warnings: list[str] = field(default_factory=list)        # avisos (no errores) de robot.toml, ej. un perfil mal escrito
 
     def topics_used(self) -> set[str]:
@@ -288,6 +301,67 @@ def _claim(declared: dict, name: str, kind: str, profiles: tuple[str, ...]) -> N
     declared.setdefault(name, []).append((kind, profiles))
 
 
+def _parse_machines(data: dict) -> list[MachineConfig]:
+    """Las [[machine]] (RFC 0011 §3.4). `host` no se resuelve aquí: eso lo hace
+    agmen run al arrancar (agmen.machines), con límite de tiempo."""
+    from .machines import split_host
+
+    raw_machines = data.get("machine", [])
+    if not isinstance(raw_machines, list) or not all(isinstance(m, dict) for m in raw_machines):
+        raise ConfigError("'machine' se declara como [[machine]] (una por computadora), ej.\n\n"
+                          "  [[machine]]\n  name = \"robot\"\n  host = \"192.168.1.20\"")
+    out: list[MachineConfig] = []
+    for i, raw in enumerate(raw_machines, start=1):
+        where = f"[[machine]] #{i}"
+        if "port" in raw:
+            raise ConfigError(f"{where}: el puerto va en host, ej. host = \"192.168.1.20:7391\" "
+                              f"(sin puerto se usa 7391)")
+        _check_keys(raw, {"name", "host"}, where)
+        name = raw.get("name")
+        if name is None:
+            raise ConfigError(f"{where}: falta 'name' (cómo le dices a esa computadora), ej. name = \"robot\"")
+        if not isinstance(name, str) or not _PROFILE_NAME.fullmatch(name):
+            raise ConfigError(f"{where}: {name!r} no es un nombre de computadora válido. Usa letras (sin acentos), "
+                              f"dígitos, '_' o '-', ej. \"robot\" o \"laptop\"")
+        where = f"[[machine]] '{name}'"
+        if any(m.name == name for m in out):
+            raise ConfigError(f"hay dos [[machine]] llamadas '{name}': los nombres deben ser únicos "
+                              f"(una [[machine]] por computadora)")
+        host = raw.get("host")
+        if host is None:
+            raise ConfigError(f"{where}: falta 'host' (la IP o el nombre de esa computadora), "
+                              f"ej. host = \"192.168.1.20\" o host = \"robot.local\"")
+        if not isinstance(host, str):
+            raise ConfigError(f"{where}: host es un texto, ej. host = \"192.168.1.20\" o host = \"robot.local\"")
+        try:
+            address, port = split_host(host)
+        except ValueError as e:
+            raise ConfigError(f"{where}: host {e}") from None
+        out.append(MachineConfig(name, address, port))
+    return out
+
+
+def _parse_machine(raw: dict, where: str, machines: list[MachineConfig]) -> str:
+    """El `machine` de un [[node]] o [[mux]]: el name de una [[machine]] declarada."""
+    if "machine" not in raw:
+        return ""
+    value = raw["machine"]
+    names = [m.name for m in machines]
+    if not isinstance(value, str) or not value:
+        raise ConfigError(f"{where}: machine es el name de una [[machine]], ej. machine = \"robot\" "
+                          f"(sin machine, corre donde corres agmen run)")
+    if value in names:
+        return value
+    if not names:
+        raise ConfigError(f"{where}: machine = '{value}', pero robot.toml no declara ninguna [[machine]]. "
+                          f"Declárala:\n\n  [[machine]]\n  name = \"{value}\"\n  host = \"192.168.1.20\"\n\n"
+                          f"o quita machine para que corra donde corres agmen run")
+    hint = difflib.get_close_matches(value, names, n=1)
+    extra = f" ¿Quisiste decir '{hint[0]}'?" if hint else f" Computadoras declaradas: {', '.join(names)}."
+    raise ConfigError(f"{where}: machine = '{value}' no es ninguna [[machine]] de robot.toml.{extra} "
+                      f"Sin machine, corre donde corres agmen run")
+
+
 def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
     """Lee robot.toml y lo resuelve para un perfil (RFC 0011): nodes, muxes y
     topics traen solo lo que corre en él. Sin `profile`, usa [robot] profile o
@@ -300,10 +374,12 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{path.name} no es TOML válido: {e}") from None
 
-    _check_keys(data, {"robot", "node", "mux", "topic", "hub", "web", "clock", "record", "profile"}, path.name)
+    _check_keys(data, {"robot", "node", "mux", "topic", "hub", "web", "clock", "record", "profile", "machine"},
+                path.name)
     robot = data.get("robot", {})
     _check_keys(robot, {"name", "before", "profile"}, "[robot]")
     base_dir = path.parent
+    machines = _parse_machines(data)
 
     nodes: list[NodeConfig] = []
     raw_nodes = data.get("node", [])
@@ -314,7 +390,7 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
     mentions: list[tuple[str, str, tuple[str, ...]]] = []   # (dónde, nombre, perfiles): para los avisos
     for i, raw in enumerate(raw_nodes, start=1):
         where = f"[[node]] #{i}"
-        _check_keys(raw, {"name", "cmd", "restart", "autostart", "cwd", "env", "profile"}, where)
+        _check_keys(raw, {"name", "cmd", "restart", "autostart", "cwd", "env", "profile", "machine"}, where)
         name = raw.get("name")
         if not isinstance(name, str) or not name.strip():
             raise ConfigError(f"{where}: falta 'name' (el nombre del nodo)")
@@ -338,6 +414,8 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
             cwd=(base_dir / raw["cwd"]).resolve() if "cwd" in raw else None,
             env={str(k): str(v) for k, v in env.items()},
             profiles=profiles,
+            machine=_parse_machine(raw, where, machines),
+            raw=copy.deepcopy(raw),
         ))
 
     hub_raw = data.get("hub", {})
@@ -352,7 +430,7 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
     mux_configs: list[MuxConfig] = []
     for i, raw in enumerate(raw_muxes, start=1):
         where = f"[[mux]] #{i}"
-        _check_keys(raw, {"name", "output", "hold_ms", "input", "profile"}, where)
+        _check_keys(raw, {"name", "output", "hold_ms", "input", "profile", "machine"}, where)
         name = raw.get("name")
         if not isinstance(name, str) or not name.strip():
             raise ConfigError(f"{where}: falta 'name', ej. name = \"ruedas\"")
@@ -360,6 +438,7 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
         profiles = _parse_profiles(raw, where)
         _claim(declared, name, "mux", profiles)
         mentions.append((where, name, profiles))
+        machine = _parse_machine(raw, where, machines)
         if "output" not in raw:
             raise ConfigError(f"{where}: falta 'output' (a dónde reenviar), ej. output = \"127.0.0.1:7500\"")
         hold_ms = raw.get("hold_ms", 300)
@@ -398,7 +477,7 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
             listens.add(inp["listen"])
             args += ["--in", f"{inp['name']}={inp['listen']}@{inp['priority']}"]
             mux_inputs.append((str(inp["name"]), str(inp["listen"]), int(inp["priority"])))
-        mux_configs.append(MuxConfig(name, str(raw["output"]), mux_inputs, float(hold_ms), profiles))
+        mux_configs.append(MuxConfig(name, str(raw["output"]), mux_inputs, float(hold_ms), profiles, machine))
         if hub_enabled:   # quién manda, en /mux/<nombre> (RFC 0012): necesita el hub, como todo topic
             from .mux import state_topic
 
@@ -410,6 +489,8 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
             env={"PYTHONPATH": os.pathsep.join(
                 [str(Path(__file__).resolve().parent.parent), *filter(None, [os.environ.get("PYTHONPATH")])])},
             profiles=profiles,
+            machine=machine,
+            raw=copy.deepcopy(raw),
         ))
     nodes = muxes + nodes   # los mux arrancan primero: ya escuchan cuando llegan comandos
 
@@ -522,7 +603,7 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
                        hub=hub_enabled, clock=clock, record=record, path=path,
                        muxes=mux_configs, profile=profile, profiles=known,
                        skipped=[(n.name, n.profiles) for n in skipped_nodes],
-                       local=bool(active.get("local", False)),
+                       local=bool(active.get("local", False)), machines=machines,
                        warnings=_typo_warnings(mentions, raw_tables))
 
 
