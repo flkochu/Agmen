@@ -62,6 +62,8 @@ def cmd_run(args) -> int:
     except ConfigError as e:
         print(f"error en {args.archivo}: {e}", file=sys.stderr)
         return 2
+    if args.forget_key is not None:
+        return _forget_key(config, args.forget_key, args.archivo)
     if config.profile == "replay" and not args.play:
         print(f"error: el perfil replay es el de --play: agmen run {args.archivo} --play ARCHIVO.mcap",
               file=sys.stderr)
@@ -95,8 +97,9 @@ def cmd_run(args) -> int:
     places = {}   # RFC 0011 §3.4: dónde corre cada [[machine]]; nunca medio robot en silencio.
     # Después de los errores del archivo: esta consulta puede tardar hasta 1.5 s (DNS)
     player = None
+    remotes: dict = {}   # [[machine]] de otra computadora → su agmen agent (agent.AgentLink)
     if config.machines:
-        from .machines import place_machines, remote_error
+        from .machines import address_error, place_machines
 
         if args.play:   # la grabación tampoco depende de la red: se revisa antes
             from .play import Player
@@ -107,14 +110,24 @@ def cmd_run(args) -> int:
                 print(f"error: --play: {e}", file=sys.stderr)
                 return 2
         places = place_machines(config)
-        remote = remote_error(config, places)
+        remote = address_error(config, places)
+        keys = {}
+        if not remote:
+            from .agent import AgentError
+
+            try:
+                remotes, keys = _links_for(config, places, args.archivo)
+            except AgentError as e:   # no hay clave, o keys.toml no se puede leer
+                remote = str(e)
         if remote:
             if player is not None:
                 player.stop()
             print(f"error: {remote}", file=sys.stderr)
             return 2
 
-    launcher = Launcher(config, places=places)
+    lost: list[str] = []
+    stop = threading.Event()
+    launcher = Launcher(config, places=places, remotes=remotes)
     out = _SayTo(launcher)
     launcher.say(f"Agmen {__version__} · robot '{config.name}' · {len(config.nodes)} nodos · {hub_note}")
     if args.play or config.profile != "real" or config.skipped:   # un robot.toml sin perfiles se ve como antes
@@ -131,6 +144,14 @@ def cmd_run(args) -> int:
                          f"Si tocan hardware, se van a mover con datos grabados (también si los arrancas "
                          f"desde el panel): quítalos con --skip"
                          + (f", o corre sin --profile {args.profile}" if args.profile else ""))
+    if remotes:   # ANTES de arrancar nada: si una computadora falla, no arranca nada en ninguna
+        error = _connect(launcher, config, remotes, keys, "replay" if args.play else config.clock.mode, lost, stop)
+        if error:
+            launcher.printer.close()
+            if player is not None:
+                player.stop()
+            print(f"error: {error}", file=sys.stderr)
+            return 2
     for warning in config.warnings:
         launcher.say(f"⚠ {warning}")
     for note in skip_notes:
@@ -145,8 +166,12 @@ def cmd_run(args) -> int:
     except BaseException:           # Ctrl+C en un comando de before: la grabación ya abierta se cierra
         if player is not None:
             player.stop()
+        for link in remotes.values():
+            link.finish()
         raise
-    if not ready:
+    if not ready or lost:
+        for link in remotes.values():
+            link.finish()
         launcher.printer.close()
         if player is not None:
             player.stop()
@@ -179,7 +204,6 @@ def cmd_run(args) -> int:
         if err:
             launcher.say(f"⚠ no se pudo grabar: {err}")
     launcher.recording = recording
-    stop = threading.Event()
     watch = _watch_for(config, launcher, stop)    # [[topic]] max_gap_ms (RFC 0012)
     launcher.watch = watch
 
@@ -210,8 +234,9 @@ def cmd_run(args) -> int:
             ctl = f" · {len(c.cfg.controls)} controles" if c.cfg.controls else ""
             launcher.say(f"mando '{c.cfg.name}' en el panel: {c.cfg.layout.name} → {c.cfg.target}{to} · {what}{ctl}")
 
-    launcher.start_all()
-    launcher.say("todo arrancado. Ctrl+C para detener todo.")
+    if not stop.is_set():   # una computadora se perdió mientras se preparaba lo de aquí: no se arranca
+        launcher.start_all()
+        launcher.say("todo arrancado. Ctrl+C para detener todo.")
     if player is not None:   # que los nodos alcancen a suscribirse antes del primer mensaje
         threading.Timer(2.0, player.resume).start()
 
@@ -229,7 +254,100 @@ def cmd_run(args) -> int:
             player.stop()
         elif clock_server:
             clock_server.close()
+    return 1 if lost else 0
+
+
+def _forget_key(config, name: str, archivo: str) -> int:
+    """agmen run --forget-key NOMBRE: borra la clave guardada de esa [[machine]] y sale."""
+    import difflib
+
+    from .agent import AgentError, client_keys_path, forget_client_key, machine_address
+
+    m = next((x for x in config.machines if x.name == name), None)
+    if m is None:
+        names = [x.name for x in config.machines]
+        hint = difflib.get_close_matches(name, names, n=1)
+        extra = (f" ¿Quisiste decir '{hint[0]}'?" if hint else
+                 f" Hay: {', '.join(names)}." if names else " No declara ninguna.")
+        print(f"error: --forget-key {name}: {archivo} no tiene una [[machine]] con ese nombre.{extra}", file=sys.stderr)
+        return 2
+    address = machine_address(m.host, m.port)
+    try:
+        had = forget_client_key(address)
+    except AgentError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if had:
+        print(f"agmen │ borré la clave de {name} ({address}) de {client_keys_path()}: la próxima vez agmen run te la pide")
+    else:
+        print(f"agmen │ no había una clave guardada para {name} ({address}): nada que borrar")
     return 0
+
+
+def _links_for(config, places: dict, archivo: str) -> tuple[dict, dict]:
+    """Una conexión (sin abrir) por cada [[machine]] de otra computadora, y su clave:
+    de keys.toml, de AGMEN_AGENT_KEY o pedida en la terminal (RFC 0011 §3.4, D9)."""
+    from .agent import AgentLink, get_key
+
+    links, keys = {}, {}
+    for m in config.machines:
+        if m.name in places and not places[m.name].here:
+            link = AgentLink(m, toml_hint=archivo)
+            links[m.name] = link
+            keys[m.name] = get_key(m.name, link.address)
+    return links, keys
+
+
+def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list, stop) -> str:
+    """Abre la sesión con cada agente, una tras otra. Devuelve "" si todas se abrieron;
+    si no, el error, y las que ya estaban abiertas reciben adios (no arranca nada)."""
+    from .agent import AgentError, save_client_key, session_message
+
+    def on_lost(link, text):
+        lost.append(text)
+        launcher.say(f"✖ {text}", "error")
+        stop.set()
+
+    opened = []
+    try:
+        for name, link in remotes.items():
+            key, source = keys[name]
+
+            def keep(link=link, key=key, source=source):
+                if source == "escrita":   # solo tras una conexión aceptada (la clave probó ser buena)
+                    save_client_key(link.address, key)
+                    launcher.say(f"guardé la clave de {link.name} en tu usuario (agmen run --forget-key {link.name} "
+                                 f"la borra)")
+
+            launcher.say(f"conectando con {name} ({link.shown})…")
+            try:
+                link.open(key, session_message(config, name, clock), on_key_ok=keep)
+            except AgentError as e:
+                code = getattr(e, "code", "")
+                text = str(e)
+                if code == "clave":
+                    text += {"guardada": f". La clave guardada ya no sirve (¿alguien corrió agmen agent --new-key?): "
+                                         f"bórrala con agmen run --forget-key {name} y vuelve a correr agmen run "
+                                         f"(te pide la nueva)",
+                             "variable": ". Pon en AGMEN_AGENT_KEY la que muestra agmen agent al arrancar",
+                             "escrita": ". Vuelve a correr agmen run y escribe la que muestra agmen agent al arrancar, "
+                                        f"en la terminal de {name}"}[source]
+                for other in opened:
+                    other.close()
+                return text
+            opened.append(link)
+            link.on_lost = on_lost
+            launcher.say(f"{name} ({link.shown}): conectado · Agmen {link.version}")
+            from ._version import __version__ as mine
+
+            if link.version != mine:
+                launcher.say(f"⚠ {name} tiene Agmen {link.version} y esta computadora Agmen {mine}: se entienden "
+                             f"(mismo protocolo), pero conviene la misma versión en las dos (pip install -U agmen)")
+    except BaseException:   # Ctrl+C mientras se conecta (o el before de un agente): adios a todas
+        for link in remotes.values():
+            link.close()
+        raise
+    return ""
 
 
 def cmd_agent(args) -> int:
@@ -549,6 +667,8 @@ def main(argv: list[str] | None = None) -> int:
                         "(default: [robot] profile o real; con --play, replay)")
     p.add_argument("--sim", action="store_true",
                    help="lo mismo que --profile sim: el simulador en vez del robot, con reloj de simulación")
+    p.add_argument("--forget-key", metavar="NOMBRE",
+                   help="borrar la clave guardada de agmen agent de esa [[machine]] (y salir)")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("agent", help="en otra computadora del robot: espera a agmen run y corre ahí sus nodos")

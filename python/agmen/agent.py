@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Callable
 
 from ._version import __version__
+from .run import Node
 
 try:
     import tomllib  # Python 3.11+
@@ -638,6 +639,7 @@ class _Plan:
     names: list[str]        # los nodos de la sesión, en el orden del archivo (sin el hub)
     hub_note: str
     profile: str
+    held: tuple[str, ...] = ()   # no_arrancar: los que la laptop arranca después (o nunca: --skip)
 
 
 class _Refused(Exception):
@@ -929,9 +931,16 @@ class AgentServer:
             sub, hub_note = prepare_hub(replace(cfg, nodes=mine_nodes))
         except ConfigError as e:
             raise _Refused("config", f"{m}: {e}") from None
+        held = msg.get("no_arrancar", [])
+        names = [n.name for n in mine_nodes]
+        if not isinstance(held, list) or not all(isinstance(x, str) for x in held):
+            raise _Refused("protocolo", "no_arrancar es una lista de nombres de nodo")
+        unknown = [x for x in held if x not in names]
+        if unknown:
+            raise _Refused("protocolo", f"no_arrancar nombra nodos que no son de {m}: {', '.join(unknown)}")
         if version != __version__:
             self.say(f"⚠ la laptop usa Agmen {version} y esta computadora Agmen {__version__}")
-        return _Plan(sub, {m: Place(True, "agent")}, [n.name for n in mine_nodes], hub_note, profile)
+        return _Plan(sub, {m: Place(True, "agent")}, names, hub_note, profile, tuple(held))
 
     @staticmethod
     def _foreign_nodes(address: str) -> list[str]:
@@ -1093,6 +1102,8 @@ class _Session:
                 if self.cancel.is_set():
                     return
                 node = launcher.nodes[name]
+                if name in plan.held:
+                    continue   # la laptop lo arranca cuando le toca (o no: --skip); solo puede quitar, no agregar
                 if node.cfg.autostart:
                     node.start()
                 else:
@@ -1241,3 +1252,356 @@ class _Session:
             self.done.set()
             if not self.server.stopping:
                 self.say(f"{self.server.waiting_line()} (otra vez)", "out")
+
+
+# ---------------------------------------------------------------------------
+# El lado de agmen run (el cliente)
+# ---------------------------------------------------------------------------
+
+CONNECT_TIMEOUT = 5.0           # para abrir la conexión TCP con el agente
+FINISH_TIMEOUT = 8.0            # Ctrl+C: cuánto esperar los estado de detener_todo
+KEY_ENV = "AGMEN_AGENT_KEY"     # una sola clave para todas las computadoras (terminal no interactiva)
+_RUNNING = ("corriendo", "reiniciando")
+
+
+class LinkError(AgentError):
+    """No se pudo abrir la sesión con un agente. `code` dice por qué (rechazada, tiempo,
+    sin_ruta, no_agmen, clave, espera, version, impostor, cerrado, perdida, o el código de
+    sesion_error del agente) y el texto ya dice qué computadora, qué pasó y qué hacer."""
+
+    def __init__(self, code: str, text: str) -> None:
+        super().__init__(text)
+        self.code = code
+
+
+def get_key(name: str, address: str, *, interactive: bool | None = None,
+            env: dict | None = None, ask: Callable[[str], str] | None = None) -> tuple[str, str]:
+    """La clave para la computadora `name` (en `address`, de machine_address). Devuelve
+    (clave, de dónde): "guardada" (keys.toml), "variable" (AGMEN_AGENT_KEY) o "escrita"
+    (se pidió en la terminal: hay que guardarla tras una conexión aceptada).
+    AgentKeyError dice cómo darla si no hay manera."""
+    import getpass
+    import sys
+
+    saved = client_key(address)
+    if saved is not None:
+        return saved, "guardada"
+    env = os.environ if env is None else env
+    if env.get(KEY_ENV):
+        try:
+            return format_key(env[KEY_ENV]), "variable"
+        except AgentKeyError as e:
+            raise AgentKeyError(f"{KEY_ENV}: {e}") from None
+    if interactive is None:
+        interactive = sys.stdin is not None and sys.stdin.isatty()
+    if not interactive:
+        raise AgentKeyError(f"no tengo la clave de agmen agent en '{name}' ({address}) y esta terminal no es "
+                            f"interactiva para pedírtela. Dala en la variable {KEY_ENV} (la muestra agmen agent al "
+                            f"arrancar, en la terminal de '{name}'), o corre agmen run una vez en una terminal: te "
+                            f"la pide y la guarda")
+    ask = ask or getpass.getpass
+    for attempt in range(3):
+        text = ask(f"clave de agmen agent en '{name}' ({address}); la muestra agmen agent al arrancar, en la "
+                   f"terminal de '{name}': ")
+        try:
+            return format_key(text), "escrita"
+        except AgentKeyError as e:
+            if attempt == 2:
+                raise
+            print(f"  {e}", file=sys.stderr)
+    raise AssertionError("inalcanzable")
+
+
+def session_message(config, machine: str, clock: str) -> dict:
+    """El `sesion` para el agente de `machine`. no_arrancar = todos sus nodos: agmen run
+    los arranca después, cuando TODAS las computadoras aceptaron (y en el orden del
+    archivo; los de --skip o autostart = false, nunca solos)."""
+    nodes = written_nodes(config, machine)
+    return {"op": "sesion", "perfil": config.profile, "reloj": clock, "agmen": __version__, "maquina": machine,
+            "nodos": nodes, "no_arrancar": list(nodes)}
+
+
+def _kind(text: str) -> str:
+    """El tipo de una línea de log que llega del agente (para el color, como las locales)."""
+    if text.startswith(("✖", "no se pudo arrancar")):
+        return "error"
+    if text.startswith(("▶ ", "■ ", "↻ ", "✔ ", "… ")):
+        return "agmen"
+    return "out"
+
+
+class AgentLink:
+    """La conexión de agmen run con el agmen agent de una [[machine]]: abre la sesión,
+    manda las órdenes de sus nodos (RemoteNode) y reparte lo que llega (estado, log).
+
+    El Launcher lo conecta con su LogBook y su Printer (attach). on_lost(link, texto)
+    se llama una vez si la conexión se pierde después de abrir la sesión."""
+
+    def __init__(self, machine, *, toml_hint: str = "robot.toml") -> None:
+        from .machines import _address
+
+        self.machine = machine
+        self.name = machine.name
+        self.address = machine_address(machine.host, machine.port)
+        self.shown = _address(machine)
+        self.toml_hint = toml_hint
+        self.nodes: dict = {}               # nombre → RemoteNode (los pone el Launcher)
+        self.version = ""
+        self.channel: Channel | None = None
+        self.on_lost: Callable[[AgentLink, str], None] | None = None
+        self.lost = ""
+        self._closing = False
+        self._done = threading.Event()      # ping y lector: terminar
+        self._logs = None
+        self._printer = None
+        self._lock = threading.Lock()
+
+    def attach(self, logs, printer) -> None:
+        self._logs, self._printer = logs, printer
+
+    def _say(self, text: str, kind: str = "agmen") -> None:
+        text = _printable(text)
+        if self._logs is not None:
+            self._logs.add(self.name, text, kind)
+        if self._printer is not None:
+            self._printer(self.name, text, kind)
+
+    # --- abrir ---
+    def open(self, key: str, session: dict, *, on_key_ok: Callable[[], None] | None = None,
+             connect_timeout: float = CONNECT_TIMEOUT) -> None:
+        """Conecta, saluda y abre la sesión. Vuelve cuando el agente contestó sesion_ok;
+        LinkError si no. Mientras el agente corre su [robot] before, su salida se ve."""
+        where = f"{self.name} ({self.shown})"
+        host = self.machine.host
+        try:
+            sock = socket.create_connection((host, self.machine.port), timeout=connect_timeout)
+        except ConnectionRefusedError:
+            raise LinkError("rechazada", f"{where} no contesta: ¿está corriendo agmen agent ahí? En {self.name}: "
+                                         f"agmen agent {self.toml_hint}") from None
+        except socket.timeout:
+            raise LinkError("tiempo", f"{where} no contestó en {connect_timeout:g} s: ¿está prendida y en la misma "
+                                      f"red que esta computadora? Revisa host de [[machine]] '{self.name}' en "
+                                      f"robot.toml") from None
+        except OSError as e:
+            raise LinkError("sin_ruta", f"no llego a {where} ({e.strerror or e}): ¿está prendida y en la misma red "
+                                        f"que esta computadora? Revisa host de [[machine]] '{self.name}' en "
+                                        f"robot.toml") from None
+        try:
+            channel = client_handshake(sock, derive_key(key))
+        except HandshakeError as e:
+            sock.close()
+            raise self._handshake_error(e, where) from None
+        except BaseException:
+            sock.close()
+            raise
+        if on_key_ok is not None:
+            on_key_ok()
+        self.channel, self.version = channel, channel.peer_version
+        threading.Thread(target=self._ping_loop, daemon=True, name=f"agmen-ping-{self.name}").start()
+        try:
+            channel.send(session)
+            while True:
+                try:
+                    msg = channel.recv(SILENCE_TIMEOUT)
+                except ChannelTimeout:
+                    raise LinkError("perdida", f"{where} dejó de contestar mientras preparaba la sesión "
+                                               f"({SILENCE_TIMEOUT:g} s sin nada): ¿se apagó o se cayó la red?")
+                except ChannelClosed:
+                    raise LinkError("perdida", f"{where} cerró la conexión mientras preparaba la sesión: mira la "
+                                               f"terminal de agmen agent en {self.name}")
+                except ChannelError as e:
+                    raise LinkError("protocolo", f"{where} mandó un mensaje inválido ({e}): ¿las dos "
+                                                 f"computadoras tienen la misma versión de Agmen?")
+                op = msg["op"]
+                if op == "sesion_ok":
+                    break
+                if op == "sesion_error":
+                    code, text = str(msg.get("codigo", "?")), _printable(str(msg.get("texto", "")))
+                    if not text.startswith(self.name):
+                        text = f"{self.name}: {text}"
+                    raise LinkError(code, text)
+                self._dispatch(msg)
+        except BaseException:
+            self._done.set()
+            channel.close()
+            self.channel = None
+            raise
+        threading.Thread(target=self._read_loop, daemon=True, name=f"agmen-agent-{self.name}").start()
+
+    def _handshake_error(self, e: HandshakeError, where: str) -> LinkError:
+        if e.code == "clave":
+            return LinkError("clave", f"{where} rechazó la clave")   # el texto del agente habla desde allá
+        if e.code == "espera":
+            return LinkError("espera", f"{where} no acepta intentos por ahora: {e}")
+        if e.code in ("no_agmen", "protocolo"):
+            return LinkError("no_agmen", f"en {where} contestó algo que no es agmen agent: ¿otro programa usa ese "
+                                         f"puerto? Revisa host de [[machine]] '{self.name}' (agmen agent escucha en "
+                                         f"el 7391 si no le dices otro)")
+        if e.code == "tiempo":
+            return LinkError("tiempo", f"{where} aceptó la conexión pero no completó el saludo en "
+                                       f"{HANDSHAKE_TIMEOUT:g} s: ¿es agmen agent? Mira su terminal")
+        if e.code == "cerrado":
+            return LinkError("cerrado", f"{where} cerró la conexión durante el saludo: mira la terminal de agmen "
+                                        f"agent en {self.name}")
+        return LinkError(e.code, f"{where}: {e}")
+
+    # --- la sesión abierta ---
+    def _ping_loop(self) -> None:
+        while not self._done.wait(PING_EVERY):
+            channel = self.channel
+            if channel is None:
+                return
+            try:
+                channel.send({"op": "ping", "t": time.monotonic()})
+            except AgentError:
+                return   # el lector se entera
+
+    def _read_loop(self) -> None:
+        channel = self.channel
+        while True:
+            try:
+                msg = channel.recv(SILENCE_TIMEOUT)
+            except ChannelTimeout:
+                self._lose(f"dejó de contestar ({SILENCE_TIMEOUT:g} s sin nada)")
+                return
+            except ChannelClosed:
+                self._lose("cerró la conexión")
+                return
+            except ChannelError as e:
+                self._lose(f"mandó un mensaje inválido ({e})")
+                return
+            self._dispatch(msg)
+
+    def _dispatch(self, msg: dict) -> None:
+        op = msg["op"]
+        if op == "log":
+            name, text = msg.get("nodo"), _printable(str(msg.get("linea", "")))
+            node = self.nodes.get(name)
+            if node is not None:
+                node._log(text, _kind(text))
+            else:
+                self._say(text, "agmen" if name == "agmen" else "out")
+        elif op == "estado":
+            node = self.nodes.get(msg.get("nodo"))
+            if node is not None:
+                pid, code = msg.get("pid"), msg.get("codigo")
+                node.remote_state(str(msg.get("estado", "?")), pid if isinstance(pid, int) else None,
+                                  code if isinstance(code, int) else None)
+        elif op == "error":
+            self._say(str(msg.get("texto", "")), "error")
+        # pong y lo que no conozca (un agente más nuevo): nada
+
+    def _lose(self, why: str) -> None:
+        with self._lock:
+            if self._closing or self.lost:
+                return
+            self.lost = (f"{self.name} ({self.shown}): se perdió la conexión con agmen agent ({why}). Se detiene todo. "
+                         f"Revisa {self.name} (¿se apagó, se cayó la red o se cerró agmen agent?) y vuelve a correr "
+                         f"agmen run")
+        self._done.set()
+        for node in self.nodes.values():
+            node.remote_state("falló", None, None, log=f"✖ se perdió la conexión con {self.name}")
+        if self.on_lost is not None:
+            self.on_lost(self, self.lost)
+
+    def order(self, op: str, node: str) -> str | None:
+        """Manda arrancar/detener/reiniciar. Devuelve un error en texto, o None."""
+        channel = self.channel
+        if channel is None or self.lost:
+            return f"no hay conexión con {self.name}: '{op} {node}' no se hizo"
+        try:
+            channel.send({"op": op, "nodo": node})
+        except AgentError as e:
+            return f"no pude mandarle '{op} {node}' a {self.name}: {e}"
+        return None
+
+    def finish(self, timeout: float = FINISH_TIMEOUT) -> None:
+        """Al terminar (Ctrl+C): detener_todo, espera los estado (hasta `timeout`), adios."""
+        channel = self.channel
+        if channel is None:
+            return
+        if not self.lost:
+            try:
+                channel.send({"op": "detener_todo"})
+                end = time.monotonic() + timeout
+                while time.monotonic() < end and not self.lost and any(
+                        n.state in _RUNNING for n in self.nodes.values()):
+                    time.sleep(0.05)
+            except AgentError:
+                pass
+        self.close()
+
+    def close(self) -> None:
+        """adios y cierra (sin esperar nada)."""
+        with self._lock:
+            self._closing = True
+        channel, self.channel = self.channel, None
+        self._done.set()
+        if channel is None:
+            return
+        if not self.lost:
+            try:
+                channel.send({"op": "adios"})
+            except AgentError:
+                pass
+        channel.close()
+
+
+class RemoteNode(Node):
+    """Un nodo de otra computadora, para el Launcher y el panel igual que uno local:
+    sus órdenes viajan al agente (AgentLink) y su estado y sus logs llegan de él."""
+
+    def __init__(self, cfg, base_dir, logs, printer, link: AgentLink) -> None:
+        super().__init__(cfg, base_dir, logs, printer)
+        self.link = link
+        self.label = f"{link.name}/{cfg.name}"   # en la terminal: robot/motor │ …
+        self.remote_pid: int | None = None
+
+    def info(self) -> dict:
+        with self.lock:
+            running = self.state == "corriendo"
+            return {
+                "name": self.cfg.name,
+                "cmd": " ".join(self.cfg.cmd),
+                "state": self.state,
+                "pid": self.remote_pid if running else None,
+                "uptime": (time.time() - self.started_at) if running and self.started_at else None,
+                "restarts": self.restarts,
+                "exit_code": self.exit_code,
+                "restart": self.cfg.restart,
+                "machine": self.link.name,
+            }
+
+    def _log(self, text: str, kind: str = "out") -> None:
+        self.logs.add(self.cfg.name, text, kind)
+        self.printer(self.label, text, kind)
+
+    def _order(self, op: str) -> None:
+        err = self.link.order(op, self.cfg.name)
+        if err:
+            self._log(err, "error")
+
+    def start(self) -> None:
+        with self.lock:
+            self.wanted = True
+        self._order("arrancar")
+
+    def stop(self, timeout: float = 3.0) -> None:
+        with self.lock:
+            self.wanted = False
+        if self.state in _RUNNING:
+            self._order("detener")
+
+    def restart(self) -> None:
+        self._order("reiniciar")
+
+    def remote_state(self, state: str, pid: int | None, code: int | None, log: str = "") -> None:
+        with self.lock:
+            if state == "corriendo" and self.state != "corriendo":
+                self.started_at = time.time()
+            if state == "reiniciando":
+                self.restarts += 1
+            self.remote_pid, self.exit_code = pid, code
+            self.state = state
+        if log:
+            self._log(log, "error")

@@ -1120,23 +1120,40 @@ class Printer:
 # ---------------------------------------------------------------------------
 
 class Launcher:
-    def __init__(self, config: RobotConfig, stream=None, *, places: dict | None = None) -> None:
+    def __init__(self, config: RobotConfig, stream=None, *, places: dict | None = None,
+                 remotes: dict | None = None) -> None:
         """`places`: dónde corre cada [[machine]] ({nombre: machines.Place}, de
         machines.place_machines), si quien construye el Launcher ya lo decidió; si
-        no, se decide aquí. Si ningún nodo dice machine, no se consulta nada. Esta
-        versión solo arranca nodos en esta computadora: si alguno es de otra, o su
-        machine no está declarada, ConfigError antes de crear nada (RFC 0011 §3.4:
-        nunca medio robot en silencio)."""
-        self.places = self._check_places(config, places)
+        no, se decide aquí. Si ningún nodo dice machine, no se consulta nada.
+        `remotes`: {nombre de [[machine]]: agent.AgentLink} de las computadoras que
+        no son esta (RFC 0011 §3.4): sus nodos son agent.RemoteNode, nodos como los
+        demás cuyas órdenes viajan a su agmen agent. Si un nodo es de otra
+        computadora sin AgentLink, o su machine no está declarada, ConfigError antes
+        de crear nada (nunca medio robot en silencio)."""
+        remotes = remotes or {}
+        self.places = self._check_places(config, places, remotes)
         self.config = config
+        self.remotes = remotes
         self.logs = LogBook()
-        self.printer = Printer([n.name for n in config.nodes] + ["agmen"], stream=stream)
-        self.nodes = {n.name: Node(n, config.base_dir, self.logs, self.printer) for n in config.nodes}
+        shown = [f"{n.machine}/{n.name}" if n.machine in remotes else n.name for n in config.nodes]
+        self.printer = Printer(shown + list(remotes) + ["agmen"], stream=stream)
+        self.nodes: dict[str, Node] = {}
+        for n in config.nodes:
+            if n.machine in remotes:
+                from .agent import RemoteNode
+
+                node = RemoteNode(n, config.base_dir, self.logs, self.printer, remotes[n.machine])
+                remotes[n.machine].nodes[n.name] = node
+            else:
+                node = Node(n, config.base_dir, self.logs, self.printer)
+            self.nodes[n.name] = node
+        for link in remotes.values():
+            link.attach(self.logs, self.printer)
         self.stopping = threading.Event()
         self.recording = None    # el control de grabación (RFC 0010); lo pone agmen run
 
     @staticmethod
-    def _check_places(config: RobotConfig, places: dict | None) -> dict:
+    def _check_places(config: RobotConfig, places: dict | None, remotes: dict | None = None) -> dict:
         used = {n.machine for n in config.nodes if n.machine}
         if not used:
             return {}   # ningún nodo dice machine: todo corre aquí, sin consultar nada
@@ -1157,7 +1174,10 @@ class Launcher:
         if missing:
             raise ValueError(f"Launcher: places no dice dónde corre {', '.join(missing)} "
                              f"(usa machines.place_machines(config))")
-        error = remote_error(config, places)
+        from .machines import Place
+
+        error = remote_error(config, {m: (Place(True, "agent") if m in (remotes or {}) else p)
+                                      for m, p in places.items()})
         if error:
             raise ConfigError(error)
         return places
@@ -1191,7 +1211,14 @@ class Launcher:
             return
         self.stopping.set()
         self.say("deteniendo todos los nodos…")
-        threads = [threading.Thread(target=n.stop) for n in self.nodes.values()]
+        # Primero las otras computadoras (detener_todo, sus estado, adios); luego lo de aquí.
+        threads = [threading.Thread(target=link.finish) for link in self.remotes.values()]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        local = [n for n in self.nodes.values() if n.cfg.machine not in self.remotes]
+        threads = [threading.Thread(target=n.stop) for n in local]
         for t in threads:
             t.start()
         for t in threads:

@@ -354,19 +354,10 @@ def hardware_remote(config, remote: list[str]) -> bool:
         n.machine in remote and "real" in n.profiles for n in config.nodes)
 
 
-def _sim_is_safe(config, remote: list[str]) -> bool:
-    """¿Sugerir [profile.sim] local = true no traería aquí hardware de las otras computadoras?
-    No, si algún nodo remoto es a la vez de "real" y de "sim" (ej. profile = ["real", "sim"]).
-    Solo ve config.nodes (los del perfil activo): la respuesta es completa solo en el perfil
-    "real", donde están todos los nodos de hardware. Por eso solo se usa en "real"."""
-    return config.profile != "sim" and not any(
-        n.machine in remote and "real" in n.profiles and "sim" in n.profiles for n in config.nodes)
-
-
 def remote_error(config, places: dict[str, Place]) -> str:
-    """El error si algún nodo del perfil activo es de otra computadora (esta
-    versión todavía no los arranca allá: llega con agmen agent), o "" si no.
-    Nunca medio robot en silencio. El "qué hacer" es algo que sí se puede hacer."""
+    """El error si algún nodo del perfil activo es de otra computadora y no hay conexión
+    con su agmen agent (un Launcher armado sin ella), o "" si no. agmen run abre esas
+    conexiones solo (agmen.agent.AgentLink). Nunca medio robot en silencio."""
     used = [m for m in config.machines if m.name in places]
     remote = [m for m in used if not places[m.name].here]
     if not remote:
@@ -376,28 +367,25 @@ def remote_error(config, places: dict[str, Place]) -> str:
         names = _nodes_on(config, m.name)
         parts.append(f"{and_names(names)} {'corre' if len(names) == 1 else 'corren'} en '{m.name}' ({_address(m)})")
     notes = "".join(f" {n[0].upper()}{n[1:]}." for n in (places[m.name].note for m in remote) if n)
-    remote_names = [m.name for m in remote]
-    # Con hardware entre los remotos nunca se sugiere correrlos aquí: serían los drivers del robot en esta
-    # computadora. Solo, si no lo trae, probar en simulación.
-    hardware = hardware_remote(config, remote_names)
-    sim = "[profile.sim] local = true y agmen run --sim"
-    local = f"[profile.{config.profile}] local = true para correr todo aquí"
-    if len(used) == 1:
-        text = (f"{parts[0]} y esta versión todavía no arranca nodos en otra computadora (llega con agmen agent)."
-                f"{notes} Mientras tanto: corre agmen run en esa computadora")
-        if not hardware:
-            return f"{text}, o usa {local}"
-        if config.profile == "real" and _sim_is_safe(config, remote_names):
-            return f"{text}. Para probar aquí en simulación: {sim}"
-        return f"{text}."
-    every = ", ".join(f"'{m.name}'" for m in used)
-    text = (f"{'; '.join(parts)}. Con nodos en varias computadoras ({every}) hace falta agmen agent, que llega "
-            f"en una versión próxima.{notes}")
-    if not hardware:
-        return f"{text} Mientras tanto: usa {local}"
-    if config.profile == "real" and _sim_is_safe(config, remote_names):
-        return f"{text} Mientras tanto, para probar aquí en simulación: {sim}"
-    return text
+    which = " y ".join(f"'{m.name}'" for m in remote)
+    return (f"{'; '.join(parts)} y no hay conexión con su agmen agent.{notes} Corre agmen agent en {which} "
+            f"y agmen run aquí: se conecta solo")
+
+
+# Por qué no se intenta ni conectar: la dirección misma no sirve (RFC 0011 §3.4, parte 3a).
+UNREACHABLE = ("unresolved", "timeout", "zone", "mixed", "special")
+
+
+def address_error(config, places: dict[str, Place]) -> str:
+    """El error si la dirección de alguna computadora remota no sirve para conectarse
+    (un nombre que no se resuelve, una IPv6 link-local sin %interfaz, un nombre con IP
+    de aquí y de fuera…), con la nota de qué hacer; o "" si todas se pueden intentar."""
+    bad = [m for m in config.machines if m.name in places and not places[m.name].here
+           and places[m.name].why in UNREACHABLE]
+    if not bad:
+        return ""
+    return "; ".join(f"no puedo conectarme con '{m.name}' ({_address(m)}): {places[m.name].note or 'su host no sirve'}"
+                     for m in bad) + ". Corrige host en robot.toml"
 
 
 def placement_lines(config, places: dict[str, Place]) -> list[str]:
