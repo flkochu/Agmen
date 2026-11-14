@@ -39,9 +39,20 @@ def _wait_for_ctrl_c(stop: threading.Event) -> None:
         pass
 
 
+def _ctrl_break_like_ctrl_c() -> None:
+    """Windows: Ctrl+Break (CTRL_BREAK_EVENT, lo único que se le puede mandar a un grupo de
+    procesos) llega como SIGBREAK, y Python no le pone manejador: el manejador por defecto
+    de la consola mata al proceso en el acto (código 0xC000013A), sin adios a los agentes ni
+    aviso. Hasta que _wait_for_ctrl_c ponga el suyo, que sea lo mismo que Ctrl+C."""
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, signal.default_int_handler)
+
+
 def cmd_run(args) -> int:
     from .panel import Panel, Teleop
     from .run import ConfigError, Launcher, load_config, prepare_hub
+
+    _ctrl_break_like_ctrl_c()   # mientras pide la clave, se conecta o corre [robot] before
 
     # El perfil (RFC 0011 §3.2): --profile X, --sim (= --profile sim) o, con --play, "replay".
     if args.sim and args.profile not in (None, "sim"):

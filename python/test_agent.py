@@ -447,6 +447,14 @@ class TestObtenerLaClave(ConfigDirCase):
         for frag in ("'robot'", self.ADDR, "AGMEN_AGENT_KEY", "no es interactiva"):
             self.assertIn(frag, t)
 
+    def test_nul_como_entrada_no_es_terminal(self):
+        # stdin=DEVNULL: en Windows NUL es un dispositivo de caracteres e isatty() dice que sí; getpass leería
+        # del teclado de la consola y agmen run se quedaría esperando para siempre en vez de salir con 2
+        with open(os.devnull, encoding="utf-8") as nul, mock.patch.object(sys, "stdin", nul):
+            self.assertFalse(agent._stdin_is_terminal())
+        with mock.patch.object(sys, "stdin", None):
+            self.assertFalse(agent._stdin_is_terminal())
+
     def test_se_pide_en_la_terminal_y_es_escrita(self):
         pedidos = []
         res = agent.get_key("robot", self.ADDR, interactive=True, env={}, ask=lambda p: pedidos.append(p) or "KQ3F-9XM2-7TDW")
@@ -1846,7 +1854,10 @@ class TestSesion(ServerCase):
     def test_nodo_desconocido_y_ordenes_malas_son_error_y_la_sesion_sigue(self):
         self.start_server()
         cli, _ = self.sesion()
-        casos = [({"op": "detener", "nodo": "zzz"}, "no tiene el nodo 'zzz'"),
+        # sesion_ok sale ANTES de arrancar los nodos: hay que esperar a que motor esté vivo (en Windows Python
+        # tarda en arrancar más de lo que tardan las órdenes de abajo)
+        self.assertTrue(self.espera(lambda: self.vivo("motor"), 30), f"motor no arrancó: {cli.msgs}")
+        casos =[({"op": "detener", "nodo": "zzz"}, "no tiene el nodo 'zzz'"),
                  ({"op": "arrancar", "nodo": "ia"}, "no tiene el nodo 'ia'"),      # de la laptop
                  ({"op": "reiniciar", "nodo": "x" * 500}, "no tiene el nodo"),
                  ({"op": "arrancar"}, "lleva el nombre del nodo"),
@@ -1863,6 +1874,7 @@ class TestSesion(ServerCase):
         cli.send({"op": "ping", "t": 7})
         self.assertTrue(cli.wait(cli.hay("pong", t=7)))
         self.assertTrue(self.vivo("motor"))
+        self.assertEqual(len(self.pids("motor")), 1, "una orden mala no debe reiniciar nada")
 
     def test_pong_acota_la_t(self):
         self.start_server()
@@ -2224,7 +2236,9 @@ class TestD7NadaDelClienteLlegaAUnComando(ServerCase):
                 con_cmd_real += 1
                 self.assertEqual(args[1], nodo)
                 self.assertEqual(args[3], str(self.marks))
-                self.assertEqual(str(call.kwargs["cwd"]), str(self.dir))
+                # load_config resuelve la ruta del robot.toml: en Windows sale el nombre largo
+                # (runneradmin) aunque la carpeta temporal se escriba con el corto 8.3 (RUNNER~1)
+                self.assertEqual(Path(call.kwargs["cwd"]), self.dir.resolve())
         self.assertGreaterEqual(con_cmd_real, 4, "no se vieron los arranques de los nodos")
 
     def test_el_nodo_distinto_no_llega_a_popen(self):
@@ -3225,6 +3239,16 @@ class E2EBase(unittest.TestCase):
     def vivo(self, nodo, ventana=3.0):
         return nodo_vivo(self.marks, nodo, ventana)
 
+    def fin(self, p: subprocess.Popen, timeout=40) -> int | None:
+        """El código de salida de p; None si no salió en `timeout` s (se mata, y la falla muestra su salida en
+        vez de un TimeoutExpired sin ella)."""
+        try:
+            return p.wait(timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+            return None
+
     def detener(self, p: subprocess.Popen, timeout=40) -> int | None:
         if p.poll() is None:
             p.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
@@ -3248,6 +3272,10 @@ class E2EBase(unittest.TestCase):
 
     def texto(self, lineas):
         return "".join(lineas)
+
+    def pids_de_marcas(self) -> dict:
+        """Los pids que escribió cada nodo de prueba al arrancar (para el mensaje de una falla)."""
+        return {f.name[len("arranque_"):]: f.read_text().split() for f in sorted(self.marks.glob("arranque_*"))}
 
 
 class E2E(E2EBase):
@@ -3286,8 +3314,13 @@ class E2E(E2EBase):
         # Ctrl+C en el agente
         self.assertEqual(self.detener(pa), 0, self.texto(la))
         self.assertIn("listo. ¡Hasta luego!", self.texto(la))
-        for n in ("motor", "imu", "ia"):
-            self.assertFalse(self.vivo(n))
+        # en Windows nodo_vivo solo ve el latido (cada 0.1 s, ventana de 3 s): un nodo recién detenido sigue
+        # "vivo" hasta 3 s, así que se espera; uno que de verdad quedó vivo sigue latiendo y la espera falla
+        self.assertTrue(self.espera(lambda: not any(self.vivo(n) for n in ("motor", "imu", "ia")), 30),
+                        "quedaron nodos vivos tras detener las dos puntas: "
+                        f"{[n for n in ('motor', 'imu', 'ia') if self.vivo(n)]}; pids {self.pids_de_marcas()}; "
+                        f"agmen run: código {pr2.poll()}\n{self.texto(lr2)}\nagmen agent: código {pa.poll()}\n"
+                        f"{self.texto(la)}")
         self.assertNotIn(clave, self.texto(lr2))
 
     def test_la_clave_escrita_a_mano_no_se_guarda_si_viene_de_la_variable(self):
@@ -3309,21 +3342,21 @@ class E2E(E2EBase):
         self.assertEqual(self.detener(pr), 0)
         # --forget-key
         pf, lf = self.correr(clave=None, args=("--forget-key", "robot"))
-        self.assertEqual(pf.wait(40), 0, self.texto(lf))
+        self.assertEqual(self.fin(pf, 40), 0, self.texto(lf))
         self.assertIn(f"borré la clave de robot (127.0.0.1:{self.port})", self.texto(lf))
         self.assertNotIn(clave, self.texto(lf))
         with mock.patch.dict(os.environ, {"AGMEN_CONFIG_DIR": str(cfg)}):
             self.assertIsNone(agent.client_key(agent.machine_address("127.0.0.1", self.port)))
         pf2, lf2 = self.correr(clave=None, args=("--forget-key", "robot"))
-        self.assertEqual(pf2.wait(40), 0)
+        self.assertEqual(self.fin(pf2, 40), 0)
         self.assertIn("no había una clave guardada para robot", self.texto(lf2))
         pf3, lf3 = self.correr(clave=None, args=("--forget-key", "robto"))
-        self.assertEqual(pf3.wait(40), 2)
+        self.assertEqual(self.fin(pf3, 40), 2)
         self.assertIn("¿Quisiste decir 'robot'?", self.texto(lf3))
         # y sin clave guardada ni variable ni terminal: error que dice como darla, y no arranca nada
         antes = (self.marks / "arranque_ia").read_text() if (self.marks / "arranque_ia").exists() else ""
         pn, ln = self.correr(clave=None)
-        self.assertEqual(pn.wait(40), 2, self.texto(ln))
+        self.assertEqual(self.fin(pn, 40), 2, self.texto(ln))
         self.assertIn("AGMEN_AGENT_KEY", self.texto(ln))
         despues = (self.marks / "arranque_ia").read_text() if (self.marks / "arranque_ia").exists() else ""
         self.assertEqual(despues, antes, "arrancó 'ia' sin tener la clave")
@@ -3333,7 +3366,7 @@ class E2E(E2EBase):
         with mock.patch.dict(os.environ, {"AGMEN_CONFIG_DIR": str(self.dir / "cfg-run")}):
             agent.save_client_key(agent.machine_address("127.0.0.1", self.port), "aaaa-bbbb-cccc")
         pr, lr = self.correr(clave=None)
-        self.assertEqual(pr.wait(40), 2, self.texto(lr))
+        self.assertEqual(self.fin(pr, 40), 2, self.texto(lr))
         t = self.texto(lr)
         self.assertIn("rechazó la clave", t)
         self.assertIn("La clave guardada ya no sirve", t)
@@ -3346,7 +3379,7 @@ class E2E(E2EBase):
         self.hub_real = True
         self.write_toml(hub=True)
         pr, lr = self.correr(clave=KEY)
-        self.assertEqual(pr.wait(60), 2, self.texto(lr))
+        self.assertEqual(self.fin(pr, 60), 2, self.texto(lr))
         t = self.texto(lr)
         self.assertIn(f"error: robot (127.0.0.1:{self.port}) no contesta: ¿está corriendo agmen agent ahí? En robot: agmen agent", t)
         self.assertFalse(list(self.marks.iterdir()), "arrancó algún nodo")
@@ -3359,7 +3392,7 @@ class E2E(E2EBase):
         pa, la, clave = self.agente()
         mala = "aaaa-bbbb-cccc"
         pr, lr = self.correr(clave=mala)
-        self.assertEqual(pr.wait(60), 2, self.texto(lr))
+        self.assertEqual(self.fin(pr, 60), 2, self.texto(lr))
         t = self.texto(lr)
         self.assertIn("rechazó la clave", t)
         self.assertIn("AGMEN_AGENT_KEY", t)
@@ -3377,7 +3410,7 @@ class E2E(E2EBase):
         laptop.write_text(self.toml.read_text(encoding="utf-8").replace(
             'name = "motor"\ncmd = ["python"', 'name = "motor"\ncmd = ["python3"', 1), encoding="utf-8")
         pr, lr = self.correr(clave=clave, toml=laptop)
-        self.assertEqual(pr.wait(60), 2, self.texto(lr))
+        self.assertEqual(self.fin(pr, 60), 2, self.texto(lr))
         t = self.texto(lr)
         self.assertIn("el nodo motor es distinto en su robot.toml (cmd)", t)
         self.assertIn("Haz git pull en robot", t)
@@ -3443,6 +3476,9 @@ class E2E(E2EBase):
         self.assertTrue(self.espera(lambda: nodo("motor")["state"] == "corriendo", 30), self.texto(lr))
         self.assertEqual(nodo("motor").get("machine"), "robot")
         self.assertIsNone(nodo("ia").get("machine"))
+        # "corriendo" sale al lanzar el proceso, antes de su primer latido: imu tiene que estar vivo ANTES de
+        # detener motor para que "detener motor no toca imu" signifique algo
+        self.assertTrue(self.espera(lambda: self.vivo("imu"), 30), self.texto(lr))
         self.assertEqual(post("/api/node/motor/stop"), 200)
         self.assertTrue(self.espera(lambda: nodo("motor")["state"] == "detenido", 30))
         self.assertTrue(self.espera(lambda: not self.vivo("motor"), 30))
@@ -3716,7 +3752,11 @@ class TestRunConAgentesDeMentira(E2EBase):
         pr, lr = self.correr(clave=KEY, toml=t)
         self.assertTrue(self.espera(lambda: recibidos, 40), self.texto(lr))     # el agente recibió la sesión: se está conectando
         time.sleep(0.3)
-        self.assertEqual(self.detener(pr, 40), 130, self.texto(lr))
+        codigo = self.detener(pr, 40)
+        # (en Windows la prueba manda Ctrl+Break: 0xC000013A sería la consola matando a agmen run sin avisar)
+        self.assertEqual(codigo, 130, f"código {codigo!r} ({codigo & 0xFFFFFFFF:#x}); el agente recibió {recibidos}\n"
+                                      f"{self.texto(lr)}" if isinstance(codigo, int) else
+                         f"agmen run no salió en 40 s; el agente recibió {recibidos}\n{self.texto(lr)}")
         texto = self.texto(lr)
         self.assertIn("cancelado (Ctrl+C) mientras me conectaba", texto)
         self.assertNotIn("Traceback", texto)

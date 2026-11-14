@@ -1692,6 +1692,29 @@ class KeyPromptCancelled(Exception):
     AgentError: agmen run lo trata como el Ctrl+C en ese punto (cancelado, no arranca nada)."""
 
 
+def _stdin_is_terminal() -> bool:
+    """¿Hay una persona en la entrada para pedirle la clave? En Windows isatty() no basta:
+    es verdad para cualquier dispositivo de caracteres, también NUL (stdin=DEVNULL), y
+    getpass lee del teclado de la consola, no de stdin, así que se quedaría esperando para
+    siempre. Ahí solo cuenta una consola de verdad (GetConsoleMode funciona en ella)."""
+    import sys
+
+    stdin = sys.stdin
+    try:
+        if stdin is None or not stdin.isatty():
+            return False
+        if os.name != "nt":
+            return True
+        import ctypes
+        import msvcrt
+
+        mode = ctypes.c_uint32()
+        handle = msvcrt.get_osfhandle(stdin.fileno())
+        return bool(ctypes.windll.kernel32.GetConsoleMode(ctypes.c_void_p(handle), ctypes.byref(mode)))
+    except (OSError, ValueError, AttributeError):   # stdin cerrado, sin descriptor o sin consola
+        return False
+
+
 def get_key(name: str, address: str, *, interactive: bool | None = None,
             env: dict | None = None, ask: Callable[[str], str] | None = None) -> tuple[str, str]:
     """La clave para la computadora `name` (en `address`, de machine_address). Devuelve
@@ -1712,7 +1735,7 @@ def get_key(name: str, address: str, *, interactive: bool | None = None,
         except AgentKeyError as e:
             raise AgentKeyError(f"{KEY_ENV}: {e}") from None
     if interactive is None:
-        interactive = sys.stdin is not None and sys.stdin.isatty()
+        interactive = _stdin_is_terminal()
     if not interactive:
         raise AgentKeyError(f"no tengo la clave de agmen agent en '{name}' ({address}) y esta terminal no es "
                             f"interactiva para pedírtela. Dala en la variable {KEY_ENV} (la muestra agmen agent al "
