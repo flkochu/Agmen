@@ -32,6 +32,12 @@ TRAMO = SEG // 100      # 10 ms simulados por /imu (100 Hz), sea cual sea el tim
 TOPE = 20               # tramos por tick, a lo más, corriendo (0.2 s): si falta más, la computadora no alcanza
 TOPE_PASO = 6000        # en pausa, un "paso" del panel se simula entero, hasta 60 s
 FRENO = SEG // 2        # 0.5 s sin comandos → ruedas en 0, como el motor del tutorial
+# Un retroceso de la hora del sistema se avisa solo si deja a t_data más de esto por delante. Por debajo es la
+# resolución del reloj, no un ajuste: en Windows con Python ≤ 3.12, time.time_ns() avanza en saltos de ~15.6 ms
+# (más que un TRAMO), así que el desfase de un tick a otro "retrocede" unos ms sin que nadie toque la hora. Eso
+# se absorbe igual (t_data avanza de 1 ns en 1 ns), pero sin avisar. 0.1 s: menos que el ajuste de golpe más
+# chico de NTP (0.128 s), más que la resolución de Windows más un hilo que se demora entre las dos lecturas.
+TOLERANCIA_HORA = SEG // 10
 
 
 class Ritmo:
@@ -154,12 +160,15 @@ def main() -> int:
             with candado:                                   # la cámara copia juntos el estado y su hora
                 mundo.avanzar(pasos)
                 s.t += TRAMO
-                atras = s.t + desfase <= s.t_data           # la hora del sistema retrocedió: t_data no
-                s.t_data = s.t_data + 1 if atras else s.t + desfase
-            if atras != s.atras:
-                s.atras = atras
-                di("⚠ la hora del sistema retrocedió: t_data avanza de 1 ns en 1 ns hasta alcanzarla" if atras
-                   else "t_data ya va otra vez con la hora del sistema", error=atras)
+                hora = s.t + desfase
+                atras = hora <= s.t_data                    # la hora del sistema quedó atrás: t_data no
+                s.t_data = s.t_data + 1 if atras else hora  # baja ni se repite, avanza de 1 ns en 1 ns
+            # Se avisa una vez por retroceso real (más que TOLERANCIA_HORA), y otra al alcanzarla.
+            aviso = s.t_data - hora > TOLERANCIA_HORA if atras and not s.atras else atras
+            if aviso != s.atras:
+                s.atras = aviso
+                di("⚠ la hora del sistema retrocedió: t_data avanza de 1 ns en 1 ns hasta alcanzarla" if aviso
+                   else "t_data ya va otra vez con la hora del sistema", error=aviso)
             accel, gyro = mundo.imu()
             pub.publish(agmen.wire.ImuSample(accel=accel, gyro=gyro), t_data=s.t_data)
             s.imus += 1

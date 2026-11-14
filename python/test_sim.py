@@ -760,9 +760,10 @@ def publish(self, msg, t_data=None):
     return orig(self, msg, t_data=t_data)
 P.publish = publish
 real_now, T0 = clock.now_ns, time.monotonic()
+RES, SALTA = 1, True                            # resolución de la hora del sistema (ns); si la ajustan o no
 def now_ns():                                   # la hora del sistema: +5 s a los 0.8 s; -0.3 s a los 1.4 s
     e = time.monotonic() - T0
-    return real_now() + (0 if e < 0.8 else 5_000_000_000 if e < 1.4 else 4_700_000_000)
+    return real_now() // RES * RES + (0 if not SALTA or e < 0.8 else 5_000_000_000 if e < 1.4 else 4_700_000_000)
 clock.now_ns = now_ns
 sys.argv = ["mundo.py", "--seconds", "3", "--sin-camara"]
 try:
@@ -819,19 +820,42 @@ class TestNodoHoraDelSistema(unittest.TestCase):
     """Con reloj real, t_data sigue la escala de agmen.clock.now_ns() aunque la hora del sistema se ajuste
     después de arrancar. Se sustituye clock.now_ns en un proceso de prueba (no se toca el reloj del sistema)."""
 
-    def test_adelanta_y_retrocede(self):
-        r = _driver(_DRIVER_HORA, {"AGMEN_CLOCK": "real"})
+    # time.time_ns() de Python ≤ 3.12 en Windows: avanza en saltos de 15.625 ms, más que un tramo de 10 ms.
+    GRUESA = 15_625_000
+
+    def _correr(self, res: int, salta: bool):
+        self.assertEqual(_DRIVER_HORA.count("RES, SALTA = 1, True"), 1)
+        codigo = _DRIVER_HORA.replace("RES, SALTA = 1, True", f"RES, SALTA = {res}, {salta}")
+        r = _driver(codigo, {"AGMEN_CLOCK": "real"})
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
         rec = json.loads(next(l for l in r.stdout.splitlines() if l.startswith("REC "))[4:])
         self.assertGreater(len(rec), 200, len(rec))
         difs = [b - a for a, b in zip(rec, rec[1:])]
         self.assertEqual([d for d in difs if d <= 0], [], "t_data nunca se repite ni baja")
+        return r, rec, difs
+
+    def test_adelanta_y_retrocede(self):
+        self._comprobar_un_retroceso(1)
+
+    def test_adelanta_y_retrocede_con_hora_de_resolucion_gruesa(self):
+        # Lo que falló en el CI de Windows: con la hora en saltos de 15.6 ms, el desfase de un tick a otro baja
+        # hasta 15.6 ms y t_data "retrocedía" sin que nadie tocara la hora: un aviso de más por cada vez.
+        self._comprobar_un_retroceso(self.GRUESA)
+
+    def test_resolucion_gruesa_sin_ajuste_no_avisa(self):
+        r, _, difs = self._correr(self.GRUESA, False)
+        self.assertNotIn("retrocedió", r.stderr, "la resolución del reloj no es un retroceso")
+        self.assertNotIn("t_data ya va otra vez", r.stdout + r.stderr)
+        self.assertLess(max(difs), 10**9, "sin ajuste, t_data no da saltos")
+
+    def _comprobar_un_retroceso(self, res: int):
+        r, rec, difs = self._correr(res, True)
         self.assertLess(abs(rec[0] - time.time_ns()), 60 * 10**9, "en la escala de now_ns")
         self.assertTrue(any(4.9e9 <= d <= 5.2e9 for d in difs), "la hora adelantada se sigue de golpe")
         self.assertGreaterEqual(sum(1 for d in difs if d == 1), 10, "al retroceder, avanza de 1 ns en 1 ns")
         self.assertEqual(r.stderr.count("la hora del sistema retrocedió: t_data avanza de 1 ns en 1 ns"), 1, r.stderr)
         self.assertEqual((r.stdout + r.stderr).count("t_data ya va otra vez con la hora del sistema"), 1, r.stdout)
-        self.assertNotIn("Traceback", r.stderr)
 
 
 @unittest.skipUnless(HAY_MUJOCO, SIN_MUJOCO)
