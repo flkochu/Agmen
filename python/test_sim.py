@@ -767,9 +767,10 @@ def t_imu():
 real_now = clock.now_ns
 H = json.loads(os.environ.get("HORA_PRUEBA", "{}"))
 RES, FASE = H.get("res", 1), H.get("fase", 0)   # resolución de la hora del sistema y dónde caen sus saltos (ns)
-# [s de /imu, ns que se le suman a la hora desde ahí]. Sin HORA_PRUEBA: +5 s a los 0.8 s y luego -0.3 s a
-# los 1.4 s.
-AJUSTES = H.get("ajustes", [[0.8, 5_000_000_000], [1.4, 4_700_000_000]])
+# [s de /imu, ns que se le suman a la hora desde ahí]. Sin HORA_PRUEBA: +5 s a los 0.8 s y luego -1 s a
+# los 1.4 s (1 s y no 0.3 s: para alcanzar la hora antes de tiempo, y quedarse sin los pasos de 1 ns que
+# la prueba cuenta, el nodo tendría que trabarse más de 1 s; con 0.3 s bastaba una traba de 0.4 s).
+AJUSTES = H.get("ajustes", [[0.8, 5_000_000_000], [1.4, 4_000_000_000]])
 DEMORA = H.get("demora")        # [s, ms]: una vez, el tick se demora dentro del now_ns() con que lee la hora
 def now_ns():
     global DEMORA
@@ -924,8 +925,10 @@ class TestNodoHoraDelSistema(unittest.TestCase):
         self.assertEqual(self._avisos(r), (5, 5), r.stdout + r.stderr)
 
     def test_segundo_retroceso_antes_de_alcanzar_no_vuelve_a_avisar(self):
-        # -0.3 s y otros -0.3 s 0.1 s después: el aviso que ya salió sigue siendo cierto; uno y su "otra vez".
-        r, _, _ = self._correr({"ajustes": [[0.6, -300 * self.MS], [0.7, -600 * self.MS]], "segundos": 1.7,
+        # -1 s y otro -1 s 0.1 s después: el aviso que ya salió sigue siendo cierto; uno y su "otra vez".
+        # (De 1 s y no de 0.3 s: con 0.3 s, una traba de 0.35 s del nodo entre los dos lo hacía alcanzar la
+        # hora antes del segundo, y entonces eran de verdad dos retrocesos y dos avisos.)
+        r, _, _ = self._correr({"ajustes": [[0.6, -1000 * self.MS], [0.7, -2000 * self.MS]], "segundos": 3.2,
                                 "res": self.GRUESA})
         self.assertEqual(self._avisos(r), (1, 1), r.stdout + r.stderr)
 
