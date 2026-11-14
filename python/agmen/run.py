@@ -1069,11 +1069,14 @@ class Printer:
                 text = f"\x1b[2m{text}\x1b[0m" if kind == "agmen" else f"\x1b[31m{text}\x1b[0m"
         return f"{tag} │ {text}"
 
-    def __call__(self, node: str, text: str, kind: str = "out") -> None:
+    def __call__(self, node: str, text: str, kind: str = "out", droppable: bool | None = None) -> None:
+        """`droppable`: ¿se puede descartar si la terminal no da abasto? Por defecto, solo las
+        líneas "out": los avisos de agmen y los errores de aquí nunca. Lo que llega de otra
+        computadora (agmen agent) siempre se puede: un agente roto no llena la memoria aquí."""
         line = self._format(node, text, kind)
         with self.cond:
-            if len(self.queue) >= self.max_queue and kind == "out":
-                self.dropped += 1   # los avisos de agmen y los errores nunca se descartan
+            if len(self.queue) >= self.max_queue and (kind == "out" if droppable is None else droppable):
+                self.dropped += 1
                 return
             self.queue.append(line)
             self.cond.notify()

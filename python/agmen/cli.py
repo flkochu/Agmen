@@ -119,6 +119,11 @@ def cmd_run(args) -> int:
                 remotes, keys = _links_for(config, places, args.archivo)
             except AgentError as e:   # no hay clave, o keys.toml no se puede leer
                 remote = str(e)
+            except KeyboardInterrupt:   # Ctrl+C mientras pedía la clave
+                if player is not None:
+                    player.stop()
+                print("\nagmen │ cancelado (Ctrl+C) antes de conectarme: no arrancó nada", file=sys.stderr)
+                return 130
         if remote:
             if player is not None:
                 player.stop()
@@ -145,7 +150,16 @@ def cmd_run(args) -> int:
                          f"desde el panel): quítalos con --skip"
                          + (f", o corre sin --profile {args.profile}" if args.profile else ""))
     if remotes:   # ANTES de arrancar nada: si una computadora falla, no arranca nada en ninguna
-        error = _connect(launcher, config, remotes, keys, "replay" if args.play else config.clock.mode, lost, stop)
+        try:
+            error = _connect(launcher, config, remotes, keys, "replay" if args.play else config.clock.mode, lost,
+                             stop)
+        except KeyboardInterrupt:   # _connect ya mandó adios a todas
+            launcher.printer.close()
+            if player is not None:
+                player.stop()
+            print("\nagmen │ cancelado (Ctrl+C) mientras me conectaba con las otras computadoras: les avisé y no "
+                  "arrancó nada", file=sys.stderr)
+            return 130
         if error:
             launcher.printer.close()
             if player is not None:
@@ -161,6 +175,13 @@ def cmd_run(args) -> int:
 
         for line in other_robot(config):
             launcher.say(line)
+    if lost:   # una computadora se perdió mientras me conectaba con otra: no se arranca nada de aquí
+        for link in remotes.values():
+            link.finish()
+        launcher.printer.close()
+        if player is not None:
+            player.stop()
+        return 1
     try:
         ready = launcher.run_before()
     except BaseException:           # Ctrl+C en un comando de before: la grabación ya abierta se cierra
@@ -199,7 +220,7 @@ def cmd_run(args) -> int:
         if clock_note:
             launcher.say(clock_note)
     recording = _recording_for(config, args, out)
-    if args.record or (config.record is not None and config.record.auto):
+    if not lost and (args.record or (config.record is not None and config.record.auto)):
         err = recording.start()
         if err:
             launcher.say(f"⚠ no se pudo grabar: {err}")
@@ -208,7 +229,7 @@ def cmd_run(args) -> int:
     launcher.watch = watch
 
     panel = None
-    if config.web.enabled and not args.no_web:
+    if config.web.enabled and not args.no_web and not lost:
         teleop = Teleop(config.web.teleop.target, config.web.teleop.max_speed) if config.web.teleop else None
         commands = _commands_for(config)
         http = _http_for(args.http or config.web.http, args.red)
@@ -758,6 +779,14 @@ def main(argv: list[str] | None = None) -> int:
 
     ensure_utf8_output()
     args = ap.parse_args(argv)
+    if args.cmd in ("run", "agent"):   # AGMEN_REMOTE_HOSTS (pruebas, RFC 0011 §6 reto 9): mal escrita, error
+        from .machines import forced_remote
+
+        try:
+            forced_remote()
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
     if args.cmd in ("run", "record", "play", "topic", "node", "web", "echo", "mux"):
         # Su nombre para el hub ("▶ 'agmen play' publica /imu"), si no trae AGMEN_NODE.
         from .pubsub import set_default_node_name

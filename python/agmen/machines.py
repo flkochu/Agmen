@@ -324,9 +324,31 @@ def _norm(host: str) -> str:
 
 
 def forced_remote(env: dict | None = None) -> set[str]:
-    """Los host de AGMEN_REMOTE_HOSTS, normalizados (vacío si no está)."""
+    """Los host de AGMEN_REMOTE_HOSTS, normalizados (vacío si no está). Cada entrada se
+    escribe como un host de [[machine]]: con o sin puerto ("127.0.0.2:7391", que se ignora),
+    IPv6 entre corchetes, nombres sin importar mayúsculas ni el punto final. ValueError si
+    una entrada no se entiende: es una variable de pruebas, mejor fallar que ignorarla."""
     value = (os.environ if env is None else env).get(REMOTE_HOSTS_ENV, "")
-    return {_norm(h) for h in value.split(",") if h.strip()}
+    out = set()
+    for entry in value.split(","):
+        if not entry.strip():
+            continue
+        text = entry.strip()
+        bracket = re.fullmatch(r"\[([^\]]+)\](?::[0-9]{1,5})?", text)
+        host = bracket.group(1) if bracket else (text.rpartition(":")[0] if text.count(":") == 1 else text)
+        try:
+            ipaddress.ip_address(host.split("%", 1)[0])   # cualquier IP se entiende (aunque no sea de nadie)
+            out.add(_norm(host))
+            continue
+        except ValueError:
+            pass
+        try:
+            host, _ = split_host(text)
+        except ValueError as e:
+            raise ValueError(f"{REMOTE_HOSTS_ENV}: la entrada {entry.strip()!r} no se entiende ({e}). Es una lista "
+                             f"de IP o nombres separados por comas, ej. {REMOTE_HOSTS_ENV}=127.0.0.2,robot.local") from None
+        out.add(_norm(host))
+    return out
 
 
 def _apply_forced(result: dict[str, Place], addresses: dict[str, list[str]], forced: set[str]) -> None:

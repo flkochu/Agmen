@@ -66,9 +66,9 @@ SEND_TIMEOUT = 6.0              # si la otra punta no lee en este tiempo, se da 
 FAIL_PAUSE = 1.0                # tras una clave mala, esa IP espera esto antes de otro intento
 FAIL_WINDOW = 60.0
 MAX_FAILS_IP = 5                # pruebas malas por minuto desde una IP (IPv6: su /64)
-MAX_FAILS_TOTAL = 60            # pruebas malas por minuto en total (salvo la IP que ya demostró la clave)
+MAX_FAILS_TOTAL = 60            # pruebas malas por minuto en total (salvo la IP de la última sesión aceptada)
 MAX_PENDING_IP = 4              # conexiones sin saludar a la vez desde una IP
-MAX_PENDING_TOTAL = 32          # … y en total (1 guardada para la IP que ya demostró la clave)
+MAX_PENDING_TOTAL = 32          # … y en total (1 guardada para la IP de la última sesión aceptada)
 MAX_TRACKED_IPS = 1024          # IP que se recuerdan para los límites (las más viejas se olvidan)
 NOTES_PER_MINUTE = 20           # avisos por conexiones sin clave en la terminal del agente
 LOG_LINE_MAX = 8 * 1024         # bytes de una línea de log que se manda (más se corta)
@@ -854,7 +854,7 @@ class AgentServer:
         self.session: _Session | None = None
         self.stopping = False
         self.sock: socket.socket | None = None
-        self.trusted = ""                            # la IP que demostró la clave la última vez
+        self.trusted = ""                            # la IP de la última sesión aceptada (sesion_ok)
         self._ips: OrderedDict[str, _IpRecord] = OrderedDict()   # por IP (con tope: MAX_TRACKED_IPS)
         self._fails_all: deque[float] = deque()      # pruebas malas del último minuto, de todas las IP
         self._pending_total = 0
@@ -937,7 +937,7 @@ class AgentServer:
 
     def _admit(self, key: str) -> bool:
         """¿Cabe otra conexión sin saludar? 4 por IP y 32 en total, con 1 guardada para la
-        IP que demostró la clave la última vez."""
+        IP de la última sesión aceptada."""
         with self.lock:
             rec = self._rec(key)
             room = MAX_PENDING_TOTAL if key == self.trusted else MAX_PENDING_TOTAL - 1
@@ -1053,8 +1053,6 @@ class AgentServer:
             self.say(f"error inesperado en el saludo con {ip}: {_clean(repr(e), 200)}", "error")
             return
         unreserve()
-        with self.lock:
-            self.trusted = key   # demostró la clave: conserva su lugar aunque otros fallen
         try:
             self._open(channel, ip)
         except Exception as e:   # _Session.run ya termina en end(); esto es por si acaso
@@ -1480,6 +1478,8 @@ class _Session:
                 launcher.nodes["hub"].start()   # el hub de esta computadora, como en agmen run
             self.send({"op": "sesion_ok", "maquina": m, "agmen": __version__, "nodos": list(plan.names)})
             self.ready.set()
+            with self.server.lock:   # la IP de la última sesión ACEPTADA conserva su lugar aunque otros fallen
+                self.server.trusted = _ip_key(self.ip)
             for name in plan.names:
                 node = launcher.nodes[name]
                 with node.lock:
@@ -1661,6 +1661,7 @@ CONNECT_TIMEOUT = 5.0           # para abrir la conexión TCP con el agente
 FINISH_TIMEOUT = 8.0            # Ctrl+C: cuánto esperar los estado de detener_todo
 KEY_ENV = "AGMEN_AGENT_KEY"     # una sola clave para todas las computadoras (terminal no interactiva)
 _RUNNING = ("corriendo", "reiniciando")
+NODE_STATES = ("corriendo", "detenido", "falló", "reiniciando", "terminó")   # los de run.Node
 
 
 class LinkError(AgentError):
@@ -1754,16 +1755,20 @@ class AgentLink:
         self._logs = None
         self._printer = None
         self._lock = threading.Lock()
+        self._noted: set[str] = set()
 
     def attach(self, logs, printer) -> None:
         self._logs, self._printer = logs, printer
 
     def _say(self, text: str, kind: str = "agmen") -> None:
-        text = _printable(text)
+        """Una línea que manda el agente (su salida de before, su hub, un error): sin
+        caracteres de control ni saltos (no puede fingir una línea de aquí), corta, y
+        descartable en la terminal si no da abasto (un agente roto no llena la memoria aquí)."""
+        text = _clean(text, LOG_LINE_MAX)
         if self._logs is not None:
             self._logs.add(self.name, text, kind)
         if self._printer is not None:
-            self._printer(self.name, text, kind)
+            self._printer(self.name, text, kind, droppable=True)
 
     # --- abrir ---
     def open(self, key: str, session: dict, *, on_key_ok: Callable[[], None] | None = None,
@@ -1815,7 +1820,7 @@ class AgentLink:
                 if op == "sesion_ok":
                     break
                 if op == "sesion_error":
-                    code, text = str(msg.get("codigo", "?")), _printable(str(msg.get("texto", "")))
+                    code, text = _clean(msg.get("codigo", "?"), 40), _clean(msg.get("texto", ""), 2000)
                     if not text.startswith(self.name):
                         text = f"{self.name}: {text}"
                     raise LinkError(code, text)
@@ -1823,16 +1828,21 @@ class AgentLink:
                     self._dispatch(msg)
         except BaseException:
             self._done.set()
+            try:
+                channel.send({"op": "adios"})   # Ctrl+C mientras se preparaba: que el agente lo sepa
+            except AgentError:
+                pass
             channel.close()
             self.channel = None
             raise
+        self.version = _clean(channel.peer_version, 40)
         threading.Thread(target=self._read_loop, daemon=True, name=f"agmen-agent-{self.name}").start()
 
     def _handshake_error(self, e: HandshakeError, where: str) -> LinkError:
         if e.code == "clave":
             return LinkError("clave", f"{where} rechazó la clave")   # el texto del agente habla desde allá
         if e.code == "espera":
-            return LinkError("espera", f"{where} no acepta intentos por ahora: {e}")
+            return LinkError("espera", f"{where} no acepta intentos por ahora: {_clean(e, 300)}")
         if e.code in ("no_agmen", "protocolo"):
             return LinkError("no_agmen", f"en {where} contestó algo que no es agmen agent: ¿otro programa usa ese "
                                          f"puerto? Revisa host de [[machine]] '{self.name}' (agmen agent escucha en "
@@ -1881,21 +1891,37 @@ class AgentLink:
     def _dispatch(self, msg: dict) -> None:
         op = msg["op"]
         if op == "log":
-            name, text = msg.get("nodo"), _printable(str(msg.get("linea", "")))
-            node = self.nodes.get(name)
+            name, text = msg.get("nodo"), _clean(msg.get("linea", ""), LOG_LINE_MAX)
+            node = self.nodes.get(name) if isinstance(name, str) else None
             if node is not None:
-                node._log(text, _kind(text))
+                node._log(text, _kind(text))   # descartable en la terminal, como lo de un nodo ruidoso
             else:
                 self._say(text, "agmen" if name == "agmen" else "out")
         elif op == "estado":
-            node = self.nodes.get(msg.get("nodo"))
-            if node is not None:
-                pid, code = msg.get("pid"), msg.get("codigo")
-                node.remote_state(str(msg.get("estado", "?")), pid if isinstance(pid, int) else None,
-                                  code if isinstance(code, int) else None)
+            name, state = msg.get("nodo"), msg.get("estado")
+            node = self.nodes.get(name) if isinstance(name, str) else None
+            if node is None:
+                return
+            if state not in NODE_STATES:   # solo los estados que conoce el Launcher
+                self._note_once("estado", f"⚠ {self.name} mandó un estado que no conozco para '{node.cfg.name}' "
+                                          f"({_clean(state, 40)!r}): lo ignoro (¿otra versión de Agmen allá?)")
+                return
+            pid, code = msg.get("pid"), msg.get("codigo")
+            node.remote_state(state, pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
+                              code if isinstance(code, int) and not isinstance(code, bool) else None)
         elif op == "error":
-            self._say(str(msg.get("texto", "")), "error")
+            self._say(msg.get("texto", ""), "error")
         # pong y lo que no conozca (un agente más nuevo): nada
+
+    def _note_once(self, what: str, text: str) -> None:
+        """Un aviso propio de agmen run sobre lo que manda el agente: una vez por conexión."""
+        if what in self._noted:
+            return
+        self._noted.add(what)
+        if self._logs is not None:
+            self._logs.add("agmen", text, "agmen")
+        if self._printer is not None:
+            self._printer("agmen", text, "agmen")
 
     def _lose(self, why: str) -> None:
         with self._lock:
@@ -1978,14 +2004,16 @@ class RemoteNode(Node):
                 "machine": self.link.name,
             }
 
-    def _log(self, text: str, kind: str = "out") -> None:
+    def _log(self, text: str, kind: str = "out", own: bool = False) -> None:
+        """own: un aviso de agmen run (no se descarta). Si no, una línea que mandó el agente:
+        se puede descartar en la terminal si no da abasto (un agente roto no llena la memoria)."""
         self.logs.add(self.cfg.name, text, kind)
-        self.printer(self.label, text, kind)
+        self.printer(self.label, text, kind, droppable=not own)
 
     def _order(self, op: str) -> None:
         err = self.link.order(op, self.cfg.name)
         if err:
-            self._log(err, "error")
+            self._log(err, "error", own=True)
 
     def start(self) -> None:
         with self.lock:
@@ -2010,4 +2038,4 @@ class RemoteNode(Node):
             self.remote_pid, self.exit_code = pid, code
             self.state = state
         if log:
-            self._log(log, "error")
+            self._log(log, "error", own=True)
