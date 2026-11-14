@@ -22,6 +22,7 @@ import concurrent.futures
 import json
 import os
 import random
+import re
 import shutil
 import signal
 import socket
@@ -393,6 +394,90 @@ from agmen.msgs import Imagen
 p = agmen.Publisher(Imagen, "/cierre/padre")
 """
 
+# B1: un hilo vuelve de receive() y queda ESPERANDO el GIL (lo tiene otro hilo en una llamada larga de C
+# que no lo suelta: sum(range(...))). Cuando el GIL se libera ya pasó el límite del cierre: si el cierre
+# lo toma primero, se rinde con el receptor esperando el GIL; la finalización suelta el GIL (un __del__
+# que duerme) y el receptor, al tomarlo, era terminado dentro del núcleo (SIGABRT con Python 3.12).
+ESPERA_GIL = CABECERA + """
+import atexit, builtins
+class Suelta:
+    def __del__(self):
+        time.sleep(0.2)
+builtins._suelta = Suelta()
+import agmen
+from agmen.clock import Clock
+sub = agmen.Subscriber(Clock, "/cierre/espera_gil")
+ya = threading.Event()
+def r():
+    while True:
+        sub.receive(0.2)
+t0 = time.perf_counter()
+sum(range(5_000_000))
+N = int(5_000_000 * 2.6 / max(time.perf_counter() - t0, 0.001))   # calibrado a esta máquina
+def b():
+    ya.wait()
+    sum(range(N))   # ~2.6 s en C con el GIL tomado (más que el límite del cierre, 2 s)
+threading.Thread(target=r, daemon=True).start()
+threading.Thread(target=b, daemon=True).start()
+atexit.register(ya.set)   # corre ANTES del cierre de agmen
+time.sleep(0.3)
+"""
+
+# I1: una función de un Node que tarda más que el límite del cierre y vuelve cuando el intérprete ya se
+# está finalizando (un __del__ lento alarga la finalización). Con glibc el hilo se queda detenido y el
+# proceso sale con su código; sin glibc no hay garantía (el aviso lo dice).
+FUNCION_ATORADA = CABECERA + """
+import builtins
+class Lento:
+    def __del__(self):
+        time.sleep(1.5)
+builtins._lento = Lento()
+import agmen
+print("PARK=%d" % bool(agmen._backend.core._PARK_FORCED_UNWIND), flush=True)
+node = agmen.Node("atorado")
+node.every(0.01, lambda: time.sleep(2.5))
+threading.Thread(target=node.spin, daemon=True).start()
+time.sleep(0.3)
+"""
+
+# M2: igual, pero con el SIGINT en manos de Python (signal.signal después de arrancar el spin): mientras un
+# spin() gira, el manejador propio de agmen se queda con el primer Ctrl+C (src/node.cpp) y Python no lo ve.
+FUNCION_LARGA_SIGINT_PYTHON = CABECERA + """
+import signal
+import agmen
+node = agmen.Node("larga")
+node.every(0.01, lambda: time.sleep(10))
+threading.Thread(target=node.spin, daemon=True).start()
+time.sleep(0.3)
+signal.signal(signal.SIGINT, signal.default_int_handler)
+print("principal termina", flush=True)
+"""
+
+# M1: un hilo con el lock de un Publisher y de un Subscriber tomado y dormido para siempre; un atexit
+# ajeno (corre después del cierre) llama a close() de los dos: sin límite se colgaría la salida.
+LOCK_TOMADO = CABECERA + """
+import atexit
+def al_final():
+    t0 = time.monotonic()
+    pub.close()
+    sub.close()
+    print("CERRADOS %.2f" % (time.monotonic() - t0), flush=True)
+atexit.register(al_final)
+import agmen
+from agmen.msgs import Imagen
+pub = agmen.Publisher(Imagen, "/cierre/lock")
+sub = agmen.Subscriber(Imagen, "/cierre/lock")
+dormido = threading.Event()
+def duerme(lock):
+    lock.acquire()
+    dormido.set()
+    threading.Event().wait()   # para siempre, con el lock
+for o in (pub, sub):
+    threading.Thread(target=duerme, args=(o._lock,), daemon=True).start()
+    dormido.wait(); dormido.clear()
+time.sleep(0.7)   # el hilo de latidos ya intentó latir y se quedó esperando el lock
+"""
+
 MALAS = ("terminate called", "Fatal Python error")
 
 
@@ -483,9 +568,80 @@ class TestCierreSalidas(_ConHub):
         self.assertEqual(r.stderr.count("al salir no terminaron"), 1, r.stderr)
         self.assertIn("una función de un Node", r.stderr)
         self.assertIn("El programa sale igual", r.stderr)
+        self.assertIn("Para evitarlo, detén tus hilos que usan agmen (o llama a node.stop()) antes de salir", r.stderr)
+        # el tiempo que dice es el medido, no un "2 s" fijo
+        m = re.search(r"\(esperé (\d+\.\d) s\)", r.stderr)
+        self.assertIsNotNone(m, r.stderr)
+        self.assertTrue(1.8 <= float(m.group(1)) <= 3.0, m.group(0))
+        self.assertNotIn("hilo de latidos", r.stderr, "el hilo de latidos solo se nombra si sigue vivo")
         for m in MALAS:
             self.assertNotIn(m, r.stderr)
         self.assertEqual(len([ln for ln in r.stderr.splitlines() if "[agmen]" in ln]), 1, r.stderr)
+
+    def test_funcion_atorada_que_vuelve_en_plena_finalizacion(self):
+        """I1: con glibc el proceso sale con su código y el aviso (no aborta con Python 3.12). Sin glibc
+        (Windows, macOS) no hay garantía: solo se afirma que el aviso lo dice, no el código de salida."""
+        def una(_):
+            return correr(FUNCION_ATORADA, hub=self.addr, timeout=30, fijar=True)
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            res = list(pool.map(una, range(2)))
+        for r in res:
+            park = "PARK=1" in r.stdout
+            self.assertEqual(r.stderr.count("al salir no terminaron"), 1, r.stderr)
+            self.assertIn("una función de un Node", r.stderr)
+            if park:
+                self.assertEqual(r.returncode, 0, r.stderr)
+                for m in MALAS:
+                    self.assertNotIn(m, r.stderr)
+                self.assertIn("esos hilos se quedan detenidos hasta que termine", r.stderr)
+                self.assertNotIn("error de Python", r.stderr)
+            else:
+                self.assertIn("puede terminar con un error de Python al salir", r.stderr)
+
+    @unittest.skipUnless(POSIX, "SIGINT a un proceso hijo: solo POSIX (en Windows requiere un grupo de procesos)")
+    def test_ctrl_c_durante_el_cierre_deja_de_esperar_y_avisa_sin_traceback(self):
+        """M2: un Ctrl+C a media espera del cierre no salta lo que falta: el aviso sale, sin traceback."""
+        cmd = [sys.executable, "-c", FUNCION_LARGA_SIGINT_PYTHON, str(ROOT)]
+        p = subprocess.Popen(cmd, env=entorno(self.addr), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(p.stdout.readline().strip(), "principal termina")
+            time.sleep(0.6)   # el cierre ya lleva un rato esperando a la función de 10 s
+            t0 = time.monotonic()
+            p.send_signal(signal.SIGINT)
+            try:
+                _, err = p.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                _, err = p.communicate()
+                self.fail(f"Ctrl+C durante el cierre no terminó el programa en 15 s: {err}")
+        finally:
+            if p.poll() is None:
+                p.kill()
+        self.assertLess(time.monotonic() - t0, 1.0, "tras el Ctrl+C debía dejar de esperar (faltaba 1.4 s del límite)")
+        self.assertEqual(p.returncode, 0, err)
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn("KeyboardInterrupt", err)
+        self.assertEqual(err.count("al salir no terminaron"), 1, err)
+        for m in MALAS:
+            self.assertNotIn(m, err)
+
+    def test_lock_de_publisher_y_subscriber_tomado_no_cuelga_la_salida(self):
+        """M1: tras empezar el cierre, close() no espera sin límite el lock que tiene un hilo dormido."""
+        try:
+            r = correr(LOCK_TOMADO, hub=self.addr, timeout=20)
+        except subprocess.TimeoutExpired:
+            self.fail("la salida se colgó esperando el lock de un Publisher/Subscriber tomado por otro hilo")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        m = re.search(r"CERRADOS (\d+\.\d+)", r.stdout)
+        self.assertIsNotNone(m, f"{r.stdout}\n{r.stderr}")
+        self.assertLess(float(m.group(1)), 2.0, "cada close() espera a lo más 0.2 s")
+        for mal in MALAS:
+            self.assertNotIn(mal, r.stderr)
+        # el hilo de latidos quedó esperando el mismo lock: se nombra, y el aviso no promete un error de Python
+        if "al salir no terminaron" in r.stderr:
+            self.assertIn("el hilo de latidos", r.stderr)
+            self.assertIn("El programa sale igual.", r.stderr)
+            self.assertNotIn("error de Python", r.stderr)
 
     def test_sin_hilos_propios_no_escribe_nada_al_salir(self):
         t0 = time.monotonic()
@@ -503,11 +659,11 @@ class TestCierreAlAzar(_ConHub):
     núcleos; con el código anterior a la corrección cada una abortaba en una fracción de las corridas
     (publicar y spin(): casi siempre). AGMEN_CIERRE_VECES cambia las repeticiones."""
 
-    VECES = {"publicar": 6, "recibir": 10, "spin": 6, "aviso": 4}
+    VECES = {"publicar": 6, "recibir": 10, "spin": 6, "aviso": 4, "espera_gil": 6}
 
-    def _corre_varias(self, nombre):
+    def _corre_varias(self, nombre, codigo=None, permite_aviso=False):
         veces = int(os.environ.get("AGMEN_CIERRE_VECES", self.VECES[nombre]))
-        codigo = ALEATORIAS[nombre]
+        codigo = codigo or ALEATORIAS[nombre]
 
         def una(i):
             try:
@@ -520,7 +676,7 @@ class TestCierreAlAzar(_ConHub):
             res = list(pool.map(una, range(veces)))
         malas = [f"corrida {i}: código {rc}: {(err.strip().splitlines() or [''])[-1][:160]}"
                  for i, rc, err in res
-                 if rc != 0 or any(m in err for m in MALAS) or "al salir no terminaron" in err]
+                 if rc != 0 or any(m in err for m in MALAS) or (not permite_aviso and "al salir no terminaron" in err)]
         self.assertFalse(malas, f"salir con un hilo que {nombre}: {len(malas)} de {veces} corridas mal:\n" + "\n".join(malas))
 
     def test_salir_con_un_hilo_publicando(self):
@@ -534,6 +690,11 @@ class TestCierreAlAzar(_ConHub):
 
     def test_salir_con_un_aviso_del_nucleo(self):
         self._corre_varias("aviso")
+
+    def test_salir_con_un_hilo_esperando_el_gil_cuando_el_cierre_se_rinde(self):
+        """B1: el cierre nunca regresa con un hilo a medio tomar el GIL dentro del núcleo. Con el código de
+        b6683fb y Python 3.12 abortaba (SIGABRT) en una fracción de las corridas. Puede salir el aviso."""
+        self._corre_varias("espera_gil", ESPERA_GIL, permite_aviso=True)
 
 
 @unittest.skipUnless(_backend.NATIVE, "sin núcleo de C++ (AGMEN_BACKEND=pure o sin compilar)")
