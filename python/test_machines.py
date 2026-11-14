@@ -121,7 +121,9 @@ class TestTheseAreHere(unittest.TestCase):
             self.skipTest("el nombre de esta computadora no resuelve")
         if not ips:
             self.skipTest("sin direcciones")
-        self.assertTrue(these_are_here([nombre])[nombre])
+        # si falla, el mensaje dice a qué direcciones resuelve el nombre y por qué no cuenta como de aquí
+        self.assertTrue(these_are_here([nombre])[nombre],
+                        f"{nombre!r} resuelve a {sorted(ips)}; check_hosts dice {machines.check_hosts([nombre])[nombre]}")
 
     def test_mezcla_y_orden(self):
         r = these_are_here(["localhost", AJENA, "x.invalid", "127.0.0.1"])
