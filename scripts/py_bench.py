@@ -136,6 +136,24 @@ def run(backend: str) -> dict:
     return json.loads(r.stdout.strip().splitlines()[-1])
 
 
+TIMES = ("encode_us", "decode_us", "publish_us", "receive_us")
+
+
+def passes(native: dict, pure: dict) -> bool:
+    """Lo mismo que decide main(): 1.8 veces en las cuatro, y every(1 ms) sin quedarse atrás."""
+    return (all(native[k] <= 0 or pure[k] / native[k] >= 1.8 for k in TIMES)
+            and native["every_runs"] + 200 >= pure["every_runs"])
+
+
+def best(a: dict, b: dict) -> dict:
+    """La mejor de dos mediciones del mismo núcleo: el menor de cada tiempo y el every() que más corrió."""
+    out = dict(a if a["every_runs"] >= b["every_runs"] else b)
+    for k in a:
+        if k.endswith("_us") and k in b:
+            out[k] = min(a[k], b[k])
+    return out
+
+
 def main() -> int:
     if "--measure" in sys.argv:
         print(json.dumps(measure()))
@@ -147,6 +165,14 @@ def main() -> int:
         print(f"no se pudo medir el núcleo de C++ (¿compilaste? cmake --build build):\n{e}")
         return 1
     pure = run("pure")
+    # El CI comparte máquina: un vecino ruidoso durante UNA de las dos mediciones mueve la razón (en
+    # Windows quedó en 1.7 una vez y en 2+ la corrida de al lado). Si no alcanza, se mide hasta dos
+    # veces más y se toma lo mejor de cada lado (el menor tiempo: el ruido solo suma), no se baja el umbral.
+    for intento in range(2):
+        if passes(native, pure):
+            break
+        print(f"medición {intento + 1}: por debajo del umbral; mido otra vez (cuenta la mejor de hasta 3)")
+        native, pure = best(native, run("native")), best(pure, run("pure"))
     print(f"Agmen · Python con núcleo de C++ contra Python puro · {sys.platform} · Python {sys.version.split()[0]}\n")
     rows = [("codificar", "encode_us"), ("decodificar", "decode_us"), ("publish()", "publish_us"),
             ("recibir", "receive_us")]

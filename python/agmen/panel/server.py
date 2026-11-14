@@ -23,7 +23,6 @@ import hmac
 import json
 import os
 import secrets
-import socket
 import threading
 import time
 import webbrowser
@@ -37,6 +36,7 @@ from urllib.parse import parse_qs, urlsplit
 from .. import schema, wire
 from .. import ws as wsmod
 from .._version import __version__
+from ..machines import lan_addresses   # vive en machines: también la usa agmen run (RFC 0011 §3.4)
 from ..pubsub import RawSubscriber, _PurePublisher, is_closed_error
 from .bridge import FOXGLOVE_PROTOCOL, PROTOCOLS, Bridge
 
@@ -101,24 +101,6 @@ def choose_token(lan: bool, token: str | None) -> str | None:
     if token:
         return token
     return secrets.token_urlsafe(9) if lan else None
-
-
-def lan_addresses() -> list[str]:
-    """Las IP de esta computadora en la red local (para el link del celular)."""
-    found: list[str] = []
-    try:   # la interfaz de la ruta por defecto (no manda ningún paquete)
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("10.255.255.255", 1))
-            found.append(s.getsockname()[0])
-    except OSError:
-        pass
-    try:
-        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
-            if ip not in found:
-                found.append(ip)
-    except OSError:
-        pass
-    return [ip for ip in found if not ip.startswith("127.")]
 
 
 class SensorHub:
