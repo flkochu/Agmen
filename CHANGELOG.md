@@ -12,9 +12,11 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   [RFC 0011](docs/rfc/0011-sim-real-y-varias-computadoras.md) (D1–D10 = a:
   perfiles en `robot.toml`, un mundo de MuJoCo de ejemplo y `agmen agent` en
   cada computadora). Hechos: los perfiles (bloque 1, abajo), el mundo de
-  MuJoCo (bloque 2, abajo) y `[[machine]]` (bloque 3, parte 3a, abajo). Falta:
-  `agmen agent` (parte 3b), el panel con nodos de varias computadoras (3c),
-  topics entre computadoras y relojes (bloques 4 y 5 del plan del RFC).
+  MuJoCo (bloque 2, abajo), `[[machine]]` (bloque 3, parte 3a, abajo) y
+  `agmen agent` con clave (parte 3b, abajo). Falta: reconectar tras un corte,
+  la etiqueta de la computadora en el panel, el servicio de arranque y el
+  capítulo 18 (parte 3c); topics entre computadoras y relojes (bloques 4 y 5
+  del plan del RFC).
 
 ### Agregado
 - **Perfiles en `robot.toml`** (RFC 0011 §3.2): `profile = "real"`, `"sim"`,
@@ -61,20 +63,49 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   `[[node]]` o un `[[mux]]` dice en cuál corre. Los nombres de `[[machine]]`
   son únicos, y dos `[[machine]]` no pueden tener el mismo `host`. Un nodo sin
   `machine` corre donde corres `agmen run`, como antes.
-- **Qué funciona hoy con `machine`**: `agmen run` decide si cada `[[machine]]`
-  es esta computadora (una de sus IP, o loopback) y lo dice en la terminal
+- **Qué funciona con `machine`**: `agmen run` decide si cada `[[machine]]` es
+  esta computadora (una de sus IP, o loopback) y lo dice en la terminal
   (`es esta computadora; sus nodos corren aquí`). Si lo es, sus nodos arrancan
   aquí. Un nombre que no resuelve en 1.5 s se toma como otra computadora, y el
   aviso pide poner la IP en `host`.
-- **Lo que todavía no existe**: arrancar nodos en otra computadora. Si un nodo
-  dice `machine` de otra computadora, `agmen run` sale con código 2 sin
-  arrancar nada (ni el hub) y dice qué hacer. Eso llega con `agmen agent`, en
-  una versión próxima.
+- **`agmen agent`** (RFC 0011 §3.4, parte 3b): en la computadora del robot,
+  `agmen agent robot.toml` escucha en el puerto de su `[[machine]]` (7391 por
+  defecto) y arranca solo los nodos de **su** `robot.toml` que dicen `machine`
+  de esa computadora. Imprime su clave (`xxxx-xxxx-xxxx`). Opciones: `--machine
+  NOMBRE` (si el archivo tiene varias `[[machine]]` aquí), `--port N` y
+  `--new-key`.
+- **La clave**: se crea la primera vez y se guarda en la carpeta de Agmen del
+  usuario (`agent.key`, solo legible por su dueño). Nunca va en `robot.toml`.
+  Laptop y agente se prueban que tienen la misma clave sin enviarla (PBKDF2 y
+  HMAC). El protocolo `agmen-agent/1` está en
+  [`docs/PROTOCOLO.md`](docs/PROTOCOLO.md).
+- **`agmen run` se conecta con cada agente** antes de arrancar nada (ni hub, ni
+  `before`, ni nodos locales). Si una conexión falla, no arranca nada, sale con
+  código 2 y dice qué hacer. La primera vez pide la clave en la terminal, o la
+  toma de `AGMEN_AGENT_KEY`. Solo guarda en `keys.toml` la que escribiste a
+  mano, y únicamente después de una conexión aceptada.
+- **`agmen run --forget-key NOMBRE`**: borra la clave guardada de una
+  `[[machine]]` y sale.
+- **Logs y Ctrl+C con nodos remotos**: los logs de los nodos de otra
+  computadora llevan el prefijo `robot/motor │`. Ctrl+C en la laptop detiene
+  los nodos de todas las computadoras. Si se pierde la conexión, el agente
+  detiene sus nodos y `agmen run` detiene todo y lo dice.
+- **Lo que todavía no existe**: reconectar tras un corte (y el tiempo de gracia
+  de 10 s), la etiqueta de la computadora en el panel, el servicio de arranque
+  del agente y el capítulo 18 (parte 3c). Los topics todavía no cruzan entre
+  computadoras (bloque 4): cada computadora tiene su propio hub, y un nodo de la
+  laptop no recibe los topics del robot. Medir la diferencia de reloj entre
+  computadoras es el bloque 5. Una laptop a la vez por agente.
 - **Capítulo 5 del tutorial, sección 7**: cómo declarar `[[machine]]`, qué
-  funciona hoy, la IP contra el nombre y por qué el hardware va con
+  funciona hoy, arrancar nodos desde la laptop con `agmen agent` (con los tres
+  errores más comunes), la IP contra el nombre y por qué el hardware va con
   `profile = "real"`.
 
 ### Cambiado
+- **`agmen run` con nodos en otra computadora** ya no sale con el error de la
+  parte 3a: se conecta con `agmen agent` (ver arriba). Si el agente no contesta,
+  la clave es mala o los `robot.toml` no dicen lo mismo, sale con código 2, no
+  arranca nada y dice qué hacer.
 - **El robot del tutorial usa perfiles.** `imu` y `motor` son
   `profile = "real"`, y `mundo` es `profile = "sim"`. Por eso `agmen run
   examples/tutorial/robot.toml` imprime `no corren: mundo (perfil sim)`, y

@@ -227,3 +227,203 @@ ef cd ab 89 67 45 23 01                          source_id
 ```
 
 Los bytes exactos de este y otros ejemplos están en los vectores de prueba.
+
+## Conexión con clave: `agmen-agent/1` (desde Agmen 0.14.0)
+
+> **Estado:** implementado en la parte 3b del RFC 0011 (`python/agmen/agent.py`,
+> `agmen agent` y `agmen run`). Diseño y razones en el
+> [RFC 0011, §3.4](rfc/0011-sim-real-y-varias-computadoras.md) (D6, D7 y D9).
+> Las pruebas de formato están en `python/test_agent.py`, con los vectores de
+> la sección [Vectores](#vectores-de-agmen-agent1).
+
+Es un protocolo de **control** entre dos computadoras del robot, como
+`agmen-hub/1`. **No cambia nada de lo de arriba**: el sobre de 64 bytes, los
+datos, los topics y `agmen-hub/1` siguen igual. Este protocolo va por su propio
+puerto (el de `[[machine]]`, 7391 por defecto). El agente solo arranca nodos de
+**su propio robot.toml**: la laptop no manda comandos, rutas ni variables de
+entorno. Para pruebas y CI hay una variable, `AGMEN_REMOTE_HOSTS` (lista separada
+por comas), que trata direcciones de esta computadora como si fueran otra; no
+existe para uso normal (ver `python/agmen/machines.py`).
+
+Hoy cada computadora tiene su propio hub: los topics todavía no cruzan entre
+computadoras (bloque 4 del RFC 0011).
+
+### Texto y líneas
+
+- Todo es texto UTF-8. Cada línea termina en `\n`; un `\r` antes se ignora al leer.
+- Líneas del saludo: como máximo 1 KiB.
+- Líneas firmadas: como máximo 64 KiB (65 536 bytes, sin contar el `\n`).
+
+### La clave y el material de la sesión
+
+| Nombre | Cómo se obtiene |
+|---|---|
+| clave | 12 caracteres de `abcdefghjkmnpqrstuvwxyz23456789` (sin `i`, `l`, `o`, `0` ni `1`), escritos `xxxx-xxxx-xxxx`. Nunca viaja por la red. |
+| `K` | PBKDF2-HMAC-SHA256 de la clave en minúsculas y sin guiones, con sal `agmen-agent/1` (ASCII), 200 000 vueltas y 32 bytes. Se calcula una vez al arrancar. |
+| `nc`, `na` | Aleatorios del cliente y del agente: 16 bytes, escritos como 32 caracteres hexadecimales. |
+| `S` | Clave de la sesión: HMAC-SHA256(`K`, `agmen-agent/1\|sesion\|` + `nc` + `\|` + `na`). Firma los mensajes. |
+
+Las pruebas de saludo son HMAC-SHA256(`K`, texto), en hexadecimal (64 caracteres):
+
+```
+prueba del cliente = HMAC(K, "agmen-agent/1|cliente|" + nc + "|" + na)
+prueba del agente  = HMAC(K, "agmen-agent/1|agente|"  + nc + "|" + na)
+```
+
+### El saludo (sin firmar)
+
+Son cuatro líneas en el caso bueno:
+
+```
+C → A   agmen-agent/1 hola <nc>
+A → C   agmen-agent/1 hola <na> <versión de Agmen>
+C → A   prueba <prueba del cliente>
+A → C   prueba <prueba del agente>
+```
+
+La versión de Agmen sale con sus espacios cambiados por `_`. El cliente comprueba
+la prueba del agente; si no coincide, la laptop se rinde con `impostor` (eso no
+viaja por la red: es solo de la terminal de la laptop).
+
+En lugar de la línea 2 o la 4, el agente puede contestar un error y cerrar:
+
+```
+error version <texto>      el protocolo no es agmen-agent/1 (se avisa en las dos terminales)
+error protocolo <texto>    el hola o la prueba están mal formados
+error clave <texto>        la prueba no es la de este agente
+error espera <texto>       demasiados intentos (ver Límites)
+```
+
+- Si la primera línea no empieza con `agmen-agent/` (por ejemplo, una petición
+  HTTP), el agente cierra sin contestar.
+- Cuando el agente contesta `error espera demasiadas conexiones…` antes del
+  saludo, el cliente lo lee igual que `error espera`.
+- El cliente solo reconoce los códigos `clave`, `espera`, `version` y `protocolo`.
+  Cualquier otro se toma como `protocolo`.
+- `error espera` no dice que la clave esté mal, y la laptop no debe decirlo.
+
+### Mensajes firmados
+
+Después de la prueba del agente, cada línea tiene este formato:
+
+```
+<n> <json> <firma>
+```
+
+- `n`: número decimal que empieza en 1 y sube de uno en uno. Cada sentido lleva
+  su propio contador.
+- `json`: un objeto en una sola línea, con `"op"`. Se escribe sin espacios
+  (`separators=(",", ":")`) y sin escapar las letras no ASCII (`ensure_ascii=False`).
+- `firma`: 64 caracteres hexadecimales de HMAC-SHA256(`S`, `<sentido>|<n>|<json>`).
+  El sentido es `c` (cliente → agente) o `a` (agente → cliente).
+
+Quien recibe comprueba, en este orden: el formato de la línea, que `n` sea el
+siguiente, que la firma sea buena (comparación de tiempo constante), y que el
+JSON sea un objeto con `"op"`. Si algo falla, cierra la conexión.
+
+### Mensajes de la laptop al agente
+
+- `sesion`: es el primer mensaje, y solo uno.
+  - `perfil`: el perfil activo (texto).
+  - `reloj`: `real`, `sim` o `replay`.
+  - `agmen`: la versión de Agmen de la laptop.
+  - `maquina`: el nombre de su `[[machine]]`.
+  - `nodos`: objeto de nombre → lo escrito de ese nodo, con las claves `cmd`,
+    `env`, `cwd`, `restart`, `autostart` y `profile`. Una clave que no está
+    escrita no aparece.
+  - `no_arrancar`: lista de nombres de `nodos` que el agente **no** arranca solo.
+    La laptop los arranca después, cuando todas las computadoras aceptaron.
+- `arrancar`, `detener`, `reiniciar`: `nodo` (el nombre).
+- `detener_todo`, `adios`: sin campos.
+- `ping`: `t` (un número). El agente lo repite en `pong`.
+
+Ejemplo de un `sesion` (la firma va al final de la línea, aquí se omite):
+
+```
+1 {"op":"sesion","perfil":"real","reloj":"real","agmen":"0.13.0","maquina":"robot","nodos":{"motor":{"cmd":"python latido.py motor","restart":"on-failure"}},"no_arrancar":["motor"]} <firma>
+```
+
+### Mensajes del agente a la laptop
+
+- `sesion_ok`: `maquina`, `agmen` (la versión del agente) y `nodos` (la lista de
+  nombres, en el orden del archivo). Después de esto, el agente arranca sus
+  nodos con `autostart`.
+- `sesion_error`: `codigo` y `texto`. El agente cierra después de mandarlo.
+  - `ocupado`: ya hay otra laptop conectada (el texto dice desde qué IP).
+  - `maquina`: el nombre de `maquina` no es el de este agente.
+  - `distinto`: un nodo o el reloj no coinciden con el robot.toml del agente. El
+    texto trae **todas** las diferencias.
+  - `perfil`: el agente no tiene ese perfil, o el perfil dice `local = true`.
+  - `nodos_ajenos`: ya corren nodos en esta computadora que el agente no lanzó
+    (por ejemplo, un hub con nodos de otra sesión).
+  - `antes`: falló `[robot] before`. Su salida llegó antes, como `log`.
+  - `config`: el robot.toml del agente tiene un error.
+  - `protocolo`: campos inválidos, lo primero no fue `sesion`, o `no_arrancar`
+    nombra nodos que no son del agente.
+  - `interno`: falló algo inesperado en el agente.
+- `estado`: `nodo`, `estado` (`corriendo`, `detenido`, `falló`, `reiniciando` o
+  `terminó`), `pid` y `codigo`. Solo llega después de `sesion_ok`, en cada cambio.
+- `log`: `nodo`, `n` y `linea`.
+  - `nodo` es el nombre del nodo. Las líneas del propio agente (y de su
+    `before`) van con `"agmen"`; las del hub van con `"agmen"` y el prefijo `hub: `.
+  - `n` cuenta las líneas de cada nodo, de uno en uno. Si hay un hueco, el agente
+    descartó líneas (ver Límites).
+  - `linea` tiene como máximo 8 KiB: una línea más larga se corta.
+- `error`: `texto`. Una orden que no se pudo cumplir: nodo desconocido, nodo que
+  todavía no arranca, orden desconocida o más de 64 órdenes pendientes.
+- `pong`: `t`. Repite el `t` del `ping` si es un número o un texto de hasta 64
+  caracteres; si no, `null`.
+
+### Quién cierra la conexión
+
+| Cierra (y el agente detiene sus nodos) | No cierra: contesta `error` |
+|---|---|
+| Línea que no es `<n> <json> <firma>`, firma mala, `n` fuera de orden, JSON inválido, o más de 64 KiB | Orden desconocida (`op` que no existe) |
+| Silencio de 6 s: sin ninguna línea, ni un `ping` | `arrancar`, `detener` o `reiniciar` de un nodo que no existe |
+| La laptop cierra sin `adios` | Una segunda `sesion` en la misma conexión |
+| `adios`: la laptop se despide | Más de 64 órdenes pendientes |
+| `sesion_error`: después de mandarlo | |
+| Saludo que no termina en 10 s, o cualquier error del saludo | |
+
+La laptop manda `ping` cada 2 s desde que manda `sesion`, así que 6 s de silencio
+sí quiere decir que se perdió la conexión.
+
+### Límites
+
+| Qué | Valor |
+|---|---|
+| Pruebas malas (`error clave`) por minuto, por IP (en IPv6, por cada /64) | 5 |
+| Pruebas malas por minuto, en total | 60. La IP de la última sesión aceptada no cuenta para este límite |
+| Pausa tras una prueba mala, por IP | 1 s |
+| Conexiones sin saludar a la vez, por IP | 4 |
+| Conexiones sin saludar a la vez, en total | 32 (una queda reservada para la IP de la última sesión aceptada) |
+| Tiempo para completar el saludo | 10 s |
+| Silencio antes de dar la conexión por perdida | 6 s |
+| `ping` de la laptop | cada 2 s |
+| Órdenes pendientes por sesión | 64 |
+| Línea firmada | 64 KiB |
+| Línea de log | 8 KiB |
+| Cola de salida del agente, para los `log` | 5 000 mensajes o 4 MiB. Lo que no cabe se descarta y su `n` sigue subiendo |
+| Respuestas (`pong`, `error`) sin leer por la laptop | 1 000. Si pasan 6 s sin que las lea, el agente cierra la sesión |
+| Avisos en la terminal del agente por conexiones sin clave | Uno por IP y tipo, por minuto; 20 por minuto en total |
+
+### Vectores de `agmen-agent/1`
+
+Clave de prueba `kq3f-9xm2-7tdw`, la de `python/test_agent.py`. **No la uses en un
+robot real.** Con `nc = 00112233445566778899aabbccddeeff` y
+`na = ffeeddccbbaa99887766554433221100`:
+
+```
+prueba del cliente  4ccd04c6bd307ed3e48e8cd315d5e5bb15aac997d193ededeb480773d8c376a9
+prueba del agente   db3e2b006ee58e65791487588690824aa08f34c3b3be982036532322666f6cee
+S                   5c8b7630ef446344669af3d4e406f590883efd0b94b39afb772f1afde0223989
+```
+
+El primer mensaje de la laptop (`n = 1`, sentido `c`) con `{"op":"ping","t":1.5}`:
+
+```
+1 {"op":"ping","t":1.5} abf6628a56840d9a62e07d7670936ead562102b9cdf5b14d262b51406242f169
+```
+
+Estos valores vienen de la referencia `hmac`/`hashlib` y los comprueban las
+pruebas de `python/test_agent.py`.
