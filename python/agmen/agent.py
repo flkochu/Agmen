@@ -62,6 +62,8 @@ HELLO_MAX = 1024                # las líneas del saludo son cortas: no se acept
 HANDSHAKE_TIMEOUT = 10.0        # segundos para completar el saludo
 SILENCE_TIMEOUT = 6.0           # sin recibir nada en este tiempo, la otra punta se da por perdida
 PING_EVERY = 2.0                # el cliente manda ping cada tanto
+BYE_TIMEOUT = 0.5               # el adios de salida: de cortesía, no se espera más
+STOP_POLL = 0.2                 # open(): cada cuánto revisa stop mientras el agente prepara la sesión
 SEND_TIMEOUT = 6.0              # si la otra punta no lee en este tiempo, se da por perdida
 FAIL_PAUSE = 1.0                # tras una clave mala, esa IP espera esto antes de otro intento
 FAIL_WINDOW = 60.0
@@ -523,8 +525,9 @@ def _error_line(line: str) -> HandshakeError | None:
     if not line.startswith("error "):
         return None
     code, _, text = line[len("error "):].partition(" ")
-    return HandshakeError(code if code in ("clave", "espera", "version", "protocolo") else "protocolo",
-                          text or f"el agente dijo error {code}")
+    code = code if code in ("clave", "espera", "version", "protocolo") else "protocolo"
+    # viene de quien sea que conteste en ese puerto, sin clave: sin caracteres de control y corto
+    return HandshakeError(code, _clean(text, 300) if text else f"el agente dijo error {code}")
 
 
 def client_handshake(sock: socket.socket, key: bytes, *, timeout: float = HANDSHAKE_TIMEOUT) -> Channel:
@@ -544,7 +547,7 @@ def client_handshake(sock: socket.socket, key: bytes, *, timeout: float = HANDSH
     if not parts[0].startswith(_PREFIX):
         raise HandshakeError("no_agmen", "contestó algo que no es agmen agent")
     if parts[0] != PROTOCOL:
-        raise HandshakeError("version", f"el agente habla {parts[0]} y este Agmen ({__version__}) habla {PROTOCOL}: "
+        raise HandshakeError("version", f"el agente habla {_clean(parts[0], 40)} y este Agmen ({__version__}) habla {PROTOCOL}: "
                                         f"pon la misma versión de Agmen en las dos computadoras "
                                         f"(pip install -U agmen en las dos)")
     if len(parts) != 4 or parts[1] != "hola" or not _HEX32.fullmatch(parts[2]) or not parts[3]:
@@ -725,6 +728,16 @@ def _clean(text, limit: int = 80) -> str:
     la terminal) y corto."""
     text = "".join(c if c.isprintable() else "\ufffd" for c in str(text))
     return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _bye(channel: Channel) -> None:
+    """El adios de salida: de cortesía. Con un límite corto (un agente callado no detiene la
+    salida SEND_TIMEOUT segundos) y sin traceback si llega otro Ctrl+C mientras se manda."""
+    try:
+        channel.sock.settimeout(BYE_TIMEOUT)
+        channel.send({"op": "adios"})
+    except (AgentError, OSError, KeyboardInterrupt):
+        pass
 
 
 def _show_ip(ip: str) -> str:
@@ -1794,9 +1807,11 @@ class AgentLink:
 
     # --- abrir ---
     def open(self, key: str, session: dict, *, on_key_ok: Callable[[], None] | None = None,
-             connect_timeout: float = CONNECT_TIMEOUT) -> None:
+             connect_timeout: float = CONNECT_TIMEOUT, stop: threading.Event | None = None) -> None:
         """Conecta, saluda y abre la sesión. Vuelve cuando el agente contestó sesion_ok;
-        LinkError si no. Mientras el agente corre su [robot] before, su salida se ve."""
+        LinkError si no. Mientras el agente corre su [robot] before, su salida se ve.
+        Si `stop` se prende mientras espera (otra computadora se perdió), deja de esperar:
+        adios al agente y LinkError("detenido")."""
         where = f"{self.name} ({self.shown})"
         host = self.machine.host
         try:
@@ -1822,14 +1837,20 @@ class AgentLink:
             raise
         if on_key_ok is not None:
             on_key_ok()
-        self.channel, self.version = channel, channel.peer_version
+        self.channel, self.version = channel, _clean(channel.peer_version, 40)
         threading.Thread(target=self._ping_loop, daemon=True, name=f"agmen-ping-{self.name}").start()
         try:
             channel.send(session)
+            silent_until = time.monotonic() + SILENCE_TIMEOUT
             while True:
-                try:
-                    msg = channel.recv(SILENCE_TIMEOUT)
+                if stop is not None and stop.is_set():
+                    raise LinkError("detenido", f"{where}: dejé de esperar a que preparara la sesión porque se "
+                                                f"perdió otra computadora")
+                try:   # en tramos cortos, para ver stop entre uno y otro (lo leído a medias se guarda)
+                    msg = channel.recv(min(STOP_POLL, max(0.0, silent_until - time.monotonic())))
                 except ChannelTimeout:
+                    if time.monotonic() < silent_until:
+                        continue
                     raise LinkError("perdida", f"{where} dejó de contestar mientras preparaba la sesión "
                                                f"({SILENCE_TIMEOUT:g} s sin nada): ¿se apagó o se cayó la red?")
                 except ChannelClosed:
@@ -1846,14 +1867,12 @@ class AgentLink:
                     if not text.startswith(self.name):
                         text = f"{self.name}: {text}"
                     raise LinkError(code, text)
+                silent_until = time.monotonic() + SILENCE_TIMEOUT
                 if op != "estado":   # antes de sesion_ok no debería llegar ninguno: se ignora
                     self._dispatch(msg)
         except BaseException:
             self._done.set()
-            try:
-                channel.send({"op": "adios"})   # Ctrl+C mientras se preparaba: que el agente lo sepa
-            except AgentError:
-                pass
+            _bye(channel)   # Ctrl+C, stop o un error mientras se preparaba: que el agente lo sepa
             channel.close()
             self.channel = None
             raise
@@ -1875,7 +1894,7 @@ class AgentLink:
         if e.code == "cerrado":
             return LinkError("cerrado", f"{where} cerró la conexión durante el saludo: mira la terminal de agmen "
                                         f"agent en {self.name}")
-        return LinkError(e.code, f"{where}: {e}")
+        return LinkError(e.code, f"{where}: {_clean(e, 400)}")   # sin control: puede traer texto de allá
 
     # --- la sesión abierta ---
     def _ping_loop(self) -> None:
@@ -1993,10 +2012,7 @@ class AgentLink:
         if channel is None:
             return
         if not self.lost:
-            try:
-                channel.send({"op": "adios"})
-            except AgentError:
-                pass
+            _bye(channel)
         channel.close()
 
 

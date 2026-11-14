@@ -345,8 +345,10 @@ def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list
             launcher.say(f"conectando con {name} ({link.shown})…")
             link.on_lost = on_lost   # ANTES de open(): una pérdida justo después de abrir no se olvida
             try:
-                link.open(key, session_message(config, name, clock), on_key_ok=keep)
+                link.open(key, session_message(config, name, clock), on_key_ok=keep, stop=stop)
             except AgentError as e:
+                if lost:   # otra se perdió mientras esta preparaba la sesión: ya recibió adios; cmd_run sale con 1
+                    break
                 code = getattr(e, "code", "")
                 text = str(e)
                 if code == "clave":
@@ -360,6 +362,8 @@ def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list
                     other.close()
                 return text
             opened.append(link)
+            if lost:   # se perdió (esta u otra) mientras abría: no se dice "conectado"
+                break
             launcher.say(f"{name} ({link.shown}): conectado · Agmen {link.version}")
             from ._version import __version__ as mine
 

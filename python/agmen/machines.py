@@ -335,10 +335,13 @@ def forced_remote(env: dict | None = None) -> set[str]:
             continue
         text = entry.strip()
 
-        def bad(why: str) -> ValueError:
-            return ValueError(f"{REMOTE_HOSTS_ENV}: la entrada {text!r} no se entiende ({why}). Es una lista de IP "
-                              f"o nombres separados por comas, ej. {REMOTE_HOSTS_ENV}=127.0.0.2,robot.local")
+        def bad(why: str) -> ValueError:   # qué entrada (una vez), por qué y un ejemplo de la variable
+            return ValueError(f"{REMOTE_HOSTS_ENV}: la entrada {text!r} no se entiende: {why}. Es una lista de "
+                              f"IP o nombres separados por comas, ej. {REMOTE_HOSTS_ENV}=192.168.1.20,"
+                              f"robot.local:7391")
 
+        if "://" in text or "/" in text:
+            raise bad("lleva http:// o una ruta; pon solo la IP o el nombre")
         bracket = re.fullmatch(r"\[([^\]]+)\](?::(.*))?", text)
         if bracket:
             host, port_text = bracket.group(1), bracket.group(2)
@@ -346,17 +349,19 @@ def forced_remote(env: dict | None = None) -> set[str]:
             host, _, port_text = text.partition(":")
         else:
             host, port_text = text, None
+        if port_text is not None and (not (port_text.isascii() and port_text.isdigit())
+                                      or not 1 <= int(port_text) <= 65535):
+            raise bad("el puerto debe ser un número entre 1 y 65535, o quítalo (aquí se ignora)")
         try:
             ipaddress.ip_address(host.split("%", 1)[0])   # cualquier IP se entiende (aunque no sea de nadie)
         except ValueError:
+            if bracket:
+                raise bad("entre corchetes va una IPv6, ej. [fe80::1]") from None
             try:
-                host, _ = split_host(text)               # un nombre: split_host revisa también el puerto
-            except ValueError as e:
-                raise bad(str(e)) from None
-        else:   # una IP: su puerto se revisa igual que el de un nombre (se ignora, pero bien escrito)
-            if port_text is not None and (not (port_text.isascii() and port_text.isdigit())
-                                          or not 1 <= int(port_text) <= 65535):
-                raise bad(f"{text!r}: el puerto debe ser un número entre 1 y 65535, o quítalo")
+                host, _ = split_host(host)               # un nombre bien escrito (sin consultar el DNS)
+            except ValueError:
+                raise bad("no es una IP ni un nombre de computadora válido (un nombre lleva letras sin acentos, "
+                          "dígitos, '-' y '_', separados por puntos)") from None
         out.add(_norm(host))
     return out
 
