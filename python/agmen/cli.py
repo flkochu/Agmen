@@ -139,22 +139,29 @@ def cmd_run(args) -> int:
 
         for line in other_robot(config):
             launcher.say(line)
-    if not launcher.run_before():
+    try:
+        ready = launcher.run_before()
+    except BaseException:           # Ctrl+C en un comando de before: la grabación ya abierta se cierra
+        if player is not None:
+            player.stop()
+        raise
+    if not ready:
         launcher.printer.close()
         if player is not None:
             player.stop()
         return 1
-    if player is not None:      # ya revisada antes de la consulta de red
-        player.out = out
-    elif args.play:
-        from .play import Player
+    if args.play:
+        if player is not None:      # ya revisada antes de la consulta de red ([[machine]])
+            player.out = out
+        else:
+            from .play import Player
 
-        try:
-            player = Player(args.play, args.play_topic or None, paused=True, out=out)
-        except (ValueError, OSError) as e:
-            launcher.printer.close()
-            print(f"error: --play: {e}", file=sys.stderr)
-            return 2
+            try:
+                player = Player(args.play, args.play_topic or None, paused=True, out=out)
+            except (ValueError, OSError) as e:
+                launcher.printer.close()
+                print(f"error: --play: {e}", file=sys.stderr)
+                return 2
         if config.clock.mode == "sim":
             launcher.say("⚠ --play usa el tiempo de la grabación: no aplica [clock] mode = \"sim\"")
         player.start()
