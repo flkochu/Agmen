@@ -84,8 +84,18 @@ class _CtrlC:
             if self.pressed:   # se anotó justo antes de entrar: que no se pierda
                 raise KeyboardInterrupt
             yield
-        finally:
-            self.catch()
+        finally:   # queda una ventana de microsegundos: un Ctrl+C ya aquí dentro, antes de que catch() ponga
+            self.catch()   # el que anota, sale como KeyboardInterrupt; en Python no se puede cerrar del todo
+
+
+def _finish_all(remotes: dict) -> str:
+    """detener_todo y adios a cada agente. Devuelve la frase que lo cuenta, o "" si a ninguno se le
+    mandó nada: un enlace que se perdió o que nunca se abrió no recibe nada, y no se dice que sí."""
+    told = 0
+    for link in remotes.values():
+        told += link.channel is not None and not link.lost
+        link.finish()
+    return " (les avisé a las otras computadoras)" if told else ""
 
 
 def _cancelled(when: str, what: str) -> int:
@@ -271,22 +281,18 @@ def _run(args) -> int:
         for line in other_robot(config):
             launcher.say(line)
     if lost:   # una computadora se perdió mientras me conectaba con otra: no se arranca nada de aquí
-        for link in remotes.values():
-            link.finish()
+        told = _finish_all(remotes)
         launcher.printer.close()
         if player is not None:
             player.stop()
-        told = " (les avisé a las otras computadoras)" if remotes else ""
         return _cancelled_or(1, what=f"no arrancó ningún nodo{told}")
 
     def cancel_before_nodes(when: str) -> int:   # todavía no arrancó ningún nodo: adios a los agentes y sale
         ctrl_c.catch()
-        for link in remotes.values():
-            link.finish()
+        told = _finish_all(remotes)
         launcher.printer.close()
         if player is not None:
             player.stop()
-        told = " (les avisé a las otras computadoras)" if remotes else ""
         return _cancelled(when, f"no arrancó ningún nodo{told}")
 
     if ctrl_c.pressed:
