@@ -3639,6 +3639,112 @@ class TestCtrlCAlArrancar(E2EBase):
         self.assertNotIn("Traceback", texto)
         self.assertIs(signal.getsignal(signal.SIGINT), antes, "agmen run no dejó el manejador de SIGINT como estaba")
 
+    # --- agmen run aquí mismo (en este proceso), con lo lento simulado con mock
+
+    def toml_local(self, maquina: bool = False) -> Path:
+        nodo = json.dumps(str(self.dir / "nodo.py"))
+        marks = json.dumps(str(self.marks))
+        extra = (f'[[machine]]\nname = "robot"\nhost = "127.0.0.1:{self.port}"\n\n'
+                 f'[[node]]\nname = "motor"\ncmd = ["python", {nodo}, "motor", {marks}]\nmachine = "robot"\n\n'
+                 if maquina else "")
+        self.toml.write_text(
+            f'[robot]\nname = "e2e"\n\n{extra}'
+            f'[[node]]\nname = "ia"\ncmd = ["python", {nodo}, "ia", {marks}]\n\n'
+            f'[hub]\nenabled = false\n\n[web]\nenabled = false\n', encoding="utf-8")
+        return self.toml
+
+    def run_aqui(self, *args) -> tuple:
+        """cli.main(["run", ...]) en este proceso: (código o "KeyboardInterrupt sin atrapar", salida, segundos)."""
+        from agmen import cli
+
+        self.addCleanup(signal.signal, signal.SIGINT, signal.getsignal(signal.SIGINT))
+        out, err = io.StringIO(), io.StringIO()
+        t0 = time.monotonic()
+        with mock.patch.dict(os.environ, {"AGMEN_REMOTE_HOSTS": "", "NO_COLOR": "1", "AGMEN_AGENT_KEY": KEY,
+                                          "AGMEN_CONFIG_DIR": str(self.dir / "cfg-run")}), \
+                mock.patch("sys.stdout", out), mock.patch("sys.stderr", err), \
+                mock.patch("sys.stdin", io.StringIO()):
+            try:
+                codigo = cli.main(["run", str(self.toml), "--no-browser", *args])
+            except KeyboardInterrupt:
+                codigo = "KeyboardInterrupt sin atrapar"
+        return codigo, out.getvalue() + err.getvalue(), time.monotonic() - t0
+
+    def grabacion_lenta(self):
+        """Un Player que tarda en abrir (como una grabación cortada de varios GB, que se recorre entera) y recibe
+        Ctrl+C a la mitad. Sin poder cortarlo tardaría 10 s y diría un error en vez de cancelado."""
+        class Lento:
+            def __init__(self, *a, **kw):
+                signal.raise_signal(signal.SIGINT)
+                fin = time.monotonic() + 10
+                while time.monotonic() < fin:
+                    time.sleep(0.05)
+                raise ValueError("terminó de abrirla: Ctrl+C no la cortó")
+
+        return mock.patch("agmen.play.Player", Lento)
+
+    def test_ctrl_c_mientras_abre_la_grabacion_la_corta(self):
+        for maquina in (False, True):     # sin [[machine]] se abre tras before; con, antes de consultar la red
+            with self.subTest(maquina=maquina):
+                self.toml_local(maquina)
+                with self.grabacion_lenta():
+                    codigo, texto, dura = self.run_aqui("--play", str(self.dir / "grabacion.mcap"))
+                self.assertEqual(codigo, 130, texto)
+                self.assertIn("cancelado (Ctrl+C) mientras abría la grabación", texto)
+                self.assertNotIn("Traceback", texto)
+                self.assertLess(dura, 5, "Ctrl+C esperó a que terminara de abrir la grabación")
+                self.assertFalse(list(self.marks.glob("arranque_*")), "arrancó algún nodo")
+
+    def test_ctrl_c_durante_la_consulta_de_red_gana_aunque_la_direccion_salga_mal(self):
+        self.toml_local(maquina=True)
+
+        def consulta_con_ctrl_c(config):
+            signal.raise_signal(signal.SIGINT)    # Ctrl+C mientras consulta (DNS): solo se anota
+            return {}
+
+        with mock.patch("agmen.machines.place_machines", consulta_con_ctrl_c), \
+                mock.patch("agmen.machines.address_error", return_value="no encontré robot (DNS)"):
+            codigo, texto, _ = self.run_aqui()
+        self.assertEqual(codigo, 130, texto)
+        self.assertIn("error: no encontré robot (DNS)", texto)
+        self.assertIn("cancelado (Ctrl+C) antes de conectarme: no arrancó nada", texto)
+
+    def test_ctrl_c_anotado_justo_antes_de_una_fase_que_se_puede_cortar_no_se_pierde(self):
+        from agmen import cli
+
+        for s in (signal.SIGINT, *([signal.SIGBREAK] if hasattr(signal, "SIGBREAK") else [])):
+            self.addCleanup(signal.signal, s, signal.getsignal(s))
+        c = cli._CtrlC(threading.Event())
+        c.catch()
+        signal.raise_signal(signal.SIGINT)        # entre el "if ctrl_c.pressed" y el with: solo se anota
+        self.assertTrue(c.pressed)
+        entro = []
+        with self.assertRaises(KeyboardInterrupt):
+            with c.interruptible():
+                entro.append(True)                # aquí estaría get_key esperando la clave
+        self.assertEqual(entro, [], "entró a la fase aunque Ctrl+C ya se había anotado")
+
+    def test_fuera_del_hilo_principal_una_sola_traza(self):
+        self.toml_local()
+        from agmen import cli
+
+        errores = []
+
+        def correr():
+            try:
+                with mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                    cli.main(["run", str(self.toml), "--no-browser"])
+            except BaseException as e:   # noqa: BLE001 - se revisa abajo
+                errores.append(e)
+
+        h = threading.Thread(target=correr)
+        h.start()
+        h.join(30)
+        self.assertEqual(len(errores), 1, errores)
+        self.assertIsInstance(errores[0], ValueError)
+        self.assertIsNone(errores[0].__context__, f"dos trazas encadenadas: {errores[0].__context__!r}")
+        self.assertFalse(list(self.marks.glob("arranque_*")), "arrancó algún nodo")
+
 
 # ===========================================================================
 # 8. Segunda revisión: texto de un agente, AGMEN_REMOTE_HOSTS, Ctrl+C al conectar, computadora perdida

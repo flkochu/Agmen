@@ -81,6 +81,8 @@ class _CtrlC:
         signal.signal(signal.SIGINT, signal.default_int_handler)
         _ctrl_break_like_ctrl_c()
         try:
+            if self.pressed:   # se anotó justo antes de entrar: que no se pierda
+                raise KeyboardInterrupt
             yield
         finally:
             self.catch()
@@ -94,6 +96,8 @@ def _cancelled(when: str, what: str) -> int:
 def cmd_run(args) -> int:
     """agmen run. Al salir deja los manejadores de señales como estaban (llamado desde Python,
     como en las pruebas, el proceso no se queda con los de agmen run)."""
+    if threading.current_thread() is not threading.main_thread():
+        return _run(args)   # signal.signal falla aquí (ValueError): no hay nada que restaurar
     saved = [(s, signal.getsignal(s)) for s in _RUN_SIGNALS]
     try:
         return _run(args)
@@ -138,6 +142,10 @@ def _run(args) -> int:
     ctrl_c = _CtrlC(stop)
     ctrl_c.catch()   # desde aquí Ctrl+C se revisa entre fases (y corta lo que puede tardar sin fin)
 
+    def _cancelled_or(code: int, when: str = "antes de arrancar los nodos", what: str = "no arrancó ningún nodo") -> int:
+        """Si Ctrl+C ya se anotó, gana la cancelación (130), aunque además haya salido un error."""
+        return _cancelled(when, what) if ctrl_c.pressed else code
+
     try:
         if config.hub and any(name == "hub" for name, _ in config.skipped):   # igual en todos los perfiles
             raise ConfigError("hay un nodo llamado 'hub': ese nombre lo usa Agmen para el directorio de topics")
@@ -174,10 +182,13 @@ def _run(args) -> int:
             from .play import Player
 
             try:
-                player = Player(args.play, args.play_topic or None, paused=True)
+                with ctrl_c.interruptible():   # una grabación cortada se recorre entera: puede tardar
+                    player = Player(args.play, args.play_topic or None, paused=True)
+            except KeyboardInterrupt:
+                return _cancelled("mientras abría la grabación", "no arrancó nada")
             except (ValueError, OSError) as e:
                 print(f"error: --play: {e}", file=sys.stderr)
-                return 2
+                return _cancelled_or(2, "antes de conectarme", "no arrancó nada")
         places = place_machines(config)
         remote = address_error(config, places)
         keys = {}
@@ -203,7 +214,7 @@ def _run(args) -> int:
             if player is not None:
                 player.stop()
             print(f"error: {remote}", file=sys.stderr)
-            return 2
+            return _cancelled_or(2, "antes de conectarme", "no arrancó nada")
 
     lost: list[str] = []
     launcher = Launcher(config, places=places, remotes=remotes)
@@ -247,7 +258,7 @@ def _run(args) -> int:
             if player is not None:
                 player.stop()
             print(f"error: {error}", file=sys.stderr)
-            return 2
+            return _cancelled_or(2, "mientras me conectaba con las otras computadoras", "les avisé y no arrancó nada")
     for warning in config.warnings:
         launcher.say(f"⚠ {warning}")
     for note in skip_notes:
@@ -263,7 +274,7 @@ def _run(args) -> int:
         launcher.printer.close()
         if player is not None:
             player.stop()
-        return 1
+        return _cancelled_or(1)
 
     def cancel_before_nodes(when: str) -> int:   # todavía no arrancó ningún nodo: adios a los agentes y sale
         ctrl_c.catch()
@@ -304,11 +315,14 @@ def _run(args) -> int:
             from .play import Player
 
             try:
-                player = Player(args.play, args.play_topic or None, paused=True, out=out)
+                with ctrl_c.interruptible():   # una grabación cortada se recorre entera: puede tardar
+                    player = Player(args.play, args.play_topic or None, paused=True, out=out)
+            except KeyboardInterrupt:
+                return cancel_before_nodes("mientras abría la grabación")
             except (ValueError, OSError) as e:
                 launcher.printer.close()
                 print(f"error: --play: {e}", file=sys.stderr)
-                return 2
+                return _cancelled_or(2)
         if config.clock.mode == "sim":
             launcher.say("⚠ --play usa el tiempo de la grabación: no aplica [clock] mode = \"sim\"")
         player.start()
@@ -343,7 +357,7 @@ def _run(args) -> int:
             launcher.printer.close()
             print(f"no se pudo abrir el panel web en {http}: {e}. "
                   f"¿Ya hay otro 'agmen run' corriendo? Usa --http 127.0.0.1:8081", file=sys.stderr)
-            return 1
+            return _cancelled_or(1)
         panel.start(open_browser=config.web.open_browser and not args.no_browser)
         for line in _panel_lines(panel):
             launcher.say(line)
