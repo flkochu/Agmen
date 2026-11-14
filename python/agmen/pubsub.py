@@ -92,7 +92,6 @@ class _HubLink:
         self._warned = False
         self._on_warn = on_warn or (lambda t: print(f"[agmen] ⚠ {t}", file=sys.stderr, flush=True))
         self._stop = threading.Event()
-        self._pid = os.getpid()   # quién lo creó (tras un fork, el hijo lo hereda)
         self.beat()
         self._thread = threading.Thread(target=self._loop, name=f"agmen-latido-{self.id[:6]}", daemon=True)
         self._thread.start()
@@ -122,8 +121,6 @@ class _HubLink:
 
     def close(self) -> None:
         self._stop.set()
-        if os.getpid() != self._pid:
-            return   # heredado por un fork: el id es el del creador, que sigue usándolo; un "bye" lo daría de baja
         try:
             self.sock.sendto(hp.encode("bye", id=self.id), self.hub)
         except OSError:
@@ -1078,6 +1075,9 @@ if _backend.NATIVE:
         # laten solos (y los vuelven a registrar), y un Subscriber vigilado con fileno()/filenos() vuelve
         # a la lista de latidos al pedirlos (_usado_en_el_hijo). Límite: si su mutex quedó tomado, ese
         # objeto no sirve en el hijo (publish() o receive() también se quedarían esperando).
+        # Límite conocido (sin arreglar): cerrar o destruir en el hijo un objeto heredado da de baja en el
+        # hub los ids del padre y borra sus bloques de memoria compartida (en los dos núcleos). Hasta que
+        # se arregle, el hijo no debe cerrar los objetos heredados: basta con salir.
         _beats.pubs = weakref.WeakSet()
         _beats.lock = threading.Lock()
         _beats.stopping = threading.Event()

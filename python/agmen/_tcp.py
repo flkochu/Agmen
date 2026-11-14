@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import collections
 import dataclasses
-import os
 import select
 import socket
 import struct
@@ -231,7 +230,6 @@ class Fanout:
         self._wake_r.setblocking(False)
         self._wake_w.setblocking(False)
         self._closed = False
-        self._pid = os.getpid()   # quién lo creó (tras un fork, el hijo lo hereda)
         self._thread = threading.Thread(target=self._loop, name="agmen-tcp", daemon=True)
         self._thread.start()
 
@@ -456,11 +454,6 @@ class Fanout:
 
     def close(self) -> None:
         self._closed = True
-        if os.getpid() != self._pid:
-            # Heredado por un fork: el hilo no existe aquí, self.lock pudo quedar tomado por un hilo
-            # del creador, y los bloques de memoria compartida (y su registro) son del creador, que
-            # los sigue usando. No se toca nada (como en el núcleo de C++, src/pubsub.cpp).
-            return
         with self.lock:
             for c in self.conns.values():
                 c.fail(None)
