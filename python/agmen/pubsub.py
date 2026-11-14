@@ -861,10 +861,12 @@ if _backend.NATIVE:
             fin = "El programa sale igual; esos hilos se quedan detenidos hasta que termine."
         else:
             fin = "El programa sale igual, pero puede terminar con un error de Python al salir."
-        _avisado = True
         _stderr(f"[agmen] ⚠ al salir no terminaron (esperé {espera:.1f} s): {'; '.join(partes)}. {fin} "
                 "Para evitarlo, detén tus hilos que usan agmen (o llama a node.stop()) antes de salir, y que las "
                 "funciones de un Node sean cortas.")
+        # Después de escribirlo, no antes: si un Ctrl+C corta la escritura, _core._cierre vuelve a llamar
+        # a esta función y el aviso sale entonces (mejor repetido a medias que perdido).
+        _avisado = True
 
     def _despues_de_fork() -> None:
         """En el hijo de un fork: el cierre empieza de cero (C++ y los locks de aquí)."""
