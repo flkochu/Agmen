@@ -4344,6 +4344,78 @@ class TestAdiosNoSeBloquea(LinkCase):
         self.assertLess(time.monotonic() - t0, self.TOPE)
 
 
+class TestAdiosCierraLimpio(LinkCase):
+    """Tras el adios, agmen run lee lo que el agente aún mande y cierra sin RST. Con RST, en
+    Windows el agente pierde lo que no había leído (el adios) y dice "cerró la conexión sin
+    despedirse" (falló en el CI de Windows: el panel no abre y agmen run sale con 1). En Linux el
+    RST no borra nada, pero se ve: el agente recibe ConnectionResetError en vez de un fin normal."""
+    TOPE = 3.0
+
+    def setUp(self):
+        super().setUp()
+        self.port = free_tcp_port()
+        self.write_toml()
+
+    def agente(self, sesion_ok: bool):
+        """Contesta tarde (después del adios, como los estado/log de detener_todo cuando agmen run
+        ya se despidió), cierra su lado y cuenta cómo cerró agmen run: 'fin' o 'rst: …'."""
+        resultado: list = []
+        ops: list = []
+
+        def script(ch, ses):
+            if sesion_ok:
+                ch.send({"op": "sesion_ok", "maquina": "robot", "agmen": __version__, "nodos": list(ses["nodos"])})
+            try:
+                while True:
+                    op = ch.recv(10)["op"]
+                    if op != "ping":
+                        ops.append(op)
+                    if op == "adios":
+                        break
+                time.sleep(0.1)   # agmen run ya mandó el adios: lo de antes ya habría cerrado
+                ch.send({"op": "log", "nodo": "agmen", "linea": "la laptop pidió detener todo"})
+                ch.send({"op": "estado", "nodo": "motor", "estado": "detenido"})
+                time.sleep(0.1)
+                ch.sock.shutdown(socket.SHUT_WR)
+                ch.sock.settimeout(5)
+                while ch.sock.recv(4096):
+                    pass
+                resultado.append("fin")
+            except (OSError, AgentError) as e:
+                resultado.append(f"rst: {e!r}")
+
+        falso = FakeAgent(agente_que_saluda_bien(script))
+        self.addCleanup(falso.close)
+        return falso, ops, resultado
+
+    def test_finish_lee_lo_que_llega_despues_del_adios(self):
+        falso, ops, resultado = self.agente(sesion_ok=True)
+        cfg, m = self.machine(port=falso.port)
+        link = agent.AgentLink(m)
+        link.open(KEY, agent.session_message(cfg, "robot", "real"))
+        self.addCleanup(link.close)
+        t0 = time.monotonic()
+        link.finish()   # sin nodos corriendo: detener_todo y adios enseguida (el camino del panel que no abre)
+        self.assertLess(time.monotonic() - t0, self.TOPE)
+        self.assertTrue(self.espera(lambda: resultado, 10))
+        self.assertEqual(ops, ["detener_todo", "adios"])
+        self.assertEqual(resultado, ["fin"], "agmen run cerró con RST: en Windows el agente perdería el adios")
+        self.assertEqual(link.lost, "")
+
+    def test_open_que_sale_por_stop_lee_lo_que_llega_despues_del_adios(self):
+        falso, ops, resultado = self.agente(sesion_ok=False)
+        cfg, m = self.machine(port=falso.port)
+        stop = threading.Event()
+        threading.Timer(0.3, stop.set).start()
+        link = agent.AgentLink(m)
+        with self.assertRaises(agent.LinkError) as ctx:
+            link.open(KEY, agent.session_message(cfg, "robot", "real"), stop=stop)
+        self.assertEqual(ctx.exception.code, "detenido")
+        self.assertTrue(self.espera(lambda: resultado, 10))
+        self.assertEqual(ops, ["adios"])
+        self.assertEqual(resultado, ["fin"], "agmen run cerró con RST: en Windows el agente perdería el adios")
+
+
 @unittest.skipUnless(os.name == "posix", "necesita una terminal de verdad (pty): solo POSIX")
 class TestTerminalInteractiva(E2EBase):
     """agmen run con una terminal interactiva (pty): pide la clave sin mostrarla y la guarda; Ctrl+C al pedirla."""

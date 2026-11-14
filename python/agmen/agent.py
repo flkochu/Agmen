@@ -761,14 +761,32 @@ def _clean(text, limit: int = 80) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
-def _bye(channel: Channel) -> None:
-    """El adios de salida: de cortesía. Con un límite corto (un agente callado no detiene la
-    salida SEND_TIMEOUT segundos) y sin traceback si llega otro Ctrl+C mientras se manda."""
+def _bye(channel: Channel, reader: threading.Thread | None = None) -> None:
+    """El adios de salida y el cierre de la conexión: de cortesía, todo en BYE_TIMEOUT (un agente
+    callado o que no lee no detiene la salida) y sin traceback si llega otro Ctrl+C.
+
+    No basta mandar el adios y cerrar: si al cerrar queda algo del agente sin leer (los estado y
+    log con que contesta detener_todo), o le llega después, el sistema manda RST en vez de un
+    cierre normal; y en Windows un RST borra lo que el agente aún no leía, el adios incluido: el
+    agente diría "cerró la conexión sin despedirse" (regla 1). Por eso, como _close_after_error:
+    adios, fin de lo que se manda (shutdown), se lee lo que llegue hasta que el agente cierre o
+    se acabe el plazo (el lector `reader`, si está vivo, y si no aquí), y al final close()."""
+    end = time.monotonic() + BYE_TIMEOUT
+    sock = channel.sock
     try:
-        channel.sock.settimeout(BYE_TIMEOUT)
+        sock.settimeout(BYE_TIMEOUT)
         channel.send({"op": "adios"})
-    except (AgentError, OSError, KeyboardInterrupt):
+        sock.shutdown(socket.SHUT_WR)
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(max(0.0, end - time.monotonic()))   # sale al ver que el agente cerró
+        while True:   # sin lector (o si salió antes de tiempo): se vacía aquí
+            left = end - time.monotonic()
+            if left <= 0 or not select.select([sock], [], [], left)[0] or not sock.recv(65536):
+                break
+    except (AgentError, OSError, ValueError, KeyboardInterrupt):
         pass
+    finally:
+        channel.close()
 
 
 def _show_ip(ip: str) -> str:
@@ -1853,6 +1871,7 @@ class AgentLink:
         self._noted: set[str] = set()
         self._on_lost: Callable[[AgentLink, str], None] | None = on_lost
         self._lost_told = False             # ¿ya se le avisó a on_lost? (una sola vez)
+        self._reader: threading.Thread | None = None   # el hilo que lee la sesión abierta
 
     @property
     def on_lost(self) -> Callable[[AgentLink, str], None] | None:
@@ -1953,12 +1972,12 @@ class AgentLink:
                     self._dispatch(msg)
         except BaseException:
             self._done.set()
-            _bye(channel)   # Ctrl+C, stop o un error mientras se preparaba: que el agente lo sepa
-            channel.close()
+            _bye(channel)   # Ctrl+C, stop o un error mientras se preparaba: que el agente lo sepa (y cierra)
             self.channel = None
             raise
         self.version = _clean(channel.peer_version, 40)
-        threading.Thread(target=self._read_loop, daemon=True, name=f"agmen-agent-{self.name}").start()
+        self._reader = threading.Thread(target=self._read_loop, daemon=True, name=f"agmen-agent-{self.name}")
+        self._reader.start()
 
     def _handshake_error(self, e: HandshakeError, where: str) -> LinkError:
         if e.code == "clave":
@@ -2085,7 +2104,7 @@ class AgentLink:
         self.close()
 
     def close(self) -> None:
-        """adios y cierra (sin esperar nada)."""
+        """adios y cierra (sin esperar a los nodos; lo que tarde el agente en cerrar, hasta BYE_TIMEOUT)."""
         with self._lock:
             self._closing = True
         channel, self.channel = self.channel, None
@@ -2093,8 +2112,9 @@ class AgentLink:
         if channel is None:
             return
         if not self.lost:
-            _bye(channel)
-        channel.close()
+            _bye(channel, self._reader)   # adios, y lee lo que el agente aún mande hasta que cierre
+        else:
+            channel.close()
 
 
 class RemoteNode(Node):
