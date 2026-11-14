@@ -327,6 +327,13 @@ _PUB_CERRADO = "el Publisher ya se cerró"
 _SUB_CERRADO = "el Subscriber ya se cerró"
 _RX_TRAMO_S = 0.2   # receive() toma el turno por tramos de a lo más esto (el nativo: 200 ms)
 _RX_CIERRE_S = 2.0  # close() espera el turno a lo más esto (lo normal: un tramo)
+_SELECT_FALLO = object()   # _receive_turn(): select() falló (distinto de None: venció el tramo)
+
+
+def is_closed_error(e: BaseException) -> bool:
+    """True si `e` es el error de publicar o recibir tras close() (núcleo nativo o puro). Para quien
+    puede publicar durante el apagado (el panel, el reloj): eso es "no se mandó", no una falla."""
+    return isinstance(e, RuntimeError) and "ya se cerró" in str(e)
 
 
 @dataclass
@@ -424,9 +431,9 @@ class _Receiver:
         """Los sockets que hay que vigilar (para select)."""
         return [self._sock, *(self._tcp.filenos() if self._tcp is not None else [])]
 
-    def _recv(self, deadline: float | None):
-        """Siguiente paquete de DATOS, (bytes, "ip:puerto", conexión TCP o None). Los
-        de control se procesan aquí."""
+    def _recv(self, deadline: float | None, failed=None):
+        """Siguiente paquete de DATOS, (bytes, "ip:puerto", conexión TCP o None), o None si venció
+        `deadline`. Si select() falla, `failed` (None por omisión). Los de control se procesan aquí."""
         if self._tcp is None:
             return self._recv_udp(deadline)
         while True:
@@ -436,7 +443,7 @@ class _Receiver:
             try:
                 r, _, _ = select.select(self.filenos(), [], [], left)
             except (OSError, ValueError):
-                return None
+                return failed
             if not r:
                 return None
             if self._sock in r:
@@ -490,10 +497,13 @@ class _PureSubscriber(_Receiver):
         self._shm = _shm.Receiver(where) if arrow else None
         # El turno de recibir (como rx_mu_ del nativo): los receive() de varios hilos sobre este
         # Subscriber se turnan y nunca leen a la vez los sockets ni lo que va llegando de cada
-        # conexión; close() también lo espera. Reentrante: el mismo hilo no se bloquea a sí mismo.
-        self._rx = threading.RLock()
+        # conexión; close() también lo espera. No es reentrante: un close() desde el mismo hilo que
+        # está en receive() (un manejador de señales) no cierra los sockets debajo de su recvfrom,
+        # los deja pendientes y receive() los cierra al soltar el turno.
+        self._rx = threading.Lock()
         self._closed = False
         self._sockets_closed = False
+        self._close_warned = False
         self._puros.add(self)
 
     _puros: weakref.WeakSet = weakref.WeakSet()   # para reponer el turno en el hijo de un fork
@@ -516,27 +526,30 @@ class _PureSubscriber(_Receiver):
                     continue
             try:
                 if self._closed:
-                    self._close_sockets()   # por si close() no alcanzó el turno
                     raise RuntimeError(_SUB_CERRADO)
-                if short:
+                last = short   # ¿este tramo llega hasta el límite? Se decide aquí, no leyendo el reloj
+                if short:      # después: en Windows (Python <= 3.12) avanza en pasos de 15.6 ms
                     deadline = end
                 else:
                     deadline = time.monotonic() + _RX_TRAMO_S
-                    if end is not None and end < deadline:
-                        deadline = end
+                    if end is not None and end <= deadline:
+                        deadline, last = end, True
                 s = self._receive_turn(deadline)
             finally:
+                if self._closed:
+                    self._close_sockets()   # un close() que no alcanzó el turno (de otro hilo, o de este)
                 rx.release()
-            # None con deadline == end: se acabó el límite. None antes del tramo: select() falló (como antes).
-            if s is not None or deadline == end or time.monotonic() < deadline:
-                return s
+            if s is _SELECT_FALLO:
+                return None          # select() falló (un socket que ya no sirve): como siempre, None
+            if s is not None or last:
+                return s             # un mensaje, o venció el límite
 
     def _receive_turn(self, deadline: float):
         """receive() con el turno tomado, hasta `deadline` (monotonic)."""
         while True:
-            got = self._recv(deadline)
-            if got is None:
-                return None
+            got = self._recv(deadline, _SELECT_FALLO)
+            if got is None or got is _SELECT_FALLO:
+                return got
             data, src, peer = got
             env, payload = wire.parse(data, shm=peer is not None and peer.hello)
             if env.encoding == wire.ENC_SCHEMA:
@@ -557,12 +570,23 @@ class _PureSubscriber(_Receiver):
             return Sample(env, msg, src)
 
     def close(self) -> None:
-        """Cierra; desde cualquier hilo. Espera el turno (un receive() en curso lo suelta en a lo
-        más un tramo) para no cerrar los sockets debajo de quien lee: desde entonces receive()
-        lanza "el Subscriber ya se cerró". Si el turno no llega a tiempo (un hilo detenido con
-        él), quien lo tenga cierra los sockets al tomar su siguiente tramo."""
+        """Cierra; desde cualquier hilo. La baja del hub y el fin de los latidos no esperan a nadie.
+        Los sockets, sí: se espera el turno (un receive() en curso lo suelta en a lo más un tramo)
+        para no cerrarlos debajo de quien lee; desde entonces receive() lanza "el Subscriber ya se
+        cerró". Si el turno no llega a tiempo (un hilo detenido con él, o este mismo hilo dentro de
+        receive()), se avisa y los cierra quien suelte el turno, o la recolección del objeto."""
         self._closed = True
+        if self._link is not None:
+            self._link.close()
         if not self._rx.acquire(timeout=_RX_CIERRE_S):
+            if not self._close_warned:
+                self._close_warned = True
+                print(f"[agmen] ⚠ close() del Subscriber de '{self.topic or self.listen}' esperó "
+                      f"{_RX_CIERRE_S:.0f} s a que un hilo saliera de receive() y no salió. Ya se dio de baja "
+                      f"del hub; sus sockets se cierran cuando ese hilo suelte receive() o cuando se libere el "
+                      f"Subscriber. Revisa que ningún hilo se quede detenido dentro de receive() (o que no "
+                      f"llames close() desde un manejador de señales del hilo que recibe).",
+                      file=sys.stderr, flush=True)
             return
         try:
             self._close_sockets()
@@ -570,10 +594,20 @@ class _PureSubscriber(_Receiver):
             self._rx.release()
 
     def _close_sockets(self) -> None:
-        """Con el turno tomado; una sola vez."""
+        """Con el turno tomado (o sin nadie que lo tenga); una sola vez. La baja del hub ya la hizo close()."""
         if not self._sockets_closed:
             self._sockets_closed = True
-            super().close()
+            if self._tcp is not None:
+                self._tcp.close()
+            self._sock.close()
+
+    def __del__(self) -> None:
+        # Un close() que quedó pendiente: sin referencias, ningún hilo puede estar en receive().
+        try:
+            if self._closed and not self._sockets_closed:
+                self._close_sockets()
+        except Exception:  # noqa: BLE001 — al salir del intérprete puede faltar de todo
+            pass
 
     def _check_type(self, env) -> None:
         if env.schema_id != self.type.SCHEMA_ID:
@@ -601,7 +635,7 @@ def _turnos_despues_de_fork() -> None:
     """En el hijo de un fork (un solo hilo): el turno de receive() de un Subscriber puro pudo quedar
     tomado por un hilo del padre que en el hijo no existe. Se repone, libre (como el nativo)."""
     for o in list(_PureSubscriber._puros):
-        o._rx = threading.RLock()
+        o._rx = threading.Lock()
 
 
 if hasattr(os, "register_at_fork"):

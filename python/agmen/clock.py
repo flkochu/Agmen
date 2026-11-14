@@ -343,7 +343,13 @@ class ClockServer:
         with self._send_lock:
             m = self._feed_ordered()
             if self._pub is not None:
-                self._pub.publish(m, t_data=m.t)
+                try:
+                    self._pub.publish(m, t_data=m.t)
+                except RuntimeError as e:   # "ya se cerró": el reloj se está apagando; no se mandó
+                    from .pubsub import is_closed_error  # aquí: pubsub importa wire, que importa este módulo
+
+                    if not is_closed_error(e):
+                        raise
 
     # --- controles (panel) ---
     def pause(self) -> None:
