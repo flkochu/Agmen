@@ -23,14 +23,28 @@
 
 // La reserva de memoria más grande desde la última vez que se puso en 0 (ver
 // memoria_acotada_con_datos_que_faltan). Este programa es de un solo hilo.
+//
+// Los tres operadores reemplazados no se meten en línea. GCC 15, con -O2/-O3,
+// mete el `delete` reemplazado dentro de quien lo llama (p. ej. el destructor
+// de std::vector), ve un `free` sobre un puntero que según él "viene de
+// operator new" y avisa con -Wmismatched-new-delete, que con -Werror rompe la
+// compilación. El código es correcto: este `new` reserva con malloc. Si no se
+// meten en línea, el compilador solo ve la pareja new/delete y no avisa.
+// MSVC no tiene ese aviso y no necesita nada.
+#if defined(__GNUC__)
+#define AGMEN_SIN_INLINE __attribute__((noinline))
+#else
+#define AGMEN_SIN_INLINE
+#endif
 static std::size_t g_biggest_alloc = 0;
-void* operator new(std::size_t n) {
+AGMEN_SIN_INLINE void* operator new(std::size_t n) {
     if (n > g_biggest_alloc) g_biggest_alloc = n;
     if (void* p = std::malloc(n == 0 ? 1 : n)) return p;
     throw std::bad_alloc();
 }
-void operator delete(void* p) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+AGMEN_SIN_INLINE void operator delete(void* p) noexcept { std::free(p); }
+AGMEN_SIN_INLINE void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+#undef AGMEN_SIN_INLINE
 
 namespace {
 
