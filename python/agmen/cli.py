@@ -332,6 +332,8 @@ def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list
     opened = []
     try:
         for name, link in remotes.items():
+            if lost:   # otra ya se perdió: no se abre ninguna más (las abiertas reciben adios en cmd_run)
+                break
             key, source = keys[name]
 
             def keep(link=link, key=key, source=source):
@@ -341,6 +343,7 @@ def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list
                                  f"la borra)")
 
             launcher.say(f"conectando con {name} ({link.shown})…")
+            link.on_lost = on_lost   # ANTES de open(): una pérdida justo después de abrir no se olvida
             try:
                 link.open(key, session_message(config, name, clock), on_key_ok=keep)
             except AgentError as e:
@@ -357,7 +360,6 @@ def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list
                     other.close()
                 return text
             opened.append(link)
-            link.on_lost = on_lost
             launcher.say(f"{name} ({link.shown}): conectado · Agmen {link.version}")
             from ._version import __version__ as mine
 

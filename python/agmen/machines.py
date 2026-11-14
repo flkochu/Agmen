@@ -334,19 +334,29 @@ def forced_remote(env: dict | None = None) -> set[str]:
         if not entry.strip():
             continue
         text = entry.strip()
-        bracket = re.fullmatch(r"\[([^\]]+)\](?::[0-9]{1,5})?", text)
-        host = bracket.group(1) if bracket else (text.rpartition(":")[0] if text.count(":") == 1 else text)
+
+        def bad(why: str) -> ValueError:
+            return ValueError(f"{REMOTE_HOSTS_ENV}: la entrada {text!r} no se entiende ({why}). Es una lista de IP "
+                              f"o nombres separados por comas, ej. {REMOTE_HOSTS_ENV}=127.0.0.2,robot.local")
+
+        bracket = re.fullmatch(r"\[([^\]]+)\](?::(.*))?", text)
+        if bracket:
+            host, port_text = bracket.group(1), bracket.group(2)
+        elif text.count(":") == 1:
+            host, _, port_text = text.partition(":")
+        else:
+            host, port_text = text, None
         try:
             ipaddress.ip_address(host.split("%", 1)[0])   # cualquier IP se entiende (aunque no sea de nadie)
-            out.add(_norm(host))
-            continue
         except ValueError:
-            pass
-        try:
-            host, _ = split_host(text)
-        except ValueError as e:
-            raise ValueError(f"{REMOTE_HOSTS_ENV}: la entrada {entry.strip()!r} no se entiende ({e}). Es una lista "
-                             f"de IP o nombres separados por comas, ej. {REMOTE_HOSTS_ENV}=127.0.0.2,robot.local") from None
+            try:
+                host, _ = split_host(text)               # un nombre: split_host revisa también el puerto
+            except ValueError as e:
+                raise bad(str(e)) from None
+        else:   # una IP: su puerto se revisa igual que el de un nombre (se ignora, pero bien escrito)
+            if port_text is not None and (not (port_text.isascii() and port_text.isdigit())
+                                          or not 1 <= int(port_text) <= 65535):
+                raise bad(f"{text!r}: el puerto debe ser un número entre 1 y 65535, o quítalo")
         out.add(_norm(host))
     return out
 
@@ -402,16 +412,6 @@ def _address(m) -> str:
 
 def _nodes_on(config, machine: str) -> list[str]:
     return [n.name for n in config.nodes if n.machine == machine]
-
-
-def hardware_remote(config, remote: list[str]) -> bool:
-    """¿Hay hardware entre los nodos que corren en las computadoras `remote`? Sí si el
-    perfil activo es "real", o si alguno de esos nodos nombra "real" en su profile
-    (ej. profile = ["real", "mesa"]). Un nodo sin profile no cuenta: lo que toca
-    hardware se marca profile = "real" (un nodo sin perfil corre también en
-    simulación). Si hay hardware, no se sugiere correr esos nodos aquí."""
-    return config.profile == "real" or any(
-        n.machine in remote and "real" in n.profiles for n in config.nodes)
 
 
 def remote_error(config, places: dict[str, Place]) -> str:

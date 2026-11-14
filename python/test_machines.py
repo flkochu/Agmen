@@ -1398,18 +1398,6 @@ class TestSinSugerenciasDeHardware(unittest.TestCase):
         c = _config(robot_toml([("robot", AJENA)], [("motor", None, "robot")]))
         self.assertEqual(remote_error(c, {"robot": Place(True, "agent")}), "")
 
-    def test_hardware_remote_funciones(self):
-        # (codigo que ya nadie llama en 3b: se queda cubierto mientras exista; ver el reporte)
-        from agmen.machines import hardware_remote
-        c = _config(robot_toml([("robot", AJENA), ("laptop", "127.0.0.1")],
-                               [("m", '["real", "mesa"]', "robot"), ("ia", "mesa", "laptop")]), "mesa")
-        self.assertTrue(hardware_remote(c, ["robot"]))
-        self.assertFalse(hardware_remote(c, ["laptop"]))
-        c2 = _config(robot_toml([("robot", AJENA)], [("m", None, "robot")]), "sim")
-        self.assertFalse(hardware_remote(c2, ["robot"]))
-        c3 = _config(robot_toml([("robot", AJENA)], [("m", None, "robot")]))
-        self.assertTrue(hardware_remote(c3, ["robot"]))       # el perfil real
-
 
 class TestValidacionBloque3aSegunda(unittest.TestCase):
     def malo(self, texto, *frag):

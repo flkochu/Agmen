@@ -1735,9 +1735,11 @@ class AgentLink:
     manda las órdenes de sus nodos (RemoteNode) y reparte lo que llega (estado, log).
 
     El Launcher lo conecta con su LogBook y su Printer (attach). on_lost(link, texto)
-    se llama una vez si la conexión se pierde después de abrir la sesión."""
+    se llama una vez si la conexión se pierde después de abrir la sesión; si se perdió
+    antes de que hubiera a quién avisar, se llama al asignarlo (ninguna pérdida se olvida)."""
 
-    def __init__(self, machine, *, toml_hint: str = "robot.toml") -> None:
+    def __init__(self, machine, *, toml_hint: str = "robot.toml",
+                 on_lost: Callable[[AgentLink, str], None] | None = None) -> None:
         from .machines import _address
 
         self.machine = machine
@@ -1748,7 +1750,6 @@ class AgentLink:
         self.nodes: dict = {}               # nombre → RemoteNode (los pone el Launcher)
         self.version = ""
         self.channel: Channel | None = None
-        self.on_lost: Callable[[AgentLink, str], None] | None = None
         self.lost = ""
         self._closing = False
         self._done = threading.Event()      # ping y lector: terminar
@@ -1756,6 +1757,27 @@ class AgentLink:
         self._printer = None
         self._lock = threading.Lock()
         self._noted: set[str] = set()
+        self._on_lost: Callable[[AgentLink, str], None] | None = on_lost
+        self._lost_told = False             # ¿ya se le avisó a on_lost? (una sola vez)
+
+    @property
+    def on_lost(self) -> Callable[[AgentLink, str], None] | None:
+        return self._on_lost
+
+    @on_lost.setter
+    def on_lost(self, handler: Callable[[AgentLink, str], None] | None) -> None:
+        """Si la conexión ya se perdió y nadie se enteró, el nuevo manejador se entera ya."""
+        with self._lock:
+            self._on_lost = handler
+        self._tell_lost()
+
+    def _tell_lost(self) -> None:
+        with self._lock:
+            handler = self._on_lost
+            if not self.lost or handler is None or self._lost_told:
+                return
+            self._lost_told = True
+        handler(self, self.lost)
 
     def attach(self, logs, printer) -> None:
         self._logs, self._printer = logs, printer
@@ -1933,8 +1955,7 @@ class AgentLink:
         self._done.set()
         for node in self.nodes.values():
             node.remote_state("falló", None, None, log=f"✖ se perdió la conexión con {self.name}")
-        if self.on_lost is not None:
-            self.on_lost(self, self.lost)
+        self._tell_lost()   # si todavía no hay manejador, queda guardada y se entrega al asignarlo
 
     def order(self, op: str, node: str) -> str | None:
         """Manda arrancar/detener/reiniciar. Devuelve un error en texto, o None."""

@@ -3611,7 +3611,6 @@ class TestAgmenRemoteHosts(unittest.TestCase):
                 self.assertIn("AGMEN_REMOTE_HOSTS", str(ctx.exception))
                 self.assertIn("ej. AGMEN_REMOTE_HOSTS=127.0.0.2,robot.local", str(ctx.exception))
 
-    @unittest.expectedFailure      # DISCREPANCIA de 51f2911: el puerto de una entrada que es IP no se valida (ver el reporte)
     def test_el_puerto_mal_escrito_de_una_ip_tambien_es_error(self):
         for malo in ("127.0.0.1:99999", "127.0.0.1:abc", "127.0.0.1:0", "127.0.0.1:"):
             with self.subTest(malo=malo):
@@ -3712,7 +3711,6 @@ class TestRunConAgentesDeMentira(E2EBase):
         self.assertTrue(self.espera(lambda: "adios" in recibidos, 30), f"el agente no recibió adios: {recibidos}")
         self.assertFalse(list(self.marks.iterdir()), "no debe arrancar nada")
 
-    @unittest.expectedFailure      # BUG de 51f2911: ver el reporte (on_lost se asigna después de open(); la pérdida se olvida)
     def test_una_computadora_que_se_pierde_justo_despues_de_abrirse_no_se_olvida(self):
         """cli._connect abre cada sesión y DESPUÉS asigna link.on_lost: si el agente se cae en medio, _lose() ve
         on_lost vacío y nadie se entera (agmen run seguiría: [robot] before, nodos locales…). Se fuerza la ventana
