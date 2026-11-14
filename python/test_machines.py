@@ -1729,6 +1729,12 @@ class TestZonaAparteScopeId(unittest.TestCase):
             self.assertEqual(sock.connect.call_args.args[0], ("fe80::1%eth0", 1, 0, 4))
             self.assertEqual(check_hosts(["fe80::1%4"])["fe80::1%4"].why, "mine")
 
+    def test_zona_con_digitos_que_no_son_ascii_no_tumba_nada(self):
+        # "²" y "١" son isdigit() pero no son un número de interfaz: es OTRA computadora, sin excepción
+        for host in ("fe80::1%²", "fe80::1%١"):
+            with self.subTest(host=host):
+                self.assertFalse(check_hosts([host])[host].here)
+
     def test_with_zone(self):
         from agmen.machines import _with_zone
         self.assertEqual(_with_zone(("fe80::1", 0, 0, 5)), "fe80::1%5")

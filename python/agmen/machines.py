@@ -149,8 +149,11 @@ class Place:
 
 def _zone_key(zone: str) -> int | str:
     """La zona de una IPv6 como número de interfaz: "12" → 12, "eth0" → su número
-    (si existe aquí). Si no se puede traducir, se queda el texto tal cual."""
-    if zone.isdigit():
+    (si existe aquí). Si no se puede traducir, se queda el texto tal cual.
+
+    Solo dígitos ASCII cuentan como número: "²" o "١" también son isdigit(), pero el
+    sistema no los entiende como interfaz (e int("²") lanza ValueError)."""
+    if zone.isascii() and zone.isdigit():
         return int(zone)
     try:
         return socket.if_nametoindex(zone)
