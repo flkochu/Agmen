@@ -2,9 +2,9 @@
 
 | | |
 |---|---|
-| **Estado** | 📝 **Propuesto** (2026-11-13). Sin implementar. Faltan las decisiones de la [sección 5](#5-decisiones) (D1–D18) |
+| **Estado** | 📝 **Propuesto** (2026-11-13). Sin implementar. Adán decidió 16 de las 18 decisiones el 2026-11-14 ([sección 5](#5-decisiones)). **Faltan D5 y D6**; mientras falten, el RFC no está aceptado |
 | **Depende de** | RFC 0001 (sobre v1, `compact` y `arrow`), RFC 0004 (el hub y su protocolo `agmen-hub/1`), RFC 0005 (archivos `.agmen`), RFC 0006 (el reloj de Agmen y los grupos de un nodo), RFC 0008 (datos grandes; D4: los mismos campos que Foxglove), RFC 0010 (grabaciones), RFC 0011 (`robot.toml` con perfiles; el mundo de MuJoCo), RFC 0012 (`[[mux]]`) |
-| **Versión** | Por decidir (D1). Si D1 = a: Agmen 0.15.0, después del nivel 10 |
+| **Versión** | Agmen 0.15.0, después del nivel 10 (D1 = a) |
 | **Requisitos** | a (datos grandes sin copias), c (grabaciones que sirven como datasets), d (misma interfaz en simulación y en el robot real), f (microcontroladores) |
 
 Este RFC **no cambia el formato de los mensajes**: no toca el sobre, ni
@@ -109,22 +109,22 @@ números**; y de micro-ROS, que un mensaje chico **no lleva texto**.
 
 Esta sección describe el diseño completo **con la opción recomendada de cada
 decisión** de la sección 5, para que se pueda leer de corrido. Cada parte dice
-de qué decisión depende; nada de esto está decidido.
+de qué decisión depende. Lo que depende de D5 y de D6 sigue sin decidir.
 
 ### 3.1 La idea en un dibujo
 
 ```
  robot.toml (una vez)                          en la red (cada mensaje)
  ┌────────────────────────────────┐
- │ [[frame]]  el árbol de marcos   │           /imu            Imu                      40 B
- │ [[joints]] nombres y orden     │           /odom           Odometria               104 B
- │ [[topic]]  frame = "imu"       │           /patas/estado   EstadoArticulaciones<12> 144 B
- └───────────────┬────────────────┘           /patas/cmd      ComandoArticulaciones<12> 240 B
+ │ [[frame]]  el árbol de marcos   │           /imu            Imu               40 B
+ │ [[joints]] nombres y orden     │           /odom           Odometry         104 B
+ │ [[topic]]  frame = "imu"       │           /patas/estado   JointState<12>   144 B
+ └───────────────┬────────────────┘           /patas/cmd      JointCommand<12> 240 B
                  │ agmen run lo revisa             (compact, UDP: sin texto, sin nombres)
                  ▼ y lo publica 1 vez por segundo
-            /frames  (Marcos)                  /laser   EscaneoLaser    ┐ arrow, TCP o memoria
-                 │                             /nube    NubeDePuntos    │ compartida: los campos
-                 ▼                             /mapa    Rejilla         ┘ de Foxglove
+            /frames  (FrameTree)               /laser   LaserScan     ┐ arrow, TCP o memoria
+                 │                             /nube    PointCloud    │ compartida: los campos
+                 ▼                             /mapa    Grid          ┘ de Foxglove
    la biblioteca de marcos, el panel,
    Foxglove, las grabaciones, el puente
    de MuJoCo: todos leen lo mismo
@@ -165,34 +165,34 @@ Todos de tamaño fijo, sin texto.
 
 struct Vector2    { f64 x; f64 y }                    # 16 B  (foxglove.Vector2)
 struct Vector3    { f64 x; f64 y; f64 z }             # 24 B  (foxglove.Vector3)
-struct Cuaternion { f64 x; f64 y; f64 z; f64 w = 1 }  # 32 B  (foxglove.Quaternion)
+struct Quaternion { f64 x; f64 y; f64 z; f64 w = 1 }  # 32 B  (foxglove.Quaternion)
 
 message Pose {                    # 56 B  (foxglove.Pose)
     Vector3    position           # m
-    Cuaternion orientation
+    Quaternion orientation
 }
 
-message Transformacion {          # 56 B  (los campos de foxglove.FrameTransform, sin los nombres)
+message Transform {          # 56 B  (los campos de foxglove.FrameTransform, sin los nombres)
     Vector3    translation        # dónde está el origen del hijo, visto desde el padre (m)
-    Cuaternion rotation           # cómo está girado el hijo, visto desde el padre
+    Quaternion rotation           # cómo está girado el hijo, visto desde el padre
 }
 
-message Velocidad {               # 48 B  (los campos de geometry_msgs/Twist)
+message Twist {               # 48 B  (los campos de geometry_msgs/Twist)
     Vector3 linear                # m/s, en el marco del topic (para mover un robot: su base_link)
     Vector3 angular               # rad/s, en el mismo marco
 }
 
-message Odometria {               # 104 B (los campos de foxglove.Odometry, sin texto ni covarianzas)
+message Odometry {               # 104 B (los campos de foxglove.Odometry, sin texto ni covarianzas)
     Pose    pose                  # el hijo visto desde el padre (ej. base_link en odom)
     Vector3 linear_velocity       # m/s, medida en el hijo (como body_frame_id en Foxglove)
     Vector3 angular_velocity      # rad/s, medida en el hijo
 }
 
 struct Vector3f    { f32 x; f32 y; f32 z }
-struct Cuaternionf { f32 x = nan; f32 y = nan; f32 z = nan; f32 w = nan }   # se mide: vacía hasta que la llenes
+struct Quaternionf { f32 x = nan; f32 y = nan; f32 z = nan; f32 w = nan }   # se mide: vacía hasta que la llenes
 
 message Imu {                     # 40 B  (los campos de sensor_msgs/Imu, sin covarianzas)
-    Cuaternionf orientation       # la IMU vista desde un marco quieto con z arriba; NaN si no la estima
+    Quaternionf orientation       # la IMU vista desde un marco quieto con z arriba; NaN si no la estima
     Vector3f    angular_velocity      # rad/s, en el marco de la IMU
     Vector3f    linear_acceleration   # m/s², en el marco de la IMU (quieta y con z arriba marca +9.81 en z)
 }
@@ -200,14 +200,14 @@ message Imu {                     # 40 B  (los campos de sensor_msgs/Imu, sin co
 
 - **Sin `timestamp`**: el instante es el `t_data` del sobre (se pone con
   `publish(msg, t_data=...)`; por defecto, ahora). **Sin `frame_id`**: el marco
-  se declara una vez (§3.6). Una `Odometria` tiene dos marcos, padre e hijo:
+  se declara una vez (§3.6). Una `Odometry` tiene dos marcos, padre e hijo:
   los dice el `[[frame]]` cuyo `topic` es ese (§3.6).
 - **`Imu.orientation`**: respecto a un marco que no se mueve, con z hacia
   arriba (alineado con la gravedad). Hacia dónde apunta x en ese marco es
   arbitrario (donde quedó la IMU al encender), salvo que tenga magnetómetro.
   A una política le basta: de ahí saca hacia dónde está la gravedad.
-- `Cuaternion` empieza en "sin rotación" (`w = 1`) porque se calcula;
-  `Cuaternionf` empieza en `NaN` porque se mide, y lo que no se mide no se
+- `Quaternion` empieza en "sin rotación" (`w = 1`) porque se calcula;
+  `Quaternionf` empieza en `NaN` porque se mide, y lo que no se mide no se
   inventa.
 - **`f64` para la geometría** (como Foxglove y ROS) y **`f32` para lo que sale
   de un microcontrolador y entra a una política**: IMU y articulaciones (D4).
@@ -222,19 +222,19 @@ message Imu {                     # 40 B  (los campos de sensor_msgs/Imu, sin co
 
 **El tamaño depende del robot** (2 ruedas, 12 servos, 29 motores), y `compact`
 pide tamaño fijo. La propuesta es que **el número sea parte del tipo**. En
-este documento, `EstadoArticulaciones<12>` quiere decir "el tipo
-`EstadoArticulaciones` con arreglos de 12". Lo que queda fijo es su forma
+este documento, `JointState<12>` quiere decir "el tipo
+`JointState` con arreglos de 12". Lo que queda fijo es su forma
 (el nombre, los campos, su orden y `f32`); cómo se escribe en cada lenguaje
 es la decisión D5.
 
 ```
-message EstadoArticulaciones<N> {     # 12·N bytes: 144 B con 12
+message JointState<N> {     # 12·N bytes: 144 B con 12
     f32[N] position = nan             # rad (o m)
     f32[N] velocity = nan             # rad/s (o m/s)
     f32[N] effort   = nan             # N·m (o N)
 }
 
-message ComandoArticulaciones<N> {    # 20·N bytes: 240 B con 12
+message JointCommand<N> {    # 20·N bytes: 240 B con 12
     f32[N] position = nan             # objetivo de posición; NaN = sin objetivo de posición
     f32[N] velocity = 0               # objetivo de velocidad
     f32[N] effort   = 0               # par (o fuerza) que se suma directo
@@ -255,25 +255,25 @@ estándar tenga sus campos y sus valores por defecto, y si no, lo dice.
 # patas.agmen
 package patas
 
-message EstadoArticulaciones {
+message JointState {
     f32[12] position = nan
     f32[12] velocity = nan
     f32[12] effort   = nan
 }
-# ... y ComandoArticulaciones, igual, con sus cinco arreglos de 12
+# ... y JointCommand, igual, con sus cinco arreglos de 12
 ```
 ```cpp
-agmen::Publisher<patas::EstadoArticulaciones> pub("/patas/estado");   // generado de patas.agmen
+agmen::Publisher<patas::JointState> pub("/patas/estado");   // generado de patas.agmen
 ```
 ```python
-from agmen.msgs import ComandoArticulaciones
-Cmd = ComandoArticulaciones[12]            # una función arma el tipo con el texto del esquema
+from agmen.msgs import JointCommand
+Cmd = JointCommand[12]            # una función arma el tipo con el texto del esquema
 pub = node.publisher(Cmd, "/patas/cmd")
 pub.publish(Cmd(position=objetivo))        # lo demás, por defecto
 ```
 
 - En la red no hay nada nuevo: el texto canónico es
-  `EstadoArticulaciones{f32[12] position;f32[12] velocity;f32[12] effort}`,
+  `JointState{f32[12] position;f32[12] velocity;f32[12] effort}`,
   que ya es válido hoy (RFC 0001, anexo A). El `package` no entra en ese texto
   (RFC 0005 D5), así que el tipo de `patas.agmen`, el de Python y el que
   daría `<12>` son **el mismo tipo**, con el mismo `schema_id`.
@@ -320,8 +320,8 @@ pub.publish(Cmd(position=objetivo))        # lo demás, por defecto
 ```toml
 [[joints]]
 name = "patas"
-state = "/patas/estado"            # EstadoArticulaciones<12>
-command = "/patas/cmd"             # ComandoArticulaciones<12>
+state = "/patas/estado"            # JointState<12>
+command = "/patas/cmd"             # JointCommand<12>
 kp = 20.0                          # ganancias cuando el comando trae NaN: un número para todas,
 kd = 0.5                           # o una lista con una por articulación
 names = ["FR_hip", "FR_thigh", "FR_calf",      # ESTE es el orden, en todos lados:
@@ -371,7 +371,7 @@ Los mismos campos que Foxglove, como `Imagen` (RFC 0008 D4). El puente los
 entrega a Foxglove con su nombre (`foxglove.LaserScan`, …).
 
 ```
-message EscaneoLaser {            # foxglove.LaserScan
+message LaserScan {            # foxglove.LaserScan
     time   timestamp
     string frame_id
     Pose   pose                   # el origen del láser en su marco (casi siempre, sin mover)
@@ -381,8 +381,8 @@ message EscaneoLaser {            # foxglove.LaserScan
     f64[]  intensities            # vacío si el láser no las da
 }
 
-enum TipoNumerico : u8 {          # foxglove.NumericType
-    DESCONOCIDO = 0
+enum NumericType : u8 {          # foxglove.NumericType
+    UNKNOWN = 0
     UINT8 = 1
     INT8 = 2
     UINT16 = 3
@@ -393,22 +393,22 @@ enum TipoNumerico : u8 {          # foxglove.NumericType
     FLOAT64 = 8
 }
 
-struct CampoEmpaquetado {         # foxglove.PackedElementField
+struct PackedElementField {         # foxglove.PackedElementField
     string       name             # "x", "y", "z", "intensity", "red"...
     u32          offset           # en qué byte empieza, dentro de cada punto
-    TipoNumerico type
+    NumericType type
 }
 
-message NubeDePuntos {            # foxglove.PointCloud
+message PointCloud {            # foxglove.PointCloud
     time   timestamp
     string frame_id
     Pose   pose
     u32    point_stride           # bytes por punto
-    CampoEmpaquetado[] fields
+    PackedElementField[] fields
     bytes  data
 }
 
-message Rejilla {                 # foxglove.Grid (un mapa 2D)
+message Grid {                 # foxglove.Grid (un mapa 2D)
     time    timestamp
     string  frame_id
     Pose    pose                  # la esquina de la celda (0, 0)
@@ -416,28 +416,28 @@ message Rejilla {                 # foxglove.Grid (un mapa 2D)
     Vector2 cell_size             # m por celda, en x y en y
     u32     row_stride            # bytes por renglón
     u32     cell_stride           # bytes por celda
-    CampoEmpaquetado[] fields
+    PackedElementField[] fields
     bytes   data                  # renglón por renglón
 }
 
-message Poses {                   # foxglove.PosesInFrame (un camino)
+message PosesInFrame {                   # foxglove.PosesInFrame (un camino)
     time   timestamp
     string frame_id
     Pose[] poses
 }
 
-struct TransformacionEnMarco {    # foxglove.FrameTransform
+struct FrameTransform {    # foxglove.FrameTransform
     time       timestamp
     string     parent_frame_id
     string     child_frame_id
     Vector3    translation
-    Cuaternion rotation
+    Quaternion rotation
 }
-message Transformaciones {        # foxglove.FrameTransforms (marcos que no se conocen de antemano, §3.7)
-    TransformacionEnMarco[] transforms
+message FrameTransforms {        # foxglove.FrameTransforms (marcos que no se conocen de antemano, §3.7)
+    FrameTransform[] transforms
 }
 
-message TrayectoriaArticular {    # sin equivalente en Foxglove (D16)
+message JointTrajectory {    # sin equivalente en Foxglove (D16)
     time          timestamp       # cuándo empieza
     string        joints          # el grupo de [[joints]], ej. "brazo"
     duration[]    time_from_start # T instantes
@@ -448,7 +448,7 @@ message TrayectoriaArticular {    # sin equivalente en Foxglove (D16)
 }
 ```
 
-- **Mapa de ocupación** (D17) = una `Rejilla` con un solo campo `occupancy` de
+- **Mapa de ocupación** (D17) = una `Grid` con un solo campo `occupancy` de
   tipo `INT8`: `-1` no se sabe, `0` libre, `100` ocupado, y lo de en medio es
   qué tan probable es que esté ocupado, en por ciento. Son los valores que usa
   Nav2. El `.msg` de ROS no los fija: dice que "dependen de la aplicación".
@@ -470,7 +470,7 @@ message TrayectoriaArticular {    # sin equivalente en Foxglove (D16)
 [[frame]]
 name = "base_link"             # el centro del robot
 parent = "odom"
-topic = "/odom"                # SE MUEVE: su pose llega por /odom (Odometria, Pose o Transformacion)
+topic = "/odom"                # SE MUEVE: su pose llega por /odom (Odometry, Pose o Transform)
 
 [[frame]]
 name = "odom"
@@ -514,7 +514,7 @@ Tres clases de marco, según cómo se sabe dónde está:
 |---|---|---|
 | **Fijo** | `xyz`, y `rpy_deg`, `quat` u `optical` | `robot.toml`. No cambia |
 | **Por topic** | `topic = "/odom"` | El mensaje de ese topic (un marco, un topic) |
-| **Por articulación** | `joint`, `axis` y `joint_type` (`"revolute"` = `GIRATORIA`, `"prismatic"` = `LINEAL`), más `xyz` y `rpy_deg` del origen | El estado de las articulaciones: lo calcula quien lo consulta. Primero la parte fija y después el giro (o el deslizamiento) sobre `axis` |
+| **Por articulación** | `joint`, `axis` y `joint_type` (`"revolute"` = `REVOLUTE`, `"prismatic"` = `PRISMATIC`), más `xyz` y `rpy_deg` del origen | El estado de las articulaciones: lo calcula quien lo consulta. Primero la parte fija y después el giro (o el deslizamiento) sobre `axis` |
 
 `agmen run` **revisa el árbol antes de arrancar** (regla 1), con el archivo y
 la línea:
@@ -527,7 +527,7 @@ robot.toml:71: el topic '/imu' dice frame = "imuu", que no está en [[frame]]
 robot.toml:80: el marco 'FR_thigh' dice joint = "FR_thihg", que no está en ningún [[joints]]
 ```
 
-El tipo del topic de un marco (`Odometria`, `Pose` o `Transformacion`) se
+El tipo del topic de un marco (`Odometry`, `Pose` o `Transform`) se
 revisa al correr, cuando se anuncia, igual que el de las articulaciones.
 
 **Si el robot ya tiene un modelo** (el XML de MuJoCo o un URDF), casi todo el
@@ -570,7 +570,7 @@ Sin modelo, las tablas se escriben a mano: alcanza para un robot chico.
 
 ### 3.7 Marcos: cómo se publican (D9, D10)
 
-**El árbol completo va en `/frames`**, de tipo `Marcos` (`arrow`; unos pocos
+**El árbol completo va en `/frames`**, de tipo `FrameTree` (`arrow`; unos pocos
 KB para un robot de 20 marcos). Lo publica `agmen run` **una vez por segundo**
 y cada vez que cambia (como hace hoy cada `[[mux]]` con `/mux/<nombre>`), y
 también en cuanto aparece un suscriptor nuevo. Quien llega tarde lo tiene
@@ -578,30 +578,30 @@ enseguida, sin necesitar "último valor para quien llegue tarde", que Agmen no
 tiene (RFC 0004 §5).
 
 ```
-enum ClaseDeMarco : u8 {
-    FIJO = 0
-    POR_TOPIC = 1
-    POR_ARTICULACION = 2
+enum FrameKind : u8 {
+    FIXED = 0
+    TOPIC = 1
+    JOINT = 2
 }
-enum TipoDeArticulacion : u8 {
-    GIRATORIA = 0
-    LINEAL = 1
+enum JointType : u8 {
+    REVOLUTE = 0
+    PRISMATIC = 1
 }
 
-struct Marco {
+struct Frame {
     string       name             # "imu"
     string       parent           # "base_link"; "" en la raíz
-    ClaseDeMarco kind
+    FrameKind kind
     Vector3      translation      # la parte fija (xyz)
-    Cuaternion   rotation         # la parte fija (rpy_deg, quat u optical, ya como cuaternión)
-    string       topic            # POR_TOPIC: de dónde llega su pose
-    u32          hold_ms          # POR_TOPIC: cuánto sigue valiendo la última muestra (0 = nada)
-    string       joint            # POR_ARTICULACION: el nombre de la articulación
-    TipoDeArticulacion joint_type
-    Vector3      axis             # POR_ARTICULACION: el eje, después de la parte fija
+    Quaternion   rotation         # la parte fija (rpy_deg, quat u optical, ya como cuaternión)
+    string       topic            # TOPIC: de dónde llega su pose
+    u32          hold_ms          # TOPIC: cuánto sigue valiendo la última muestra (0 = nada)
+    string       joint            # JOINT: el nombre de la articulación
+    JointType joint_type
+    Vector3      axis             # JOINT: el eje, después de la parte fija
 }
 
-struct GrupoDeArticulaciones {
+struct JointGroup {
     string   name                 # "patas"
     string   state                # el topic del estado
     string   command              # el topic del comando ("" si no hay)
@@ -610,30 +610,30 @@ struct GrupoDeArticulaciones {
     f32[]    kd
 }
 
-struct MarcoDeTopic {
+struct TopicFrame {
     string topic                  # "/imu"
     string frame                  # "imu"
 }
 
-message Marcos {
+message FrameTree {
     string  robot                 # [robot] name
     string  profile               # el perfil activo (RFC 0011)
     u64     version               # cambia si cambia cualquier cosa de abajo
-    Marco[] frames
-    GrupoDeArticulaciones[] joints
-    MarcoDeTopic[] topics
+    Frame[] frames
+    JointGroup[] joints
+    TopicFrame[] topics
 }
 ```
 
 - **Cada marco que se mueve tiene su propio topic**, con un mensaje `compact`
-  sin nombres (`Odometria`, `Pose` o `Transformacion`: de 56 a 104 B). Quién es
+  sin nombres (`Odometry`, `Pose` o `Transform`: de 56 a 104 B). Quién es
   el padre y quién el hijo ya lo dijo `robot.toml`.
 - **Los eslabones de un robot articulado no se publican** (D10): con el estado
   de las articulaciones (un mensaje de 144 B) y `/frames`, cada quien calcula
   la posición de cada eslabón. En ROS, `robot_state_publisher` republica una
   transformación por eslabón.
 - **Marcos que no se conocen de antemano** (un objeto que detectó la cámara,
-  una etiqueta): los publican tus nodos en `/tf`, de tipo `Transformaciones`,
+  una etiqueta): los publican tus nodos en `/tf`, de tipo `FrameTransforms`,
   con sus nombres en texto, como en Foxglove. Reglas: deben colgar de un marco
   declarado; uno que se llame igual que un marco declarado se rechaza con un
   aviso; y viven mientras llegan (pasados los 10 s del historial, ya no
@@ -652,8 +652,8 @@ message Marcos {
   mientras `agmen run` corre lo recibe cualquier nodo de esa computadora (y de
   las otras, RFC 0011), aunque no lo haya arrancado `agmen run`. Si no hay
   ningún `agmen run`, `agmen frame publish robot.toml` publica `/frames` solo;
-  sin eso, la biblioteca dice `SIN_ARBOL` (§3.8).
-- **Dos copias de `robot.toml`** (la laptop y el robot): `Marcos.version`
+  sin eso, la biblioteca dice `NO_TREE` (§3.8).
+- **Dos copias de `robot.toml`** (la laptop y el robot): `FrameTree.version`
   resume todo el árbol y los nombres. Al conectarse, el agente compara la suya
   con la de `agmen run`, además de lo que ya compara (RFC 0011 D7), y si son
   distintas no arranca (es un dato nuevo en la conexión del agente; con D18,
@@ -677,9 +677,9 @@ from agmen.frames import Frames, LATEST
 
 frames = Frames(node)                              # lee /frames; todavía no escucha ningún marco
 
-@frames.on(EscaneoLaser, "/laser", target="odom")  # te lo entrega cuando ya se puede transformar
+@frames.on(LaserScan, "/laser", target="odom")  # te lo entrega cuando ya se puede transformar
 def ver(s, r):
-    puntos_en_odom = r.apply(puntos)               # r.transform es una Transformacion
+    puntos_en_odom = r.apply(puntos)               # r.transform es una Transform
 
 r = frames.lookup(source="laser", target="odom", at=t)   # contesta ya; nunca espera
 if not r:
@@ -727,13 +727,13 @@ qué hacer:
 
 | `r.reason` | Texto de ejemplo |
 |---|---|
-| `TODAVIA_NO` | `odom → base_link: pediste t = 12.340 s y lo último de /odom es de 12.321 s (llega a 50 Hz). Usa @frames.on, que espera lo justo` |
-| `MUY_VIEJO` | `pediste hace 14.2 s y solo se guardan 10 s` |
-| `SIN_DATOS` | `nadie publica /odom, de donde sale base_link` |
-| `SIN_CAMINO` | `'laser' y 'mesa' no están en el mismo árbol` |
-| `MARCO_DESCONOCIDO` | `'lasr' no está en /frames. ¿Quisiste decir 'laser'?` |
-| `SIN_ARBOL` | `nadie publica /frames: arranca con agmen run, o corre agmen frame publish robot.toml` |
-| `OTRO_RELOJ` | `/odom llega con reloj de simulación y este nodo usa el real` |
+| `NOT_YET` | `odom → base_link: pediste t = 12.340 s y lo último de /odom es de 12.321 s (llega a 50 Hz). Usa @frames.on, que espera lo justo` |
+| `TOO_OLD` | `pediste hace 14.2 s y solo se guardan 10 s` |
+| `NO_DATA` | `nadie publica /odom, de donde sale base_link` |
+| `NO_PATH` | `'laser' y 'mesa' no están en el mismo árbol` |
+| `UNKNOWN_FRAME` | `'lasr' no está en /frames. ¿Quisiste decir 'laser'?` |
+| `NO_TREE` | `nadie publica /frames: arranca con agmen run, o corre agmen frame publish robot.toml` |
+| `OTHER_CLOCK` | `/odom llega con reloj de simulación y este nodo usa el real` |
 
 ### 3.9 Los problemas conocidos de tf2, uno por uno
 
@@ -741,13 +741,13 @@ qué hacer:
 |---|---|
 | **Todo en un topic; cada nodo guarda todo.** "Alta carga de CPU con muchos nodos que escuchan"; cada uno crea un nodo extra suscrito a `/tf` a alta frecuencia | Un topic por marco que se mueve; cada nodo escucha solo los de su consulta. Los fijos y los de articulaciones no viajan como transformaciones. (Los marcos que no se conocen de antemano sí van juntos en `/tf`: ahí el problema sigue) |
 | **`/tf_static` y quien llega tarde.** El publicador guarda un solo mensaje; dos publicadores de estáticas en una grabación y solo aparece una; rosbag2 necesitó `--repeat-transient-local` para partir grabaciones | Los fijos viven en `robot.toml` y van completos en `/frames` cada segundo. No hay "último valor" ni publicadores de estáticas que se pisen |
-| **"Lookup would require extrapolation into the future".** El tutorial oficial lo provoca pidiendo `now()`: la transformación tarda unos milisegundos en llegar | El resultado `TODAVIA_NO` dice cuánto falta y a qué ritmo llega; `@frames.on` espera lo justo; `hold_ms` para los marcos lentos |
+| **"Lookup would require extrapolation into the future".** El tutorial oficial lo provoca pidiendo `now()`: la transformación tarda unos milisegundos en llegar | El resultado `NOT_YET` dice cuánto falta y a qué ritmo llega; `@frames.on` espera lo justo; `hold_ms` para los marcos lentos |
 | **Tiempo cero = "lo último".** La salida usual del error anterior, que entrega datos viejos sin avisar | `at=` obligatorio; `LATEST` es explícito y devuelve la edad |
 | **"Message Filter dropping message… for reason 'Unknown'"**, abierto desde 2021; RViz inunda la consola si un `frame_id` no existe | Cada descarte tiene un motivo de la tabla de §3.8, y se cuenta en vez de repetirse |
 | **Un nombre mal escrito solo falla al consultar** | Los marcos se declaran: `agmen run` revisa el árbol antes de arrancar, y un nombre desconocido se sugiere corregido |
 | **Dos fuentes para la misma transformación** se mezclan sin aviso | Un marco, un topic; si hay dos fuentes, `[[mux]]`; si dos se alternan sin mux, se avisa |
 | **El tiempo retrocede** (reiniciar el simulador o la grabación): `TF_OLD_DATA` | El reloj de Agmen nunca va hacia atrás (RFC 0006), así que no sirve de señal. La biblioteca mira los datos: una muestra un poco más vieja que la última (un paquete UDP que llegó en desorden) se descarta y se cuenta; si retrocede **más de 1 s**, es un reinicio: se vacía el historial de ese marco y se dice una vez. Reiniciar un simulador sin reiniciar los nodos sigue teniendo el límite del RFC 0006 (el reloj se frena hasta que el simulador lo alcanza); con `--loop`, `agmen play` ya suma tiempo en cada vuelta (RFC 0010) y no hay salto |
-| **Relojes de dos computadoras** | El `clock` del sobre separa simulación de real (`OTRO_RELOJ`). Entre computadoras, la diferencia se va a medir desde 0.14.0 (RFC 0011 D10): si pasa de unos milisegundos, las consultas lo dicen. Corregirla es del nivel 11 |
+| **Relojes de dos computadoras** | El `clock` del sobre separa simulación de real (`OTHER_CLOCK`). Entre computadoras, la diferencia se va a medir desde 0.14.0 (RFC 0011 D10): si pasa de unos milisegundos, las consultas lo dicen. Corregirla es del nivel 11 |
 | **Sin incertidumbre** | Tampoco aquí, por ahora (D13) |
 | **Solo árbol** | También aquí, a propósito: un padre por marco, como REP-105 y Rerun. Se revisa al arrancar |
 | **Varios robots: nombres globales sin prefijo** | No entra (§4); `/` queda reservado en los nombres |
@@ -757,8 +757,8 @@ qué hacer:
 - **Foxglove**: el puente de `agmen run` ya convierte cada tipo
   a JSON con su nombre de Foxglove (hoy, las imágenes). Se le agrega: los
   mensajes grandes van tal cual (mismos campos); los chicos se completan con
-  lo que dice `robot.toml`: `Pose` → `foxglove.PoseInFrame`, `Odometria` →
-  `foxglove.Odometry`, `EstadoArticulaciones<N>` + `names` →
+  lo que dice `robot.toml`: `Pose` → `foxglove.PoseInFrame`, `Odometry` →
+  `foxglove.Odometry`, `JointState<N>` + `names` →
   `foxglove.JointStates`.
 - **Los marcos, para Foxglove**: el puente arma **un solo** canal `/tf`
   (`foxglove.FrameTransforms`) con los fijos (una vez por segundo), los de
@@ -775,9 +775,9 @@ qué hacer:
   tiene de dónde sacar su lista `names`. Las unidades siguen en radianes y se
   dice en los metadatos.
 - **Microcontroladores** (`agmen-micro`, nivel 12): `Imu` (40 B),
-  `EstadoArticulaciones<N>` y `ComandoArticulaciones<N>` usan solo `f32`, sin
+  `JointState<N>` y `JointCommand<N>` usan solo `f32`, sin
   texto ni listas. Un microcontrolador publica el estado de sus ruedas
-  (`EstadoArticulaciones<2>`) y recibe su comando; **la odometría la calcula
+  (`JointState<2>`) y recibe su comando; **la odometría la calcula
   un nodo en la computadora**, porque los mensajes de geometría usan `f64` y
   no todos los microcontroladores lo tienen (§6, reto 9). El microcontrolador
   no sabe de marcos ni de nombres: eso vive en `robot.toml`.
@@ -788,28 +788,52 @@ qué hacer:
 
 | Topic | Tipo | Quién lo publica |
 |---|---|---|
-| `/cmd_vel` | `Velocidad` (48 B) | El cerebro y el panel, por un `[[mux]]` (regla 13): "avanza a 0.2 m/s y gira a 0.5 rad/s" |
-| `/ruedas/estado` | `EstadoArticulaciones<2>` (24 B) | El microcontrolador de las ruedas (o el mundo de MuJoCo) |
-| `/odom` | `Odometria` (104 B) | Un nodo que cuenta las vueltas de las ruedas (o el mundo de MuJoCo): dónde cree que está |
+| `/cmd_vel` | `Twist` (48 B) | El cerebro y el panel, por un `[[mux]]` (regla 13): "avanza a 0.2 m/s y gira a 0.5 rad/s" |
+| `/ruedas/estado` | `JointState<2>` (24 B) | El microcontrolador de las ruedas (o el mundo de MuJoCo) |
+| `/odom` | `Odometry` (104 B) | Un nodo que cuenta las vueltas de las ruedas (o el mundo de MuJoCo): dónde cree que está |
 | `/imu` | `Imu` (40 B) | La IMU (o el mundo de MuJoCo) |
 | `/camara` | `ImagenComprimida` | La cámara, como hoy |
-| `/frames` | `Marcos` | `agmen run`: `odom → base_link → imu, camara → camara_optical` |
+| `/frames` | `FrameTree` | `agmen run`: `odom → base_link → imu, camara → camara_optical` |
 
 **Un robot de patas con 12 servos**, con una política entrenada:
 
 ```
-            /imu  (Imu)  ─────────────┐
-   /patas/estado  (EstadoArticulaciones<12>) ─┤──►  política  ──►  /patas/cmd  (ComandoArticulaciones<12>)
-        /cmd_vel  (Velocidad) ────────┘      (50 Hz)                    │
-                                                                        ▼
-                         perfil sim:  el mundo de MuJoCo o de Isaac Sim (aplica el PD)
-                         perfil real: el driver de los servos            (aplica el PD)
+            /imu  (Imu) ─────────────┐
+   /patas/estado  (JointState<12>) ──┤──►  política  ──►  /patas/cmd  (JointCommand<12>)
+        /cmd_vel  (Twist) ───────────┘      (50 Hz)                │
+                                                                   ▼
+                    perfil sim:  el mundo de MuJoCo o de Isaac Sim (aplica el PD)
+                    perfil real: el driver de los servos            (aplica el PD)
 ```
 
 Los mismos cuatro topics, con los mismos tipos, el mismo orden de
 articulaciones (`[[joints]] names`), radianes y el cuaternión con nombres, en
 los tres lugares. Lo que cambia entre simulación y real es el nodo marcado con
 `profile` (RFC 0011), nada más.
+
+### 3.12 Los nombres de los tipos (D14 = b)
+
+Con los tipos en inglés, la regla propuesta es: el nombre de Foxglove si el
+tipo tiene sus mismos campos; el de ROS si no hay uno de Foxglove; y uno
+propio solo si no existe ninguno. Un nombre no se puede cambiar después sin
+romper (§5, D14), así que la lista se revisa antes de implementar.
+
+| Tipo | De dónde sale el nombre | Ojo |
+|---|---|---|
+| `Vector2`, `Vector3`, `Quaternion`, `Pose` | Foxglove, mismos campos | |
+| `LaserScan`, `PointCloud`, `PackedElementField`, `NumericType`, `Grid`, `PosesInFrame`, `FrameTransform`, `FrameTransforms` | Foxglove, mismos campos | |
+| `Odometry` | Foxglove | Mismo nombre, **menos campos** (sin marcos en texto ni covarianzas, D2) |
+| `Transform` | ROS (`geometry_msgs/Transform`), mismos campos | La versión con nombres es `FrameTransform` |
+| `Twist` | ROS (`geometry_msgs/Twist`), mismos campos | Foxglove no tiene. Es el nombre que menos dice a quien no viene de ROS; la alternativa es `Velocity` |
+| `Imu` | ROS (`sensor_msgs/Imu`) | Menos campos (sin covarianzas) y en `f32` |
+| `JointState`, `JointCommand` | ROS (`sensor_msgs/JointState`) y propio | Otra forma que el de ROS (sin nombres); en Foxglove, `JointState` es **una** articulación |
+| `JointTrajectory` | ROS (`trajectory_msgs/JointTrajectory`) | Otra forma (tensores, D16) |
+| `Vector3f`, `Quaternionf` | Propios | Los de `f32` |
+| `FrameTree`, `Frame`, `JointGroup`, `TopicFrame`, `FrameKind`, `JointType` | Propios | Lo que va en `/frames` |
+
+Los tipos que ya existen con nombre en español (`Imagen`, `ImagenComprimida`,
+`MuxEstado`) **no se tocan en este RFC**. Renombrarlos rompería las
+grabaciones y los nodos de 0.10 a 0.13: si se hace, es otra decisión.
 
 ## 4. Lo que NO entra
 
@@ -843,28 +867,28 @@ los tres lugares. Lo que cambia entre simulación y real es el nodo marcado con
 
 ## 5. Decisiones
 
-Todas pendientes; las decide Adán. La recomendada está en su columna: casi siempre (a); en D5, D6 y D14 es otra, porque cambiaron después de la primera lectura. Los ejemplos de la sección 3 usan los nombres en español de la opción (a) de D14; con (b) cambian los nombres de los tipos y nada más.
+Adán decidió el 2026-11-14 las que tienen ✅. Faltan dos: **D5** (pidió investigar si hay una opción mejor que la recomendada) y **D6** (toca el protocolo del hub y necesita su aprobación explícita).
 
-| # | Pregunta | Opciones | Recomendada | Por qué |
-|---|---|---|---|---|
-| **D1** | ¿Qué entra, y cuándo? | (a) **Mensajes, convenciones y marcos (declararlos, publicarlos y consultarlos) juntos, en una versión propia después del nivel 10 (0.15.0)**, antes del visualizador y del control, (b) solo los mensajes ahora; los marcos, con el visualizador (nivel 14), (c) todo junto con el visualizador | **(a)** | El visualizador, el control, el puente de MuJoCo genérico y el puente con ROS 2 necesitan las dos cosas. Sin marcos, un láser o una nube no se pueden usar ni dibujar. (b) deja mensajes con un `frame_id` que nadie entiende, como `Imagen` hoy. (c) retrasa el control y la simulación, que no necesitan dibujar nada |
-| **D2** | Cuando el mensaje es chico y el esquema de Foxglove lleva texto (`JointStates`, `Odometry`, `PoseInFrame`, `FrameTransform`), ¿se copia tal cual? | (a) **Dos familias**: los chicos van en `compact`, con los mismos nombres de campo, unidades y significado, pero **sin** `timestamp`, `frame_id` ni nombres (van en el sobre y en `robot.toml`), sin covarianzas y sin `acceleration`; el puente los completa para Foxglove. Los grandes (láser, nube, rejilla, poses) llevan **exactamente** los campos de Foxglove, como `Imagen`; en ellos manda `timestamp`, y se avisa si difiere del `t_data` del sobre, (b) todo exactamente como Foxglove, (c) todo propio, sin mirar a Foxglove | **(a)** | Un texto en el mensaje lo manda a `arrow` y a TCP (RFC 0008): unos 200 B más y 200 veces más lento de codificar en Python (RFC 0001 §2), y un microcontrolador no lo puede armar. Con (a) una odometría mide 104 B. (b) cumple al pie de la letra el RFC 0008 D4, pero rompe la regla 6 justo en los mensajes de control. (c) pierde Foxglove gratis |
-| **D3** | ¿Qué convenciones? | (a) **Unidades SI y radianes; ejes de REP-103 (x al frente, y a la izquierda, z arriba; cámaras con z al frente); cuaternión `x, y, z, w` con campos con nombre; `NaN` = no se mide o no se manda; en `robot.toml`, `rpy_deg` en grados sobre los ejes fijos del padre, como URDF** (§3.2), (b) igual, pero el cuaternión con `w` primero, como MuJoCo, (c) igual, pero los ángulos en grados, como LeRobot y los servos de hobby | **(a)** | Es lo que usan ROS, Foxglove, los URDF que existen e Isaac Lab desde 3.0; MuJoCo es el único con `w` primero, y con campos con nombre no hay orden que confundir. Los radianes son lo que usan MuJoCo, Isaac Lab y las políticas; los grados solo se muestran. (b) le queda bien a MuJoCo y mal a todo lo demás. (c) es cómodo de leer, pero cada simulador y cada política tendría que convertir |
-| **D4** | ¿`f64` o `f32`? | (a) **`f64` en la geometría** (pose, transformación, velocidad, odometría), como Foxglove y ROS; **`f32` en IMU y articulaciones**, (b) todo `f64`, (c) todo `f32` | **(a)** | Una posición en `f32` pierde el centímetro a unos 83 km del origen (REP-105) y ya no sirve con GPS; en `f64` la geometría es igual a Foxglove y a ROS. La IMU y las articulaciones salen de un microcontrolador y entran a una red neuronal en `f32` (Unitree los manda en `float32`): con `f64` serían el doble de bytes sin ganar nada. (c) se aparta de Foxglove en todo. El costo de (a): la geometría no se arma en un microcontrolador sin `f64` |
-| **D5** | El número de articulaciones depende del robot y `compact` pide tamaño fijo: ¿cómo se escribe el tipo? | (a) **Tipos con tamaño en el lenguaje**: `EstadoArticulaciones<N>` definido una vez en `msgs.agmen` (C++: `agmen::msgs::EstadoArticulaciones<12>`), (b) arreglos variables `f32[]` (va en `arrow`, por TCP), (c) un tamaño máximo fijo para todos (como los 20 y 35 motores de Unitree) y un campo que dice cuántos se usan, (d) cada robot escribe su mensaje siguiendo una convención de nombres de campo, (e) **sin cambiar el lenguaje**: el estándar fija la forma del tipo (nombre, campos, orden, `f32`); un comando escribe el `.agmen` del robot con su número (`patas::EstadoArticulaciones`) y en Python lo arma una función (`EstadoArticulaciones[12]`) | **(e)** | (a) y (e) dan **los mismos bytes y el mismo `schema_id`**, y en las dos el número es parte del tipo: un simulador con otra cantidad de articulaciones no se conecta. La diferencia es el costo. (a) cambia el lector de `.agmen` y el generador (`idl.py` y `gen.py`, unas 750 líneas cada uno): lo difícil es el C++, porque hoy el generador escribe el esquema y el tamaño como constantes ya calculadas y una plantilla sobre N tendría que armarlas al compilar. El navegador no cambia en ninguna: no lee `.agmen`, decodifica con el texto que se anuncia. (e) no toca el lector ni el generador. Lo que (e) pierde: en C++ no se puede escribir código general sobre N con un tipo estándar, y dos grupos de distinto tamaño van en `package` distintos. Como los bytes son iguales, (a) se puede agregar después sin romper nada. (b) es lo de ROS: pierde `compact`. (c) desperdicia bytes y no avisa si la cantidad no coincide. (d) deja a las herramientas adivinando |
-| **D6** | ¿Dónde van los nombres y el orden de las articulaciones? | (a) **Una vez, en `robot.toml` (`[[joints]] names`)**, publicados en `/frames`; los mensajes son solo números; cada puente (MuJoCo, Isaac Sim, el robot) busca por nombre, (b) `string[] name` en cada mensaje, como ROS y Foxglove, (c) como (a), más un número calculado a partir de la lista de nombres (un *hash*) en cada mensaje, que el receptor compara, (d) **como (a), y además quien trae su propia lista (una política, un puente, el agente de un microcontrolador) la declara al hub al registrarse; el hub la compara con `robot.toml` y con los demás, y rechaza al que no coincide**, como hoy con los tipos | **(d)** | Con (a) sola queda un hueco: un nodo con otra lista (una política entrenada con otro orden, un firmware, otra copia de `robot.toml`) publica sin que nada lo note, y el robot se cae sin error, que es justo lo que se quiere evitar. (d) lo cierra con cero bytes por mensaje: la lista viaja en el registro del hub, una vez por segundo. Cuesta un campo opcional nuevo en el protocolo de control del hub (Python y C++; un hub anterior lo ignora) y que la política o el firmware traigan su lista. (c) también lo cierra, pero con 8 B por mensaje y sin poder decir cuál nombre está mal. (b) son 12 textos 500 veces por segundo |
-| **D7** | ¿Cómo es el comando de articulaciones? | (a) **Un solo mensaje con cinco arreglos: `position`, `velocity`, `effort`, `kp`, `kd`** (el de Unitree y el mini-cheetah), con `NaN` = "no lo mando" y valores por defecto seguros (pide `nan` como valor por defecto en `.agmen`); las ganancias que no vienen en el comando salen de `[[joints]]`, iguales en simulación y en real, (b) un mensaje por modo: `ComandoPosicion<N>`, `ComandoVelocidad<N>`, `ComandoEsfuerzo<N>`, (c) los dos: el de cinco y uno simple de posición | **(a)** | Un solo contrato entre la política y los motores, igual en simulación y en real: las ganancias viajan con el comando y el simulador aplica la misma cuenta que el driver. Cubre posición, velocidad, par y sus mezclas. (b) es más chico (48 B en vez de 240 B con 12) y más fácil de explicar, pero cada driver y cada simulador tendría que aceptar tres tipos, y las ganancias quedarían escondidas en cada uno. (c) son dos caminos para lo mismo |
-| **D8** | ¿Cómo se sabe en qué marco está un dato chico? | (a) **Se declara una vez por topic** en `robot.toml` (`[[topic]] frame = "imu"`) y va en `/frames`; el mensaje no lleva nada, (b) `string frame_id` en cada mensaje (ROS, Foxglove), (c) un número de 8 B en cada mensaje, calculado a partir del nombre del marco (un *hash*) | **(a)** | Cero bytes por mensaje, y el nombre se revisa antes de arrancar. Es la idea del RFC 0001 §3, por otro camino (§3.1). (b) manda cada mensaje a `arrow`. (c) son 8 B que casi nunca cambian, y en `agmen topic echo` se vería un número. En los mensajes grandes, `frame_id` se queda (D2): si viene vacío vale el del topic; si los dos dicen cosas distintas, se avisa |
-| **D9** | ¿Cómo se publican las transformaciones? | (a) **El árbol se declara en `robot.toml`; `agmen run` lo publica entero en `/frames` cada segundo; cada marco que se mueve tiene su topic `compact` sin nombres; los marcos que no se conocen de antemano van en `/tf` (`Transformaciones`, con nombres), cuelgan de uno declarado, no pueden llamarse como uno declarado y caducan a los 10 s; al reproducir una grabación manda su `/frames`**, (b) como ROS: todo en `/tf` y `/tf_static`, con nombres en cada mensaje, (c) solo `/tf` con nombres, y los fijos repetidos ahí cada segundo | **(a)** | Evita los problemas reportados de tf2 (§3.9): nadie recibe lo que no consulta, no hace falta "último valor para quien llegue tarde" (que Agmen no tiene) y el árbol se revisa antes de arrancar. (b) necesita una calidad de servicio que no existe y repite el diseño que da problemas. (c) es más simple de explicar y más fácil de pasar a ROS, pero todo va en `arrow`, cada nodo recibe todo y los nombres no se revisan. El costo de (a): hay que declarar los marcos (o tomarlos del modelo, D18), y si no corre ningún `agmen run` hace falta `agmen frame publish` |
-| **D10** | Los eslabones de un robot articulado (12 articulaciones = 12 marcos que se mueven): ¿quién calcula dónde están? | (a) **Quien lo consulta**: `[[frame]]` dice qué articulación mueve cada marco (`joint`, `axis`) y la biblioteca (y el navegador) lo calculan del estado de las articulaciones, (b) un nodo que republica una transformación por eslabón, como `robot_state_publisher` | **(a)** | Un mensaje de 144 B en vez de 12 transformaciones por ciclo; así dibuja un robot `urdf-loader` en el navegador (`setJointValue`). La cuenta es la misma en todos lados y se prueba con vectores compartidos. (b) es más simple para quien consulta, pero multiplica los mensajes y pone a trabajar al robot. El costo de (a): para Foxglove, que no hace esa cuenta, la tiene que hacer el puente (§3.10) |
-| **D11** | ¿Cómo se consulta y qué pasa cuando no se puede contestar? | (a) **Un resultado con su motivo** (§3.8); `at=` obligatorio y `LATEST` explícito con su edad; 10 s de historial; interpolar entre dos muestras, sin extrapolar; `hold_ms` declarado para los marcos lentos; `lookup` nunca espera y `@frames.on` espera con tope; una muestra que retrocede más de 1 s vacía el historial de su marco, (b) como tf2: una excepción, tiempo cero = lo último, y `lookup` con espera, (c) siempre lo último, sin tiempo | **(a)** | Es la regla 1 aplicada al error más famoso de ROS. (b) es conocido para quien viene de ROS, pero el tiempo cero entrega datos viejos sin decirlo, y esperar dentro de un callback detiene al nodo. (c) es lo más simple y está mal para cualquier sensor en un robot que se mueve: usa la posición de ahora con el dato de hace 80 ms |
-| **D12** | ¿Dónde vive la biblioteca de marcos? | (a) **Un módulo aparte dentro del mismo paquete**, en los tres lenguajes: `agmen.frames` (Python), `<agmen/frames.hpp>` con su propia biblioteca de CMake (C++) y un módulo de JavaScript para el panel; `Node` no cambia, (b) dentro de `Node` (`@node.on(..., frame="odom")`, `node.lookup(...)`), (c) un paquete aparte (`pip install agmen-frames`) | **(a)** | El núcleo sigue sin saber qué es un marco (regla 2), pero se instala y se versiona junto con Agmen: un `pip install` y un CMake. Son tres implementaciones de las mismas cuentas, y se mantienen iguales con vectores de prueba compartidos, como el formato. (b) es lo más cómodo de escribir, pero mete geometría en el núcleo. (c) es lo más limpio, y obliga a mantener dos versiones que deben coincidir |
-| **D13** | ¿Los mensajes llevan incertidumbre (covarianzas)? | (a) **No por ahora.** Cuando un consumidor las use (un filtro que mezcle sensores), tipos aparte: `OdometriaConCovarianza`, (b) siempre, como ROS: dos matrices de 36 `f64` en la odometría, (c) solo la diagonal (6 `f32`) | **(a)** | En ROS son 576 de los 720 bytes de una odometría, la propia documentación de `robot_localization` pide que los usuarios "pongan bien las covarianzas" porque suelen venir en cero, y un microcontrolador no las calcula. Agregar un tipo después no rompe nada. (c) parece un buen punto medio, pero se pierde justo lo que un filtro necesita |
-| **D14** | ¿En qué idioma van los nombres? | (a) **Tipos en español** (`Odometria`, `EscaneoLaser`, como `Imagen`); **campos en inglés, iguales a Foxglove y ROS** (`position`, `velocity`, como `width` en `Imagen`); tablas y claves de `robot.toml` en inglés, como hoy (`[[frame]]`, `[[joints]]`, una tabla por grupo); la biblioteca en inglés, como `Node` (`Frames`, `lookup`); marcos recomendados `map`, `odom`, `base_link` y el sufijo `_optical` (REP-105 y 103), (b) igual, pero los tipos en inglés (`Odometry`, `LaserScan`, `JointState`), (c) todo en español (`posicion`, `velocidad`; marcos `mapa`, `base`) | **(b)** | **Es la más difícil de deshacer**: el nombre del tipo es parte del texto canónico y del `schema_id` (RFC 0001 §5), así que renombrarlo después lo vuelve incompatible con los nodos y con las grabaciones anteriores. Los campos, las claves de `robot.toml`, la documentación y los errores se pueden cambiar o traducir después; el nombre del tipo, no. Hoy ya hay de los dos: `Imagen`, `ImagenComprimida` y `MuxEstado` en español; `Clock`, `ImuSample` y `MotorCommand` en inglés. Se recomienda (b) porque es la que menos se puede lamentar: si después la comunidad resulta ser solo de habla hispana, el costo es leer `LaserScan` junto a `Publisher`, `Node` y `position`, que ya están en inglés; si se elige (a) y después se quiere gente de fuera, no hay vuelta sin romper. (b) deja además los tipos con el mismo nombre que en Foxglove (`LaserScan` → `foxglove.LaserScan`); `Imagen`, `ImagenComprimida` y `MuxEstado` se quedarían como están o se renombrarían en una versión que rompa. (a) sigue a `Imagen` y a un proyecto escrito en español: es la mejor si Agmen es, a propósito, para una comunidad que habla español. Eso solo lo sabe Adán. (c) rompe el criterio del RFC 0008 D4 y obliga al puente a traducir cada campo |
-| **D15** | ¿Qué pasa con `ImuSample`? | (a) **Se agrega `Imu`** (orientación, giro y aceleración en `f32`, 40 B) como mensaje estándar; `ImuSample` se queda como está, para el tutorial, (b) `ImuSample` es el estándar y solo se documentan sus unidades, (c) `Imu` reemplaza a `ImuSample` en el tutorial | **(a)** | Una política necesita la orientación (hacia dónde está la gravedad) y muchas IMU ya la entregan; `ImuSample` solo trae aceleración y giro. No se toca el nivel 0 ni el tutorial. (b) no agrega nada, pero deja a cada política calculando la orientación por su cuenta, distinto en cada robot. (c) se puede hacer después, al reescribir el tutorial con los mensajes estándar |
-| **D16** | ¿Cómo es una trayectoria de articulaciones? | (a) **Un tensor `[T, N]`** por magnitud (`positions`, `velocities`…), con `time_from_start` de T instantes, (b) una lista de puntos, cada uno con sus arreglos, como `trajectory_msgs/JointTrajectory` | **(a)** | Llega a NumPy y a PyTorch sin copiar, y es la misma forma que el bloque de acciones que saca una política de imitación. (b) es lo que espera un puente con ROS, que puede convertirlo |
-| **D17** | ¿Cómo es un mapa de ocupación? | (a) **Una `Rejilla` (los campos de `foxglove.Grid`) con un campo `occupancy` `INT8`: −1 no se sabe, 0 libre, 100 ocupado**, (b) lo mismo con 0 libre, 1 ocupado y −1 no se sabe (lo que el `.msg` de ROS llama "frecuente"), (c) un tipo propio `MapaDeOcupacion` con resolución, ancho, alto y datos, como `nav_msgs/OccupancyGrid` | **(a)** | Foxglove lo dibuja tal cual, y los valores son los que usa Nav2, así que un puente no convierte nada. (b) pierde el "quizá ocupado". (c) es más fácil de leer, pero es un tipo más que Foxglove no conoce |
-| **D18** | Si el robot ya tiene un modelo (MJCF o URDF), ¿de dónde sale el árbol de marcos? | (a) **Del modelo, cada vez que arranca**: `[robot] model = "robot.xml"`; `robot.toml` solo agrega lo que el modelo no sabe, y contradecirlo es un error (§3.6), (b) un comando que lee el modelo **una vez** y escribe las tablas `[[frame]]` en `robot.toml`, (c) siempre a mano en `robot.toml` | **(a)** | El árbol ya existe en el modelo que usa el simulador: con (a) hay una sola fuente y no se pueden separar. (b) es más fácil de hacer y de leer, pero el día que cambie el modelo, `robot.toml` se queda viejo sin que nadie lo note. (c) es escribir dos veces lo mismo. El costo de (a): leer un MJCF bien pide el paquete `mujoco` en cada computadora que arranque nodos, también en la del robot real (el URDF no pide nada), y mete en este RFC una parte de "leer el modelo" que iba con el visualizador |
+| # | Pregunta | Opciones | Recomendada | Decisión de Adán | Por qué |
+|---|---|---|---|---|---|
+| **D1** | ¿Qué entra, y cuándo? | (a) **Mensajes, convenciones y marcos (declararlos, publicarlos y consultarlos) juntos, en una versión propia después del nivel 10 (0.15.0)**, antes del visualizador y del control, (b) solo los mensajes ahora; los marcos, con el visualizador (nivel 14), (c) todo junto con el visualizador | **(a)** | ✅ **(a)** | El visualizador, el control, el puente de MuJoCo genérico y el puente con ROS 2 necesitan las dos cosas. Sin marcos, un láser o una nube no se pueden usar ni dibujar. (b) deja mensajes con un `frame_id` que nadie entiende, como `Imagen` hoy. (c) retrasa el control y la simulación, que no necesitan dibujar nada |
+| **D2** | Cuando el mensaje es chico y el esquema de Foxglove lleva texto (`JointStates`, `Odometry`, `PoseInFrame`, `FrameTransform`), ¿se copia tal cual? | (a) **Dos familias**: los chicos van en `compact`, con los mismos nombres de campo, unidades y significado, pero **sin** `timestamp`, `frame_id` ni nombres (van en el sobre y en `robot.toml`), sin covarianzas y sin `acceleration`; el puente los completa para Foxglove. Los grandes (láser, nube, rejilla, poses) llevan **exactamente** los campos de Foxglove, como `Imagen`; en ellos manda `timestamp`, y se avisa si difiere del `t_data` del sobre, (b) todo exactamente como Foxglove, (c) todo propio, sin mirar a Foxglove | **(a)** | ✅ **(a)** | Un texto en el mensaje lo manda a `arrow` y a TCP (RFC 0008): unos 200 B más y 200 veces más lento de codificar en Python (RFC 0001 §2), y un microcontrolador no lo puede armar. Con (a) una odometría mide 104 B. (b) cumple al pie de la letra el RFC 0008 D4, pero rompe la regla 6 justo en los mensajes de control. (c) pierde Foxglove gratis |
+| **D3** | ¿Qué convenciones? | (a) **Unidades SI y radianes; ejes de REP-103 (x al frente, y a la izquierda, z arriba; cámaras con z al frente); cuaternión `x, y, z, w` con campos con nombre; `NaN` = no se mide o no se manda; en `robot.toml`, `rpy_deg` en grados sobre los ejes fijos del padre, como URDF** (§3.2), (b) igual, pero el cuaternión con `w` primero, como MuJoCo, (c) igual, pero los ángulos en grados, como LeRobot y los servos de hobby | **(a)** | ✅ **(a)** | Es lo que usan ROS, Foxglove, los URDF que existen e Isaac Lab desde 3.0; MuJoCo es el único con `w` primero, y con campos con nombre no hay orden que confundir. Los radianes son lo que usan MuJoCo, Isaac Lab y las políticas; los grados solo se muestran. (b) le queda bien a MuJoCo y mal a todo lo demás. (c) es cómodo de leer, pero cada simulador y cada política tendría que convertir |
+| **D4** | ¿`f64` o `f32`? | (a) **`f64` en la geometría** (pose, transformación, velocidad, odometría), como Foxglove y ROS; **`f32` en IMU y articulaciones**, (b) todo `f64`, (c) todo `f32` | **(a)** | ✅ **(a)** | Una posición en `f32` pierde el centímetro a unos 83 km del origen (REP-105) y ya no sirve con GPS; en `f64` la geometría es igual a Foxglove y a ROS. La IMU y las articulaciones salen de un microcontrolador y entran a una red neuronal en `f32` (Unitree los manda en `float32`): con `f64` serían el doble de bytes sin ganar nada. (c) se aparta de Foxglove en todo. El costo de (a): la geometría no se arma en un microcontrolador sin `f64` |
+| **D5** | El número de articulaciones depende del robot y `compact` pide tamaño fijo: ¿cómo se escribe el tipo? | (a) **Tipos con tamaño en el lenguaje**: `JointState<N>` definido una vez en `msgs.agmen` (C++: `agmen::msgs::JointState<12>`), (b) arreglos variables `f32[]` (va en `arrow`, por TCP), (c) un tamaño máximo fijo para todos (como los 20 y 35 motores de Unitree) y un campo que dice cuántos se usan, (d) cada robot escribe su mensaje siguiendo una convención de nombres de campo, (e) **sin cambiar el lenguaje**: el estándar fija la forma del tipo (nombre, campos, orden, `f32`); un comando escribe el `.agmen` del robot con su número (`patas::JointState`) y en Python lo arma una función (`JointState[12]`) | **(e)** | ⏳ pendiente | (a) y (e) dan **los mismos bytes y el mismo `schema_id`**, y en las dos el número es parte del tipo: un simulador con otra cantidad de articulaciones no se conecta. La diferencia es el costo. (a) cambia el lector de `.agmen` y el generador (`idl.py` y `gen.py`, unas 750 líneas cada uno): lo difícil es el C++, porque hoy el generador escribe el esquema y el tamaño como constantes ya calculadas y una plantilla sobre N tendría que armarlas al compilar. El navegador no cambia en ninguna: no lee `.agmen`, decodifica con el texto que se anuncia. (e) no toca el lector ni el generador. Lo que (e) pierde: en C++ no se puede escribir código general sobre N con un tipo estándar, y dos grupos de distinto tamaño van en `package` distintos. Como los bytes son iguales, (a) se puede agregar después sin romper nada. (b) es lo de ROS: pierde `compact`. (c) desperdicia bytes y no avisa si la cantidad no coincide. (d) deja a las herramientas adivinando |
+| **D6** | ¿Dónde van los nombres y el orden de las articulaciones? | (a) **Una vez, en `robot.toml` (`[[joints]] names`)**, publicados en `/frames`; los mensajes son solo números; cada puente (MuJoCo, Isaac Sim, el robot) busca por nombre, (b) `string[] name` en cada mensaje, como ROS y Foxglove, (c) como (a), más un número calculado a partir de la lista de nombres (un *hash*) en cada mensaje, que el receptor compara, (d) **como (a), y además quien trae su propia lista (una política, un puente, el agente de un microcontrolador) la declara al hub al registrarse; el hub la compara con `robot.toml` y con los demás, y rechaza al que no coincide**, como hoy con los tipos | **(d)** | ⏳ pendiente | Con (a) sola queda un hueco: un nodo con otra lista (una política entrenada con otro orden, un firmware, otra copia de `robot.toml`) publica sin que nada lo note, y el robot se cae sin error, que es justo lo que se quiere evitar. (d) lo cierra con cero bytes por mensaje: la lista viaja en el registro del hub, una vez por segundo. Cuesta un campo opcional nuevo en el protocolo de control del hub (Python y C++; un hub anterior lo ignora) y que la política o el firmware traigan su lista. (c) también lo cierra, pero con 8 B por mensaje y sin poder decir cuál nombre está mal. (b) son 12 textos 500 veces por segundo |
+| **D7** | ¿Cómo es el comando de articulaciones? | (a) **Un solo mensaje con cinco arreglos: `position`, `velocity`, `effort`, `kp`, `kd`** (el de Unitree y el mini-cheetah), con `NaN` = "no lo mando" y valores por defecto seguros (pide `nan` como valor por defecto en `.agmen`); las ganancias que no vienen en el comando salen de `[[joints]]`, iguales en simulación y en real, (b) un mensaje por modo: `PositionCommand<N>`, `VelocityCommand<N>`, `EffortCommand<N>`, (c) los dos: el de cinco y uno simple de posición | **(a)** | ✅ **(a)** | Un solo contrato entre la política y los motores, igual en simulación y en real: las ganancias viajan con el comando y el simulador aplica la misma cuenta que el driver. Cubre posición, velocidad, par y sus mezclas. (b) es más chico (48 B en vez de 240 B con 12) y más fácil de explicar, pero cada driver y cada simulador tendría que aceptar tres tipos, y las ganancias quedarían escondidas en cada uno. (c) son dos caminos para lo mismo |
+| **D8** | ¿Cómo se sabe en qué marco está un dato chico? | (a) **Se declara una vez por topic** en `robot.toml` (`[[topic]] frame = "imu"`) y va en `/frames`; el mensaje no lleva nada, (b) `string frame_id` en cada mensaje (ROS, Foxglove), (c) un número de 8 B en cada mensaje, calculado a partir del nombre del marco (un *hash*) | **(a)** | ✅ **(a)** | Cero bytes por mensaje, y el nombre se revisa antes de arrancar. Es la idea del RFC 0001 §3, por otro camino (§3.1). (b) manda cada mensaje a `arrow`. (c) son 8 B que casi nunca cambian, y en `agmen topic echo` se vería un número. En los mensajes grandes, `frame_id` se queda (D2): si viene vacío vale el del topic; si los dos dicen cosas distintas, se avisa |
+| **D9** | ¿Cómo se publican las transformaciones? | (a) **El árbol se declara en `robot.toml`; `agmen run` lo publica entero en `/frames` cada segundo; cada marco que se mueve tiene su topic `compact` sin nombres; los marcos que no se conocen de antemano van en `/tf` (`FrameTransforms`, con nombres), cuelgan de uno declarado, no pueden llamarse como uno declarado y caducan a los 10 s; al reproducir una grabación manda su `/frames`**, (b) como ROS: todo en `/tf` y `/tf_static`, con nombres en cada mensaje, (c) solo `/tf` con nombres, y los fijos repetidos ahí cada segundo | **(a)** | ✅ **(a)** | Evita los problemas reportados de tf2 (§3.9): nadie recibe lo que no consulta, no hace falta "último valor para quien llegue tarde" (que Agmen no tiene) y el árbol se revisa antes de arrancar. (b) necesita una calidad de servicio que no existe y repite el diseño que da problemas. (c) es más simple de explicar y más fácil de pasar a ROS, pero todo va en `arrow`, cada nodo recibe todo y los nombres no se revisan. El costo de (a): hay que declarar los marcos (o tomarlos del modelo, D18), y si no corre ningún `agmen run` hace falta `agmen frame publish` |
+| **D10** | Los eslabones de un robot articulado (12 articulaciones = 12 marcos que se mueven): ¿quién calcula dónde están? | (a) **Quien lo consulta**: `[[frame]]` dice qué articulación mueve cada marco (`joint`, `axis`) y la biblioteca (y el navegador) lo calculan del estado de las articulaciones, (b) un nodo que republica una transformación por eslabón, como `robot_state_publisher` | **(a)** | ✅ **(a)** | Un mensaje de 144 B en vez de 12 transformaciones por ciclo; así dibuja un robot `urdf-loader` en el navegador (`setJointValue`). La cuenta es la misma en todos lados y se prueba con vectores compartidos. (b) es más simple para quien consulta, pero multiplica los mensajes y pone a trabajar al robot. El costo de (a): para Foxglove, que no hace esa cuenta, la tiene que hacer el puente (§3.10) |
+| **D11** | ¿Cómo se consulta y qué pasa cuando no se puede contestar? | (a) **Un resultado con su motivo** (§3.8); `at=` obligatorio y `LATEST` explícito con su edad; 10 s de historial; interpolar entre dos muestras, sin extrapolar; `hold_ms` declarado para los marcos lentos; `lookup` nunca espera y `@frames.on` espera con tope; una muestra que retrocede más de 1 s vacía el historial de su marco, (b) como tf2: una excepción, tiempo cero = lo último, y `lookup` con espera, (c) siempre lo último, sin tiempo | **(a)** | ✅ **(a)** | Es la regla 1 aplicada al error más famoso de ROS. (b) es conocido para quien viene de ROS, pero el tiempo cero entrega datos viejos sin decirlo, y esperar dentro de un callback detiene al nodo. (c) es lo más simple y está mal para cualquier sensor en un robot que se mueve: usa la posición de ahora con el dato de hace 80 ms |
+| **D12** | ¿Dónde vive la biblioteca de marcos? | (a) **Un módulo aparte dentro del mismo paquete**, en los tres lenguajes: `agmen.frames` (Python), `<agmen/frames.hpp>` con su propia biblioteca de CMake (C++) y un módulo de JavaScript para el panel; `Node` no cambia, (b) dentro de `Node` (`@node.on(..., frame="odom")`, `node.lookup(...)`), (c) un paquete aparte (`pip install agmen-frames`) | **(a)** | ✅ **(a)** | El núcleo sigue sin saber qué es un marco (regla 2), pero se instala y se versiona junto con Agmen: un `pip install` y un CMake. Son tres implementaciones de las mismas cuentas, y se mantienen iguales con vectores de prueba compartidos, como el formato. (b) es lo más cómodo de escribir, pero mete geometría en el núcleo. (c) es lo más limpio, y obliga a mantener dos versiones que deben coincidir |
+| **D13** | ¿Los mensajes llevan incertidumbre (covarianzas)? | (a) **No por ahora.** Cuando un consumidor las use (un filtro que mezcle sensores), tipos aparte: `OdometryWithCovariance`, (b) siempre, como ROS: dos matrices de 36 `f64` en la odometría, (c) solo la diagonal (6 `f32`) | **(a)** | ✅ **(a)** | En ROS son 576 de los 720 bytes de una odometría, la propia documentación de `robot_localization` pide que los usuarios "pongan bien las covarianzas" porque suelen venir en cero, y un microcontrolador no las calcula. Agregar un tipo después no rompe nada. (c) parece un buen punto medio, pero se pierde justo lo que un filtro necesita |
+| **D14** | ¿En qué idioma van los nombres? | (a) Tipos en español (`Odometria`, `EscaneoLaser`, como `Imagen`); campos en inglés, iguales a Foxglove y ROS; `robot.toml` y la biblioteca en inglés, como hoy; marcos `map`, `odom`, `base_link`, (b) **igual, pero los tipos en inglés** (`Odometry`, `LaserScan`, `JointState`), (c) todo en español (`posicion`, `velocidad`; marcos `mapa`, `base`) | **(b)** | ✅ **(b)** | **Es la más difícil de deshacer**: el nombre del tipo es parte del texto canónico y del `schema_id` (RFC 0001 §5), así que renombrarlo después lo vuelve incompatible con los nodos y con las grabaciones anteriores. Los campos, las claves de `robot.toml`, la documentación y los errores se pueden cambiar o traducir después; el nombre del tipo, no. (b) es la que menos se puede lamentar: si la comunidad resulta ser solo de habla hispana, el costo es leer `LaserScan` junto a `Publisher`, `Node` y `position`, que ya están en inglés; con (a), si después se quiere gente de fuera, no hay vuelta sin romper. (b) deja además los tipos con el mismo nombre que en Foxglove. Los tipos que ya existen en español (`Imagen`, `ImagenComprimida`, `MuxEstado`) no se tocan aquí (§3.12). (c) rompe el criterio del RFC 0008 D4 |
+| **D15** | ¿Qué pasa con `ImuSample`? | (a) **Se agrega `Imu`** (orientación, giro y aceleración en `f32`, 40 B) como mensaje estándar; `ImuSample` se queda como está, para el tutorial, (b) `ImuSample` es el estándar y solo se documentan sus unidades, (c) `Imu` reemplaza a `ImuSample` en el tutorial | **(a)** | ✅ **(a)** | Una política necesita la orientación (hacia dónde está la gravedad) y muchas IMU ya la entregan; `ImuSample` solo trae aceleración y giro. No se toca el nivel 0 ni el tutorial. (b) no agrega nada, pero deja a cada política calculando la orientación por su cuenta, distinto en cada robot. (c) se puede hacer después, al reescribir el tutorial con los mensajes estándar |
+| **D16** | ¿Cómo es una trayectoria de articulaciones? | (a) **Un tensor `[T, N]`** por magnitud (`positions`, `velocities`…), con `time_from_start` de T instantes, (b) una lista de puntos, cada uno con sus arreglos, como `trajectory_msgs/JointTrajectory` | **(a)** | ✅ **(a)** | Llega a NumPy y a PyTorch sin copiar, y es la misma forma que el bloque de acciones que saca una política de imitación. (b) es lo que espera un puente con ROS, que puede convertirlo |
+| **D17** | ¿Cómo es un mapa de ocupación? | (a) **Una `Grid` (los campos de `foxglove.Grid`) con un campo `occupancy` `INT8`: −1 no se sabe, 0 libre, 100 ocupado**, (b) lo mismo con 0 libre, 1 ocupado y −1 no se sabe (lo que el `.msg` de ROS llama "frecuente"), (c) un tipo propio `OccupancyGrid` con resolución, ancho, alto y datos, como `nav_msgs/OccupancyGrid` | **(a)** | ✅ **(a)** | Foxglove lo dibuja tal cual, y los valores son los que usa Nav2, así que un puente no convierte nada. (b) pierde el "quizá ocupado". (c) es más fácil de leer, pero es un tipo más que Foxglove no conoce |
+| **D18** | Si el robot ya tiene un modelo (MJCF o URDF), ¿de dónde sale el árbol de marcos? | (a) **Del modelo, cada vez que arranca**: `[robot] model = "robot.xml"`; `robot.toml` solo agrega lo que el modelo no sabe, y contradecirlo es un error (§3.6), (b) un comando que lee el modelo **una vez** y escribe las tablas `[[frame]]` en `robot.toml`, (c) siempre a mano en `robot.toml` | **(a)** | ✅ **(a)** | El árbol ya existe en el modelo que usa el simulador: con (a) hay una sola fuente y no se pueden separar. (b) es más fácil de hacer y de leer, pero el día que cambie el modelo, `robot.toml` se queda viejo sin que nadie lo note. (c) es escribir dos veces lo mismo. El costo de (a): leer un MJCF bien pide el paquete `mujoco` en cada computadora que arranque nodos, también en la del robot real (el URDF no pide nada), y mete en este RFC una parte de "leer el modelo" que iba con el visualizador |
 
 ## 6. Las partes difíciles
 
@@ -875,7 +899,7 @@ Todas pendientes; las decide Adán. La recomendada está en su columna: casi sie
 | 3 | **El cuaternión** | "Un cuaternión copiado pasa las revisiones de forma y representa otra orientación" (guía de migración de Isaac Lab 3.0) | Campos con nombre; funciones `wxyz()` y `from_wxyz()`; una prueba con una rotación que no sea simétrica |
 | 4 | **Las mismas cuentas en C++, Python y JavaScript** | La interpolación esférica tiene casos límite (`q` y `−q` son la misma rotación; dos muestras casi iguales), y un marco por articulación depende del orden en que se multiplica | Vectores de prueba compartidos (dos muestras, un instante, el resultado esperado; una cadena de tres articulaciones con sus ángulos), como los del formato |
 | 5 | **Esperar una transformación sin frenar al nodo** | El dato llega antes que la transformación de su instante. Si un callback esperara, detendría a los demás del grupo (RFC 0006: corren de una en una) y la transformación que espera ni siquiera entraría | `lookup` nunca espera; `@frames.on` guarda pocos mensajes, con tope de tiempo, y cuenta los que tira; la biblioteca recibe en su propio grupo. Medido en `paralelo_check`: un control a 1 kHz no pierde ciclos junto a un `@frames.on` |
-| 6 | **El primer segundo** | Un nodo que arranca todavía no tiene `/frames` | `agmen run` lo manda también en cuanto ve un suscriptor nuevo; mientras, `SIN_ARBOL` lo dice y `@frames.on` guarda lo que llega |
+| 6 | **El primer segundo** | Un nodo que arranca todavía no tiene `/frames` | `agmen run` lo manda también en cuanto ve un suscriptor nuevo; mientras, `NO_TREE` lo dice y `@frames.on` guarda lo que llega |
 | 7 | **Datos que retroceden en el tiempo** (se reinicia el nodo que publica la odometría, o el simulador) | El reloj de Agmen no retrocede (RFC 0006), así que no avisa; un historial con muestras "del futuro" contesta mal | Por marco: una muestra un poco más vieja que la última se descarta y se cuenta; si retrocede más de 1 s, se vacía su historial y se dice una vez. Reiniciar el simulador con los nodos vivos queda con el límite del RFC 0006 |
 | 8 | **Relojes de dos computadoras** | La odometría sale del robot y el láser se procesa en la laptop: con 5 ms de diferencia, la consulta interpola en el instante equivocado | Se usará la diferencia que medirá el RFC 0011 (D10) para avisar; corregir es del nivel 11. El tutorial recomienda consultar en la misma computadora donde se producen los datos |
 | 9 | **`f64` en un microcontrolador** | En algunos de 8 bits (avr-gcc, el del Arduino Uno) `double` mide 4 bytes: un struct escrito a mano tendría otro tamaño. En los de 32 bits, el layout `compact` alinea `f64` a 8 y algunos compiladores a 4 (RFC 0001, reto 4) | Lo que arma un microcontrolador (`Imu`, articulaciones) es todo `f32`. La geometría se arma en la computadora (§3.10); si un microcontrolador de 32 bits la arma, con el código generado y sus `static_assert` |
@@ -886,29 +910,29 @@ Todas pendientes; las decide Adán. La recomendada está en su columna: casi sie
 
 ## 7. Plan por bloques
 
-Si D1 = a, para Agmen 0.15.0. Un PR por bloque, cada uno con sus pruebas (C++,
+Para Agmen 0.15.0 (D1 = a). Un PR por bloque, cada uno con sus pruebas (C++,
 Python y JavaScript donde aplique) y la revisión ciega.
 
-1. **Convenciones y mensajes chicos**: `Vector2`, `Vector3`, `Cuaternion`,
-   `Pose`, `Transformacion`, `Velocidad`, `Odometria` e `Imu` en `msgs.agmen`
+1. **Convenciones y mensajes chicos**: `Vector2`, `Vector3`, `Quaternion`,
+   `Pose`, `Transform`, `Twist`, `Odometry` e `Imu` en `msgs.agmen`
    (con `nan` como valor por defecto en `.agmen`); el C++ generado; `wxyz()`;
    vectores de prueba; el puente de Foxglove.
-2. **Articulaciones**: `EstadoArticulaciones` y `ComandoArticulaciones` con
+2. **Articulaciones**: `JointState` y `JointCommand` con
    su número (según D5: el comando que escribe el `.agmen` del robot y la
    función de Python, o `<N>` en el lenguaje); `[[joints]]` en `robot.toml`
    con sus revisiones (al arrancar y al anunciarse el topic); y, si D6 = d,
    `names=` en `Publisher` y `Subscriber`, el campo nuevo del hub en Python y
    en C++, y PROTOCOLO.
 3. **Marcos, primera parte**: `[[frame]]` y `[[topic]] frame`; leer el árbol
-   del modelo (`[robot] model`, D18); la revisión del árbol; el mensaje `Marcos` y el topic `/frames`; `agmen frame list`,
+   del modelo (`[robot] model`, D18); la revisión del árbol; el mensaje `FrameTree` y el topic `/frames`; `agmen frame list`,
    `agmen frame echo <origen> <destino>` y `agmen frame publish`.
 4. **Marcos, segunda parte**: la biblioteca, tres veces con las mismas
    cuentas y los mismos vectores de prueba (`agmen.frames` en Python,
    `<agmen/frames.hpp>` en C++ y el módulo de JavaScript del panel): historial, interpolación,
    motivos, `hold_ms`, `@frames.on`, marcos por articulación, `/tf`,
    `Frames.from_recording`.
-5. **Mensajes grandes**: `EscaneoLaser`, `NubeDePuntos`, `Rejilla`, `Poses`,
-   `Transformaciones` y `TrayectoriaArticular`; `as_array()` y `from_array()`;
+5. **Mensajes grandes**: `LaserScan`, `PointCloud`, `Grid`, `PosesInFrame`,
+   `FrameTransforms` y `JointTrajectory`; `as_array()` y `from_array()`;
    el inspector del panel; Foxglove.
 6. **El robot del tutorial con mensajes estándar**, apoyado en el mundo de
    MuJoCo del RFC 0011 (la clase `Mundo` del nivel 10: este bloque espera a
