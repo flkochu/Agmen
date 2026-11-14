@@ -11,7 +11,9 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import re
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -423,6 +425,137 @@ class TestPlayConMachines(PlayCase):
         self.assertEqual(len(casos), 1)
         self.assertIn("out", casos[0], "sin [[machine]] el reproductor se crea con out= como siempre")
         self.assertIn("error: --play: para aquí", err)
+
+
+ECO = """\
+import time
+
+import agmen
+from agmen import clock, wire
+
+clock.mode()                      # en replay, empieza a escuchar /clock desde ya
+sub = agmen.Subscriber(wire.ImuSample, "/imu")
+visto = False
+try:
+    while True:
+        s = sub.receive(1.0)
+        if s is None:
+            continue
+        if not visto:
+            fin = time.monotonic() + 5.0
+            while not clock.state().received and time.monotonic() < fin:
+                time.sleep(0.02)
+            print(f"ECO modo={clock.mode()} sobre={s.envelope.clock} reloj_recibido={clock.state().received}",
+                  flush=True)
+            visto = True
+except KeyboardInterrupt:
+    pass
+"""
+
+
+class TestPlayConMachinesDePuntaAPunta(PlayCase):
+    """agmen run --play con [[machine]] SIN error, como subproceso real: el reproductor arranca, se publica
+    /clock, el nodo recibe la grabación y se detiene con código 0 (con y sin panel). Lo que no se probaba:
+    el camino sin error (93eecbb dejó el reproductor sin arrancar y ninguna prueba lo vio)."""
+
+    MALO = ("Traceback", "AttributeError", "UnboundLocalError", "NameError")
+
+    def setUp(self):
+        super().setUp()
+        self.path = os.path.join(self.dir, "vuelta.mcap")
+        make_recording(self.path, 100)          # 5 s: da tiempo a que el nodo arranque y se suscriba
+        self.eco = os.path.join(self.dir, "eco.py")
+        with open(self.eco, "w", encoding="utf-8") as f:
+            f.write(ECO)
+        self.toml = os.path.join(self.dir, "robot.toml")
+
+    def robot(self, con_machine: bool) -> None:
+        m = '[[machine]]\nname = "robot"\nhost = "127.0.0.1"\n\n' if con_machine else ""
+        mach = 'machine = "robot"\n' if con_machine else ""
+        with open(self.toml, "w", encoding="utf-8") as f:
+            f.write('[robot]\nname = "r"\n\n' + m
+                    + f"[[node]]\nname = 'eco'\ncmd = ['python', '{self.eco}']\n{mach}\n"
+                    + "[hub]\nenabled = false\n")      # el hub es el de la prueba (AGMEN_HUB)
+
+    def env(self):
+        return {**os.environ, "PYTHONPATH": str(ROOT / "python"), "PYTHONIOENCODING": "utf-8", "NO_COLOR": "1"}
+
+    def corre(self, *args, esperar="ECO modo=", seg=45.0):
+        kw = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
+        p = subprocess.Popen([sys.executable, "-m", "agmen", "run", self.toml, "--no-browser", *args],
+                             env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                             encoding="utf-8", errors="replace", **kw)
+        lines = []
+        reader = threading.Thread(target=lambda: lines.extend(iter(p.stdout.readline, "")), daemon=True)
+        reader.start()
+        end = time.monotonic() + seg
+        while time.monotonic() < end and p.poll() is None and esperar not in "".join(lines):
+            time.sleep(0.1)
+        time.sleep(0.7)
+        if p.poll() is None:
+            p.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
+        try:
+            p.wait(30)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+        reader.join(5)
+        p.stdout.close()
+        return p.returncode, "".join(lines)
+
+    def revisa(self, code, out):
+        self.assertEqual(code, 0, out)
+        for malo in self.MALO:
+            self.assertNotIn(malo, out)
+        self.assertIn("reloj: reproducción de", out, "el reproductor no arrancó")
+        self.assertIn("vuelta.mcap", out)
+        if self.con_machine:
+            self.assertIn("127.0.0.1): es esta computadora; sus nodos corren aquí (eco)", out)
+        self.assertIn("ECO modo=replay sobre=%d reloj_recibido=True" % wire.CLOCK_REPLAY, out,
+                      "el nodo no recibió la grabación con /clock")
+        self.assertIn("todo arrancado", out)
+        self.assertIn("listo", out)
+
+    def test_play_con_machine_sin_panel(self):
+        self.con_machine = True
+        self.robot(True)
+        code, out = self.corre("--no-web", "--play", self.path)
+        self.revisa(code, out)
+
+    def test_play_con_machine_con_panel(self):
+        self.con_machine = True
+        self.robot(True)
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            puerto = s.getsockname()[1]
+        code, out = self.corre("--http", f"127.0.0.1:{puerto}", "--play", self.path)
+        self.revisa(code, out)
+        self.assertIn(f"panel web: http://127.0.0.1:{puerto}", out)
+
+    def lineas(self, out):
+        """Las líneas propias de agmen run, sin tiempos, PIDs ni conteos, sin las de [[machine]]."""
+        res = set()
+        for ln in out.splitlines():
+            if not ln.startswith("agmen"):
+                continue
+            if "es esta computadora" in ln or "sin machine" in ln:
+                continue
+            ln = re.sub(r"[0-9a-f]{16,}", "T", ln)
+            res.add(re.sub(r"\d+", "N", ln))
+        return res
+
+    def test_las_mismas_lineas_con_y_sin_machine(self):
+        self.con_machine = True
+        self.robot(True)
+        c1, con = self.corre("--no-web", "--play", self.path)
+        self.revisa(c1, con)
+        self.con_machine = False
+        self.robot(False)
+        c2, sin = self.corre("--no-web", "--play", self.path)
+        self.revisa(c2, sin)
+        self.assertEqual(self.lineas(con), self.lineas(sin))
+        self.assertIn("es esta computadora", con)
+        self.assertNotIn("es esta computadora", sin)
 
 
 NODO = """\
