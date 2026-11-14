@@ -979,6 +979,34 @@ if _backend.NATIVE:
     _LATIDOS_MIN_S = 0.2   # el hilo de latidos termina en microsegundos; esto aunque el límite se haya agotado
 
     _avisado = False
+    _hijo_de_fork = False   # True en el hijo de un os.fork() (lo marca _despues_de_fork)
+
+    def _donde_esta(t: threading.Thread | None) -> str:
+        """Para el aviso: en qué proceso y en qué línea de Python está parado el hilo `t` (los dos
+        marcos de más adentro). Si estaba dentro del núcleo de C++, la línea es la que lo llamó."""
+        import linecache
+
+        proceso = f"proceso {os.getpid()}" + (", hijo de un fork" if _hijo_de_fork else "")
+        marco = None
+        try:
+            if t is not None and t.ident is not None:
+                marco = sys._current_frames().get(t.ident)
+        except Exception:  # noqa: BLE001 — el aviso sale aunque no se sepa dónde
+            marco = None
+        if marco is None:
+            return f"({proceso})"
+        lugares = []
+        while marco is not None and len(lugares) < 2:
+            co = marco.f_code
+            lugar = f"{os.path.basename(co.co_filename)}:{marco.f_lineno} {co.co_name}"
+            if not lugares:   # el de más adentro: también la instrucción (p. ej. self._core.heartbeat())
+                codigo = linecache.getline(co.co_filename, marco.f_lineno).strip()
+                if codigo:
+                    lugar += f" «{codigo}»"
+            lugares.append(lugar)
+            marco = marco.f_back
+        del marco
+        return f"({proceso}; parado en {' ← '.join(lugares)})"
 
     def _cierre_resto(falta: str, sobra: float, esperado: float, apurado: bool) -> None:
         """Lo que sigue al cierre del núcleo, que registra atexit como _core._cierre (una función de C:
@@ -996,7 +1024,7 @@ if _backend.NATIVE:
         latidos = _beats.stop(0.05 if apurado else max(sobra, _LATIDOS_MIN_S))
         partes = [falta] if falta else []
         if not latidos:
-            partes.append("el hilo de latidos")
+            partes.append("el hilo de latidos " + _donde_esta(_beats.thread))
         if not partes or _avisado:
             return
         espera = esperado + (time.monotonic() - inicio)
@@ -1018,12 +1046,19 @@ if _backend.NATIVE:
         tenía un hilo del padre (el de latidos en _beat, un close()) quedaría tomado para siempre: se
         reponen los de los Publisher y Subscriber nativos vivos y el estado del hilo de latidos, que en
         el hijo no existe (el próximo Publisher o Subscriber lo arranca de nuevo)."""
-        global _cerrando, _avisado
+        global _cerrando, _avisado, _hijo_de_fork
         _backend.core._after_fork_child()
         _cerrando = False
         _avisado = False
+        _hijo_de_fork = True
         for o in list(_nativos):
             o._lock = threading.Lock()
+        # El hilo de latidos del hijo no late por los objetos heredados: su estado de C++ puede tener
+        # tomado un mutex que retenía un hilo del padre (un publish() a medias: el de PublisherCore), y
+        # el latido se quedaría esperándolo para siempre (al salir: "1 en un latido; el hilo de latidos").
+        # No hacen falta: llevan el mismo id en el hub que los del padre, que sigue latiendo por ellos, y si
+        # el hijo los usa, publish() y receive() laten solos.
+        _beats.pubs = weakref.WeakSet()
         _beats.lock = threading.Lock()
         _beats.stopping = threading.Event()
         _beats.thread = None
