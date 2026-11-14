@@ -36,6 +36,9 @@ from . import hubproto as hp
 from . import wire
 
 ANNOUNCE_EVERY_S = 1.0
+# _same_port_tcp: cuántos números seguidos que no sirven en UDP puede cruzar (en Windows, los rangos
+# apartados son de cientos de puertos). Cada intento son dos sockets: el total tarda milisegundos.
+_SAME_PORT_TRIES = 2000
 
 
 def _addr(text: str) -> tuple[str, int]:
@@ -350,7 +353,12 @@ class _Receiver:
         de otro programa) o, en Windows, reservado (Hyper-V, WSL y Docker apartan
         rangos enteros de puertos TCP: WinError 10013). Como Windows da los puertos
         de corrido, probar con otro UDP caía en el mismo rango: se pide primero el
-        TCP (el sistema nunca da uno reservado) y el UDP se abre en ese número."""
+        TCP (el sistema nunca da uno reservado) y el UDP se abre en ese número.
+
+        Ese número puede no servir en UDP (un socket UDP de otro programa, o un rango
+        que Windows apartó solo para UDP), y como los TCP también salen de corrido,
+        el siguiente intento cae en el número siguiente del mismo bloque: se sigue
+        hasta cruzarlo (_SAME_PORT_TRIES; cada intento tarda microsegundos)."""
         host, port = _addr(where)
         try:
             return _tcp.Listener(self._sock.getsockname(), shm=shm)
@@ -358,22 +366,26 @@ class _Receiver:
             if port != 0:
                 self._sock.close()
                 raise
-        for attempt in range(20):
+        last: OSError | None = None
+        for _ in range(_SAME_PORT_TRIES):
             listener = _tcp.Listener((host, 0), shm=shm)
             udp = wire.udp_socket()
             try:
                 udp.bind((host, listener.port))
-            except OSError:
+            except OSError as e:
+                last = e
                 udp.close()
                 listener.close()
-                if attempt == 19:
-                    self._sock.close()
-                    raise
                 continue
             self._sock.close()
             self._sock = udp
             return listener
-        raise AssertionError("no llega aquí")   # pragma: no cover
+        self._sock.close()
+        raise OSError(last.errno if last else None,
+                      f"no encontré un puerto libre a la vez en UDP y en TCP en {host} tras {_SAME_PORT_TRIES} "
+                      f"intentos (el último UDP: {last}). Algo tiene tomados o apartados muchos puertos UDP "
+                      f"seguidos; en Windows, revísalo con 'netsh int ipv4 show excludedportrange protocol=udp'. "
+                      f"O usa una dirección con puerto fijo (ej. 127.0.0.1:7500).")
 
     @property
     def port(self) -> int:

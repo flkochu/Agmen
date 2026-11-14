@@ -37,10 +37,23 @@ def get_state():
 
 def post(path, body=None, headers=H):
     req = urllib.request.Request(URL + path, data=json.dumps(body or {}).encode(), headers=headers, method="POST")
+    t0 = time.monotonic()
     try:
         return urllib.request.urlopen(req, timeout=5).status
     except urllib.error.HTTPError as e:
         return e.code
+    except (urllib.error.URLError, OSError) as e:
+        # Sin respuesta: se anota como FALLA y la prueba sigue, para que al final salga la
+        # salida de agmen (antes el traceback la perdía). ¿El panel entero no contesta, o solo esta?
+        took = time.monotonic() - t0
+        try:
+            t1 = time.monotonic()
+            urllib.request.urlopen(URL + "/api/state", timeout=5).read()
+            alive = f"el panel sí contesta /api/state ({(time.monotonic() - t1) * 1000:.0f} ms después)"
+        except OSError as e2:
+            alive = f"el panel tampoco contesta /api/state: {e2}"
+        check(f"POST {path} contesta", False, f"{type(e).__name__}: {e} tras {took:.1f} s; {alive}")
+        return None
 
 
 def node(state, name):
