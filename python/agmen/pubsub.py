@@ -624,6 +624,7 @@ class _Beats:
         self.pubs: weakref.WeakSet = weakref.WeakSet()
         self.thread: threading.Thread | None = None
         self.lock = threading.Lock()
+        self.stopping = threading.Event()
 
     def add(self, pub) -> None:
         with self.lock:
@@ -633,13 +634,21 @@ class _Beats:
                 self.thread.start()
 
     def _loop(self) -> None:
-        while True:
-            time.sleep(0.25)
+        while not self.stopping.wait(0.25):
             for p in list(self.pubs):
                 try:
                     p._beat()
                 except Exception:  # noqa: BLE001 — un latido fallido no tumba a nadie
                     pass
+
+    def stop(self) -> None:
+        """Al salir del intérprete: espera a que el hilo termine el latido en curso. Un hilo daemon
+        que vuelve de una llamada de C++ que soltó el GIL cuando el intérprete ya se finaliza es
+        terminado con pthread_exit, y ese desenrollado forzado aborta el proceso (SIGABRT)."""
+        self.stopping.set()
+        t = self.thread
+        if t is not None and t is not threading.current_thread():
+            t.join()
 
 
 _beats = _Beats()
@@ -790,4 +799,5 @@ if _backend.NATIVE:
 
     _backend.core.set_log_sink(_stderr)
     atexit.register(_backend.core.set_log_sink, None)
+    atexit.register(_beats.stop)
     _backend.core.set_default_node_name(node_name())
