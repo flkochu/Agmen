@@ -4415,6 +4415,41 @@ class TestAdiosCierraLimpio(LinkCase):
         self.assertEqual(ops, ["adios"])
         self.assertEqual(resultado, ["fin"], "agmen run cerró con RST: en Windows el agente perdería el adios")
 
+    def test_nunca_dos_lectores_si_el_lector_sigue_vivo(self):
+        """Si el join del lector vuelve con el lector vivo (p. ej. el temporizador de Windows lo
+        despierta un poco antes del plazo), _bye no lee del socket: le robaría bytes al lector."""
+        class Espia(socket.socket):
+            recvs = 0
+
+            def recv(self, *a, **k):
+                type(self).recvs += 1
+                return super().recv(*a, **k)
+
+        class LectorVivo:   # join vuelve enseguida y sigue vivo
+            def join(self, timeout=None):
+                pass
+
+            def is_alive(self):
+                return True
+
+        a, b = socket.socketpair()
+        self.addCleanup(b.close)
+        s = Espia(fileno=a.detach())
+        b.sendall(b"1 {\"op\":\"log\"} firma\n")   # algo del agente, pendiente para el lector
+
+        class Canal:
+            sock = s
+
+            def send(self, obj):
+                s.sendall(b"adios\n")
+
+            def close(self):
+                s.close()
+
+        agent._bye(Canal(), LectorVivo())
+        self.assertEqual(Espia.recvs, 0, "_bye leyó del socket con el lector vivo: dos lectores")
+        self.assertEqual(s.fileno(), -1, "_bye no cerró el socket")
+
 
 @unittest.skipUnless(os.name == "posix", "necesita una terminal de verdad (pty): solo POSIX")
 class TestTerminalInteractiva(E2EBase):

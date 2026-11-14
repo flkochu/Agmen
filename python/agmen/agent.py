@@ -779,7 +779,9 @@ def _bye(channel: Channel, reader: threading.Thread | None = None) -> None:
         sock.shutdown(socket.SHUT_WR)
         if reader is not None and reader is not threading.current_thread():
             reader.join(max(0.0, end - time.monotonic()))   # sale al ver que el agente cerró
-        while True:   # sin lector (o si salió antes de tiempo): se vacía aquí
+            if reader.is_alive():   # se acabó el plazo con el lector leyendo: nunca dos lectores
+                return              # (el finally cierra; lo que tenga a medias, el lector lo descarta)
+        while True:   # sin lector (o el lector es este hilo, o ya terminó): se vacía aquí
             left = end - time.monotonic()
             if left <= 0 or not select.select([sock], [], [], left)[0] or not sock.recv(65536):
                 break
