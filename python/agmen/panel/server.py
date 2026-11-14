@@ -37,7 +37,7 @@ from urllib.parse import parse_qs, urlsplit
 from .. import schema, wire
 from .. import ws as wsmod
 from .._version import __version__
-from ..pubsub import RawSubscriber, _PurePublisher
+from ..pubsub import RawSubscriber, _PurePublisher, is_closed_error
 from .bridge import FOXGLOVE_PROTOCOL, PROTOCOLS, Bridge
 
 HERE = Path(__file__).resolve().parent
@@ -341,7 +341,12 @@ class Teleop:
             now = time.monotonic()
             if now - self.last_sent < 0.015 and (left, right) != (0.0, 0.0):
                 return self.last_cmd  # máx. ~60 Hz: un navegador no puede saturar al robot
-            self.pub.publish(MotorCommand(left, right))
+            try:
+                self.pub.publish(MotorCommand(left, right))
+            except RuntimeError as e:
+                if not is_closed_error(e):
+                    raise
+                return self.last_cmd   # el panel se está apagando: no se mandó
             self.last_sent, self.last_cmd = now, (left, right)
         return left, right
 

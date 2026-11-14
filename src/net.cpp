@@ -273,10 +273,18 @@ std::optional<Received> UdpSocket::recv_from(std::span<std::uint8_t> buffer,
         throw NetError(code, "falló la espera de datos");
     }
 
+    // Sin bloquear: entre el poll y la lectura, otro lector del mismo socket (el
+    // hijo de un fork lo comparte) puede llevarse el datagrama; esperar ahí no
+    // tendría límite. Windows no tiene fork ni MSG_DONTWAIT.
+#ifdef _WIN32
+    constexpr int kFlags = 0;
+#else
+    constexpr int kFlags = MSG_DONTWAIT;
+#endif
     sockaddr_in from{};
     socklen_t from_len = sizeof from;
     const auto n = ::recvfrom(s, reinterpret_cast<char*>(buffer.data()),
-                              static_cast<LenType>(buffer.size()), 0,
+                              static_cast<LenType>(buffer.size()), kFlags,
                               reinterpret_cast<sockaddr*>(&from), &from_len);
     if (n < 0) {
         const int code = last_error();

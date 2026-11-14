@@ -1022,7 +1022,12 @@ struct SubscriberCore::State {
     // otro programa) o, en Windows, reservado (Hyper-V, WSL y Docker apartan rangos
     // enteros de puertos TCP: WSAEACCES). Como Windows da los puertos de corrido,
     // probar con otro UDP caía en el mismo rango: se pide primero el TCP (el
-    // sistema nunca da uno reservado) y el UDP se abre en ese número.
+    // sistema nunca da uno reservado) y el UDP se abre en ese número. Ese número
+    // puede no servir en UDP (un socket UDP de otro programa, o un rango que
+    // Windows apartó solo para UDP) y, como los TCP también salen de corrido, el
+    // siguiente intento cae en el número siguiente del mismo bloque: se sigue
+    // hasta cruzarlo (igual que _same_port_tcp en Python).
+    static constexpr int kSamePortTries = 2000;
     std::unique_ptr<Listener> same_port_listener(const std::string& w) {
         const bool any_port = w.size() >= 2 && w.compare(w.size() - 2, 2, ":0") == 0;
         try {
@@ -1031,13 +1036,21 @@ struct SubscriberCore::State {
         } catch (const net::NetError&) {
             if (!any_port) throw;
         }
-        for (int attempt = 0;; ++attempt) {
+        for (int attempt = 1;; ++attempt) {
             auto tcp_first = std::make_unique<Listener>(host_of(w) + ":0", shm::enabled());
             try {
                 socket = net::UdpSocket::bind(host_of(w) + ":" + std::to_string(tcp_first->listener.local_port()));
                 return tcp_first;
-            } catch (const net::NetError&) {
-                if (attempt >= 19) throw;
+            } catch (const net::NetError& e) {
+                if (attempt >= kSamePortTries) {
+                    throw net::NetError(e.code().value(),
+                                        "no encontré un puerto libre a la vez en UDP y en TCP en " + host_of(w) +
+                                            " tras " + std::to_string(kSamePortTries) + " intentos (el último UDP: " +
+                                            e.what() +
+                                            "). Algo tiene tomados o apartados muchos puertos UDP seguidos; en "
+                                            "Windows, revísalo con 'netsh int ipv4 show excludedportrange "
+                                            "protocol=udp'. O usa una dirección con puerto fijo (ej. 127.0.0.1:7500).");
+                }
             }
         }
     }

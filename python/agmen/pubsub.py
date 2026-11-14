@@ -36,6 +36,9 @@ from . import hubproto as hp
 from . import wire
 
 ANNOUNCE_EVERY_S = 1.0
+# _same_port_tcp: cuántos números seguidos que no sirven en UDP puede cruzar (en Windows, los rangos
+# apartados son de cientos de puertos). Cada intento son dos sockets: el total tarda milisegundos.
+_SAME_PORT_TRIES = 2000
 
 
 def _addr(text: str) -> tuple[str, int]:
@@ -141,6 +144,7 @@ class _PurePublisher:
         self._sock = wire.udp_socket()
         self._announced_at: float | None = None
         self._pub_lock = threading.Lock()   # se puede publicar desde varios grupos de un Node
+        self._closed = False                # close(): publish() lanza el error claro, como el nativo
         # Un tipo arrow (string, bytes, T[], tensor) va por TCP (RFC 0008 D2) o, en la misma
         # computadora, por memoria compartida (RFC 0009); compact, por UDP.
         self.arrow = msg_type.LAYOUT.encoding == wire.ENC_ARROW
@@ -195,6 +199,8 @@ class _PurePublisher:
 
     def _drain_locked(self) -> None:
         with self._lock:
+            if self._closed:
+                return
             self._drain()
             if self._tcp is not None:
                 self._tcp.flush()      # termina lo que quedó a medias aunque no se publique
@@ -240,6 +246,8 @@ class _PurePublisher:
         Devuelve False si no se pudo entregar a nadie (no es un error)."""
         if self._link is not None:
             with self._lock:
+                if self._closed:
+                    raise RuntimeError(_PUB_CERRADO)
                 self._drain()
                 dests = list(self.dests)
             if self._link.error:
@@ -247,6 +255,8 @@ class _PurePublisher:
         else:
             dests = self.dests
         with self._pub_lock:
+            if self._closed:
+                raise RuntimeError(_PUB_CERRADO)
             if self._announced_at is None or time.monotonic() - self._announced_at >= ANNOUNCE_EVERY_S:
                 self.announce()
             if self._tcp is not None:
@@ -296,11 +306,34 @@ class _PurePublisher:
             return self._tcp.pool.bytes() if self._tcp.pool is not None else 0
 
     def close(self) -> None:
+        # Un publish() de otro hilo puede estar dentro: se espera a que suelte sus locks (los
+        # tiene microsegundos) y desde entonces publish() lanza "el Publisher ya se cerró".
+        # Un envío UDP ya fuera del lock que encuentre el socket cerrado devuelve False.
+        with self._pub_lock:
+            if self._closed:
+                return
+            self._closed = True
         if self._link is not None:
             self._link.close()
+            with self._lock:   # un _drain() en curso (de publish() o del latido) termina antes
+                pass
         if self._tcp is not None:
             self._tcp.close()
         self._sock.close()
+
+
+# Los textos de los errores tras close(): los mismos que el núcleo nativo (python/src/core.cpp).
+_PUB_CERRADO = "el Publisher ya se cerró"
+_SUB_CERRADO = "el Subscriber ya se cerró"
+_RX_TRAMO_S = 0.2   # receive() toma el turno por tramos de a lo más esto (el nativo: 200 ms)
+_RX_CIERRE_S = 2.0  # close() espera el turno a lo más esto (lo normal: un tramo)
+_SELECT_FALLO = object()   # _receive_turn(): select() falló (distinto de None: venció el tramo)
+
+
+def is_closed_error(e: BaseException) -> bool:
+    """True si `e` es el error de publicar o recibir tras close() (núcleo nativo o puro). Para quien
+    puede publicar durante el apagado (el panel, el reloj): eso es "no se mandó", no una falla."""
+    return isinstance(e, RuntimeError) and "ya se cerró" in str(e)
 
 
 @dataclass
@@ -350,7 +383,12 @@ class _Receiver:
         de otro programa) o, en Windows, reservado (Hyper-V, WSL y Docker apartan
         rangos enteros de puertos TCP: WinError 10013). Como Windows da los puertos
         de corrido, probar con otro UDP caía en el mismo rango: se pide primero el
-        TCP (el sistema nunca da uno reservado) y el UDP se abre en ese número."""
+        TCP (el sistema nunca da uno reservado) y el UDP se abre en ese número.
+
+        Ese número puede no servir en UDP (un socket UDP de otro programa, o un rango
+        que Windows apartó solo para UDP), y como los TCP también salen de corrido,
+        el siguiente intento cae en el número siguiente del mismo bloque: se sigue
+        hasta cruzarlo (_SAME_PORT_TRIES; cada intento tarda microsegundos)."""
         host, port = _addr(where)
         try:
             return _tcp.Listener(self._sock.getsockname(), shm=shm)
@@ -358,22 +396,26 @@ class _Receiver:
             if port != 0:
                 self._sock.close()
                 raise
-        for attempt in range(20):
+        last: OSError | None = None
+        for _ in range(_SAME_PORT_TRIES):
             listener = _tcp.Listener((host, 0), shm=shm)
             udp = wire.udp_socket()
             try:
                 udp.bind((host, listener.port))
-            except OSError:
+            except OSError as e:
+                last = e
                 udp.close()
                 listener.close()
-                if attempt == 19:
-                    self._sock.close()
-                    raise
                 continue
             self._sock.close()
             self._sock = udp
             return listener
-        raise AssertionError("no llega aquí")   # pragma: no cover
+        self._sock.close()
+        raise OSError(last.errno if last else None,
+                      f"no encontré un puerto libre a la vez en UDP y en TCP en {host} tras {_SAME_PORT_TRIES} "
+                      f"intentos (el último UDP: {last}). Algo tiene tomados o apartados muchos puertos UDP "
+                      f"seguidos; en Windows, revísalo con 'netsh int ipv4 show excludedportrange protocol=udp'. "
+                      f"O usa una dirección con puerto fijo (ej. 127.0.0.1:7500).")
 
     @property
     def port(self) -> int:
@@ -389,9 +431,9 @@ class _Receiver:
         """Los sockets que hay que vigilar (para select)."""
         return [self._sock, *(self._tcp.filenos() if self._tcp is not None else [])]
 
-    def _recv(self, deadline: float | None):
-        """Siguiente paquete de DATOS, (bytes, "ip:puerto", conexión TCP o None). Los
-        de control se procesan aquí."""
+    def _recv(self, deadline: float | None, failed=None):
+        """Siguiente paquete de DATOS, (bytes, "ip:puerto", conexión TCP o None), o None si venció
+        `deadline`. Si select() falla, `failed` (None por omisión). Los de control se procesan aquí."""
         if self._tcp is None:
             return self._recv_udp(deadline)
         while True:
@@ -401,7 +443,7 @@ class _Receiver:
             try:
                 r, _, _ = select.select(self.filenos(), [], [], left)
             except (OSError, ValueError):
-                return None
+                return failed
             if not r:
                 return None
             if self._sock in r:
@@ -453,15 +495,61 @@ class _PureSubscriber(_Receiver):
         super().__init__(where, f"{msg_type.SCHEMA_ID:016x}", msg_type.NAME, tcp=arrow,
                          shm=arrow and _shm.enabled())
         self._shm = _shm.Receiver(where) if arrow else None
+        # El turno de recibir (como rx_mu_ del nativo): los receive() de varios hilos sobre este
+        # Subscriber se turnan y nunca leen a la vez los sockets ni lo que va llegando de cada
+        # conexión; close() también lo espera. No es reentrante: un close() desde el mismo hilo que
+        # está en receive() (un manejador de señales) no cierra los sockets debajo de su recvfrom,
+        # los deja pendientes y receive() los cierra al soltar el turno.
+        self._rx = threading.Lock()
+        self._closed = False
+        self._sockets_closed = False
+        self._close_warned = False
+        self._puros.add(self)
+
+    _puros: weakref.WeakSet = weakref.WeakSet()   # para reponer el turno en el hijo de un fork
 
     def receive(self, timeout: float | None = None):
         """Espera hasta `timeout` s un mensaje. Devuelve Sample, o None si no llegó.
-        Lanza wire.WireError si llega algo inválido o de otro tipo."""
-        deadline = None if timeout is None else time.monotonic() + timeout
+        Lanza wire.WireError si llega algo inválido o de otro tipo, y RuntimeError
+        si el Subscriber ya se cerró (como el núcleo nativo)."""
+        # En tramos de a lo más _RX_TRAMO_S, como el nativo: con varios hilos ninguno se queda sin
+        # turno, ni siquiera frente a un receive() sin límite, y close() espera poco.
+        end = None if timeout is None else time.monotonic() + timeout
+        short = timeout is not None and timeout <= _RX_TRAMO_S   # cabe en un tramo (receive(0) del Node)
+        rx = self._rx
         while True:
-            got = self._recv(deadline)
-            if got is None:
-                return None
+            if not rx.acquire(False):   # lo normal (un solo hilo): el turno libre, sin esperar
+                left = _RX_TRAMO_S if end is None else min(_RX_TRAMO_S, end - time.monotonic())
+                if not (left > 0 and rx.acquire(True, left)):
+                    if end is not None and time.monotonic() >= end:
+                        return None
+                    continue
+            try:
+                if self._closed:
+                    raise RuntimeError(_SUB_CERRADO)
+                last = short   # ¿este tramo llega hasta el límite? Se decide aquí, no leyendo el reloj
+                if short:      # después: en Windows (Python <= 3.12) avanza en pasos de 15.6 ms
+                    deadline = end
+                else:
+                    deadline = time.monotonic() + _RX_TRAMO_S
+                    if end is not None and end <= deadline:
+                        deadline, last = end, True
+                s = self._receive_turn(deadline)
+            finally:
+                if self._closed:
+                    self._close_sockets()   # un close() que no alcanzó el turno (de otro hilo, o de este)
+                rx.release()
+            if s is _SELECT_FALLO:
+                return None          # select() falló (un socket que ya no sirve): como siempre, None
+            if s is not None or last:
+                return s             # un mensaje, o venció el límite
+
+    def _receive_turn(self, deadline: float):
+        """receive() con el turno tomado, hasta `deadline` (monotonic)."""
+        while True:
+            got = self._recv(deadline, _SELECT_FALLO)
+            if got is None or got is _SELECT_FALLO:
+                return got
             data, src, peer = got
             env, payload = wire.parse(data, shm=peer is not None and peer.hello)
             if env.encoding == wire.ENC_SCHEMA:
@@ -480,6 +568,46 @@ class _PureSubscriber(_Receiver):
             _, msg = wire.decode(self.type, data)
             self._check_clock(env)
             return Sample(env, msg, src)
+
+    def close(self) -> None:
+        """Cierra; desde cualquier hilo. La baja del hub y el fin de los latidos no esperan a nadie.
+        Los sockets, sí: se espera el turno (un receive() en curso lo suelta en a lo más un tramo)
+        para no cerrarlos debajo de quien lee; desde entonces receive() lanza "el Subscriber ya se
+        cerró". Si el turno no llega a tiempo (un hilo detenido con él, o este mismo hilo dentro de
+        receive()), se avisa y los cierra quien suelte el turno, o la recolección del objeto."""
+        self._closed = True
+        if self._link is not None:
+            self._link.close()
+        if not self._rx.acquire(timeout=_RX_CIERRE_S):
+            if not self._close_warned:
+                self._close_warned = True
+                print(f"[agmen] ⚠ close() del Subscriber de '{self.topic or self.listen}' esperó "
+                      f"{_RX_CIERRE_S:.0f} s a que un hilo saliera de receive() y no salió. Ya se dio de baja "
+                      f"del hub; sus sockets se cierran cuando ese hilo suelte receive() o cuando se libere el "
+                      f"Subscriber. Revisa que ningún hilo se quede detenido dentro de receive() (o que no "
+                      f"llames close() desde un manejador de señales del hilo que recibe).",
+                      file=sys.stderr, flush=True)
+            return
+        try:
+            self._close_sockets()
+        finally:
+            self._rx.release()
+
+    def _close_sockets(self) -> None:
+        """Con el turno tomado (o sin nadie que lo tenga); una sola vez. La baja del hub ya la hizo close()."""
+        if not self._sockets_closed:
+            self._sockets_closed = True
+            if self._tcp is not None:
+                self._tcp.close()
+            self._sock.close()
+
+    def __del__(self) -> None:
+        # Un close() que quedó pendiente: sin referencias, ningún hilo puede estar en receive().
+        try:
+            if self._closed and not self._sockets_closed:
+                self._close_sockets()
+        except Exception:  # noqa: BLE001 — al salir del intérprete puede faltar de todo
+            pass
 
     def _check_type(self, env) -> None:
         if env.schema_id != self.type.SCHEMA_ID:
@@ -501,6 +629,17 @@ class _PureSubscriber(_Receiver):
               f"{clock.mode_name()}. ¿Corriste el nodo fuera de 'agmen run'? Usa el mismo reloj: "
               f"AGMEN_CLOCK={ {wire.CLOCK_SIM: 'sim', wire.CLOCK_REPLAY: 'replay'}.get(env.clock, 'real') }",
               file=sys.stderr, flush=True)
+
+
+def _turnos_despues_de_fork() -> None:
+    """En el hijo de un fork (un solo hilo): el turno de receive() de un Subscriber puro pudo quedar
+    tomado por un hilo del padre que en el hijo no existe. Se repone, libre (como el nativo)."""
+    for o in list(_PureSubscriber._puros):
+        o._rx = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_turnos_despues_de_fork)
 
 
 class RawSubscriber(_Receiver):
@@ -615,6 +754,26 @@ class RawPublisher:
 # Mismo uso, mismos atributos.
 # ---------------------------------------------------------------------------
 
+# True desde que el cierre del núcleo de C++ empezó (_cierre, al salir). Un hilo que se quedó dormido
+# dentro del núcleo puede tener tomado el lock de un Publisher o Subscriber: desde entonces, esos locks
+# se piden con límite, para que la salida nunca se cuelgue.
+_cerrando = False
+_LOCK_AL_CERRAR_S = 0.2
+# Desde el cierre, publish() y receive() de otros hilos regresan al instante sin soltar el GIL (ver
+# python/src/core.cpp): un hilo que los llama en un bucle acapararía el GIL, y el hilo de latidos (y el
+# que cierra) esperarían turno. Tras una llamada que no hizo nada, se cede el GIL este rato.
+_CORTESIA_S = 0.002
+
+
+# Los Publisher y Subscriber nativos vivos: en el hijo de un fork sus locks se reponen (_despues_de_fork).
+_nativos: weakref.WeakSet = weakref.WeakSet()
+
+
+def _lock_or_skip(lock) -> bool:
+    """Toma `lock`; al salir (ver _cerrando), con límite: False = no se pudo."""
+    return lock.acquire(timeout=_LOCK_AL_CERRAR_S) if _cerrando else lock.acquire()
+
+
 class _Beats:
     """Late por los Publisher y Subscriber del núcleo de C++ que pasan ratos sin
     publicar o sin llamar receive() (el panel, un nodo que solo manda al cambiar
@@ -641,14 +800,17 @@ class _Beats:
                 except Exception:  # noqa: BLE001 — un latido fallido no tumba a nadie
                     pass
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 2.0) -> bool:
         """Al salir del intérprete: espera a que el hilo termine el latido en curso. Un hilo daemon
         que vuelve de una llamada de C++ que soltó el GIL cuando el intérprete ya se finaliza es
-        terminado con pthread_exit, y ese desenrollado forzado aborta el proceso (SIGABRT)."""
+        terminado con pthread_exit, y ese desenrollado forzado aborta el proceso (SIGABRT).
+        Devuelve False si el hilo sigue vivo al vencer `timeout`."""
         self.stopping.set()
         t = self.thread
         if t is not None and t is not threading.current_thread():
-            t.join(2.0)   # un latido dura microsegundos; el límite es por si su aviso se atora (stderr lleno)
+            t.join(timeout)   # un latido dura microsegundos; el límite es por si su aviso se atora (stderr lleno)
+            return not t.is_alive()
+        return True
 
 
 _beats = _Beats()
@@ -670,6 +832,7 @@ class _NativePublisher:
         self.topic = self._core.topic
         self.source_id = self._core.source_id
         self._lock = threading.Lock()
+        _nativos.add(self)
         if hp.is_topic(to):
             _beats.add(self)
 
@@ -677,15 +840,23 @@ class _NativePublisher:
         """Manda `msg`. t_data = instante al que corresponden los datos (default: ahora).
         Devuelve False si no se pudo entregar a nadie (no es un error)."""
         payload = msg.encode_payload()
-        return self._core.publish(payload, wire.now_ns() if t_data is None else int(t_data))
+        ok = self._core.publish(payload, wire.now_ns() if t_data is None else int(t_data))
+        if not ok and _cerrando:
+            time.sleep(_CORTESIA_S)   # saliendo: no acaparar el GIL (ver _CORTESIA_S)
+        return ok
 
     def announce(self) -> None:
         self._core.announce()
 
     def _beat(self) -> None:
-        with self._lock:
+        # El latido es de mejor esfuerzo: nunca espera el lock sin límite (lo tiene un close() en curso).
+        if not self._lock.acquire(timeout=_LOCK_AL_CERRAR_S):
+            return
+        try:
             if not self._core.closed:
                 self._core.heartbeat()
+        finally:
+            self._lock.release()
 
     @property
     def seq(self) -> int:
@@ -716,8 +887,12 @@ class _NativePublisher:
         return self._core.shm_bytes
 
     def close(self) -> None:
-        with self._lock:
+        if not _lock_or_skip(self._lock):
+            return   # al salir: lo tiene un hilo que se quedó dormido en el núcleo; el proceso ya termina
+        try:
             self._core.close()
+        finally:
+            self._lock.release()
 
 
 class _NativeSubscriber:
@@ -737,6 +912,7 @@ class _NativeSubscriber:
                                               layout.size or 0, layout.encoding == wire.ENC_ARROW)
         self.listen = f"127.0.0.1:{self._core.port}" if self.topic else where
         self._lock = threading.Lock()
+        _nativos.add(self)
         if self.topic:
             _beats.add(self)   # sigue latiendo aunque no llames receive() por un rato
 
@@ -745,6 +921,8 @@ class _NativeSubscriber:
         si no llegó. Lanza wire.WireError si llega algo inválido o de otro tipo."""
         got = self._core.receive(timeout)
         if got is None:
+            if _cerrando:
+                time.sleep(_CORTESIA_S)   # saliendo: no acaparar el GIL (ver _CORTESIA_S)
             return None
         env, payload, sender = got
         return Sample(wire.Envelope(*env), self.type.decode_payload(payload), sender)
@@ -760,10 +938,22 @@ class _NativeSubscriber:
         return self._core.port
 
     def fileno(self) -> int:
+        self._usado_en_el_hijo()
         return self._core.fileno()
 
     def filenos(self) -> list:
+        self._usado_en_el_hijo()
         return self._core.filenos()
+
+    _heredado = False   # True en el hijo de un fork, hasta que lo usa (ver _despues_de_fork)
+
+    def _usado_en_el_hijo(self) -> None:
+        """Heredado de un fork y vigilado con select(): que el hijo lata por él (si el padre muere, el
+        hub lo quitaría y el hijo esperaría sordo). receive() late solo, así que no lo necesita."""
+        if self._heredado:
+            self._heredado = False
+            if self.topic:
+                _beats.add(self)
 
     @property
     def tcp_port(self) -> int:
@@ -771,13 +961,22 @@ class _NativeSubscriber:
         return self._core.tcp_port
 
     def _beat(self) -> None:
-        with self._lock:
+        # El latido es de mejor esfuerzo: nunca espera el lock sin límite (lo tiene un close() en curso).
+        if not self._lock.acquire(timeout=_LOCK_AL_CERRAR_S):
+            return
+        try:
             if not self._core.closed:
                 self._core.heartbeat()
+        finally:
+            self._lock.release()
 
     def close(self) -> None:
-        with self._lock:
+        if not _lock_or_skip(self._lock):
+            return   # al salir: lo tiene un hilo que se quedó dormido en el núcleo; el proceso ya termina
+        try:
             self._core.close()
+        finally:
+            self._lock.release()
 
 
 # La clase que se usa se elige una vez, al importar: isinstance y herencia funcionan.
@@ -797,7 +996,96 @@ if _backend.NATIVE:
             except (OSError, ValueError):
                 pass
 
+    # Límite total del cierre: lo normal es que tarde nada (o lo que tarda en volver un receive(), a
+    # lo más 0.2 s, o un spin(), a lo más 0.1 s); el límite es por si una llamada se atora.
+    _CIERRE_S = 2.0
+    _LATIDOS_MIN_S = 0.2   # el hilo de latidos termina en microsegundos; esto aunque el límite se haya agotado
+
+    _avisado = False
+    _hijo_de_fork = False   # True en el hijo de un os.fork() (lo marca _despues_de_fork)
+
+    def _donde_esta(t: threading.Thread | None) -> str:
+        """Para el aviso: en qué proceso y en qué línea de Python está parado el hilo `t` (los dos
+        marcos de más adentro). Si estaba dentro del núcleo de C++, la línea es la que lo llamó. Sin el
+        texto de la línea: el aviso va a stderr y a los logs, y una línea de código puede tener un secreto."""
+        proceso = f"proceso {os.getpid()}" + (", hijo de un fork" if _hijo_de_fork else "")
+        try:   # todo: si algo falla aquí, el aviso sale igual, sin el lugar
+            marco = sys._current_frames().get(t.ident) if t is not None and t.ident is not None else None
+            lugares = []
+            while marco is not None and len(lugares) < 2:
+                co = marco.f_code
+                lugares.append(f"{os.path.basename(co.co_filename)}:{marco.f_lineno} {co.co_name}")
+                marco = marco.f_back
+            del marco
+        except Exception:  # noqa: BLE001
+            lugares = []
+        return f"({proceso}; parado en {' <- '.join(lugares)})" if lugares else f"({proceso})"
+
+    def _cierre_resto(falta: str, sobra: float, esperado: float, apurado: bool) -> None:
+        """Lo que sigue al cierre del núcleo, que registra atexit como _core._cierre (una función de C:
+        corre antes de que el intérprete empiece a finalizar, y una señal pendiente no se la salta como
+        a una función de Python). _core._cierre ya marcó _cerrando y esperó, con límite, a las llamadas
+        que estaban dentro del núcleo: los demás hilos ya no sueltan ni toman el GIL al entrar
+        (publish() devuelve False, receive() None, spin() vuelve), así que ninguno vuelve de C++
+        durante la finalización, que lo terminaría y abortaría el proceso (Python 3.12: SIGABRT,
+        "terminate called without an active exception").
+
+        Aquí: detener el hilo de latidos y, si algo no terminó, el aviso. Con apurado=True (hubo un
+        Ctrl+C) no se espera más; si un Ctrl+C interrumpe esto, _core._cierre lo vuelve a llamar así."""
+        global _avisado
+        inicio = time.monotonic()
+        latidos = _beats.stop(0.05 if apurado else max(sobra, _LATIDOS_MIN_S))
+        partes = [falta] if falta else []
+        if not latidos:
+            partes.append("el hilo de latidos " + _donde_esta(_beats.thread))
+        if not partes or _avisado:
+            return
+        espera = esperado + (time.monotonic() - inicio)
+        if not falta:
+            fin = "El programa sale igual."
+        elif _backend.core._PARK_FORCED_UNWIND:
+            fin = "El programa sale igual; esos hilos se quedan detenidos hasta que termine."
+        else:
+            fin = "El programa sale igual, pero puede terminar con un error de Python al salir."
+        _stderr(f"[agmen] ⚠ al salir no terminaron (esperé {espera:.1f} s): {'; '.join(partes)}. {fin} "
+                "Para evitarlo, detén tus hilos que usan agmen (o llama a node.stop()) antes de salir, y que las "
+                "funciones de un Node sean cortas.")
+        # Después de escribirlo, no antes: si un Ctrl+C corta la escritura, _core._cierre vuelve a llamar
+        # a esta función y el aviso sale entonces (mejor repetido a medias que perdido).
+        _avisado = True
+
+    def _despues_de_fork() -> None:
+        """En el hijo de un fork (un solo hilo): el cierre empieza de cero, en C++ y aquí. Un lock que
+        tenía un hilo del padre (el de latidos en _beat, un close()) quedaría tomado para siempre: se
+        reponen los de los Publisher y Subscriber nativos vivos y el estado del hilo de latidos, que en
+        el hijo no existe (el próximo Publisher o Subscriber lo arranca de nuevo)."""
+        global _cerrando, _avisado, _hijo_de_fork
+        _backend.core._after_fork_child()
+        _cerrando = False
+        _avisado = False
+        _hijo_de_fork = True
+        for o in list(_nativos):
+            o._lock = threading.Lock()
+            o._heredado = True
+        # El hilo de latidos del hijo no late por los objetos heredados: su estado de C++ puede tener
+        # tomado un mutex que retenía un hilo del padre (un publish() a medias: el de PublisherCore), y
+        # el latido se quedaría esperándolo para siempre (al salir: "1 en un latido; el hilo de latidos").
+        # Mientras el padre vive, sobran: llevan el mismo id en el hub que los del padre, que late por
+        # ellos. Si el padre muere, el hub quita a los que nadie usa a los 3 s; publish() y receive()
+        # laten solos (y los vuelven a registrar), y un Subscriber vigilado con fileno()/filenos() vuelve
+        # a la lista de latidos al pedirlos (_usado_en_el_hijo). Límite: si su mutex quedó tomado, ese
+        # objeto no sirve en el hijo (publish() o receive() también se quedarían esperando).
+        # Límite conocido (sin arreglar): cerrar o destruir en el hijo un objeto heredado da de baja en el
+        # hub los ids del padre y borra sus bloques de memoria compartida (en los dos núcleos). Hasta que
+        # se arregle, el hijo no debe cerrar los objetos heredados: basta con salir.
+        _beats.pubs = weakref.WeakSet()
+        _beats.lock = threading.Lock()
+        _beats.stopping = threading.Event()
+        _beats.thread = None
+
     _backend.core.set_log_sink(_stderr)
     atexit.register(_backend.core.set_log_sink, None)
-    atexit.register(_beats.stop)
+    atexit.register(_backend.core._cierre, _cierre_resto, sys.modules[__name__], _CIERRE_S)
+    if hasattr(os, "register_at_fork"):
+        os.register_at_fork(after_in_child=_despues_de_fork)
     _backend.core.set_default_node_name(node_name())

@@ -32,6 +32,46 @@ TRAMO = SEG // 100      # 10 ms simulados por /imu (100 Hz), sea cual sea el tim
 TOPE = 20               # tramos por tick, a lo más, corriendo (0.2 s): si falta más, la computadora no alcanza
 TOPE_PASO = 6000        # en pausa, un "paso" del panel se simula entero, hasta 60 s
 FRENO = SEG // 2        # 0.5 s sin comandos → ruedas en 0, como el motor del tutorial
+# La hora del sistema que retrocede. t_data nunca baja ni se repite: si la hora queda atrás, avanza de 1 ns en
+# 1 ns hasta alcanzarla. Pero no todo "atrás" es un ajuste: en Windows con Python ≤ 3.12, time.time_ns() avanza
+# en saltos de 15.625 ms (más que un TRAMO), y el desfase hora − monótono que lee cada tick baja hasta 15.6 ms
+# de un tick a otro sin que nadie toque la hora. Por eso no se avisa por cada "atrás" sino por lo que la hora
+# retrocedió en neto: `ref` es el desfase más alto visto (sigue a la hora cuando adelanta) y `ref − desfase` es
+# lo retrocedido, que es lo que t_data tiene que absorber de 1 ns en 1 ns. Con solo la resolución gruesa eso
+# nunca pasa de 15.6 ms. Se avisa cuando pasa de TOLERANCIA_HORA (50 ms, más de 3 × 15.6 ms) mientras t_data va
+# adelantada, y suma retrocesos chicos: dos de 32 ms avisan, aunque ninguno solo lo haga.
+# Umbral real de un retroceso R: con hora fina, R + lo que falta para el siguiente salto de la hora (0 a 15.6 ms)
+# − lo que tarda el tick en despertar tras un salto (unos ms). Con hora gruesa y ticks alineados a sus saltos
+# (Windows), lo medido es un múltiplo de 15.625 ms: 60 ms puede verse como 46.875 ms. Así que avisa siempre si
+# R > 62.5 ms, nunca si R < 50 − 15.6 = 34.4 ms, y en medio según la fase. Un paso de NTP (≥ 128 ms) avisa
+# siempre. La cuenta se pone en cero al avisar (ref = desfase, hasta alcanzar la hora) y se olvida sola a
+# OLVIDO_HORA, 1 ms por segundo: lo más que se absorbe en silencio es ≈ 1 ms por segundo (más la tolerancia),
+# el doble de lo que NTP frena la hora al corregirla (0.5 ms/s), que así no se confunde con un retroceso.
+# Si el hilo se demora más de ~35–50 ms entre las dos lecturas (mono_ns y now_ns), t_data salta adelante y en
+# el tick siguiente parece que la hora retrocedió: desfase_de_la_hora() repite la lectura para evitarlo; solo
+# si las INTENTOS lecturas se demoran todas puede salir un aviso falso, que se corrige solo al alcanzar.
+# Si la hora retrocede otra vez antes de que t_data la alcance, no hay un segundo aviso: el primero sigue
+# siendo cierto y su "ya va otra vez" sale al alcanzar la hora más vieja de las dos.
+TOLERANCIA_HORA = SEG // 20
+OLVIDO_HORA = 1000      # ref baja 1 ns por cada 1000 ns de reloj monótono: 1 ms por segundo
+PEGADO, INTENTOS = SEG // 1000, 5   # desfase_de_la_hora(): las lecturas a 1 ms o menos; si no, hasta 5 veces
+
+
+def desfase_de_la_hora(reloj) -> int:
+    """now_ns() − mono_ns() de agmen.clock (`reloj`), leídos juntos. Si el hilo se demora entre las dos lecturas
+    (la máquina cargada), el desfase sale corrido por esa demora: t_data saltaría adelante y en el tick
+    siguiente parecería que la hora retrocedió. Por eso now_ns() se lee entre dos mono_ns() y, si quedaron a más de PEGADO, se repite (hasta
+    INTENTOS veces), quedándose con la lectura más pegada."""
+    mejor = None
+    for _ in range(INTENTOS):
+        antes = reloj.mono_ns()
+        hora = reloj.now_ns()
+        despues = reloj.mono_ns()
+        if mejor is None or despues - antes < mejor[0]:
+            mejor = (despues - antes, hora - (antes + despues) // 2)
+        if despues - antes <= PEGADO:
+            break
+    return mejor[1]
 
 
 class Ritmo:
@@ -91,7 +131,7 @@ def main() -> int:
     real = reloj.mode() == reloj.REAL
     candado = threading.Lock()                              # la física escribe; la cámara y la ventana copian
     s = SimpleNamespace(t=None, t_data=0, atras=False, ultimo_cmd=0, alto=True, nan=False, impreso=0, saltado=0,
-                        imus=0)
+                        imus=0, ref=0, antes=0)          # ref, antes: el desfase más alto y el tick anterior
     ritmo = Ritmo(real)
     cam = None
     if not args.sin_camara:
@@ -130,12 +170,17 @@ def main() -> int:
     # 5. El corazón: seguir al reloj de Agmen.
     @node.every(0.01)                                       # 100 Hz de Agmen: en pausa no corre
     def tick():
-        ahora, st = reloj.mono_ns(), reloj.state()
+        ahora = reloj.mono_ns()
+        desfase = desfase_de_la_hora(reloj) if real else 0
+        st = reloj.state()
         vel, pausa = st.speed or 1.0, not real and st.paused   # en pausa, el tick solo corre si hubo un "paso"
-        desfase = reloj.now_ns() - ahora if real else 0     # cada tick: si la hora del sistema cambia, se sigue
         primero = s.t is None
         if primero:
-            s.t = s.impreso = ahora
+            s.t = s.impreso = s.antes = ahora
+            s.ref = desfase
+        # Lo retrocedido en neto (ver TOLERANCIA_HORA). Con el aviso puesto, todo retroceso ya está avisado.
+        s.ref = desfase if s.atras else max(desfase, s.ref - (ahora - s.antes) // OLVIDO_HORA)
+        s.antes = ahora
 
         # Ponerse al día en tramos de 10 ms, un /imu por tramo. Si falta mucho, lo viejo se salta (y se cuenta).
         tramos, tope = (ahora - s.t) // TRAMO, TOPE_PASO if pausa else TOPE
@@ -154,12 +199,17 @@ def main() -> int:
             with candado:                                   # la cámara copia juntos el estado y su hora
                 mundo.avanzar(pasos)
                 s.t += TRAMO
-                atras = s.t + desfase <= s.t_data           # la hora del sistema retrocedió: t_data no
-                s.t_data = s.t_data + 1 if atras else s.t + desfase
-            if atras != s.atras:
-                s.atras = atras
-                di("⚠ la hora del sistema retrocedió: t_data avanza de 1 ns en 1 ns hasta alcanzarla" if atras
-                   else "t_data ya va otra vez con la hora del sistema", error=atras)
+                hora = s.t + desfase
+                atras = hora <= s.t_data                    # la hora del sistema quedó atrás: t_data no
+                s.t_data = s.t_data + 1 if atras else hora  # baja ni se repite, avanza de 1 ns en 1 ns
+            # Se avisa una vez por retroceso neto de más de TOLERANCIA_HORA, y otra al alcanzar la hora.
+            aviso = s.ref - desfase > TOLERANCIA_HORA if atras and not s.atras else atras
+            if aviso != s.atras:
+                s.atras = aviso
+                if aviso:
+                    s.ref = desfase                         # la cuenta empieza de cero
+                di("⚠ la hora del sistema retrocedió: t_data avanza de 1 ns en 1 ns hasta alcanzarla" if aviso
+                   else "t_data ya va otra vez con la hora del sistema", error=aviso)
             accel, gyro = mundo.imu()
             pub.publish(agmen.wire.ImuSample(accel=accel, gyro=gyro), t_data=s.t_data)
             s.imus += 1
