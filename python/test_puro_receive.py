@@ -98,7 +98,11 @@ class TestRelojGrueso(_ConHub):
     def test_receive_con_limite_sin_trafico_espera_todo_el_limite(self):
         for T, nombre, _ in self.TIPOS:
             sub = self._sub(T, f"/grueso/limite/{nombre}")
-            for limite, minimo, veces in ((1.0, 0.95, 2), (0.5, 0.475, 2)):
+            # El mínimo deja tres pasos del reloj (3 × 15.6 ms) de margen: con un reloj grueso el límite se
+            # calcula desde una lectura redondeada hacia abajo, y en Windows la espera misma despierta en
+            # múltiplos de ~15.6 ms (en el CI, receive(0.5) volvió a los 0.474 s). El defecto que se vigila
+            # volvía a los 0.2 s (un tramo), muy lejos de este margen.
+            for limite, minimo, veces in ((1.0, 1.0 - 3 * 0.015625, 2), (0.5, 0.5 - 3 * 0.015625, 2)):
                 for _ in range(veces):
                     with mock.patch.object(pubsub, "time", reloj_grueso()):
                         t0 = time.perf_counter()
