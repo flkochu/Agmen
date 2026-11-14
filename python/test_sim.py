@@ -1,32 +1,42 @@
-"""Pruebas de la clase `Mundo` (examples/sim/mundo.py, RFC 0011 §3.3): la física sola, sin Agmen.
+"""Pruebas del mundo de MuJoCo (examples/sim/, RFC 0011 §3.3), que son tres archivos: fisica.py (la clase
+`Mundo`, la física sola, sin Agmen), ver.py (la ventana de --ver) y mundo.py (el nodo).
 
-mundo.py no es un paquete: se carga por ruta. Se saltan si no hay MuJoCo (pip install mujoco);
+No son un paquete: fisica.py se carga por ruta (el nodo y ver.py, con examples/sim en sys.path). Se saltan si no hay MuJoCo (pip install mujoco);
 las de la cámara se saltan además si esta máquina no puede dibujar sin ventana (OpenGL).
 El nodo completo (freno, reloj, /imu, /camara) se prueba en scripts/sim_smoke.py.
 
     python -m unittest discover -s python
 """
 
+import contextlib
+import importlib
 import importlib.util
+import io
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 RAIZ = Path(__file__).resolve().parent.parent
-MUNDO_PY = RAIZ / "examples" / "sim" / "mundo.py"
+SIM_DIR = RAIZ / "examples" / "sim"
+MUNDO_PY = SIM_DIR / "mundo.py"      # el nodo
+FISICA_PY = SIM_DIR / "fisica.py"    # la clase Mundo y la plomería de MuJoCo/OpenGL
+VER_PY = SIM_DIR / "ver.py"          # la ventana de --ver
 ROBOT_XML = RAIZ / "examples" / "sim" / "robot.xml"
 HAY_MUJOCO = importlib.util.find_spec("mujoco") is not None
 SIN_MUJOCO = "falta MuJoCo: pip install mujoco (o pip install agmen[sim])"
 
 
 def cargar_modulo():
-    spec = importlib.util.spec_from_file_location("agmen_ejemplo_mundo", MUNDO_PY)
+    spec = importlib.util.spec_from_file_location("agmen_ejemplo_mundo", FISICA_PY)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -492,7 +502,7 @@ class TestImagen(unittest.TestCase):
 
 PRELUDIO = (
     "import importlib.util as u\n"
-    f"s = u.spec_from_file_location('mundo', r'{MUNDO_PY}'); m = u.module_from_spec(s); s.loader.exec_module(m)\n"
+    f"s = u.spec_from_file_location('mundo', r'{FISICA_PY}'); m = u.module_from_spec(s); s.loader.exec_module(m)\n"
 )
 
 
@@ -630,10 +640,11 @@ class TestWithYCerrar(unittest.TestCase):
         self.assertIsNone(m._dibujo)
         self.assertNotIn(m, _mod._ABIERTOS)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "osmesa y egl son de Linux (en Windows y Mac MUJOCO_GL es otro)")
     def test_salir_sin_cerrar_no_deja_exception_ignored(self):
         codigo = (
             "import importlib.util as u, sys\n"
-            f"s = u.spec_from_file_location('mundo', r'{MUNDO_PY}'); m = u.module_from_spec(s); s.loader.exec_module(m)\n"
+            f"s = u.spec_from_file_location('mundo', r'{FISICA_PY}'); m = u.module_from_spec(s); s.loader.exec_module(m)\n"
             "m.elegir_gl()\n"
             "w = m.Mundo()\n"
             "try:\n"
@@ -800,7 +811,7 @@ print("CUENTAS " + json.dumps(cuentas))
 def _driver(codigo: str, extra_env: dict):
     """Corre un driver de Python que sustituye agmen.clock.now_ns o manda /clock y ejecuta mundo.py."""
     pre = f"import sys; sys.argv_mundo = r'{MUNDO_PY}'\n"
-    return correr(pre + codigo, [RAIZ / "python"], {"AGMEN_HUB": "127.0.0.1:7394", **extra_env})
+    return correr(pre + codigo, [RAIZ / "python", SIM_DIR], {"AGMEN_HUB": "127.0.0.1:7394", **extra_env})
 
 
 @unittest.skipUnless(HAY_MUJOCO, SIN_MUJOCO)
@@ -840,13 +851,232 @@ class TestNodoPasoLargo(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
 
 
+class TestTresArchivos(unittest.TestCase):
+    """El simulador son tres archivos (examples/sim/): fisica.py no sabe de Agmen ni carga MuJoCo al importarse;
+    mundo.py (el nodo) y ver.py (la ventana) importan a fisica, así que examples/sim tiene que estar en sys.path."""
+
+    CARGA = (
+        "import sys, importlib.util as u\n"
+        f"sys.path.insert(0, r'{SIM_DIR}')\n"
+    )
+
+    def test_importar_fisica_no_deja_agmen_ni_mujoco(self):
+        codigo = self.CARGA + (
+            "import os, fisica\n"
+            "malos = sorted(k for k in sys.modules if k.split('.')[0] in ('agmen', 'mujoco'))\n"
+            "print('CARGADOS', malos)\n"
+            "print('GL', os.environ.get('MUJOCO_GL'))\n"
+        )
+        r = correr(codigo, [RAIZ / "python"])        # con agmen al alcance: si lo importara, se vería
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("CARGADOS []", r.stdout)
+        self.assertIn("GL None", r.stdout, "importar fisica no toca MUJOCO_GL")
+        self.assertEqual(r.stderr.strip(), "", r.stderr)
+
+    def test_mundo_py_se_carga_por_ruta_con_sim_en_sys_path(self):
+        codigo = self.CARGA + (
+            f"s = u.spec_from_file_location('mundo', r'{MUNDO_PY}'); m = u.module_from_spec(s); s.loader.exec_module(m)\n"
+            "print('MAIN', callable(m.main), callable(m.di), m.TRAMO, m.fisica.__name__)\n"
+            "malos = sorted(k for k in sys.modules if k.split('.')[0] in ('agmen', 'mujoco'))\n"
+            "print('CARGADOS', malos)\n"
+        )
+        r = correr(codigo, [RAIZ / "python"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("MAIN True True 10000000 fisica", r.stdout)
+        self.assertIn("CARGADOS []", r.stdout, "agmen y MuJoCo se cargan dentro de main(), no al importar")
+
+    def test_mundo_py_por_ruta_sin_sim_en_sys_path_falla_con_modulenotfound_de_fisica(self):
+        # Documenta la regla: sin examples/sim en sys.path no hay fisica. (Como script, python lo pone solo.)
+        codigo = (
+            "import importlib.util as u\n"
+            f"s = u.spec_from_file_location('mundo', r'{MUNDO_PY}'); m = u.module_from_spec(s)\n"
+            "try:\n"
+            "    s.loader.exec_module(m)\n"
+            "except ModuleNotFoundError as e:\n"
+            "    print('FALTA', e.name)\n"
+        )
+        r = correr(codigo, [])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("FALTA fisica", r.stdout)
+
+    def test_ver_se_importa_sin_pantalla_ni_mujoco(self):
+        codigo = self.CARGA + (
+            "import ver\n"
+            "print('API', callable(ver.abrir), ver.Ventana.__name__)\n"
+            "malos = sorted(k for k in sys.modules if k.split('.')[0] in ('agmen', 'mujoco', 'glfw'))\n"
+            "print('CARGADOS', malos)\n"
+        )
+        r = correr(codigo, [RAIZ / "python"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("API True Ventana", r.stdout)
+        self.assertIn("CARGADOS []", r.stdout, "ver.py importa glfw y mujoco.viewer solo al abrir")
+
+    @unittest.skipUnless(HAY_MUJOCO and sys.platform.startswith("linux"), "pantalla falsa: solo en Linux, con MuJoCo")
+    def test_ver_abrir_sin_pantalla_devuelve_none_y_lo_dice(self):
+        codigo = self.CARGA + (
+            "import threading, types, ver\n"
+            "v = ver.abrir(types.SimpleNamespace(modelo=None, datos=None), threading.Lock())\n"
+            "print('RESULTADO', v)\n"
+        )
+        for display in ("", ":99"):
+            with self.subTest(DISPLAY=display):
+                r = correr(codigo, [], {"DISPLAY": display, "WAYLAND_DISPLAY": ""})
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("RESULTADO None", r.stdout)
+                self.assertIn("[mundo] --ver necesita pantalla (GLFW: ", r.stdout)
+                self.assertIn("sigo sin ventana", r.stdout)
+                self.assertNotIn("Traceback", r.stderr)
+
+
+class _VisorFalso:
+    def __init__(self, candado=None) -> None:
+        self.corriendo, self.syncs, self.cerrado, self.candado, self.con_candado = True, 0, 0, candado, []
+
+    def is_running(self):
+        return self.corriendo
+
+    def sync(self):
+        self.syncs += 1
+        self.con_candado.append(self.candado.locked())
+
+    def close(self):
+        self.cerrado += 1
+
+
+class TestVentana(unittest.TestCase):
+    """ver.py con un GLFW y un mujoco.viewer falsos (en sys.modules): no abre ninguna ventana de verdad,
+    así que corre igual en cualquier sistema."""
+
+    def setUp(self):
+        ctx = mock.patch.object(sys, "path", [str(SIM_DIR), *sys.path])
+        ctx.start()
+        self.addCleanup(ctx.stop)
+        tocados = ("ver", "fisica", "glfw", "mujoco", "mujoco.viewer")     # solo estos: se restauran tal cual
+        antes = {k: sys.modules[k] for k in tocados if k in sys.modules}
+        self.addCleanup(lambda: ([sys.modules.pop(k, None) for k in tocados], sys.modules.update(antes)))
+        for k in ("ver", "fisica"):
+            sys.modules.pop(k, None)
+        self.glfw = types.ModuleType("glfw")
+        self.glfw.init = lambda: True
+        self.viewer = types.ModuleType("mujoco.viewer")
+        self.visor = _VisorFalso()
+        self.lanzado = []
+
+        def launch_passive(modelo, datos):
+            self.lanzado.append((modelo, datos, self.candado.locked()))
+            self.visor.candado = self.candado
+            self.hilo = threading.Thread(target=time.sleep, args=(0.05,))   # un hilo que deja la ventana
+            self.hilo.start()
+            return self.visor
+
+        self.viewer.launch_passive = launch_passive
+        mujoco = types.ModuleType("mujoco")
+        mujoco.__path__ = []
+        mujoco.viewer = self.viewer
+        sys.modules.update({"glfw": self.glfw, "mujoco": mujoco, "mujoco.viewer": self.viewer})
+        self.ver = importlib.import_module("ver")
+        self.candado = threading.Lock()
+        self.mundo = types.SimpleNamespace(modelo="MODELO", datos="DATOS")
+
+    def abrir(self):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            v = self.ver.abrir(self.mundo, self.candado)
+        return v, out.getvalue()
+
+    def test_abre_y_lo_dice(self):
+        v, out = self.abrir()
+        self.assertIsInstance(v, self.ver.Ventana)
+        self.assertEqual(out, "[mundo] ventana abierta: si la cierras, el robot sigue (sin ventana)\n")
+        self.assertEqual(self.lanzado, [("MODELO", "DATOS", True)], "mujoco.viewer se lanza con el candado tomado")
+        v.cerrar()
+
+    def test_sin_pantalla_glfw_dice_el_motivo_y_devuelve_none(self):
+        def init():
+            import warnings
+            warnings.warn("65550 b'X11: The DISPLAY environment variable is missing'")
+            return False
+
+        self.glfw.init = init
+        v, out = self.abrir()
+        self.assertIsNone(v)
+        self.assertEqual(out, "[mundo] --ver necesita pantalla (GLFW: X11: The DISPLAY environment variable is missing); "
+                              "sigo sin ventana\n")
+        self.assertEqual(self.lanzado, [], "sin pantalla no se lanza el visor")
+
+    def test_sin_pantalla_y_sin_aviso_dice_sin_motivo(self):
+        self.glfw.init = lambda: False
+        v, out = self.abrir()
+        self.assertIsNone(v)
+        self.assertIn("(GLFW: sin motivo); sigo sin ventana", out)
+
+    def test_si_falta_glfw_devuelve_none_en_una_linea(self):
+        sys.modules["glfw"] = None                 # "import glfw" -> ImportError
+        v, out = self.abrir()
+        self.assertIsNone(v)
+        self.assertEqual(out.count("\n"), 1, out)
+        self.assertIn("[mundo] --ver no pudo abrir la ventana (", out)
+        self.assertIn("sigo sin ventana", out)
+
+    def test_si_el_visor_truena_devuelve_none_con_la_primera_linea(self):
+        def truena(modelo, datos):
+            raise RuntimeError("launch_passive necesita mjpython en macOS\nsegunda línea larga")
+
+        self.viewer.launch_passive = truena
+        v, out = self.abrir()
+        self.assertIsNone(v)
+        self.assertEqual(out, "[mundo] --ver no pudo abrir la ventana (launch_passive necesita mjpython en macOS); "
+                              "sigo sin ventana\n")
+        self.assertFalse(self.candado.locked(), "el candado se suelta aunque el visor truene")
+
+    def test_al_dia_sincroniza_unas_30_veces_por_segundo_de_pared(self):
+        v, _ = self.abrir()
+        seg = self.ver.SEG
+        t0, paso = seg, seg // 30 + 1              # 33.3 ms (el +1 evita el redondeo de SEG / 30)
+        v.al_dia(t0, 1.0)                          # la primera vez solo marca la hora
+        self.assertEqual(self.visor.syncs, 0)
+        v.al_dia(t0 + seg // 100, 1.0)             # 10 ms después: todavía no
+        self.assertEqual(self.visor.syncs, 0)
+        v.al_dia(t0 + paso, 1.0)                   # 33 ms: sí
+        self.assertEqual(self.visor.syncs, 1)
+        v.al_dia(t0 + paso + seg // 100, 1.0)
+        self.assertEqual(self.visor.syncs, 1)
+        v.al_dia(t0 + 2 * paso, 2.0)               # a ×2 se espera el doble: 33 ms ya no bastan
+        self.assertEqual(self.visor.syncs, 1)
+        v.al_dia(t0 + 3 * paso, 2.0)
+        self.assertEqual(self.visor.syncs, 2)
+        self.assertEqual(self.visor.con_candado, [True, True], "sync() corre con el candado tomado")
+        self.assertFalse(self.candado.locked())
+        v.cerrar()
+
+    def test_si_cierras_la_ventana_lo_dice_una_vez_y_el_robot_sigue(self):
+        v, _ = self.abrir()
+        seg = self.ver.SEG
+        v.al_dia(seg, 1.0)
+        self.visor.corriendo = False
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            v.al_dia(2 * seg, 1.0)
+            v.al_dia(3 * seg, 1.0)                 # ya sin ventana: no hace nada ni repite el aviso
+        self.assertEqual(out.getvalue(), "[mundo] cerraste la ventana: el robot sigue, sin ventana\n")
+        self.assertEqual(self.visor.syncs, 0)
+        v.cerrar()                                 # y cerrar después no truena
+        self.assertEqual(self.visor.cerrado, 0, "la ventana ya la cerró el usuario: no se cierra otra vez")
+        self.assertFalse(self.hilo.is_alive(), "cerrar() espera a los hilos de la ventana")
+
+    def test_cerrar_cierra_el_visor_una_vez_y_espera_a_sus_hilos(self):
+        v, _ = self.abrir()
+        v.cerrar()
+        v.cerrar()                                 # idempotente
+        self.assertEqual(self.visor.cerrado, 1)
+        self.assertFalse(self.hilo.is_alive())
+
+
 class TestSinAgmen(unittest.TestCase):
     @unittest.skipUnless(HAY_MUJOCO, SIN_MUJOCO)
     def test_mundo_no_importa_agmen(self):
-        # python/ en el PYTHONPATH: si Mundo importara agmen, lo cargaría y se vería en sys.modules.
+        # python/ en el PYTHONPATH: si fisica.py importara agmen, lo cargaría y se vería en sys.modules.
         codigo = (
             "import sys, importlib.util as u\n"
-            f"s = u.spec_from_file_location('mundo', r'{MUNDO_PY}'); m = u.module_from_spec(s); s.loader.exec_module(m)\n"
+            f"s = u.spec_from_file_location('mundo', r'{FISICA_PY}'); m = u.module_from_spec(s); s.loader.exec_module(m)\n"
             "w = m.Mundo(); w.comando(0.3, 0.3); w.avanzar(50); w.imu(); w.pose(); w.reiniciar()\n"
             "try:\n"
             "    w.imagen()\n"
@@ -878,7 +1108,7 @@ class TestFaltaDependencia(unittest.TestCase):
         self.falso("mujoco")
         codigo = (
             "import importlib.util as u\n"
-            f"s = u.spec_from_file_location('mundo', r'{MUNDO_PY}'); m = u.module_from_spec(s); s.loader.exec_module(m)\n"
+            f"s = u.spec_from_file_location('mundo', r'{FISICA_PY}'); m = u.module_from_spec(s); s.loader.exec_module(m)\n"
             "try:\n"
             "    m.Mundo()\n"
             "except m.ErrorDelMundo as e:\n"
@@ -899,7 +1129,7 @@ class TestFaltaDependencia(unittest.TestCase):
         self.falso("numpy")
         codigo = (
             "import importlib.util as u\n"
-            f"s = u.spec_from_file_location('mundo', r'{MUNDO_PY}'); m = u.module_from_spec(s); s.loader.exec_module(m)\n"
+            f"s = u.spec_from_file_location('mundo', r'{FISICA_PY}'); m = u.module_from_spec(s); s.loader.exec_module(m)\n"
             "try:\n"
             "    m.Mundo()\n"
             "except m.ErrorDelMundo as e:\n"
