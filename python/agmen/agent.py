@@ -73,6 +73,9 @@ MAX_PENDING_IP = 4              # conexiones sin saludar a la vez desde una IP
 MAX_PENDING_TOTAL = 32          # … y en total (1 guardada para la IP de la última sesión aceptada)
 MAX_TRACKED_IPS = 1024          # IP que se recuerdan para los límites (las más viejas se olvidan)
 NOTES_PER_MINUTE = 20           # avisos por conexiones sin clave en la terminal del agente
+ERROR_DRAIN = 0.5               # tras mandar una línea de error: hasta esto esperando a que la otra punta cierre
+ERROR_DRAIN_BYTES = 4 * HELLO_MAX  # … y no se lee más que esto de lo que mandó (más: se cierra sin esperar)
+TURN_AWAY_CLOSERS = 8           # cierres ordenados a la vez de conexiones rechazadas por los topes (más: directo)
 LOG_LINE_MAX = 8 * 1024         # bytes de una línea de log que se manda (más se corta)
 OUT_MAX_MSGS = 5000             # cola de salida del agente: con esto, o
 OUT_MAX_BYTES = 4 * 1024 * 1024  # con esto, los log se descartan
@@ -509,6 +512,34 @@ def _send_raw(sock: socket.socket, text: str) -> None:
         raise HandshakeError("cerrado", f"la conexión se cortó ({e.strerror or e})") from None
 
 
+def _close_after_error(sock: socket.socket, timeout: float = ERROR_DRAIN) -> None:
+    """Cierra una conexión a la que se le acaba de mandar una línea de error, sin que se pierda.
+
+    Si se cerrara con algo de la otra punta sin leer (su hola, si se le rechaza antes de leerlo),
+    o si eso llegara después, el sistema contesta con RST en vez de un cierre normal; y en Windows
+    un RST borra lo que la otra punta aún no leía: agmen run diría "se cerró la conexión" en vez de
+    "la clave está mal" o "espera" (regla 1). Por eso: primero el fin de lo que se manda
+    (shutdown), luego se vacía lo que llegue hasta que la otra punta cierre, con plazo y tope de
+    bytes (nadie retiene la conexión), y al final close()."""
+    end = time.monotonic() + timeout
+    try:
+        sock.shutdown(socket.SHUT_WR)
+        got = 0
+        while got <= ERROR_DRAIN_BYTES:
+            left = end - time.monotonic()
+            if left <= 0:
+                break
+            sock.settimeout(left)
+            data = sock.recv(4096)
+            if not data:   # la otra punta ya leyó y cerró
+                break
+            got += len(data)
+    except OSError:
+        pass
+    finally:
+        sock.close()
+
+
 def _read_hs(lines: _Lines, deadline: float, what: str) -> str:
     try:
         return lines.read(HELLO_MAX, deadline)
@@ -873,6 +904,7 @@ class AgentServer:
         self._pending_total = 0
         self._notes: deque[float] = deque()          # avisos sin clave del último minuto (tope global)
         self._notes_skipped = 0
+        self._closers = threading.BoundedSemaphore(TURN_AWAY_CLOSERS)   # cierres ordenados de _turn_away
 
     def use_key(self, key: str) -> None:
         self._key = derive_key(key)
@@ -961,14 +993,26 @@ class AgentServer:
             return True
 
     def _turn_away(self, conn: socket.socket, ip: str, key: str) -> None:
+        """Rechaza una conexión que no cabe en los topes de conexiones sin saludar. Corre en el hilo
+        que acepta: el cierre ordenado (su hola llega sin leer) va en otro hilo, como mucho
+        TURN_AWAY_CLOSERS a la vez; si ya están todos ocupados, se cierra directo."""
         try:
             conn.settimeout(0.2)
             conn.sendall(b"error espera demasiadas conexiones a la vez (desde tu IP o en total) sin completar "
                          b"el saludo: cierra las que no uses y vuelve a intentar en unos segundos\n")
         except OSError:
-            pass
-        finally:
             conn.close()
+        else:
+            if self._closers.acquire(blocking=False):
+                def close() -> None:
+                    try:
+                        _close_after_error(conn)
+                    finally:
+                        self._closers.release()
+
+                threading.Thread(target=close, daemon=True, name="agmen-agent-rechazo").start()
+            else:
+                conn.close()
         self._note_once(key, "muchas", f"rechacé conexiones de {ip}: demasiadas a la vez sin completar el saludo")
 
     def _note_once(self, key: str, what: str, text: str, kind: str = "agmen") -> None:
@@ -1037,6 +1081,9 @@ class AgentServer:
         try:
             try:
                 channel = agent_handshake(conn, self._key, refuse=refuse)
+            except HandshakeError:
+                _close_after_error(conn)   # todavía cuenta como conexión sin saludar (los topes la cubren)
+                raise
             finally:
                 with self.lock:
                     rec = self._rec(key)

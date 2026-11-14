@@ -2471,6 +2471,35 @@ class TestLimitesDelSaludo(ServerCase):
         self.assertTrue(self.espera(lambda: self.server._pending_total == 0, 30), self.server._pending_total)
         self.assertIsInstance(self.saludo(K()), Channel)
 
+    def test_la_rechazada_que_ya_saludo_recibe_su_error_y_un_cierre_normal_no_un_rst(self):
+        # La quinta manda su hola (como agmen run) y el agente la rechaza sin leerlo. Si cerrara así, con datos
+        # sin leer, el sistema mandaría RST; en Windows el RST borra lo que agmen run aún no leía y la línea de
+        # error se pierde ("se cerró la conexión" en vez de "espera"). En Linux el RST no borra la línea, pero se
+        # ve: tras ella, recv da ConnectionResetError en vez de fin de conexión (b"").
+        self.start_server()
+        for _ in range(agent.MAX_PENDING_IP):
+            self.peers.append(socket.create_connection(("127.0.0.1", self.port), timeout=5))
+        self.assertTrue(self.espera(lambda: self.server._pending_total == agent.MAX_PENDING_IP, 30))
+        for intento in range(3):
+            with self.subTest(intento=intento):
+                quinta = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+                self.peers.append(quinta)
+                quinta.sendall(f"{agent.PROTOCOL} hola {'a' * 32}\n".encode())
+                time.sleep(0.2)                     # que el agente la rechace con el hola ya llegado
+                recibido = b""
+                try:
+                    while not recibido.endswith(b"\n"):
+                        dato = quinta.recv(4096)
+                        if not dato:
+                            break
+                        recibido += dato
+                    fin = quinta.recv(4096)
+                except ConnectionResetError:
+                    self.fail(f"el agente cerró con RST (llegó {recibido!r}): en Windows la línea de error se pierde")
+                self.assertTrue(recibido.startswith(b"error espera demasiadas conexiones"), recibido)
+                self.assertEqual(fin, b"", "después del error, el fin normal de la conexión")
+                quinta.close()
+
     @unittest.skipUnless(source_ip_available("127.0.0.2"), "necesita 127.0.0.2 para ser otra IP")
     def test_las_mudas_de_una_ip_no_bloquean_a_otra(self):
         self.start_server()
