@@ -641,14 +641,17 @@ class _Beats:
                 except Exception:  # noqa: BLE001 — un latido fallido no tumba a nadie
                     pass
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 2.0) -> bool:
         """Al salir del intérprete: espera a que el hilo termine el latido en curso. Un hilo daemon
         que vuelve de una llamada de C++ que soltó el GIL cuando el intérprete ya se finaliza es
-        terminado con pthread_exit, y ese desenrollado forzado aborta el proceso (SIGABRT)."""
+        terminado con pthread_exit, y ese desenrollado forzado aborta el proceso (SIGABRT).
+        Devuelve False si el hilo sigue vivo al vencer `timeout`."""
         self.stopping.set()
         t = self.thread
         if t is not None and t is not threading.current_thread():
-            t.join(2.0)   # un latido dura microsegundos; el límite es por si su aviso se atora (stderr lleno)
+            t.join(timeout)   # un latido dura microsegundos; el límite es por si su aviso se atora (stderr lleno)
+            return not t.is_alive()
+        return True
 
 
 _beats = _Beats()
@@ -797,7 +800,27 @@ if _backend.NATIVE:
             except (OSError, ValueError):
                 pass
 
+    # Límite total del cierre: lo normal es que tarde nada (o lo que tarda en volver un receive(), a
+    # lo más 0.2 s, o un spin(), a lo más 0.1 s); el límite es por si una llamada se atora.
+    _CIERRE_S = 2.0
+
+    def _cierre() -> None:
+        """atexit (corre antes de que el intérprete empiece a finalizar): el núcleo de C++ queda
+        "cerrando". Los demás hilos ya no sueltan ni toman el GIL al entrar al núcleo (publish()
+        devuelve False, receive() None, spin() vuelve), y se espera a los que ya estaban dentro.
+        Así ningún hilo vuelve de C++ durante la finalización, que lo terminaría y abortaría el
+        proceso (Python 3.12: SIGABRT, "terminate called without an active exception")."""
+        falta, sobra = _backend.core._shutdown(_CIERRE_S)
+        partes = [falta] if falta else []
+        if not _beats.stop(sobra):
+            partes.append("el hilo de latidos")
+        if partes:
+            _stderr(f"[agmen] ⚠ al salir no terminaron en {_CIERRE_S:g} s: {'; '.join(partes)}. El programa sale "
+                    "igual; si un hilo tuyo usa agmen, detenlo (o cierra lo suyo con close()) antes de salir")
+
     _backend.core.set_log_sink(_stderr)
     atexit.register(_backend.core.set_log_sink, None)
-    atexit.register(_beats.stop)
+    atexit.register(_cierre)
+    if hasattr(os, "register_at_fork"):
+        os.register_at_fork(after_in_child=_backend.core._after_fork_child)
     _backend.core.set_default_node_name(node_name())

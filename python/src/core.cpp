@@ -21,15 +21,20 @@
 #include <agmen/agmen.hpp>
 #include <agmen/shm.hpp>
 
+#include <array>
+#include <atomic>
 #include <bit>
 #include <cfloat>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -53,6 +58,109 @@ PyObject* g_wire_error = nullptr;
 
 [[noreturn]] void schema_error(const std::string& msg) { raise(g_schema_error, msg); }
 
+// ---------------------------------------------------------------------------
+// El cierre del intérprete.
+//
+// Un hilo que vuelve a tomar el GIL cuando el intérprete ya se está
+// finalizando es terminado por CPython (3.12: pthread_exit). Si en su pila hay
+// código nuestro (un gil_scoped_release, un gil_scoped_acquire, el despacho de
+// nanobind), ese desenrollado forzado cruza un destructor noexcept y el
+// proceso aborta ("terminate called without an active exception").
+//
+// Por eso, al salir (atexit, que corre ANTES de que empiece la finalización),
+// agmen llama a _shutdown(): el núcleo queda "cerrando", y desde entonces
+//   - las llamadas que soltarían el GIL, desde otros hilos, no lo sueltan: no
+//     hacen nada y regresan (publish → False, receive → None, spin → vuelve);
+//   - los hilos de C++ ya no toman el GIL (las funciones de un Node no corren;
+//     un aviso sale directo a stderr);
+//   - _shutdown() espera, con límite, a las llamadas que ya estaban dentro,
+//     hasta que hayan vuelto a Python con el GIL.
+// El hilo que cierra (el que corre atexit y luego finaliza) sigue normal.
+// ---------------------------------------------------------------------------
+
+// Lo que puede estar en curso al salir (para decir qué quedó sin cerrar).
+enum class Inside : std::size_t { Publish, Receive, Heartbeat, Spin, Callback, Log, Close, Create, Release, Count };
+
+constexpr std::array<const char*, static_cast<std::size_t>(Inside::Count)> kInsideName = {
+    "publish()", "receive()", "un latido", "spin()", "una función de un Node", "un aviso",
+    "close()", "crear un Publisher o Subscriber", "soltar una función de Python"};
+
+struct alignas(64) InsideCount {
+    std::atomic<int> n{0};
+};
+
+std::array<InsideCount, static_cast<std::size_t>(Inside::Count)> g_inside;
+std::atomic<bool> g_closing{false};     // _shutdown() empezó
+std::atomic<bool> g_abandoned{false};   // _shutdown() se rindió (venció el límite)
+thread_local bool t_closer = false;     // este hilo es el que cierra
+
+/// ¿Este hilo ya no debe soltar ni tomar el GIL?
+bool closing_for_me() { return g_closing.load() && !t_closer; }
+
+/// Un hilo que vuelve de C++ cuando el cierre ya se rindió: si tomara el GIL,
+/// la finalización lo terminaría y el proceso abortaría. Se queda dormido; el
+/// proceso termina igual (es un hilo daemon o de C++).
+[[noreturn]] void park_forever() {
+    for (;;) std::this_thread::sleep_for(std::chrono::hours(1));
+}
+
+/// En lugar de nb::gil_scoped_release, en las llamadas desde Python. Si el
+/// núcleo está cerrando, NO suelta el GIL (`released()` = false) y quien llama
+/// decide qué hacer (normalmente regresar sin hacer nada).
+class NoGil {
+public:
+    explicit NoGil(Inside what) : n_(g_inside[static_cast<std::size_t>(what)].n) {
+        n_.fetch_add(1);   // antes de mirar g_closing: _shutdown() lo ve o nosotros lo vemos
+        if (closing_for_me()) {
+            n_.fetch_sub(1);
+            return;
+        }
+        state_ = PyEval_SaveThread();
+    }
+    ~NoGil() {
+        if (state_ == nullptr) return;
+        if (g_abandoned.load() && !t_closer) park_forever();
+        PyEval_RestoreThread(state_);
+        n_.fetch_sub(1);   // DESPUÉS de retomar el GIL: si no, _shutdown() podría seguir antes
+    }
+    NoGil(const NoGil&) = delete;
+    NoGil& operator=(const NoGil&) = delete;
+    [[nodiscard]] bool released() const { return state_ != nullptr; }
+
+private:
+    std::atomic<int>& n_;
+    PyThreadState* state_ = nullptr;
+};
+
+/// Antes de que un hilo (de C++ o de Python sin el GIL) tome el GIL para
+/// llamar a Python. Si el núcleo está cerrando, `ok()` = false: no lo tomes.
+/// Declárala ANTES del nb::gil_scoped_acquire: se descuenta después de soltarlo.
+class PyEntry {
+public:
+    explicit PyEntry(Inside what) : n_(g_inside[static_cast<std::size_t>(what)].n) {
+        n_.fetch_add(1);
+        if (closing_for_me()) {
+            n_.fetch_sub(1);
+            ok_ = false;
+        }
+    }
+    ~PyEntry() {
+        if (ok_) n_.fetch_sub(1);
+    }
+    PyEntry(const PyEntry&) = delete;
+    PyEntry& operator=(const PyEntry&) = delete;
+    [[nodiscard]] bool ok() const { return ok_; }
+
+private:
+    std::atomic<int>& n_;
+    bool ok_ = true;
+};
+
+std::runtime_error closing_error(const char* what) {
+    return std::runtime_error(std::string("agmen se está cerrando (el programa está saliendo): ya no se puede crear ") +
+                              what + " desde otro hilo. Crea tus Publisher y Subscriber antes de salir.");
+}
+
 // Una referencia a un objeto de Python que se puede guardar en C++ y
 // destruir desde cualquier hilo (toma el GIL para el conteo de referencias).
 struct PyRef {
@@ -66,6 +174,8 @@ struct PyRef {
     PyRef& operator=(const PyRef&) = delete;
     ~PyRef() {
         if (o == nullptr || Py_IsInitialized() == 0) return;
+        const PyEntry entry(Inside::Release);
+        if (!entry.ok()) return;   // cerrando: se queda la referencia (el proceso ya termina)
         nb::gil_scoped_acquire gil;
         Py_DECREF(o);
     }
@@ -419,25 +529,28 @@ nb::object payload_object(agmen::Payload p) {
 class PyPublisher {
 public:
     PyPublisher(const std::string& to, const std::string& name, const std::string& text, std::uint64_t id,
-                std::size_t size, bool arrow, const std::string& topic)
-        : core_(std::make_unique<agmen::PublisherCore>(to, type_info(name, text, id, size, arrow), topic)) {}
+                std::size_t size, bool arrow, const std::string& topic) {
+        const NoGil nogil(Inside::Create);
+        if (!nogil.released()) throw closing_error("un Publisher");
+        core_ = std::make_unique<agmen::PublisherCore>(to, type_info(name, text, id, size, arrow), topic);
+    }
 
     bool publish(nb::handle payload, std::int64_t t_data) {
         // El payload se lee del buffer de Python sin copiarlo aquí (una imagen de
         // varios MB): se copia una vez al armar el paquete, con el GIL suelto.
         Py_buffer view;
         if (PyObject_GetBuffer(payload.ptr(), &view, PyBUF_SIMPLE) != 0) throw nb::python_error();
-        auto& c = live();
         try {
+            auto& c = live();
             const agmen::wire::ByteView data(static_cast<const std::uint8_t*>(view.buf),
                                              static_cast<std::size_t>(view.len));
-            agmen::net::SendStatus st;
+            bool ok = false;   // cerrando: no se manda
             {
-                nb::gil_scoped_release nogil;
-                st = c.publish_payload(data, t_data);
+                const NoGil nogil(Inside::Publish);
+                if (nogil.released()) ok = c.publish_payload(data, t_data) == agmen::net::SendStatus::Ok;
             }
             PyBuffer_Release(&view);
-            return st == agmen::net::SendStatus::Ok;
+            return ok;
         } catch (...) {
             PyBuffer_Release(&view);
             throw;
@@ -446,8 +559,8 @@ public:
     void announce() { live().announce(); }
     void heartbeat() {
         auto& c = live();
-        nb::gil_scoped_release nogil;
-        c.heartbeat();
+        const NoGil nogil(Inside::Heartbeat);
+        if (nogil.released()) c.heartbeat();
     }
     void close() { core_.reset(); }
     [[nodiscard]] bool closed() const { return !core_; }
@@ -471,17 +584,21 @@ private:
 class PySubscriber {
 public:
     PySubscriber(const std::string& where, const std::string& name, const std::string& text, std::uint64_t id,
-                 std::size_t size, bool arrow)
-        : core_(std::make_unique<agmen::SubscriberCore>(where, type_info(name, text, id, size, arrow))) {}
+                 std::size_t size, bool arrow) {
+        const NoGil nogil(Inside::Create);
+        if (!nogil.released()) throw closing_error("un Subscriber");
+        core_ = std::make_unique<agmen::SubscriberCore>(where, type_info(name, text, id, size, arrow));
+    }
 
     /// None, o (sobre, payload, "ip:puerto"). timeout en segundos (None = sin límite).
     /// El payload es bytes o, si llegó por memoria compartida, un ShmPayload.
+    /// Cerrando el núcleo (el programa sale), regresa None sin esperar.
     std::optional<std::tuple<EnvTuple, nb::object, std::string>> receive(std::optional<double> timeout) {
         using namespace std::chrono;
         auto& c = live();
         const auto start = steady_clock::now();
         for (;;) {
-            milliseconds slice(200);   // Ctrl+C y latidos, aunque el timeout sea largo
+            milliseconds slice(200);   // Ctrl+C, latidos y el cierre, aunque el timeout sea largo
             if (timeout) {
                 const auto left = duration_cast<milliseconds>(duration<double>(*timeout) - (steady_clock::now() - start));
                 if (left.count() <= 0) slice = milliseconds(0);
@@ -489,7 +606,8 @@ public:
             }
             std::optional<agmen::RawSample> s;
             {
-                nb::gil_scoped_release nogil;
+                const NoGil nogil(Inside::Receive);
+                if (!nogil.released()) return std::nullopt;
                 s = c.receive_raw(slice);
             }
             if (s) return std::make_tuple(env_tuple(s->envelope), payload_object(std::move(s->payload)), s->from);
@@ -505,8 +623,8 @@ public:
     }
     void heartbeat() {
         auto& c = live();
-        nb::gil_scoped_release nogil;
-        c.heartbeat();
+        const NoGil nogil(Inside::Heartbeat);
+        if (nogil.released()) c.heartbeat();
     }
     void close() { core_.reset(); }
     [[nodiscard]] bool closed() const { return !core_; }
@@ -528,14 +646,29 @@ private:
 // Node
 // ---------------------------------------------------------------------------
 
+class PyNode;
+std::vector<PyNode*> g_nodes;   // los Node vivos; se toca solo con el GIL
+
 class PyNode {
 public:
-    explicit PyNode(const std::string& name) : node_(std::make_unique<agmen::Node>(name)) {}
+    explicit PyNode(const std::string& name) : node_(std::make_unique<agmen::Node>(name)) { g_nodes.push_back(this); }
+    ~PyNode() { std::erase(g_nodes, this); }
+    PyNode(const PyNode&) = delete;
+    PyNode& operator=(const PyNode&) = delete;
+
+    /// Del cierre (con el GIL): que spin() vuelva.
+    static void stop_all() {
+        for (PyNode* p : g_nodes) {
+            if (p->node_) p->node_->stop();
+        }
+    }
 
     void every(std::int64_t period_ns, nb::handle fn, const std::string& group) {
         PyRef ref(fn);
         live().every(std::chrono::nanoseconds(period_ns),
                      [ref] {
+                         const PyEntry entry(Inside::Callback);
+                         if (!entry.ok()) return;   // cerrando: ya no se llama a Python
                          nb::gil_scoped_acquire gil;
                          PyObject* r = PyObject_CallNoArgs(ref.o);
                          if (r == nullptr) {
@@ -555,6 +688,8 @@ public:
             [ref](const agmen::RawSample& s) {
                 std::string invalid;
                 {
+                    const PyEntry entry(Inside::Callback);
+                    if (!entry.ok()) return;   // cerrando: ya no se llama a Python
                     nb::gil_scoped_acquire gil;
                     try {
                         // Regresa un texto si el payload no se pudo decodificar.
@@ -575,7 +710,8 @@ public:
 
     void spin(std::optional<double> seconds) {
         auto& n = live();
-        nb::gil_scoped_release nogil;
+        const NoGil nogil(Inside::Spin);
+        if (!nogil.released()) return;   // cerrando: no corre
         if (seconds) {
             n.spin_for(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(*seconds)));
         } else {
@@ -586,8 +722,12 @@ public:
     void stop() { live().stop(); }
     [[nodiscard]] std::string name() { return live().name(); }
     void close() {
-        nb::gil_scoped_release nogil;   // los destructores de las funciones toman el GIL
-        node_.reset();
+        // Se saca con el GIL: el cierre (stop_all) no debe ver un Node a medio destruir.
+        std::unique_ptr<agmen::Node> n = std::move(node_);
+        // Los destructores de las funciones toman el GIL. Cerrando, desde otro
+        // hilo, se destruye con el GIL (ya no corre ninguna función de Python).
+        const NoGil nogil(Inside::Close);
+        n.reset();
     }
 
     nb::list timers() {
@@ -627,7 +767,14 @@ void set_log_sink(nb::object fn) {
     }
     auto ref = std::make_shared<PyRef>(fn);
     agmen::log::set_sink([ref](std::string_view line) {
-        if (Py_IsInitialized() == 0) return;
+        const PyEntry entry(Inside::Log);
+        if (!entry.ok() || Py_IsInitialized() == 0) {
+            // Cerrando (o ya sin intérprete): directo a stderr, sin tomar el GIL.
+            std::fwrite(line.data(), 1, line.size(), stderr);
+            std::fputc('\n', stderr);
+            std::fflush(stderr);
+            return;
+        }
         nb::gil_scoped_acquire gil;
         PyObject* s = PyUnicode_FromStringAndSize(line.data(), static_cast<Py_ssize_t>(line.size()));
         if (s == nullptr) {
@@ -642,6 +789,51 @@ void set_log_sink(nb::object fn) {
             Py_DECREF(r);
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// El cierre (ver arriba): lo llama agmen en atexit, con el GIL.
+// ---------------------------------------------------------------------------
+
+/// Declara el núcleo "cerrando", detiene los spin() y espera hasta `limit_s`
+/// segundos a que las llamadas en curso vuelvan a Python. Regresa (qué quedó
+/// sin cerrar o "", segundos que sobraron del límite).
+std::tuple<std::string, double> shutdown(double limit_s) {
+    using namespace std::chrono;
+    const auto deadline = steady_clock::now() + duration_cast<steady_clock::duration>(duration<double>(limit_s));
+    t_closer = true;
+    g_closing.store(true);
+    for (;;) {
+        // Cada vuelta: un spin() que entró justo antes del cierre pudo empezar después del stop().
+        PyNode::stop_all();
+        int total = 0;
+        for (const auto& c : g_inside) total += c.n.load();
+        if (total <= 0) break;
+        if (steady_clock::now() >= deadline) {
+            g_abandoned.store(true);
+            std::string what;
+            for (std::size_t k = 0; k < g_inside.size(); ++k) {
+                const int n = g_inside[k].n.load();
+                if (n <= 0) continue;
+                if (!what.empty()) what += ", ";
+                what += std::to_string(n) + " en " + kInsideName[k];
+            }
+            return {what, 0.0};
+        }
+        nb::gil_scoped_release nogil;   // que los demás hilos retomen el GIL y salgan de C++
+        std::this_thread::sleep_for(milliseconds(1));
+    }
+    const double left = duration<double>(deadline - steady_clock::now()).count();
+    return {std::string(), left > 0 ? left : 0.0};
+}
+
+/// En el hijo de un fork (os.register_at_fork): solo existe el hilo que hizo
+/// fork, así que nada está "dentro" del núcleo y el cierre empieza de cero.
+void after_fork_child() {
+    for (auto& c : g_inside) c.n.store(0);
+    g_closing.store(false);
+    g_abandoned.store(false);
+    t_closer = false;
 }
 
 }  // namespace
@@ -683,8 +875,7 @@ NB_MODULE(_core, m) {
     nb::class_<PyPublisher>(m, "Publisher")
         .def(nb::init<const std::string&, const std::string&, const std::string&, std::uint64_t, std::size_t, bool,
                       const std::string&>(),
-             "to"_a, "name"_a, "text"_a, "schema_id"_a, "size"_a, "arrow"_a, "topic"_a,
-             nb::call_guard<nb::gil_scoped_release>())
+             "to"_a, "name"_a, "text"_a, "schema_id"_a, "size"_a, "arrow"_a, "topic"_a)
         .def("publish", &PyPublisher::publish, "payload"_a, "t_data"_a)
         .def("announce", &PyPublisher::announce)
         .def("heartbeat", &PyPublisher::heartbeat)
@@ -710,8 +901,7 @@ NB_MODULE(_core, m) {
 
     nb::class_<PySubscriber>(m, "Subscriber")
         .def(nb::init<const std::string&, const std::string&, const std::string&, std::uint64_t, std::size_t, bool>(),
-             "where"_a, "name"_a, "text"_a, "schema_id"_a, "size"_a, "arrow"_a,
-             nb::call_guard<nb::gil_scoped_release>())
+             "where"_a, "name"_a, "text"_a, "schema_id"_a, "size"_a, "arrow"_a)
         .def("receive", &PySubscriber::receive, "timeout"_a.none())
         .def("announced", &PySubscriber::announced)
         .def("heartbeat", &PySubscriber::heartbeat)
@@ -800,4 +990,6 @@ NB_MODULE(_core, m) {
     m.def("fnv1a64", [](nb::bytes b) { return agmen::wire::fnv1a64(std::string_view(b.c_str(), b.size())); });
     m.def("set_default_node_name", [](const std::string& n) { agmen::hub::set_default_node_name(n); });
     m.def("set_log_sink", &set_log_sink, "fn"_a.none());
+    m.def("_shutdown", &shutdown, "limit_s"_a);
+    m.def("_after_fork_child", &after_fork_child);
 }
