@@ -57,7 +57,7 @@ como paquetes opcionales.
 | Imágenes, tensores y texto (datos grandes) | [RFC 0008](docs/rfc/0008-datos-grandes.md) (aceptado, implementado en 0.10.0) |
 | Memoria compartida: imágenes sin copiar entre procesos | [RFC 0009](docs/rfc/0009-memoria-compartida.md) (aceptado, implementado en 0.11.0; D6 a′ en 0.11.1) |
 | Grabar, reproducir y exportar a Parquet | [RFC 0010](docs/rfc/0010-grabar-y-reproducir.md) (aceptado, implementado en 0.12.0) · [el perfil `agmen` de MCAP](docs/PROTOCOLO.md#grabaciones-mcap) |
-| Simulación y real; nodos en varias computadoras (nivel 10) | [RFC 0011](docs/rfc/0011-sim-real-y-varias-computadoras.md) (aceptado el 2026-11-13; sin implementar) |
+| Simulación y real; nodos en varias computadoras (nivel 10) | [RFC 0011](docs/rfc/0011-sim-real-y-varias-computadoras.md) (aceptado el 2026-11-13; en curso en 0.14.0: hechos los perfiles, el mundo de MuJoCo y `[[machine]]`; faltan `agmen agent`, topics entre computadoras y relojes) |
 | Mandos del panel para cualquier tipo y quién manda en el mux | [RFC 0012](docs/rfc/0012-mandos-del-panel-y-quien-manda.md) (aceptado, implementado en 0.13.0) |
 | Publicar versiones | [`docs/PUBLICAR.md`](docs/PUBLICAR.md) |
 

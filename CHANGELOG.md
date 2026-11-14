@@ -11,9 +11,10 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 - Nodos en varias computadoras. Diseño aceptado el 2026-11-13 en el
   [RFC 0011](docs/rfc/0011-sim-real-y-varias-computadoras.md) (D1–D10 = a:
   perfiles en `robot.toml`, un mundo de MuJoCo de ejemplo y `agmen agent` en
-  cada computadora). Hechos: los perfiles (bloque 1, abajo) y el mundo de
-  MuJoCo (bloque 2, abajo). Falta: `[[machine]]`, `agmen agent`, topics entre
-  computadoras y relojes (bloques 3 a 5 del plan del RFC).
+  cada computadora). Hechos: los perfiles (bloque 1, abajo), el mundo de
+  MuJoCo (bloque 2, abajo) y `[[machine]]` (bloque 3, parte 3a, abajo). Falta:
+  `agmen agent` (parte 3b), el panel con nodos de varias computadoras (3c),
+  topics entre computadoras y relojes (bloques 4 y 5 del plan del RFC).
 
 ### Agregado
 - **Perfiles en `robot.toml`** (RFC 0011 §3.2): `profile = "real"`, `"sim"`,
@@ -21,9 +22,9 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   `[[topic]]`. Sin `profile`, corren en todos. Un perfil puede ser una lista
   (`profile = ["real", "mesa"]`). Dos nodos pueden llamarse igual si nunca
   corren juntos (una `imu` real y una `imu` falsa).
-- **`[profile.X]`** con `clock`, `web` y `record`: cada una reemplaza la de
-  arriba, solo en ese perfil. `local` se acepta, pero todavía no hace nada
-  (llega con varias computadoras).
+- **`[profile.X]`** con `clock`, `web`, `record` y `local`: cada una reemplaza
+  la de arriba, solo en ese perfil. `local = true` hace que todo el perfil corra
+  en esta computadora y se ignora `machine` (en la terminal, lo dice).
 - **`[robot] profile`**: el perfil por defecto de `agmen run`. Por omisión,
   `real`.
 - **Banderas de `agmen run`**: `--sim` (lo mismo que `--profile sim`, con el
@@ -54,6 +55,24 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 - **`agmen[sim]`**: extra de `pip` que trae MuJoCo (`mujoco>=3.2.7`).
 - **Capítulo 17 del tutorial**: el mismo robot en simulación y en el mundo
   real.
+- **`[[machine]]` y `machine` en `robot.toml`** (RFC 0011 §3.4, parte 3a):
+  `[[machine]]` declara una computadora del robot con `name` y `host` (IP o
+  nombre, con `:puerto` opcional; por defecto 7391). `machine = "nombre"` en un
+  `[[node]]` o un `[[mux]]` dice en cuál corre. Los nombres de `[[machine]]`
+  son únicos, y dos `[[machine]]` no pueden tener el mismo `host`. Un nodo sin
+  `machine` corre donde corres `agmen run`, como antes.
+- **Qué funciona hoy con `machine`**: `agmen run` decide si cada `[[machine]]`
+  es esta computadora (una de sus IP, o loopback) y lo dice en la terminal
+  (`es esta computadora; sus nodos corren aquí`). Si lo es, sus nodos arrancan
+  aquí. Un nombre que no resuelve en 1.5 s se toma como otra computadora, y el
+  aviso pide poner la IP en `host`.
+- **Lo que todavía no existe**: arrancar nodos en otra computadora. Si un nodo
+  dice `machine` de otra computadora, `agmen run` sale con código 2 sin
+  arrancar nada (ni el hub) y dice qué hacer. Eso llega con `agmen agent`, en
+  una versión próxima.
+- **Capítulo 5 del tutorial, sección 7**: cómo declarar `[[machine]]`, qué
+  funciona hoy, la IP contra el nombre y por qué el hardware va con
+  `profile = "real"`.
 
 ### Cambiado
 - **El robot del tutorial usa perfiles.** `imu` y `motor` son

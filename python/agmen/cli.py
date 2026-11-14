@@ -91,11 +91,38 @@ def cmd_run(args) -> int:
             n.autostart = False             # se puede arrancar desde el panel
         if args.play:                       # RFC 0010: todos con el tiempo de la grabación
             n.env.update({"AGMEN_CLOCK": "replay", "AGMEN_CLOCK_SOURCE": "agmen"})
-    launcher = Launcher(config)
+    places = {}   # RFC 0011 §3.4: dónde corre cada [[machine]]; nunca medio robot en silencio.
+    # Después de los errores del archivo: esta consulta puede tardar hasta 1.5 s (DNS)
+    player = None
+    if config.machines:
+        from .machines import place_machines, remote_error
+
+        if args.play:   # la grabación tampoco depende de la red: se revisa antes
+            from .play import Player
+
+            try:
+                player = Player(args.play, args.play_topic or None, paused=True)
+            except (ValueError, OSError) as e:
+                print(f"error: --play: {e}", file=sys.stderr)
+                return 2
+        places = place_machines(config)
+        remote = remote_error(config, places)
+        if remote:
+            if player is not None:
+                player.stop()
+            print(f"error: {remote}", file=sys.stderr)
+            return 2
+
+    launcher = Launcher(config, places=places)
     out = _SayTo(launcher)
     launcher.say(f"Agmen {__version__} · robot '{config.name}' · {len(config.nodes)} nodos · {hub_note}")
     if args.play or config.profile != "real" or config.skipped:   # un robot.toml sin perfiles se ve como antes
         launcher.say(_profile_line(config, bool(args.play)))
+    if config.machines:
+        from .machines import placement_lines
+
+        for line in placement_lines(config, places):
+            launcher.say(line)
     if args.play:   # RFC 0011, reto 1: los nodos 'real' con datos grabados, que se note
         real = [n.name for n in config.nodes if "real" in n.profiles and n.name not in args.skip]
         if real:
@@ -112,19 +139,29 @@ def cmd_run(args) -> int:
 
         for line in other_robot(config):
             launcher.say(line)
-    if not launcher.run_before():
+    try:
+        ready = launcher.run_before()
+    except BaseException:           # Ctrl+C en un comando de before: la grabación ya abierta se cierra
+        if player is not None:
+            player.stop()
+        raise
+    if not ready:
         launcher.printer.close()
+        if player is not None:
+            player.stop()
         return 1
-    player = None
     if args.play:
-        from .play import Player
+        if player is not None:      # ya revisada antes de la consulta de red ([[machine]])
+            player.out = out
+        else:
+            from .play import Player
 
-        try:
-            player = Player(args.play, args.play_topic or None, paused=True, out=out)
-        except (ValueError, OSError) as e:
-            launcher.printer.close()
-            print(f"error: --play: {e}", file=sys.stderr)
-            return 2
+            try:
+                player = Player(args.play, args.play_topic or None, paused=True, out=out)
+            except (ValueError, OSError) as e:
+                launcher.printer.close()
+                print(f"error: --play: {e}", file=sys.stderr)
+                return 2
         if config.clock.mode == "sim":
             launcher.say("⚠ --play usa el tiempo de la grabación: no aplica [clock] mode = \"sim\"")
         player.start()
