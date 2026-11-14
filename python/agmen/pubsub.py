@@ -634,6 +634,10 @@ _cerrando = False
 _LOCK_AL_CERRAR_S = 0.2
 
 
+# Los Publisher y Subscriber nativos vivos: en el hijo de un fork sus locks se reponen (_despues_de_fork).
+_nativos: weakref.WeakSet = weakref.WeakSet()
+
+
 def _lock_or_skip(lock) -> bool:
     """Toma `lock`; al salir (ver _cerrando), con límite: False = no se pudo."""
     return lock.acquire(timeout=_LOCK_AL_CERRAR_S) if _cerrando else lock.acquire()
@@ -697,6 +701,7 @@ class _NativePublisher:
         self.topic = self._core.topic
         self.source_id = self._core.source_id
         self._lock = threading.Lock()
+        _nativos.add(self)
         if hp.is_topic(to):
             _beats.add(self)
 
@@ -772,6 +777,7 @@ class _NativeSubscriber:
                                               layout.size or 0, layout.encoding == wire.ENC_ARROW)
         self.listen = f"127.0.0.1:{self._core.port}" if self.topic else where
         self._lock = threading.Lock()
+        _nativos.add(self)
         if self.topic:
             _beats.add(self)   # sigue latiendo aunque no llames receive() por un rato
 
@@ -881,11 +887,19 @@ if _backend.NATIVE:
         _avisado = True
 
     def _despues_de_fork() -> None:
-        """En el hijo de un fork: el cierre empieza de cero (C++ y los locks de aquí)."""
+        """En el hijo de un fork (un solo hilo): el cierre empieza de cero, en C++ y aquí. Un lock que
+        tenía un hilo del padre (el de latidos en _beat, un close()) quedaría tomado para siempre: se
+        reponen los de los Publisher y Subscriber nativos vivos y el estado del hilo de latidos, que en
+        el hijo no existe (el próximo Publisher o Subscriber lo arranca de nuevo)."""
         global _cerrando, _avisado
         _backend.core._after_fork_child()
         _cerrando = False
         _avisado = False
+        for o in list(_nativos):
+            o._lock = threading.Lock()
+        _beats.lock = threading.Lock()
+        _beats.stopping = threading.Event()
+        _beats.thread = None
 
     _backend.core.set_log_sink(_stderr)
     atexit.register(_backend.core.set_log_sink, None)

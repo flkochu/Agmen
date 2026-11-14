@@ -44,6 +44,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -637,13 +638,29 @@ private:
     std::unique_ptr<agmen::PublisherCore> core_;
 };
 
+class PySubscriber;
+std::vector<PySubscriber*> g_subs;   // los Subscriber vivos (para el fork); se toca solo con el GIL
+
 class PySubscriber {
 public:
     PySubscriber(const std::string& where, const std::string& name, const std::string& text, std::uint64_t id,
                  std::size_t size, bool arrow) {
-        const NoGil nogil(Inside::Create);
-        if (!nogil.released()) throw closing_error("un Subscriber");
-        core_ = std::make_unique<agmen::SubscriberCore>(where, type_info(name, text, id, size, arrow));
+        {
+            const NoGil nogil(Inside::Create);
+            if (!nogil.released()) throw closing_error("un Subscriber");
+            core_ = std::make_unique<agmen::SubscriberCore>(where, type_info(name, text, id, size, arrow));
+        }
+        g_subs.push_back(this);   // ya con el GIL
+    }
+    ~PySubscriber() { std::erase(g_subs, this); }
+    PySubscriber(const PySubscriber&) = delete;
+    PySubscriber& operator=(const PySubscriber&) = delete;
+
+    /// En el hijo de un fork (con el GIL, un solo hilo): el turno de receive()
+    /// pudo quedar tomado por un hilo del padre que en el hijo no existe. Se
+    /// construye de nuevo, libre (no se destruye: un mutex tomado no se puede).
+    static void reset_turns_after_fork() {
+        for (PySubscriber* p : g_subs) new (&p->rx_mu_) std::timed_mutex();
     }
 
     /// None, o (sobre, payload, "ip:puerto"). timeout en segundos (None = sin límite).
@@ -703,12 +720,13 @@ public:
     }
     void close() {
         // Un receive() de otro hilo puede estar dentro (sin el GIL): se espera su
-        // turno sin el GIL. Cerrando, desde otro hilo, con el GIL y con límite: si
-        // un hilo detenido para siempre tiene el turno, el Subscriber se deja vivo.
+        // turno sin el GIL. Con el cierre ya declarado (desde cualquier hilo, también
+        // el que cierra), con límite: si un hilo detenido para siempre tiene el
+        // turno, el Subscriber se deja vivo. Desde otro hilo, esa espera es con el GIL.
         std::unique_lock lock(rx_mu_, std::defer_lock);
         {
             const NoGil nogil(Inside::Close);
-            if (nogil.released()) {
+            if (!g_closing.load()) {
                 lock.lock();
             } else if (!lock.try_lock_for(std::chrono::milliseconds(250))) {
                 return;
@@ -987,8 +1005,10 @@ void cierre(nb::handle resto, nb::handle modulo, double limit_s) {
 }
 
 /// En el hijo de un fork (os.register_at_fork): solo existe el hilo que hizo
-/// fork, así que nada está "dentro" del núcleo y el cierre empieza de cero.
+/// fork, así que nada está "dentro" del núcleo, el cierre empieza de cero y
+/// ningún turno de receive() queda tomado.
 void after_fork_child() {
+    PySubscriber::reset_turns_after_fork();
     for (auto& c : g_inside) c.n.store(0);
     g_retaking.store(0);
     g_closing.store(false);
