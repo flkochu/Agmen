@@ -179,10 +179,10 @@ mueven cosas de verdad (un motor, un sensor conectado a la computadora), y
 quieres probar el resto sin el robot. Un **perfil** es un nombre que dice en
 qué modo corre cada nodo. Así no copias el archivo: tienes uno solo.
 
-Esta sección funciona hoy, sin simulador. La "IMU falsa" es el mismo
-`publisher` de antes, con otra velocidad. El simulador de física (MuJoCo)
-llega después en la versión 0.14.0, y el capítulo 17 mostrará el mismo robot
-con física.
+Esta sección funciona sin simulador: la "IMU falsa" es el mismo `publisher`
+de antes, con otra velocidad. El simulador de física (MuJoCo) también viene
+en la versión 0.14.0: el [capítulo 17](17-simulacion-y-real.md) muestra el
+mismo robot con física, con `agmen run examples/tutorial/robot.toml --sim`.
 
 ### Paso 1: el archivo
 

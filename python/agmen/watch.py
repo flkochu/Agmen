@@ -14,15 +14,24 @@ llegar y otra al volver, en la terminal y en el panel.
   `required`).
 - Mide con el reloj de Agmen (regla 5): en simulación en pausa no avisa, y a
   velocidad ×2 los ms son simulados.
+- Un salto del reloj (el botón *paso* del panel) no es un hueco todavía: los
+  mensajes de ese tiempo vienen en camino. Durante JUMP_MARGIN_S segundos de
+  pared se revisa sin el salto; si no llegaron, se avisa con el hueco completo.
 """
 
 from __future__ import annotations
 
 import select
 import threading
+import time
 
-from . import wire
+from . import clock, wire
 from .pubsub import RawSubscriber
+
+
+# Cuánto tiempo DE PARED se espera, tras un salto del reloj, a que lleguen los
+# mensajes de ese tiempo (están en tránsito: no es tiempo del robot).
+JUMP_MARGIN_S = 0.3
 
 
 def _secs(s: float) -> str:
@@ -31,15 +40,21 @@ def _secs(s: float) -> str:
 
 class TopicWatch:
     def __init__(self, topics: dict[str, float], log=print, node: str = "agmen run", now_ns=None,
-                 subscribe: bool = True) -> None:
+                 subscribe: bool = True, wall=None) -> None:
         """`topics`: topic → max_gap_ms. `log`: a dónde van los avisos. `subscribe=False`:
-        sin suscribirse (las pruebas llaman a seen() y check() a mano)."""
+        sin suscribirse (las pruebas llaman a seen() y check() a mano). `wall`: el
+        reloj DE PARED del margen tras un salto (s; por defecto time.monotonic)."""
         self.max_gap = {t: ms / 1000.0 for t, ms in topics.items()}
         self.log = log
         self.now = now_ns or wire.now_ns
+        self.wall = wall or time.monotonic
+        self._own_clock = now_ns is None
         self.lock = threading.Lock()
         self.last: dict[str, float] = {}         # topic → cuándo llegó el último (s, reloj de Agmen)
         self.late: dict[str, float] = {}         # topic → desde cuándo no llega
+        self.jumped = clock.mono_jumps()[1]      # el último total de saltos del reloj que vio (ns)
+        # Los saltos cuyo margen sigue vigente: (vence en self.wall(), cuánto saltó en s).
+        self.holds: list[tuple[float, float]] = []
         self.rx: dict[str, RawSubscriber] = {}
         try:
             for t in topics if subscribe else ():
@@ -47,6 +62,15 @@ class TopicWatch:
         except OSError:
             self.close()
             raise
+
+    def _now_and_jumped(self, t: float | None) -> tuple[float, int]:
+        """La hora (s) y el total de saltos del reloj (ns), leídos a la vez si la
+        hora es la del reloj de Agmen en simulación (en real no hay saltos)."""
+        if t is None and self._own_clock and clock.mode() != clock.REAL:
+            now, jumped, _, _ = clock.mono_jumps()   # en simulación, mono_ns() == now_ns()
+            return now / 1e9, jumped
+        t = self.now() / 1e9 if t is None else t
+        return t, clock.mono_jumps()[1]
 
     def seen(self, topic: str, t: float | None = None) -> None:
         """Llegó un mensaje de `topic` (lo llama run(); las pruebas, directo)."""
@@ -59,12 +83,21 @@ class TopicWatch:
 
     def check(self, t: float | None = None) -> None:
         """¿Alguno lleva más de su max_gap_ms sin llegar?"""
-        t = self.now() / 1e9 if t is None else t
+        t, jumped = self._now_and_jumped(t)
         news = []
         with self.lock:
+            wall = self.wall()
+            if jumped != self.jumped:        # el reloj saltó: el lote de ese tiempo viene en camino
+                # Cada salto con su propio margen: un paso nuevo no le quita el
+                # suyo al anterior (doble clic) ni lo alarga (un topic muerto se
+                # avisa igual, a lo más JUMP_MARGIN_S de pared más tarde).
+                self.holds.append((wall + JUMP_MARGIN_S, (jumped - self.jumped) / 1e9))
+                self.jumped = jumped
+            self.holds = [h for h in self.holds if wall < h[0]]   # se podan los vencidos
+            t_eval = t - sum(dj for _, dj in self.holds)
             for topic, last in self.last.items():
                 gap = self.max_gap[topic]
-                if topic not in self.late and t - last > gap:
+                if topic not in self.late and t_eval - last > gap:
                     self.late[topic] = last
                     news.append((topic, t - last, gap))
         for topic, waited, gap in news:

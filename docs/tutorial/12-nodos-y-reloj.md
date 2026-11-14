@@ -155,6 +155,12 @@ simulados) y la **velocidad**. Pruébalo:
   fuera de `agmen run`), el que lo recibe avisa **una vez**:
   `⚠ '/cmd' llega con reloj real y este nodo usa reloj simulación`.
 
+💡 El salto del botón **paso** no cuenta como ciclos saltados: no verás
+`⚠ every(…): N ciclos saltados` por dar un paso. Ese aviso sale solo cuando
+de verdad hay atraso (una función que tarda más que su periodo, o el sistema
+que despierta tarde al nodo). Un paso tampoco cuenta como hueco para el
+vigilante de `max_gap_ms`.
+
 ### Tu propio simulador manda el tiempo
 
 Si tu simulador (o el de Arca9) calcula la física paso a paso, que sea él

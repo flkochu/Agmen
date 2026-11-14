@@ -66,6 +66,19 @@ enum class Mode { Real, Sim, Replay };
 /// monótono de la computadora; en Sim, el tiempo de la simulación.
 [[nodiscard]] std::int64_t mono_ns();
 
+/// Para el executor (Node) y el vigilante de max_gap_ms: mono_ns() y, leído a
+/// la vez, los saltos del reloj. Un salto es lo que avanza un /clock cuando el
+/// reloj YA estaba en pausa (el botón *paso* del panel): ese tiempo no corrió.
+/// Los ciclos cuyo plazo cae dentro de un salto no son atraso del nodo.
+/// En Real, con un simulador paso a paso y con el primer /clock, no hay saltos.
+struct MonoReading {
+    std::int64_t t = 0;
+    std::int64_t jumped = 0;      ///< total que ha saltado este proceso (ns); nunca baja
+    std::int64_t jump_from = 0;   ///< el último salto, en tiempo de Agmen: (jump_from, jump_to].
+    std::int64_t jump_to = 0;     ///< Saltos seguidos en la misma pausa se unen en uno.
+};
+[[nodiscard]] MonoReading mono_reading();
+
 /// Cuánto tiempo REAL falta para que mono_ns() llegue a `t`. Si el tiempo
 /// está en pausa o avanza paso a paso (simulador externo), devuelve
 /// `unknown` (quien espera debe volver a preguntar en un rato).

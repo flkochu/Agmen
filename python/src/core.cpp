@@ -745,6 +745,10 @@ NB_MODULE(_core, m) {
     m.def("clock_domain", [] { return static_cast<int>(ck::domain()); });
     m.def("clock_now_ns", [] { return ck::now_ns(); });
     m.def("clock_mono_ns", [] { return ck::mono_ns(); });
+    m.def("clock_mono_jumps", [] {
+        const auto r = ck::mono_reading();
+        return std::make_tuple(r.t, r.jumped, r.jump_from, r.jump_to);
+    });
     m.def("clock_wall_until", [](std::int64_t t) -> std::optional<double> {
         const auto w = ck::wall_until(t);
         if (w == ck::kUnknown) return std::nullopt;

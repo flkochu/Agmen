@@ -66,6 +66,9 @@ class _Global:
         self.st = State()
         self.at_wall = 0         # time.monotonic_ns() del último /clock
         self.last_returned = 0
+        self.jumped = 0          # tiempo que llegó de golpe (mono_jumps); nunca baja
+        self.jump_from = 0       # el último salto: (jump_from, jump_to]
+        self.jump_to = 0
         self.changed = threading.Condition(self.lock)
 
 
@@ -153,6 +156,20 @@ def mono_ns() -> int:
         return _sim_now_locked()
 
 
+def mono_jumps() -> tuple[int, int, int, int]:
+    """Para el executor (Node) y el vigilante de max_gap_ms: (mono_ns(), jumped,
+    jump_from, jump_to), leídos a la vez. Un salto es lo que avanza un /clock
+    cuando el reloj YA estaba en pausa (el botón *paso* del panel): ese tiempo
+    no corrió. `jumped` es el total de este proceso (ns, nunca baja) y el último
+    salto es (jump_from, jump_to], en tiempo de Agmen; saltos seguidos en la
+    misma pausa se unen. En real, con un simulador paso a paso y con el primer
+    /clock no hay saltos. Espejo de clock::mono_reading()."""
+    if mode() == REAL:
+        return time.monotonic_ns(), 0, 0, 0
+    with _g.lock:
+        return _sim_now_locked(), _g.jumped, _g.jump_from, _g.jump_to
+
+
 def wall_until(t: int) -> float | None:
     """Cuántos segundos REALES faltan para que mono_ns() llegue a `t`. None si el
     tiempo está en pausa o avanza paso a paso (hay que volver a preguntar)."""
@@ -196,6 +213,7 @@ def configure(m: str, stepped: bool = False, listen: bool = True) -> None:
         _g.st = State()
         _g.at_wall = time.monotonic_ns()
         _g.last_returned = 0
+        _g.jump_from = _g.jump_to = 0   # el tiempo vuelve a empezar; `jumped` no baja
         _start_listener_locked()
 
 
@@ -203,6 +221,17 @@ def update(m: Clock) -> None:
     """Alimenta el reloj con un /clock."""
     with _g.changed:
         _ensure_configured_locked()
+        # Si el reloj YA estaba en pausa, no corría: lo que avanza este /clock llegó
+        # de golpe (el botón *paso*). Corriendo (también al pausar), la diferencia es
+        # solo la corrección de la interpolación. No cuentan el primer /clock ni un
+        # simulador paso a paso (no interpola nunca). Igual que clock.cpp.
+        if not _g.stepped and _g.st.received and _g.st.paused:
+            before = _sim_now_locked()
+            if int(m.t) > before:
+                _g.jumped += int(m.t) - before
+                if before != _g.jump_to:     # seguido del anterior: se unen
+                    _g.jump_from = before
+                _g.jump_to = int(m.t)
         _g.st = State(int(m.t), float(m.speed), bool(m.paused), True)
         _g.at_wall = time.monotonic_ns()
         _g.changed.notify_all()
@@ -230,6 +259,9 @@ if _backend.NATIVE:
 
     def mono_ns() -> int:  # noqa: F811
         return _c.clock_mono_ns()
+
+    def mono_jumps() -> tuple[int, int, int, int]:  # noqa: F811
+        return _c.clock_mono_jumps()
 
     def wall_until(t: int) -> float | None:  # noqa: F811
         return _c.clock_wall_until(int(t))
@@ -272,6 +304,9 @@ class ClockServer:
             raise ValueError(f"ClockServer: modo '{mode}' (usa sim o replay)")
         self.mode = mode
         self._lock = threading.Lock()
+        # Armar, aplicar y publicar cada /clock en orden: sin esto, el hilo de
+        # 50 Hz podía mandar un "corriendo" viejo DESPUÉS de una pausa o un paso.
+        self._send_lock = threading.Lock()
         self.t = int(t)                  # ns simulados (o de la grabación)
         self.speed = float(speed)
         self.paused = bool(paused)
@@ -294,6 +329,10 @@ class ClockServer:
         return Clock(t=self.t, speed=self.speed, paused=self.paused)
 
     def _feed(self) -> Clock:
+        with self._send_lock:
+            return self._feed_ordered()
+
+    def _feed_ordered(self) -> Clock:
         with self._lock:
             self._advance_locked()
             m = self._msg_locked()
@@ -301,9 +340,10 @@ class ClockServer:
         return m
 
     def _send(self) -> None:
-        m = self._feed()
-        if self._pub is not None:
-            self._pub.publish(m, t_data=m.t)
+        with self._send_lock:
+            m = self._feed_ordered()
+            if self._pub is not None:
+                self._pub.publish(m, t_data=m.t)
 
     # --- controles (panel) ---
     def pause(self) -> None:
@@ -327,12 +367,20 @@ class ClockServer:
         self._send()
 
     def step(self, seconds: float = 0.1) -> None:
-        """En pausa: avanza `seconds` de tiempo simulado y se queda en pausa."""
+        """Avanza `seconds` de tiempo simulado y se queda en pausa. Si el reloj
+        corría, primero publica la pausa y luego el paso (dos /clock): así los
+        nodos ven el paso con el reloj ya en pausa, como un salto, y no como
+        atraso suyo."""
         if not (0 < seconds <= 60):
             raise ValueError("el paso debe estar entre 0 y 60 s")
         with self._lock:
             self._advance_locked()
+            was_running = not self.paused
             self.paused = True
+        if was_running:
+            self._send()
+        with self._lock:
+            self._advance_locked()
             self.t += int(seconds * 1e9)
         self._send()
 

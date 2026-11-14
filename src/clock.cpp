@@ -57,6 +57,9 @@ struct Global {
     State st{};
     std::int64_t at_wall = 0;
     std::int64_t last_returned = 0;   // para no ir nunca hacia atrás
+    std::int64_t jumped = 0;          // tiempo que llegó de golpe (mono_reading); nunca baja
+    std::int64_t jump_from = 0;       // el último salto: (jump_from, jump_to]
+    std::int64_t jump_to = 0;
 };
 
 Global& g() {
@@ -157,6 +160,13 @@ std::int64_t mono_ns() {
     return sim_now_locked(s);
 }
 
+MonoReading mono_reading() {
+    if (mode() == Mode::Real) return {steady_ns(), 0};
+    auto& s = g();
+    std::lock_guard lk(s.mu);
+    return {sim_now_locked(s), s.jumped, s.jump_from, s.jump_to};
+}
+
 std::chrono::nanoseconds wall_until(std::int64_t t) {
     if (mode() == Mode::Real) return std::chrono::nanoseconds(t - steady_ns());
     auto& s = g();
@@ -187,6 +197,7 @@ void configure(Mode m, bool stepped, bool listen) {
         s.st = State{};
         s.at_wall = steady_ns();
         s.last_returned = 0;
+        s.jump_from = s.jump_to = 0;   // el tiempo vuelve a empezar; `jumped` no baja
     }
     g_mode_cache.store(cache_of(m), std::memory_order_release);
     if (m != Mode::Real) start_listener_if_needed(s);
@@ -196,6 +207,18 @@ void update(const ClockMsg& m) {
     auto& s = g();
     std::lock_guard lk(s.mu);
     ensure_configured_locked(s);
+    // Si el reloj YA estaba en pausa, no corría: lo que avanza este /clock llegó
+    // de golpe (el botón *paso*). Corriendo (también al pausar), la diferencia es
+    // solo la corrección de la interpolación. No cuentan el primer /clock ni un
+    // simulador paso a paso (no interpola nunca). Igual que clock.py.
+    if (!s.stepped && s.st.received && s.st.paused) {
+        const std::int64_t before = sim_now_locked(s);
+        if (m.t > before) {
+            s.jumped += m.t - before;
+            if (before != s.jump_to) s.jump_from = before;   // seguido del anterior: se unen
+            s.jump_to = m.t;
+        }
+    }
     s.st.t = m.t;
     s.st.speed = m.speed;
     s.st.paused = m.paused;

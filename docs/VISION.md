@@ -130,6 +130,43 @@ Agmen deja de tener soporte oficial en macOS: se prueba y se publica para
 - Si alguien quiere volver a probar en macOS, basta agregar `macos-latest` al
   CI; la decisión se puede revisar si hay quien la mantenga.
 
+### Hasta dónde debe llegar: aprendizaje por refuerzo y simuladores (2026-11-13)
+
+**La meta.** Adán quiere entrenar robots con aprendizaje por refuerzo
+(*reinforcement learning*) en MuJoCo, y después llevar esos robots a Isaac
+Sim. Agmen tiene que ayudar en todo el camino: probar la política con el robot
+completo en simulación, llevarla al robot real con los mismos topics y grabar
+datos reales para seguir entrenando.
+
+**Qué cambia al diseñar, desde ya.** Es un criterio, no una regla nueva de §3.
+Ninguna decisión debe cerrar ese camino:
+- **El simulador es un nodo más.** Se cambia sin tocar los demás nodos (RFC 0011 §3.3).
+- **La física va separada del nodo** que la conecta a los topics, para poder
+  envolverla después en un entorno de entrenamiento. El ejemplo
+  `examples/sim/fisica.py` ya lo hace: la clase `Mundo` no usa Agmen (el nodo
+  `mundo.py` solo la conecta a los topics).
+- **Los topics no dependen de un simulador.** Un simulador publica lo mismo que
+  el hardware (`ImuSample`, `Imagen`) y escucha `MotorCommand`.
+
+**Dónde encaja Agmen, con honestidad.** El entrenamiento masivo (miles de pasos
+por segundo, muchos mundos en paralelo) normalmente corre dentro del simulador,
+sin pasar mensajes por la red. Agmen no compite con eso. Su papel es:
+- probar la política con el robot completo en simulación, con el reloj y los
+  nodos de Agmen;
+- llevarla al robot real con los mismos topics;
+- grabar datos reales como datasets (nivel 9) para seguir entrenando.
+
+**Lo que ya hay y lo que falta** (detalle en RFC 0011 §4):
+- **Ya hay:** el simulador como nodo, con el robot del tutorial en MuJoCo
+  (`examples/sim/`); perfiles en `robot.toml` y `--sim`, en curso en el
+  nivel 10; el reloj de simulación (nivel 5); grabaciones como datasets (nivel 9).
+- **Falta:** mensajes estándar de articulaciones y odometría; el paso a paso
+  determinista (*lockstep*) y muchos mundos en paralelo, en `agmen-learn`
+  (nivel 13); un puente para Isaac Sim, que trae su propio reloj (`[clock] source`).
+
+Esta sección no pone fechas ni cambia el orden de los niveles. Lo que falta
+entra al roadmap de §7 cuando le toque.
+
 ## 5. Estado contra la visión
 
 ### Se queda igual
@@ -238,7 +275,7 @@ iceoryx2).
 | 10 | Abstracción sim/real; `robot.toml` con nodos en varias máquinas (el lanzador básico ya existe desde 0.2.0) ([RFC 0011](rfc/0011-sim-real-y-varias-computadoras.md), aceptado el 2026-11-13) | d, i |
 | 11 | Red multi-máquina, sincronización de relojes y **`agmen-web` en la nube** (relay con autenticación) | c, h |
 | 12 | Puentes (`agmen-iot` MQTT, ROS 2) y `agmen-micro` | f |
-| 13 | Paquetes de IA: `agmen-vision`, `agmen-learn` | — |
+| 13 | Paquetes de IA: `agmen-vision`, `agmen-learn` (meta de aprendizaje por refuerzo: ver §4, 2026-11-13) | — |
 | 14 | **Visualizador propio** ("nuestro Foxglove", pedido por Adán para cuando Agmen esté completo): 3D, URDF, nubes de puntos, layouts guardados, reproducir grabaciones; sobre `agmen.ws` y `agmen.js` | h |
 
 ## 8. Decisiones pendientes
@@ -262,7 +299,7 @@ iceoryx2).
 | Préstamo para escribir directo en la memoria compartida (la cámara llena el bloque) | Cuando se mida que la copia del publicador estorba (RFC 0009 §4) |
 | ~~¿Seguir probando y publicando para macOS?~~ | ✅ No, desde 0.11.1 (2026-11-05, §4): Windows y Linux, x86-64 y ARM64; en macOS, Python puro |
 | ~~Formato de grabación: MCAP o propio sobre Arrow IPC~~ | ✅ [RFC 0010](rfc/0010-grabar-y-reproducir.md) aceptado el 2026-11-05 (D1–D9 = a): MCAP con los mensajes de Agmen adentro, sin cambiar un byte |
-| ~~Simulación y real; nodos y topics en varias computadoras~~ | ✅ [RFC 0011](rfc/0011-sim-real-y-varias-computadoras.md) aceptado el 2026-11-13 (D1–D10 = a): perfiles en `robot.toml`, un mundo de MuJoCo y `agmen agent` en cada computadora; sin implementar, se hace en 0.14.0 |
+| ~~Simulación y real; nodos y topics en varias computadoras~~ | ✅ [RFC 0011](rfc/0011-sim-real-y-varias-computadoras.md) aceptado el 2026-11-13 (D1–D10 = a): perfiles en `robot.toml`, un mundo de MuJoCo y `agmen agent` en cada computadora; en curso en 0.14.0: perfiles y el mundo de MuJoCo hechos; faltan `[[machine]]`, `agmen agent`, topics entre computadoras y relojes |
 | ~~Mandos del panel de cualquier tipo; quién manda en el mux; `max_gap_ms`~~ | ✅ [RFC 0012](rfc/0012-mandos-del-panel-y-quien-manda.md) aceptado el 2026-11-13 (D1–D6 = a), implementado en 0.13.0 a pedido de Arca9 |
 
 ## Fuentes

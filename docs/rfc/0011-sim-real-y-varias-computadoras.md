@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Estado** | ✅ **Aceptado** (2026-11-13, D1–D10 = a), aún sin implementar; se implementa en Agmen 0.14.0, por bloques según la [sección 7](#7-plan-para-agmen-0140). Decisiones en la [sección 5](#5-decisiones) |
+| **Estado** | ✅ **Aceptado** (2026-11-13, D1–D10 = a); en curso en Agmen 0.14.0, por bloques según la [sección 7](#7-plan-para-agmen-0140): perfiles y el mundo de MuJoCo hechos; faltan `[[machine]]`, `agmen agent`, topics entre computadoras y relojes. Decisiones en la [sección 5](#5-decisiones) |
 | **Depende de** | RFC 0003 (`agmen run`, `robot.toml` y el panel), RFC 0004 (el hub, los topics esperados y el diseño de varias máquinas de §3.6), RFC 0006 (el reloj de simulación y `/clock`), RFC 0008 (TCP para datos grandes; un suscriptor lento no frena a nadie), RFC 0009 (la memoria compartida se prueba, no se adivina), RFC 0010 (`--play` y `--skip`) |
 | **Versión** | Agmen 0.14.0 |
 | **Requisitos** | d (misma interfaz para simulación y robot real), i (un solo comando levanta todo el robot), g (Windows y Linux, x86-64 y ARM64) |
@@ -193,6 +193,8 @@ examples/sim/
   robot.xml     el robot del tutorial en MuJoCo: dos ruedas, una IMU y una cámara
   mundo.py      el nodo: avanza la física, publica /imu (ImuSample) y /camara (Imagen), escucha /cmd (MotorCommand)
 ```
+
+> **Nota de implementación:** al implementarlo, la física, la cámara y la ventana quedaron en `fisica.py` (la clase `Mundo`), `camara.py` y `ver.py` (decisión de Adán del 2026-11-13); `mundo.py` queda como el nodo.
 
 ```bash
 pip install agmen[sim]                              # agmen + mujoco

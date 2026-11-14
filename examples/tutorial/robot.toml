@@ -1,6 +1,7 @@
 # robot.toml — todo el robot del tutorial con UN solo comando:
 #
-#   agmen run examples/tutorial/robot.toml
+#   agmen run examples/tutorial/robot.toml          # el robot de verdad (perfil "real")
+#   agmen run examples/tutorial/robot.toml --sim    # el mismo robot en MuJoCo (perfil "sim")
 #
 # Las rutas son relativas a este archivo. "python" se reemplaza por el mismo
 # Python que corre agmen (funciona igual en Windows y Linux).
@@ -18,11 +19,19 @@ before = ["cmake --build ../../build --config Release"]
 name = "imu"                                   # el sensor del capítulo 1
 cmd = "../../build/bin/publisher --rate 100 --to /imu"
 restart = "on-failure"                         # si se cae, se vuelve a levantar solo
+profile = "real"                               # el sensor de verdad: en simulación lo reemplaza el mundo
 
 [[node]]
 name = "motor"                                 # el motor con freno de seguridad (capítulo 2)
 cmd = "../../build/bin/tutorial_motor --escuchar /cmd"
 restart = "on-failure"
+profile = "real"                               # toca el hardware: nunca corre en simulación
+
+[[node]]
+name = "mundo"                                 # MuJoCo: el robot y el piso, con física (capítulo 17)
+cmd = "python ../sim/mundo.py"                 # agrega --ver para ver la ventana de MuJoCo
+profile = "sim"                                # reemplaza a imu y motor: publica /imu y /camara, escucha /cmd
+# Necesita MuJoCo: pip install agmen[sim]. Sin restart: si falta, lo dice una vez y no se reinicia en bucle.
 
 [[node]]
 name = "cerebro"                               # la "IA" en Python (capítulo 3)
@@ -55,6 +64,11 @@ name = "/imu"
 type = "ImuSample"
 required = true
 max_gap_ms = 100                               # llega a 100 Hz: si pasan 0.1 s sin nada, agmen run lo avisa (Agmen 0.13)
+
+[[topic]]
+name = "/camara"                               # la cámara del mundo (no obligatoria)
+type = "Imagen"
+profile = "sim"
 
 [[topic]]
 name = "/cmd"

@@ -109,6 +109,14 @@ class _Timer:
         self.last_warn = -10 * _SEC
 
 
+def _in_jump(first: int, k: int, period: int, jump_from: int, jump_to: int) -> int:
+    """Cuántos de los plazos first + i·period (0 <= i < k) caen dentro del salto
+    del reloj (jump_from, jump_to]. Espejo de in_jump (src/node.cpp)."""
+    lo = 0 if jump_from < first else (jump_from - first) // period + 1
+    hi = min(k - 1, (jump_to - first) // period) if jump_to >= first else -1
+    return max(0, hi - lo + 1)
+
+
 class _Invalid:
     """Los paquetes de una suscripción que no se pudieron leer (un anuncio o un
     payload mal hecho, de otro programa o a propósito): se descartan, se cuentan
@@ -401,10 +409,14 @@ class _PureNode:
 
             # 1. Temporizadores que ya tocan.
             for t in g.timers:
-                now = clock.mono_ns()
+                now, _, jump_from, jump_to = clock.mono_jumps()
                 if now < t.next:
                     continue
-                late = now - t.next
+                # Tras un salto del reloj (el botón *paso* del panel), el tiempo que
+                # saltó no es atraso del nodo: al atraso se le resta lo que el salto
+                # cubre de (plazo, ahora], y los ciclos cuyo plazo cayó DENTRO del
+                # salto corren igual que siempre pero no cuentan como saltados.
+                late = now - t.next - max(0, min(now, jump_to) - max(t.next, jump_from))
                 t0 = time.perf_counter_ns()
                 t.fn()
                 run = time.perf_counter_ns() - t0
@@ -418,13 +430,14 @@ class _PureNode:
                 if run > g.slow_ns:
                     g.slow_ns, g.slow_label = run, t.label
                 t.next += t.period
-                after = clock.mono_ns()
+                after, _, jump_from, jump_to = clock.mono_jumps()
                 if after > t.next:
                     k = (after - t.next) // t.period
                     if k > 0:
+                        own = k - _in_jump(t.next, k, t.period, jump_from, jump_to)
                         t.next += k * t.period
-                        st.skipped += k
-                        t.win_skipped += k
+                        st.skipped += own
+                        t.win_skipped += own
                 if stop.is_set():
                     break
 
