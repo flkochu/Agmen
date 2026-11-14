@@ -8,6 +8,8 @@ y los nombres `.invalid` (RFC 6761), que nunca existen. Nada manda paquetes a la
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import io
 import json
 import os
@@ -196,7 +198,7 @@ def robot_toml(maquinas="", nodos=(("motor", None, "robot"), ("imu", None, "robo
     for name, profile, machine in nodos:
         t += f'\n[[node]]\nname = "{name}"\ncmd = "x"\n'
         if profile:
-            t += f'profile = "{profile}"\n'
+            t += f'profile = {profile}\n' if profile.startswith("[") else f'profile = "{profile}"\n'
         if machine:
             t += f'machine = "{machine}"\n'
     return t + extra
@@ -469,15 +471,16 @@ class TestMaquinasEnLaLineaDeComandos(unittest.TestCase):
         self.assertNotIn("Para probar aquí en simulación", r.stderr)
         self.assertNotIn("ARRANCO", r.stdout)
 
-    def test_varias_computadoras_no_dice_corre_en_cada_una(self):
+    def test_varias_computadoras_con_hardware_solo_sugiere_simulacion(self):
         self.robot({"laptop": "127.0.0.1", "robot": AJENA},
                    [("ia", None, "laptop"), ("motor", None, "robot")])
         r, _ = self.falla()
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("Con nodos en varias computadoras ('laptop', 'robot') hace falta agmen agent, que llega en "
-                      "una versión próxima. Mientras tanto: quita machine de los nodos para correr todo en una "
-                      "sola computadora", r.stderr)
-        self.assertNotIn("cada computadora", r.stderr)
+                      "una versión próxima. Mientras tanto, para probar aquí en simulación: [profile.sim] local = "
+                      "true y agmen run --sim", r.stderr)
+        for no in ("cada computadora", "quita machine", "[profile.real] local"):
+            self.assertNotIn(no, r.stderr)
         self.assertNotIn("ARRANCO", r.stdout)
 
     def test_nombre_sin_resolver_dice_que_pongas_la_ip(self):
@@ -645,10 +648,13 @@ class TestEsEstaComputadoraSeguridad(unittest.TestCase):
         self.assertIn(AJENA, p.note)
         sock.bind.assert_not_called()
 
-    def test_nombre_con_varias_ips_basta_una_de_aqui(self):
+    def test_nombre_con_varias_ips_una_de_aqui_y_otra_no_es_mixed(self):
         info = [(socket.AF_INET, 2, 17, "", (AJENA, 0)), (socket.AF_INET, 2, 17, "", ("127.0.0.1", 0))]
         with mock.patch("socket.getaddrinfo", return_value=info):
-            self.assertEqual(check_hosts(["dos.local"])["dos.local"], Place(True, "mine"))
+            p = check_hosts(["dos.local"])["dos.local"]
+        self.assertEqual((p.here, p.why), (False, "mixed"))
+        self.assertEqual(p.note, f"'dos.local' es {AJENA} y 127.0.0.1: una es de esta computadora y otra no; "
+                                 f"pon la IP en host")
 
     @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("unshare"),
                          "necesita Linux con el comando unshare (espacio de red propio)")
@@ -658,11 +664,11 @@ class TestEsEstaComputadoraSeguridad(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             guion = Path(d) / "dentro.py"
             guion.write_text(NETNS_GUION, encoding="utf-8")
-            sonda = subprocess.run(["unshare", "-rn", sys.executable, "-I", "-c", "print('ok')"],
+            sonda = subprocess.run(["unshare", "-rnm", sys.executable, "-I", "-c", "print('ok')"],
                                    capture_output=True, text=True, timeout=30, check=False)
             if sonda.returncode != 0 or "ok" not in sonda.stdout:
                 self.skipTest(f"unshare -rn no está disponible aquí: {sonda.stderr.strip()[:120]}")
-            r = subprocess.run(["unshare", "-rn", sys.executable, str(guion)],
+            r = subprocess.run(["unshare", "-rnm", sys.executable, str(guion)],
                                env={**os.environ, "PYTHONPATH": str(ROOT / "python")},
                                capture_output=True, text=True, timeout=60, check=False)
         if r.returncode == 77:
@@ -674,6 +680,16 @@ class TestEsEstaComputadoraSeguridad(unittest.TestCase):
                                            "192.168.1.255": False, "10.9.9.255": False})
         # y las de la propia red sí (cualquier interfaz, no solo la de la ruta por defecto)
         self.assertEqual(datos["propias"], {"192.168.1.5": True, "10.9.9.9": True, "127.0.0.1": True})
+        if not datos["hosts_ok"]:
+            self.skipTest("no se pudo montar un /etc/hosts propio en el espacio de montaje")
+        n = datos["nombres"]
+        self.assertEqual(n["aqui.test"][:2], [True, "mine"])                  # todas las IP de aquí
+        self.assertEqual(n["repetida.test"][:2], [True, "mine"])              # la misma IP dos veces
+        self.assertEqual(n["ajena.test"][:2], [False, "other"])
+        self.assertEqual(n["mezcla.test"][:2], [False, "mixed"])              # una de aquí y otra no: NO
+        self.assertIn("192.168.1.5 y 8.8.8.8", n["mezcla.test"][2])
+        self.assertEqual(n["tres.test"][:2], [False, "mixed"])
+        self.assertIn("unas son", n["tres.test"][2])
 
 
 # Corre dentro de `unshare -rn`: arma lo, 192.168.1.5 (ruta por defecto) y 10.9.9.9, sin la herramienta ip.
@@ -709,6 +725,24 @@ except OSError as e:
     print(f"sin red de prueba: {e}")
     sys.exit(77)
 
+# un /etc/hosts propio (solo en este espacio de montaje) para probar nombres con varias IP
+import os, tempfile
+hosts_ok = True
+try:
+    tmp = os.path.join(tempfile.mkdtemp(), "hosts")
+    with open(tmp, "w") as f:
+        f.write("127.0.0.1 localhost\n192.168.1.5 aqui.test\n10.9.9.9 aqui.test\n192.168.1.5 mezcla.test\n"
+                "8.8.8.8 mezcla.test\n8.8.8.8 ajena.test\n8.8.4.4 ajena.test\n"
+                "192.168.1.5 tres.test\n10.9.9.9 tres.test\n8.8.8.8 tres.test\n"
+                "192.168.1.5 repetida.test\n192.168.1.5 repetida.test\n")
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.mount(tmp.encode(), b"/etc/hosts", None, 4096, None) != 0:   # MS_BIND
+        hosts_ok = False
+    else:
+        socket.getaddrinfo("aqui.test", None)
+except OSError:
+    hosts_ok = False
+
 from agmen.machines import these_are_here
 
 try:
@@ -721,6 +755,9 @@ print(json.dumps({
     "bind_ajeno_funciona": bind_ajeno,
     "ajenas": these_are_here(["192.168.1.20", "8.8.8.8", "255.255.255.255", "192.168.1.255", "10.9.9.255"]),
     "propias": these_are_here(["192.168.1.5", "10.9.9.9", "127.0.0.1"]),
+    "hosts_ok": hosts_ok,
+    "nombres": {h: [p.here, p.why, p.note] for h, p in __import__("agmen.machines").machines.check_hosts(
+        ["aqui.test", "mezcla.test", "ajena.test", "tres.test", "repetida.test"]).items()} if hosts_ok else {},
 }))
 """
 
@@ -859,17 +896,16 @@ class TestRemoteError(unittest.TestCase):
         self.assertTrue(remote_error(c, {"robot": self.OTRA}).endswith(
             ", o usa [profile.pruebas] local = true para correr todo aquí"))
 
-    def test_varias_computadoras_una_aqui_y_una_remota(self):
+    def test_varias_computadoras_con_hardware_una_aqui_y_una_remota(self):
         c = self.cfg([("laptop", "127.0.0.1"), ("robot", AJENA)],
                      [("ia", None, "laptop"), ("motor", None, "robot")])
         e = remote_error(c, {"laptop": self.AQUI, "robot": self.OTRA})
         self.assertIn(f"'motor' corre en 'robot' ({AJENA}).", e)
-        self.assertIn("Con nodos en varias computadoras ('laptop', 'robot') hace falta agmen agent, que llega "
-                      "en una versión próxima.", e)
-        self.assertIn("Mientras tanto: quita machine de los nodos para correr todo en una sola computadora", e)
-        self.assertNotIn("cada computadora", e)
-        self.assertNotIn("corre agmen run en", e)
-        self.assertNotIn("'ia' corre", e)         # solo se nombra lo que corre allá
+        self.assertTrue(e.endswith("Con nodos en varias computadoras ('laptop', 'robot') hace falta agmen agent, "
+                                   "que llega en una versión próxima. Mientras tanto, para probar aquí en "
+                                   "simulación: [profile.sim] local = true y agmen run --sim"), e)
+        for no in ("quita machine", "cada computadora", "corre agmen run en", "[profile.real] local", "'ia' corre"):
+            self.assertNotIn(no, e)
 
     def test_varias_computadoras_dos_remotas(self):
         c = self.cfg([("robot", AJENA), ("brazo", "198.51.100.7:7400")],
@@ -878,11 +914,12 @@ class TestRemoteError(unittest.TestCase):
         self.assertIn(f"'motor' corre en 'robot' ({AJENA}); 'pinza' corre en 'brazo' (198.51.100.7:7400).", e)
         self.assertIn("('robot', 'brazo')", e)
 
-    def test_varias_en_sim_sugiere_ademas_local(self):
+    def test_varias_en_sim_sin_hardware_sugiere_local_del_perfil(self):
         c = self.cfg([("a", AJENA), ("b", "198.51.100.7")], [("x", "sim", "a"), ("y", "sim", "b")], profile="sim")
         e = remote_error(c, {"a": self.OTRA, "b": self.OTRA})
-        self.assertIn("quita machine de los nodos para correr todo en una sola computadora, o usa "
-                      "[profile.sim] local = true para correr todo aquí", e)
+        self.assertTrue(e.endswith("que llega en una versión próxima. Mientras tanto: usa [profile.sim] local = "
+                                   "true para correr todo aquí"), e)
+        self.assertNotIn("quita machine", e)
 
     def test_nombre_que_no_resolvio(self):
         c = self.cfg([("robot", "robot.local")], [("motor", None, "robot")])
@@ -1193,6 +1230,389 @@ class TestLoadConfigMachinesBloque3a(unittest.TestCase):
     def test_hosts_distintos_se_permiten(self):
         c = _config(self.m("a", "1.2.3.4") + self.m("b", "1.2.3.5") + robot_toml(nodos=[("n", None, None)]).split("\n", 2)[2])
         self.assertEqual(len(c.machines), 2)
+
+
+# ---------------------------------------------------------------------------
+# Segunda revisión (aadf6ef): nombres con varias IP, avisos sin hardware aquí, inet_aton, loopback, orden
+# ---------------------------------------------------------------------------
+
+def _info(*ips):
+    """Lo que devolvería getaddrinfo para esas IP, en ese orden."""
+    return [(socket.AF_INET6 if ":" in ip else socket.AF_INET, 2, 17, "", (ip, 0)) for ip in ips]
+
+
+def _socket_eco():
+    """Un socket falso que dice "mi origen es la misma IP" (como una interfaz de aquí)."""
+    sock = mock.MagicMock()
+    sock.__enter__.return_value = sock
+    ultimo = {}
+    sock.connect.side_effect = lambda dest: ultimo.update(ip=dest[0])
+    sock.getsockname.side_effect = lambda: (ultimo["ip"], 5)
+    return mock.MagicMock(return_value=sock)
+
+
+class TestNombreConVariasIP(unittest.TestCase):
+    """Un nombre es esta computadora SOLO si TODAS sus IP lo son."""
+
+    def lugar(self, *ips, socket_eco=True, nombre="n.local"):
+        with mock.patch("socket.getaddrinfo", return_value=_info(*ips)):
+            if socket_eco:
+                with mock.patch("socket.socket", _socket_eco()):
+                    return check_hosts([nombre])[nombre]
+            return check_hosts([nombre])[nombre]
+
+    def test_mezcla_de_dos(self):
+        # 127.0.0.1 es de aquí; AJENA: el socket falso la acepta como suya, así que se usa uno distinto
+        with mock.patch("socket.getaddrinfo", return_value=_info("127.0.0.1", AJENA)), \
+                mock.patch("socket.socket", _falso_socket("10.0.0.7")[0]):
+            p = check_hosts(["dos.local"])["dos.local"]
+        self.assertEqual(p, Place(False, "mixed", f"'dos.local' es 127.0.0.1 y {AJENA}: una es de esta "
+                                                  f"computadora y otra no; pon la IP en host"))
+
+    def test_el_orden_es_el_de_getaddrinfo(self):
+        with mock.patch("socket.getaddrinfo", return_value=_info(AJENA, "127.0.0.1")), \
+                mock.patch("socket.socket", _falso_socket("10.0.0.7")[0]):
+            p = check_hosts(["dos.local"])["dos.local"]
+        self.assertIn(f"'dos.local' es {AJENA} y 127.0.0.1:", p.note)
+
+    def test_mezcla_de_tres_o_mas(self):
+        with mock.patch("socket.getaddrinfo", return_value=_info("127.0.0.1", AJENA, "198.51.100.7")), \
+                mock.patch("socket.socket", _falso_socket("10.0.0.7")[0]):
+            p = check_hosts(["tres.local"])["tres.local"]
+        self.assertEqual((p.here, p.why), (False, "mixed"))
+        self.assertEqual(p.note, f"'tres.local' es 127.0.0.1, {AJENA} y 198.51.100.7: unas son de esta "
+                                 f"computadora y otras no; pon la IP en host")
+
+    def test_todas_de_aqui_es_mine(self):
+        p = self.lugar("192.168.1.5", "10.9.9.9")
+        self.assertEqual((p.here, p.why), (True, "mine"))
+
+    def test_todas_loopback_es_loopback(self):
+        self.assertEqual(self.lugar("127.0.0.1", "::1").why, "loopback")
+        self.assertEqual(self.lugar("127.0.0.1", "127.0.1.1").why, "loopback")
+
+    def test_loopback_y_una_de_la_lan_es_mine(self):
+        self.assertEqual(self.lugar("127.0.0.1", "192.168.1.5").why, "mine")
+
+    def test_ninguna_de_aqui_es_other(self):
+        with mock.patch("socket.getaddrinfo", return_value=_info(AJENA, "198.51.100.7")), \
+                mock.patch("socket.socket", _falso_socket("10.0.0.7")[0]):
+            p = check_hosts(["fuera.local"])["fuera.local"]
+        self.assertEqual((p.here, p.why), (False, "other"))
+        self.assertIn(f"{AJENA} y 198.51.100.7", p.note)
+
+    def test_la_misma_ip_repetida_cuenta_una_vez(self):
+        p = self.lugar("192.168.1.5", "192.168.1.5", "192.168.1.5")
+        self.assertEqual((p.here, p.why), (True, "mine"))
+        with mock.patch("socket.getaddrinfo", return_value=_info(AJENA, AJENA)), \
+                mock.patch("socket.socket", _falso_socket("10.0.0.7")[0]):
+            q = check_hosts(["r.local"])["r.local"]
+        self.assertEqual((q.here, q.why), (False, "other"))
+        self.assertIn(f"'r.local' es {AJENA},", q.note)       # una sola vez en la nota
+
+    def test_ipv4_mapeada_y_la_ipv4_cuentan_una_vez(self):
+        p = self.lugar("192.168.1.5", "::ffff:192.168.1.5")
+        self.assertEqual((p.here, p.why), (True, "mine"))
+        with mock.patch("socket.getaddrinfo", return_value=_info("::ffff:192.0.2.10", AJENA)), \
+                mock.patch("socket.socket", _falso_socket("10.0.0.7")[0]):
+            q = check_hosts(["m.local"])["m.local"]
+        self.assertEqual((q.here, q.why), (False, "other"))
+
+    def test_lista_vacia_es_unresolved_nunca_true(self):
+        with mock.patch("socket.getaddrinfo", return_value=[]):
+            p = check_hosts(["vacio.local"])["vacio.local"]
+        self.assertEqual((p.here, p.why), (False, "unresolved"))
+
+    def test_la_nota_de_mixed_llega_al_error_de_agmen_run(self):
+        c = _config(robot_toml([("robot", "dos.local")], [("motor", None, "robot")]))
+        with mock.patch("socket.getaddrinfo", return_value=_info("127.0.0.1", AJENA)), \
+                mock.patch("socket.socket", _falso_socket("10.0.0.7")[0]):
+            places = place_machines(c)
+        self.assertEqual(places["robot"].why, "mixed")
+        e = remote_error(c, places)
+        self.assertIn(f"'dos.local' es 127.0.0.1 y {AJENA}: una es de esta computadora y otra no; pon la IP "
+                      f"en host.", e)
+        with self.assertRaises(ConfigError) as ctx:
+            Launcher(c, io.StringIO(), places=places)
+        self.assertIn("una es de esta computadora y otra no", str(ctx.exception))
+
+    def test_ipv4_mapeada_se_decide_como_ipv4(self):
+        r = check_hosts(["::ffff:127.0.0.1", "::ffff:0.0.0.0", "::ffff:224.0.0.1", "::ffff:255.255.255.255"])
+        self.assertEqual(r["::ffff:127.0.0.1"], Place(True, "loopback"))
+        for h in ("::ffff:0.0.0.0", "::ffff:224.0.0.1", "::ffff:255.255.255.255"):
+            with self.subTest(host=h):
+                self.assertEqual((r[h].here, r[h].why), (False, "special"))
+
+    def test_loopback_con_punto_final_y_mayusculas(self):
+        with mock.patch("socket.socket", side_effect=AssertionError("sin sockets")), \
+                mock.patch("socket.getaddrinfo", side_effect=AssertionError("sin DNS")):
+            r = check_hosts(["localhost.", "LOCALHOST", "LocalHost.", "::ffff:127.0.0.1"])
+        self.assertEqual({h: (p.here, p.why) for h, p in r.items()}, {h: (True, "loopback") for h in r})
+
+    def test_nota_de_ipv6_link_local_menciona_linux_y_windows(self):
+        n = check_hosts(["fe80::1"])["fe80::1"].note
+        for frag in ("%eth0", "%12", "Linux", "Windows"):
+            self.assertIn(frag, n)
+
+
+class TestAvisosSinHardwareAqui(unittest.TestCase):
+    """Los avisos nunca sugieren correr el hardware en esta computadora."""
+
+    OTRA = Place(False, "other")
+    AQUI = Place(True, "loopback")
+    UNA = ("Mientras tanto: corre agmen run en esa computadora")
+    SIM = "[profile.sim] local = true y agmen run --sim"
+    VARIAS = "hace falta agmen agent, que llega en una versión próxima."
+
+    def err(self, maquinas, nodos, profile=None, extra="", aqui=()):
+        c = _config(robot_toml(maquinas, nodos, extra), profile)
+        return remote_error(c, {m[0]: (self.AQUI if m[0] in aqui else self.OTRA) for m in maquinas})
+
+    def test_una_remota_en_real_termina_sugiriendo_simulacion(self):
+        e = self.err([("robot", AJENA)], [("motor", "real", "robot")])
+        self.assertTrue(e.endswith(f"{self.UNA}. Para probar aquí en simulación: {self.SIM}"), e)
+
+    def test_una_remota_en_otro_perfil_sin_hardware_sugiere_local_de_ese_perfil(self):
+        e = self.err([("robot", AJENA)], [("n", "pruebas", "robot")], "pruebas", '\n[profile.pruebas]\n')
+        self.assertTrue(e.endswith(f"{self.UNA}, o usa [profile.pruebas] local = true para correr todo aquí"), e)
+
+    def test_un_nodo_sin_profile_no_cuenta_como_hardware(self):
+        for perfil, extra in (("sim", ""), ("pruebas", '\n[profile.pruebas]\n')):
+            with self.subTest(perfil=perfil):
+                e = self.err([("robot", AJENA)], [("n", None, "robot")], perfil, extra)
+                self.assertTrue(e.endswith(f", o usa [profile.{perfil}] local = true para correr todo aquí"), e)
+
+    def test_una_remota_en_otro_perfil_con_hardware_no_sugiere_nada_mas(self):
+        e = self.err([("robot", AJENA)], [("motor", '["real", "pruebas"]', "robot")], "pruebas",
+                     '\n[profile.pruebas]\n')
+        self.assertTrue(e.endswith("Mientras tanto: corre agmen run en esa computadora."), e)
+        self.assertNotIn("local = true", e)
+
+    def test_hardware_en_el_perfil_sim_con_nodo_real_y_sim(self):
+        # una remota, perfil sim, nodo ["real","sim"]: hay hardware, el perfil ya es sim → solo "corre allá"
+        e = self.err([("robot", AJENA)], [("motor", '["real", "sim"]', "robot")], "sim")
+        self.assertTrue(e.endswith("Mientras tanto: corre agmen run en esa computadora."), e)
+
+    def test_una_remota_en_real_con_nodo_real_y_sim_omite_la_simulacion(self):
+        e = self.err([("robot", AJENA)], [("motor", '["real", "sim"]', "robot")])
+        self.assertTrue(e.endswith("Mientras tanto: corre agmen run en esa computadora."), e)
+        self.assertNotIn("simulación", e)
+
+    def test_varias_con_hardware(self):
+        e = self.err([("laptop", "127.0.0.1"), ("robot", AJENA)], [("ia", None, "laptop"), ("motor", "real", "robot")],
+                     aqui=("laptop",))
+        self.assertTrue(e.endswith(f"{self.VARIAS} Mientras tanto, para probar aquí en simulación: {self.SIM}"), e)
+
+    def test_varias_sin_hardware_sugiere_local_del_perfil(self):
+        e = self.err([("a", AJENA), ("b", "198.51.100.7")], [("x", "pruebas", "a"), ("y", None, "b")], "pruebas",
+                     '\n[profile.pruebas]\n')
+        self.assertTrue(e.endswith(f"{self.VARIAS} Mientras tanto: usa [profile.pruebas] local = true para "
+                                   f"correr todo aquí"), e)
+
+    def test_varias_con_hardware_en_otro_perfil_via_profile_lista(self):
+        e = self.err([("a", AJENA), ("b", "198.51.100.7")],
+                     [("x", '["real", "pruebas"]', "a"), ("y", "pruebas", "b")], "pruebas", '\n[profile.pruebas]\n')
+        self.assertTrue(e.endswith(f"{self.VARIAS} Mientras tanto, para probar aquí en simulación: {self.SIM}"), e)
+
+    def test_varias_en_sim_con_nodo_remoto_real_y_sim_omite_la_simulacion(self):
+        e = self.err([("a", AJENA), ("b", "198.51.100.7")],
+                     [("x", '["real", "sim"]', "a"), ("y", "sim", "b")], "sim")
+        self.assertTrue(e.endswith("que llega en una versión próxima."), e)
+
+    def test_varias_en_real_con_nodo_remoto_real_y_sim_omite_la_simulacion(self):
+        e = self.err([("a", AJENA), ("b", "198.51.100.7")],
+                     [("x", '["real", "sim"]', "a"), ("y", "real", "b")])
+        self.assertTrue(e.endswith("que llega en una versión próxima."), e)
+
+    def test_el_nodo_real_y_sim_de_una_computadora_aqui_no_cuenta(self):
+        # solo importan los nodos de las computadoras remotas
+        e = self.err([("laptop", "127.0.0.1"), ("robot", AJENA)],
+                     [("x", '["real", "sim"]', "laptop"), ("motor", "real", "robot")], aqui=("laptop",))
+        self.assertTrue(e.endswith(f"Mientras tanto, para probar aquí en simulación: {self.SIM}"), e)
+
+    def test_nunca_quita_machine_ni_real_local(self):
+        casos = [
+            ([("robot", AJENA)], [("m", "real", "robot")], None, ""),
+            ([("robot", AJENA)], [("m", None, "robot")], "sim", ""),
+            ([("a", AJENA), ("b", "198.51.100.7")], [("x", None, "a"), ("y", None, "b")], None, ""),
+            ([("a", AJENA), ("b", "198.51.100.7")], [("x", "sim", "a"), ("y", "sim", "b")], "sim", ""),
+            ([("a", AJENA), ("b", "198.51.100.7")], [("x", '["real","sim"]', "a"), ("y", "sim", "b")], "sim", ""),
+        ]
+        for maquinas, nodos, perfil, extra in casos:
+            with self.subTest(nodos=nodos, perfil=perfil):
+                e = self.err(maquinas, nodos, perfil, extra)
+                self.assertNotIn("quita machine", e)
+                self.assertNotIn("[profile.real] local", e)
+
+    def test_hardware_remote_funciones(self):
+        from agmen.machines import hardware_remote
+        c = _config(robot_toml([("robot", AJENA), ("laptop", "127.0.0.1")],
+                               [("m", '["real", "mesa"]', "robot"), ("ia", "mesa", "laptop")]), "mesa")
+        self.assertTrue(hardware_remote(c, ["robot"]))
+        self.assertFalse(hardware_remote(c, ["laptop"]))
+        c2 = _config(robot_toml([("robot", AJENA)], [("m", None, "robot")]), "sim")
+        self.assertFalse(hardware_remote(c2, ["robot"]))
+        c3 = _config(robot_toml([("robot", AJENA)], [("m", None, "robot")]))
+        self.assertTrue(hardware_remote(c3, ["robot"]))       # el perfil real
+
+
+class TestValidacionBloque3aSegunda(unittest.TestCase):
+    def malo(self, texto, *frag):
+        with self.assertRaises(ValueError) as ctx:
+            split_host(texto)
+        for f in frag:
+            self.assertIn(f, str(ctx.exception))
+
+    def test_numeros_al_estilo_inet_aton_piden_la_ipv4_completa(self):
+        for texto in ("0x0", "0xffffffff", "0XFF", "1.2.3", "010.1.1.1", "0x7f.1", "2130706433", "1.2.3.4.5",
+                      "0x7f.0.0.1", "0x0:7400", "1.2.", "0x"):
+            with self.subTest(texto=texto):
+                self.malo(texto, "IPv4", "cuatro números")
+
+    def test_en_load_config_dice_la_machine(self):
+        for host in ("0x0", "1.2.3", "010.1.1.1", "0x7f.1"):
+            with self.subTest(host=host):
+                with self.assertRaises(ConfigError) as ctx:
+                    _config(f'\n[[machine]]\nname = "robot"\nhost = "{host}"\n')
+                self.assertIn("[[machine]] 'robot'", str(ctx.exception))
+                self.assertIn("IPv4", str(ctx.exception))
+
+    def test_nombres_que_parecen_numeros_pero_no_lo_son_siguen_validos(self):
+        for texto in ("123abc", "1e2", "0xg", "1.2.3.x", "a1", "0x1.local", "3com", "007bond.local"):
+            with self.subTest(texto=texto):
+                self.assertEqual(split_host(texto)[1], DEFAULT_PORT)
+
+    def test_ipv4_normal_sigue_valiendo(self):
+        self.assertEqual(split_host("10.0.0.1:7400"), ("10.0.0.1", 7400))
+        self.assertEqual(split_host("192.168.1.20"), ("192.168.1.20", DEFAULT_PORT))
+
+    def test_ipv4_mapeada_que_no_es_una_computadora(self):
+        for texto in ("::ffff:0.0.0.0", "::ffff:224.0.0.1", "::ffff:255.255.255.255",
+                      "[::ffff:0.0.0.0]:7391", "[::ffff:224.0.0.1]", "[::ffff:255.255.255.255]:7400",
+                      "::ffff:239.1.1.1"):
+            with self.subTest(texto=texto):
+                self.malo(texto, "no es la dirección de una computadora")
+
+    def test_ipv4_mapeada_normal_vale(self):
+        self.assertEqual(split_host("::ffff:192.168.1.20"), ("::ffff:192.168.1.20", DEFAULT_PORT))
+        self.assertEqual(split_host("[::ffff:192.168.1.20]:7400")[1], 7400)
+
+    def test_la_ipv4_y_su_forma_mapeada_son_la_misma_computadora(self):
+        base = '\n[[machine]]\nname = "{}"\nhost = "{}"\n'
+        for a, b in (("192.168.1.20", "::ffff:192.168.1.20"), ("::ffff:192.168.1.20", "192.168.1.20"),
+                     ("192.168.1.20:7400", "[::ffff:192.168.1.20]:7400")):
+            with self.subTest(a=a, b=b):
+                with self.assertRaises(ConfigError) as ctx:
+                    _config(base.format("a", a) + base.format("b", b))
+                self.assertIn("son la misma computadora", str(ctx.exception))
+
+    def test_ipv4_y_su_forma_mapeada_con_otro_puerto_son_distintas(self):
+        base = '\n[[machine]]\nname = "{}"\nhost = "{}"\n'
+        c = _config(base.format("a", "192.168.1.20") + base.format("b", "[::ffff:192.168.1.20]:7400")
+                    + '\n[[node]]\nname = "n"\ncmd = "x"\n')
+        self.assertEqual([m.port for m in c.machines], [7391, 7400])
+
+    def test_el_error_de_nombre_invalido_menciona_guiones_y_xn(self):
+        with self.assertRaises(ValueError) as ctx:
+            split_host("róbot.local")
+        t = str(ctx.exception)
+        self.assertIn("'-' y '_'", t)
+        self.assertIn("xn--", t)
+
+
+class TestLauncherMachineNoDeclarada(unittest.TestCase):
+    def test_machine_que_no_esta_en_config_machines(self):
+        c = _config(robot_toml([("robot", "127.0.0.1")], [("motor", None, "robot"), ("ia", None, None)]))
+        roto = dataclasses.replace(c, machines=[])
+        with mock.patch("agmen.run.LogBook", side_effect=AssertionError("ya creó")), \
+                mock.patch("agmen.machines.place_machines", side_effect=AssertionError("consultó")), \
+                mock.patch("socket.getaddrinfo", side_effect=AssertionError("DNS")):
+            with self.assertRaises(ConfigError) as ctx:
+                Launcher(roto, io.StringIO())
+        e = str(ctx.exception)
+        self.assertIn("'motor'", e)
+        self.assertIn("'robot'", e)
+        self.assertIn("[[machine]]", e)
+
+    def test_machine_distinta_de_las_declaradas(self):
+        c = _config(robot_toml([("robot", "127.0.0.1"), ("laptop", "127.0.0.1:7400")],
+                               [("motor", None, "robot")]))
+        roto = dataclasses.replace(c, machines=[m for m in c.machines if m.name == "laptop"])
+        with self.assertRaises(ConfigError) as ctx:
+            Launcher(roto, io.StringIO(), places={"robot": Place(True, "loopback")})
+        self.assertIn("'robot'", str(ctx.exception))
+        self.assertIn("laptop", str(ctx.exception))
+
+    def test_places_dado_no_salva_una_machine_no_declarada(self):
+        c = _config(robot_toml([("robot", "127.0.0.1")], [("motor", None, "robot")]))
+        with self.assertRaises(ConfigError):
+            Launcher(dataclasses.replace(c, machines=[]), io.StringIO(), places={"robot": Place(True, "mine")})
+
+    def test_sin_nodos_con_machine_no_toca_la_red_aunque_haya_machines(self):
+        c = _config(robot_toml([("robot", "robot.local")], [("ia", None, None)]))
+        with mock.patch("agmen.machines.place_machines", side_effect=AssertionError("consultó")), \
+                mock.patch("socket.getaddrinfo", side_effect=AssertionError("DNS")), \
+                mock.patch("socket.socket", side_effect=AssertionError("socket")):
+            self.assertEqual(Launcher(c, io.StringIO()).places, {})
+            self.assertEqual(Launcher(dataclasses.replace(c, machines=[]), io.StringIO()).places, {})
+
+
+class TestOrdenEnAgmenRun(unittest.TestCase):
+    """Los errores que no dependen de la red salen ANTES de consultarla."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.toml = os.path.join(self.dir, "robot.toml")
+        with open(self.toml, "w", encoding="utf-8") as f:
+            f.write(robot_toml([("robot", "robot.local")], [("motor", None, "robot"), ("ia", None, None)])
+                    + "\n[web]\nenabled = false\n")
+
+    def run_cli(self, *args):
+        from agmen import cli
+        err, out = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            code = cli.main(["run", self.toml, "--no-browser", *args])
+        return code, err.getvalue()
+
+    def test_skip_inexistente_sale_sin_consultar_la_red(self):
+        with mock.patch("agmen.machines.place_machines", side_effect=AssertionError("consultó la red")) as pm, \
+                mock.patch("socket.getaddrinfo", side_effect=AssertionError("DNS")):
+            code, err = self.run_cli("--skip", "no-existe")
+        self.assertEqual(code, 2)
+        self.assertIn("--skip no-existe: no hay un nodo con ese nombre", err)
+        pm.assert_not_called()
+
+    def test_sin_el_error_del_archivo_si_consulta(self):
+        # control: el mismo robot sin --skip malo sí llega a la consulta (la prueba de arriba no es vacua)
+        with mock.patch("agmen.machines.place_machines", return_value={"robot": Place(False, "other")}) as pm:
+            code, err = self.run_cli()
+        self.assertEqual(code, 2)
+        pm.assert_called_once()
+        self.assertIn("'motor' corre en 'robot'", err)
+
+    def test_el_error_del_archivo_con_dns_lento_no_espera(self):
+        liberar = threading.Event()
+
+        def colgado(*a, **k):
+            liberar.wait(30)
+            raise OSError
+
+        try:
+            with mock.patch("socket.getaddrinfo", colgado):
+                t0 = time.monotonic()
+                code, _ = self.run_cli("--skip", "no-existe")
+                dt = time.monotonic() - t0
+        finally:
+            liberar.set()
+        self.assertEqual(code, 2)
+        self.assertLess(dt, 1.0, f"tardó {dt:.1f} s: consultó el DNS antes del error del archivo")
+
+    def test_perfil_replay_sin_play_sale_sin_consultar(self):
+        with mock.patch("agmen.machines.place_machines", side_effect=AssertionError("consultó")):
+            code, err = self.run_cli("--profile", "replay")
+        self.assertEqual(code, 2)
+        self.assertIn("replay", err)
 
 
 if __name__ == "__main__":
