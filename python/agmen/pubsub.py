@@ -1019,7 +1019,7 @@ if _backend.NATIVE:
             del marco
         except Exception:  # noqa: BLE001
             lugares = []
-        return f"({proceso}; parado en {' ← '.join(lugares)})" if lugares else f"({proceso})"
+        return f"({proceso}; parado en {' <- '.join(lugares)})" if lugares else f"({proceso})"
 
     def _cierre_resto(falta: str, sobra: float, esperado: float, apurado: bool) -> None:
         """Lo que sigue al cierre del núcleo, que registra atexit como _core._cierre (una función de C:

@@ -1170,7 +1170,7 @@ class TestHiloDeLatidosAlSalir(_ConHub):
     def test_el_aviso_dice_donde_esta_parado_el_hilo_de_latidos(self):
         aviso, pid = self._atorado("normal")
         self.assertRegex(aviso, r"el hilo de latidos \(proceso %s; parado en atorado_prueba\.py:\d+ _beat" % pid)
-        self.assertRegex(aviso, r"← pubsub\.py:\d+ _loop\)")
+        self.assertRegex(aviso, r"<- pubsub\.py:\d+ _loop\)")
         self.assertNotIn("hijo de un fork", aviso)
 
     def test_el_aviso_sale_igual_si_el_diagnostico_falla_por_dentro(self):
