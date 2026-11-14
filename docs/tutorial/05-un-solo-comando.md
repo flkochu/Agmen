@@ -445,8 +445,9 @@ Así corre todo el robot sin laptop, con el mismo archivo.
 Agmen no arranca nada, ni siquiera el hub. Sale con código de error (2) y el
 mensaje dice cuatro cosas: qué nodos están en la otra computadora, dónde está
 (nombre y dirección), que esta versión todavía no los arranca, y qué hacer.
-Lo que hacer: correr `agmen run` en la Raspberry Pi (caso 1), o probar aquí en
-simulación (caso 3).
+Lo que hacer: correr `agmen run` en la Raspberry Pi (caso 1). Si corres el
+perfil `real`, el mensaje también ofrece probar aquí en simulación (caso 3). En
+otro perfil, solo dice que hace falta `agmen agent`.
 
 **Caso 3: simulación en la laptop con `local = true`.** Agrega esto a tu archivo:
 
@@ -473,6 +474,10 @@ está. Si la red no lo conoce, o no contesta en 1.5 segundos, Agmen no puede
 saber si esa computadora es la tuya. Ante la duda, supone que es **otra**. Por
 eso el mensaje dice `no pude resolver 'robot.local'` y te pide la IP.
 
+Si el nombre apunta a dos direcciones, una de esta computadora y otra de fuera,
+Agmen tampoco adivina: el mensaje dice que el nombre es esas dos direcciones, que
+una es de aquí y la otra no, y pide poner la IP en `host`.
+
 ¿Por qué es mejor así? Un error de más (no arranca y lo dice) se arregla en un
 minuto. Un motor que arranca en la computadora equivocada, no. Una IP no depende
 de la red de la escuela: siempre apunta a la misma computadora. Si la Raspberry
@@ -482,8 +487,10 @@ Pi cambia de IP, cámbiala en `host`.
 
 Un motor o un sensor de verdad se marca con `profile = "real"`. Así la
 simulación nunca lo arranca, aunque lo olvides. Los avisos de Agmen tampoco
-sugieren correr ese hardware en la laptop: si el motor está en la Raspberry Pi,
-el aviso solo ofrece la simulación (caso 3), donde ese nodo no corre.
+sugieren correr ese hardware en la laptop: si el motor está en la Raspberry Pi y
+corres el perfil `real`, el aviso ofrece la simulación (caso 3), donde ese nodo
+no corre. En otro perfil no ofrece simulación: solo dice que hace falta
+`agmen agent`.
 
 Un nodo **sin** `profile` corre en todos los perfiles, incluida la simulación. Si
 es un motor, la simulación en la laptop podría intentar moverlo. Por eso el
