@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Estado** | 📝 **Propuesto** (2026-11-13). Sin implementar. Adán tomó las 18 decisiones el 2026-11-14 ([sección 5](#5-decisiones)). Adán confirmó también los nombres de los tipos (§3.12). Para aceptarlo solo falta que Adán lo dé por aceptado |
+| **Estado** | ✅ **Aceptado** (2026-11-14: D5 = f, D6 = d, D14 = b; las demás, a), aún sin implementar; se implementa en Agmen 0.15.0, por bloques según la [sección 7](#7-plan-por-bloques). Decisiones en la [sección 5](#5-decisiones). Propuesto el 2026-11-13 |
 | **Depende de** | RFC 0001 (sobre v1, `compact` y `arrow`), RFC 0004 (el hub y su protocolo `agmen-hub/1`), RFC 0005 (archivos `.agmen`), RFC 0006 (el reloj de Agmen y los grupos de un nodo), RFC 0008 (datos grandes; D4: los mismos campos que Foxglove), RFC 0010 (grabaciones), RFC 0011 (`robot.toml` con perfiles; el mundo de MuJoCo), RFC 0012 (`[[mux]]`) |
 | **Versión** | Agmen 0.15.0, después del nivel 10 (D1 = a) |
 | **Requisitos** | a (datos grandes sin copias), c (grabaciones que sirven como datasets), d (misma interfaz en simulación y en el robot real), f (microcontroladores) |
@@ -872,7 +872,7 @@ grabaciones y los nodos de 0.10 a 0.13: si se hace, es otra decisión.
 
 ## 5. Decisiones
 
-Adán tomó las 18 decisiones el 2026-11-14. En D5 pidió investigar si había una opción mejor que la que se le recomendó primero (e): se investigó, se probó, y eligió (f). D6 = d toca el protocolo de control del hub y la aprobó por nombre. D14 = b cambió los nombres de los tipos a inglés.
+Aprobadas por Adán el 2026-11-14, y con ellas aceptó el RFC. En D5 pidió investigar si había una opción mejor que la que se le recomendó primero (e): se investigó, se probó, y eligió (f). D6 = d toca el protocolo de control del hub y la aprobó por nombre. D14 = b cambió los nombres de los tipos a inglés; también confirmó la lista de nombres (§3.12).
 
 | # | Pregunta | Opciones | Recomendada | Decisión de Adán | Por qué |
 |---|---|---|---|---|---|
