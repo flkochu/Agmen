@@ -1050,5 +1050,149 @@ class TestFormasDeSalir(_ConHub):
         self.assertIn("hijo=0", r.stdout, f"el hijo no pudo crear un Publisher: {r.stderr}")
 
 
+# Un hijo de vida larga (sin cerrar nada heredado) mientras el padre publica imágenes grandes sin parar:
+# el padre puede estar dentro de publish() (con un mutex de C++ tomado) justo al hacer fork.
+FORK_VIDA_LARGA = CABECERA + """
+import os
+import numpy as np
+import agmen
+from agmen.msgs import Imagen
+msg = Imagen.from_array(np.zeros((480, 640, 3), dtype=np.uint8), encoding="bgr8", timestamp=0, frame_id="x")
+pub = agmen.Publisher(Imagen, "/cierre/vl")
+sub = agmen.Subscriber(Imagen, "/cierre/vl")
+def publica():
+    while True:
+        pub.publish(msg)
+def recibe():
+    while True:
+        sub.receive(0.2)
+for f in (publica, recibe):
+    threading.Thread(target=f, daemon=True).start()
+time.sleep(0.3)
+pid = os.fork()
+if pid == 0:
+    agmen.Publisher(Imagen, "/cierre/vl_hijo").publish(msg)
+    time.sleep(0.6)   # su hilo de latidos alcanza a latir
+    sys.exit(4)
+_, estado = os.waitpid(pid, 0)
+sys.exit(10 + os.waitstatus_to_exitcode(estado))
+"""
+
+# Un hilo de latidos atorado: un objeto de la lista de latidos cuyo _beat se duerme. En la línea donde
+# se duerme va una cadena reconocible: el aviso dice dónde está parado, pero no imprime la línea.
+LATIDO_ATORADO = """
+import os, sys, time
+sys.path.insert(0, sys.argv[1])
+modo = sys.argv[2]
+if modo == "diagnostico_roto":
+    import linecache
+    def roto(*a, **k):
+        raise RuntimeError("roto a propósito")
+    linecache.getline = roto
+    sys._current_frames = roto
+import agmen
+from agmen import pubsub
+from agmen.msgs import Imagen
+pub = agmen.Publisher(Imagen, "/cierre/atorado")
+class Atorado:
+    def _beat(self):
+        time.sleep(100)  # LINEA_SECRETA_9f3a
+a = Atorado()
+pubsub._beats.pubs.add(a)
+print("PID %d" % os.getpid(), flush=True)
+time.sleep(0.8)
+sys.exit(0)
+"""
+
+# Tres hilos giran tras el cierre: dos publicando y uno en receive(0); el principal sale con 3.
+BUCLES_TRAS_EL_CIERRE = CABECERA + """
+import agmen
+from agmen.msgs import Imagen
+msg = Imagen(timestamp=0, frame_id="x", width=2, height=2, encoding="mono8", step=0, data=b"\\0" * 4)
+pub = agmen.Publisher(Imagen, "/cierre/bucle")
+sub = agmen.Subscriber(Imagen, "/cierre/bucle")
+def publica():
+    while True:
+        pub.publish(msg)
+def recibe():
+    while True:
+        sub.receive(0)
+for f in (publica, publica, recibe):
+    threading.Thread(target=f, daemon=True).start()
+time.sleep(1.5)
+sys.exit(3)
+"""
+
+# Un hilo retiene el _lock de un Publisher nativo varios segundos mientras el programa sale.
+LOCK_RETENIDO = CABECERA + """
+import agmen
+from agmen.msgs import Imagen
+pub = agmen.Publisher(Imagen, "/cierre/lock")
+def retiene():
+    pub._lock.acquire()
+    time.sleep(6)
+threading.Thread(target=retiene, daemon=True).start()
+time.sleep(0.8)   # varios latidos (cada 0.25 s) topan con el lock
+sys.exit(0)
+"""
+
+
+@unittest.skipUnless(_backend.NATIVE, "sin núcleo de C++ (AGMEN_BACKEND=pure o sin compilar)")
+class TestHiloDeLatidosAlSalir(_ConHub):
+    """El hilo de latidos y el cierre: fork de vida larga, aviso con el lugar, bucles y locks."""
+
+    @unittest.skipUnless(POSIX, "os.fork: solo POSIX")
+    @unittest.skipUnless(HAY_NUMPY, "sin NumPy (la prueba publica una Imagen grande)")
+    def test_hijo_de_vida_larga_no_se_cuelga_en_el_latido_de_un_objeto_heredado(self):
+        for i in range(8):   # el padre está dentro de publish() al hacer fork solo a veces
+            r = correr(FORK_VIDA_LARGA, hub=self.addr, fijar=True, timeout=60)
+            self.assertEqual(r.returncode, 14, f"corrida {i}: {r.stderr}")
+            self.assertNotIn("al salir no terminaron", r.stderr, f"corrida {i}")
+            for m in MALAS:
+                self.assertNotIn(m, r.stderr)
+
+    def _atorado(self, modo):
+        with tempfile.TemporaryDirectory() as d:
+            guion = Path(d) / "atorado_prueba.py"   # un archivo, no -c: el aviso nombra el archivo
+            guion.write_text(LATIDO_ATORADO, encoding="utf-8")
+            r = subprocess.run([sys.executable, str(guion), str(ROOT), modo], env=entorno(self.addr),
+                               capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        m = re.search(r"PID (\d+)", r.stdout)
+        self.assertIsNotNone(m, r.stdout)
+        avisos = [ln for ln in r.stderr.splitlines() if "al salir no terminaron" in ln]
+        self.assertEqual(len(avisos), 1, f"el aviso debe salir una vez y en una línea: {r.stderr}")
+        self.assertIn("el hilo de latidos", avisos[0])
+        self.assertNotIn("LINEA_SECRETA_9f3a", r.stderr, "el aviso no debe imprimir el texto de la línea de código")
+        self.assertNotIn("Traceback", r.stderr)
+        return avisos[0], m.group(1)
+
+    def test_el_aviso_dice_donde_esta_parado_el_hilo_de_latidos(self):
+        aviso, pid = self._atorado("normal")
+        self.assertRegex(aviso, r"el hilo de latidos \(proceso %s; parado en atorado_prueba\.py:\d+ _beat" % pid)
+        self.assertRegex(aviso, r"← pubsub\.py:\d+ _loop\)")
+        self.assertNotIn("hijo de un fork", aviso)
+
+    def test_el_aviso_sale_igual_si_el_diagnostico_falla_por_dentro(self):
+        aviso, pid = self._atorado("diagnostico_roto")
+        self.assertIn(f"el hilo de latidos (proceso {pid})", aviso)
+        self.assertNotIn("parado en", aviso)
+
+    def test_bucles_que_giran_tras_el_cierre_no_dejan_aviso(self):
+        for i in range(5):
+            r = correr(BUCLES_TRAS_EL_CIERRE, hub=self.addr, fijar=True, timeout=60)
+            self.assertEqual(r.returncode, 3, f"corrida {i}: {r.stderr}")
+            self.assertNotIn("al salir no terminaron", r.stderr, f"corrida {i}")
+            for m in MALAS + ("Traceback",):
+                self.assertNotIn(m, r.stderr)
+
+    def test_el_latido_no_espera_un_candado_retenido(self):
+        r = correr(LOCK_RETENIDO, hub=self.addr, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("el hilo de latidos", r.stderr)
+        for m in MALAS + ("Traceback",):
+            self.assertNotIn(m, r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
