@@ -79,6 +79,12 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   al dar pasos: tras cada paso, el topic tiene 0.3 s de reloj real para
   ponerse al día antes de avisar. Un topic que de verdad dejó de llegar se
   avisa como mucho 0.3 s más tarde.
+- **Un programa de Python que publica ya no aborta a veces al salir** con
+  `terminate called without an active exception` (pasaba con Python 3.12 y el
+  núcleo de C++, desde 0.9.0): el hilo de latidos al hub ahora se detiene
+  antes de que el intérprete termine. Si tu programa publica o recibe desde un
+  hilo propio en segundo plano, deténlo y espéralo (`join`) antes de salir:
+  ese caso todavía puede abortar con Python 3.12.
 
 ## [0.13.0] — 2026-11-06
 

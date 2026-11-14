@@ -648,7 +648,7 @@ class _Beats:
         self.stopping.set()
         t = self.thread
         if t is not None and t is not threading.current_thread():
-            t.join()
+            t.join(2.0)   # un latido dura microsegundos; el límite es por si su aviso se atora (stderr lleno)
 
 
 _beats = _Beats()
