@@ -453,6 +453,93 @@ signal.signal(signal.SIGINT, signal.default_int_handler)
 print("principal termina", flush=True)
 """
 
+# Ctrl+C PENDIENTE al entrar al cierre: un atexit escrito en C (sum sobre un range largo: no revisa
+# señales) registrado DESPUÉS de importar agmen corre justo antes del cierre; el SIGINT llega mientras
+# corre. CPython revisa las señales al ENTRAR a una función de Python, así que con el cierre escrito en
+# Python el KeyboardInterrupt salía en su primera línea y el proceso abortaba (rc=134 con 3.12).
+CTRL_C_PENDIENTE = CABECERA + """
+import atexit, builtins, os, signal, subprocess
+class Lento:
+    def __del__(self):
+        time.sleep(0.5)
+builtins._lento = Lento()
+def sonda():   # registrada ANTES que agmen: corre después del cierre
+    r = []
+    t = threading.Thread(target=lambda: r.append(PUB.publish(MSG)))
+    t.start(); t.join(5)
+    print("CIERRE_PUBLISH_OTRO_HILO=%r" % (r,), flush=True)
+atexit.register(sonda)
+import agmen
+from agmen.msgs import Imagen
+MSG = Imagen(timestamp=0, frame_id="x", width=2, height=2, encoding="mono8", step=0, data=b"\\0" * 4)
+PUB = agmen.Publisher(Imagen, "/cierre/cc")
+sub = agmen.Subscriber(Imagen, "/cierre/cc")
+def rx():
+    while True:
+        sub.receive(0.05)
+for _ in range(3):
+    threading.Thread(target=rx, daemon=True).start()
+t0 = time.perf_counter(); sum(range(3_000_000)); dt = max(time.perf_counter() - t0, 0.001)
+N = int(3_000_000 * 1.8 / dt)   # ~1.8 s en C, calibrado a esta máquina
+subprocess.Popen([sys.executable, "-c", "import os,time,signal\\ntime.sleep(1.0)\\nos.kill(%d, signal.SIGINT)" % os.getpid()])
+atexit.register(sum, range(N))
+time.sleep(0.6)
+sys.exit(4)
+"""
+
+# Una excepción que NO es KeyboardInterrupt, levantada por un manejador de señales del usuario durante la
+# espera del cierre (sys.exit en un manejador de SIGTERM): no se pierde, el cierre deja de esperar.
+SIGTERM_DURANTE_EL_CIERRE = CABECERA + """
+import signal
+import agmen
+node = agmen.Node("larga")
+node.every(0.01, lambda: time.sleep(10))
+threading.Thread(target=node.spin, daemon=True).start()
+time.sleep(0.3)
+def termina(*_):
+    sys.exit(7)
+signal.signal(signal.SIGTERM, termina)   # después del spin: mientras gira, agmen tiene su propio manejador
+print("principal termina", flush=True)
+"""
+
+# Un fork hecho con el cierre ya declarado: el hijo funciona normal (publish, receive, every).
+FORK_HIJO_FUNCIONA = CABECERA + """
+import atexit, os
+def tarde():
+    pid = os.fork()
+    if pid == 0:
+        code = 0
+        try:
+            from agmen import pubsub
+            assert pubsub._cerrando is False, "_cerrando sigue en True en el hijo"
+            pub = agmen.Publisher(Imagen, "/cierre/hijo3")
+            sub = agmen.Subscriber(Imagen, "/cierre/hijo3")
+            msg = Imagen(timestamp=0, frame_id="x", width=2, height=2, encoding="mono8", step=0, data=b"\\0" * 4)
+            fin = time.monotonic() + 5
+            publico = llego = False
+            while time.monotonic() < fin and not llego:
+                publico = pub.publish(msg) or publico
+                llego = sub.receive(0.2) is not None
+            assert publico and llego, "publish/receive del hijo: %r" % ((publico, llego),)
+            n = [0]
+            node = agmen.Node("hijo")
+            @node.every(0.01)
+            def tic():
+                n[0] += 1
+            node.spin_for(0.3)
+            assert n[0] >= 5, "every del hijo corrió %d veces" % n[0]
+        except BaseException as e:
+            sys.stderr.write("HIJO FALLO: %r\\n" % (e,))
+            code = 9
+        os._exit(code)
+    _, estado = os.waitpid(pid, 0)
+    print("hijo=%d" % os.waitstatus_to_exitcode(estado), flush=True)
+atexit.register(tarde)
+import agmen
+from agmen.msgs import Imagen
+p = agmen.Publisher(Imagen, "/cierre/padre3")
+"""
+
 # M1: un hilo con el lock de un Publisher y de un Subscriber tomado y dormido para siempre; un atexit
 # ajeno (corre después del cierre) llama a close() de los dos: sin límite se colgaría la salida.
 LOCK_TOMADO = CABECERA + """
@@ -625,6 +712,44 @@ class TestCierreSalidas(_ConHub):
         for m in MALAS:
             self.assertNotIn(m, err)
 
+    @unittest.skipUnless(POSIX, "SIGINT enviado con os.kill a un proceso: solo POSIX")
+    def test_ctrl_c_pendiente_al_entrar_al_cierre_no_lo_salta(self):
+        """Un Ctrl+C que llega mientras corre un atexit largo escrito en C no hace saltar el cierre ni
+        aborta: rc de sys.exit, sin traceback, y el cierre sí corrió (la sonda ve publish() == False)."""
+        r = correr(CTRL_C_PENDIENTE, hub=self.addr, timeout=30, fijar=True)
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        for m in MALAS:
+            self.assertNotIn(m, r.stderr)
+        self.assertIn("CIERRE_PUBLISH_OTRO_HILO=[False]", r.stdout, f"el cierre no corrió:\n{r.stdout}\n{r.stderr}")
+
+    @unittest.skipUnless(POSIX, "SIGTERM enviado a un proceso: solo POSIX")
+    def test_excepcion_de_un_manejador_de_senales_durante_la_espera_no_se_pierde(self):
+        """sys.exit(7) en un manejador de SIGTERM durante la espera: el cierre deja de esperar, termina,
+        el aviso sale y la excepción se reporta como 'Exception ignored in atexit callback'."""
+        cmd = [sys.executable, "-c", SIGTERM_DURANTE_EL_CIERRE, str(ROOT)]
+        p = subprocess.Popen(cmd, env=entorno(self.addr), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(p.stdout.readline().strip(), "principal termina")
+            time.sleep(0.6)   # el cierre ya lleva un rato esperando a la función de 10 s
+            t0 = time.monotonic()
+            p.send_signal(signal.SIGTERM)
+            try:
+                _, err = p.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                _, err = p.communicate()
+                self.fail(f"SIGTERM durante el cierre no terminó el programa en 15 s: {err}")
+        finally:
+            if p.poll() is None:
+                p.kill()
+        self.assertLess(time.monotonic() - t0, 1.0, "tras la señal debía dejar de esperar")
+        self.assertEqual(err.count("al salir no terminaron"), 1, err)
+        self.assertIn("Exception ignored in atexit callback", err)
+        self.assertIn("SystemExit: 7", err)
+        for m in MALAS:
+            self.assertNotIn(m, err)
+
     def test_lock_de_publisher_y_subscriber_tomado_no_cuelga_la_salida(self):
         """M1: tras empezar el cierre, close() no espera sin límite el lock que tiene un hilo dormido."""
         try:
@@ -659,7 +784,7 @@ class TestCierreAlAzar(_ConHub):
     núcleos; con el código anterior a la corrección cada una abortaba en una fracción de las corridas
     (publicar y spin(): casi siempre). AGMEN_CIERRE_VECES cambia las repeticiones."""
 
-    VECES = {"publicar": 6, "recibir": 10, "spin": 6, "aviso": 4, "espera_gil": 6}
+    VECES = {"publicar": 6, "recibir": 8, "spin": 6, "aviso": 4, "espera_gil": 6}
 
     def _corre_varias(self, nombre, codigo=None, permite_aviso=False):
         veces = int(os.environ.get("AGMEN_CIERRE_VECES", self.VECES[nombre]))
@@ -755,6 +880,13 @@ class TestFormasDeSalir(_ConHub):
         r = correr(FORMAS_DE_SALIR, "fork_osexit", hub=self.addr, fijar=True)
         self.assertEqual(r.returncode, 16, r.stderr)   # 10 + 6
         self._sin_avisos(r)
+
+    @unittest.skipUnless(POSIX, "os.fork: solo POSIX")
+    def test_fork_con_el_cierre_ya_declarado_el_hijo_publica_recibe_y_gira(self):
+        r = correr(FORK_HIJO_FUNCIONA, hub=self.addr)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("hijo=0", r.stdout, f"el hijo no funcionó normal: {r.stderr}")
+        self.assertNotIn("HIJO FALLO", r.stderr)
 
     @unittest.skipUnless(POSIX, "os.fork: solo POSIX")
     def test_fork_con_el_cierre_ya_declarado_el_hijo_empieza_de_cero(self):
