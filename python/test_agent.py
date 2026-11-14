@@ -2838,6 +2838,11 @@ class TestClienteQueNoLee(ServerCase):
             self.leer_hasta_sesion_ok(cli)
             maximo = 0
             sesion = self.server.session
+            # El cliente NO se rinde antes que el agente: su envío tenía el mismo tiempo límite (1.5 s) que el
+            # agente para decidir "no lee"; al empatarse, el cliente podía rendirse a media línea (sendall no es
+            # atómico) justo cuando el agente volvía a leer, y el agente esperaba el resto de esa línea hasta dar
+            # "no dijo nada en 6 s" en vez de "no lee". Con 20 s quien cierra es siempre el agente.
+            cli.ch.sock.settimeout(20)
             t0 = time.monotonic()
             enviados = 0
             try:
@@ -2859,7 +2864,8 @@ class TestClienteQueNoLee(ServerCase):
             self.assertTrue(self.espera(lambda: self.server.session is None, 30), "el agente no se recuperó")
             self.assertTrue(self.espera(lambda: not self.vivo("motor"), 30))
             self.assertEqual(self.cola(sesion), 0, "la memoria de la cola no se liberó al cerrar")
-        self.assertTrue(any("no lee" in t for t, _ in self.said), self.said)
+        self.assertTrue(any("no lee" in t for t, _ in self.said),
+                        f"{enviados} ping en {time.monotonic() - t0:.1f} s, cola máx. {maximo}; el agente dijo: {self.said}")
 
     def test_ordenes_con_error_sin_leer_tambien_acotan_la_cola(self):
         with mock.patch.object(agent, "SEND_TIMEOUT", 1.5):
@@ -2867,6 +2873,7 @@ class TestClienteQueNoLee(ServerCase):
             cli.send(self.mensaje())
             self.leer_hasta_sesion_ok(cli)
             sesion = self.server.session
+            cli.ch.sock.settimeout(20)      # como en la prueba del ping: el cliente no se rinde antes que el agente
             maximo, enviados = 0, 0
             try:
                 while enviados < 40000:
