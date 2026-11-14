@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Estado** | 📝 **Propuesto** (2026-11-13). Sin implementar. Adán tomó las 18 decisiones el 2026-11-14 ([sección 5](#5-decisiones)). Para aceptarlo falta que Adán confirme los nombres de los tipos (§3.12), que quedan fijos, y que lo dé por aceptado |
+| **Estado** | 📝 **Propuesto** (2026-11-13). Sin implementar. Adán tomó las 18 decisiones el 2026-11-14 ([sección 5](#5-decisiones)). Adán confirmó también los nombres de los tipos (§3.12). Para aceptarlo solo falta que Adán lo dé por aceptado |
 | **Depende de** | RFC 0001 (sobre v1, `compact` y `arrow`), RFC 0004 (el hub y su protocolo `agmen-hub/1`), RFC 0005 (archivos `.agmen`), RFC 0006 (el reloj de Agmen y los grupos de un nodo), RFC 0008 (datos grandes; D4: los mismos campos que Foxglove), RFC 0010 (grabaciones), RFC 0011 (`robot.toml` con perfiles; el mundo de MuJoCo), RFC 0012 (`[[mux]]`) |
 | **Versión** | Agmen 0.15.0, después del nivel 10 (D1 = a) |
 | **Requisitos** | a (datos grandes sin copias), c (grabaciones que sirven como datasets), d (misma interfaz en simulación y en el robot real), f (microcontroladores) |
@@ -820,7 +820,8 @@ los tres lugares. Lo que cambia entre simulación y real es el nodo marcado con
 Con los tipos en inglés, la regla propuesta es: el nombre de Foxglove si el
 tipo tiene sus mismos campos; el de ROS si no hay uno de Foxglove; y uno
 propio solo si no existe ninguno. Un nombre no se puede cambiar después sin
-romper (§5, D14), así que la lista se revisa antes de implementar.
+romper (§5, D14). **Adán confirmó esta lista el 2026-11-14**, con `Twist`
+para la velocidad.
 
 | Tipo | De dónde sale el nombre | Ojo |
 |---|---|---|
