@@ -824,8 +824,16 @@ class LogBook:
             notify()
 
     def since(self, idx: int) -> tuple[list[dict], int]:
+        """Las líneas desde la `idx` (en orden). Recorre solo las nuevas, desde el final:
+        el agente la llama por cada línea (RFC 0011 §3.4) y no debe recorrer las 5000."""
         with self.lock:
-            return [line for line in self.lines if line["i"] >= idx], self.next_idx
+            out = []
+            for line in reversed(self.lines):
+                if line["i"] < idx:
+                    break
+                out.append(line)
+            out.reverse()
+            return out, self.next_idx
 
 
 # ---------------------------------------------------------------------------

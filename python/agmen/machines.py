@@ -12,11 +12,19 @@ para que un nombre que no existe no cuelgue el arranque.
 La regla de seguridad: ante la duda, una [[machine]] es OTRA computadora. Un
 error de más ("no arranca y lo dice") se arregla en un minuto; un driver de
 motor que arranca en la computadora equivocada, no.
+
+AGMEN_REMOTE_HOSTS (para pruebas y para el CI de Windows, RFC 0011 §6 reto 9): una
+lista separada por comas de IP o nombres, ej. AGMEN_REMOTE_HOSTS=127.0.0.2. Una
+[[machine]] cuyo host (o alguna de sus direcciones) está en la lista se trata como
+OTRA computadora aunque sea esta: así agmen agent en 127.0.0.2 y agmen run en
+127.0.0.1 son dos computadoras en una sola máquina. Solo convierte "aquí" en
+"otra" (la dirección segura), nunca al revés.
 """
 
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import socket
 import threading
@@ -282,6 +290,10 @@ def check_hosts(hosts: list[str], timeout: float = RESOLVE_TIMEOUT) -> dict[str,
                                                  f"pon la IP en host")
         else:
             result[host] = Place(False, "other", f"'{host}' es {shown}, que no es de esta computadora")
+    forced = forced_remote()
+    if forced:
+        loopback = {"localhost": ["127.0.0.1", "::1"]}
+        _apply_forced(result, {**{h: loopback.get(h.lower().rstrip("."), []) for h in result}, **resolved}, forced)
     return result
 
 
@@ -298,6 +310,32 @@ def _distinct_ips(ips: list[str]) -> list[str]:
             key = (ip, None)
         out.setdefault(key, ip)
     return list(out.values())
+
+
+REMOTE_HOSTS_ENV = "AGMEN_REMOTE_HOSTS"
+
+
+def _norm(host: str) -> str:
+    host = host.strip().lower().rstrip(".")
+    try:
+        return str(unwrap(ipaddress.ip_address(host.split("%", 1)[0])))
+    except ValueError:
+        return host
+
+
+def forced_remote(env: dict | None = None) -> set[str]:
+    """Los host de AGMEN_REMOTE_HOSTS, normalizados (vacío si no está)."""
+    value = (os.environ if env is None else env).get(REMOTE_HOSTS_ENV, "")
+    return {_norm(h) for h in value.split(",") if h.strip()}
+
+
+def _apply_forced(result: dict[str, Place], addresses: dict[str, list[str]], forced: set[str]) -> None:
+    for host, place in result.items():
+        if not place.here:
+            continue   # nunca al revés: "otra" se queda "otra"
+        if _norm(host) in forced or any(_norm(ip) in forced for ip in addresses.get(host, [])):
+            result[host] = Place(False, "other", f"'{host}' está en {REMOTE_HOSTS_ENV}: se trata como otra "
+                                                 f"computadora")
 
 
 def these_are_here(hosts: list[str], timeout: float = RESOLVE_TIMEOUT) -> dict[str, bool]:

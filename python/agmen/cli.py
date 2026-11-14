@@ -371,18 +371,14 @@ def cmd_agent(args) -> int:
         print(f"error: --port {args.port}: el puerto es un número entre 1 y 65535", file=sys.stderr)
         return 2
     port = args.port if args.port is not None else me.port
-    try:
-        key, created = load_agent_key(new=args.new_key)
-    except AgentError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 2
     host = f"[{me.host}]" if ":" in me.host else me.host
     printer = Printer(["agmen agent"])
 
     def say(text: str, kind: str = "agmen") -> None:
         printer("agmen agent", text, kind)
 
-    server = AgentServer(args.archivo, me.name, key, port=port, shown=f"{host}:{port}", say=say)
+    # Primero el puerto y luego la clave: con el puerto ocupado, --new-key no tira la clave de antes.
+    server = AgentServer(args.archivo, me.name, None, port=port, shown=f"{host}:{port}", say=say)
     try:
         server.bind()
     except OSError as e:
@@ -392,6 +388,14 @@ def cmd_agent(args) -> int:
               f"[[machine]] '{me.name}' (ej. host = \"{host}:{port + 1}\")", file=sys.stderr)
         printer.close()
         return 2
+    try:
+        key, created = load_agent_key(new=args.new_key)
+    except AgentError as e:
+        server.sock.close()
+        printer.close()
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    server.use_key(key)
     here = [n.name for n in config.nodes if n.machine == me.name]
     say(f"Agmen {__version__} · robot '{config.name}' · esta computadora es '{me.name}' ({_address(me)}) · "
         f"nodos de aquí (perfil {config.profile}): {', '.join(here) or 'ninguno'}")

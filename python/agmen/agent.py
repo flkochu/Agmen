@@ -34,7 +34,7 @@ import socket
 import subprocess
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
@@ -65,10 +65,18 @@ PING_EVERY = 2.0                # el cliente manda ping cada tanto
 SEND_TIMEOUT = 6.0              # si la otra punta no lee en este tiempo, se da por perdida
 FAIL_PAUSE = 1.0                # tras una clave mala, esa IP espera esto antes de otro intento
 FAIL_WINDOW = 60.0
-MAX_FAILS = 5                   # intentos con clave mala por minuto, en total
-MAX_HANDSHAKES = 16             # saludos a la vez (el resto se cierra: nadie tumba al agente así)
+MAX_FAILS_IP = 5                # pruebas malas por minuto desde una IP (IPv6: su /64)
+MAX_FAILS_TOTAL = 60            # pruebas malas por minuto en total (salvo la IP que ya demostró la clave)
+MAX_PENDING_IP = 4              # conexiones sin saludar a la vez desde una IP
+MAX_PENDING_TOTAL = 32          # … y en total (1 guardada para la IP que ya demostró la clave)
+MAX_TRACKED_IPS = 1024          # IP que se recuerdan para los límites (las más viejas se olvidan)
+NOTES_PER_MINUTE = 20           # avisos por conexiones sin clave en la terminal del agente
 LOG_LINE_MAX = 8 * 1024         # bytes de una línea de log que se manda (más se corta)
-OUT_QUEUE_MAX = 5000            # mensajes por mandar; si la laptop no da abasto, se descartan logs
+OUT_MAX_MSGS = 5000             # cola de salida del agente: con esto, o
+OUT_MAX_BYTES = 4 * 1024 * 1024  # con esto, los log se descartan
+OUT_MAX_REPLIES = 1000          # respuestas (pong, error) sin leer: la sesión deja de leer a la laptop
+PONG_T_MAX = 64                 # un pong repite t solo si es un número o un texto corto
+MAX_ORDERS = 64                 # órdenes pendientes por sesión
 
 WRITTEN_KEYS = ("cmd", "env", "cwd", "restart", "autostart", "profile")   # lo escrito que se compara (D7)
 CLOCKS = ("real", "sim", "replay")
@@ -188,50 +196,100 @@ def client_keys_path() -> Path:
     return config_dir() / "keys.toml"
 
 
-def _write_private(path: Path, text: str) -> None:
-    """Escribe un archivo que solo lee su dueño (0600 donde aplica; en Windows, la carpeta
-    %APPDATA% ya es solo del usuario). Primero a un archivo aparte y luego se cambia de
-    nombre: un corte a la mitad no deja el archivo a medias."""
+def _private_dir(path: Path) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    except OSError as e:
+        raise AgentKeyError(f"no pude crear {path.parent}: {e.strerror or e}. Revisa sus permisos (o usa otra "
+                            f"carpeta con la variable AGMEN_CONFIG_DIR)") from None
+
+
+def _write_private(path: Path, text: str) -> None:
+    """Escribe un archivo que solo lee su dueño (0600 donde aplica; en Windows, la carpeta
+    %APPDATA% ya es solo del usuario). Primero a un temporal (0600 desde que nace) y luego
+    os.replace: un corte a la mitad no deja el archivo a medias. Si falla, el temporal se borra."""
+    _private_dir(path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
-        if os.name != "nt":
-            os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     except OSError as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
         raise AgentKeyError(f"no pude guardar {path}: {e.strerror or e}. Revisa que puedas escribir en "
                             f"{path.parent} (o usa otra carpeta con la variable AGMEN_CONFIG_DIR)") from None
 
 
+def _read_agent_key(path: Path) -> str:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        why = getattr(e, "strerror", None) or e
+        raise AgentKeyError(f"no pude leer la clave de {path}: {why}. Revisa sus permisos, o crea otra "
+                            f"con agmen agent --new-key (la laptop te la va a pedir de nuevo)") from None
+    try:
+        return format_key(text.strip())
+    except AgentKeyError:
+        raise AgentKeyError(f"{path} no tiene una clave válida (¿se editó a mano?). Crea otra con "
+                            f"agmen agent --new-key (la laptop te la va a pedir de nuevo)") from None
+
+
 def load_agent_key(new: bool = False) -> tuple[str, bool]:
     """La clave del agente, de agent.key (la crea si no existe, o si `new`).
-    Devuelve (clave como xxxx-xxxx-xxxx, ¿es nueva?)."""
+    Devuelve (clave como xxxx-xxxx-xxxx, ¿es nueva?). Si dos agentes arrancan a la vez
+    por primera vez, el archivo se crea con exclusión: el segundo lee la del primero."""
     path = agent_key_path()
-    if not new and path.exists():
+    if new:
+        key = new_key()
+        _write_private(path, key + "\n")
+        return key, True
+    if not path.exists():
+        _private_dir(path)
+        key = new_key()
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
         try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as e:
-            why = getattr(e, "strerror", None) or e
-            raise AgentKeyError(f"no pude leer la clave de {path}: {why}. Revisa sus permisos, o crea otra "
-                                f"con agmen agent --new-key (la laptop te la va a pedir de nuevo)") from None
-        try:
-            key = format_key(text.strip())
-        except AgentKeyError:
-            raise AgentKeyError(f"{path} no tiene una clave válida (¿se editó a mano?). Crea otra con "
-                                f"agmen agent --new-key (la laptop te la va a pedir de nuevo)") from None
-        if os.name != "nt":
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                f.write(key + "\n")
             try:
-                if path.stat().st_mode & 0o077:
-                    os.chmod(path, 0o600)   # que solo la lea su dueño
+                os.link(tmp, path)   # crea agent.key solo si no existe, ya completo (atómico)
+                return key, True
+            except FileExistsError:
+                pass                 # otro agente la creó primero: se usa la suya
+            except OSError:
+                try:                 # sin enlaces (FAT…): creación exclusiva directa
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                except FileExistsError:
+                    pass
+                else:
+                    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(key + "\n")
+                    return key, True
+        except OSError as e:
+            raise AgentKeyError(f"no pude guardar {path}: {e.strerror or e}. Revisa que puedas escribir en "
+                                f"{path.parent} (o usa otra carpeta con la variable AGMEN_CONFIG_DIR)") from None
+        finally:
+            try:
+                os.unlink(tmp)
             except OSError:
                 pass
-        return key, False
-    key = new_key()
-    _write_private(path, key + "\n")
-    return key, True
+        for _ in range(20):          # la del otro agente puede estar terminando de escribirse
+            try:
+                return _read_agent_key(path), False
+            except AgentKeyError:
+                time.sleep(0.05)
+    key = _read_agent_key(path)
+    if os.name != "nt":
+        try:
+            if path.stat().st_mode & 0o077:
+                os.chmod(path, 0o600)   # que solo la lea su dueño
+        except OSError:
+            pass
+    return key, False
 
 
 def machine_address(host: str, port: int) -> str:
@@ -388,12 +446,15 @@ class Channel:
     def send(self, obj: dict) -> None:
         if not isinstance(obj, dict) or not isinstance(obj.get("op"), str):
             raise ValueError("cada mensaje es un objeto con 'op'")
-        body = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+        self.send_body(obj["op"], json.dumps(obj, separators=(",", ":"), ensure_ascii=False))
+
+    def send_body(self, op: str, body: str) -> None:
+        """Manda un objeto ya escrito en JSON (en una línea, como lo deja send)."""
         with self._send_lock:
             n = self._sent + 1
             line = f"{n} {body} {sign(self._key, self.side, n, body)}\n".encode("utf-8")
             if len(line) - 1 > MAX_LINE:
-                raise MessageTooLarge(f"el mensaje '{obj['op']}' mide {len(line) - 1} bytes y el límite es "
+                raise MessageTooLarge(f"el mensaje '{op}' mide {len(line) - 1} bytes y el límite es "
                                       f"{MAX_LINE}: no se mandó")
             try:
                 self.sock.sendall(line)
@@ -418,8 +479,8 @@ class Channel:
             raise ChannelError(f"el mensaje {n_text} trae una firma equivocada (no lo firmó quien tiene la clave)")
         try:
             obj = json.loads(body)
-        except ValueError:
-            raise ChannelError(f"el mensaje {n_text} no es JSON válido") from None
+        except (ValueError, RecursionError, MemoryError):   # RecursionError: JSON anidado miles de niveles
+            raise ChannelError(f"el mensaje {n_text} no es JSON válido (o anida demasiado)") from None
         if not isinstance(obj, dict) or not isinstance(obj.get("op"), str):
             raise ChannelError(f"el mensaje {n_text} no es un objeto con 'op'")
         self._received = expected
@@ -517,6 +578,7 @@ def agent_handshake(sock: socket.socket, key: bytes, *, version: str = __version
         raise HandshakeError("no_agmen", "la primera línea no empieza con agmen-agent/")
     proto, _, rest = line.partition(" ")
     if proto != PROTOCOL:
+        proto = _clean(proto, 40)   # viene de quien sea, sin clave: corto y sin caracteres de control
         major = proto[len(_PREFIX):]
         newer = major.isdigit() and int(major) > PROTOCOL_MAJOR
         text = (f"la laptop habla {proto} y este agente (Agmen {version}) habla {PROTOCOL}: "
@@ -542,7 +604,10 @@ def agent_handshake(sock: socket.socket, key: bytes, *, version: str = __version
     if not _same(proof(key, "cliente", nc, na), line[len("prueba "):]):
         text = ("la clave no es la de este agente: usa la que muestra agmen agent en la terminal de esta "
                 "computadora")
-        _send_raw(sock, f"error clave {text}")
+        try:
+            _send_raw(sock, f"error clave {text}")
+        except HandshakeError:
+            pass   # aunque cierre antes de oír la respuesta, fue una clave mala (y cuenta)
         raise HandshakeError("clave", text)
     _send_raw(sock, f"prueba {proof(key, 'agente', nc, na)}")
     return Channel(sock, session_key(key, nc, na), "a", lines=lines)
@@ -649,17 +714,36 @@ class _Refused(Exception):
 
 
 def _printable(text: str) -> str:
-    """Sin caracteres de control: lo que manda la laptop (nombres de nodo, versión) se
-    imprime en la terminal del agente, y un escape ANSI ahí podría reescribir la pantalla."""
-    return "".join(c if c.isprintable() or c in "\n\t" else "\ufffd" for c in text)
+    """Para la terminal: sin escapes ANSI ni otros caracteres de control (los saltos de
+    línea de los textos propios, como los ejemplos de un ConfigError, se quedan)."""
+    return "".join(c if c.isprintable() or c == "\n" else "\ufffd" for c in text)
+
+
+def _clean(text, limit: int = 80) -> str:
+    """Un texto que viene de otra computadora (la laptop, o alguien sin clave): sin
+    NINGÚN carácter de control (tampoco saltos de línea: no puede fingir una línea de
+    la terminal) y corto."""
+    text = "".join(c if c.isprintable() else "\ufffd" for c in str(text))
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def _show_ip(ip: str) -> str:
     return ip[len("::ffff:"):] if ip.startswith("::ffff:") and "." in ip else ip
 
 
+def _taskkill(pid: int) -> None:
+    """Windows: mata un proceso y todos sus hijos (respaldo de CTRL_BREAK_EVENT, que falla si
+    el agente no tiene consola, p. ej. como servicio)."""
+    try:
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def _kill_group(proc: subprocess.Popen) -> None:
-    """Detiene un comando de [robot] before (con su grupo de procesos)."""
+    """Detiene un comando de [robot] before con todo su grupo de procesos (un compilador
+    lanza otros). En Windows: CTRL_BREAK_EVENT y, si no basta o no se puede, taskkill /T."""
     if proc.poll() is not None:
         return
     try:
@@ -667,17 +751,22 @@ def _kill_group(proc: subprocess.Popen) -> None:
             proc.send_signal(signal.CTRL_BREAK_EVENT)
         else:
             os.killpg(proc.pid, signal.SIGTERM)
-    except (OSError, ProcessLookupError):
-        pass
+    except (OSError, ProcessLookupError, ValueError):
+        if os.name == "nt":
+            _taskkill(proc.pid)
     try:
         proc.wait(timeout=3)
     except subprocess.TimeoutExpired:
-        try:
-            if os.name == "nt":
-                proc.kill()
-            else:
+        if os.name == "nt":
+            _taskkill(proc.pid)
+        else:
+            try:
                 os.killpg(proc.pid, signal.SIGKILL)
-        except (OSError, ProcessLookupError):
+            except (OSError, ProcessLookupError):
+                pass
+        try:
+            proc.kill()
+        except OSError:
             pass
         proc.wait()
 
@@ -689,29 +778,91 @@ def _cut(text: str, limit: int = LOG_LINE_MAX) -> str:
     return data[:limit].decode("utf-8", "ignore") + " … (línea cortada)"
 
 
+# Orden de los candados del agente (de afuera hacia adentro; nunca al revés, y nunca
+# se llama a algo que tome uno de más afuera teniendo uno de más adentro):
+#
+#   run.Node.lock          el gancho on_state y los logs del nodo se llaman con él tomado
+#     → _Session._log_lock     contadores de log (n por nodo); con él se toma LogBook.lock
+#                              (en since()) y _Outbox.cond (al encolar). Nunca junto con
+#                              _state_lock.
+#     → _Session._state_lock   el último estado mandado de cada nodo; se suelta ANTES de encolar
+#       → _Outbox.cond         la cola de salida: hoja (con él tomado no se toma ningún otro)
+#   Printer (say)            solo encola: hoja
+#   Channel._send_lock       solo lo toma el hilo que manda, sin ningún otro tomado
+#   AgentServer.lock         límites del saludo y la sesión activa; con él tomado no se toma
+#                            ninguno de los de arriba ni se imprime
+#
+# Ningún camino toma node.lock teniendo uno de los de la sesión: las órdenes (arrancar,
+# detener…) corren en el hilo de órdenes, sin ningún candado de la sesión tomado.
+
+
+def _ip_key(ip: str) -> str:
+    """La "IP" para los límites del saludo: una IPv4, o la red /64 de una IPv6 (quien
+    tiene una IPv6 suele tener todo su /64: contarlas por separado no limita nada)."""
+    import ipaddress
+
+    try:
+        addr = ipaddress.ip_address(ip.split("%", 1)[0])
+    except ValueError:
+        return ip
+    if addr.version == 6:
+        if addr.ipv4_mapped is not None:
+            return str(addr.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{addr}/64", strict=False))
+    return str(addr)
+
+
+class _IpRecord:
+    __slots__ = ("fails", "next_try", "pending", "said")
+
+    def __init__(self) -> None:
+        self.fails: deque[float] = deque()     # pruebas malas del último minuto (y las que se están revisando)
+        self.next_try = 0.0                    # tras una prueba mala, la siguiente espera hasta aquí
+        self.pending = 0                       # conexiones sin saludar
+        self.said: dict[str, float] = {}       # aviso → cuándo se imprimió (uno por minuto)
+
+
+def _udp_port_busy(address: str) -> bool:
+    """¿Algo tiene ocupado este puerto UDP (un hub que no contesta)? Se prueba abriéndolo."""
+    host, _, port = address.rpartition(":")
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.bind((host, int(port)))
+    except OSError as e:
+        return e.errno != getattr(__import__("errno"), "EADDRNOTAVAIL", -1)
+    except ValueError:
+        return False
+    return False
+
+
 class AgentServer:
     """El agente: escucha a agmen run y, con una sesión abierta, corre los nodos de
     SU robot.toml que dicen machine = `machine`. Una laptop a la vez.
 
-    say(texto, kind) escribe en la terminal del agente (kind: "out", "agmen" o "error")."""
+    say(texto, kind) escribe en la terminal del agente (kind: "out", "agmen" o "error").
+    La clave se puede dar después (use_key), para abrir el puerto antes de crearla."""
 
-    def __init__(self, path: str | Path, machine: str, key: str, *, port: int, shown: str = "",
+    def __init__(self, path: str | Path, machine: str, key: str | None, *, port: int, shown: str = "",
                  say: Callable[[str, str], None] | None = None) -> None:
         self.path = Path(path).resolve()
         self.machine = machine
         self.port = port
         self.shown = shown or f"0.0.0.0:{port}"      # dónde decir que espera (el host de su [[machine]])
         self._say = say or (lambda text, kind="agmen": print(text, flush=True))
-        self._key = derive_key(key)
+        self._key = derive_key(key) if key is not None else None
         self.lock = threading.Lock()
         self.session: _Session | None = None
         self.stopping = False
         self.sock: socket.socket | None = None
-        self._fails: deque[float] = deque()          # cuándo hubo una clave mala (monotonic)
-        self._in_flight = 0                          # pruebas que se están revisando (cuentan como intento)
-        self._last_fail: dict[str, float] = {}      # por IP
-        self._said: dict[tuple[str, str], float] = {}   # avisos repetidos de una IP, uno por minuto
-        self._handshakes = threading.BoundedSemaphore(MAX_HANDSHAKES)
+        self.trusted = ""                            # la IP que demostró la clave la última vez
+        self._ips: OrderedDict[str, _IpRecord] = OrderedDict()   # por IP (con tope: MAX_TRACKED_IPS)
+        self._fails_all: deque[float] = deque()      # pruebas malas del último minuto, de todas las IP
+        self._pending_total = 0
+        self._notes: deque[float] = deque()          # avisos sin clave del último minuto (tope global)
+        self._notes_skipped = 0
+
+    def use_key(self, key: str) -> None:
+        self._key = derive_key(key)
 
     def say(self, text: str, kind: str = "agmen") -> None:
         self._say(_printable(text), kind)
@@ -726,7 +877,7 @@ class AgentServer:
         self.sock.settimeout(0.3)
 
     def serve(self, stop: threading.Event) -> None:
-        assert self.sock is not None, "llama bind() antes"
+        assert self.sock is not None and self._key is not None, "llama bind() y da la clave antes"
         while not stop.is_set() and not self.stopping:
             try:
                 conn, addr = self.sock.accept()
@@ -737,8 +888,12 @@ class AgentServer:
                     return
                 time.sleep(0.1)
                 continue
-            threading.Thread(target=self._handle, args=(conn, _show_ip(addr[0])), daemon=True,
-                             name="agmen-agent-conn").start()
+            ip = _show_ip(addr[0])
+            key = _ip_key(ip)
+            if not self._admit(key):
+                self._turn_away(conn, ip, key)
+                continue
+            threading.Thread(target=self._handle, args=(conn, ip, key), daemon=True, name="agmen-agent-conn").start()
 
     def close(self) -> None:
         """Ctrl+C: detiene los nodos de la sesión, cierra la conexión y deja de escuchar."""
@@ -752,89 +907,159 @@ class AgentServer:
             session = self.session
         if session is not None:
             session.end("Ctrl+C en el agente: detengo los nodos y cierro la conexión con la laptop")
-            session.done.wait(20)
+            session.done.wait(30)
 
     def waiting_line(self) -> str:
         return f"esperando a agmen run en {self.shown}"
 
-    # --- límites del saludo ---
-    def _note_once(self, ip: str, what: str, text: str, kind: str = "agmen") -> None:
-        now = time.monotonic()
+    # --- límites del saludo (I4): nadie sin la clave deja fuera al dueño ---
+    def _rec(self, key: str) -> _IpRecord:
+        """El registro de una IP (con self.lock tomado). Con tope: se olvidan las más viejas
+        sin conexiones abiertas (su minuto de castigo se pierde, pero la memoria no crece)."""
+        rec = self._ips.get(key)
+        if rec is None:
+            rec = self._ips[key] = _IpRecord()
+            if len(self._ips) > MAX_TRACKED_IPS:
+                for old in list(self._ips):
+                    if len(self._ips) <= MAX_TRACKED_IPS:
+                        break
+                    if self._ips[old].pending == 0 and old != self.trusted and old != key:
+                        del self._ips[old]
+        else:
+            self._ips.move_to_end(key)
+        return rec
+
+    def _prune(self, rec: _IpRecord, now: float) -> None:
+        while rec.fails and now - rec.fails[0] > FAIL_WINDOW:
+            rec.fails.popleft()
+        while self._fails_all and now - self._fails_all[0] > FAIL_WINDOW:
+            self._fails_all.popleft()
+
+    def _admit(self, key: str) -> bool:
+        """¿Cabe otra conexión sin saludar? 4 por IP y 32 en total, con 1 guardada para la
+        IP que demostró la clave la última vez."""
         with self.lock:
-            if now - self._said.get((ip, what), -1e9) < FAIL_WINDOW:
+            rec = self._rec(key)
+            room = MAX_PENDING_TOTAL if key == self.trusted else MAX_PENDING_TOTAL - 1
+            if rec.pending >= MAX_PENDING_IP or self._pending_total >= room:
+                return False
+            rec.pending += 1
+            self._pending_total += 1
+            return True
+
+    def _turn_away(self, conn: socket.socket, ip: str, key: str) -> None:
+        try:
+            conn.settimeout(0.2)
+            conn.sendall(b"error espera demasiadas conexiones a la vez (desde tu IP o en total) sin completar "
+                         b"el saludo: cierra las que no uses y vuelve a intentar en unos segundos\n")
+        except OSError:
+            pass
+        finally:
+            conn.close()
+        self._note_once(key, "muchas", f"rechacé conexiones de {ip}: demasiadas a la vez sin completar el saludo")
+
+    def _note_once(self, key: str, what: str, text: str, kind: str = "agmen") -> None:
+        """Un aviso provocado por alguien sin clave: uno por IP y tipo por minuto, y no más de
+        NOTES_PER_MINUTE en total (así nadie inunda la terminal del agente)."""
+        now = time.monotonic()
+        skipped = 0
+        with self.lock:
+            rec = self._rec(key)
+            if now - rec.said.get(what, -1e9) < FAIL_WINDOW:
                 return
-            self._said[(ip, what)] = now
-            for k in [k for k, t in self._said.items() if now - t > FAIL_WINDOW]:
-                del self._said[k]
+            while self._notes and now - self._notes[0] > FAIL_WINDOW:
+                self._notes.popleft()
+            if len(self._notes) >= NOTES_PER_MINUTE:
+                self._notes_skipped += 1
+                return
+            rec.said[what] = now
+            self._notes.append(now)
+            skipped, self._notes_skipped = self._notes_skipped, 0
+        if skipped:
+            self.say(f"… {skipped} avisos de conexiones sin clave omitidos en el último minuto")
         self.say(text, kind)
 
-    def _prune(self, now: float) -> None:
-        while self._fails and now - self._fails[0] > FAIL_WINDOW:
-            self._fails.popleft()
-        for ip in [ip for ip, t in self._last_fail.items() if now - t > FAIL_WINDOW]:
-            del self._last_fail[ip]
-
-    def _pause_for(self, ip: str) -> float:
-        with self.lock:
-            last = self._last_fail.get(ip)
-        return 0.0 if last is None else max(0.0, last + FAIL_PAUSE - time.monotonic())
-
-    def _handle(self, conn: socket.socket, ip: str) -> None:
-        if not self._handshakes.acquire(blocking=False):
-            self._note_once(ip, "muchas", f"demasiadas conexiones a la vez (la última, de {ip}): las cierro")
-            conn.close()
-            return
-        reserved = False
+    def _handle(self, conn: socket.socket, ip: str, key: str) -> None:
+        reserved: float | None = None
+        start = time.monotonic()
 
         def refuse() -> str | None:
+            """Justo antes de revisar la prueba: el fallo se cuenta YA (se borra si sale buena),
+            así varias conexiones en paralelo no se saltan los límites ni la pausa de 1 s."""
             nonlocal reserved
-            with self.lock:
-                now = time.monotonic()
-                self._prune(now)
-                if len(self._fails) + self._in_flight >= MAX_FAILS:
-                    wait = math.ceil(FAIL_WINDOW - (now - self._fails[0])) if self._fails else 1
-                    return (f"hubo demasiados intentos con una clave equivocada en el último minuto: espera "
-                            f"{max(1, wait)} s y vuelve a intentar")
-                self._in_flight += 1
-                reserved = True
-            return None
-
-        try:
-            pause = self._pause_for(ip)
-            if pause > 0:
-                time.sleep(pause)   # tras una clave mala, esa IP espera 1 s
-            channel = agent_handshake(conn, self._key, refuse=refuse)
-        except HandshakeError as e:
-            count = 0
-            if e.code == "clave":
+            while True:
                 with self.lock:
                     now = time.monotonic()
-                    self._fails.append(now)
-                    self._last_fail[ip] = now
-                    count = len(self._fails)
-            if e.code == "clave":
-                self.say(f"rechacé a {ip}: su clave no es la de este agente ({count} de {MAX_FAILS} intentos "
-                         f"fallidos permitidos por minuto)", "error")
-            elif e.code == "espera":
-                self._note_once(ip, "espera", f"rechacé a {ip} sin revisar su clave: {e}", "error")
-            elif e.code == "version":
-                self.say(f"rechacé a {ip}: {e}", "error")
-            elif e.code in ("no_agmen", "protocolo"):
-                self._note_once(ip, "basura", f"{ip} se conectó pero no habla agmen-agent ({e}): cerré la conexión")
-            else:
-                self._note_once(ip, e.code, f"{ip} se conectó y no completó el saludo: {e}")
+                    rec = self._rec(key)
+                    self._prune(rec, now)
+                    if len(rec.fails) >= MAX_FAILS_IP:
+                        wait = max(1, math.ceil(FAIL_WINDOW - (now - rec.fails[0])))
+                        return (f"demasiados intentos con una clave equivocada desde tu IP en el último minuto: "
+                                f"espera {wait} s y vuelve a intentar")
+                    if key != self.trusted and len(self._fails_all) >= MAX_FAILS_TOTAL:
+                        wait = max(1, math.ceil(FAIL_WINDOW - (now - self._fails_all[0])))
+                        return (f"demasiados intentos con una clave equivocada en el último minuto (desde varias "
+                                f"IP): espera {wait} s y vuelve a intentar")
+                    if now >= rec.next_try:
+                        reserved = now
+                        rec.fails.append(now)
+                        self._fails_all.append(now)
+                        rec.next_try = now + FAIL_PAUSE
+                        return None
+                    wait = rec.next_try - now
+                if time.monotonic() + wait > start + HANDSHAKE_TIMEOUT:
+                    return "se está revisando otro intento desde tu IP: espera 1 s y vuelve a intentar"
+                time.sleep(wait)
+
+        def unreserve() -> None:
+            with self.lock:
+                rec = self._rec(key)
+                for d in (rec.fails, self._fails_all):
+                    try:
+                        d.remove(reserved)
+                    except ValueError:
+                        pass
+                rec.next_try = 0.0
+
+        try:
+            try:
+                channel = agent_handshake(conn, self._key, refuse=refuse)
+            finally:
+                with self.lock:
+                    rec = self._rec(key)
+                    rec.pending -= 1
+                    self._pending_total -= 1
+        except HandshakeError as e:
             conn.close()
+            if e.code == "clave":   # ya contado (refuse)
+                with self.lock:
+                    count = len(self._rec(key).fails)
+                self._note_once(key, "clave", f"rechacé a {ip}: su clave no es la de este agente ({count} de "
+                                              f"{MAX_FAILS_IP} intentos por minuto desde esa IP)", "error")
+                return
+            if reserved is not None:
+                unreserve()   # la prueba era buena y falló después (se cortó): no es una clave mala
+            if e.code == "espera":
+                self._note_once(key, "espera", f"rechacé a {ip} sin revisar su clave: {e}", "error")
+            elif e.code == "version":
+                self._note_once(key, "version", f"rechacé a {ip}: {e}", "error")
+            elif e.code in ("no_agmen", "protocolo"):
+                self._note_once(key, "basura", f"{ip} se conectó pero no habla agmen-agent ({e}): cerré la conexión")
+            else:
+                self._note_once(key, e.code, f"{ip} se conectó y no completó el saludo: {e}")
             return
         except Exception as e:   # nunca tumbar al agente por una conexión
-            self.say(f"error inesperado con la conexión de {ip}: {e!r}", "error")
             conn.close()
+            self.say(f"error inesperado en el saludo con {ip}: {_clean(repr(e), 200)}", "error")
             return
-        finally:
-            self._handshakes.release()
-            with self.lock:
-                if reserved:
-                    self._in_flight -= 1
-        self._open(channel, ip)
+        unreserve()
+        with self.lock:
+            self.trusted = key   # demostró la clave: conserva su lugar aunque otros fallen
+        try:
+            self._open(channel, ip)
+        except Exception as e:   # _Session.run ya termina en end(); esto es por si acaso
+            self.say(f"error inesperado con la conexión de {ip}: {_clean(repr(e), 200)}", "error")
+            channel.close()
 
     # --- la sesión ---
     def _open(self, channel: Channel, ip: str) -> None:
@@ -845,8 +1070,13 @@ class AgentServer:
             channel.close()
             return
         if first.get("op") != "sesion":
-            self._refuse_now(channel, ip, "protocolo", f"lo primero es 'sesion' y llegó '{first.get('op')}'")
+            self._refuse_now(channel, ip, "protocolo",
+                             f"lo primero es 'sesion' y llegó '{_clean(first.get('op'), 40)}'")
             return
+        with self.lock:
+            leaving = self.session if self.session is not None and self.session._ending else None
+        if leaving is not None:   # la sesión anterior se está cerrando (detiene sus nodos): se espera
+            leaving.done.wait(30)
         with self.lock:
             if self.stopping:
                 busy = "el agente se está cerrando"
@@ -874,6 +1104,34 @@ class AgentServer:
             if self.session is session:
                 self.session = None
 
+    def foreign(self, address: str) -> tuple[str, bool]:
+        """¿Ya corren aquí nodos que este agente no lanzó? Devuelve (por qué no se puede, o "";
+        ¿hay un hub en `address`?). RFC 0011 §6, reto 1: un robot en reloj real no se conecta a
+        una simulación ni a otra laptop sin que se note.
+
+        Lo que esta comprobación NO ve: nodos que no publican ni escuchan ningún topic (el hub no
+        los conoce), nodos que arrancaron hace un instante y aún no se anotan, hubs en otro
+        puerto (otro AGMEN_HUB) y programas que no son de Agmen (un driver que abre el puerto
+        serie). Por eso se repite justo antes de arrancar."""
+        from .hub import ping, query
+
+        m = self.machine
+        if ping(address, timeout=0.5) is None:
+            if _udp_port_busy(address):
+                return (f"{m}: algo ocupa el puerto del agmen hub ({address}) y no contesta: ¿un agmen hub trabado "
+                        f"o de otra versión? Detenlo (o reinicia {m}) y vuelve a correr agmen run"), True
+            return "", False
+        try:
+            msgs = query(address, timeout=1.0)
+        except (ConnectionError, OSError):
+            return (f"{m}: el agmen hub de {address} contesta pero no dice qué nodos tiene: detenlo y vuelve a "
+                    f"correr agmen run"), True
+        names = sorted({_clean(f.get("node", "?"), 40) for op, f in msgs if op in ("ep", "stat")})
+        if names:
+            return (f"{m}: ya corren nodos que este agente no lanzó ({', '.join(names)}), con su agmen hub en "
+                    f"{address}. Detenlos (Ctrl+C en su terminal en {m}) y vuelve a correr agmen run"), True
+        return "", True
+
     def plan(self, msg: dict) -> _Plan:
         """Revisa la sesión que pide la laptop y arma la configuración de esta
         computadora. Nada de lo que manda la laptop llega a un comando: solo se
@@ -889,6 +1147,7 @@ class AgentServer:
                 or not isinstance(version, str) or not isinstance(theirs, dict) \
                 or not all(isinstance(v, dict) for v in theirs.values()):
             raise _Refused("protocolo", "la sesión no trae bien perfil, reloj, agmen, maquina y nodos")
+        machine, profile, version = _clean(machine, 64), _clean(profile, 64), _clean(version, 40)
         if machine != m:
             raise _Refused("maquina", f"esta computadora es '{m}' en su robot.toml, no '{machine}'. Revisa host de "
                                       f"[[machine]] '{machine}' en tu robot.toml (¿es la IP de otra computadora?), "
@@ -913,6 +1172,7 @@ class AgentServer:
             raise _Refused("perfil", f"{m}: en su {file}, el perfil '{profile}' dice local = true (todo corre en "
                                      f"la laptop): no hace falta el agente. Haz git pull en {m} o en tu laptop")
         mine_nodes = [n for n in cfg.nodes if n.machine == m]
+        theirs = {_clean(k, 64): v for k, v in theirs.items()}
         diffs = diff_nodes(m, profile, theirs, {n.name: written(n) for n in mine_nodes})
         if clock != "replay" and clock != cfg.clock.mode:
             diffs.append(f"el reloj es distinto ({cfg.clock.mode} en su robot.toml, {clock} en el tuyo)")
@@ -922,41 +1182,104 @@ class AgentServer:
         if clock == "replay":   # agmen run --play: todos con el tiempo de la grabación (RFC 0010)
             for n in mine_nodes:
                 n.env.update({"AGMEN_CLOCK": "replay", "AGMEN_CLOCK_SOURCE": "agmen"})
-        foreign = self._foreign_nodes(hub_address())
-        if foreign:
-            raise _Refused("nodos_ajenos", f"{m}: ya corren nodos que este agente no lanzó ({', '.join(foreign)}), "
-                                           f"con su agmen hub en {hub_address()}. Detenlos (Ctrl+C en su terminal "
-                                           f"en {m}) y vuelve a correr agmen run")
-        try:
-            sub, hub_note = prepare_hub(replace(cfg, nodes=mine_nodes))
-        except ConfigError as e:
-            raise _Refused("config", f"{m}: {e}") from None
         held = msg.get("no_arrancar", [])
         names = [n.name for n in mine_nodes]
         if not isinstance(held, list) or not all(isinstance(x, str) for x in held):
             raise _Refused("protocolo", "no_arrancar es una lista de nombres de nodo")
-        unknown = [x for x in held if x not in names]
+        unknown = [_clean(x, 64) for x in held if x not in names]
         if unknown:
-            raise _Refused("protocolo", f"no_arrancar nombra nodos que no son de {m}: {', '.join(unknown)}")
+            raise _Refused("protocolo", f"no_arrancar nombra nodos que no son de {m}: {', '.join(unknown[:10])}")
+        why, _ = self.foreign(hub_address())
+        if why:
+            raise _Refused("nodos_ajenos", why)
+        try:
+            sub, hub_note = prepare_hub(replace(cfg, nodes=mine_nodes))
+        except ConfigError as e:
+            raise _Refused("config", f"{m}: {e}") from None
         if version != __version__:
             self.say(f"⚠ la laptop usa Agmen {version} y esta computadora Agmen {__version__}")
         return _Plan(sub, {m: Place(True, "agent")}, names, hub_note, profile, tuple(held))
 
-    @staticmethod
-    def _foreign_nodes(address: str) -> list[str]:
-        """Los nodos registrados en un agmen hub que ya corre aquí (de otro agmen run)."""
-        from .hub import query
 
-        try:
-            msgs = query(address, timeout=0.5)
-        except (ConnectionError, OSError):
-            return []
-        return sorted({f.get("node", "?") for op, f in msgs if op in ("ep", "stat")})
+class _Outbox:
+    """Lo que el agente le manda a la laptop, en orden, con tope en mensajes y en bytes.
+
+    Los log se descartan si no caben (el n de cada nodo sigue subiendo: el hueco se nota).
+    Lo demás (estado, pong, error, sesion_*) siempre entra: pong y error solo los provoca la
+    laptop, y si se acumulan demasiados (replies_full) la sesión deja de leerla hasta que
+    drene; los estado dependen de los nodos, que cambian poco (el reinicio espera ≥ 1 s)."""
+
+    def __init__(self) -> None:
+        self.cond = threading.Condition()
+        self.items: deque[tuple[str, str, int, bool]] = deque()   # (op, json, bytes, ¿es un log?)
+        self.bytes = 0
+        self.replies = 0        # lo que no es log, pendiente
+        self.dropped = 0
+        self.closed = False
+        self.sending = False    # el hilo que manda tiene uno en la mano (ya salió de la cola)
+
+    def put(self, obj: dict, droppable: bool = False) -> bool:
+        body = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+        size = len(body.encode("utf-8"))
+        with self.cond:
+            if self.closed:
+                return False
+            if droppable and (len(self.items) >= OUT_MAX_MSGS or self.bytes + size > OUT_MAX_BYTES):
+                self.dropped += 1
+                return False
+            self.items.append((obj["op"], body, size, droppable))
+            self.bytes += size
+            if not droppable:
+                self.replies += 1
+            self.cond.notify_all()
+            return True
+
+    def get(self) -> tuple[str, str] | None:
+        """El siguiente (espera); None si se cerró."""
+        with self.cond:
+            while not self.items and not self.closed:
+                self.cond.wait()
+            if self.closed:
+                return None
+            op, body, size, droppable = self.items.popleft()
+            self.bytes -= size
+            if not droppable:
+                self.replies -= 1
+            self.sending = True
+            self.cond.notify_all()
+            return op, body
+
+    def sent(self) -> None:
+        """El hilo que manda terminó con el que tenía en la mano."""
+        with self.cond:
+            self.sending = False
+            self.cond.notify_all()
+
+    def replies_full(self) -> bool:
+        return self.replies >= OUT_MAX_REPLIES
+
+    def wait_replies(self, timeout: float) -> bool:
+        """Espera a que las respuestas pendientes bajen a la mitad. False si no pasó a tiempo."""
+        with self.cond:
+            return self.cond.wait_for(lambda: self.closed or self.replies < OUT_MAX_REPLIES // 2, timeout)
+
+    def drain(self, timeout: float) -> None:
+        """Espera (poco) a que salga lo pendiente, antes de cerrar."""
+        with self.cond:
+            self.cond.wait_for(lambda: self.closed or (not self.items and not self.sending), timeout)
+
+    def close(self) -> None:
+        with self.cond:
+            self.closed = True
+            self.items.clear()   # la memoria se libera al cerrar la sesión
+            self.bytes = self.replies = 0
+            self.cond.notify_all()
 
 
 class _Session:
-    """Una laptop conectada: su canal, los nodos de esta computadora (un Launcher) y
-    lo que se le manda (en orden, desde un hilo propio: un nodo nunca espera a la red)."""
+    """Una laptop conectada: su canal, los nodos de esta computadora (un Launcher), lo que
+    se le manda (en orden, desde un hilo propio: un nodo nunca espera a la red) y las
+    órdenes (en otro hilo, una tras otra). Siempre termina en end(), pase lo que pase."""
 
     def __init__(self, server: AgentServer, channel: Channel, ip: str) -> None:
         self.server = server
@@ -965,8 +1288,8 @@ class _Session:
         self.say = server.say
         self.launcher = None
         self.plan: _Plan | None = None
-        self.out: queue.Queue = queue.Queue()
-        self.ready = threading.Event()       # sesion_ok ya salió
+        self.out = _Outbox()
+        self.ready = threading.Event()       # sesion_ok ya salió (antes no se manda ningún estado)
         self.cancel = threading.Event()      # detener_todo antes de estar lista, o fin de la sesión
         self.done = threading.Event()
         self._end_lock = threading.Lock()
@@ -975,37 +1298,49 @@ class _Session:
         self._log_lock = threading.Lock()
         self._log_idx = 0
         self._log_k: dict[str, int] = {}
-        self._dropped = 0
+        self._drop_noted = -1e9
         self._state_lock = threading.Lock()
         self._last_state: dict[str, tuple] = {}
-        self._workers: list[threading.Thread] = []   # preparar la sesión y las órdenes: end() los espera
+        self._orders: queue.Queue = queue.Queue()
+        self._setup_thread: threading.Thread | None = None
         self.sender = threading.Thread(target=self._send_loop, daemon=True, name="agmen-agent-send")
+        self.worker = threading.Thread(target=self._work_loop, daemon=True, name="agmen-agent-orders")
         self.sender.start()
+        self.worker.start()
 
     # --- mandar ---
-    def send(self, obj: dict, droppable: bool = False) -> None:
-        if droppable and self.out.qsize() >= OUT_QUEUE_MAX:
-            with self._log_lock:
-                self._dropped += 1
-            return
-        self.out.put(obj)
+    def send(self, obj: dict, droppable: bool = False) -> bool:
+        return self.out.put(obj, droppable)
 
     def _send_loop(self) -> None:
         while True:
-            obj = self.out.get()
-            if obj is None:
+            item = self.out.get()
+            if item is None:
                 return
             try:
-                self.channel.send(obj)
+                try:
+                    self.channel.send_body(*item)
+                finally:
+                    self.out.sent()
             except MessageTooLarge as e:
                 self.say(f"⚠ {e}", "error")
-            except AgentError as e:
-                threading.Thread(target=self.end, args=(f"no pude mandarle nada a la laptop ({self.ip}): {e}",),
-                                 daemon=True).start()
+            except ChannelClosed as e:
+                # La laptop cerró: el lector lo ve en seguida (y si antes dijo adios, lo lee). Por si no:
+                why = f"no pude mandarle nada a la laptop ({self.ip}): {_clean(e, 200)}"
+                t = threading.Timer(2.0, self.end, args=(why, "error"))
+                t.daemon = True
+                t.start()
+                return
+            except Exception as e:   # no lee (tiempo agotado), o cualquier otra: la sesión termina en end()
+                threading.Thread(target=self.end, args=(f"no pude mandarle nada a la laptop ({self.ip}): "
+                                                        f"{_clean(e, 200)}", "error"), daemon=True).start()
                 return
 
     def _on_log(self) -> None:
+        """Listener del LogBook: se llama con el node.lock del nodo que escribió (ver el orden
+        de candados). since() solo recorre lo nuevo."""
         launcher = self.launcher
+        note = False
         with self._log_lock:
             lines, self._log_idx = launcher.logs.since(self._log_idx)
             for line in lines:
@@ -1013,12 +1348,19 @@ class _Session:
                 if node == "hub":
                     node, text = "agmen", f"hub: {text}"
                 k = self._log_k[node] = self._log_k.get(node, 0) + 1
-                self.send({"op": "log", "nodo": node, "n": k, "linea": _cut(text)}, droppable=True)
+                if not self.send({"op": "log", "nodo": node, "n": k, "linea": _cut(text)}, droppable=True):
+                    now = time.monotonic()
+                    if now - self._drop_noted > FAIL_WINDOW:
+                        self._drop_noted, note = now, True
+        if note:
+            self.say(f"⚠ la laptop ({self.ip}) no lee tan rápido como escriben los nodos: descarto líneas de log "
+                     f"para ella (su número n sigue subiendo: el hueco se nota). Los nodos no esperan")
 
     def _on_state(self, node) -> None:
-        """El gancho de run.Node: se llama con su lock tomado, así que solo encola."""
+        """El gancho de run.Node: se llama con su lock tomado, así que solo encola. Antes de
+        sesion_ok no se manda ningún estado (los iniciales salen justo después)."""
         name = node.cfg.name
-        if name == "hub":
+        if name == "hub" or not self.ready.is_set():
             return
         state = node.state
         running = state == "corriendo" and node.proc is not None
@@ -1030,49 +1372,89 @@ class _Session:
         self.send({"op": "estado", "nodo": name, "estado": snap[0], "pid": snap[1], "codigo": snap[2]})
 
     def _error(self, text: str) -> None:
-        self.send({"op": "error", "texto": text})
+        self.send({"op": "error", "texto": _cut(text, 2000)})
 
+    def _refused(self, code: str, text: str) -> None:
+        self.say(f"rechacé la sesión de {self.ip}: {text}", "error")
+        self.send({"op": "sesion_error", "codigo": code, "texto": _cut(text, 8000)})
+        self.end("", quiet=True)
+
+    # --- órdenes: un solo hilo, con tope ---
     def _work(self, target, *args, **kwargs) -> None:
-        """Corre algo en otro hilo (arrancar, detener…), salvo que la sesión ya termine:
-        así ningún nodo arranca después de que end() los detuvo."""
-        t = threading.Thread(target=target, args=args, kwargs=kwargs, daemon=True, name="agmen-agent-work")
-        with self._end_lock:
-            if self._ending:
+        if self._ending:
+            return
+        if self._orders.qsize() >= MAX_ORDERS:
+            self._error(f"{self.server.machine} tiene {MAX_ORDERS} órdenes pendientes: espera a que terminen")
+            return
+        self._orders.put((target, args, kwargs))
+
+    def _work_loop(self) -> None:
+        while True:
+            item = self._orders.get()
+            if item is None:
                 return
-            self._workers.append(t)
-            t.start()
+            if self._ending:
+                continue
+            target, args, kwargs = item
+            try:
+                target(*args, **kwargs)
+            except Exception as e:   # nunca en silencio, y la sesión sigue
+                self.say(f"error inesperado en una orden de la laptop: {_clean(repr(e), 200)}", "error")
+                self._error(f"{self.server.machine}: la orden falló ({_clean(e, 200)})")
 
     # --- ciclo ---
     def run(self, first: dict) -> None:
+        try:
+            self._run(first)
+        except Exception as e:   # I3: pase lo que pase, la sesión termina en end()
+            self.say(f"error inesperado en la sesión de {self.ip}: {_clean(repr(e), 300)}. Detengo sus nodos",
+                     "error")
+            self._error(f"{self.server.machine}: error inesperado en el agente ({_clean(e, 200)}); cierro la sesión")
+            self.out.drain(1.0)
+            self.end("", quiet=True)
+        finally:
+            if not self._ending:
+                self.end("", quiet=True)
+
+    def _run(self, first: dict) -> None:
         from .run import ConfigError, Launcher
 
         try:
             plan = self.server.plan(first)
             launcher = Launcher(plan.config, places=plan.places)
         except _Refused as r:
-            self.say(f"rechacé la sesión de {self.ip}: {r.text}", "error")
-            self.send({"op": "sesion_error", "codigo": r.code, "texto": r.text})
-            self.end("", quiet=True)
+            self._refused(r.code, r.text)
             return
         except (ConfigError, ValueError) as e:
-            text = f"{self.server.machine}: {e}"
-            self.say(f"rechacé la sesión de {self.ip}: {text}", "error")
-            self.send({"op": "sesion_error", "codigo": "config", "texto": text})
-            self.end("", quiet=True)
+            self._refused("config", f"{self.server.machine}: {e}")
+            return
+        except Exception as e:
+            self.say(f"error inesperado al revisar la sesión de {self.ip}: {_clean(repr(e), 300)}", "error")
+            self._refused("interno", f"{self.server.machine}: error inesperado al revisar la sesión "
+                                     f"({_clean(e, 200)}). Mira la terminal de agmen agent en {self.server.machine}")
             return
         self.plan, self.launcher = plan, launcher
         launcher.logs.listeners.append(self._on_log)
         for node in launcher.nodes.values():
             node.on_state = self._on_state
         shown = ", ".join(plan.names) or "ninguno"
-        self.say(f"laptop {self.ip} conectada · Agmen {first.get('agmen')} · perfil {plan.profile} · "
+        self.say(f"laptop {self.ip} conectada · Agmen {_clean(first.get('agmen'), 40)} · perfil {plan.profile} · "
                  f"nodos de aquí: {shown}", "out")
         launcher.say(f"sesión de {self.ip}: {plan.hub_note}")
-        self._work(self._setup)
+        if "hub" not in launcher.nodes and plan.config.hub:
+            launcher.say(f"⚠ en {self.server.machine} ya corría un agmen hub sin nodos: lo reuso (sus [[topic]] no "
+                         f"se revisan). Si no es tuyo, detenlo y vuelve a correr agmen run")
+        self._setup_thread = threading.Thread(target=self._setup, daemon=True, name="agmen-agent-setup")
+        with self._end_lock:
+            if not self._ending:
+                self._setup_thread.start()
         self._loop()
 
     def _setup(self) -> None:
+        from .pubsub import hub_address
+
         launcher, plan = self.launcher, self.plan
+        m = self.server.machine
         try:
             for cmd in plan.config.before:
                 code = self._run_before(cmd)
@@ -1080,19 +1462,23 @@ class _Session:
                     return
                 if code != 0:
                     what = "no se pudo correr" if code is None else f"terminó con código {code}"
-                    text = (f"{self.server.machine}: falló [robot] before: '{' '.join(cmd)}' {what} (su salida está "
-                            f"en el log de agmen). Arréglalo en {self.server.machine} y vuelve a correr agmen run")
-                    self.say(f"✖ {text}", "error")
-                    self.send({"op": "sesion_error", "codigo": "antes", "texto": text})
-                    self.end("", quiet=True)
+                    self._refused("antes", f"{m}: falló [robot] before: '{' '.join(cmd)}' {what} (su salida está "
+                                           f"en el log de agmen). Arréglalo en {m} y vuelve a correr agmen run")
                     return
-            hub = launcher.nodes.get("hub")   # el hub de esta computadora, como en agmen run
-            if hub is not None:
-                hub.start()
+            # I6: otra vez justo antes de arrancar (el before pudo tardar minutos).
+            own = "hub" in launcher.nodes
+            why, alive = self.server.foreign(hub_address())
+            if not why and own and alive:
+                why = (f"{m}: mientras corría [robot] before arrancó otro agmen hub en {hub_address()}: detenlo y "
+                       f"vuelve a correr agmen run")
+            if why:
+                self._refused("nodos_ajenos", why)
+                return
             if self.cancel.is_set():
                 return
-            self.send({"op": "sesion_ok", "maquina": self.server.machine, "agmen": __version__,
-                       "nodos": list(plan.names)})
+            if own:
+                launcher.nodes["hub"].start()   # el hub de esta computadora, como en agmen run
+            self.send({"op": "sesion_ok", "maquina": m, "agmen": __version__, "nodos": list(plan.names)})
             self.ready.set()
             for name in plan.names:
                 node = launcher.nodes[name]
@@ -1109,9 +1495,14 @@ class _Session:
                 else:
                     launcher.say(f"'{name}' no arranca solo (autostart = false): arráncalo desde la laptop")
         except Exception as e:   # nunca en silencio
-            self.say(f"error inesperado al preparar la sesión: {e!r}", "error")
-            self.send({"op": "sesion_error", "codigo": "antes", "texto": f"{self.server.machine}: error al arrancar: {e}"})
-            self.end("", quiet=True)
+            self.say(f"error inesperado al preparar la sesión: {_clean(repr(e), 300)}", "error")
+            if self.ready.is_set():
+                self._error(f"{m}: error inesperado al arrancar ({_clean(e, 200)}); cierro la sesión")
+                self.out.drain(1.0)
+                self.end("", quiet=True)
+            else:
+                self._refused("interno", f"{m}: error inesperado al preparar la sesión ({_clean(e, 200)}). Mira la "
+                                         f"terminal de agmen agent en {m}")
 
     def _run_before(self, cmd: list[str]) -> int | None:
         """Un comando de [robot] before, con su salida como log de "agmen" (RFC 0011 §3.3)."""
@@ -1137,7 +1528,12 @@ class _Session:
         return code
 
     def _loop(self) -> None:
-        while True:
+        while not self._ending:
+            if self.out.replies_full() and not self.out.wait_replies(SEND_TIMEOUT):
+                # B2: la laptop manda (ping…) y no lee las respuestas: no se le lee más.
+                self.end(f"la laptop ({self.ip}) no lee lo que le contesto ({OUT_MAX_REPLIES} respuestas sin leer "
+                         f"en {SEND_TIMEOUT:g} s): cierro la sesión y detengo los nodos", "error")
+                return
             try:
                 msg = self.channel.recv(SILENCE_TIMEOUT)
             except ChannelTimeout:
@@ -1161,7 +1557,8 @@ class _Session:
         op = msg["op"]
         if op == "ping":
             t = msg.get("t")
-            self.send({"op": "pong", "t": t if isinstance(t, (int, float, str)) and not isinstance(t, bool) else None})
+            ok = (isinstance(t, (int, float)) and not isinstance(t, bool)) or (isinstance(t, str) and len(t) <= PONG_T_MAX)
+            self.send({"op": "pong", "t": t if ok else None})
         elif op == "adios":
             self.end(f"la laptop ({self.ip}) se despidió")
             return True
@@ -1178,9 +1575,10 @@ class _Session:
             if not isinstance(name, str):
                 self._error(f"'{op}' lleva el nombre del nodo en 'nodo'")
             elif not self.ready.is_set():
-                self._error(f"{self.server.machine} todavía está preparando la sesión: '{op} {name}' no se hizo")
+                self._error(f"{self.server.machine} todavía está preparando la sesión: '{op} {_clean(name)}' no se "
+                            f"hizo")
             elif name not in self.plan.names:
-                self._error(f"{self.server.machine} no tiene el nodo '{name}' (tiene: "
+                self._error(f"{self.server.machine} no tiene el nodo '{_clean(name)}' (tiene: "
                             f"{', '.join(self.plan.names) or 'ninguno'})")
             else:
                 what = {"arrancar": "start", "detener": "stop", "reiniciar": "restart"}[op]
@@ -1189,7 +1587,7 @@ class _Session:
         elif op == "sesion":
             self._error("esta conexión ya tiene su sesión abierta")
         else:
-            self._error(f"orden desconocida '{op}' (este agente es Agmen {__version__})")
+            self._error(f"orden desconocida '{_clean(op, 40)}' (este agente es Agmen {__version__})")
         return False
 
     def _stop_nodes(self, hub: bool) -> None:
@@ -1220,6 +1618,7 @@ class _Session:
             if self._ending:
                 return
             self._ending = True
+        me = threading.current_thread()
         try:
             if reason and not quiet:
                 self.say(reason, kind)
@@ -1227,9 +1626,9 @@ class _Session:
             before = self._before
             if before is not None:
                 _kill_group(before)
-            me = threading.current_thread()
-            for t in self._workers:   # ya no se agregan más (_ending): ninguno arranca un nodo después
-                if t is not me:
+            self._orders.put(None)
+            for t in (self.worker, self._setup_thread):   # ya no hay órdenes nuevas: ninguna arranca un nodo después
+                if t is not None and t is not me and t.ident is not None:
                     t.join(15)
             if self.launcher is not None:
                 self._stop_nodes(hub=True)
@@ -1239,15 +1638,15 @@ class _Session:
                 except ValueError:
                     pass
                 self.launcher.printer.close()
-            with self._log_lock:
-                dropped = self._dropped
-            if dropped:
-                self.say(f"⚠ {dropped} líneas de log no se mandaron a la laptop (no daba abasto)")
-            self.out.put(None)
-            if threading.current_thread() is not self.sender:
-                self.sender.join(2.0)
-            self.channel.close()
+            if self.out.dropped:
+                self.say(f"⚠ {self.out.dropped} líneas de log no se mandaron a la laptop (no daba abasto)")
+            if me is not self.sender:
+                self.out.drain(2.0)
+        except Exception as e:   # que end() siempre libere al agente
+            self.say(f"error al cerrar la sesión: {_clean(repr(e), 300)}", "error")
         finally:
+            self.out.close()
+            self.channel.close()
             self.server._release(self)
             self.done.set()
             if not self.server.stopping:
@@ -1420,7 +1819,8 @@ class AgentLink:
                     if not text.startswith(self.name):
                         text = f"{self.name}: {text}"
                     raise LinkError(code, text)
-                self._dispatch(msg)
+                if op != "estado":   # antes de sesion_ok no debería llegar ninguno: se ignora
+                    self._dispatch(msg)
         except BaseException:
             self._done.set()
             channel.close()
@@ -1457,6 +1857,12 @@ class AgentLink:
                 return   # el lector se entera
 
     def _read_loop(self) -> None:
+        try:
+            self._read()
+        except Exception as e:   # I3: cualquier fallo del lector termina en on_lost, nunca en silencio
+            self._lose(f"error inesperado al leerlo: {_clean(repr(e), 200)}")
+
+    def _read(self) -> None:
         channel = self.channel
         while True:
             try:
