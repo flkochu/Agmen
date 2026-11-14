@@ -30,6 +30,10 @@
 // operator new" y avisa con -Wmismatched-new-delete, que con -Werror rompe la
 // compilación. El código es correcto: este `new` reserva con malloc. Si no se
 // meten en línea, el compilador solo ve la pareja new/delete y no avisa.
+// Hacen falta los DOS lados sin meter en línea (el `new` y los `delete`):
+// quitar cualquiera vuelve a dar el error, también en GCC 13 y 14 (con
+// noinline solo en `new` avisa del `free`; solo en los `delete`, del
+// `operator delete` sobre un puntero de `malloc`).
 // MSVC no tiene ese aviso y no necesita nada.
 #if defined(__GNUC__)
 #define AGMEN_SIN_INLINE __attribute__((noinline))
