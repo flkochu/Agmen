@@ -2,18 +2,20 @@
 
 Es lo que usa el nodo `mundo.py`, pero sirve igual para otras cosas (por ejemplo,
 un entorno de aprendizaje por refuerzo): no importa Agmen, no usa hilos y no
-toca variables de entorno.
+toca variables de entorno (salvo elegir_gl(), y solo si la llamas).
 
     import sys; sys.path.insert(0, "examples/sim")
-    from fisica import Mundo
+    import fisica
 
-    with Mundo() as m:                     # el robot de robot.xml, ya asentado en el piso
+    fisica.elegir_gl()                     # antes del primer Mundo: con qué OpenGL dibuja la cámara
+    with fisica.Mundo() as m:              # el robot de robot.xml, ya asentado en el piso
         m.comando(0.5, 0.5)                # las dos ruedas a media velocidad
         m.avanzar(500)                     # 500 pasos de 2 ms = 1 s simulado
         print(m.pose(), m.imu(), m.imagen().shape)
 
 MuJoCo se importa al crear el primer Mundo (no al importar este archivo), así
-el nodo puede elegir antes con qué OpenGL dibuja la cámara (elegir_gl()).
+se puede elegir antes con qué OpenGL dibuja la cámara: elegir_gl() (en Linux sin
+pantalla, EGL u OSMesa). Si solo usas la física, no hace falta.
 Al final, separado, va la plomería de MuJoCo y OpenGL: no hace falta leerla.
 """
 
@@ -74,6 +76,17 @@ class Mundo:
         if self.modelo.sensor_dim[i] != 3:
             raise ErrorDelMundo(f"en '{self.ruta}', el sensor '{nombre}' debe medir 3 ejes")
         return slice(int(self.modelo.sensor_adr[i]), int(self.modelo.sensor_adr[i]) + 3)
+
+    def pasos_en(self, segundos: float) -> int:
+        """Cuántos pasos de física hay en `segundos` simulados; ErrorDelMundo si no es un número entero."""
+        n = round(segundos / self.dt)
+        if n < 1 or abs(n * self.dt - segundos) > 1e-12:
+            ms = segundos * 1e3
+            buenos = [f"{d:g}" for d in (1, 2, 2.5, 5, 10, 20, 25, 50, 100) if d <= ms and (ms / d).is_integer()]
+            usa = ", ".join(buenos[:-1]) + " o " + buenos[-1] + " ms" if len(buenos) > 1 else "uno que lo divida"
+            raise ErrorDelMundo(f"el timestep de '{self.ruta}' ({self.dt * 1e3:g} ms) no cabe un número entero de "
+                                f"veces en {ms:g} ms: usa {usa} en <option timestep>")
+        return n
 
     def reiniciar(self) -> None:
         """El robot de vuelta al inicio, quieto (robot.xml lo pone ya asentado en el piso)."""
@@ -145,7 +158,17 @@ class Mundo:
 # Apéndice: la plomería de MuJoCo y OpenGL. No hace falta leerla para usar Mundo.
 # Cada sistema falla distinto al dibujar sin ventana; aquí se dice el motivo y el
 # remedio, y se esquivan dos tropiezos de MuJoCo.
+# De aquí, el nodo (mundo.py, ver.py, camara.py) usa: elegir_gl(), REMEDIO_GL,
+# LINUX, corto(), y SEG y di() (lo que comparten los tres; fisica no imprime con di).
 # =============================================================================
+
+SEG = 1_000_000_000
+
+
+def di(txt: str, error: bool = False) -> None:
+    """Una línea del nodo, con su prefijo: [mundo] … (a stderr si es un error o un aviso)."""
+    print(f"[mundo] {txt}", file=sys.stderr if error else sys.stdout, flush=True)
+
 
 LINUX = sys.platform.startswith("linux")
 REMEDIO_GL = ("instala libegl1 o libosmesa6 (y prueba MUJOCO_GL=egl u osmesa)" if LINUX else
@@ -160,13 +183,13 @@ def _cerrar_abiertos() -> None:
         try:
             m.cerrar()
         except Exception as e:   # al salir, con OpenGL en otro hilo o colgado: una línea, sin traceback
-            print(f"[mundo] al salir no pude cerrar la cámara ({e})", file=sys.stderr)
+            print(f"[fisica] al salir no pude cerrar la cámara ({e})", file=sys.stderr)
 
 
 atexit.register(_cerrar_abiertos)
 
 
-def _corto(e) -> str:
+def corto(e) -> str:
     """El motivo de un error en una línea corta."""
     txt = (str(e).strip().splitlines() or [type(e).__name__])[0]
     return txt if len(txt) <= 90 else txt[:87] + "..."
@@ -181,13 +204,13 @@ def _importar_mujoco():
         if "KeyboardInterrupt" in repr(e):                  # Ctrl+C mientras carga (ctypes lo envuelve)
             raise KeyboardInterrupt from None
         if "mujoco._structs" in sys.modules:                # el núcleo cargó: falló su OpenGL (MUJOCO_GL)
-            raise ErrorDelMundo(f"MuJoCo no carga con MUJOCO_GL={os.environ.get('MUJOCO_GL')!r} ({_corto(e)}): "
+            raise ErrorDelMundo(f"MuJoCo no carga con MUJOCO_GL={os.environ.get('MUJOCO_GL')!r} ({corto(e)}): "
                                 f"quita esa variable o usa una que funcione aquí; {REMEDIO_GL}") from None
         if isinstance(e, ImportError):
             que = "NumPy" if "numpy" not in sys.modules else "MuJoCo"
-            motivo = "" if getattr(e, "name", None) in ("numpy", "mujoco") else f" ({_corto(e)})"
+            motivo = "" if getattr(e, "name", None) in ("numpy", "mujoco") else f" ({corto(e)})"
             raise ErrorDelMundo(f"falta {que}: instálalo con  pip install agmen[sim]{motivo}") from None
-        raise ErrorDelMundo(f"MuJoCo no carga ({_corto(e)}): reinstálalo con  pip install agmen[sim]") from None
+        raise ErrorDelMundo(f"MuJoCo no carga ({corto(e)}): reinstálalo con  pip install agmen[sim]") from None
 
 
 def _abrir_opengl(mj, modelo, ancho: int, alto: int):
@@ -203,7 +226,7 @@ def _abrir_opengl(mj, modelo, ancho: int, alto: int):
             warnings.simplefilter("ignore")
             r.__init__(modelo, height=alto, width=ancho)
     except Exception as e:                                  # cada sistema falla distinto: se dice el motivo
-        _GL_FALLO = f"no pude dibujar sin ventana ({gl}; {_corto(e)}); {REMEDIO_GL}"
+        _GL_FALLO = f"no pude dibujar sin ventana ({gl}; {corto(e)}); {REMEDIO_GL}"
         raise ErrorDelMundo(_GL_FALLO) from None
     return r
 

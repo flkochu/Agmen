@@ -4,17 +4,11 @@ El nodo la importa solo si se pidió --ver. Si no hay pantalla, avisa en una lí
 y el nodo sigue sin ventana; si la cierras, el robot sigue igual.
 """
 
-import sys
+import os
 import threading
 import warnings
 
-from fisica import _corto
-
-SEG = 1_000_000_000
-
-
-def _di(txt: str) -> None:
-    print(f"[mundo] {txt}", file=sys.stdout, flush=True)
+from fisica import LINUX, REMEDIO_GL, SEG, corto, di
 
 
 class Ventana:
@@ -25,7 +19,8 @@ class Ventana:
         self._sync = None                                   # cuándo se puso al día por última vez (mono_ns)
 
     def al_dia(self, ahora: int, vel: float) -> None:
-        """Después de avanzar el mundo: la ventana se pone al día unas 30 veces por segundo (de pared)."""
+        """La ventana se pone al día unas 30 veces por segundo (de pared). La primera llamada solo marca
+        la hora: el nodo la hace en su primer tick, y después cada vez que el mundo avanza."""
         if self._visor is None:
             return
         if self._sync is None:
@@ -37,7 +32,7 @@ class Ventana:
             with self._candado:                             # la ventana copia el estado del mundo
                 self._visor.sync()
         else:
-            _di("cerraste la ventana: el robot sigue, sin ventana")
+            di("cerraste la ventana: el robot sigue, sin ventana")
             self._visor = None
 
     def cerrar(self) -> None:
@@ -57,14 +52,23 @@ def abrir(mundo, candado) -> "Ventana | None":
             warnings.simplefilter("always")
             if not glfw.init():                             # sin pantalla dice False (la ventana abortaría)
                 motivo = str(avisos[-1].message).split(" ", 1)[-1].strip("b'\"") if avisos else "sin motivo"
-                _di(f"--ver necesita pantalla (GLFW: {motivo}); sigo sin ventana")
+                di(f"--ver necesita pantalla (GLFW: {motivo}); sigo sin ventana")
                 return None
         import mujoco.viewer
         antes = set(threading.enumerate())
         with candado:
             visor = mujoco.viewer.launch_passive(mundo.modelo, mundo.datos)
     except Exception as e:                                  # en macOS pide correr con mjpython
-        _di(f"--ver no pudo abrir la ventana ({_corto(e)}); sigo sin ventana")
+        di(f"--ver no pudo abrir la ventana ({corto(e)}); sigo sin ventana")
         return None
-    _di("ventana abierta: si la cierras, el robot sigue (sin ventana)")
+    di("ventana abierta: si la cierras, el robot sigue (sin ventana)")
     return Ventana(visor, list(set(threading.enumerate()) - antes), candado)
+
+
+def choque_con_la_camara() -> str:
+    """Con la ventana abierta, por qué no puede haber cámara ("" si sí puede): si la cámara también
+    dibujara con GLFW (todo lo que no sea EGL u OSMesa), las dos chocan en dos hilos."""
+    if os.environ.get("MUJOCO_GL", "").strip().lower() in ("egl", "osmesa"):
+        return ""
+    return ("con --ver, la cámara y la ventana usarían GLFW a la vez y chocan; "
+            + ("para tener las dos, " + REMEDIO_GL if LINUX else "quita --ver para tener cámara"))
