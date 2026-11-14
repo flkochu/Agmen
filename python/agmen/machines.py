@@ -147,11 +147,43 @@ class Place:
     note: str = ""
 
 
-def _same_ip(a: str, b: str) -> bool:
+def _zone_key(zone: str) -> int | str:
+    """La zona de una IPv6 como número de interfaz: "12" → 12, "eth0" → su número
+    (si existe aquí). Si no se puede traducir, se queda el texto tal cual."""
+    if zone.isdigit():
+        return int(zone)
     try:
-        return ipaddress.ip_address(a.split("%", 1)[0]) == ipaddress.ip_address(b.split("%", 1)[0])
+        return socket.if_nametoindex(zone)
+    except (OSError, ValueError):
+        return zone
+
+
+def _with_zone(sockaddr: tuple) -> str:
+    """La dirección de un sockaddr como texto, con su zona. En Windows (y en Linux
+    con getaddrinfo) la zona de una IPv6 no viene en el texto sino aparte, en
+    sockaddr[3] (scope_id): fe80::1 con scope_id 5 → "fe80::1%5". Sin esto, una
+    link-local de un nombre parecería no tener zona."""
+    ip = str(sockaddr[0])
+    if len(sockaddr) >= 4 and sockaddr[3] and "%" not in ip:
+        ip = f"{ip}%{sockaddr[3]}"
+    return ip
+
+
+def _same_ip(a: str, b: str) -> bool:
+    """¿Es la misma IP? En una IPv6 link-local la zona también cuenta (con la misma
+    clave en Linux y en Windows: "fe80::1%eth0" y "fe80::1%4" son la misma si eth0
+    es la interfaz 4); si una de las dos no trae zona, no son la misma."""
+    base_a, _, zone_a = a.partition("%")
+    base_b, _, zone_b = b.partition("%")
+    try:
+        addr_a, addr_b = ipaddress.ip_address(base_a), ipaddress.ip_address(base_b)
     except ValueError:
         return False
+    if addr_a != addr_b:
+        return False
+    if addr_a.version == 6 and addr_a.is_link_local:
+        return bool(zone_a) and bool(zone_b) and _zone_key(zone_a) == _zone_key(zone_b)
+    return True
 
 
 def _ip_place(ip: str) -> Place:
@@ -179,10 +211,17 @@ def _ip_place(ip: str) -> Place:
                                     f"agrega la interfaz (en Linux su nombre, ej. host = \"[{ip}%eth0]\" o "
                                     f"\"[{ip}%wlan0]\"; en Windows un número, ej. \"[{ip}%12]\") o pon su IPv4")
     family = socket.AF_INET6 if addr.version == 6 else socket.AF_INET
+    target: tuple = (ip, 1)
+    if addr.version == 6 and addr.is_link_local:
+        # La zona va en el cuarto elemento (scope_id): Python no la toma del texto
+        # "%zona" si el sockaddr no la trae aparte: con (ip, 1) la deja en 0.
+        zone = _zone_key(ip.partition("%")[2])
+        if isinstance(zone, int):
+            target = (ip, 1, 0, zone)
     try:
         with socket.socket(family, socket.SOCK_DGRAM) as s:
-            s.connect((ip, 1))
-            mine = _same_ip(s.getsockname()[0], ip)
+            s.connect(target)
+            mine = _same_ip(_with_zone(s.getsockname()), ip)
     except OSError:   # sin ruta, o difusión de una subred (EACCES): no es de aquí
         mine = False
     return Place(True, "mine") if mine else Place(False, "other")
@@ -190,7 +229,7 @@ def _ip_place(ip: str) -> Place:
 
 def _resolve(host: str, out: dict[str, list[str]]) -> None:
     try:
-        found = [info[4][0] for info in socket.getaddrinfo(host, None, type=socket.SOCK_DGRAM)]
+        found = [_with_zone(info[4]) for info in socket.getaddrinfo(host, None, type=socket.SOCK_DGRAM)]
     except (OSError, UnicodeError, ValueError):
         found = []
     out[host] = found
@@ -245,14 +284,15 @@ def check_hosts(hosts: list[str], timeout: float = RESOLVE_TIMEOUT) -> dict[str,
 
 def _distinct_ips(ips: list[str]) -> list[str]:
     """Las IP sin repetir: la misma escrita dos veces (o ::ffff:1.2.3.4 y 1.2.3.4) cuenta una vez.
-    La zona es parte de la dirección: fe80::1%eth0 y fe80::1%wlan0 son dos."""
-    out: dict[str, str] = {}
+    La zona es parte de la dirección: fe80::1%eth0 y fe80::1%wlan0 son dos; fe80::1%4 y
+    fe80::1%eth0 son una si eth0 es la interfaz 4."""
+    out: dict[tuple, str] = {}
     for ip in ips:
         base, sep, zone = ip.partition("%")
         try:
-            key = str(unwrap(ipaddress.ip_address(base))) + sep + zone
+            key: tuple = (str(unwrap(ipaddress.ip_address(base))), _zone_key(zone) if sep else None)
         except ValueError:
-            key = ip
+            key = (ip, None)
         out.setdefault(key, ip)
     return list(out.values())
 
