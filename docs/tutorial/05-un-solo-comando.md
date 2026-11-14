@@ -519,7 +519,7 @@ clave que vas a escribir en la laptop):
 ```
 agmen agent │ Agmen 0.13.0 · robot 'robot del tutorial, en dos computadoras' · esta computadora es 'robot' (192.168.1.20:7391) · nodos de aquí (perfil real): imu
 agmen agent │ clave creada (guardada en /home/pi/.config/agmen/agent.key): agmen run te la pide la primera vez que se conecta
-agmen agent │ esperando a agmen run en 192.168.1.20:7391 · clave: 4m3u-96bx-nhn9
+agmen agent │ esperando a agmen run en 192.168.1.20:7391 · clave: haxr-9gh2-ztgz
 ```
 
 La versión que aparece es la de tu instalación de Agmen.
@@ -554,42 +554,74 @@ agmen     │ todo arrancado. Ctrl+C para detener todo.
 robot/imu │ [publisher] enviados=101 retrasos=0
 ```
 
-Y en la terminal de la Pi aparece lo que le pidió la laptop:
+La terminal de la Pi sigue así desde que la laptop se conecta, hasta que la
+laptop se despide (salida completa, sin recortes):
 
 ```
 agmen agent │ laptop 192.168.1.7 conectada · Agmen 0.13.0 · perfil real · nodos de aquí: imu
-agmen agent │ la laptop pidió arrancar 'imu'
-imu         │ ▶ iniciado (pid 5772)
+agmen │ sesión de 192.168.1.7: agmen hub en 127.0.0.1:7390
+hub   │ ▶ iniciado (pid 8594)
+agmen │ la laptop pidió arrancar 'imu'
+imu   │ ▶ iniciado (pid 8605)
+hub   │ [hub] Agmen 0.13.0 · directorio de topics en 127.0.0.1:7390 · los datos van directo entre nodos
+imu   │ [publisher] Agmen 0.13.0 · agmen/1 ImuSample{f32 ax;f32 ay;f32 az;f32 gx;f32 gy;f32 gz} (schema_id 0x83b0e57da34a724d) → /imu a 100 Hz
+hub   │ [hub] ▶ 'imu' publica /imu (ImuSample)
+imu   │ [publisher] enviados=101 retrasos=0
+imu   │ [publisher] enviados=202 retrasos=0
+imu   │ [publisher] enviados=302 retrasos=0
+imu   │ [publisher] enviados=403 retrasos=0
+imu   │ [publisher] enviados=504 retrasos=0
+imu   │ [publisher] enviados=605 retrasos=0
+imu   │ [publisher] enviados=705 retrasos=0
+imu   │ [publisher] enviados=806 retrasos=0
+imu   │ [publisher] enviados=907 retrasos=0
+imu   │ [publisher] enviados=1007 retrasos=0
+agmen │ la laptop pidió detener todo
+imu   │ ■ detenido
+agmen agent │ la laptop (192.168.1.7) se despidió
+hub   │ ■ detenido
+agmen agent │ esperando a agmen run en 192.168.1.20:7391 (otra vez)
 ```
 
 Los logs de `imu` llegan a la laptop con el prefijo `robot/imu │`. Los nodos
 que corren en la laptop, como `cerebro`, no llevan prefijo de computadora.
 
-Ctrl+C en la laptop detiene los nodos de **las dos** computadoras. La Pi no se
-apaga: vuelve a esperar a la siguiente `agmen run`:
+Ctrl+C en la laptop detiene los nodos de **las dos** computadoras. Así termina
+su terminal:
 
 ```
 agmen     │ deteniendo todos los nodos…
+robot     │ la laptop pidió detener todo
+robot/imu │ ■ detenido
+hub       │ ■ detenido
 agmen     │ listo. ¡Hasta luego!
 ```
 
-```
-agmen agent │ la laptop (192.168.1.7) se despidió
-agmen agent │ esperando a agmen run en 192.168.1.20:7391 (otra vez)
-```
+La Pi no se apaga: vuelve a esperar a la siguiente `agmen run`. Ctrl+C en la
+Pi detiene sus nodos y cierra el agente:
 
-Ctrl+C en la Pi también detiene sus nodos y cierra el agente.
+```
+agmen agent │ deteniendo…
+agmen agent │ listo. ¡Hasta luego!
+```
 
 #### La clave: dónde queda y cómo olvidarla
 
 - **En la Pi**: `agent.key`, en la carpeta de Agmen de tu usuario
   (`%APPDATA%\agmen\` en Windows, `~/.config/agmen/` en Linux). Solo la lee su dueño.
 - **En la laptop**: `keys.toml`, en la misma carpeta de tu usuario, con una
-  línea por computadora (`"192.168.1.20:7391" = "4m3u-96bx-nhn9"`). Nunca va en
+  línea por computadora (`"192.168.1.20:7391" = "haxr-9gh2-ztgz"`). Nunca va en
   `robot.toml` ni en git.
 - La laptop guarda **solo la clave que escribiste a mano**, y solo después de
   una conexión aceptada. Si la pones en la variable `AGMEN_AGENT_KEY`, no se
   guarda.
+- Si pulsas Ctrl+C o Ctrl+D cuando `agmen run` te pide la clave, cancela. No
+  conecta ni arranca nada, y lo dice (salida real de Ctrl+D):
+
+  ```
+  agmen │ cancelado (Ctrl+D) antes de conectarme: no arrancó nada
+  ```
+
 - Para olvidar la clave guardada de una computadora:
   `agmen run examples/tutorial/robot_dos.toml --forget-key robot`. La
   próxima vez `agmen run` te la vuelve a pedir.
