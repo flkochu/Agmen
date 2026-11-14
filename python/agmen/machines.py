@@ -27,12 +27,31 @@ DEFAULT_PORT = 7391            # donde escucha agmen agent (RFC 0011 §3.4)
 RESOLVE_TIMEOUT = 1.5          # segundos, para todos los nombres juntos
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 _HOST_LABEL = re.compile(r"[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?")
+_NUMERIC_LABEL = re.compile(r"0[xX][0-9A-Fa-f]*|[0-9]+")   # como las lee inet_aton: decimal, octal o 0x…
 _EXAMPLE = "ej. host = \"192.168.1.20\" o host = \"robot.local\""
+
+
+def unwrap(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    """::ffff:192.168.1.20 → 192.168.1.20: una IPv6 con una IPv4 dentro es esa IPv4
+    (igual en todas las versiones de Python, que no la tratan igual)."""
+    if addr.version == 6 and addr.ipv4_mapped is not None:
+        return addr.ipv4_mapped
+    return addr
+
+
+def _not_a_computer(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    addr = unwrap(addr)
+    return addr.is_unspecified or addr.is_multicast or addr == ipaddress.IPv4Address("255.255.255.255")
+
+
+def is_loopback_name(host: str) -> bool:
+    """localhost, LOCALHOST, localhost. (con el punto final de un nombre completo), 127.0.0.1, ::1."""
+    return host.lower().rstrip(".") in LOOPBACK_NAMES
 
 
 def _check_ip(addr: ipaddress.IPv4Address | ipaddress.IPv6Address, value: str) -> None:
     """Direcciones que nunca son una computadora: se rechazan al leer robot.toml."""
-    if addr.is_unspecified or addr.is_multicast or addr == ipaddress.IPv4Address("255.255.255.255"):
+    if _not_a_computer(addr):
         raise ValueError(f"{value!r} no es la dirección de una computadora (es de difusión, multicast o "
                          f"\"cualquiera\"): pon la IP de esa computadora, {_EXAMPLE}")
 
@@ -71,17 +90,20 @@ def split_host(value: str) -> tuple[str, int]:
         port_text = port_text if ":" in text else None
         if not host:
             raise ValueError(f"{value!r}: falta la IP o el nombre antes de ':', ej. host = \"192.168.1.20:7391\"")
-        if re.fullmatch(r"[0-9.]+", host):         # parece una IPv4: que lo sea
+        labels = host[:-1].split(".") if host.endswith(".") else host.split(".")
+        if re.fullmatch(r"[0-9.]+", host) or all(_NUMERIC_LABEL.fullmatch(x) for x in labels):
+            # Parece un número: el sistema lo leería como IPv4 ("0x0", "1.2.3" o "010.1.1.1" son
+            # direcciones para inet_aton, y no las que uno cree). Solo la IPv4 completa.
             try:
                 _check_ip(ipaddress.IPv4Address(host), value)
             except ipaddress.AddressValueError:
-                raise ValueError(f"{value!r}: {host!r} no es una IPv4 válida (cuatro números del 0 al 255 "
-                                 f"separados por puntos, ej. host = \"192.168.1.20\")") from None
-        else:
-            labels = host[:-1].split(".") if host.endswith(".") else host.split(".")
-            if len(host) > 253 or not all(_HOST_LABEL.fullmatch(x) for x in labels):
-                raise ValueError(f"{value!r} no es una IP ni un nombre de computadora válido: un nombre lleva "
-                                 f"letras sin acentos, dígitos y '-', separados por puntos, {_EXAMPLE}")
+                raise ValueError(f"{value!r}: {host!r} no es una IPv4 válida. Escribe la IPv4 completa, con "
+                                 f"cuatro números del 0 al 255 separados por puntos (sin ceros a la izquierda "
+                                 f"ni 0x), ej. host = \"192.168.1.20\"") from None
+        elif len(host) > 253 or not all(_HOST_LABEL.fullmatch(x) for x in labels):
+            raise ValueError(f"{value!r} no es una IP ni un nombre de computadora válido: un nombre lleva letras "
+                             f"sin acentos, dígitos, '-' y '_', separados por puntos. Un nombre con acentos se "
+                             f"escribe en su forma xn--… (punycode), o pon la IP; {_EXAMPLE}")
     port = DEFAULT_PORT
     if port_text is not None:
         if not (port_text.isascii() and port_text.isdigit()) or not 1 <= int(port_text) <= 65535:
@@ -117,7 +139,8 @@ class Place:
     why: "local" ([profile.X] local = true), "loopback", "mine" (una IP de aquí),
     "other" (una IP o un nombre de otra computadora), "unresolved" (el nombre no
     existe), "timeout" (el nombre no contestó a tiempo), "zone" (IPv6 link-local
-    sin %interfaz), "special" (difusión, multicast, 0.0.0.0).
+    sin %interfaz), "special" (difusión, multicast, 0.0.0.0), "mixed" (un nombre
+    con varias IP, unas de aquí y otras no: no se sabe cuál usar, así que no).
     note: qué hacer, en una frase para el usuario (vacía si no hace falta)."""
     here: bool
     why: str
@@ -136,18 +159,25 @@ def _ip_place(ip: str) -> Place:
     un socket UDP hacia ella (no manda ningún paquete) el sistema elige esa misma
     IP como origen: eso solo pasa si una interfaz de aquí la tiene (cualquiera, no
     solo la de la ruta por defecto). Un bind() no sirve: con ip_nonlocal_bind, o
-    con una dirección de difusión, funciona con IPs que no son de aquí."""
+    con una dirección de difusión, funciona con IPs que no son de aquí.
+
+    Una ruta local tipo AnyIP (`ip route add local 172.16.0.0/16 dev lo`) hace
+    que el sistema considere suyas todas esas IP, y entonces salen "de aquí": es
+    la definición del propio sistema (también les contestaría como suyas)."""
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return Place(False, "other")
+    if addr.version == 6 and addr.ipv4_mapped is not None:   # ::ffff:127.0.0.1 es 127.0.0.1
+        ip, addr = str(addr.ipv4_mapped), addr.ipv4_mapped
     if addr.is_loopback:
         return Place(True, "loopback")
-    if addr.is_unspecified or addr.is_multicast or addr == ipaddress.IPv4Address("255.255.255.255"):
+    if _not_a_computer(addr):
         return Place(False, "special", f"'{ip}' no es la dirección de una computadora: pon la IP de esa computadora")
     if addr.version == 6 and addr.is_link_local and not addr.scope_id:
         return Place(False, "zone", f"'{ip}' es una IPv6 link-local sin %interfaz y así no se sabe de qué red es: "
-                                    f"agrega la interfaz (ej. host = \"[{ip}%eth0]\") o pon su IPv4")
+                                    f"agrega la interfaz (en Linux su nombre, ej. host = \"[{ip}%eth0]\" o "
+                                    f"\"[{ip}%wlan0]\"; en Windows un número, ej. \"[{ip}%12]\") o pon su IPv4")
     family = socket.AF_INET6 if addr.version == 6 else socket.AF_INET
     try:
         with socket.socket(family, socket.SOCK_DGRAM) as s:
@@ -174,7 +204,7 @@ def check_hosts(hosts: list[str], timeout: float = RESOLVE_TIMEOUT) -> dict[str,
     result: dict[str, Place] = {}
     names: list[str] = []
     for host in dict.fromkeys(hosts):
-        if host.lower() in LOOPBACK_NAMES:
+        if is_loopback_name(host):
             result[host] = Place(True, "loopback")
             continue
         try:
@@ -184,6 +214,7 @@ def check_hosts(hosts: list[str], timeout: float = RESOLVE_TIMEOUT) -> dict[str,
             continue
         result[host] = _ip_place(host)
     resolved: dict[str, list[str]] = {}
+    # daemon: un hilo que se queda esperando a un DNS caído no impide que agmen run termine.
     threads = [threading.Thread(target=_resolve, args=(h, resolved), daemon=True) for h in names]
     for t in threads:
         t.start()
@@ -194,16 +225,34 @@ def check_hosts(hosts: list[str], timeout: float = RESOLVE_TIMEOUT) -> dict[str,
         if host not in resolved:
             result[host] = Place(False, "timeout", f"no pude resolver '{host}' en {timeout:g} s: {hint}")
             continue
-        ips = list(dict.fromkeys(resolved[host]))
+        ips = _distinct_ips(resolved[host])
         if not ips:
             result[host] = Place(False, "unresolved", f"no pude resolver '{host}' (la red no lo conoce): {hint}")
             continue
         places = [_ip_place(ip) for ip in ips]
-        if any(p.here for p in places):
-            result[host] = Place(True, "mine")
+        shown = " y ".join([", ".join(ips[:-1]), ips[-1]]) if len(ips) > 1 else ips[0]
+        if all(p.here for p in places):   # ips no está vacía: all() no puede dar True por nada
+            result[host] = Place(True, "loopback" if all(p.why == "loopback" for p in places) else "mine")
+        elif any(p.here for p in places):
+            some = "una es" if len(ips) == 2 else "unas son"
+            other = "otra no" if len(ips) == 2 else "otras no"
+            result[host] = Place(False, "mixed", f"'{host}' es {shown}: {some} de esta computadora y {other}; "
+                                                 f"pon la IP en host")
         else:
-            result[host] = Place(False, "other", f"'{host}' es {', '.join(ips)}, que no es de esta computadora")
+            result[host] = Place(False, "other", f"'{host}' es {shown}, que no es de esta computadora")
     return result
+
+
+def _distinct_ips(ips: list[str]) -> list[str]:
+    """Las IP sin repetir: la misma escrita dos veces (o ::ffff:1.2.3.4 y 1.2.3.4) cuenta una vez."""
+    out: dict[str, str] = {}
+    for ip in ips:
+        try:
+            key = str(unwrap(ipaddress.ip_address(ip.split("%", 1)[0])))
+        except ValueError:
+            key = ip
+        out.setdefault(key, ip)
+    return list(out.values())
 
 
 def these_are_here(hosts: list[str], timeout: float = RESOLVE_TIMEOUT) -> dict[str, bool]:
@@ -250,6 +299,23 @@ def _nodes_on(config, machine: str) -> list[str]:
     return [n.name for n in config.nodes if n.machine == machine]
 
 
+def hardware_remote(config, remote: list[str]) -> bool:
+    """¿Hay hardware entre los nodos que corren en las computadoras `remote`? Sí si el
+    perfil activo es "real", o si alguno de esos nodos nombra "real" en su profile
+    (ej. profile = ["real", "mesa"]). Un nodo sin profile no cuenta: lo que toca
+    hardware se marca profile = "real" (un nodo sin perfil corre también en
+    simulación). Si hay hardware, no se sugiere correr esos nodos aquí."""
+    return config.profile == "real" or any(
+        n.machine in remote and "real" in n.profiles for n in config.nodes)
+
+
+def _sim_is_safe(config, remote: list[str]) -> bool:
+    """¿Sugerir [profile.sim] local = true no traería aquí hardware de las otras computadoras?
+    No, si algún nodo remoto es a la vez de "real" y de "sim" (ej. profile = ["real", "sim"])."""
+    return config.profile != "sim" and not any(
+        n.machine in remote and "real" in n.profiles and "sim" in n.profiles for n in config.nodes)
+
+
 def remote_error(config, places: dict[str, Place]) -> str:
     """El error si algún nodo del perfil activo es de otra computadora (esta
     versión todavía no los arranca allá: llega con agmen agent), o "" si no.
@@ -263,18 +329,28 @@ def remote_error(config, places: dict[str, Place]) -> str:
         names = _nodes_on(config, m.name)
         parts.append(f"{and_names(names)} {'corre' if len(names) == 1 else 'corren'} en '{m.name}' ({_address(m)})")
     notes = "".join(f" {n[0].upper()}{n[1:]}." for n in (places[m.name].note for m in remote) if n)
+    remote_names = [m.name for m in remote]
+    # Con hardware entre los remotos nunca se sugiere correrlos aquí: serían los drivers del robot en esta
+    # computadora. Solo, si no lo trae, probar en simulación.
+    hardware = hardware_remote(config, remote_names)
+    sim = "[profile.sim] local = true y agmen run --sim"
+    local = f"[profile.{config.profile}] local = true para correr todo aquí"
     if len(used) == 1:
         text = (f"{parts[0]} y esta versión todavía no arranca nodos en otra computadora (llega con agmen agent)."
                 f"{notes} Mientras tanto: corre agmen run en esa computadora")
-    else:
-        every = ", ".join(f"'{m.name}'" for m in used)
-        text = (f"{'; '.join(parts)}. Con nodos en varias computadoras ({every}) hace falta agmen agent, que llega "
-                f"en una versión próxima.{notes} Mientras tanto: quita machine de los nodos para correr todo en "
-                f"una sola computadora")
-    if config.profile != "real":
-        return text + f", o usa [profile.{config.profile}] local = true para correr todo aquí"
-    # en el perfil real no se sugiere correr aquí: serían los drivers del robot en esta computadora
-    return text + ". Para probar aquí en simulación: [profile.sim] local = true y agmen run --sim"
+        if not hardware:
+            return f"{text}, o usa {local}"
+        if config.profile == "real" and _sim_is_safe(config, remote_names):
+            return f"{text}. Para probar aquí en simulación: {sim}"
+        return f"{text}."
+    every = ", ".join(f"'{m.name}'" for m in used)
+    text = (f"{'; '.join(parts)}. Con nodos en varias computadoras ({every}) hace falta agmen agent, que llega "
+            f"en una versión próxima.{notes}")
+    if not hardware:
+        return f"{text} Mientras tanto: usa {local}"
+    if _sim_is_safe(config, remote_names):
+        return f"{text} Mientras tanto, para probar aquí en simulación: {sim}"
+    return text
 
 
 def placement_lines(config, places: dict[str, Place]) -> list[str]:

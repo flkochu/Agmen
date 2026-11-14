@@ -351,11 +351,14 @@ def _parse_machines(data: dict) -> list[MachineConfig]:
 
 def _same_host(a: str, b: str) -> bool:
     """¿Dos host escritos distinto son la misma dirección? ("Robot.local" y "robot.local.",
-    "::1" y "0:0::1"). Sin DNS: dos nombres que resuelven igual no se detectan aquí."""
+    "::1" y "0:0::1", "192.168.1.20" y "::ffff:192.168.1.20"). Sin DNS: dos nombres que
+    resuelven igual no se detectan aquí."""
     import ipaddress
 
+    from .machines import unwrap
+
     try:
-        return ipaddress.ip_address(a) == ipaddress.ip_address(b)
+        return unwrap(ipaddress.ip_address(a)) == unwrap(ipaddress.ip_address(b))
     except ValueError:
         return a.lower().rstrip(".") == b.lower().rstrip(".")
 
@@ -1107,9 +1110,10 @@ class Launcher:
     def __init__(self, config: RobotConfig, stream=None, *, places: dict | None = None) -> None:
         """`places`: dónde corre cada [[machine]] ({nombre: machines.Place}, de
         machines.place_machines), si quien construye el Launcher ya lo decidió; si
-        no, se decide aquí. Sin [[machine]] no se consulta nada. Esta versión solo
-        arranca nodos en esta computadora: si alguno es de otra, ConfigError (RFC
-        0011 §3.4: nunca medio robot en silencio)."""
+        no, se decide aquí. Si ningún nodo dice machine, no se consulta nada. Esta
+        versión solo arranca nodos en esta computadora: si alguno es de otra, o su
+        machine no está declarada, ConfigError antes de crear nada (RFC 0011 §3.4:
+        nunca medio robot en silencio)."""
         self.places = self._check_places(config, places)
         self.config = config
         self.logs = LogBook()
@@ -1120,13 +1124,22 @@ class Launcher:
 
     @staticmethod
     def _check_places(config: RobotConfig, places: dict | None) -> dict:
-        if not config.machines:
-            return {}
+        used = {n.machine for n in config.nodes if n.machine}
+        if not used:
+            return {}   # ningún nodo dice machine: todo corre aquí, sin consultar nada
+        declared = {m.name for m in config.machines}
+        unknown = [n for n in config.nodes if n.machine and n.machine not in declared]
+        if unknown:   # una configuración armada desde Python (load_config ya lo revisa en robot.toml)
+            n = unknown[0]
+            raise ConfigError(f"el nodo '{n.name}' dice machine = '{n.machine}', pero no hay ninguna [[machine]] "
+                              f"'{n.machine}' en la configuración"
+                              + (f" (hay: {', '.join(sorted(declared))})" if declared else "")
+                              + f". Declárala en robot.toml ([[machine]] name = \"{n.machine}\" y su host), "
+                                f"o quita machine para que corra aquí")
         from .machines import place_machines, remote_error
 
         if places is None:
             places = place_machines(config)
-        used = {n.machine for n in config.nodes if n.machine}
         missing = sorted(used - set(places))
         if missing:
             raise ValueError(f"Launcher: places no dice dónde corre {', '.join(missing)} "

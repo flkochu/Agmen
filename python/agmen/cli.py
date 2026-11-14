@@ -65,15 +65,6 @@ def cmd_run(args) -> int:
         print(f"error: el perfil replay es el de --play: agmen run {args.archivo} --play ARCHIVO.mcap",
               file=sys.stderr)
         return 2
-    places = {}   # RFC 0011 §3.4: dónde corre cada [[machine]]; nunca medio robot en silencio
-    if config.machines:
-        from .machines import place_machines, remote_error
-
-        places = place_machines(config)
-        remote = remote_error(config, places)
-        if remote:
-            print(f"error: {remote}", file=sys.stderr)
-            return 2
 
     try:
         if config.hub and any(name == "hub" for name, _ in config.skipped):   # igual en todos los perfiles
@@ -100,6 +91,17 @@ def cmd_run(args) -> int:
             n.autostart = False             # se puede arrancar desde el panel
         if args.play:                       # RFC 0010: todos con el tiempo de la grabación
             n.env.update({"AGMEN_CLOCK": "replay", "AGMEN_CLOCK_SOURCE": "agmen"})
+    places = {}   # RFC 0011 §3.4: dónde corre cada [[machine]]; nunca medio robot en silencio.
+    # Después de los errores del archivo: esta consulta puede tardar hasta 1.5 s (DNS)
+    if config.machines:
+        from .machines import place_machines, remote_error
+
+        places = place_machines(config)
+        remote = remote_error(config, places)
+        if remote:
+            print(f"error: {remote}", file=sys.stderr)
+            return 2
+
     launcher = Launcher(config, places=places)
     out = _SayTo(launcher)
     launcher.say(f"Agmen {__version__} · robot '{config.name}' · {len(config.nodes)} nodos · {hub_note}")
