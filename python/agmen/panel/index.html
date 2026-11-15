@@ -383,7 +383,7 @@ function renderNodes() {
     const shownState = n.state === OFFLINE && n.known_state ? n.known_state : n.state;
     const alive = shownState === "corriendo" || shownState === "reiniciando";
     let meta = n.state;
-    // DECISIÓN PENDIENTE: cómo se dice el último estado conocido de un nodo sin conexión (§3 pide no perderlo; el texto es nuestro)
+    // Cómo se dice el último estado conocido de un nodo sin conexión (§3 pide no perderlo; el texto es nuestro)
     if (n.state === OFFLINE && n.known_state) meta += ` · lo último que se supo: ${n.known_state}`;
     if (n.state === "corriendo") meta += ` · ${fmtUptime(n.uptime)} · pid ${n.pid}`;
     if (n.exit_code != null && (n.state === "falló" || n.state === "terminó")) meta += ` (código ${n.exit_code})`;
