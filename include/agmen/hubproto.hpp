@@ -138,6 +138,11 @@ public:
     /// Las IP del campo `peers` del último `ok` (modo red, RFC 0011 §3.5); sin valor si el
     /// último `ok` no lo traía (modo local).
     [[nodiscard]] const std::optional<std::vector<std::string>>& peers() const { return peers_; }
+    /// Cuántos `ok` de este endpoint llegaron (el Subscriber que pasa a la red espera el primero
+    /// que llega por su socket nuevo, RFC 0011 §2).
+    [[nodiscard]] std::uint64_t oks() const { return oks_; }
+    /// Cambia la línea del latido (el Subscriber que pasa a la red: puerto nuevo y net=1).
+    void set_beat(std::string beat) { beat_ = std::move(beat); }
 
 private:
     net::Address hub_;
@@ -149,6 +154,7 @@ private:
     bool warned_ = false;
     std::string error_;
     std::optional<std::vector<std::string>> peers_;
+    std::uint64_t oks_ = 0;
 };
 
 }  // namespace agmen::hub

@@ -388,6 +388,7 @@ bool Link::handle(wire::ByteView data, std::optional<std::vector<std::string>>& 
             if (tcp != nullptr) *tcp = split_list(l.get("tcp"));
             error_.clear();
         } else if (l.op == "ok") {
+            ++oks_;
             error_.clear();
             const auto it = l.fields.find("peers");
             if (it == l.fields.end()) {

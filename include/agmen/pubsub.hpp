@@ -108,6 +108,9 @@ public:
     /// Bytes de memoria compartida que este publicador tiene apartados ahora
     /// (sus bloques de datos). Baja solo: un bloque sin usar 5 s se libera (D6 a′).
     [[nodiscard]] std::size_t shm_bytes() const;
+    /// Mensajes que no salieron hacia un destino de otra computadora (RFC 0011 §3). Siempre 0 en
+    /// una sola computadora.
+    [[nodiscard]] std::uint64_t unreachable() const;
 
 private:
     struct State;
@@ -182,6 +185,11 @@ public:
     [[nodiscard]] std::uint16_t local_port() const;
     /// Puerto TCP donde recibe mensajes arrow (0 si el tipo no los usa).
     [[nodiscard]] std::uint16_t tcp_port() const;
+    /// La IP donde escucha: 127.0.0.1 por topic; en modo red (RFC 0011 §2), 0.0.0.0 o AGMEN_NET_IP.
+    [[nodiscard]] std::string listen_ip() const;
+    /// Datos (datagramas o conexiones TCP) descartados por venir de una IP que no es de esta
+    /// computadora ni de [[machine]] (RFC 0011 §2). Siempre 0 mientras no escuche en la red.
+    [[nodiscard]] std::uint64_t rejected() const;
     [[nodiscard]] const std::string& where() const;
     [[nodiscard]] const TypeInfo& type() const;
     /// Anuncios vistos: schema_id → (topic, esquema).
@@ -243,6 +251,8 @@ public:
     [[nodiscard]] std::uint64_t shm_fallbacks() const { return core_.shm_fallbacks(); }
     /// Bytes de memoria compartida apartados ahora (RFC 0009 D6 a′).
     [[nodiscard]] std::size_t shm_bytes() const { return core_.shm_bytes(); }
+    /// Mensajes que no salieron hacia otra computadora (RFC 0011 §3; se avisa una vez por destino).
+    [[nodiscard]] std::uint64_t unreachable() const { return core_.unreachable(); }
 
 private:
     PublisherCore core_;
@@ -297,6 +307,10 @@ public:
     [[nodiscard]] std::uint16_t local_port() const { return core_.local_port(); }
     /// Puerto TCP donde recibe mensajes arrow (0 si el tipo no los usa).
     [[nodiscard]] std::uint16_t tcp_port() const { return core_.tcp_port(); }
+    /// La IP donde escucha: 127.0.0.1 por topic; en modo red, 0.0.0.0 o AGMEN_NET_IP (RFC 0011 §2).
+    [[nodiscard]] std::string listen_ip() const { return core_.listen_ip(); }
+    /// Datos descartados por venir de una computadora que no es de [[machine]] (RFC 0011 §2).
+    [[nodiscard]] std::uint64_t rejected() const { return core_.rejected(); }
 
     /// Topic o dirección donde escucha.
     [[nodiscard]] const std::string& where() const { return core_.where(); }
