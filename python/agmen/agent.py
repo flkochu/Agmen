@@ -1421,6 +1421,7 @@ class _Session:
         # §13.1: la conexión reanudada que aún no confirma que la laptop oye (None: ninguna). Mientras haya
         # una, lost_at sigue puesto y el temporizador de la gracia sigue armado: si vence, los nodos se detienen.
         self.unconfirmed: Channel | None = None
+        self._replaced: str | None = None    # §14: la IP de la conexión viva que sustituyó la sin confirmar
         self._memory: deque[tuple[str, int, str, int]] = deque()   # (nodo, n, línea, bytes): para reanudar
         self._memory_bytes = 0
         self.out = _Outbox()
@@ -1707,6 +1708,7 @@ class _Session:
                     self._unread.clear()   # el lector de la nueva es este hilo (en _guarded, abajo)
                     old_ip, self.ip = self.ip, ip
         if failed is not None:
+            channel.close()   # §14: el canal nuevo no se queda abierto (end() cierra el de antes, el actual)
             self.end(f"la laptop volvió a conectarse desde {ip} y no pude esperar a que confirme "
                      f"({_clean(repr(failed), 200)}): detengo los nodos", "error")
             return True
@@ -1716,9 +1718,9 @@ class _Session:
             old_out.close()
             old_channel.close()   # si aún se leía (no se daba por perdida), su lector ve que ya no es la actual
             self.sender = self._start_sender(channel, out)
-            if substituted:
-                self.say(f"la laptop volvió a conectarse desde {ip} antes de que se perdiera la conexión de "
-                         f"{old_ip}: la sustituyo y espero a que confirme que me oye", "out")
+            # §14: aún sin confirmar no se anuncia que la laptop volvió: se dice en _confirm (de qué IP venía, si
+            # sustituyó a una conexión viva).
+            self._replaced = old_ip if substituted else None
         except Exception as e:
             self.end(f"error inesperado al retomar la sesión de {ip} ({_clean(repr(e), 200)}): detengo los nodos",
                      "error")
@@ -1739,6 +1741,11 @@ class _Session:
             timer.cancel()
         with self.server.lock:
             self.server.trusted = _ip_key(self.ip)
+        replaced, self._replaced = self._replaced, None
+        if replaced is not None:
+            self.say(f"la laptop volvió a conectarse desde {self.ip} antes de que se perdiera la conexión de "
+                     f"{replaced}: la sustituí y sigo con la misma sesión (no se reinició nada)", "out")
+            return
         self.say(f"la laptop ({self.ip}) volvió a los {time.monotonic() - (lost_at or time.monotonic()):.0f} s: sigo "
                  f"con la misma sesión (no se reinició nada)", "out")
 
@@ -1983,6 +1990,9 @@ class _Session:
             if grace_token is not None and (grace_token != self._grace_token or self.lost_at is None):
                 return
             self._ending = True
+            if grace_token is not None and self.unconfirmed is not None:   # §14: volvió, pero sin confirmar
+                reason = (f"la laptop ({self.ip}) intentó volver pero no confirmó que me oye: detuve los nodos"
+                          if reason else reason)
             timer = self._grace_timer
             bye = bool(farewell) and (self.lost_at is None or self.unconfirmed is not None)   # hay conexión
         if timer is not None:
@@ -2040,6 +2050,10 @@ OFFLINE = "sin conexión"        # estado de un RemoteNode mientras agmen run re
 RETRY_EVERY = 1.0               # reconectar (3c): un intento cada tanto…
 RETRY_CONNECT_TIMEOUT = 2.0     # … con este tope para abrir la conexión TCP
 RETRY_REFUSED = 5.0             # tras un rechazo (clave, distinto, ocupado…), se reintenta con esta pausa
+# La cuenta segura (§13.2, §14): lo que el agente puede tardar en detener un nodo tras vencer la gracia. Es lo que
+# hace run.Node.stop: hasta 3 s (su timeout por defecto) tras la señal amable y 2 s más tras terminate().
+STOP_BUDGET = 5.0
+NET_MARGIN = 1.0                # … y un ping que llegó tarde
 RETRY_NOTE_EVERY = 60.0         # pasada la gracia, un recordatorio cada tanto (nunca una línea por intento)
 _UNREACHABLE = ("rechazada", "tiempo", "sin_ruta", "cerrado", "perdida")   # todavía no hay red: no es un rechazo
 
@@ -2179,8 +2193,9 @@ class AgentLink:
         # y se prometería de más; ni "lo último mandado": con la red caída los envíos solo llegan al buffer.
         self.last_ok = 0.0
         # La cuenta segura (§13.2): lo último que se MANDÓ por la conexión instalada (ping, orden). El robot no
-        # pudo oír a la laptop después de esto, así que a más tardar en last_tx + gracia + RESUME_CONFIRM + 0.5 s
-        # ya detuvo sus nodos. Un 'reanudar' no la mueve (por sí solo ya no alarga la gracia del robot).
+        # pudo oír a la laptop después de esto, así que pasado safe_end() presumimos (bien fundado, no garantizado)
+        # que ya detuvo sus nodos. Un 'reanudar' no la mueve (por sí solo ya no alarga la gracia del robot), y
+        # al reanudar last_ok tampoco sube hasta el pong del ping de confirmación (§14).
         self.last_tx = 0.0
         self.down_since: float | None = None   # sin conexión, reintentando, desde (monotonic)
         self.farewell = ""                  # el motivo del adios del agente (§10): lo cerraron a propósito allá
@@ -2397,20 +2412,21 @@ class AgentLink:
         """Un ping cada PING_EVERY s; con `now`, el primero de inmediato (el que confirma un reanudar, §13.1)."""
         while now or not done.wait(PING_EVERY):
             now = False
+            counts = channel is self.channel   # §14: se decide ANTES de mandarlo (el robot pudo oírlo igual)
             try:
                 channel.send({"op": "ping", "t": time.monotonic()})
             except AgentError:
                 return   # el lector se entera
-            self._sent(channel)
-
-    def _sent(self, channel: Channel) -> None:
-        """Algo salió por `channel`: si es la conexión instalada, sube la cuenta segura (§13.2)."""
-        if channel is self.channel:
-            self.last_tx = time.monotonic()
+            finally:
+                if counts:
+                    self.last_tx = time.monotonic()
 
     def safe_end(self) -> float:
-        """Cuándo, a más tardar, el robot ya detuvo sus nodos si no volvió a oír a la laptop (§13.2)."""
-        return self.last_tx + self.grace + RESUME_CONFIRM + 0.5
+        """Cuándo el robot ya habrá detenido sus nodos si no volvió a oír a la laptop (§13.2, §14): lo último
+        mandado por una conexión instalada + la gracia + la prórroga de un reanudar + lo que tarda en detener
+        un nodo + un ping que llegó tarde. Es una presunción bien fundada, no una garantía: sin conexión no hay
+        cómo saberlo."""
+        return self.last_tx + self.grace + RESUME_CONFIRM + STOP_BUDGET + NET_MARGIN
 
     def grace_left(self) -> float:
         """Lo que le queda seguro a la gracia del robot (la cuenta pesimista, §13.2): para el panel."""
@@ -2659,14 +2675,20 @@ class AgentLink:
                 _bye(channel)
                 return None
             if self.session_id:
-                contact = time.monotonic()   # §11: antes de mandarlo (el agente lo recibió entonces o después)
+                # §14: un reanudar contestado ya no renueva la gracia del robot: no sube el último contacto
+                # confirmado (eso lo hace solo el pong del ping de confirmación, abajo).
                 channel.send({"op": "reanudar", "sesion": self.session_id, "logs": dict(self._log_n)})
-                msg, contact = self._first_reply(channel, contact)
+                msg, _ = self._first_reply(channel, self.last_ok)
                 if msg is None:   # stop
                     _bye(channel)
                     return None
                 if msg["op"] == "reanudar_ok":
-                    self._install(channel, threading.Event(), resumed=msg, contact=contact)
+                    got = self._confirm_resume(channel)
+                    if got is None:   # stop
+                        _bye(channel)
+                        return None
+                    early, contact = got
+                    self._install(channel, threading.Event(), resumed=msg, contact=contact, early=early)
                     return None
                 channel.close()
                 if msg["op"] != "sesion_error":
@@ -2722,6 +2744,40 @@ class AgentLink:
             until = time.monotonic() + SILENCE_TIMEOUT   # (pong de nada: no debería haber otra cosa)
         return None, contact
 
+    def _confirm_resume(self, channel: Channel) -> tuple[list[dict], float] | None:
+        """§13.1, §14: tras reanudar_ok, el ping de confirmación y su pong, antes de dar la conexión por buena.
+        Devuelve (lo que llegó mientras tanto salvo los log, que se muestran al llegar; el t del ping) o None si se dejó de intentar. Si el pong
+        no llega en RESUME_CONFIRM + SILENCE_TIMEOUT (el tope de respuesta de los intentos): AgentError, un
+        intento fallido. El ping cuenta para la cuenta segura aunque el pong no vuelva: el robot pudo oírlo."""
+        t = time.monotonic()
+        self.last_tx = t
+        try:
+            channel.send({"op": "ping", "t": t})
+        finally:
+            self.last_tx = time.monotonic()
+        early: list[dict] = []
+        until = time.monotonic() + RESUME_CONFIRM + SILENCE_TIMEOUT
+        while not self._retry_stop.is_set():
+            left = until - time.monotonic()
+            if left <= 0:
+                raise ChannelTimeout(f"no contestó el ping de confirmación en {RESUME_CONFIRM + SILENCE_TIMEOUT:g} s")
+            try:
+                msg = channel.recv(min(STOP_POLL, left))
+            except ChannelTimeout:
+                continue
+            if msg["op"] == "pong" and msg.get("t") == t:
+                return early, t
+            if msg["op"] == "adios":   # lo cerraron allá a media reanudación: el siguiente intento abre otra
+                raise ChannelClosed("se despidió antes de confirmar")
+            if msg["op"] == "log":
+                # Los log se muestran al llegar, al ritmo de la red como haría el lector: juntarlos y soltarlos de
+                # golpe al instalar desborda la terminal (miles tras un corte largo). Ya mostrados cuentan en
+                # _log_n: si este intento falla, el siguiente reanudar no los vuelve a pedir.
+                self._dispatch(msg)
+            else:
+                early.append(msg)   # estado y demás: se aplican al instalar, después de reanudar_ok (si no, nada)
+        return None
+
     def _refused(self, e: LinkError, said: set[str]) -> float:
         """Un rechazo al reconectar: se dice una vez por código, con su "qué hacer", y se sigue intentando."""
         if e.code not in said:
@@ -2731,7 +2787,7 @@ class AgentLink:
         return RETRY_REFUSED
 
     def _install(self, channel: Channel, done: threading.Event, ok: dict | None = None,
-                 resumed: dict | None = None, contact: float | None = None) -> None:
+                 resumed: dict | None = None, contact: float | None = None, early: list[dict] | None = None) -> None:
         """La conexión nueva pasa a ser la actual: su lector arranca (y su ping, si no lo tenía).
         Si algo falla a medias, se deshace (vuelve a quedar sin conexión, la conexión se cierra y
         el error sube a _retry, que sigue intentando): nunca una conexión actual sin lector."""
@@ -2754,8 +2810,9 @@ class AgentLink:
             self.version = _clean(channel.peer_version, 40)
             now = time.monotonic()
             if resumed is not None:
-                self.last_ok = contact if contact is not None else now
-                self._start_ping(channel, done, now=True)   # §13.1: el ping que confirma que se oye al agente
+                if contact is not None:   # el t del ping cuyo pong llegó (§14): confirmado en los dos sentidos
+                    self.last_ok = max(self.last_ok, contact)
+                self._start_ping(channel, done)   # (el de confirmación ya salió y ya volvió su pong)
                 nodes = resumed.get("nodos")
                 for name, node in self.nodes.items():
                     st = nodes.get(name) if isinstance(nodes, dict) else None
@@ -2769,6 +2826,8 @@ class AgentLink:
                     if isinstance(lost, dict) else 0
                 self._notice(f"{where}: reconectado tras {away} s sin conexión · no se reinició nada"
                              + (f" · se perdieron {missing} líneas de log" if missing else ""))
+                for msg in early or ():   # lo que llegó entre reanudar_ok y el pong, en orden
+                    self._dispatch(msg)
             else:
                 self._took(ok or {}, contact if contact is not None else now)
                 for node in self.nodes.values():
@@ -2802,11 +2861,14 @@ class AgentLink:
                 return (f"no hay conexión con {self.name}: '{op} {node}' no se hizo ({why}; "
                         f"reintento cada {RETRY_EVERY:g} s)")
             return f"no hay conexión con {self.name}: '{op} {node}' no se hizo"
+        counts = channel is self.channel   # §14: se decide antes de mandarla
         try:
             channel.send({"op": op, "nodo": node})
         except AgentError as e:
             return f"no pude mandarle '{op} {node}' a {self.name}: {e}"
-        self._sent(channel)
+        finally:
+            if counts:
+                self.last_tx = time.monotonic()
         return None
 
     def finish(self, timeout: float = FINISH_TIMEOUT) -> None:
@@ -2817,7 +2879,7 @@ class AgentLink:
         if channel is None:
             if self.down_since is not None and not self._closing:
                 self.close()
-                if not self.farewell:
+                if not self.farewell and not self._pending:   # (§14: antes de arrancar no dio ninguna orden allá)
                     self._notice(f"{self.name} no se enteró (sin conexión): detiene sus nodos solo, {self.grace:g} "
                                  f"s después de perder a la laptop")
             return
