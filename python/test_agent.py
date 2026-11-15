@@ -3908,25 +3908,28 @@ class TestCtrlCAlArrancar(E2EBase):
             pass
         self.assertEqual(signal.getsignal(signal.SIGINT), c._note)
 
-    def test_fuera_del_hilo_principal_una_sola_traza(self):
+    def test_fuera_del_hilo_principal_lo_dice_en_espanol_y_no_arranca_nada(self):
         self.toml_local()
         from agmen import cli
 
-        errores = []
+        errores, codigos, err = [], [], io.StringIO()
 
         def correr():
             try:
-                with mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
-                    cli.main(["run", str(self.toml), "--no-browser"])
+                with mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", err):
+                    codigos.append(cli.main(["run", str(self.toml), "--no-browser"]))
             except BaseException as e:   # noqa: BLE001 - se revisa abajo
                 errores.append(e)
 
         h = threading.Thread(target=correr, daemon=True)
         h.start()
         h.join(30)
-        self.assertEqual(len(errores), 1, errores)
-        self.assertIsInstance(errores[0], ValueError)
-        self.assertIsNone(errores[0].__context__, f"dos trazas encadenadas: {errores[0].__context__!r}")
+        self.assertFalse(h.is_alive(), "agmen run se quedó corriendo en el hilo")
+        self.assertEqual(errores, [], "debe ser un error dicho en español, no una excepción")
+        self.assertEqual(codigos, [2])
+        self.assertIn("necesita el hilo principal", err.getvalue())
+        self.assertIn("Ctrl+C", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
         self.assertFalse(list(self.marks.glob("arranque_*")), "arrancó algún nodo")
 
 

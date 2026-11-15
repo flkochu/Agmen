@@ -107,7 +107,12 @@ def cmd_run(args) -> int:
     """agmen run. Al salir deja los manejadores de señales como estaban (llamado desde Python,
     como en las pruebas, el proceso no se queda con los de agmen run)."""
     if threading.current_thread() is not threading.main_thread():
-        return _run(args)   # signal.signal falla aquí (ValueError): no hay nada que restaurar
+        # Python solo deja poner manejadores de señales (Ctrl+C) en el hilo principal: sin ellos agmen run no
+        # podría detener el robot con Ctrl+C. Mejor decirlo antes de arrancar nada que un ValueError de signal.
+        print("error: agmen run necesita el hilo principal de Python para atender Ctrl+C, y lo llamaste desde "
+              "otro hilo. Llámalo desde el hilo principal, o córrelo en otro proceso "
+              "(ej. subprocess.run([sys.executable, \"-m\", \"agmen\", \"run\", \"robot.toml\"]))", file=sys.stderr)
+        return 2
     saved = [(s, signal.getsignal(s)) for s in _RUN_SIGNALS]
     try:
         return _run(args)
