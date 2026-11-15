@@ -1219,6 +1219,7 @@ std::uint64_t PublisherCore::unreachable() const {
     return s_->unreachable.load() + (s_->fanout ? s_->fanout->unreachable() : 0);
 }
 std::uint64_t PublisherCore::rejected() const { return s_->rejected.load(); }
+std::uint16_t PublisherCore::net_port() const { return s_->net_socket ? s_->net_socket->local_port() : 0; }
 
 // ---------------------------------------------------------------------------
 // SubscriberCore
@@ -1255,6 +1256,8 @@ struct SubscriberCore::State {
     std::set<std::string> rejected_ips;
     std::chrono::steady_clock::time_point last_ok{};   // el último `ok` del hub (modo red, RFC 0011 §9.2)
     bool expired = false;                              // ya volvió a solo lo local por falta de `ok` (avisado)
+    std::vector<std::string> quiet_peers;              // los peers de cuando el hub calló (RFC 0011 §10.2)
+    std::set<std::string> quiet_warned;
 
     void forget_idle_blocks(bool now_please) {
         const auto now = std::chrono::steady_clock::now();
@@ -1300,6 +1303,8 @@ struct SubscriberCore::State {
     void on_ok(std::intptr_t via) {
         const auto peers = link->peers();
         last_ok = std::chrono::steady_clock::now();
+        quiet_peers.clear();   // el hub contesta: lo de §10.2 ya no aplica
+        quiet_warned.clear();
         if (peers && !peers->empty()) expired = false;
         if (peers && !net) go_net();
         if (!net) return;
@@ -1357,6 +1362,9 @@ struct SubscriberCore::State {
         if (std::chrono::steady_clock::now() - last_ok <= hub::kNetExpire) return;
         const std::size_t n_local = net_ip.empty() ? 1 : 2;
         if (allowed && allowed->size() == n_local) return;   // ya solo lo local
+        if (allowed) {   // sus datos se descartan con otro texto (§10.2)
+            quiet_peers.assign(allowed->begin() + static_cast<std::ptrdiff_t>(n_local), allowed->end());
+        }
         set_allowed({});
         if (!expired) {
             expired = true;
@@ -1369,6 +1377,15 @@ struct SubscriberCore::State {
 
     void reject(const std::string& ip) {
         rejected.fetch_add(1);
+        if (std::find(quiet_peers.begin(), quiet_peers.end(), ip) != quiet_peers.end()) {
+            // SÍ es de [[machine]], pero el hub calló (RFC 0011 §10.2): el mismo texto que Python.
+            if (quiet_warned.size() < kMaxRejectedWarned && quiet_warned.insert(ip).second) {
+                log::write("[agmen] '" + topic + "': llegó un dato de " + ip +
+                           " (una computadora de [[machine]]), pero mi hub no contesta hace " +
+                           std::to_string(hub::kNetExpire.count() / 1000) + " s: no lo acepto hasta que vuelva");
+            }
+            return;
+        }
         // Una vez por IP; con un tope, para que una avalancha de IP distintas no llene la salida.
         if (rejected_ips.size() < kMaxRejectedWarned && rejected_ips.insert(ip).second) {
             log::write("[agmen] '" + topic + "': llegó un dato de " + ip +
@@ -1611,13 +1628,18 @@ std::optional<RawSample> SubscriberCore::receive_raw(std::chrono::milliseconds t
         }
         // Tipo arrow (UDP para control y anuncios, TCP para los datos), o el socket de antes mientras
         // se pasa a la red (RFC 0011 §2): todos a la vez.
+        // La caducidad, antes de entregar lo ya leído de TCP y de aceptar conexiones (RFC 0011 §9.2, §10.3).
+        if (s.allowed) s.expire_check();
         if (s.tcp && !s.tcp->ready.empty()) {
             auto got = std::move(s.tcp->ready.front());
             s.tcp->ready.pop_front();
+            if (s.allowed && !ip_in(got.from, *s.allowed)) {
+                s.reject(host_of(got.from));   // leído antes de que su IP dejara de valer
+                continue;
+            }
             if (auto out = s.handle_packet(got.packet, std::move(got.from), got.peer)) return out;
             continue;
         }
-        if (s.allowed) s.expire_check();   // antes de aceptar conexiones TCP (RFC 0011 §9.2)
         bool hasta_el_final = true;   // ¿esta espera llega hasta `deadline`? (o hasta cerrar los sockets de antes)
         if (s.old_until) {
             if (now >= *s.old_until) {
@@ -1669,7 +1691,17 @@ std::size_t SubscriberCore::shm_mapped() const { return s_->tcp ? s_->tcp->mappe
 
 std::uint16_t SubscriberCore::local_port() const { return s_->socket.local_port(); }
 std::uint16_t SubscriberCore::tcp_port() const { return s_->tcp ? s_->tcp->listener.local_port() : 0; }
-std::string SubscriberCore::listen_ip() const { return s_->listen_ip; }
+std::string SubscriberCore::listen_ip() const {
+    std::lock_guard lock(s_->link_mu);   // go_net() la cambia con link_mu (RFC 0011 §10.4)
+    return s_->listen_ip;
+}
+ListenAddress SubscriberCore::listen_address() const {
+    // go_net() cambia la IP y los dos sockets con link_mu tomado: aquí, los tres de una vez (§10.4).
+    // link_mu nunca se tiene durante la espera de receive_raw(), solo mientras se atiende un datagrama.
+    std::lock_guard lock(s_->link_mu);
+    const std::uint16_t puerto_tcp = s_->tcp ? s_->tcp->listener.local_port() : std::uint16_t{0};
+    return ListenAddress{s_->listen_ip, s_->socket.local_port(), puerto_tcp};
+}
 std::uint64_t SubscriberCore::rejected() const { return s_->rejected.load(); }
 
 const std::string& SubscriberCore::last_from() const { return s_->last_from; }

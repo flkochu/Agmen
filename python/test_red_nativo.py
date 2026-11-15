@@ -8,13 +8,14 @@ C++ → Python y Python → C++. Sin el núcleo nativo, se salta.
 """
 
 import socket
+import threading
 import time
 import unittest
 
 from agmen import _backend, pubsub, wire
 from agmen import hubproto as hp
 
-from test_red import AVISO_CONTROL, BIG, Base, Chico, Grande, raw_sock, receive_all, until
+from test_red import AVISO_CALLADO, AVISO_CONTROL, BIG, Base, Chico, Grande, opened, raw_sock, receive_all, until
 
 
 @unittest.skipUnless(_backend.NATIVE, "sin el núcleo nativo (agmen._core)")
@@ -152,3 +153,80 @@ class TestNativoControlYContadores(Base):
         self.assertTrue(until(lambda: sub.rejected == 1, every=lambda: sub.receive(0.05)))
         sub.close()
         self.assertEqual(sub.listen.split(":")[0], "127.0.0.2")    # tras close(), el último
+
+    def test_listen_coherente_mientras_otro_hilo_pasa_a_la_red(self):
+        """§10.4: `.listen` nunca mezcla la IP de antes con el puerto nuevo (ni al revés), aunque otro hilo
+        esté pasando a la red dentro de receive(). Estrés corto: un Subscriber nuevo por ronda, ~2 s."""
+        h = self.hub("127.0.0.2")
+        h.red("a@127.0.0.3")
+        malos: list = []
+        rondas = 0
+        fin = time.monotonic() + 2.0
+        while time.monotonic() < fin:
+            sub = opened(h, pubsub._NativeSubscriber, Chico, "/l%d" % rondas, net_ip="127.0.0.2")
+            antes = sub.port                        # nadie recibe todavía: sigue en 127.0.0.1
+            parar = threading.Event()
+
+            def recibir(sub=sub, parar=parar):
+                while not parar.is_set():
+                    sub.receive(0.005)
+            t = threading.Thread(target=recibir)
+            t.start()
+            try:
+                tope = time.monotonic() + 3.0
+                while time.monotonic() < tope:
+                    ip, port = sub.listen.rsplit(":", 1)
+                    if (ip == "127.0.0.1") != (int(port) == antes):
+                        malos.append(sub.listen)
+                    if ip == "127.0.0.2":
+                        break
+                else:
+                    self.fail("no pasó a la red en 3 s")
+            finally:
+                parar.set()
+                t.join(2)
+                sub.close()
+            rondas += 1
+        self.assertEqual(malos, [])
+        self.assertGreater(rondas, 1)
+
+
+@unittest.skipUnless(_backend.NATIVE, "sin el núcleo nativo (agmen._core)")
+class TestNativoHubCallado(Base):
+    """§9.2 y §10.2 en el núcleo nativo (su plazo no se puede acortar: tarda NET_EXPIRE_S de verdad)."""
+
+    def test_caduca_cierra_tcp_otro_texto_y_al_volver_acepta(self):
+        h = self.hub("127.0.0.6")
+        h.red("par@127.0.0.4")
+        sub = self.open(h, pubsub._NativeSubscriber, Chico, "/q")
+        subg = self.open(h, pubsub._NativeSubscriber, Grande, "/qg")
+        # En la red, y ya cerrados los sockets de antes: UDP + escucha TCP.
+        self.assertTrue(until(lambda: sub.listen.startswith("0.0.0.0:") and len(subg.filenos()) == 2
+                              and subg.listen.startswith("0.0.0.0:"),
+                              every=lambda: (sub.receive(0.02), subg.receive(0.02))))
+        c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)   # una conexión TCP de la otra computadora
+        self.addCleanup(c.close)
+        c.bind(("127.0.0.4", 0))
+        c.connect(("127.0.0.1", subg.tcp_port))
+        self.assertTrue(until(lambda: len(subg.filenos()) == 3, every=lambda: subg.receive(0.02)))
+        h.callar(True)
+        t0 = time.monotonic()
+        # Caduca: la conexión de fuera se cierra (§9.2).
+        self.assertTrue(until(lambda: len(subg.filenos()) == 2, tope=hp.NET_EXPIRE_S + 3,
+                              every=lambda: (sub.receive(0.05), subg.receive(0.05))))
+        self.assertGreater(time.monotonic() - t0, hp.NET_EXPIRE_S - 1.5)   # no antes de tiempo
+        par = raw_sock(self, "127.0.0.4")
+        dest = ("127.0.0.1", sub.port)
+        for n in (1, 2):
+            par.sendto(wire.encode(Chico(n, 0), n, topic="/q"), dest)
+            self.assertEqual(receive_all(sub, 0.1), [])
+        self.assertEqual(sub.rejected, 2)
+        err = self.err.getvalue()
+        self.assertEqual(err.count(AVISO_CALLADO.format("/q", "127.0.0.4")), 1)   # el mismo texto que Python
+        self.assertNotIn("que no es una computadora de [[machine]]", err)
+        self.assertEqual(err.count("el hub no contesta hace más de 6 s"), 2)        # uno por Subscriber
+        h.callar(False)                             # el hub vuelve
+        got: list = []
+        self.assertTrue(until(lambda: got, every=lambda: (
+            par.sendto(wire.encode(Chico(9, 0), 9, topic="/q"), dest), got.extend(receive_all(sub, 0.05)))))
+        self.assertEqual((got[0].sender.split(":")[0], got[0].message.a), ("127.0.0.4", 9))

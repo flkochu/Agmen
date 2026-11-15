@@ -83,6 +83,13 @@ def foreign_control_text(topic: str, sender: str, hub: str) -> str:
 _default_name = ""
 
 
+def quiet_hub_text(topic: str, ip: str) -> str:
+    """El dato de una computadora de [[machine]] cuando el hub calló (RFC 0011 §10.2). El mismo texto
+    en C++ (src/pubsub.cpp)."""
+    return (f"[agmen] '{topic}': llegó un dato de {ip} (una computadora de [[machine]]), pero mi hub no "
+            f"contesta hace {hp.NET_EXPIRE_S:.0f} s: no lo acepto hasta que vuelva")
+
+
 def set_default_node_name(name: str) -> None:
     """El nombre a usar si no hay AGMEN_NODE (lo llama agmen.Node)."""
     global _default_name
@@ -191,33 +198,13 @@ class _HubLink:
                 pass
 
 
-class _PurePublisher:
-    def __init__(self, msg_type, to: str, topic: str | None = None, *, source_id: int | None = None,
-                 node: str | None = None) -> None:
-        """`to` = topic ("/cmd") o dirección ("127.0.0.1:7500"). Con dirección,
-        `topic` es solo una etiqueta (default "/" + nombre del tipo). `source_id`:
-        el de una grabación (agmen play); si no, uno al azar. `node`: su nombre en
-        el hub (si no, el del proceso)."""
-        _backend.notice_pure_once()
-        self.type = msg_type
-        self.to = to
-        # Antes de cualquier hilo: el hub, la conexión TCP y los bloques de memoria
-        # compartida (su dueño) nacen ya con este source_id.
-        self.source_id = source_id or wire.new_source_id()
-        self.seq = 0
-        self._sock = wire.udp_socket()
-        self._announced_at: float | None = None
-        self._pub_lock = threading.Lock()   # se puede publicar desde varios grupos de un Node
-        self._closed = False                # close(): publish() lanza el error claro, como el nativo
-        # Un tipo arrow (string, bytes, T[], tensor) va por TCP (RFC 0008 D2) o, en la misma
-        # computadora, por memoria compartida (RFC 0009); compact, por UDP.
-        self.arrow = msg_type.LAYOUT.encoding == wire.ENC_ARROW
-        if hp.is_topic(to):
-            hp.check_topic(to)
-        self.topic = to if hp.is_topic(to) else (topic if topic is not None else "/" + msg_type.NAME)
-        self._topic_id = wire.topic_id(self.topic)
-        # Modo red (RFC 0011 §3): los destinos que no son 127.0.0.1 salen por otro socket (_net_sock).
-        self._net_ip = _net_ip() if hp.is_topic(to) else None
+class _NetSend:
+    """El envío UDP de un Publisher (y del RawPublisher del [[mux]]): a esta computadora por el socket
+    atado a 127.0.0.1; a otra computadora (modo red, RFC 0011 §3) por un socket aparte, con el
+    contador `unreachable` y un aviso por destino. Usa self._sock, self.topic y self._lock (el del hub)."""
+
+    def _init_net(self, net_ip: str | None) -> None:
+        self._net_ip = net_ip
         self._net_sock: socket.socket | None = None
         self._net_failed = False                 # el socket de red no se pudo abrir (y hay destinos de fuera)
         self._remote: frozenset | None = None    # destinos de otra computadora; None = todos locales
@@ -225,32 +212,18 @@ class _PurePublisher:
         self._unreach_warned: set = set()
         self._count_lock = threading.Lock()   # los contadores de red: se publica desde varios hilos (§9.8)
         self._rejected = 0                    # control que no vino del hub (RFC 0011 §9.1)
-        self._local_ips = (hp.LOCALHOST, self._net_ip) if self._net_ip else (hp.LOCALHOST,)   # §9.5
-        self._tcp = (_tcp.Fanout(self.topic, self.source_id, self._topic_id, net=hp.is_topic(to),
-                                 net_ip=self._net_ip) if self.arrow else None)
-        if hp.is_topic(to):
-            self.dests: list[tuple[str, int]] = []
-            self._sock.bind(("127.0.0.1", 0))   # local (nivel 2): Windows no pregunta por el firewall
-            self._sock.setblocking(False)
-            self._lock = threading.Lock()
-            self._link = None
-            self._link = _HubLink(self._sock, dict(
-                op="pub", id=f"{self.source_id:016x}", node=node or node_name(), pid=os.getpid(), topic=to,
-                schema=f"{msg_type.SCHEMA_ID:016x}", type=msg_type.NAME, text=msg_type.SCHEMA_TEXT),
-                on_tick=self._drain_locked)
-            # Espera breve a la primera respuesta del hub: si ya hay receptores,
-            # el primer mensaje no se pierde por no saber a quién mandarlo.
-            end = time.monotonic() + 0.1
-            while self._link.last_reply is None and time.monotonic() < end:
-                time.sleep(0.005)
-                self._drain()
-        else:
-            self.dests = [_addr(to)]
-            self._link = None
-            if self._tcp is not None:
-                self._tcp.update(self.dests, self._announcement())
+        self._local_ips = (hp.LOCALHOST, net_ip) if net_ip else (hp.LOCALHOST,)   # §9.5
 
-    # --- envío ---
+    def _route(self, new: list) -> None:
+        """Los destinos nuevos que dio el hub (con self._lock): abre o cierra el socket de red."""
+        local = self._local_ips   # AGMEN_NET_IP también es esta computadora (§9.5)
+        remote = frozenset(d for d in new if d[0] not in local)
+        if remote:
+            self._open_net_sock()
+        elif self._net_sock is not None:
+            self._close_net_sock()
+        self._remote = remote or None
+
     def _send(self, data: bytes, dest) -> bool:
         try:
             self._sock.sendto(data, dest)
@@ -312,6 +285,59 @@ class _PurePublisher:
         if s is not None:
             s.close()
 
+
+
+class _PurePublisher(_NetSend):
+    def __init__(self, msg_type, to: str, topic: str | None = None, *, source_id: int | None = None,
+                 node: str | None = None) -> None:
+        """`to` = topic ("/cmd") o dirección ("127.0.0.1:7500"). Con dirección,
+        `topic` es solo una etiqueta (default "/" + nombre del tipo). `source_id`:
+        el de una grabación (agmen play); si no, uno al azar. `node`: su nombre en
+        el hub (si no, el del proceso)."""
+        _backend.notice_pure_once()
+        self.type = msg_type
+        self.to = to
+        # Antes de cualquier hilo: el hub, la conexión TCP y los bloques de memoria
+        # compartida (su dueño) nacen ya con este source_id.
+        self.source_id = source_id or wire.new_source_id()
+        self.seq = 0
+        self._sock = wire.udp_socket()
+        self._announced_at: float | None = None
+        self._pub_lock = threading.Lock()   # se puede publicar desde varios grupos de un Node
+        self._closed = False                # close(): publish() lanza el error claro, como el nativo
+        # Un tipo arrow (string, bytes, T[], tensor) va por TCP (RFC 0008 D2) o, en la misma
+        # computadora, por memoria compartida (RFC 0009); compact, por UDP.
+        self.arrow = msg_type.LAYOUT.encoding == wire.ENC_ARROW
+        if hp.is_topic(to):
+            hp.check_topic(to)
+        self.topic = to if hp.is_topic(to) else (topic if topic is not None else "/" + msg_type.NAME)
+        self._topic_id = wire.topic_id(self.topic)
+        # Modo red (RFC 0011 §3): los destinos que no son 127.0.0.1 salen por otro socket (_net_sock).
+        self._init_net(_net_ip() if hp.is_topic(to) else None)
+        self._tcp = (_tcp.Fanout(self.topic, self.source_id, self._topic_id, net=hp.is_topic(to),
+                                 net_ip=self._net_ip) if self.arrow else None)
+        if hp.is_topic(to):
+            self.dests: list[tuple[str, int]] = []
+            self._sock.bind(("127.0.0.1", 0))   # local (nivel 2): Windows no pregunta por el firewall
+            self._sock.setblocking(False)
+            self._lock = threading.Lock()
+            self._link = None
+            self._link = _HubLink(self._sock, dict(
+                op="pub", id=f"{self.source_id:016x}", node=node or node_name(), pid=os.getpid(), topic=to,
+                schema=f"{msg_type.SCHEMA_ID:016x}", type=msg_type.NAME, text=msg_type.SCHEMA_TEXT),
+                on_tick=self._drain_locked)
+            # Espera breve a la primera respuesta del hub: si ya hay receptores,
+            # el primer mensaje no se pierde por no saber a quién mandarlo.
+            end = time.monotonic() + 0.1
+            while self._link.last_reply is None and time.monotonic() < end:
+                time.sleep(0.005)
+                self._drain()
+        else:
+            self.dests = [_addr(to)]
+            self._link = None
+            if self._tcp is not None:
+                self._tcp.update(self.dests, self._announcement())
+
     def _announcement(self) -> bytes:
         return wire.encode_announcement(self.type.SCHEMA_TEXT, self.topic, source_id=self.source_id, seq=self.seq)
 
@@ -364,13 +390,7 @@ class _PurePublisher:
                         self._tcp.update(new, self._announcement())
                     else:
                         new = [_addr(a) for a in f.get("to", "").split(",") if a]
-                        local = self._local_ips   # AGMEN_NET_IP también es esta computadora (§9.5)
-                        remote = frozenset(d for d in new if d[0] not in local)
-                        if remote:
-                            self._open_net_sock()
-                        elif self._net_sock is not None:
-                            self._close_net_sock()
-                        self._remote = remote or None
+                        self._route(new)
                         ann = self._announcement()
                         for d in new:
                             if d not in self.dests:   # recién llegado: que sepa el esquema desde ya
@@ -518,6 +538,8 @@ class _Receiver:
         self._rejected_ips: set = set()
         self._last_ok = 0.0                     # cuándo llegó el último `ok` del hub (modo red, §9.2)
         self._expired = False                   # ya se volvió a solo lo local por falta de `ok` (avisado)
+        self._quiet_peers: frozenset = frozenset()   # los peers de cuando el hub calló (§10.2)
+        self._quiet_warned: set = set()
         self._sock = wire.udp_socket()
         self.announced: dict[int, tuple[str, str]] = {}   # schema_id → (topic, esquema)
         self._link = None
@@ -617,11 +639,17 @@ class _Receiver:
                 if got is _OTRA_VEZ:
                     continue
                 return got
-            if self._tcp is not None and self._tcp.ready:
-                return self._tcp.ready.pop(0)
             now = time.monotonic()
+            # La caducidad, ANTES de entregar lo ya leído de TCP (RFC 0011 §10.3).
             if self._allowed is not None and now - self._last_ok > hp.NET_EXPIRE_S:
                 self._expire()
+            if self._tcp is not None and self._tcp.ready:
+                got = self._tcp.ready.pop(0)
+                allowed = self._allowed
+                if allowed is not None and got[1].rsplit(":", 1)[0] not in allowed:
+                    self._reject(got[1].rsplit(":", 1)[0])   # leído antes de que su IP dejara de valer
+                    continue
+                return got
             if self._old_until is not None and now >= self._old_until:
                 self._retire_old()
                 continue
@@ -691,6 +719,8 @@ class _Receiver:
         """Un `ok` del hub: con `peers`, el hub está en modo red."""
         peers = f.get("peers")
         self._last_ok = time.monotonic()
+        self._quiet_peers = frozenset()   # el hub contesta: lo de §10.2 ya no aplica
+        self._quiet_warned.clear()
         if peers:
             self._expired = False
         if peers is not None and not self._net:
@@ -738,6 +768,7 @@ class _Receiver:
         local = frozenset((hp.LOCALHOST, self._net_ip) if self._net_ip else (hp.LOCALHOST,))
         if self._allowed == local:
             return
+        self._quiet_peers = self._allowed - local   # sus datos se descartan con otro texto (§10.2)
         self._set_allowed([])
         if not self._expired:
             self._expired = True
@@ -747,6 +778,11 @@ class _Receiver:
 
     def _reject(self, ip: str) -> None:
         self._rejected += 1
+        if ip in self._quiet_peers:   # SÍ es de [[machine]], pero el hub calló (RFC 0011 §10.2)
+            if ip not in self._quiet_warned and len(self._quiet_warned) < _MAX_WARNED:
+                self._quiet_warned.add(ip)
+                print(quiet_hub_text(self.topic, ip), file=sys.stderr, flush=True)
+            return
         # Una vez por IP; con un tope, para que una avalancha de IP distintas no llene la salida.
         if ip not in self._rejected_ips and len(self._rejected_ips) < _MAX_WARNED:
             self._rejected_ips.add(ip)
@@ -948,14 +984,16 @@ class RawSubscriber(_Receiver):
         return None if got is None else got[:2]
 
 
-class RawPublisher:
+class RawPublisher(_NetSend):
     """Reenvía paquetes ya armados a un topic (para el mux). Se registra con el
-    hub cuando conoce el esquema (por el primer anuncio que reenvía)."""
+    hub cuando conoce el esquema (por el primer anuncio que reenvía). En modo red
+    manda a otra computadora como un Publisher (RFC 0011 §10.1)."""
 
     def __init__(self, topic: str) -> None:
         hp.check_topic(topic)
         self.topic = topic
         self.topic_id = wire.topic_id(topic)
+        self._init_net(_net_ip())   # antes de abrir nada: si AGMEN_NET_IP no sirve, error claro
         self.source_id = wire.new_source_id()
         self._sock = wire.udp_socket()
         self._sock.bind(("127.0.0.1", 0))
@@ -965,10 +1003,12 @@ class RawPublisher:
         self._link: _HubLink | None = None
         self._announced_at: float | None = None
         self._lock = threading.Lock()
+        self._closed = False
 
     def _drain_locked(self) -> None:
         with self._lock:
-            self._drain()
+            if not self._closed:
+                self._drain()
 
     def set_schema(self, text: str, name: str, schema_id: int) -> None:
         if self._link is not None:
@@ -991,6 +1031,8 @@ class RawPublisher:
             if not hp.is_control(data):
                 continue
             if not self._link.from_hub(sender):   # RFC 0011 §9.1: solo el hub dice a quién mandar
+                with self._count_lock:
+                    self._rejected += 1
                 self._link.foreign(self.topic, sender)
                 continue
             try:
@@ -999,9 +1041,10 @@ class RawPublisher:
                         self._link.got_reply()
                         if op == "subs":
                             new = [_addr(a) for a in f.get("to", "").split(",") if a]
+                            self._route(new)
                             for d in new:
                                 if d not in self.dests and self.schema_text:
-                                    self._sendto(self._announcement(), d)
+                                    self._send_any(self._announcement(), d)   # por el mismo camino que sus datos
                             self.dests = new
                         elif op == "error":
                             self._link.error = f.get("msg")
@@ -1011,33 +1054,47 @@ class RawPublisher:
     def _announcement(self) -> bytes:
         return wire.encode_announcement(self.schema_text, self.topic, source_id=self.source_id)
 
-    def _sendto(self, data: bytes, d) -> None:
-        try:
-            self._sock.sendto(data, d)
-        except OSError:
-            pass
-
-    def send(self, packet: bytes | bytearray) -> None:
-        """Manda un paquete de datos ya armado (topic_id y source_id se reescriben aquí)."""
+    def send(self, packet: bytes | bytearray) -> bool:
+        """Manda un paquete de datos ya armado (topic_id y source_id se reescriben aquí). Devuelve False
+        si no se pudo entregar a nadie (lo que no salió hacia otra computadora se cuenta en unreachable)."""
         with self._lock:
             self._drain()
             dests = list(self.dests)
+            remote = self._remote
         now = time.monotonic()
         if self.schema_text and (self._announced_at is None or now - self._announced_at >= ANNOUNCE_EVERY_S):
             ann = self._announcement()
             for d in dests:
-                self._sendto(ann, d)
+                if remote is not None and d in remote:
+                    self._send_net(ann, d)
+                else:
+                    self._send(ann, d)
             self._announced_at = now
         out = bytearray(packet)
         out[16:24] = self.topic_id.to_bytes(8, "little")
         out[wire.SOURCE_OFFSET:wire.SOURCE_OFFSET + 8] = self.source_id.to_bytes(8, "little")
+        ok = False
         for d in dests:
-            self._sendto(out, d)
+            ok = (self._send_net(out, d) if remote is not None and d in remote else self._send(out, d)) or ok
+        return ok
+
+    @property
+    def unreachable(self) -> int:
+        """Mensajes que no salieron hacia un destino de otra computadora (RFC 0011 §3, §10.1)."""
+        return self._unreachable
+
+    @property
+    def rejected(self) -> int:
+        """Mensajes de control descartados por no venir del hub (RFC 0011 §9.1, §10.1)."""
+        return self._rejected
 
     def close(self) -> None:
         if self._link is not None:
             self._link.close()
-        self._sock.close()
+        with self._lock:   # un _drain() en curso (de send() o del latido) termina antes
+            self._closed = True
+            self._sock.close()
+            self._close_net_sock()
 
 
 # ---------------------------------------------------------------------------
@@ -1264,11 +1321,17 @@ class _NativeSubscriber:
     @property
     def listen(self) -> str:
         """"ip:puerto" donde escucha; al día tras pasar a la red (RFC 0011 §2). Tras close(), el último."""
-        if self.topic and not self._core.closed:
+        # Con self._lock (el de close()): el núcleo no se suelta mientras se lee. La IP y el puerto
+        # salen juntos del núcleo, sin carrera con el paso a la red (RFC 0011 §10.4).
+        if self.topic and self._lock.acquire(timeout=_LOCK_AL_CERRAR_S):
             try:
-                self._listen = f"{self._core.listen_ip}:{self._core.port}"
+                if not self._core.closed:
+                    ip, port, _ = self._core.listen_address()
+                    self._listen = f"{ip}:{port}"
             except RuntimeError:
-                pass   # se cerró en este momento
+                pass   # se cerró (o se está cerrando el núcleo) en este momento
+            finally:
+                self._lock.release()
         return self._listen
 
     @property

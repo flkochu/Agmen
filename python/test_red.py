@@ -9,8 +9,10 @@ dos núcleos. Nada espera un tiempo fijo: se espera cada condición, con tope.
 """
 
 import contextlib
+import errno
 import io
 import os
+import select
 import socket
 import sys
 import threading
@@ -128,6 +130,18 @@ class Hub:
             fields["tcp"] = tcp
         self.keep(hp.encode("sub", **fields))
         assert until(lambda: eid in self.hub.endpoints), self.logs
+
+    def callar(self, callado: bool):
+        """El hub deja de contestar (sigue vivo y vuelve a contestar con callar(False)): lo que le
+        llega mientras tanto se pierde, como si se hubiera caído la red."""
+        if not hasattr(self, "_callado"):
+            self._callado = threading.Event()
+            real = self.hub.handle
+            self.hub.handle = lambda *a: None if self._callado.is_set() else real(*a)
+        if callado:
+            self._callado.set()
+        else:
+            self._callado.clear()
 
     def ep(self, eid):
         with self.hub.lock:
@@ -349,6 +363,35 @@ class TestDosComputadoras(Base):
         self.assertNotIn("memoria compartida", self.err.getvalue())
         self.assertEqual(self.sub.rejected + self.subg.rejected, 0)
 
+    def test_callado_no_entrega_lo_ya_leido_de_tcp(self):
+        """§10.3: pasado el plazo no se entrega nada de fuera, ni lo que ya estaba leído de una conexión TCP;
+        la conexión de fuera se cierra (§9.2). Cuando el hub vuelve, cruza otra vez."""
+        _, pubg = self.pubs()
+        gotg: list = []
+        self.assertTrue(until(lambda: gotg, every=lambda: (
+            pubg.publish(Grande(1, b"a")), gotg.extend(receive_all(self.subg, 0.02)))))
+        self.assertTrue(any(c.sender.startswith("127.0.0.3:") for c in self.subg._tcp.conns.values()))
+        self.hb.callar(True)
+        receive_all(self.subg, 0.1)                 # lo que venía en camino (un `ok`, quizá)
+        for k in range(2, 7):
+            pubg.publish(Grande(k, b"b"))
+
+        def leer():   # lo que hace receive() antes de entregar: leer de TCP y dejarlo en espera
+            r, _, _ = select.select(self.subg._tcp.filenos(), [], [], 0.05)
+            self.subg._tcp.service(r)
+        self.assertTrue(until(lambda: len(self.subg._tcp.ready) >= 5, every=leer))
+        listos = len(self.subg._tcp.ready)
+        self.subg._last_ok -= hp.NET_EXPIRE_S + 1   # caducó, sin esperar 6 s
+        self.assertEqual(receive_all(self.subg, 0.1), [])
+        self.assertEqual(self.subg._tcp.conns, {})   # la conexión de la otra computadora se cerró
+        self.assertEqual(self.subg.rejected, listos)
+        err = self.err.getvalue()
+        self.assertEqual(err.count(AVISO_CALLADO.format("/xg", "127.0.0.3")), 1)
+        self.assertNotIn("127.0.0.3, que no es una computadora de [[machine]]", err)
+        self.hb.callar(False)                       # el hub vuelve: se acepta otra vez (y se reconecta)
+        self.assertTrue(until(lambda: any(s.message.w == 99 for s in gotg), every=lambda: (
+            pubg.publish(Grande(99, b"c")), gotg.extend(receive_all(self.subg, 0.02)))))
+
     def test_un_destino_inalcanzable_no_frena_a_los_demas(self):
         self.ha.remote_sub("r3", Chico, "/x", "lejos", "192.0.2.1", 7600)
         self.ha.remote_sub("r4", Grande, "/xg", "lejos", "192.0.2.1", 7600, tcp=7601)
@@ -396,6 +439,21 @@ def raw_sock(case, ip):
 
 
 AVISO_CONTROL = "llegó un mensaje de control de {}, que no es el hub"
+# §10.2: el dato de un peer mientras el hub calla (el mismo texto en los dos núcleos).
+AVISO_CALLADO = ("[agmen] '{}': llegó un dato de {} (una computadora de [[machine]]), pero mi hub no contesta "
+                 "hace 6 s: no lo acepto hasta que vuelva")
+
+
+def raw_publisher(case, hub, topic, net_ip=None):
+    """Un RawPublisher (el del [[mux]]) de la "computadora" de `hub`, ya registrado con el esquema de Chico."""
+    p = env(AGMEN_HUB=hub.addr, AGMEN_NET_IP=net_ip)
+    try:
+        raw = pubsub.RawPublisher(topic)
+        raw.set_schema(Chico.SCHEMA_TEXT, Chico.NAME, Chico.SCHEMA_ID)
+    finally:
+        p.stop()
+    case.addCleanup(raw.close)
+    return raw
 
 
 class TestControlSoloDelHub(Base):
@@ -453,6 +511,26 @@ class TestControlSoloDelHub(Base):
         quien = "127.0.0.1:%d" % falso.getsockname()[1]
         self.assertEqual(self.err.getvalue().count(AVISO_CONTROL.format(quien)), 1)
 
+    def test_subs_falso_no_cambia_destinos_del_raw_publisher(self):
+        """§10.1: el RawPublisher del [[mux]] también cuenta el control ajeno en `rejected`."""
+        h = self.hub()
+        raw = raw_publisher(self, h, "/c")
+        self.assertTrue(until(lambda: raw._link.id in h.hub.endpoints))
+        sink = raw_sock(self, "127.0.0.9")
+        sink.settimeout(0.3)
+        falso = raw_sock(self, "127.0.0.1")
+        for _ in range(2):
+            falso.sendto(hp.encode("subs", id=raw._link.id, topic="/c", to="127.0.0.9:%d" % sink.getsockname()[1]),
+                         raw._sock.getsockname())
+        time.sleep(0.05)
+        self.assertFalse(raw.send(wire.encode(Chico(1, 1), 1, topic="/c")))
+        self.assertEqual((raw.dests, raw._remote, raw._net_sock), ([], None, None))
+        with self.assertRaises(socket.timeout):
+            sink.recvfrom(65536)
+        self.assertEqual(raw.rejected, 2)
+        quien = "127.0.0.1:%d" % falso.getsockname()[1]
+        self.assertEqual(self.err.getvalue().count(AVISO_CONTROL.format(quien)), 1)
+
     def test_hub_por_nombre(self):
         """AGMEN_HUB con un nombre (localhost): se compara con la dirección resuelta, y todo sigue andando."""
         h = self.hub()
@@ -492,6 +570,34 @@ class TestHubCallado(Base):
         self.assertEqual(sub._allowed, frozenset({"127.0.0.1"}))
         self.assertEqual(sub.rejected, 2)
         self.assertEqual(self.err.getvalue().count("el hub no contesta hace más de"), 1)
+
+    def test_callado_otro_texto_y_al_volver_acepta_a_los_peers(self):
+        """§10.2: con el hub callado, el dato de un peer se descarta con otro texto (sin gastar el aviso de
+        "no es de [[machine]]" de esa IP); cuando el hub vuelve (un `ok` con peers), se acepta otra vez."""
+        h = self.hub("127.0.0.6")
+        h.red("par@127.0.0.4")
+        sub = self.open(h, pubsub._PureSubscriber, Chico, "/q")
+        self.assertTrue(until(lambda: sub._allowed and "127.0.0.4" in sub._allowed, every=lambda: sub.receive(0.02)))
+        par = raw_sock(self, "127.0.0.4")
+        dest = ("127.0.0.1", sub.port)
+        h.callar(True)
+        receive_all(sub, 0.1)                       # lo que venía en camino (un `ok`, quizá)
+        sub._last_ok -= hp.NET_EXPIRE_S + 1         # caducó, sin esperar 6 s
+        for n in (1, 2):
+            par.sendto(wire.encode(Chico(n, 0), n, topic="/q"), dest)
+            self.assertEqual(receive_all(sub, 0.1), [])
+        self.assertEqual(sub._allowed, frozenset({"127.0.0.1"}))
+        self.assertEqual(sub.rejected, 2)
+        err = self.err.getvalue()
+        self.assertEqual(err.count(AVISO_CALLADO.format("/q", "127.0.0.4")), 1)   # una vez por IP
+        self.assertNotIn("127.0.0.4, que no es una computadora de [[machine]]", err)
+        h.callar(False)                             # el hub vuelve
+        got: list = []
+        self.assertTrue(until(lambda: got, every=lambda: (
+            par.sendto(wire.encode(Chico(9, 0), 9, topic="/q"), dest), got.extend(receive_all(sub, 0.05)))))
+        self.assertEqual((got[0].sender.split(":")[0], got[0].message.a), ("127.0.0.4", 9))
+        self.assertIn("127.0.0.4", sub._allowed)
+        self.assertNotIn("que no es una computadora de [[machine]]", self.err.getvalue())
 
     def test_modo_red_del_hub_caduca_de_punta_a_punta(self):
         """Nadie repite `red`: el hub de verdad vuelve a modo local (NET_EXPIRE_S) y el Subscriber, con él."""
@@ -540,6 +646,69 @@ class TestPublisherRed(Base):
         self.assertEqual((net.fileno(), pub._remote), (-1, None))
         self.assertEqual(pub.unreachable, 0)
         self.assertNotIn("no pude mandar", self.err.getvalue())
+
+    def test_vuelve_a_abrir_el_socket_de_red(self):
+        """Tras cerrar su socket de red (§9.3), el Publisher lo vuelve a abrir cuando vuelven los destinos de
+        fuera, y sigue mandando."""
+        pub = self.a_remoto()
+        net = pub._net_sock
+        with self.ha.lock:
+            self.ha.lines = []
+        self.ha.red("")
+        self.assertTrue(until(lambda: pub._net_sock is None, every=lambda: (pub.publish(Chico(2, 2)), time.sleep(0.02))))
+        self.assertEqual(net.fileno(), -1)
+        self.ha.red("b@127.0.0.2")
+        self.ha.remote_sub("r1", Chico, "/x", "b", "127.0.0.2", self.sub.port)
+        got: list = []
+        self.assertTrue(until(lambda: got, every=lambda: (
+            pub.publish(Chico(3, 3)), got.extend(s for s in receive_all(self.sub, 0.02) if s.message.a == 3))))
+        self.assertIsNot(pub._net_sock, net)
+        self.assertEqual(pub._net_sock.getsockname()[0], "127.0.0.3")
+        self.assertEqual(got[0].sender.split(":")[0], "127.0.0.3")
+        self.assertEqual(pub.unreachable, 0)
+
+    def raw_a_remoto(self):
+        self.ha.red("b@127.0.0.2")
+        self.ha.remote_sub("r1", Chico, "/x", "b", "127.0.0.2", self.sub.port)
+        raw = raw_publisher(self, self.ha, "/x", net_ip="127.0.0.3")
+        got: list = []
+        self.assertTrue(until(lambda: got, every=lambda: (
+            raw.send(wire.encode(Chico(4, 4), 0, topic="/mux")), got.extend(receive_all(self.sub, 0.02)))))
+        return raw, got
+
+    def test_raw_publisher_manda_a_otra_computadora(self):
+        """§10.1: el RawPublisher del [[mux]] manda a otra computadora por su socket de red."""
+        raw, got = self.raw_a_remoto()
+        self.assertEqual(got[0].message, Chico(4, 4))
+        self.assertEqual(got[0].sender.split(":")[0], "127.0.0.3")        # salió desde AGMEN_NET_IP
+        self.assertEqual(raw._net_sock.getsockname()[0], "127.0.0.3")
+        self.assertEqual(raw._sock.getsockname()[0], "127.0.0.1")         # el de siempre, para el hub
+        self.assertEqual((raw.unreachable, raw.rejected), (0, 0))
+
+    def test_raw_publisher_cuenta_y_avisa_lo_que_no_sale(self):
+        """§10.1: un envío del RawPublisher a otra computadora que falla no se traga: se cuenta en
+        `unreachable` y se avisa una vez por destino."""
+        raw, _ = self.raw_a_remoto()
+
+        class Caida:
+            def sendto(self, *_):
+                raise OSError(errno.EHOSTUNREACH, "No route to host")
+
+            def fileno(self):
+                return 99
+
+            def close(self):
+                pass
+        real = raw._net_sock
+        raw._net_sock = Caida()
+        try:
+            for _ in range(3):
+                self.assertFalse(raw.send(wire.encode(Chico(5, 5), 0, topic="/mux")))
+        finally:
+            raw._net_sock = real
+        self.assertGreaterEqual(raw.unreachable, 3)                       # (y el anuncio, si tocaba)
+        aviso = "no pude mandar a la computadora 127.0.0.2 (127.0.0.2:%d)" % self.sub.port
+        self.assertEqual(self.err.getvalue().count(aviso), 1)
 
     def test_bufer_lleno_no_es_inalcanzable(self):
         """§9.4: EAGAIN al mandar a otra computadora: no salió, pero ni se cuenta ni se avisa (como C++)."""

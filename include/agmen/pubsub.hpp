@@ -114,6 +114,9 @@ public:
     /// Mensajes de control descartados por no venir del hub (RFC 0011 §9.1). Siempre 0 si nadie se
     /// hace pasar por el hub.
     [[nodiscard]] std::uint64_t rejected() const;
+    /// El puerto local del socket para mandar a otra computadora (RFC 0011 §3); 0 si no está abierto
+    /// (no hay destinos de fuera, §9.3). Como subscribers(): desde el hilo que publica.
+    [[nodiscard]] std::uint16_t net_port() const;
 
 private:
     struct State;
@@ -155,6 +158,13 @@ struct RawSample {
     std::string from;   ///< "ip:puerto"
 };
 
+/// Dónde escucha un Subscriber: la IP y los dos puertos, leídos juntos (RFC 0011 §10.4).
+struct ListenAddress {
+    std::string ip;              ///< 127.0.0.1 por topic; en modo red, 0.0.0.0 o AGMEN_NET_IP
+    std::uint16_t port = 0;      ///< UDP
+    std::uint16_t tcp_port = 0;  ///< TCP (0 si el tipo no usa arrow)
+};
+
 /// Recibe mensajes de un tipo, sin decodificar el payload. Valida el sobre, el
 /// tipo y el tamaño; procesa los anuncios y el control del hub. heartbeat() se
 /// puede llamar desde otro hilo mientras uno espera en receive_raw().
@@ -190,6 +200,9 @@ public:
     [[nodiscard]] std::uint16_t tcp_port() const;
     /// La IP donde escucha: 127.0.0.1 por topic; en modo red (RFC 0011 §2), 0.0.0.0 o AGMEN_NET_IP.
     [[nodiscard]] std::string listen_ip() const;
+    /// La IP y los dos puertos a la vez, sin carrera con el paso a la red (se puede llamar desde otro
+    /// hilo mientras uno espera en receive_raw()).
+    [[nodiscard]] ListenAddress listen_address() const;
     /// Datos (datagramas o conexiones TCP) descartados por venir de una IP que no es de esta
     /// computadora ni de [[machine]] (RFC 0011 §2), y mensajes de control que no vinieron del hub (§9.1).
     [[nodiscard]] std::uint64_t rejected() const;
@@ -258,6 +271,8 @@ public:
     [[nodiscard]] std::uint64_t unreachable() const { return core_.unreachable(); }
     /// Mensajes de control descartados por no venir del hub (RFC 0011 §9.1; se avisa una vez por remitente).
     [[nodiscard]] std::uint64_t rejected() const { return core_.rejected(); }
+    /// El puerto del socket para mandar a otra computadora; 0 si no está abierto (RFC 0011 §3, §9.3).
+    [[nodiscard]] std::uint16_t net_port() const { return core_.net_port(); }
 
 private:
     PublisherCore core_;

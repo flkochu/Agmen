@@ -691,6 +691,12 @@ void test_control_que_no_es_del_hub() {
     CHECK(logs.count(aviso_control(peer, "127.0.0.4")) == 1);
 }
 
+/// El aviso de §10.2: el dato de un peer mientras el hub calla (el mismo texto que Python).
+std::string aviso_callado(const std::string& topic, const std::string& ip) {
+    return "[agmen] '" + topic + "': llegó un dato de " + ip +
+           " (una computadora de [[machine]]), pero mi hub no contesta hace 6 s: no lo acepto hasta que vuelva";
+}
+
 /// RFC 0011 §9.2: sin ningún `ok` del hub en kNetExpire (6 s), solo lo local; se dice una vez.
 void test_hub_callado() {
     Logs logs;
@@ -714,9 +720,67 @@ void test_hub_callado() {
     CHECK(got.empty());
     CHECK(sub->rejected() == 2);
     CHECK(logs.count("el hub no contesta hace más de 6 s") == 1);
+    // §10.2: 127.0.0.4 SÍ es de [[machine]]: otro texto, y no se gasta el aviso de "no es de [[machine]]".
+    CHECK(logs.count(aviso_callado("/s", "127.0.0.4")) == 1);
+    CHECK(logs.count("que no es una computadora de [[machine]]") == 0);
 }
 
-/// RFC 0011 §9.3: sin destinos de otra computadora, el Publisher cierra su socket de red.
+/// RFC 0011 §10.3 (y §9.2, §10.2): con el hub callado, pasado el plazo no se entrega nada de fuera, ni lo
+/// que ya estaba leído de una conexión TCP; la conexión de fuera se cierra. Cuando el hub vuelve (un `ok`
+/// con peers), se acepta otra vez.
+void test_hub_callado_tcp_y_vuelve() {
+    Logs logs;
+    DosComputadoras d;
+    auto pub = opened<agmen::Publisher<Chico>>(d.ha, "/x", "127.0.0.3");
+    auto pubg = opened<agmen::Publisher<Grande>>(d.ha, "/xg", "127.0.0.3");
+    std::vector<agmen::Sample<Chico>> got;
+    std::vector<agmen::Sample<Grande>> gotg;
+    const std::vector<std::uint8_t> poco{1, 2, 3};
+    // Cruza, y ya cerrados los sockets de antes: UDP + escucha TCP + la conexión de "a".
+    CHECK(until([&] { return !got.empty() && !gotg.empty() && d.subg->native_handles().size() == 3; }, [&] {
+        (void)pub->publish(Chico{1, 1});
+        (void)pubg->publish(Grande{1, poco});
+        receive_all(*d.sub, got);
+        receive_all(*d.subg, gotg);
+    }));
+    d.hb.set_silent(true);
+    const auto callado = std::chrono::steady_clock::now();
+    receive_all(*d.sub, got, 100ms);   // lo que venía en camino
+    receive_all(*d.subg, gotg, 100ms);
+    for (std::uint32_t k = 2; k <= 6; ++k) (void)pubg->publish(Grande{k, poco});
+    std::this_thread::sleep_for(200ms);   // que lleguen todos al socket
+    // Antes del plazo: receive() lee todo lo de la conexión, entrega uno y deja el resto en espera.
+    const auto primero = d.subg->receive(500ms);
+    CHECK(primero && primero->message.w == 2);
+    std::this_thread::sleep_for(hub::kNetExpire + 300ms - (std::chrono::steady_clock::now() - callado));
+    std::vector<agmen::Sample<Grande>> tarde;
+    receive_all(*d.subg, tarde, 100ms);
+    CHECK(tarde.empty());                               // §10.3: ni lo ya leído
+    CHECK(d.subg->rejected() >= 4);
+    CHECK(d.subg->native_handles().size() == 2);        // la conexión de fuera se cerró (§9.2)
+    std::vector<agmen::Sample<Chico>> tarde_chico;
+    (void)pub->publish(Chico{7, 7});
+    receive_all(*d.sub, tarde_chico, 100ms);
+    CHECK(tarde_chico.empty());
+    CHECK(logs.count(aviso_callado("/x", "127.0.0.3")) == 1);
+    CHECK(logs.count(aviso_callado("/xg", "127.0.0.3")) == 1);
+    CHECK(logs.count("que no es una computadora de [[machine]]") == 0);
+    // El hub vuelve: se acepta otra vez a "a", por UDP y por TCP.
+    d.hb.set_silent(false);
+    got.clear();
+    gotg.clear();
+    CHECK(until([&] { return !got.empty() && !gotg.empty(); }, [&] {
+        (void)pub->publish(Chico{8, 8});
+        (void)pubg->publish(Grande{99, poco});
+        receive_all(*d.sub, got);
+        receive_all(*d.subg, gotg);
+    }));
+    CHECK(!got.empty() && ip_of(got[0].from) == "127.0.0.3");
+    CHECK(!gotg.empty() && ip_of(gotg[0].from) == "127.0.0.3");
+}
+
+/// RFC 0011 §9.3: sin destinos de otra computadora, el Publisher cierra su socket de red; cuando
+/// vuelven, lo abre otra vez y sigue mandando.
 void test_cierra_el_socket_de_red() {
     Logs logs;
     DosComputadoras d;
@@ -728,13 +792,28 @@ void test_cierra_el_socket_de_red() {
     }));
     const std::string net_from = got.empty() ? std::string("127.0.0.3:1") : got[0].from;
     CHECK(ip_of(net_from) == "127.0.0.3");
-    CHECK(!udp_free(net_from));   // abierto mientras hay a quién mandarle
+    // Abierto mientras hay a quién mandarle. Se mira el socket del Publisher, no si el puerto está libre
+    // (otro programa podría tomarlo en cuanto se suelta).
+    CHECK(std::to_string(pub->net_port()) == net_from.substr(net_from.rfind(':') + 1));
     d.ha.clear_remote("/x");
-    CHECK(until([&] { return udp_free(net_from); }, [&] {
+    CHECK(until([&] { return pub->net_port() == 0; }, [&] {
         (void)pub->publish(Chico{2, 2});
         std::this_thread::sleep_for(20ms);
     }));
     CHECK(pub->subscribers() == 0);
+    CHECK(pub->unreachable() == 0);
+    // Vuelve el destino de fuera: abre otro socket de red y sigue mandando.
+    d.ha.add_remote("/x", "127.0.0.2:" + std::to_string(d.sub->local_port()));
+    receive_all(*d.sub, got, 50ms);   // los de antes de cerrarse
+    got.clear();
+    CHECK(until([&] { return !got.empty(); }, [&] {
+        (void)pub->publish(Chico{3, 3});
+        receive_all(*d.sub, got);
+        std::erase_if(got, [](const auto& s) { return s.message.a != 3; });
+    }));
+    CHECK(pub->net_port() != 0);
+    CHECK(!got.empty() && ip_of(got[0].from) == "127.0.0.3" &&
+          got[0].from.substr(got[0].from.rfind(':') + 1) == std::to_string(pub->net_port()));
     CHECK(pub->unreachable() == 0);
 }
 
@@ -811,6 +890,7 @@ int main() {
     test_agmen_net_ip_que_no_sirve();
     test_control_que_no_es_del_hub();
     test_hub_callado();
+    test_hub_callado_tcp_y_vuelve();
     test_cierra_el_socket_de_red();
     test_agmen_net_ip_es_local();
     if (g_failures == 0) std::printf("test_red: todo bien\n");
