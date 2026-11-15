@@ -216,5 +216,8 @@ def parse_peers(text: str) -> list[tuple[str, str]]:
     return out
 
 
+# DECISIÓN PENDIENTE: '@' no está entre los bytes que van sin escapar (_SAFE), así que en la red
+# `peers` va como "robot%40192.168.1.20" (se lee igual con '@' sin escapar). Añadir '@' a _SAFE
+# cambiaría los bytes de cualquier valor de hoy que lo lleve; no se tocó.
 def format_peers(peers: list[tuple[str, str]]) -> str:
     return ",".join(f"{name}@{ip}" for name, ip in peers)
