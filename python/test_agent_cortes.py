@@ -1219,6 +1219,489 @@ class TestMemoriaAcotadaDeRun(CortesBase):
 
 
 # ===========================================================================
+# 4. Segunda tanda (especificacion_3c.md §9, §10 y §11): reintentos que no mueren, la gracia desde el último
+#    contacto confirmado, el adios del agente y el recordatorio
+# ===========================================================================
+
+SESION_DE_PRUEBA = {"op": "sesion", "perfil": "real", "reloj": "real", "agmen": ta.__version__, "maquina": "robot",
+                    "nodos": {}, "no_arrancar": []}
+
+
+def _rst(c: socket.socket) -> None:
+    """Cierra con RST (no con FIN), como una caída de verdad. Donde no se pueda pedir (otro sistema), cierra normal."""
+    try:
+        c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    except OSError:
+        pass
+    c.close()
+
+
+class AgenteDeMentira:
+    """Un agmen agent de mentira (el saludo es el de verdad, con la clave ta.KEY) cuyo comportamiento cambia según
+    `modo`, para probar al AgentLink en proceso sin esperar tiempos reales:
+      bueno             responde sesion_ok (tras `retardo` s; con pongs=True contesta los ping mientras tanto) o
+                        reanudar_ok, y sigue contestando ping hasta que se prenda `soltar` (entonces cierra con RST);
+      rst               hace el saludo bien y cierra con RST sin leer nada (justo antes de leer sesion/reanudar);
+      cierra_tras_saludo  igual, pero con cierre ordenado;
+      cierra            cierra antes del saludo;
+      rechaza           lee sesion/reanudar y contesta sesion_error 'ocupado'."""
+
+    def __init__(self, test: unittest.TestCase, gracia: float = 10.0, retardo: float = 0.0, pongs: bool = False):
+        self.modo = "bueno"
+        self.gracia, self.retardo, self.pongs = gracia, retardo, pongs
+        self.conexiones = 0
+        self.recibio = 0.0                      # monotonic en que leyó el último sesion/reanudar
+        self.soltar = threading.Event()
+        self.extras: list[dict] = []            # lo que manda justo tras sesion_ok (p. ej. un op desconocido)
+        self.fake = ta.FakeAgent(self._atender)
+        test.addCleanup(self.fake.close)
+        self.port = self.fake.port
+
+    def _pong(self, ch, m) -> bool:
+        try:
+            ch.send({"op": "pong", "t": m.get("t")})
+            return True
+        except ChannelError:
+            return False
+
+    def _atender(self, c: socket.socket) -> None:
+        self.conexiones += 1
+        modo = self.modo
+        if modo == "cierra":
+            c.close()
+            return
+        ch = ta.agent_handshake(c, ta.K())
+        if modo == "rst":
+            _rst(c)
+            return
+        if modo == "cierra_tras_saludo":
+            c.close()
+            return
+        msg = ch.recv(5)
+        self.recibio = time.monotonic()
+        if modo == "rechaza":
+            ch.send({"op": "sesion_error", "codigo": "ocupado", "texto": "robot: otra laptop tiene la sesión"})
+            return
+        if msg["op"] == "reanudar":
+            ch.send({"op": "reanudar_ok", "nodos": {}, "perdidos": {}})
+        else:
+            fin = time.monotonic() + self.retardo
+            while time.monotonic() < fin:   # "preparando la sesión" (el [robot] before)
+                try:
+                    m = ch.recv(0.05)
+                except ChannelTimeout:
+                    continue
+                if self.pongs and m["op"] == "ping" and not self._pong(ch, m):
+                    return
+            ch.send({"op": "sesion_ok", "maquina": "robot", "agmen": ta.__version__, "nodos": [],
+                     "sesion": "ab" * 16, "gracia": self.gracia})
+            for extra in self.extras:
+                ch.send(extra)
+        while True:
+            if self.soltar.is_set():
+                self.soltar.clear()
+                _rst(c)
+                return
+            try:
+                m = ch.recv(0.1)
+            except ChannelTimeout:
+                continue
+            except ChannelError:
+                return
+            if m["op"] == "ping" and not self._pong(ch, m):
+                return
+            if m["op"] == "adios":
+                return
+
+
+class EnlaceCase(unittest.TestCase):
+    """Un AgentLink en proceso (como el de agmen run, con keep_trying) contra un AgenteDeMentira. Los avisos que
+    dice agmen run se juntan en self.notas con su hora."""
+
+    def setUp(self):
+        self.notas: list[tuple[float, str]] = []
+        for nombre, valor in (("PING_EVERY", 1000.0),):    # sin ping: no hay pong que confirme nada, salvo que se pida
+            self.parchea(agent, nombre, valor)
+
+    def parchea(self, modulo, nombre, valor):
+        p = mock.patch.object(modulo, nombre, valor)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def abrir(self, falso: AgenteDeMentira) -> agent.AgentLink:
+        m = SimpleNamespace(name="robot", host="127.0.0.1", port=falso.port)
+        link = agent.AgentLink(m)
+        self.addCleanup(link.close)
+        link.attach(None, lambda quien, texto, tipo, droppable=False: self.notas.append((time.monotonic(), texto)))
+        link.open(ta.KEY, dict(SESION_DE_PRUEBA))
+        self.assertTrue(link.keep_trying())
+        return link
+
+    def espera(self, cond, timeout: float = 20.0) -> bool:
+        fin = time.monotonic() + timeout
+        while time.monotonic() < fin:
+            if cond():
+                return True
+            time.sleep(0.02)
+        return cond()
+
+    def texto(self) -> str:
+        return "\n".join(f"[{h:.2f}] {t}" for h, t in self.notas)
+
+    def nota(self, fragmento: str) -> tuple[float, str] | None:
+        return next(((h, t) for h, t in list(self.notas) if fragmento in t), None)
+
+    def hay(self, fragmento: str):
+        return lambda: self.nota(fragmento) is not None
+
+    def hilo_de_reintentos(self) -> bool:
+        return any(t.name == "agmen-reconectar-robot" and t.is_alive() for t in threading.enumerate())
+
+
+class TestReintentosQueNoMueren(EnlaceCase):
+    """§9: un error de envío o de conexión durante un reintento, también entre el saludo y sesion/reanudar, es un
+    intento fallido más; el hilo de reintentos solo termina con Ctrl+C."""
+
+    def test_rst_y_cierres_justo_tras_el_saludo_no_matan_el_hilo_y_al_volver_el_agente_reconecta(self):
+        self.parchea(agent, "RETRY_EVERY", 0.15)
+        self.parchea(agent, "RETRY_REFUSED", 0.15)
+        original = agent.Channel.send
+
+        def envio_lento(canal, obj):     # para que el RST llegue ANTES del send (el caso feo: error al mandar)
+            if obj.get("op") in ("reanudar", "sesion"):
+                time.sleep(0.3)
+            return original(canal, obj)
+
+        self.parchea(agent.Channel, "send", envio_lento)
+        falso = AgenteDeMentira(self)
+        link = self.abrir(falso)
+        base = falso.conexiones
+        falso.modo = "rst"
+        falso.soltar.set()                    # se pierde lo abierto (RST); los reintentos topan con "rst"
+        self.assertTrue(self.espera(self.hay("se perdió la conexión")), self.texto())
+        self.assertTrue(self.espera(lambda: falso.conexiones >= base + 5, 30), f"no reintentó\n{self.texto()}")
+        falso.modo = "cierra_tras_saludo"
+        n = falso.conexiones
+        self.assertTrue(self.espera(lambda: falso.conexiones >= n + 4, 30), f"no reintentó\n{self.texto()}")
+        self.assertTrue(self.hilo_de_reintentos(), f"el hilo de reintentos murió\n{self.texto()}")
+        texto = self.texto()
+        for malo in ("ya no reintento", "error inesperado", "Traceback"):
+            self.assertNotIn(malo, texto)
+        self.assertEqual(len(self.notas), 1, f"sin una línea por intento: solo el aviso de la pérdida\n{texto}")
+        # aparece un agente bueno: reconecta (reanudar_ok) y lo dice
+        falso.modo = "bueno"
+        self.assertTrue(self.espera(self.hay("reconectado tras")), f"no reconectó al volver el agente\n{self.texto()}")
+        self.assertIn("no se reinició nada", self.nota("reconectado tras")[1])
+        self.assertTrue(link.channel is not None and link.down_since is None, "el enlace debe quedar conectado")
+
+    def test_un_op_desconocido_del_agente_no_rompe_al_cliente(self):
+        """Un agente más nuevo manda un op que este cliente no conoce (un cliente viejo tampoco conocía el adios):
+        se ignora, sin romper ni decir nada."""
+        falso = AgenteDeMentira(self)
+        falso.extras = [{"op": "inventado_por_un_agente_futuro", "x": 1}]
+        link = self.abrir(falso)
+        time.sleep(0.7)
+        self.assertEqual((link.lost, link.down_since, self.notas), ("", None, []), self.texto())
+
+
+class TestGraciaDelCliente(EnlaceCase):
+    """§9 y §11: lo que dice agmen run al perder la conexión se cuenta desde el último contacto confirmado, hacia
+    abajo, sin prometer de más (la comparación es con la hora a la que el agente de mentira LEYÓ la sesión: el
+    agente real no pudo recibirla antes)."""
+
+    def perdido(self) -> tuple[float, str]:
+        self.assertTrue(self.espera(self.hay("se perdió la conexión")), self.texto())
+        return self.nota("se perdió la conexión")
+
+    def test_antes_del_primer_pong_cuenta_desde_que_mando_la_sesion_y_redondea_hacia_abajo(self):
+        falso = AgenteDeMentira(self, retardo=2.15)     # el agente tarda 2.15 s en preparar (un [robot] before)
+        link = self.abrir(falso)                        # sesion_ok llega a los ~2.15 s; ningún pong (sin ping)
+        falso.soltar.set()
+        hora, texto = self.perdido()
+        m = re.search(r"Sus nodos siguen ~(\d+) s por si vuelve", texto)
+        self.assertIsNotNone(m, texto)
+        n = int(m.group(1))
+        # quedan 10 - (hora - cuando el agente leyó la sesión) ≈ 7.7 s; hacia abajo es 7 (redondeado, 8; desde
+        # sesion_ok, 9)
+        self.assertLessEqual(n, 10 - (hora - falso.recibio) + 0.1, f"promete más de lo que le queda al robot: {texto}")
+        self.assertTrue(5 <= n <= 7, f"~{n} s: ¿contó desde sesion_ok o redondeó hacia arriba? (esperado 7)\n{texto}")
+
+    def test_los_pong_que_llegan_mientras_el_agente_prepara_la_sesion_cuentan(self):
+        self.parchea(agent, "PING_EVERY", 0.3)
+        falso = AgenteDeMentira(self, retardo=2.15, pongs=True)
+        link = self.abrir(falso)
+        falso.soltar.set()
+        hora, texto = self.perdido()
+        n = int(re.search(r"Sus nodos siguen ~(\d+) s", texto).group(1))
+        self.assertTrue(8 <= n <= 9, f"con pong cada 0.3 s el último contacto es de hace <1 s: ~{n} s\n{texto}")
+
+    def test_cuando_ya_no_queda_gracia_no_dice_0_s_dice_que_ya_habra_detenido(self):
+        falso = AgenteDeMentira(self, gracia=3.0, retardo=2.3)   # quedan ~0.5 s: hacia abajo es 0
+        link = self.abrir(falso)
+        falso.soltar.set()
+        hora, texto = self.perdido()
+        self.assertNotRegex(texto, r"~0 s", f"nunca 'siguen ~0 s'\n{texto}")
+        self.assertNotIn("Sus nodos siguen", texto)
+        self.assertIn("habrá detenido sus nodos", texto)
+        time.sleep(0.5)
+        self.assertEqual(sum("ya pasaron" in t.lower() for _, t in self.notas), 1, f"se dice una sola vez\n{self.texto()}")
+
+    def test_reconectado_cuenta_desde_el_ultimo_contacto_no_desde_que_se_noto(self):
+        self.parchea(agent, "RETRY_EVERY", 0.2)
+        falso = AgenteDeMentira(self)
+        link = self.abrir(falso)
+        t0 = time.monotonic()
+        time.sleep(2.0)                    # 2 s conectado sin pong: el último contacto confirmado sigue siendo el inicio
+        falso.modo = "cierra"
+        falso.soltar.set()
+        self.perdido()
+        time.sleep(1.0)
+        falso.modo = "bueno"
+        self.assertTrue(self.espera(self.hay("reconectado tras")), self.texto())
+        x = int(re.search(r"reconectado tras (\d+) s sin conexión", self.nota("reconectado tras")[1]).group(1))
+        real = time.monotonic() - t0
+        self.assertTrue(3 <= x <= real, f"'reconectado tras {x} s' pero el último contacto fue hace ~{real:.1f} s "
+                                        f"(contarlo desde que se notó el corte daría 1)\n{self.texto()}")
+
+
+class TestRecordatorio(EnlaceCase):
+    """§3 y §9: pasada la gracia, un recordatorio periódico que dice el ritmo REAL de reintento y nunca una línea
+    por intento. Los tiempos se parchan en proceso (60 s reales de recordatorio no se esperan)."""
+
+    def test_el_recordatorio_sale_dice_1_s_o_5_s_tras_un_rechazo_y_no_hay_linea_por_intento(self):
+        self.parchea(agent, "RETRY_NOTE_EVERY", 0.4)
+        self.parchea(agent, "RETRY_EVERY", 0.1)       # (en lugar de 1 s)
+        self.parchea(agent, "RETRY_REFUSED", 0.25)    # (en lugar de 5 s)
+        falso = AgenteDeMentira(self, gracia=1.0)
+        link = self.abrir(falso)
+        falso.modo = "cierra"                          # nadie contesta: sin rechazo, ritmo normal
+        falso.soltar.set()
+
+        def recordatorios(ritmo: str) -> list[str]:
+            return [t for _, t in list(self.notas) if "sigo sin conexión" in t and f"reintento cada {ritmo} s" in t]
+
+        self.assertTrue(self.espera(lambda: len(recordatorios("0.1")) >= 3, 15), f"sin recordatorios\n{self.texto()}")
+        for t in recordatorios("0.1"):
+            self.assertRegex(t, r"^robot \(127\.0\.0\.1:\d+\): sigo sin conexión desde hace \d+ s; reintento cada 0\.1 s "
+                                r"\(Ctrl\+C para salir\)$")
+        intentos = falso.conexiones
+        self.assertGreater(intentos, 2 * len(self.notas), f"{intentos} intentos vs {len(self.notas)} líneas\n{self.texto()}")
+        self.assertLessEqual(len(self.notas), 2 + len(recordatorios("0.1")), f"líneas de más\n{self.texto()}")
+        # un rechazo: el ritmo real pasa a ser el de RETRY_REFUSED
+        falso.modo = "rechaza"
+        self.assertTrue(self.espera(lambda: len(recordatorios("0.25")) >= 2, 15), f"el recordatorio no cambió de ritmo\n{self.texto()}")
+        self.assertEqual(sum("✖" in t for _, t in self.notas), 1, f"el rechazo se dice una vez\n{self.texto()}")
+        self.assertTrue(self.hilo_de_reintentos())
+
+
+class TestAdiosDelAgenteProtocolo(ProtocoloCase):
+    """§10 y §11: el adios del agente, con una laptop de mentira que habla directo con un agente real."""
+
+    def cierra_y_mira(self, motivo: str | None):
+        self.parchea(agent, "GRACE", 30.0)
+        cli, ok = self.abrir()
+        t0 = time.monotonic()
+        if motivo is None:
+            self.server.close()
+        else:
+            self.server.close(motivo)
+        self.assertTrue(cli.wait(cli.hay("adios"), 15), f"no llegó el adios\n{cli.msgs}\n{self.lista_dicha()}")
+        self.assertTrue(self.espera(lambda: cli.error is not None, 15), "la conexión no se cerró tras el adios")
+        self.assertLess(time.monotonic() - t0, 15)
+        adios = cli.first("adios")
+        self.assertEqual(adios["motivo"], motivo or "Ctrl+C", adios)
+        # firmado (Channel.recv rechaza lo que no lo está: llegó como mensaje, no como error) y ANTES del cierre
+        self.assertEqual(cli.msgs[-1]["op"], "adios", f"el adios debe ser lo último antes del cierre\n{cli.msgs[-3:]}")
+        self.assertIsInstance(cli.error, ChannelClosed, f"se cerró de una forma rara: {cli.error!r}")
+        self.assertTrue(self.todos_muertos(15), f"los nodos siguen vivos\n{self.lista_dicha()}")
+        self.assertFalse(self.dijo("sus nodos siguen"), self.lista_dicha())
+
+    def test_ctrl_c_manda_adios_con_el_motivo_firmado_y_antes_del_cierre(self):
+        self.cierra_y_mira(None)
+
+    def test_sigterm_manda_adios_con_su_motivo(self):
+        self.cierra_y_mira("SIGTERM")
+
+    def test_ctrl_break_manda_adios_con_su_motivo(self):
+        self.cierra_y_mira("Ctrl+Break")
+
+    def test_gracia_vencida_no_manda_adios(self):
+        self.parchea(agent, "SILENCE_TIMEOUT", 1.0)
+        self.parchea(agent, "GRACE", 2.0)
+        cli, ok = self.abrir()          # la laptop se queda conectada pero muda (no manda ni ping)
+        self.assertTrue(self.espera(lambda: self.dijo("no volvió en 2 s: detuve los nodos"), 20), self.lista_dicha())
+        self.assertTrue(self.todos_muertos(15), self.lista_dicha())
+        time.sleep(0.5)
+        self.assertIsNone(cli.first("adios"), f"la gracia vencida no manda adios\n{cli.msgs}")
+
+    def test_mensaje_invalido_no_manda_adios(self):
+        self.parchea(agent, "GRACE", 30.0)
+        cli, ok = self.abrir()
+        cli.ch.sock.sendall(f'{cli.ch._sent + 1} {{"op":"ping"}} {"0" * 64}\n'.encode())    # firma mala
+        self.assertTrue(self.espera(lambda: self.dijo("mensaje inválido de la laptop"), 15), self.lista_dicha())
+        self.assertTrue(self.todos_muertos(15), self.lista_dicha())
+        time.sleep(0.5)
+        self.assertIsNone(cli.first("adios"), f"un mensaje inválido no manda adios\n{cli.msgs}")
+
+    def test_si_lo_cierran_mientras_prepara_la_sesion_manda_adios_y_no_arranca_nada(self):
+        antes = json.dumps(["python", str(self.dir / "nodo.py"), "antes", str(self.marks)])
+        self.parchea(agent, "GRACE", 30.0)
+        self.start_server(write=False)
+        self.write_toml(**{'[robot]\nname = "r"\n': f'[robot]\nname = "r"\nbefore = [{antes}]\n'})
+        cli = self.conectar()
+        cli.send(self.mensaje())
+        self.assertTrue(self.espera(lambda: self.vivo("antes"), 30), "el [robot] before no arrancó")
+        self.assertIsNone(cli.first("sesion_ok"))
+        self.server.close()
+        self.assertTrue(cli.wait(cli.hay("adios"), 15), f"sin adios mientras prepara\n{cli.msgs}\n{self.lista_dicha()}")
+        self.assertIsNone(cli.first("sesion_ok"), "no debió contestar sesion_ok")
+        self.assertTrue(self.espera(lambda: not self.vivo("antes"), 15), "el before debe detenerse")
+        self.assertFalse((self.marks / "arranque_motor").exists() or (self.marks / "arranque_imu").exists(),
+                         "arrancó un nodo")
+
+
+class TestAdiosDelAgenteDePuntaAPunta(CortesBase):
+    """§10 y §11 con dos procesos de verdad: agmen agent cerrado a propósito con la laptop conectada."""
+
+    web = True
+    FRASE = (r"robot \(127\.0\.0\.1:{puerto}\): cerraron agmen agent allá \({motivo}\): sus nodos están detenidos\. "
+             r"Reintento por si vuelve a arrancar \(Ctrl\+C para salir\)")
+
+    def cerrar_y_comprobar(self, enviar, motivo: str, espera_larga: bool):
+        self.iniciar()
+        self.assertTrue(self.espera(lambda: len(self.serie("motor")) >= 3, 30), self.diag())
+        codigo = enviar()
+        self.assertEqual(codigo, 0, self.diag("el agente debe salir con 0"))
+        self.esperar_linea("cerraron agmen agent allá", 20, que="agmen run no dijo que cerraron el agente")
+        self.assertRegex(self.texto(self.lr), self.FRASE.format(puerto=self.px.puerto, motivo=re.escape(motivo)))
+        self.assertTrue(self.espera_estado("motor", "detenido") and self.espera_estado("imu", "detenido"),
+                        self.diag("los nodos del robot deben quedar 'detenido' (no 'sin conexión')"))
+        self.assertEqual(self.estados()["ia"], "corriendo")
+        # pasa más de la gracia (10 s): agmen run sigue vivo, sigue reintentando y NO dice lo de las redes caídas
+        fin = time.monotonic() + (12.0 if espera_larga else 1.5)
+        while time.monotonic() < fin:
+            self.assertIsNone(self.pr.poll(), self.diag("agmen run salió"))
+            self.assertNotIn(self.estados()["motor"], ("sin conexión", "falló"), self.diag())
+            time.sleep(0.4)
+        texto = self.texto(self.lr)
+        self.assertEqual(self.cuenta("cerraron agmen agent allá"), 1, f"la frase va una sola vez\n{texto}")
+        for malo in ("sus nodos siguen", "Sus nodos siguen", "ya pasaron", "se perdió la conexión"):
+            self.assertNotIn(malo, texto, self.diag(f"no debe decir {malo!r} si cerraron el agente a propósito"))
+        # el agente vuelve: sesión nueva, nodos detenidos, ninguno arranca solo
+        self.pa, self.la, clave2 = self.agente()
+        self.assertEqual(clave2, self.clave)
+        self.esperar_linea("pero ya había detenido sus nodos", 40, que="agmen run no abrió una sesión nueva")
+        self.assertRegex(self.texto(self.lr), rf"robot \(127\.0\.0\.1:{self.px.puerto}\): reconectado tras \d+ s sin conexión, "
+                                              r"pero ya había detenido sus nodos")
+        self.assertNotIn("no se reinició nada", self.texto(self.lr))
+        self.assertTrue(self.espera_estado("motor", "detenido") and self.espera_estado("imu", "detenido"), self.diag())
+        self.assertTrue(self.ninguno_vivo(("motor", "imu"), 1.0), self.diag("nodos del robot vivos"))
+        hb0 = {n: self.latido(n) for n in ("motor", "imu")}
+        time.sleep(2.0)
+        self.assertEqual({n: self.latido(n) for n in ("motor", "imu")}, hb0, self.diag("un nodo arrancó solo"))
+        self.assertEqual(self.pids_de_marcas(), self.pids0, self.diag("arrancó un nodo del robot solo"))
+        codigo, _ = self.ctrl_c_a_run()
+        self.assertEqual(codigo, 0, self.diag())
+
+    def test_ctrl_c_en_el_agente_los_nodos_quedan_detenidos_se_dice_una_vez_y_se_reintenta(self):
+        self.cerrar_y_comprobar(lambda: self.detener(self.pa, 40), "Ctrl+C", espera_larga=True)
+
+    @unittest.skipIf(os.name == "nt", "SIGTERM no se puede mandar a un proceso en Windows (terminate() es "
+                                      "TerminateProcess, sin avisarle al agente); Ctrl+Break se prueba en proceso")
+    def test_sigterm_en_el_agente_dice_el_motivo(self):
+        def sigterm():
+            self.pa.send_signal(signal.SIGTERM)
+            try:
+                return self.pa.wait(40)
+            except subprocess.TimeoutExpired:
+                return None
+
+        self.cerrar_y_comprobar(sigterm, "SIGTERM", espera_larga=False)
+
+    def test_cerrar_el_agente_mientras_prepara_la_sesion_agmen_run_no_arranca_nada_y_sale_con_1(self):
+        (self.dir / "antes_agente.toml").write_text(
+            self.toml.read_text(encoding="utf-8").replace(
+                '[robot]\nname = "e2e"\n',
+                '[robot]\nname = "e2e"\nbefore = [' + json.dumps(["python", str(self.dir / "nodo.py"), "antes", str(self.marks)])
+                + ']\n', 1), encoding="utf-8")
+        self.pa, self.la, self.clave = self.agente(toml=self.dir / "antes_agente.toml")
+        self.pr, self.lr = self.correr(clave=self.clave, args=("--no-web",), toml=self.toml_run)
+        self.assertTrue(self.espera(lambda: self.vivo("antes") or self.pr.poll() is not None, 40), self.diag("antes"))
+        self.assertTrue(self.vivo("antes"), self.diag("el [robot] before del agente no corrió"))
+        self.assertEqual(self.detener(self.pa, 40), 0, self.diag())
+        codigo = self.fin(self.pr, 40)
+        texto = self.texto(self.lr)
+        self.assertEqual(codigo, 1, self.diag("sin arrancar los nodos, agmen run sale con 1"))
+        self.assertIn("cerraron agmen agent allá", texto)
+        self.assertNotIn("todo arrancado", texto)
+        self.assertNotIn("reintento", texto, "antes de arrancar los nodos no se reintenta")
+        self.assertNotIn("Traceback", texto)
+        self.assertTrue(self.ninguno_vivo(("antes",)), "el before debe detenerse")
+        for n in ("motor", "imu", "ia"):
+            self.assertFalse((self.marks / f"arranque_{n}").exists(), self.diag(f"arrancó {n}"))
+
+
+class TestRedCongeladaEnUnSentido(CortesBase):
+    """§9: la red falla en un solo sentido. Los segundos que dice agmen run nunca son más de los que de verdad le
+    quedan al robot, y 'ya pasaron 10 s' no sale tarde. Tiempos reales, dos procesos."""
+
+    web = False
+
+    def test_congelado_solo_laptop_a_robot_no_promete_de_mas_ni_dice_ya_pasaron_tarde(self):
+        self.iniciar()
+        self.assertTrue(self.espera(lambda: len(self.serie("motor")) >= 3, 30), self.diag())
+        self.px.congelar(c2a=True, a2c=False)    # la laptop sigue RECIBIENDO log; nada de lo que manda llega
+        self.esperar_linea("se perdió la conexión", 25, que="agmen run no notó la pérdida")
+        self.esperar_linea("la laptop (127.0.0.1) no volvió en 10 s: detuve los nodos", 25, self.la,
+                           "el agente no detuvo sus nodos")
+        self.esperar_linea("ya pasaron 10 s", 25, que="agmen run no dijo que ya pasaron 10 s")
+        t_dijo = self.lr.hora_de("): se perdió la conexión (")
+        t_agente = self.la.hora_de("no volvió en 10 s: detuve los nodos")     # cuándo el robot detuvo sus nodos
+        t_pasaron = self.lr.hora_de("ya pasaron 10 s")
+        perdio = next(l for l in self.lr if "): se perdió la conexión (" in l)
+        m = re.search(r"Sus nodos siguen ~(\d+) s por si vuelve", perdio)
+        self.assertIsNotNone(m, self.diag(f"agmen run debía prometer unos segundos: {perdio!r}"))
+        n = int(m.group(1))
+        queda = t_agente - t_dijo
+        self.assertLessEqual(n, queda + 0.7, self.diag(f"agmen run prometió ~{n} s y al robot le quedaban {queda:.1f} s"))
+        self.assertLessEqual(t_pasaron - t_agente, 1.5, self.diag(
+            f"'ya pasaron 10 s' salió {t_pasaron - t_agente:.1f} s después de que el robot detuvo sus nodos"))
+        self.assertTrue(self.ninguno_vivo(("motor", "imu")), self.diag("el robot debía haber detenido sus nodos"))
+        self.assertEqual(self.cuenta("ya pasaron"), 1)
+        self.assertEqual(self.cuenta("): se perdió la conexión ("), 1)
+        codigo, _ = self.ctrl_c_a_run()
+        self.assertEqual(codigo, 0, self.diag())
+
+    def test_congelado_solo_robot_a_laptop_no_promete_de_mas_y_reconecta_sin_reiniciar(self):
+        self.iniciar()
+        self.assertTrue(self.espera(lambda: len(self.serie("motor")) >= 3, 30), self.diag())
+        self.px.congelar(c2a=False, a2c=True)    # el agente sigue recibiendo ping; nada de lo suyo llega
+        t0 = time.monotonic()
+        self.esperar_linea("se perdió la conexión", 25, que="agmen run no notó el silencio")
+        t_dijo = self.lr.hora_de("): se perdió la conexión (")
+        perdio = next(l for l in self.lr if "): se perdió la conexión (" in l)
+        self.assertIn("dejó de contestar (6 s sin nada)", perdio)
+        m = re.search(r"Sus nodos siguen ~(\d+) s por si vuelve", perdio)
+        self.assertIsNotNone(m, self.diag(perdio))
+        n = int(m.group(1))
+        # el último contacto confirmado es de justo antes de congelar: a los ~6 s de silencio quedan ~4 s
+        self.assertTrue(1 <= n <= 4, self.diag(f"agmen run prometió ~{n} s a los {t_dijo - t0:.1f} s de silencio (~4)"))
+        self.assertTrue(self.vivo("motor") and self.vivo("imu"), self.diag("el agente sí recibía: sus nodos siguen"))
+        self.px.levantar()
+        self.esperar_linea("no se reinició nada", 40, que="agmen run no reconectó")
+        texto = self.texto(self.lr)
+        x = int(re.search(r"reconectado tras (\d+) s sin conexión · no se reinició nada", texto).group(1))
+        self.assertTrue(5 <= x <= 10, self.diag(f"'reconectado tras {x} s': contado desde el último contacto (~7)"))
+        self.assertEqual(self.cuenta("ya pasaron"), 0, self.diag("el agente nunca soltó la sesión"))
+        self.assertEqual(self.pids_de_marcas(), self.pids0, self.diag("algo se reinició"))
+        self.assertTrue(self.espera(lambda: len(self.serie("motor")) >= 10, 20), self.diag())
+        self.sin_huecos_ni_repetidas("motor")
+        self.sin_huecos_ni_repetidas("imu")
+        codigo, _ = self.ctrl_c_a_run()
+        self.assertEqual(codigo, 0, self.diag())
+
+
+# ===========================================================================
 # 3. Lo que la 3c no cambia
 # ===========================================================================
 
