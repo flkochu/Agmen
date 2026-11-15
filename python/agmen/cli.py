@@ -261,10 +261,16 @@ def _run(args) -> int:
             if player is not None:
                 player.stop()
             return _cancelled("antes de conectarme", "no arrancó nada")
+        # RFC 0011 parte 4b: con hub, "tablas" y cómo se llama esta computadora para los robots (`desde`).
+        desde = None
+        if config.hub:
+            from .tables import laptop_name
+
+            desde = laptop_name(config, places)
         try:
             with ctrl_c.interruptible():
                 error = _connect(launcher, config, remotes, keys, "replay" if args.play else config.clock.mode,
-                                 lost, stop)
+                                 lost, stop, desde)
         except KeyboardInterrupt:   # _connect ya mandó adios a todas (si ya había vuelto, se les manda aquí)
             for link in remotes.values():
                 link.close()
@@ -420,6 +426,9 @@ def _run(args) -> int:
             lost.append(text)
             launcher.say(f"✖ {text}", "error")
             stop.set()
+    bridge = None
+    if remotes and config.hub and not stop.is_set():   # 4b: el puente con los robots (antes de arrancar los nodos)
+        bridge = _bridge_for(launcher, remotes)
     if not stop.is_set():   # una computadora se perdió (o Ctrl+C) mientras se preparaba lo de aquí: no se arranca
         launcher.start_all()
         if not ctrl_c.pressed:
@@ -434,6 +443,8 @@ def _run(args) -> int:
     try:
         _wait_for_ctrl_c(stop)
     finally:
+        if bridge is not None:
+            bridge.close()   # sin `red` ni latidos: los hubs vuelven solos a modo local
         launcher.stop_all(then=close_recording)
         if panel:
             panel.shutdown()
@@ -499,7 +510,25 @@ def _key_hint(name: str, source: str, code: str) -> str:
                        f"en la terminal de {name}"}[source]
 
 
-def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list, stop) -> str:
+def _bridge_for(launcher, remotes: dict):
+    """El puente de agmen run (RFC 0011 parte 4b): un hilo con el hub de aquí y un Peer por cada robot. Si no
+    se puede arrancar, se dice y todo sigue sin topics entre computadoras."""
+    from .pubsub import hub_address
+    from .tables import Bridge
+
+    try:
+        bridge = Bridge(hub_address(), launcher.say, robots=len(remotes) > 1)
+        bridge.start()
+    except Exception as e:
+        launcher.say(f"⚠ no pude arrancar el puente de topics con las otras computadoras ({e!r}): los topics no "
+                     f"cruzan entre computadoras", "error")
+        return None
+    for name, link in remotes.items():
+        link.bridge(bridge.add_peer(name, link.send_table))
+    return bridge
+
+
+def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list, stop, desde=None) -> str:
     """Abre la sesión con cada agente, una tras otra. Devuelve "" si todas se abrieron;
     si no, el error, y las que ya estaban abiertas reciben adios (no arranca nada)."""
     from .agent import AgentError, save_client_key, session_message
@@ -525,7 +554,7 @@ def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list
             launcher.say(f"conectando con {name} ({link.shown})…")
             link.on_lost = on_lost   # ANTES de open(): una pérdida justo después de abrir no se olvida
             try:
-                link.open(key, session_message(config, name, clock), on_key_ok=keep, stop=stop)
+                link.open(key, session_message(config, name, clock, desde), on_key_ok=keep, stop=stop)
             except AgentError as e:
                 if lost:   # otra se perdió mientras esta preparaba la sesión: ya recibió adios; cmd_run sale con 1
                     break

@@ -1452,6 +1452,12 @@ class _Session:
         self._orders: queue.Queue = queue.Queue()
         self._setup_thread: threading.Thread | None = None
         self._unread = threading.Event()     # el lector de la conexión actual ya salió (para el adios de end)
+        # El puente (RFC 0011 parte 4b): si la laptop y este agente dijeron "tablas", el puente con el hub de aquí
+        # y el Peer de la laptop (None: sin puente; todo como en el bloque 3).
+        self._first: dict = {}
+        self._tables = False
+        self.bridge = None
+        self.peer = None
         self.sender = self._start_sender(channel, self.out)
         self.worker = threading.Thread(target=self._work_loop, daemon=True, name="agmen-agent-orders")
         self.worker.start()
@@ -1654,6 +1660,8 @@ class _Session:
         if not grace:
             self.end(early, "error")
             return
+        if self.peer is not None:
+            self.peer.lose()   # 4b: sin conexión no se late nada de la laptop ni se repite `red`
         if failed is not None:
             self.end(f"la laptop ({self.ip}) {cause}, y no pude esperar a que vuelva ({_clean(repr(failed), 200)}): "
                      f"detengo los nodos", "error")
@@ -1713,12 +1721,16 @@ class _Session:
                     if lost:
                         reply["perdidos"] = lost
                     reply["gracia"] = _grace_number()
+                    if self._tables:
+                        reply["tablas"] = 1
                     out.put(reply)
                     for item in logs:
                         out.put(item, droppable=True)
                     self.channel, self.out, self.unconfirmed = channel, out, channel
                     self._unread.clear()   # el lector de la nueva es este hilo (en _guarded, abajo)
                     old_ip, self.ip = self.ip, ip
+        if self.peer is not None:
+            self.peer.lose()   # 4b: hasta que la laptop confirme por la conexión nueva, sin puente
         if failed is not None:
             channel.close()   # §14: el canal nuevo no se queda abierto (end() cierra el de antes, el actual)
             self.end(f"la laptop volvió a conectarse desde {ip} y no pude esperar a que confirme "
@@ -1758,6 +1770,8 @@ class _Session:
             timer.cancel()
         with self.server.lock:
             self.server.trusted = _ip_key(self.ip)
+        if self.peer is not None:
+            self.peer.confirm(_show_ip(self.ip))   # 4b: el puente vuelve, con la IP desde la que llegó la laptop
         replaced, self._replaced = self._replaced, None
         if replaced is not None:
             self.say(f"la laptop volvió a conectarse desde {self.ip} antes de que se perdiera la conexión de "
@@ -1785,6 +1799,7 @@ class _Session:
                                      f"({_clean(e, 200)}). Mira la terminal de agmen agent en {self.server.machine}")
             return
         self.plan, self.launcher = plan, launcher
+        self._first = first
         launcher.logs.listeners.append(self._on_log)
         for node in launcher.nodes.values():
             node.on_state = self._on_state
@@ -1829,11 +1844,17 @@ class _Session:
                 return
             if own:
                 launcher.nodes["hub"].start()   # el hub de esta computadora, como en agmen run
-            self.send({"op": "sesion_ok", "maquina": m, "agmen": __version__, "nodos": list(plan.names),
-                       "sesion": self.id, "gracia": _grace_number()})
+            self._tables = self._wants_tables()
+            ok = {"op": "sesion_ok", "maquina": m, "agmen": __version__, "nodos": list(plan.names),
+                  "sesion": self.id, "gracia": _grace_number()}
+            if self._tables:
+                ok["tablas"] = 1
+            self.send(ok)
             self.ready.set()
             with self.server.lock:   # la IP de la última sesión ACEPTADA conserva su lugar aunque otros fallen
                 self.server.trusted = _ip_key(self.ip)
+            if self._tables:
+                self._start_bridge()
             for name in plan.names:
                 node = launcher.nodes[name]
                 with node.lock:
@@ -1857,6 +1878,58 @@ class _Session:
             else:
                 self._refused("interno", f"{m}: error inesperado al preparar la sesión ({_clean(e, 200)}). Mira la "
                                          f"terminal de agmen agent en {m}")
+
+    def _wants_tables(self) -> bool:
+        """¿Hay puente (4b §1, §3)? Si la laptop dijo "tablas" y dice cómo se llama (`desde`), este agente tiene hub
+        y ve a la laptop en una IPv4. Si la laptop lo dijo y algo de aquí no deja, se dice por qué."""
+        first = self._first
+        if not _says_tables(first):
+            return False
+        from .tables import check_name
+
+        why = ""
+        try:
+            check_name(first.get("desde"))
+        except Exception as e:
+            why = f"la laptop no dice bien cómo se llama ('desde': {_clean(e, 200)})"
+        if not why and not self.plan.config.hub:
+            why = f"en {self.server.machine} [hub] enabled = false"
+        if not why:
+            try:
+                from . import hubproto
+
+                hubproto.parse_ipv4(_show_ip(self.ip))
+            except Exception:
+                why = f"la laptop llegó desde {_show_ip(self.ip)}, que no es una IPv4 (en esta versión, solo IPv4)"
+        if why:
+            self.launcher.say(f"⚠ los topics no cruzan entre {self.server.machine} y la laptop: {why}", "error")
+            return False
+        return True
+
+    def _start_bridge(self) -> None:
+        """El puente con el hub de aquí (4b): la laptop es el único Peer; su IP, la que ve este agente."""
+        from .pubsub import hub_address
+        from .tables import Bridge
+
+        try:
+            bridge = Bridge(hub_address(), self.launcher.say)
+            peer = bridge.add_peer(self._first["desde"], lambda part: self.send(part))
+            bridge.start()
+        except Exception as e:   # nunca en silencio; la sesión sigue sin puente
+            self.launcher.say(f"⚠ no pude arrancar el puente de topics con la laptop ({_clean(repr(e), 200)}): los "
+                              f"topics no cruzan entre computadoras", "error")
+            return
+        with self._end_lock:
+            ending = self._ending
+            if not ending:
+                self.bridge, self.peer = bridge, peer
+        if ending:
+            bridge.close()
+            return
+        with self._end_lock:
+            confirmed = self.lost_at is None and self.unconfirmed is None
+        if confirmed:
+            peer.confirm(_show_ip(self.ip))
 
     def _run_before(self, cmd: list[str]) -> int | None:
         """Un comando de [robot] before, con su salida como log de "agmen" (RFC 0011 §3.3)."""
@@ -1951,6 +2024,9 @@ class _Session:
                 what = {"arrancar": "start", "detener": "stop", "reiniciar": "restart"}[op]
                 self.launcher.say(f"la laptop pidió {op} '{name}'")
                 self._work(getattr(self.launcher.nodes[name], what))
+        elif op == "tablas":   # la tabla del hub de la laptop (4b): solo si hay puente
+            if self.peer is not None:
+                self.peer.receive(msg)
         elif op in ("sesion", "reanudar"):
             self._error("esta conexión ya tiene su sesión abierta")
         else:
@@ -2019,6 +2095,8 @@ class _Session:
             timer.cancel()
         me = threading.current_thread()
         try:
+            if self.bridge is not None:
+                self.bridge.close()   # 4b: sin `red` ni latidos; su hilo y el del Peer terminan
             if reason and not quiet and grace_token is None:
                 self.say(reason, kind)
             self.cancel.set()
@@ -2160,13 +2238,24 @@ def get_key(name: str, address: str, *, interactive: bool | None = None,
     raise AssertionError("inalcanzable")
 
 
-def session_message(config, machine: str, clock: str) -> dict:
+def session_message(config, machine: str, clock: str, desde: str | None = None) -> dict:
     """El `sesion` para el agente de `machine`. no_arrancar = todos sus nodos: agmen run
     los arranca después, cuando TODAS las computadoras aceptaron (y en el orden del
-    archivo; los de --skip o autostart = false, nunca solos)."""
+    archivo; los de --skip o autostart = false, nunca solos). Con `desde` (agmen run con
+    hub, RFC 0011 parte 4b §3): "tablas": 1 y cómo se llama esta computadora allá."""
     nodes = written_nodes(config, machine)
-    return {"op": "sesion", "perfil": config.profile, "reloj": clock, "agmen": __version__, "maquina": machine,
-            "nodos": nodes, "no_arrancar": list(nodes)}
+    msg = {"op": "sesion", "perfil": config.profile, "reloj": clock, "agmen": __version__, "maquina": machine,
+           "nodos": nodes, "no_arrancar": list(nodes)}
+    if desde is not None:
+        msg["tablas"] = 1
+        msg["desde"] = desde
+    return msg
+
+
+def _says_tables(msg: dict | None) -> bool:
+    """¿El otro lado dijo que sabe pasar las tablas de su hub (RFC 0011 parte 4b §3)?"""
+    value = (msg or {}).get("tablas")
+    return type(value) is int and value == 1
 
 
 def _kind(text: str) -> str:
@@ -2242,6 +2331,11 @@ class AgentLink:
         self._resuming: threading.Event | None = None
         self._resume_bye = False
         self._pace: float = RETRY_EVERY     # el ritmo de los reintentos de ahora (1 s, o 5 s tras un rechazo)
+        # El puente (RFC 0011 parte 4b): el Peer de esta conexión en el puente de agmen run (None: sin puente) y si el
+        # agente dijo "tablas" en su último sesion_ok/reanudar_ok.
+        self._peer = None
+        self._tables = False
+        self._told_tables = False
 
     @property
     def on_lost(self) -> Callable[[AgentLink, str], None] | None:
@@ -2304,6 +2398,7 @@ class AgentLink:
             self.channel = None
             raise
         self._took(ok, contact)
+        self._tables = _says_tables(ok)
         self.version = _clean(channel.peer_version, 40)
         self.state_since = time.monotonic()
         self._reader = threading.Thread(target=self._read_loop, args=(channel, self._gen), daemon=True,
@@ -2311,11 +2406,19 @@ class AgentLink:
         self._reader.start()
 
     def _dial(self, key: str, connect_timeout: float) -> Channel:
-        """Conecta y saluda. LinkError si no se puede."""
+        """Conecta y saluda. LinkError si no se puede. Con AGMEN_NET_IP (pruebas), la conexión sale desde esa IP:
+        así el agente ve a esta computadora en la IP donde escuchan sus nodos (RFC 0011 parte 4b §5)."""
+        from .hub import net_ip_from_env
+
         where = f"{self.name} ({self.shown})"
         host = self.machine.host
         try:
-            sock = socket.create_connection((host, self.machine.port), timeout=connect_timeout)
+            net_ip = net_ip_from_env()
+        except (OSError, ValueError) as e:
+            raise LinkError("sin_ruta", f"no llego a {where}: {e}") from None
+        try:
+            sock = socket.create_connection((host, self.machine.port), timeout=connect_timeout,
+                                            source_address=(net_ip, 0) if net_ip else None)
         except ConnectionRefusedError:
             raise LinkError("rechazada", f"{where} no contesta: ¿está corriendo agmen agent ahí? En {self.name}: "
                                          f"agmen agent {self.toml_hint}") from None
@@ -2556,7 +2659,47 @@ class AgentLink:
         elif op == "pong":   # el último contacto confirmado (§9): el t es el monotonic de un ping de aquí
             if self.down_since is None:
                 self.last_ok = self._confirmed(msg, self.last_ok)
+        elif op == "tablas":   # la tabla del hub del robot (4b): solo si los dos lo dijeron
+            peer = self._peer
+            if peer is not None and self._tables:
+                peer.receive(msg)
         # lo que no conozca (un agente más nuevo): nada
+
+    # --- el puente (RFC 0011 parte 4b) ---
+    def bridge(self, peer) -> None:
+        """agmen run, justo antes de arrancar los nodos: el Peer de esta computadora en su puente. Si la conexión
+        ya está y el agente dijo "tablas", el puente empieza ya."""
+        self._peer = peer
+        channel = self.channel
+        if channel is not None and self.down_since is None:
+            self._bridge_up(channel)
+
+    def _bridge_up(self, channel: Channel) -> None:
+        """La conexión `channel` quedó confirmada: con "tablas" de los dos lados, hay puente (con la IP a la que se
+        conectó agmen run); si el agente no lo dijo, se dice una vez con qué hacer."""
+        peer = self._peer
+        if peer is None:
+            return
+        if not self._tables:
+            peer.lose()
+            if not self._told_tables:
+                self._told_tables = True
+                self._notice(f"⚠ {self.name} no pasa topics entre computadoras (su agmen agent no dice 'tablas': es un "
+                             f"Agmen anterior, o allá [hub] enabled = false): sus nodos corren, pero sus topics no "
+                             f"llegan aquí ni los de aquí allá. Actualiza Agmen en {self.name} (pip install -U agmen)",
+                             "error")
+            return
+        try:
+            ip = _show_ip(channel.sock.getpeername()[0])
+        except OSError:
+            return   # ya se cerró: su lector lo ve
+        peer.confirm(ip)
+
+    def send_table(self, part: dict) -> None:
+        """Una parte de la tabla de aquí, por la conexión actual (desde el hilo del Peer)."""
+        channel = self.channel
+        if channel is not None and self.down_since is None:
+            channel.send(part)
 
     def _note_once(self, what: str, text: str) -> None:
         """Un aviso propio de agmen run sobre lo que manda el agente: una vez por conexión."""
@@ -2592,6 +2735,8 @@ class AgentLink:
                              f"todo. Revisa {self.name} (¿se apagó, se cayó la red o se cerró agmen agent?) y vuelve "
                              f"a correr agmen run")
         self._done.set()
+        if self._peer is not None:
+            self._peer.lose()   # 4b: sin conexión no se late nada del robot ni se repite `red`
         if not resilient:
             for node in self.nodes.values():
                 if farewell:
@@ -2934,6 +3079,9 @@ class AgentLink:
                                       name=f"agmen-agent-{self.name}")
             reader.start()
             self._reader = reader
+            # 4b: confirmada (tras sesion_ok, o tras el pong de confirmación de un reanudar): vuelve el puente.
+            self._tables = _says_tables(resumed if resumed is not None else ok)
+            self._bridge_up(channel)
         except BaseException as e:
             with self._lock:   # ¿sigue siendo la actual? (si su lector ya la perdió, otro hilo reintenta)
                 mine = self._gen == gen and self.down_since is None and not self._closing
@@ -3014,6 +3162,8 @@ class AgentLink:
             channel, self.channel = self.channel, None
         self._retry_stop.set()
         self._done.set()
+        if self._peer is not None:
+            self._peer.lose()
         if channel is None:
             return
         if not self.lost:
