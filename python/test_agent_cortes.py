@@ -1618,7 +1618,7 @@ class TestAdiosDelAgenteDePuntaAPunta(CortesBase):
 
         self.cerrar_y_comprobar(sigterm, "SIGTERM", espera_larga=False)
 
-    def test_cerrar_el_agente_mientras_prepara_la_sesion_agmen_run_no_arranca_nada_y_sale_con_1(self):
+    def test_cerrar_el_agente_mientras_prepara_la_sesion_agmen_run_no_arranca_nada_y_sale_con_2(self):
         (self.dir / "antes_agente.toml").write_text(
             self.toml.read_text(encoding="utf-8").replace(
                 '[robot]\nname = "e2e"\n',
@@ -1631,7 +1631,8 @@ class TestAdiosDelAgenteDePuntaAPunta(CortesBase):
         self.assertEqual(self.detener(self.pa, 40), 0, self.diag())
         codigo = self.fin(self.pr, 40)
         texto = self.texto(self.lr)
-        self.assertEqual(codigo, 1, self.diag("sin arrancar los nodos, agmen run sale con 1"))
+        # 2, como cualquier fallo al conectar al principio (3b; especificación 3c §12, que corrige la §11).
+        self.assertEqual(codigo, 2, self.diag("sin arrancar los nodos, agmen run sale con 2"))
         self.assertIn("cerraron agmen agent allá", texto)
         self.assertNotIn("todo arrancado", texto)
         self.assertNotIn("reintento", texto, "antes de arrancar los nodos no se reintenta")
