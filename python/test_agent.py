@@ -3630,7 +3630,8 @@ class E2E(E2EBase):
         self.assertIsNone(pa.poll(), "el agente sigue esperando")
 
     # --- cortes
-    def test_matar_el_agente_con_todo_corriendo_agmen_run_sale_distinto_de_0_y_lo_dice(self):
+    def test_matar_el_agente_con_todo_corriendo_agmen_run_sigue_reintenta_y_lo_dice(self):
+        # 3c: perder un agente ya no detiene todo: agmen run lo dice, sigue con lo local y reintenta hasta Ctrl+C
         pa, la, clave = self.agente()
         pr, lr = self.correr(clave=clave)
         self.assertTrue(self.espera(lambda: any("robot/motor │ HOLA motor" in l for l in lr) or pr.poll() is not None, 60),
@@ -3638,13 +3639,15 @@ class E2E(E2EBase):
         self.assertTrue(self.espera(lambda: self.vivo("ia") and self.vivo("motor"), 30))
         pa.kill()
         pa.wait()
-        code = pr.wait(40)
-        self.assertNotEqual(code, 0, self.texto(lr))
+        self.assertTrue(self.espera(lambda: any("se perdió la conexión" in l for l in lr), 30), self.texto(lr))
+        self.assertIsNone(pr.poll(), "agmen run ya no sale por perder un agente\n" + self.texto(lr))
+        self.assertTrue(self.vivo("ia"), "lo local sigue corriendo")
+        self.assertEqual(self.detener(pr), 0, self.texto(lr))
         t = self.texto(lr)
-        self.assertIn("se perdió la conexión con agmen agent", t)
-        self.assertIn("Se detiene todo", t)
+        self.assertIn("reintento", t)
+        self.assertIn("robot no se enteró (sin conexión)", t)
         self.assertNotIn("Traceback", t)
-        self.assertTrue(self.espera(lambda: not self.vivo("ia"), 30), "lo local debe detenerse al perderse la otra computadora")
+        self.assertTrue(self.espera(lambda: not self.vivo("ia"), 30), "Ctrl+C detiene lo local")
         # (los nodos del agente quedaron huérfanos porque se mató al agente sin avisarle: los limpia _limpiar)
 
     def test_matar_agmen_run_el_agente_detiene_sus_nodos_y_acepta_otra(self):

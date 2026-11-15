@@ -394,6 +394,14 @@ def _run(args) -> int:
             ctl = f" · {len(c.cfg.controls)} controles" if c.cfg.controls else ""
             launcher.say(f"mando '{c.cfg.name}' en el panel: {c.cfg.layout.name} → {c.cfg.target}{to} · {what}{ctl}")
 
+    # RFC 0011, parte 3c: desde aquí, perder una computadora ya no detiene todo: se reintenta hasta Ctrl+C.
+    # DECISIÓN PENDIENTE: antes de este punto (mientras se conecta con las demás, corre el before local o abre el
+    # panel) sigue valiendo la 3b: una computadora perdida no deja arrancar nada y agmen run sale con 1. Opciones:
+    # (a) así (lo conservador: nada arrancó aún); (b) reconectar también ahí y arrancar al volver.
+    for name, link in remotes.items():
+        source = keys[name][1]
+        if not link.keep_trying(hint=lambda code, name=name, source=source: _key_hint(name, source, code)):
+            stop.set()   # ya se había perdido: on_lost lo cuenta (y agmen run sale con 1, como en la 3b)
     if not stop.is_set():   # una computadora se perdió (o Ctrl+C) mientras se preparaba lo de aquí: no se arranca
         launcher.start_all()
         if not ctrl_c.pressed:
@@ -461,6 +469,18 @@ def _links_for(config, places: dict, archivo: str) -> tuple[dict, dict]:
     return links, keys
 
 
+def _key_hint(name: str, source: str, code: str) -> str:
+    """El "qué hacer" de una clave rechazada, según de dónde salió (keys.toml, la variable o escrita)."""
+    if code != "clave":
+        return ""
+    return {"guardada": f". La clave guardada ya no sirve (¿alguien corrió agmen agent --new-key?): "
+                        f"bórrala con agmen run --forget-key {name} y vuelve a correr agmen run "
+                        f"(te pide la nueva)",
+            "variable": ". Pon en AGMEN_AGENT_KEY la que muestra agmen agent al arrancar",
+            "escrita": ". Vuelve a correr agmen run y escribe la que muestra agmen agent al arrancar, "
+                       f"en la terminal de {name}"}[source]
+
+
 def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list, stop) -> str:
     """Abre la sesión con cada agente, una tras otra. Devuelve "" si todas se abrieron;
     si no, el error, y las que ya estaban abiertas reciben adios (no arranca nada)."""
@@ -491,15 +511,7 @@ def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list
             except AgentError as e:
                 if lost:   # otra se perdió mientras esta preparaba la sesión: ya recibió adios; cmd_run sale con 1
                     break
-                code = getattr(e, "code", "")
-                text = str(e)
-                if code == "clave":
-                    text += {"guardada": f". La clave guardada ya no sirve (¿alguien corrió agmen agent --new-key?): "
-                                         f"bórrala con agmen run --forget-key {name} y vuelve a correr agmen run "
-                                         f"(te pide la nueva)",
-                             "variable": ". Pon en AGMEN_AGENT_KEY la que muestra agmen agent al arrancar",
-                             "escrita": ". Vuelve a correr agmen run y escribe la que muestra agmen agent al arrancar, "
-                                        f"en la terminal de {name}"}[source]
+                text = str(e) + _key_hint(name, source, getattr(e, "code", ""))
                 for other in opened:
                     other.close()
                 return text
