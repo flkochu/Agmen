@@ -18,7 +18,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -28,11 +30,12 @@ import urllib.error
 import urllib.request
 import warnings
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import test_agent as ta   # solo se usan sus ayudantes y clases base (ninguna trae pruebas)
 from agmen import agent
-from agmen.agent import ChannelError, ChannelTimeout, HandshakeError, client_handshake, derive_key
+from agmen.agent import ChannelClosed, ChannelError, ChannelTimeout, HandshakeError, client_handshake, derive_key
 
 
 def setUpModule():
@@ -280,11 +283,29 @@ class TestIntermediario(unittest.TestCase):
 # 1. El protocolo, con una laptop de mentira hablando directo con un agente real
 # ===========================================================================
 
+class Dicho(list):
+    """Lo que dijo el agente, (texto, tipo), con la hora (monotonic) de cada cosa: medir tiempos con lo que el
+    agente DICE y no con "¿vive el nodo?", que en Windows solo ve un latido con una ventana de 3 s."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.horas: list[float] = []
+
+    def append(self, item) -> None:
+        self.horas.append(time.monotonic())
+        super().append(item)
+
+    def clear(self) -> None:
+        super().clear()
+        self.horas.clear()
+
+
 class ProtocoloCase(ta.ServerCase):
     """Un agente real en un hilo, con nodos que numeran sus líneas, y ayudantes para perder y reanudar."""
 
     def setUp(self):
         super().setUp()
+        self.said = Dicho()
         (self.dir / "nodo.py").write_text(NODO_CUENTA, encoding="utf-8")
 
     def parchea(self, modulo, nombre, valor):
@@ -312,6 +333,12 @@ class ProtocoloCase(ta.ServerCase):
 
     def dijo(self, fragmento: str) -> bool:
         return any(fragmento in t for t, _ in self.said)
+
+    def hora_dicho(self, fragmento: str) -> float | None:
+        for h, (t, _) in zip(self.said.horas, self.said):
+            if fragmento in t:
+                return h
+        return None
 
     def esperar_gracia(self):
         self.assertTrue(self.espera(lambda: self.dijo("dejó de contestar")), f"el agente no entró en gracia: {self.said}")
@@ -382,8 +409,13 @@ class TestProtocoloGracia(ProtocoloCase):
         t0 = time.monotonic()          # lo último que el agente recibió (un instante antes que esto)
         self.assertTrue(self.espera(lambda: self.dijo("no dijo nada en 1 s"), 10), self.lista_dicha())
         t_silencio = time.monotonic() - t0
+        self.assertTrue(self.espera(lambda: self.dijo("no volvió en 3 s"), 15), f"la gracia no se acabó\n{self.lista_dicha()}")
+        # el tiempo se mide con lo que el agente DICE, no con "¿vive el nodo?": en Windows nodo_vivo solo ve un latido
+        # con una ventana de 3 s y vería la muerte 3 s tarde (CI de Windows: 5.98 s)
+        t_fin = self.hora_dicho("no volvió en 3 s") - t0
         self.assertTrue(self.espera(lambda: not self.vivo("motor"), 15), f"los nodos siguen vivos\n{self.lista_dicha()}")
-        t_fin = time.monotonic() - t0
+        if os.name == "posix":   # aquí "murió" se ve al instante (el pid): también el tiempo real de la muerte
+            self.assertLess(time.monotonic() - t0, 3.9, f"los nodos murieron tarde\n{self.lista_dicha()}")
         self.assertLess(t_silencio, 2.2, "el silencio se da por perdido a 1 s")
         self.assertGreater(t_fin, 2.5, "la gracia dura ~3 s desde lo último recibido")
         self.assertLess(t_fin, 3.9, f"3 s de gracia contados desde lo último recibido, no desde el silencio (+1 s): "
@@ -793,6 +825,14 @@ class CortesBase(ta.E2EBase):
         for n in ("motor", "imu", "ia"):
             self.assertEqual(len(self.pids0[n]), 1)
 
+    def latido(self, nodo: str) -> float:
+        """La hora del último latido de un nodo de prueba (0 si nunca latió). Un nodo detenido deja de escribirlo:
+        comparar este valor dice "nadie arrancó" sin la ventana de nodo_vivo (que en Windows no mira el pid)."""
+        try:
+            return (self.marks / f"hb_{nodo}").stat().st_mtime
+        except OSError:
+            return 0.0
+
     def diag(self, que: str = "") -> str:
         try:
             estado = self.estado_panel() if self.web and self.pr.poll() is None else "(sin panel)"
@@ -949,7 +989,8 @@ class TestCortesDeRed(CortesBase):
         self.assertRegex(linea, r"la laptop \(127\.0\.0\.1\) dejó de contestar: sus nodos siguen \d+ s más por si vuelve "
                                 r"\(no dijo nada en 6 s\)")
         self.assertTrue(self.vivo("motor") and self.vivo("imu"), self.diag("en gracia los nodos siguen"))
-        # a los ~10 s (NO 16) desde lo último recibido, los detiene y lo dice
+        # a los ~10 s (NO 16) desde lo último recibido, los detiene y lo dice. El tiempo se mide con lo que el agente
+        # DICE (hora de su línea), no con "¿vive el nodo?": en Windows eso solo ve un latido con ventana y llega tarde
         t_muerte = [None]
 
         def murieron():
@@ -957,10 +998,14 @@ class TestCortesDeRed(CortesBase):
                 t_muerte[0] = time.monotonic()
             return t_muerte[0] is not None
 
-        self.assertTrue(self.espera(murieron, 25), self.diag("el agente no detuvo sus nodos"))
-        dt = t_muerte[0] - ultimo
-        self.assertTrue(9.0 <= dt <= 12.5, self.diag(f"los nodos murieron a {dt:.1f} s de lo último recibido "
+        self.esperar_linea("la laptop (127.0.0.1) no volvió en 10 s: detuve los nodos", 25, self.la)
+        dt = self.la.hora_de("no volvió en 10 s: detuve los nodos") - ultimo
+        self.assertTrue(9.0 <= dt <= 12.5, self.diag(f"el agente dijo que detuvo a {dt:.1f} s de lo último recibido "
                                                      "(la gracia es 10 s desde lo último recibido; 16 s sería mal contado)"))
+        self.assertTrue(self.espera(murieron, 25), self.diag("el agente no detuvo sus nodos"))
+        # (la muerte vista: en POSIX al instante; en Windows el latido con ventana de 1 s agrega hasta ~1 s)
+        self.assertLessEqual(t_muerte[0] - ultimo, 12.5 if os.name == "posix" else 14.0,
+                             self.diag("los nodos murieron tarde"))
         self.esperar_linea("la laptop (127.0.0.1) no volvió en 10 s: detuve los nodos", 10, self.la)
         self.assertTrue(self.espera(lambda: sum("(otra vez)" in l for l in self.la) >= 1, 15), self.diag("no volvió a esperar"))
         self.assertIsNone(self.pa.poll(), "el agente debe seguir vivo, esperando")
@@ -991,10 +1036,14 @@ class TestCortesDeRed(CortesBase):
         self.assertNotIn("no se reinició nada", self.texto(self.lr))
         self.assertTrue(self.espera_estado("motor", "detenido") and self.espera_estado("imu", "detenido"),
                         self.diag("los nodos del robot deben verse 'detenido'"))
-        # ninguno arranca solo (un rato corto: lo que se vería si arrancaran de inmediato)
+        # ninguno arranca solo (un rato corto: lo que se vería si arrancaran de inmediato). NO con "¿vive?": en Windows
+        # el latido viejo sigue "vivo" durante su ventana de 3 s (CI de Windows: "un nodo arrancó solo" con los
+        # nodos detenidos). Se compara el latido: si nadie arranca, el archivo no vuelve a escribirse.
+        self.assertTrue(self.ninguno_vivo(("motor", "imu"), 1.0), self.diag("los nodos del robot siguen vivos"))
+        hb0 = {n: self.latido(n) for n in ("motor", "imu")}
         fin = time.monotonic() + 2.5
         while time.monotonic() < fin:
-            self.assertFalse(self.vivo("motor") or self.vivo("imu"), self.diag("un nodo arrancó solo"))
+            self.assertEqual({n: self.latido(n) for n in ("motor", "imu")}, hb0, self.diag("un nodo arrancó solo"))
             time.sleep(0.1)
         self.assertEqual(self.pids_de_marcas(), self.pids0, self.diag("arrancó algún nodo del robot solo"))
         self.assertEqual(self.estados()["ia"], "corriendo")
@@ -1004,7 +1053,7 @@ class TestCortesDeRed(CortesBase):
                         self.diag("la orden arrancar no arrancó motor"))
         self.assertTrue(self.espera_estado("motor", "corriendo"), self.diag())
         self.assertEqual(len(self.pids_de_marcas()["imu"]), 1, "imu no se pidió: no debe haber arrancado")
-        self.assertFalse(self.vivo("imu"))
+        self.assertEqual(self.latido("imu"), hb0["imu"], "imu no se pidió: no debe haber latido de nuevo")
         codigo, _ = self.ctrl_c_a_run()
         self.assertEqual(codigo, 0, self.diag())
 
