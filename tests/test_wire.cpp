@@ -537,7 +537,7 @@ void hub_modo_red() {
         {"robot@1.2.3.4:80", "IP válida"},
     };
     for (const auto& [bad, why] : malos) {
-        espera_rechazo([bad = bad] { (void)hub::parse_peers(bad); }, why, bad);
+        espera_rechazo([texto = bad] { (void)hub::parse_peers(texto); }, why, bad);
     }
     // Con AGMEN_NET_IP (pruebas), una 127.x vale como otra computadora; 127.0.0.1, nunca.
     CHECK(hub::parse_peers("a@127.0.0.4", true) ==

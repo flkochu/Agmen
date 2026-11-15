@@ -1618,7 +1618,7 @@ std::optional<RawSample> SubscriberCore::receive_raw(std::chrono::milliseconds t
             continue;
         }
         if (s.allowed) s.expire_check();   // antes de aceptar conexiones TCP (RFC 0011 §9.2)
-        bool last = true;   // ¿esta espera llega hasta `deadline`? (o hasta cerrar los sockets de antes)
+        bool hasta_el_final = true;   // ¿esta espera llega hasta `deadline`? (o hasta cerrar los sockets de antes)
         if (s.old_until) {
             if (now >= *s.old_until) {
                 s.retire_old();
@@ -1627,7 +1627,7 @@ std::optional<RawSample> SubscriberCore::receive_raw(std::chrono::milliseconds t
             if (const auto until_old = duration_cast<milliseconds>(*s.old_until - now) + milliseconds(1);
                 until_old < wait) {
                 wait = until_old;
-                last = false;
+                hasta_el_final = false;
             }
         }
         std::vector<std::intptr_t> handles{s.socket.native_handle()};
@@ -1637,7 +1637,7 @@ std::optional<RawSample> SubscriberCore::receive_raw(std::chrono::milliseconds t
         std::unique_ptr<bool[]> ready(new bool[handles.size()]());
         const int n = net::wait_readable(handles, wait, std::span<bool>(ready.get(), handles.size()));
         if (n <= 0) {
-            if (last) return std::nullopt;
+            if (hasta_el_final) return std::nullopt;
             continue;
         }
         const auto moves = s.moves;

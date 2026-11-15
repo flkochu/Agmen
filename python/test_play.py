@@ -176,9 +176,9 @@ class TestReproducir(PlayCase):
         seen = []
         orig = _tcp.Fanout.__init__
 
-        def spy(fan, topic="", source_id=0, topic_id=0):
+        def spy(fan, topic="", source_id=0, topic_id=0, **kw):   # **kw: lo que Fanout gane después (p. ej. net)
             seen.append(source_id)
-            orig(fan, topic, source_id, topic_id)
+            orig(fan, topic, source_id, topic_id, **kw)
 
         _tcp.Fanout.__init__ = spy
         try:
