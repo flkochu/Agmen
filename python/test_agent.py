@@ -1586,7 +1586,7 @@ class TestColaDeSalida(unittest.TestCase):
         self.assertEqual(res[0][0], "estado")
 
 
-class TestCortes(unittest.TestCase):
+class TestCortarLineas(unittest.TestCase):   # antes TestCortes: la tapaba la otra TestCortes y no corría
     def test_cortar_y_limpiar(self):
         self.assertEqual(agent._cut("hola"), "hola")
         largo = agent._cut("é" * 20000)
