@@ -498,8 +498,12 @@ cmd = "python {(TMP / 'fino.py').as_posix()}"
         avisos_py = [l for l in avisos if l.startswith("[fino]")]
         print(f"  reloj corriendo, 5 s sin pasos (control): saltados {ctrl}", flush=True)
         print(f"  reloj corriendo, 5 x (seguir -> paso):    saltados {paso}, tarde {tarde}", flush=True)
+        # Margen de 4: el control y la variante son ventanas de tiempo distintas, y en un runner cargado el nodo
+        # de Python salta algún ciclo por su cuenta (en el CI de Windows: control 0, con pasos 2, con 57 ciclos
+        # tarde en esa misma medición). Sin el arreglo, cada paso de 0.1 s se lleva ~10 ciclos de 10 ms (~50 en
+        # 5 pasos); y un defecto de un solo ciclo por paso (5) todavía se nota.
         check("seguir -> paso, 5 veces: el nodo de Python every(10 ms) no suma ciclos saltados",
-              paso[py] <= ctrl[py] + 1 and paso[py] >= 0, f"control {ctrl[py]}, con pasos {paso[py]}")
+              paso[py] <= ctrl[py] + 4 and paso[py] >= 0, f"control {ctrl[py]}, con pasos {paso[py]}")
         check("…y no sale el aviso de 'ciclos saltados' del nodo de Python", not avisos_py, "\n".join(avisos_py[:3]))
         check("…y corrió", ran(*py) > r0[py], f"{r0[py]} -> {ran(*py)}")
         if exe:
