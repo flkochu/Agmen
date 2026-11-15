@@ -3423,10 +3423,15 @@ class E2EBase(unittest.TestCase):
         if hub_env:
             env["AGMEN_HUB"] = hub_env
         p, lineas = self.lanzar(["agent", str(toml or self.toml), "--machine", "robot", "--port", str(self.port)], env)
-        self.assertTrue(self.espera(lambda: any("clave: " in l for l in lineas) or p.poll() is not None, 40),
-                        "".join(lineas))
+        self.assertTrue(self.espera(lambda: any("esperando a agmen run" in l for l in lineas) or p.poll() is not None,
+                                    40), "".join(lineas))
         self.assertIsNone(p.poll(), "".join(lineas))
-        clave = next(l for l in lineas if "clave: " in l).rsplit("clave: ", 1)[1].strip()
+        # Con la salida por una tubería el agente no imprime la clave (3c §5): se pide con --show-key,
+        # con la misma carpeta de configuración.
+        r = subprocess.run([sys.executable, "-m", "agmen", "agent", "--show-key"], env=env, capture_output=True,
+                           text=True, encoding="utf-8", timeout=60, stdin=subprocess.DEVNULL)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        clave = r.stdout.strip()
         return p, lineas, clave
 
     def correr(self, clave: str | None = KEY, args: tuple = ("--no-web",), toml: Path | None = None, **extra):

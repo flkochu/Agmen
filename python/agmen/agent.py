@@ -302,6 +302,18 @@ def load_agent_key(new: bool = False) -> tuple[str, bool]:
     return key, False
 
 
+def saved_agent_key() -> str:
+    """La clave guardada del agente, para agmen agent --show-key (RFC 0011 parte 3c §5): solo la
+    lee, nunca la crea ni la cambia. AgentKeyError, que dice cómo se crea, si aún no hay."""
+    path = agent_key_path()
+    if not path.exists():
+        raise AgentKeyError(f"todavía no hay clave de agmen agent en esta computadora (se guarda en {path}). Se crea "
+                            f"la primera vez que corres agmen agent robot.toml. Si el agente corre como servicio con "
+                            f"otro usuario, su clave está en la carpeta de ese usuario: corre --show-key como él "
+                            f"(ej. sudo -u ESE_USUARIO agmen agent --show-key)")
+    return _read_agent_key(path)
+
+
 def machine_address(host: str, port: int) -> str:
     """Cómo se guarda una [[machine]] en keys.toml: "192.168.1.20:7391", "[fe80::1%eth0]:7391"."""
     base, sep, zone = host.partition("%")   # la zona (%eth0) es el nombre de una interfaz: tal cual
@@ -2198,6 +2210,7 @@ class AgentLink:
         # al reanudar last_ok tampoco sube hasta el pong del ping de confirmación (§14).
         self.last_tx = 0.0
         self.down_since: float | None = None   # sin conexión, reintentando, desde (monotonic)
+        self.state_since = time.monotonic()    # desde cuándo está como está (conectado, sin conexión…): el panel
         self.farewell = ""                  # el motivo del adios del agente (§10): lo cerraron a propósito allá
         self._closing = False
         self._done = threading.Event()      # ping y lector de la conexión actual: terminar
@@ -2280,6 +2293,7 @@ class AgentLink:
             raise
         self._took(ok, contact)
         self.version = _clean(channel.peer_version, 40)
+        self.state_since = time.monotonic()
         self._reader = threading.Thread(target=self._read_loop, args=(channel, self._gen), daemon=True,
                                         name=f"agmen-agent-{self.name}")
         self._reader.start()
@@ -2434,6 +2448,42 @@ class AgentLink:
             return self.grace
         return max(0.0, self.grace - (time.monotonic() - self.last_ok))
 
+    def status(self) -> dict:
+        """Cómo está la conexión, para el panel (RFC 0011 parte 3c §4, §13.2): `state` ("conectado" o
+        "sin conexión"), `since` (s en ese estado), `grace_left` (la cuenta pesimista; None si no aplica)
+        y `detail` (lo que dice la línea de esta computadora en la tarjeta Nodos, ya en palabras)."""
+        now = time.monotonic()
+        with self._lock:
+            down, farewell, lost, closing = self.down_since, self.farewell, self.lost, self._closing
+            connected = self.channel is not None
+            since = round(max(0.0, now - self.state_since), 1)
+        out = {"state": OFFLINE, "since": since, "grace_left": None}
+        if closing:
+            return {**out, "detail": "sin conexión · agmen run se está cerrando"}
+        if lost:   # sin reintentos (antes de arrancar los nodos, o no se pudo reintentar): agmen run se detiene
+            return {**out, "detail": "sin conexión · se perdió la conexión: agmen run se detiene"}
+        if down is None:
+            if connected:
+                return {**out, "state": "conectado", "detail": "conectado"}
+            return {**out, "detail": "sin conexión · todavía no se conecta"}
+        # DECISIÓN PENDIENTE: la §4 no da el texto de esta línea tras el adios del agente (§10); este repite lo que
+        # dice la terminal. Igual con "agmen run se está cerrando", "se perdió la conexión: agmen run se detiene" y
+        # "todavía no se conecta" (estados de paso que la especificación no nombra).
+        if farewell:   # §10: lo cerraron allá a propósito, con los nodos ya detenidos (no hay gracia que contar)
+            return {**out, "detail": f"sin conexión · cerraron agmen agent allá ({farewell}) · sus nodos están "
+                                     f"detenidos · reintentando"}
+        # Las dos cuentas son las de la terminal (grace_left y safe_end), no otra aritmética. Una reanudación
+        # sin confirmar (§14) sigue aquí: down_since no se limpia hasta el pong del ping de confirmación.
+        left = self.grace_left()   # la cuenta pesimista: nunca promete de más
+        whole = math.floor(left)
+        if whole > 0:
+            detail = f"sin conexión · reintentando · sus nodos siguen {whole} s"
+        elif time.monotonic() < self.safe_end():   # entre las dos cuentas (§13.2): no se afirma nada
+            detail = "sin conexión · puede que ya haya detenido sus nodos"
+        else:   # pasada la cuenta segura (§14): una presunción bien fundada, no una garantía
+            detail = "sin conexión · ya habrá detenido sus nodos"
+        return {**out, "grace_left": math.floor(left * 10) / 10, "detail": detail}
+
     def _read_loop(self, channel: Channel, gen: int) -> None:
         try:
             self._read(channel, gen)
@@ -2512,6 +2562,7 @@ class AgentLink:
             if self._closing or self.lost or self.down_since is not None or (gen is not None and gen != self._gen):
                 return
             resilient, pending = self._resilient, self._pending
+            self.state_since = now
             if resilient:
                 self.down_since = now
                 self.farewell = farewell
@@ -2577,6 +2628,7 @@ class AgentLink:
             if self._closing or self.lost:
                 return
             self._resilient = False
+            self.state_since = time.monotonic()
             self.lost = (f"{self.name} ({self.shown}): se perdió la conexión con agmen agent y {why}. Se detiene todo. "
                          f"Revisa {self.name} y vuelve a correr agmen run")
         self._retry_stop.set()
@@ -2799,6 +2851,7 @@ class AgentLink:
                 self.channel, self._done = channel, done
                 since, self.down_since = self.down_since, None
                 last_ok, farewell, self.farewell = self.last_ok, self.farewell, ""
+                was, self.state_since = self.state_since, time.monotonic()
                 self._noted = set()
         if closing:   # Ctrl+C mientras reconectaba: que el agente lo sepa
             done.set()
@@ -2844,6 +2897,7 @@ class AgentLink:
                 if mine:
                     self._gen += 1   # su lector, si alcanzó a arrancar, ya no toca nada
                     self.channel, self.down_since, self.farewell = None, since, farewell
+                    self.state_since = was
             done.set()
             channel.close()
             if mine:
@@ -2898,6 +2952,8 @@ class AgentLink:
         """adios y cierra (sin esperar a los nodos; lo que tarde el agente en cerrar, hasta BYE_TIMEOUT).
         También deja de reintentar."""
         with self._lock:
+            if not self._closing:
+                self.state_since = time.monotonic()
             self._closing = True
             channel, self.channel = self.channel, None
         self._retry_stop.set()
@@ -2934,6 +2990,7 @@ class RemoteNode(Node):
                 "exit_code": self.exit_code,
                 "restart": self.cfg.restart,
                 "machine": self.link.name,
+                "known_state": self.known_state,   # en "sin conexión": el último estado que se supo (para el panel)
             }
 
     def _log(self, text: str, kind: str = "out", own: bool = False) -> None:

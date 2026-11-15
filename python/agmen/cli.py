@@ -556,15 +556,18 @@ def cmd_agent(args) -> int:
     from .machines import _address
     from .run import ConfigError, Printer, load_config
 
+    if args.show_key:
+        return _show_agent_key(args)
+    archivo = args.archivo or "robot.toml"
     try:
-        config = load_config(args.archivo)
+        config = load_config(archivo)
     except ConfigError as e:
-        print(f"error en {args.archivo}: {e}", file=sys.stderr)
+        print(f"error en {archivo}: {e}", file=sys.stderr)
         return 2
     try:
         me = pick_machine(config, args.machine)
     except AgentError as e:
-        print(f"error en {args.archivo}: {e}", file=sys.stderr)
+        print(f"error en {archivo}: {e}", file=sys.stderr)
         return 2
     if args.port is not None and not 1 <= args.port <= 65535:
         print(f"error: --port {args.port}: el puerto es un número entre 1 y 65535", file=sys.stderr)
@@ -577,7 +580,7 @@ def cmd_agent(args) -> int:
         printer("agmen agent", text, kind)
 
     # Primero el puerto y luego la clave: con el puerto ocupado, --new-key no tira la clave de antes.
-    server = AgentServer(args.archivo, me.name, None, port=port, shown=f"{host}:{port}", say=say)
+    server = AgentServer(archivo, me.name, None, port=port, shown=f"{host}:{port}", say=say)
     try:
         server.bind()
     except OSError as e:
@@ -603,7 +606,11 @@ def cmd_agent(args) -> int:
     if created:
         say(f"clave {'nueva' if args.new_key else 'creada'} (guardada en {agent_key_path()}): agmen run te la pide "
             f"la primera vez que se conecta" + ("; la clave anterior ya no sirve" if args.new_key else ""))
-    say(f"{server.waiting_line()} · clave: {key}", "out")
+    if _is_terminal(sys.stdout):
+        say(f"{server.waiting_line()} · clave: {key}", "out")
+    else:   # un servicio (journalctl) o una tubería: la clave no se escribe en un log (RFC 0011 parte 3c §5)
+        say(f"{server.waiting_line()} · clave: guardada en {agent_key_path()} (agmen agent --show-key la muestra)",
+            "out")
     stop = threading.Event()
     threading.Thread(target=server.serve, args=(stop,), daemon=True, name="agmen-agent").start()
     got: list = []
@@ -617,6 +624,39 @@ def cmd_agent(args) -> int:
         server.close(names.get(got[0], "Ctrl+C") if got else "Ctrl+C")   # el motivo va en el adios (§10)
         say("listo. ¡Hasta luego!")
         printer.close()
+    return 0
+
+
+def _is_terminal(stream) -> bool:
+    """¿`stream` es una terminal? (Sin salida, como pythonw en Windows, o si no se puede saber: no.)"""
+    try:
+        return stream is not None and stream.isatty()
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def _show_agent_key(args) -> int:
+    """agmen agent --show-key (RFC 0011 parte 3c §5): imprime solo la clave guardada y sale. No lee
+    robot.toml, no abre puertos y nunca crea ni cambia la clave."""
+    from .agent import AgentError, saved_agent_key
+
+    if args.new_key:   # una crea y la otra solo lee: juntas no queda claro cuál se quería
+        print("error: --show-key y --new-key no van juntas: --show-key solo muestra la clave guardada y --new-key "
+              "crea otra al arrancar el agente. Primero agmen agent robot.toml --new-key; luego, si la necesitas, "
+              "agmen agent --show-key", file=sys.stderr)
+        return 2
+    ignored = [what for what, given in ((args.archivo, args.archivo is not None),
+                                        ("--machine", args.machine is not None),
+                                        ("--port", args.port is not None)) if given]
+    try:
+        key = saved_agent_key()
+    except AgentError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if ignored:   # a stderr: en stdout va solo la clave (para scripts)
+        print(f"nota: --show-key no usa {' ni '.join(ignored)}: la clave es de esta computadora (de tu usuario), "
+              f"la misma para cualquier robot.toml", file=sys.stderr)
+    print(key)
     return 0
 
 
@@ -879,13 +919,15 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("agent", help="en otra computadora del robot: espera a agmen run y corre ahí sus nodos")
-    p.add_argument("archivo", nargs="?", default="robot.toml", help="archivo del robot (default: robot.toml)")
+    p.add_argument("archivo", nargs="?", default=None, help="archivo del robot (default: robot.toml)")
     p.add_argument("--machine", metavar="NOMBRE",
                    help="qué [[machine]] es esta computadora (default: la única cuyo host es de aquí)")
     p.add_argument("--port", type=int, metavar="N",
                    help="dónde escuchar (default: el puerto del host de su [[machine]], 7391)")
     p.add_argument("--new-key", action="store_true",
                    help="crear una clave nueva (la anterior deja de servir; la laptop la pide otra vez)")
+    p.add_argument("--show-key", action="store_true",
+                   help="mostrar la clave guardada de esta computadora y salir (si el agente corre como servicio)")
     p.set_defaults(func=cmd_agent)
 
     p = sub.add_parser("web", help="solo el panel web (sin administrar nodos); o una grabación: agmen web vuelta1.mcap")

@@ -56,6 +56,14 @@
   .node .meta { grid-column: 2; color: var(--muted); font-size: 12px; }
   .node .acts { grid-row: 1 / span 2; grid-column: 3; display: flex; gap: 6px; }
   .node .acts button { width: 32px; padding: 4px 0; }
+  /* varias computadoras (RFC 0011 parte 3c §4): solo aparece si robot.toml tiene [[machine]] */
+  .dot.off { background: transparent; box-shadow: inset 0 0 0 2px var(--warn); }
+  .machines { padding: 2px 6px 8px; border-bottom: 1px solid var(--line); margin-bottom: 2px; }
+  .machine { display: flex; gap: 8px; align-items: center; font: 12px/1.6 var(--mono); }
+  .machine .mname { font-weight: 600; }
+  .machine .mdetail { color: var(--muted); }
+  .machine.off .mdetail, .node.off .meta { color: var(--warn); }
+  .node .name .mach { color: var(--muted); font-weight: 400; }
   .tag { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
 
   /* manejar */
@@ -329,7 +337,27 @@ function connect() {
 }
 
 // ---------- nodos ----------
-const STATE_DOT = { "corriendo": "ok", "reiniciando": "warn", "falló": "bad", "detenido": "", "terminó": "" };
+const STATE_DOT = { "corriendo": "ok", "reiniciando": "warn", "falló": "bad", "detenido": "", "terminó": "",
+                    "sin conexión": "off" };
+const OFFLINE = "sin conexión";         // un nodo de otra computadora con la que se perdió la conexión (RFC 0011 parte 3c)
+const MACHINE_DOT = { "aquí": "", "conectado": "ok", "sin conexión": "off" };
+// Una línea por computadora del robot ([[machine]]), arriba de sus nodos. Sin [[machine]] no se dibuja nada.
+function renderMachines(box, list) {
+  if (!list.length) return;
+  const wrap = document.createElement("div");
+  wrap.className = "machines";
+  for (const m of list) {
+    const line = document.createElement("div");
+    line.className = "machine" + (m.state === OFFLINE ? " off" : "");
+    line.innerHTML = `<span class="dot ${MACHINE_DOT[m.state] || ""}"></span>
+      <span><span class="mname"></span> <span class="mhost"></span>: <span class="mdetail"></span></span>`;
+    line.querySelector(".mname").textContent = m.name;
+    line.querySelector(".mhost").textContent = `(${m.host})`;
+    line.querySelector(".mdetail").textContent = m.detail || m.state;
+    wrap.appendChild(line);
+  }
+  box.appendChild(wrap);
+}
 function renderNodes() {
   const box = $("nodes");
   if (!state.managed) {
@@ -341,23 +369,35 @@ function renderNodes() {
   const running = state.nodes.filter((n) => n.state === "corriendo").length;
   $("nodesum").textContent = `${running}/${state.nodes.length} corriendo`;
   box.innerHTML = "";
+  const machines = state.machines || [];
+  renderMachines(box, machines);
+  const machineOf = {};
+  for (const m of machines) machineOf[m.name] = m;
   for (const n of state.nodes) {
+    const m = n.machine != null ? machineOf[n.machine] : null;
+    const remote = !!(m && !m.here);              // de otra computadora: se ve como robot/motor
+    const away = !!(m && m.state === OFFLINE);    // sin conexión con su computadora: sin órdenes
     const row = document.createElement("div");
-    row.className = "node" + (filter === n.name ? " sel" : "");
+    row.className = "node" + (filter === n.name ? " sel" : "") + (n.state === OFFLINE ? " off" : "");
     row.title = n.cmd;
-    const alive = n.state === "corriendo" || n.state === "reiniciando";
+    const shownState = n.state === OFFLINE && n.known_state ? n.known_state : n.state;
+    const alive = shownState === "corriendo" || shownState === "reiniciando";
     let meta = n.state;
+    // DECISIÓN PENDIENTE: cómo se dice el último estado conocido de un nodo sin conexión (§3 pide no perderlo; el texto es nuestro)
+    if (n.state === OFFLINE && n.known_state) meta += ` · lo último que se supo: ${n.known_state}`;
     if (n.state === "corriendo") meta += ` · ${fmtUptime(n.uptime)} · pid ${n.pid}`;
     if (n.exit_code != null && (n.state === "falló" || n.state === "terminó")) meta += ` (código ${n.exit_code})`;
     if (n.restarts) meta += ` · reinicios ${n.restarts}`;
     row.innerHTML = `<span class="dot ${STATE_DOT[n.state] || ""}"></span>
-      <span class="name"><span class="tag" style="background:${colorOf(n.name)}"></span>${esc(n.name)}</span>
+      <span class="name"><span class="tag" style="background:${colorOf(n.name)}"></span>${remote ? `<span class="mach">${esc(m.name)}/</span>` : ""}${esc(n.name)}</span>
       <span class="acts"></span><span class="meta"></span>`;
     row.querySelector(".meta").textContent = meta;
     const acts = row.querySelector(".acts");
+    const why = away ? `no hay conexión con ${m.name} (${String(m.detail || m.state).replace(/^sin conexión · /, "")}): ` +
+                       "no se le puede mandar nada hasta que vuelva" : "";
     const mk = (label, title, action, enabled) => {
       const b = document.createElement("button");
-      b.textContent = label; b.title = title; b.disabled = !enabled;
+      b.textContent = label; b.title = away ? why : title; b.disabled = away || !enabled;
       b.onclick = (ev) => { ev.stopPropagation(); act({ op: "node", name: n.name, action }); };
       acts.appendChild(b);
     };
@@ -800,12 +840,14 @@ function onState(m) {
   $("robot").textContent = m.robot ? "· " + m.robot : "";
   $("ver").textContent = "v" + m.version;
   const prevTeleop = !!state.teleop;
-  state = { nodes: m.nodes, teleop: m.teleop, managed: m.managed, recording: m.recording || null,
+  state = { nodes: m.nodes, teleop: m.teleop, managed: m.managed, recording: m.recording || null, machines: m.machines || [],
             commands: m.commands || [], muxes: m.muxes || [], gaps: m.gaps || [],
             profile: m.profile || "real", playing: !!m.playing, robot: m.robot || "" };
   renderProfile(!rec);
   document.querySelector(".logs").style.display = m.managed ? "" : "none";  // agmen web: no hay nodos que mostrar
-  const key = JSON.stringify(m.nodes.map((n) => [n.name, n.state, n.restarts, n.pid, Math.floor((n.uptime || 0))]));
+  const key = JSON.stringify([m.nodes.map((n) => [n.name, n.state, n.restarts, n.pid, Math.floor((n.uptime || 0)),
+                                                  n.machine, n.known_state]),
+                              state.machines.map((x) => [x.name, x.state, x.detail])]);
   if (key !== onState.nodesKey) {
     const names = JSON.stringify(m.nodes.map((n) => n.name));
     const namesChanged = names !== onState.names;

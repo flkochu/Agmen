@@ -1162,6 +1162,7 @@ class Launcher:
             link.attach(self.logs, self.printer)
         self.stopping = threading.Event()
         self.recording = None    # el control de grabación (RFC 0010); lo pone agmen run
+        self._born = time.monotonic()
 
     @staticmethod
     def _check_places(config: RobotConfig, places: dict | None, remotes: dict | None = None) -> dict:
@@ -1251,4 +1252,34 @@ class Launcher:
         return None
 
     def nodes_info(self) -> list[dict]:
-        return [n.info() for n in self.nodes.values()]
+        """Los nodos para el panel; cada uno con `machine` (RFC 0011 parte 3c §4): el nombre de su
+        [[machine]], o None si corre aquí sin [[machine]] (o con [profile.X] local = true)."""
+        out = []
+        for n in self.nodes.values():
+            info = n.info()
+            info["machine"] = None if self.config.local else (info.get("machine") or n.cfg.machine or None)
+            out.append(info)
+        return out
+
+    def machines_info(self) -> list[dict]:
+        """Las [[machine]] que usa el perfil activo, en el orden de robot.toml, para el panel (RFC 0011
+        parte 3c §4): name, host, here, state ("aquí", "conectado" o "sin conexión"), since (s en ese
+        estado), grace_left (s que le quedan seguro a la gracia del robot; None si no aplica) y detail
+        (en palabras). Vacía sin [[machine]] o con [profile.X] local = true: el panel se ve como siempre."""
+        if self.config.local:
+            return []
+        from .machines import _address
+
+        out = []
+        for m in self.config.machines:
+            if m.name not in self.places:
+                continue   # ningún nodo de este perfil corre ahí
+            link = self.remotes.get(m.name)
+            entry = {"name": m.name, "host": _address(m), "here": link is None}
+            if link is None:   # es esta computadora (DECISIÓN PENDIENTE: el texto de `detail`; la §4 no lo da)
+                entry.update(state="aquí", since=round(time.monotonic() - self._born, 1), grace_left=None,
+                             detail="aquí (esta computadora)")
+            else:
+                entry.update(link.status())
+            out.append(entry)
+        return out

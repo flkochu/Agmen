@@ -969,7 +969,8 @@ class TestCortesDeRed(CortesBase):
         codigo, t = self.ctrl_c_a_run()
         self.assertEqual(codigo, 0, self.diag("Ctrl+C tras reconectar"))
         self.assertTrue(self.ninguno_vivo(("motor", "imu", "ia")), self.diag("quedaron nodos vivos"))
-        self.assertNotIn(self.clave, self.texto(self.lr) + self.texto(self.la).replace(f"clave: {self.clave}", ""))
+        # con la salida por una tubería el agente no escribe la clave en ninguna línea (3c §5)
+        self.assertNotIn(self.clave, self.texto(self.lr) + self.texto(self.la))
 
     def test_congelar_pierde_lo_que_iba_en_camino_y_al_volver_llega_todo_una_vez(self):
         """La red no corta: se queda muda 3 s (lo mandado se pierde) y luego se reinicia. Las líneas que el agente

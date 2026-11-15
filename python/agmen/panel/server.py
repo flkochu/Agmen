@@ -426,13 +426,27 @@ class Panel:
         for c in self.commands:
             c.close()
 
+    def nodes_info(self) -> list[dict]:
+        """Los nodos, cada uno con `machine` (RFC 0011 parte 3c §4; None si corre aquí sin [[machine]])."""
+        nodes = self.launcher.nodes_info() if self.launcher else []
+        for n in nodes:
+            n.setdefault("machine", None)
+        return nodes
+
+    def machines_info(self) -> list[dict]:
+        """Las computadoras del robot y cómo está la conexión con cada una (RFC 0011 parte 3c §4).
+        Vacía sin [[machine]] (o con un Launcher que no las conoce): el panel se ve como siempre."""
+        get = getattr(self.launcher, "machines_info", None) if self.launcher is not None else None
+        return get() if get is not None else []
+
     def snapshot(self) -> dict:
         return {
             "robot": self.robot_name,
             "profile": self.profile,
             "playing": self.playing,
             "version": __version__,
-            "nodes": self.launcher.nodes_info() if self.launcher else [],
+            "nodes": self.nodes_info(),
+            "machines": self.machines_info(),
             "managed": self.launcher is not None,
             "teleop": self.teleop.info() if self.teleop else None,
             "commands": [c.info() for c in self.commands],
