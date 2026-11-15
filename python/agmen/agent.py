@@ -2189,12 +2189,12 @@ class AgentLink:
         done = self._done
         self._start_ping(channel, done)
         try:
-            ok = self._wait_ok(channel, session, stop)
+            ok, contact = self._wait_ok(channel, session, stop)
         except BaseException:
             done.set()
             self.channel = None
             raise
-        self._took(ok)
+        self._took(ok, contact)
         self.version = _clean(channel.peer_version, 40)
         self._reader = threading.Thread(target=self._read_loop, args=(channel, self._gen), daemon=True,
                                         name=f"agmen-agent-{self.name}")
@@ -2226,11 +2226,13 @@ class AgentLink:
             sock.close()
             raise
 
-    def _wait_ok(self, channel: Channel, session: dict, stop: threading.Event | None) -> dict:
-        """Manda `session` y espera sesion_ok (lo devuelve). LinkError si no; en cualquier error, adios
-        al agente y se cierra la conexión."""
+    def _wait_ok(self, channel: Channel, session: dict, stop: threading.Event | None) -> tuple[dict, float]:
+        """Manda `session` y espera sesion_ok. Devuelve (sesion_ok, último contacto confirmado: cuándo se
+        mandó `session`, o el t del último pong que llegó mientras el agente preparaba la sesión; §11).
+        LinkError si no; en cualquier error, adios al agente y se cierra la conexión."""
         where = f"{self.name} ({self.shown})"
         try:
+            contact = time.monotonic()   # antes de mandarla: el agente la recibió en este momento o después
             try:
                 channel.send(session)
             except ChannelError as e:   # se cayó (o se reinició) justo tras el saludo: no es un bug
@@ -2256,7 +2258,7 @@ class AgentLink:
                                                  f"computadoras tienen la misma versión de Agmen?")
                 op = msg["op"]
                 if op == "sesion_ok":
-                    return msg
+                    return msg, contact
                 if op == "sesion_error":
                     raise self._session_error(msg)
                 if op == "adios":   # §10: lo cerraron allá mientras preparaba la sesión
@@ -2264,11 +2266,20 @@ class AgentLink:
                                                f"preparaba la sesión. Vuelve a correr agmen run cuando agmen agent "
                                                f"esté corriendo otra vez en {self.name}")
                 silent_until = time.monotonic() + SILENCE_TIMEOUT
-                if op != "estado":   # antes de sesion_ok no debería llegar ninguno: se ignora
+                if op == "pong":
+                    contact = self._confirmed(msg, contact)
+                elif op != "estado":   # antes de sesion_ok no debería llegar ninguno: se ignora
                     self._dispatch(msg)
         except BaseException:
             _bye(channel)   # Ctrl+C, stop o un error mientras se preparaba: que el agente lo sepa (y cierra)
             raise
+
+    @staticmethod
+    def _confirmed(msg: dict, since: float) -> float:
+        """Un pong sube el último contacto confirmado a su t (el monotonic de un ping de aquí: el agente
+        recibió algo en ese momento o después), si es más nuevo que `since` y no del futuro (§9, §11)."""
+        t = msg.get("t")
+        return t if isinstance(t, float) and since < t <= time.monotonic() else since
 
     @staticmethod
     def _motive(msg: dict) -> str:
@@ -2282,13 +2293,13 @@ class AgentLink:
             text = f"{self.name}: {text}"
         return LinkError(code, text)
 
-    def _took(self, ok: dict) -> None:
+    def _took(self, ok: dict, contact: float) -> None:
         """Lo que trae sesion_ok para reanudar (un agente sin 'sesion' no se puede reanudar: se abre otra)."""
         sid, grace = ok.get("sesion"), ok.get("gracia")
         self.session_id = sid if isinstance(sid, str) and _HEX32.fullmatch(sid) else ""
         self.grace = float(grace) if isinstance(grace, (int, float)) and not isinstance(grace, bool) \
             and 0 < grace <= 3600 else GRACE
-        self.last_ok = time.monotonic()
+        self.last_ok = contact
 
     def _handshake_error(self, e: HandshakeError, where: str) -> LinkError:
         if e.code == "clave":
@@ -2374,9 +2385,8 @@ class AgentLink:
         elif op == "error":
             self._say(msg.get("texto", ""), "error")
         elif op == "pong":   # el último contacto confirmado (§9): el t es el monotonic de un ping de aquí
-            t, now = msg.get("t"), time.monotonic()
-            if isinstance(t, float) and self.down_since is None and self.last_ok < t <= now:
-                self.last_ok = t
+            if self.down_since is None:
+                self.last_ok = self._confirmed(msg, self.last_ok)
         # lo que no conozca (un agente más nuevo): nada
 
     def _note_once(self, what: str, text: str) -> None:
@@ -2507,13 +2517,14 @@ class AgentLink:
                 _bye(channel)
                 return None
             if self.session_id:
+                contact = time.monotonic()   # §11: antes de mandarlo (el agente lo recibió entonces o después)
                 channel.send({"op": "reanudar", "sesion": self.session_id, "logs": dict(self._log_n)})
-                msg = self._first_reply(channel)
+                msg, contact = self._first_reply(channel, contact)
                 if msg is None:   # stop
                     _bye(channel)
                     return None
                 if msg["op"] == "reanudar_ok":
-                    self._install(channel, threading.Event(), resumed=msg)
+                    self._install(channel, threading.Event(), resumed=msg, contact=contact)
                     return None
                 channel.close()
                 if msg["op"] != "sesion_error":
@@ -2531,11 +2542,11 @@ class AgentLink:
             done = threading.Event()
             self._start_ping(channel, done)
             try:
-                ok = self._wait_ok(channel, self._session, stop)
+                ok, contact = self._wait_ok(channel, self._session, stop)
             except BaseException:
                 done.set()
                 raise
-            self._install(channel, done, ok)
+            self._install(channel, done, ok, contact=contact)
             return None
         except LinkError as e:
             if channel is not None:
@@ -2548,7 +2559,7 @@ class AgentLink:
                 channel.close()
             return RETRY_EVERY
 
-    def _first_reply(self, channel: Channel) -> dict | None:
+    def _first_reply(self, channel: Channel, contact: float) -> tuple[dict | None, float]:
         """La respuesta a reanudar (None si se dejó de intentar). AgentError si no llega o no sirve."""
         until = time.monotonic() + SILENCE_TIMEOUT
         while not self._retry_stop.is_set():
@@ -2559,9 +2570,11 @@ class AgentLink:
                     continue
                 raise
             if msg["op"] in ("reanudar_ok", "sesion_error"):
-                return msg
+                return msg, contact
+            if msg["op"] == "pong":
+                contact = self._confirmed(msg, contact)
             until = time.monotonic() + SILENCE_TIMEOUT   # (pong de nada: no debería haber otra cosa)
-        return None
+        return None, contact
 
     def _refused(self, e: LinkError, said: set[str]) -> float:
         """Un rechazo al reconectar: se dice una vez por código, con su "qué hacer", y se sigue intentando."""
@@ -2572,7 +2585,7 @@ class AgentLink:
         return RETRY_REFUSED
 
     def _install(self, channel: Channel, done: threading.Event, ok: dict | None = None,
-                 resumed: dict | None = None) -> None:
+                 resumed: dict | None = None, contact: float | None = None) -> None:
         """La conexión nueva pasa a ser la actual: su lector arranca (y su ping, si no lo tenía).
         Si algo falla a medias, se deshace (vuelve a quedar sin conexión, la conexión se cierra y
         el error sube a _retry, que sigue intentando): nunca una conexión actual sin lector."""
@@ -2593,8 +2606,9 @@ class AgentLink:
             away = max(0, math.floor(time.monotonic() - last_ok))   # desde el último contacto confirmado (§9)
             where = f"{self.name} ({self.shown})"
             self.version = _clean(channel.peer_version, 40)
+            now = time.monotonic()
             if resumed is not None:
-                self.last_ok = time.monotonic()
+                self.last_ok = contact if contact is not None else now
                 self._start_ping(channel, done)
                 nodes = resumed.get("nodos")
                 for name, node in self.nodes.items():
@@ -2610,7 +2624,7 @@ class AgentLink:
                 self._notice(f"{where}: reconectado tras {away} s sin conexión · no se reinició nada"
                              + (f" · se perdieron {missing} líneas de log" if missing else ""))
             else:
-                self._took(ok or {})
+                self._took(ok or {}, contact if contact is not None else now)
                 for node in self.nodes.values():
                     node.remote_state("detenido", None, None)
                 self._notice(f"{where}: reconectado tras {away} s sin conexión, pero ya había detenido sus nodos. "
