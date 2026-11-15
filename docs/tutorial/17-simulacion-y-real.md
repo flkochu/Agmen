@@ -523,6 +523,5 @@ No prometas más de lo que hay. Esto **todavía no** está en Agmen:
 - `Mundo` es una clase de Python que no depende de Agmen: úsala sola
   para probar tus ideas.
 
-**Siguiente (nivel 10):** un `robot.toml` con nodos en varias computadoras,
-para manejar el robot desde otra máquina. Está planeado para la versión
-0.14.0; todavía no está hecho.
+**Siguiente (nivel 10):** un robot con nodos en varias computadoras: el
+[capítulo 18](18-un-robot-varias-computadoras.md).
