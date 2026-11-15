@@ -529,9 +529,10 @@ cortesía: si no llega, la laptop lo trata como una pérdida normal, con gracia.
   agente nuevo no sabe qué versión es la laptop, así que aplica la gracia igual.
 - **Agente de la 3b con cliente de la 3c.** El agente de la 3b no manda `sesion` ni
   `gracia`, así que el cliente nuevo no puede reanudar: al volver, abre una sesión
-  nueva. Pero como no recibe la gracia, usa la de 10 s, y dirá "sus nodos siguen N s"
-  aunque el agente de la 3b ya los detuvo en el acto. **Límite conocido:** usen la
-  misma versión de Agmen en las dos computadoras.
+  nueva. Como no recibe la gracia, la toma como cero: nunca dice "sus nodos siguen
+  N s" (ese agente detiene sus nodos en cuanto pierde a la laptop), sino que puede
+  que ya los haya detenido. Aun así, usen la misma versión de Agmen en las dos
+  computadoras.
 - Los mensajes nuevos (`reanudar`, `reanudar_ok`, `adios`) van firmados igual que los
   de antes, con el mismo `n` y la misma forma de la línea. El formato de la red no
   cambió.

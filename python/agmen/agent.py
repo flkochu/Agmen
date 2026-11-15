@@ -2407,8 +2407,10 @@ class AgentLink:
         """Lo que trae sesion_ok para reanudar (un agente sin 'sesion' no se puede reanudar: se abre otra)."""
         sid, grace = ok.get("sesion"), ok.get("gracia")
         self.session_id = sid if isinstance(sid, str) and _HEX32.fullmatch(sid) else ""
+        # Un agente que no dice su gracia es anterior a ella: detiene sus nodos en cuanto pierde a la laptop.
+        # Con 0 nunca se le promete "sus nodos siguen N s" (antes se suponían 10 s que ese agente no da).
         self.grace = float(grace) if isinstance(grace, (int, float)) and not isinstance(grace, bool) \
-            and 0 < grace <= 3600 else GRACE
+            and 0 < grace <= 3600 else 0.0
         self.last_ok = contact
         self.last_tx = time.monotonic()   # (todo lo mandado hasta aquí salió antes de que llegara sesion_ok)
 

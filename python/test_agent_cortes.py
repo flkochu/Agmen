@@ -1516,6 +1516,17 @@ class TestGraciaDelCliente(EnlaceCase):
         self.assertLessEqual(n, 10 - (hora - falso.recibio) + 0.1, f"promete más de lo que le queda al robot: {texto}")
         self.assertTrue(5 <= n <= 7, f"~{n} s: ¿contó desde sesion_ok o redondeó hacia arriba? (esperado 7)\n{texto}")
 
+    def test_un_agente_que_no_dice_su_gracia_cuenta_como_cero_y_no_se_le_promete_tiempo(self):
+        """Un agente anterior a la gracia no manda 'gracia' y detiene sus nodos en cuanto pierde a la laptop:
+        agmen run no puede decir "Sus nodos siguen ~N s" (antes suponía 10 s que ese agente no da)."""
+        falso = AgenteDeMentira(self, gracia=None)      # sesion_ok sin gracia (null), como un agente anterior
+        link = self.abrir(falso)
+        self.assertEqual(link.grace, 0.0, "sin gracia en sesion_ok, la gracia es cero")
+        falso.soltar.set()
+        _, texto = self.perdido()
+        self.assertNotIn("Sus nodos siguen", texto, "le prometió tiempo a un agente que no da gracia")
+        self.assertIn("Puede que robot ya haya detenido sus nodos", texto)
+
     def test_los_pong_que_llegan_mientras_el_agente_prepara_la_sesion_cuentan(self):
         self.parchea(agent, "PING_EVERY", 0.3)
         falso = AgenteDeMentira(self, retardo=2.15, pongs=True)

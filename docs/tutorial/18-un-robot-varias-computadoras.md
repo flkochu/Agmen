@@ -469,9 +469,9 @@ Esto es honesto: el capítulo 18 cubre el robot con dos computadoras, pero no to
 - **No medimos la hora.** Si el reloj de la Pi está atrasado (no tiene pila),
   las dos computadoras no coinciden. Medir eso y avisarte llega en el bloque 5.
 - **Una laptop a la vez** con cada agente.
-- **Usa la misma versión de Agmen en las dos computadoras.** Con versiones
-  distintas, la laptop puede decir `sus nodos siguen` aunque la Pi ya los detuvo,
-  porque no sabe qué gracia tiene la otra.
+- **Usa la misma versión de Agmen en las dos computadoras.** Con una Pi en una
+  versión anterior, que no aguanta cortes, la laptop no puede reanudar: la Pi
+  detiene sus nodos en cuanto la pierde, y al volver hay que arrancarlos otra vez.
 
 **Lo que protege al robot en esos segundos** es el freno de su motor. Si el nodo
 del motor deja de recibir órdenes, se detiene solo, como viste en el
