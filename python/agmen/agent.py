@@ -82,6 +82,10 @@ OUT_MAX_BYTES = 4 * 1024 * 1024  # con esto, los log se descartan
 OUT_MAX_REPLIES = 1000          # respuestas (pong, error) sin leer: la sesión deja de leer a la laptop
 PONG_T_MAX = 64                 # un pong repite t solo si es un número o un texto corto
 MAX_ORDERS = 64                 # órdenes pendientes por sesión
+GRACE = 10.0                    # gracia (3c): sin laptop, sus nodos siguen esto desde lo último recibido, por si vuelve
+RESUME_LOG_LINES = 2000         # para reanudar: las últimas líneas de log de la sesión que se guardan…
+RESUME_LOG_BYTES = 1024 * 1024  # … y con tope en bytes
+RESUME_MAX_NODES = 1024         # reanudar: entradas de 'logs' que se aceptan
 
 WRITTEN_KEYS = ("cmd", "env", "cwd", "restart", "autostart", "profile")   # lo escrito que se compara (D7)
 CLOCKS = ("real", "sim", "replay")
@@ -791,6 +795,11 @@ def _bye(channel: Channel, reader: threading.Thread | None = None) -> None:
         channel.close()
 
 
+def _grace_number() -> float | int:
+    """La gracia como va en sesion_ok y reanudar_ok: 10, no 10.0."""
+    return int(GRACE) if float(GRACE).is_integer() else GRACE
+
+
 def _show_ip(ip: str) -> str:
     return ip[len("::ffff:"):] if ip.startswith("::ffff:") and "." in ip else ip
 
@@ -1147,17 +1156,44 @@ class AgentServer:
             self.say(f"{ip} completó el saludo pero no abrió la sesión ({e})")
             channel.close()
             return
-        if first.get("op") != "sesion":
+        op = first.get("op")
+        if op not in ("sesion", "reanudar"):
             self._refuse_now(channel, ip, "protocolo",
-                             f"lo primero es 'sesion' y llegó '{_clean(first.get('op'), 40)}'")
+                             f"lo primero es 'sesion' (o 'reanudar', para volver a una sesión) y llegó "
+                             f"'{_clean(op, 40)}'")
             return
+        if op == "reanudar":
+            sid, logs = first.get("sesion"), first.get("logs", {})
+            if not isinstance(sid, str) or not isinstance(logs, dict) or len(logs) > RESUME_MAX_NODES or not all(
+                    isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool) and v >= 0
+                    for k, v in logs.items()):
+                self._refuse_now(channel, ip, "protocolo",
+                                 "reanudar lleva 'sesion' (texto) y 'logs' ({nodo: número de la última línea})")
+                return
         with self.lock:
             leaving = self.session if self.session is not None and self.session._ending else None
         if leaving is not None:   # la sesión anterior se está cerrando (detiene sus nodos): se espera
             leaving.done.wait(30)
+        if op == "reanudar":
+            with self.lock:
+                stopping, session = self.stopping, self.session
+            if stopping:
+                self._refuse_now(channel, ip, "ocupado", "el agente se está cerrando")
+                return
+            # La identidad: el saludo (la clave) y el identificador de la sesión (comparado en tiempo constante).
+            if session is None or not session.ready.is_set() or not _same(sid, session.id) \
+                    or not session.resume(channel, ip, logs):
+                self._refuse_now(channel, ip, "sesion",
+                                 f"{self.machine}: esa sesión ya terminó; los nodos están detenidos. Abre una sesión "
+                                 f"nueva")
+            return
         with self.lock:
             if self.stopping:
                 busy = "el agente se está cerrando"
+            elif self.session is not None and self.session.lost_at is not None:
+                left = max(1, math.ceil(self.session.grace_left()))
+                busy = (f"{self.machine} tiene una sesión de la laptop {self.session.ip} esperando a que reconecte "
+                        f"(le quedan {left} s): una laptop a la vez. Si no regresa, intenta de nuevo en {left} s")
             elif self.session is not None:
                 busy = (f"{self.machine} ya está conectada a agmen run en otra laptop ({self.session.ip}): una "
                         f"laptop a la vez. Detén ese agmen run (Ctrl+C) y vuelve a intentar")
@@ -1357,15 +1393,29 @@ class _Outbox:
 class _Session:
     """Una laptop conectada: su canal, los nodos de esta computadora (un Launcher), lo que
     se le manda (en orden, desde un hilo propio: un nodo nunca espera a la red) y las
-    órdenes (en otro hilo, una tras otra). Siempre termina en end(), pase lo que pase."""
+    órdenes (en otro hilo, una tras otra). Siempre termina en end(), pase lo que pase.
+
+    La gracia (RFC 0011, parte 3c): si la conexión se pierde después de sesion_ok (silencio,
+    cierre sin adios, la laptop no lee), la sesión NO termina: sus nodos siguen GRACE s desde
+    lo último recibido, y una conexión nueva con 'reanudar' y el identificador `id` la retoma
+    (resume). channel, out y sender son siempre los de la conexión actual; en gracia, los de la
+    perdida (ya cerrados). Un mensaje inválido, el adios o Ctrl+C terminan sin gracia."""
 
     def __init__(self, server: AgentServer, channel: Channel, ip: str) -> None:
         self.server = server
         self.channel = channel
+        self._first_channel = channel        # la conexión que abrió la sesión (la lee run)
         self.ip = ip
         self.say = server.say
         self.launcher = None
         self.plan: _Plan | None = None
+        self.id = secrets.token_hex(16)      # para reanudar: va en sesion_ok
+        self.last_rx = time.monotonic()      # lo último que llegó de la laptop (la gracia cuenta desde aquí)
+        self.lost_at: float | None = None    # en gracia desde (None: con conexión)
+        self._grace_timer: threading.Timer | None = None
+        self._grace_token = 0
+        self._memory: deque[tuple[str, int, str, int]] = deque()   # (nodo, n, línea, bytes): para reanudar
+        self._memory_bytes = 0
         self.out = _Outbox()
         self.ready = threading.Event()       # sesion_ok ya salió (antes no se manda ningún estado)
         self.cancel = threading.Event()      # detener_todo antes de estar lista, o fin de la sesión
@@ -1381,42 +1431,68 @@ class _Session:
         self._last_state: dict[str, tuple] = {}
         self._orders: queue.Queue = queue.Queue()
         self._setup_thread: threading.Thread | None = None
-        self.sender = threading.Thread(target=self._send_loop, daemon=True, name="agmen-agent-send")
+        self.sender = self._start_sender(channel, self.out)
         self.worker = threading.Thread(target=self._work_loop, daemon=True, name="agmen-agent-orders")
-        self.sender.start()
         self.worker.start()
 
     # --- mandar ---
     def send(self, obj: dict, droppable: bool = False) -> bool:
         return self.out.put(obj, droppable)
 
-    def _send_loop(self) -> None:
+    def _start_sender(self, channel: Channel, out: _Outbox) -> threading.Thread:
+        t = threading.Thread(target=self._send_loop, args=(channel, out), daemon=True, name="agmen-agent-send")
+        t.start()
+        return t
+
+    def _send_loop(self, channel: Channel, out: _Outbox) -> None:
+        """Manda lo de `out` por `channel` (una conexión: al reanudar hay otra pareja y otro hilo)."""
         while True:
-            item = self.out.get()
+            item = out.get()
             if item is None:
                 return
             try:
                 try:
-                    self.channel.send_body(*item)
+                    channel.send_body(*item)
                 finally:
-                    self.out.sent()
+                    out.sent()
             except MessageTooLarge as e:
                 self.say(f"⚠ {e}", "error")
             except ChannelClosed as e:
                 # La laptop cerró: el lector lo ve en seguida (y si antes dijo adios, lo lee). Por si no:
-                why = f"no pude mandarle nada a la laptop ({self.ip}): {_clean(e, 200)}"
-                t = threading.Timer(2.0, self.end, args=(why, "error"))
+                t = threading.Timer(2.0, self._lost, args=(channel, f"no pude mandarle nada: {_clean(e, 200)}"))
                 t.daemon = True
                 t.start()
                 return
-            except Exception as e:   # no lee (tiempo agotado), o cualquier otra: la sesión termina en end()
-                threading.Thread(target=self.end, args=(f"no pude mandarle nada a la laptop ({self.ip}): "
-                                                        f"{_clean(e, 200)}", "error"), daemon=True).start()
+            except Exception as e:   # no lee (tiempo agotado), o cualquier otra: gracia (o end() si no estaba lista)
+                threading.Thread(target=self._lost, args=(channel, f"no pude mandarle nada: {_clean(e, 200)}"),
+                                 daemon=True).start()
                 return
+
+    def _remember(self, node: str, n: int, line: str) -> None:
+        """Guarda una línea para reanudar (con self._log_lock): las últimas RESUME_LOG_LINES, con tope en bytes."""
+        size = len(line.encode("utf-8")) + len(node) + 16
+        self._memory.append((node, n, line, size))
+        self._memory_bytes += size
+        while self._memory and (len(self._memory) > RESUME_LOG_LINES or self._memory_bytes > RESUME_LOG_BYTES):
+            self._memory_bytes -= self._memory.popleft()[3]
+
+    def _replay(self, have: dict) -> tuple[list[dict], dict]:
+        """Lo que la laptop no tiene (n > have[nodo]): los log guardados, y cuántos ya no están (con self._log_lock)."""
+        items, kept = [], {}
+        for node, n, line, _ in self._memory:
+            if n > have.get(node, 0):
+                items.append({"op": "log", "nodo": node, "n": n, "linea": line})
+                kept[node] = kept.get(node, 0) + 1
+        lost = {}
+        for node, total in self._log_k.items():
+            missing = total - have.get(node, 0) - kept.get(node, 0)
+            if total > have.get(node, 0) and missing > 0:
+                lost[node] = missing
+        return items, lost
 
     def _on_log(self) -> None:
         """Listener del LogBook: se llama con el node.lock del nodo que escribió (ver el orden
-        de candados). since() solo recorre lo nuevo."""
+        de candados). since() solo recorre lo nuevo. Cada línea también se guarda para reanudar."""
         launcher = self.launcher
         note = False
         with self._log_lock:
@@ -1426,7 +1502,10 @@ class _Session:
                 if node == "hub":
                     node, text = "agmen", f"hub: {text}"
                 k = self._log_k[node] = self._log_k.get(node, 0) + 1
-                if not self.send({"op": "log", "nodo": node, "n": k, "linea": _cut(text)}, droppable=True):
+                text = _cut(text)
+                self._remember(node, k, text)
+                if not self.send({"op": "log", "nodo": node, "n": k, "linea": text}, droppable=True) \
+                        and self.lost_at is None and not self.out.closed:   # en gracia: guardada, no "descartada"
                     now = time.monotonic()
                     if now - self._drop_noted > FAIL_WINDOW:
                         self._drop_noted, note = now, True
@@ -1443,11 +1522,11 @@ class _Session:
         state = node.state
         running = state == "corriendo" and node.proc is not None
         snap = (state, node.proc.pid if running else None, None if running else node.exit_code)
-        with self._state_lock:
+        with self._state_lock:   # encolar con el candado: así resume() no se cruza con un estado nuevo
             if self._last_state.get(name) == snap:
                 return
             self._last_state[name] = snap
-        self.send({"op": "estado", "nodo": name, "estado": snap[0], "pid": snap[1], "codigo": snap[2]})
+            self.send({"op": "estado", "nodo": name, "estado": snap[0], "pid": snap[1], "codigo": snap[2]})
 
     def _error(self, text: str) -> None:
         self.send({"op": "error", "texto": _cut(text, 2000)})
@@ -1482,17 +1561,94 @@ class _Session:
 
     # --- ciclo ---
     def run(self, first: dict) -> None:
+        self._guarded(self._first_channel, self._run, first)
+
+    def _guarded(self, channel: Channel, target, *args) -> None:
+        """Corre la parte de la sesión que lee `channel` (I3: pase lo que pase, la sesión termina en
+        end(), salvo que haya quedado en gracia o que otra conexión la haya retomado)."""
         try:
-            self._run(first)
-        except Exception as e:   # I3: pase lo que pase, la sesión termina en end()
+            target(*args)
+        except Exception as e:
             self.say(f"error inesperado en la sesión de {self.ip}: {_clean(repr(e), 300)}. Detengo sus nodos",
                      "error")
             self._error(f"{self.server.machine}: error inesperado en el agente ({_clean(e, 200)}); cierro la sesión")
             self.out.drain(1.0)
             self.end("", quiet=True)
         finally:
-            if not self._ending:
+            if not self._ending and self.lost_at is None and self.channel is channel:
                 self.end("", quiet=True)
+
+    def grace_left(self) -> float:
+        return GRACE - (time.monotonic() - self.last_rx)
+
+    def _lost(self, channel: Channel, cause: str) -> None:
+        """La conexión `channel` se perdió (silencio, cierre sin adios, no lee). Con la sesión lista:
+        gracia (los nodos siguen); si no (nadie tiene aún el identificador), end() como antes."""
+        with self._end_lock:
+            if self._ending or channel is not self.channel or self.lost_at is not None:
+                return   # ya terminó, ya está en gracia, o es una conexión vieja que otra sustituyó
+            grace = self.ready.is_set()
+            if grace:
+                now = time.monotonic()
+                self.lost_at = now
+                left = max(0.0, GRACE - (now - self.last_rx))
+                self._grace_token += 1
+                timer = self._grace_timer = threading.Timer(left, self._expire, args=(self._grace_token,))
+                timer.daemon = True
+                out = self.out
+        if not grace:
+            self.end(f"la laptop ({self.ip}) {cause}: detengo los nodos", "error")
+            return
+        out.close()
+        channel.close()
+        self.say(f"la laptop ({self.ip}) dejó de contestar: sus nodos siguen {math.ceil(left)} s más por si vuelve "
+                 f"({cause})", "error")
+        timer.start()   # (si ya la retomaron, resume() lo canceló: no hace nada)
+
+    def _expire(self, token: int) -> None:
+        self.end(f"la laptop ({self.ip}) no volvió en {GRACE:g} s: detuve los nodos", "error", grace_token=token)
+
+    def resume(self, channel: Channel, ip: str, have: dict) -> bool:
+        """'reanudar' con el identificador bueno: esta conexión sustituye a la anterior (perdida, o que aún no se
+        daba por perdida). Manda reanudar_ok y los log que la laptop no tiene, y lee esta conexión hasta que
+        termine. False si la sesión ya estaba terminando (no se retomó)."""
+        out = _Outbox()
+        with self._end_lock:
+            if self._ending:
+                return False
+            old_channel, old_out, timer, lost_at = self.channel, self.out, self._grace_timer, self.lost_at
+            self._grace_token += 1
+            self._grace_timer = None
+            # Con los dos candados: ningún estado ni log nuevo se cuela antes de reanudar_ok ni se pierde después.
+            with self._state_lock, self._log_lock:
+                nodes = {name: {"estado": s, "pid": p, "codigo": c} for name, (s, p, c) in self._last_state.items()}
+                logs, lost = self._replay(have)
+                reply: dict = {"op": "reanudar_ok", "nodos": nodes}
+                if lost:
+                    reply["perdidos"] = lost
+                reply["gracia"] = _grace_number()
+                out.put(reply)
+                for item in logs:
+                    out.put(item, droppable=True)
+                self.channel, self.out = channel, out
+                self.lost_at = None
+                self.last_rx = time.monotonic()
+                old_ip, self.ip = self.ip, ip
+        if timer is not None:
+            timer.cancel()
+        old_out.close()
+        old_channel.close()   # si aún se leía (no se daba por perdida), su lector ve que ya no es la actual
+        self.sender = self._start_sender(channel, out)
+        with self.server.lock:
+            self.server.trusted = _ip_key(ip)
+        if lost_at is not None:
+            self.say(f"la laptop ({ip}) volvió a los {time.monotonic() - lost_at:.0f} s: sigo con la misma sesión "
+                     f"(no se reinició nada)", "out")
+        else:
+            self.say(f"la laptop volvió a conectarse desde {ip} antes de que se perdiera la conexión de {old_ip}: "
+                     f"la sustituyo y sigo con la misma sesión (no se reinició nada)", "out")
+        self._guarded(channel, self._loop, channel)
+        return True
 
     def _run(self, first: dict) -> None:
         from .run import ConfigError, Launcher
@@ -1526,7 +1682,7 @@ class _Session:
         with self._end_lock:
             if not self._ending:
                 self._setup_thread.start()
-        self._loop()
+        self._loop(self._first_channel)
 
     def _setup(self) -> None:
         from .pubsub import hub_address
@@ -1556,7 +1712,8 @@ class _Session:
                 return
             if own:
                 launcher.nodes["hub"].start()   # el hub de esta computadora, como en agmen run
-            self.send({"op": "sesion_ok", "maquina": m, "agmen": __version__, "nodos": list(plan.names)})
+            self.send({"op": "sesion_ok", "maquina": m, "agmen": __version__, "nodos": list(plan.names),
+                       "sesion": self.id, "gracia": _grace_number()})
             self.ready.set()
             with self.server.lock:   # la IP de la última sesión ACEPTADA conserva su lugar aunque otros fallen
                 self.server.trusted = _ip_key(self.ip)
@@ -1607,28 +1764,32 @@ class _Session:
         self._before = None
         return code
 
-    def _loop(self) -> None:
-        while not self._ending:
-            if self.out.replies_full() and not self.out.wait_replies(SEND_TIMEOUT):
+    def _loop(self, channel: Channel) -> None:
+        """Lee `channel` mientras sea la conexión actual. Perderla lleva a la gracia (_lost); un mensaje
+        inválido es un error o un ataque, no una WiFi caída: end() sin gracia."""
+        while not self._ending and channel is self.channel:
+            out = self.out
+            if out.replies_full() and not out.wait_replies(SEND_TIMEOUT):
                 # B2: la laptop manda (ping…) y no lee las respuestas: no se le lee más.
-                self.end(f"la laptop ({self.ip}) no lee lo que le contesto ({OUT_MAX_REPLIES} respuestas sin leer "
-                         f"en {SEND_TIMEOUT:g} s): cierro la sesión y detengo los nodos", "error")
+                self._lost(channel, f"no lee lo que le contesto: {OUT_MAX_REPLIES} respuestas sin leer en "
+                                    f"{SEND_TIMEOUT:g} s")
                 return
             try:
-                msg = self.channel.recv(SILENCE_TIMEOUT)
+                msg = channel.recv(SILENCE_TIMEOUT)
             except ChannelTimeout:
-                self.end(f"la laptop ({self.ip}) no dijo nada en {SILENCE_TIMEOUT:g} s: se perdió la conexión. "
-                         f"Detengo los nodos", "error")
+                self._lost(channel, f"no dijo nada en {SILENCE_TIMEOUT:g} s")
                 return
             except ChannelClosed:
-                self.end(f"la laptop ({self.ip}) cerró la conexión sin despedirse: detengo los nodos", "error")
+                self._lost(channel, "cerró la conexión sin despedirse")
                 return
             except ChannelError as e:
-                self.end(f"mensaje inválido de la laptop ({self.ip}): {e}. Cierro la conexión y detengo los "
-                         f"nodos", "error")
+                if channel is self.channel:   # (una conexión ya sustituida que se cierra a media línea, no)
+                    self.end(f"mensaje inválido de la laptop ({self.ip}): {e}. Cierro la conexión y detengo los "
+                             f"nodos", "error")
                 return
-            if self._ending:
+            if self._ending or channel is not self.channel:
                 return
+            self.last_rx = time.monotonic()
             if self._order(msg):
                 return
 
@@ -1664,7 +1825,7 @@ class _Session:
                 what = {"arrancar": "start", "detener": "stop", "reiniciar": "restart"}[op]
                 self.launcher.say(f"la laptop pidió {op} '{name}'")
                 self._work(getattr(self.launcher.nodes[name], what))
-        elif op == "sesion":
+        elif op in ("sesion", "reanudar"):
             self._error("esta conexión ya tiene su sesión abierta")
         else:
             self._error(f"orden desconocida '{_clean(op, 40)}' (este agente es Agmen {__version__})")
@@ -1691,16 +1852,23 @@ class _Session:
                 n.state in ("corriendo", "reiniciando") for n in self.launcher.nodes.values()):
             time.sleep(0.05)
 
-    def end(self, reason: str, kind: str = "agmen", quiet: bool = False) -> None:
+    def end(self, reason: str, kind: str = "agmen", quiet: bool = False, grace_token: int | None = None) -> None:
         """Termina la sesión (una sola vez, desde cualquier hilo): detiene los nodos y
-        el hub, manda lo pendiente, cierra la conexión y deja libre al agente."""
+        el hub, manda lo pendiente, cierra la conexión y deja libre al agente.
+        grace_token: lo llama el fin de la gracia; no hace nada si mientras tanto se reanudó
+        (y entonces `reason` se dice ya con los nodos detenidos)."""
         with self._end_lock:
             if self._ending:
                 return
+            if grace_token is not None and (grace_token != self._grace_token or self.lost_at is None):
+                return
             self._ending = True
+            timer = self._grace_timer
+        if timer is not None:
+            timer.cancel()
         me = threading.current_thread()
         try:
-            if reason and not quiet:
+            if reason and not quiet and grace_token is None:
                 self.say(reason, kind)
             self.cancel.set()
             before = self._before
@@ -1718,6 +1886,8 @@ class _Session:
                 except ValueError:
                     pass
                 self.launcher.printer.close()
+            if reason and not quiet and grace_token is not None:
+                self.say(reason, kind)
             if self.out.dropped:
                 self.say(f"⚠ {self.out.dropped} líneas de log no se mandaron a la laptop (no daba abasto)")
             if me is not self.sender:
