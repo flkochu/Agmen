@@ -497,11 +497,11 @@ from fisica import Mundo
 
 No prometas más de lo que hay. Esto **todavía no** está en Agmen:
 
-- **Varias computadoras**: `[[machine]]` ya se puede declarar (sección 7 del
-  [capítulo 5](05-un-solo-comando.md#7-decir-en-qué-computadora-corre-cada-nodo-machine)),
-  pero arrancar nodos en otra computadora, `agmen agent` y los topics entre
-  computadoras están planeados (RFC 0011) y todavía no existen. Por ahora,
-  los nodos corren en una sola computadora.
+- **Varias computadoras**: `[[machine]]` ya se puede declarar, y `agmen agent`
+  arranca nodos en otra computadora con una clave (sección 7 del
+  [capítulo 5](05-un-solo-comando.md#7-decir-en-qué-computadora-corre-cada-nodo-machine)).
+  Pero los topics todavía no cruzan entre computadoras, ni se reconecta tras un
+  corte, ni el panel muestra en qué computadora corre cada nodo (RFC 0011).
 - **Un puente genérico para cualquier modelo de MuJoCo.** Hoy hay un solo
   robot, el del tutorial.
 - **Puentes para Gazebo o Isaac Sim.**

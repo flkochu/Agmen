@@ -20,7 +20,7 @@ for _stream in (sys.stdout, sys.stderr):
 ROOT = Path(__file__).resolve().parent.parent
 EXE = ".exe" if sys.platform == "win32" else ""
 BIN = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "build" / "bin"
-HUB = "127.0.0.1:7391"     # un puerto propio: no choca con un agmen run abierto
+HUB = "127.0.0.1:7395"     # un puerto propio: no choca con un agmen run abierto (7391 es de agmen agent)
 ENV = {**os.environ, "PYTHONPATH": str(ROOT / "python"), "PYTHONIOENCODING": "utf-8", "AGMEN_HUB": HUB}
 PY = [sys.executable, "-u"]
 results = []

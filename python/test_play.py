@@ -283,6 +283,12 @@ class TestPlayConMachines(PlayCase):
 
     def setUp(self):
         super().setUp()
+        # 3b: "otra computadora" = 127.0.0.1 con AGMEN_REMOTE_HOSTS y un puerto donde no escucha nadie
+        # (agmen run intenta conectar y recibe "rechazada", sin esperar tiempos de red)
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            self.cerrado = s.getsockname()[1]
+        self.AJENA = f"127.0.0.1:{self.cerrado}"
         self.toml = os.path.join(self.dir, "robot.toml")
         with open(self.toml, "w", encoding="utf-8") as f:
             f.write('[robot]\nname = "r"\n\n[[machine]]\nname = "robot"\nhost = "%s"\n\n'
@@ -293,9 +299,14 @@ class TestPlayConMachines(PlayCase):
     def run_cli(self, *args):
         from agmen import cli
         err, out = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+        env = {"AGMEN_REMOTE_HOSTS": "127.0.0.1", "AGMEN_CONFIG_DIR": os.path.join(self.dir, "cfg"),
+               "AGMEN_AGENT_KEY": self.clave}
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out), \
+                mock.patch.dict(os.environ, env), mock.patch("sys.stdin", io.StringIO()):
             code = cli.main(["run", self.toml, "--no-browser", *args])
         return code, err.getvalue()
+
+    clave = "kq3f-9xm2-7tdw"      # una clave cualquiera: nadie escucha, no llega a usarse
 
     def sin_red(self):
         return mock.patch("agmen.machines.place_machines", side_effect=AssertionError("consultó la red antes"))
@@ -363,7 +374,7 @@ class TestPlayConMachines(PlayCase):
         with mock.patch("agmen.play.Player", Espia):
             code, err = self.run_cli("--play", self.path)
         self.assertEqual(code, 2)
-        self.assertIn("'motor' corre en 'robot' (192.0.2.10)", err)     # la consulta de red SÍ se hizo
+        self.assertIn(f"robot (127.0.0.1:{self.cerrado}) no contesta", err)     # llegó a intentar la conexión
         self.assertEqual(len(casos), 1, "el reproductor se crea una sola vez")
         r = casos[0].reader
         self.assertTrue(r._file is None or r._file.closed, "el archivo de la grabación quedó abierto")
@@ -379,6 +390,26 @@ class TestPlayConMachines(PlayCase):
             code, _ = self.run_cli("--play", self.path)
         self.assertEqual(code, 2)
         st.assert_called_once()
+
+    def test_play_bueno_y_sin_clave_tambien_cierra_el_reproductor(self):
+        # el error de "no tengo la clave" sale despues de abrir la grabacion y antes de conectar: se cierra
+        casos = []
+        original = play.Player
+
+        class Espia(original):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                casos.append(self)
+
+        self.clave = ""
+        hilos = {t.ident for t in threading.enumerate()}
+        with mock.patch("agmen.play.Player", Espia):
+            code, err = self.run_cli("--play", self.path)
+        self.assertEqual(code, 2)
+        self.assertIn("no tengo la clave de agmen agent en 'robot'", err)
+        self.assertEqual(len(casos), 1)
+        self.assertTrue(casos[0].reader._file is None or casos[0].reader._file.closed)
+        self.assertEqual({t.ident for t in threading.enumerate()} - hilos, set())
 
     def test_el_orden_con_dns_colgado_no_espera_por_un_error_de_play(self):
         liberar = threading.Event()

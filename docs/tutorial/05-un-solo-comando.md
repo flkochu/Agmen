@@ -366,18 +366,22 @@ Con `[[machine]]` le dices a Agmen qué computadoras tienes. Con `machine` en un
 `[[node]]` (o en un `[[mux]]`) dices en cuál corre ese nodo. Sin `machine`, el
 nodo corre donde corres `agmen run`, como hasta ahora.
 
-> **Lo que funciona hoy.** `agmen run` decide dónde corre cada nodo y lo dice
-> en la terminal. Lo que **todavía no** funciona: arrancar un nodo en *otra*
-> computadora. Eso llega con `agmen agent`, en una versión próxima (RFC 0011).
-> Hoy, si un nodo dice que corre en otra computadora, `agmen run` **no arranca
-> nada** y te dice qué hacer.
+### Qué funciona hoy
 
-| | Hoy (0.14.0, sin publicar) | Después (con `agmen agent`) |
-|---|---|---|
-| Declarar `[[machine]]` y `machine` | Sí | Sí |
-| `agmen run` en la computadora de un `machine` arranca sus nodos | Sí | Sí |
-| Arrancar nodos en otra computadora | No: sale con error y no arranca nada | Sí |
-| `[profile.X] local = true` (todo aquí) | Sí | Sí |
+Con `agmen agent` en la computadora del robot, `agmen run` en tu laptop arranca
+también los nodos que dicen `machine` de esa computadora. La tabla dice qué
+funciona y qué **todavía no** (llega en las partes 3c y los bloques 4 y 5 del RFC 0011):
+
+| | Hoy (0.14.0, sin publicar) |
+|---|---|
+| Declarar `[[machine]]` y `machine` | Sí |
+| `agmen run` en la computadora de un `machine` arranca sus nodos | Sí |
+| Arrancar nodos de otra computadora desde la laptop (`agmen agent`) | Sí, con una clave (ver abajo) |
+| `[profile.X] local = true` (todo aquí) | Sí |
+| Etiqueta de la computadora en el panel web | No (parte 3c) |
+| Reconectar tras un corte; servicio de arranque automático del agente (systemd) | No (parte 3c) |
+| Topics que cruzan entre computadoras (un nodo de la laptop recibe `/imu` del robot) | No (bloque 4): cada computadora tiene su propio hub |
+| Medir la diferencia de reloj entre computadoras | No (bloque 5) |
 
 ### Paso 1: el archivo
 
@@ -442,12 +446,11 @@ agmen   │ sin machine, corren en esta computadora: hub, ruedas, cerebro
 Así corre todo el robot sin laptop, con el mismo archivo.
 
 **Caso 2: `agmen run` en la laptop.** La IP de `host` es de otra computadora.
-Agmen no arranca nada, ni siquiera el hub. Sale con código de error (2) y el
-mensaje dice cuatro cosas: qué nodos están en la otra computadora, dónde está
-(nombre y dirección), que esta versión todavía no los arranca, y qué hacer.
-Lo que hacer: correr `agmen run` en la Raspberry Pi (caso 1). Si corres el
-perfil `real`, el mensaje también ofrece probar aquí en simulación (caso 3). En
-otro perfil, solo dice que hace falta `agmen agent`.
+Agmen se conecta con el agente de la Raspberry Pi (la sección siguiente) **antes**
+de arrancar nada: ni el hub, ni `before`, ni los nodos de la laptop. Los nodos
+`machine = "robot"` corren en la Raspberry Pi, y los que no dicen `machine`,
+en la laptop. Si la conexión falla, no arranca nada, sale con código 2 y dice
+qué hacer.
 
 **Caso 3: simulación en la laptop con `local = true`.** Agrega esto a tu archivo:
 
@@ -466,6 +469,220 @@ agmen   │ local = true: todo corre en esta computadora (se ignora machine: mun
 
 Los nodos `imu` y `motor` son `profile = "real"`, así que en simulación no
 corren, como en la sección 6.
+
+### Arrancar los nodos del robot desde la laptop (`agmen agent`)
+
+Adán tiene una laptop con Windows y una Raspberry Pi en el robot, y las dos
+están en el WiFi de la escuela. Así arranca el robot con dos comandos, uno en
+cada computadora.
+
+Para este ejemplo, guarda el archivo de abajo como
+`examples/tutorial/robot_dos.toml`. Tiene dos nodos: `imu` en la Raspberry Pi y
+`cerebro` en la laptop. El motor va igual que `imu`, con `machine = "robot"`.
+Las salidas que siguen son de correr este archivo en dos computadoras de
+prueba; las IP y los puertos son los de Adán.
+
+```toml
+[robot]
+name = "robot del tutorial, en dos computadoras"
+
+[[machine]]
+name = "robot"                  # la Raspberry Pi
+host = "192.168.1.20"           # puerto por defecto: 7391
+
+[[node]]
+name = "imu"
+cmd = "../../build/bin/publisher --rate 100 --to /imu"
+restart = "on-failure"
+machine = "robot"
+profile = "real"
+
+[[node]]
+name = "cerebro"                # sin machine: corre en la laptop
+cmd = "python cerebro.py --destino /cmd/cerebro"
+autostart = false
+```
+
+Tiene que ser **el mismo** `robot.toml` en las dos computadoras (con `git pull`
+o copiándolo). Si no dice lo mismo, `agmen run` no arranca nada y dice qué
+cambiar.
+
+**1. En la Raspberry Pi**, en la carpeta del proyecto, deja esta terminal abierta:
+
+```
+agmen agent examples/tutorial/robot_dos.toml
+```
+
+La terminal imprime esto (la primera vez crea la clave; la última línea es la
+clave que vas a escribir en la laptop):
+
+```
+agmen agent │ Agmen 0.13.0 · robot 'robot del tutorial, en dos computadoras' · esta computadora es 'robot' (192.168.1.20:7391) · nodos de aquí (perfil real): imu
+agmen agent │ clave creada (guardada en /home/pi/.config/agmen/agent.key): agmen run te la pide la primera vez que se conecta
+agmen agent │ esperando a agmen run en 192.168.1.20:7391 · clave: haxr-9gh2-ztgz
+```
+
+La versión que aparece es la de tu instalación de Agmen.
+
+**2. En la laptop** (Windows, PowerShell, en la misma carpeta):
+
+```
+agmen run examples/tutorial/robot_dos.toml
+```
+
+La primera vez, `agmen run` pide la clave que muestra la Pi. Se escribe sin
+verla, como una contraseña. Acepta la clave con o sin guiones, y en mayúsculas
+o minúsculas:
+
+```
+clave de agmen agent en 'robot' (192.168.1.20:7391); la muestra agmen agent al arrancar, en la terminal de 'robot':
+```
+
+Con la conexión aceptada, la laptop guarda la clave y sigue. Esto es lo que
+imprime (se quitan algunas líneas, marcadas con `…`):
+
+```
+agmen     │ Agmen 0.13.0 · robot 'robot del tutorial, en dos computadoras' · 3 nodos · agmen hub en 127.0.0.1:7390
+agmen     │ sin machine, corren en esta computadora: hub, cerebro
+agmen     │ conectando con robot (192.168.1.20:7391)…
+agmen     │ guardé la clave de robot en tu usuario (agmen run --forget-key robot la borra)
+robot     │ sesión de 192.168.1.7: agmen hub en 127.0.0.1:7390
+…
+agmen     │ robot (192.168.1.20:7391): conectado · Agmen 0.13.0
+…
+agmen     │ 'cerebro' no arranca solo (autostart = false); inícialo desde el panel
+agmen     │ todo arrancado. Ctrl+C para detener todo.
+robot/imu │ [publisher] enviados=101 retrasos=0
+```
+
+La terminal de la Pi sigue así desde que la laptop se conecta, hasta que la
+laptop se despide (salida completa, sin recortes):
+
+```
+agmen agent │ laptop 192.168.1.7 conectada · Agmen 0.13.0 · perfil real · nodos de aquí: imu
+agmen │ sesión de 192.168.1.7: agmen hub en 127.0.0.1:7390
+hub   │ ▶ iniciado (pid 8594)
+agmen │ la laptop pidió arrancar 'imu'
+imu   │ ▶ iniciado (pid 8605)
+hub   │ [hub] Agmen 0.13.0 · directorio de topics en 127.0.0.1:7390 · los datos van directo entre nodos
+imu   │ [publisher] Agmen 0.13.0 · agmen/1 ImuSample{f32 ax;f32 ay;f32 az;f32 gx;f32 gy;f32 gz} (schema_id 0x83b0e57da34a724d) → /imu a 100 Hz
+hub   │ [hub] ▶ 'imu' publica /imu (ImuSample)
+imu   │ [publisher] enviados=101 retrasos=0
+imu   │ [publisher] enviados=202 retrasos=0
+imu   │ [publisher] enviados=302 retrasos=0
+imu   │ [publisher] enviados=403 retrasos=0
+imu   │ [publisher] enviados=504 retrasos=0
+imu   │ [publisher] enviados=605 retrasos=0
+imu   │ [publisher] enviados=705 retrasos=0
+imu   │ [publisher] enviados=806 retrasos=0
+imu   │ [publisher] enviados=907 retrasos=0
+imu   │ [publisher] enviados=1007 retrasos=0
+agmen │ la laptop pidió detener todo
+imu   │ ■ detenido
+agmen agent │ la laptop (192.168.1.7) se despidió
+hub   │ ■ detenido
+agmen agent │ esperando a agmen run en 192.168.1.20:7391 (otra vez)
+```
+
+Los logs de `imu` llegan a la laptop con el prefijo `robot/imu │`. Los nodos
+que corren en la laptop, como `cerebro`, no llevan prefijo de computadora.
+
+Ctrl+C en la laptop detiene los nodos de **las dos** computadoras. Así termina
+su terminal:
+
+```
+agmen     │ deteniendo todos los nodos…
+robot     │ la laptop pidió detener todo
+robot/imu │ ■ detenido
+hub       │ ■ detenido
+agmen     │ listo. ¡Hasta luego!
+```
+
+La Pi no se apaga: vuelve a esperar a la siguiente `agmen run`. Ctrl+C en la
+Pi detiene sus nodos y cierra el agente:
+
+```
+agmen agent │ deteniendo…
+agmen agent │ listo. ¡Hasta luego!
+```
+
+#### La clave: dónde queda y cómo olvidarla
+
+- **En la Pi**: `agent.key`, en la carpeta de Agmen de tu usuario
+  (`%APPDATA%\agmen\` en Windows, `~/.config/agmen/` en Linux). En Linux nace
+  con permisos 0600 (solo la lee su dueño); en Windows no se le ponen permisos
+  y queda en tu carpeta de usuario.
+- **En la laptop**: `keys.toml`, en la misma carpeta de tu usuario, con una
+  línea por computadora (`"192.168.1.20:7391" = "haxr-9gh2-ztgz"`). Nunca va en
+  `robot.toml` ni en git.
+- La laptop guarda **solo la clave que escribiste a mano**, y solo después de
+  una conexión aceptada. Si la pones en la variable `AGMEN_AGENT_KEY`, no se
+  guarda.
+- Ctrl+C cancela cuando `agmen run` te pide la clave, en cualquier sistema;
+  Ctrl+D, solo en Linux. No conecta ni arranca nada, y lo dice (salida real de
+  Ctrl+D):
+
+  ```
+  agmen │ cancelado (Ctrl+D) antes de conectarme: no arrancó nada
+  ```
+
+- Para olvidar la clave guardada de una computadora:
+  `agmen run examples/tutorial/robot_dos.toml --forget-key robot`. La
+  próxima vez `agmen run` te la vuelve a pedir.
+- Para cambiarla, en la Pi: `agmen agent examples/tutorial/robot_dos.toml --new-key`.
+  La clave anterior deja de servir. La laptop lo dice, y entonces olvida la vieja
+  con `--forget-key` y vuelve a correr `agmen run`.
+
+#### Tres errores comunes
+
+Estos son los textos reales. Los tres hacen que `agmen run` salga con código 2
+sin arrancar nada.
+
+1. **El agente no contesta.** La Pi no está corriendo `agmen agent`, o la IP de
+   `host` no es la suya:
+
+   ```
+   error: robot (192.168.1.20:7391) no contesta: ¿está corriendo agmen agent ahí? En robot: agmen agent examples/tutorial/robot_dos.toml
+   ```
+
+   Qué hacer: en la Pi, corre `agmen agent` y revisa que la IP de `host` sea la
+   suya (`hostname -I` en Linux, `ipconfig` en Windows). Las dos deben estar en
+   la misma red.
+
+2. **La clave es mala.** Si la laptop tiene una clave guardada que ya no sirve
+   (por ejemplo, porque corriste `agmen agent --new-key` en la Pi):
+
+   ```
+   error: robot (192.168.1.20:7391) rechazó la clave. La clave guardada ya no sirve (¿alguien corrió agmen agent --new-key?): bórrala con agmen run --forget-key robot y vuelve a correr agmen run (te pide la nueva)
+   ```
+
+   Qué hacer: corre el comando que dice el error (`--forget-key`) y vuelve a
+   correr `agmen run`, que te pide la clave nueva. Si la clave viene de la
+   variable `AGMEN_AGENT_KEY`, cámbiala por la que muestra la Pi.
+
+3. **Los `robot.toml` no dicen lo mismo.** Alguien cambió un nodo en una sola
+   computadora:
+
+   ```
+   error: robot: el nodo imu es distinto en su robot.toml (cmd). Haz git pull en robot (o en tu laptop): los dos robot.toml deben decir lo mismo
+   ```
+
+   Qué hacer: haz `git pull` en las dos (o copia el mismo archivo). El texto dice
+   qué nodo y qué campo difieren; si hay varios, los dice todos.
+
+> **Lo que todavía no hace (Agmen 0.14.0).**
+>
+> - **Los topics no cruzan entre computadoras.** El `cerebro` de la laptop no
+>   recibe `/imu` de la Pi: cada computadora tiene su propio hub. Eso llega en el
+>   bloque 4 del RFC 0011.
+> - **No reconecta sola.** Si se corta la red, la Pi detiene sus nodos y
+>   `agmen run` detiene todo y lo dice. Para volver a arrancar, corre `agmen run`
+>   otra vez. La reconexión llega en la parte 3c.
+> - **Una laptop a la vez** con cada agente.
+> - **El panel no dice en qué computadora corre cada nodo.** La etiqueta llega en
+>   la parte 3c, junto con el servicio que arranca `agmen agent` al prender la Pi.
+> - **Nada de relojes.** Medir la diferencia de reloj entre computadoras llega en
+>   el bloque 5.
 
 ### ¿Por qué poner la IP y no el nombre?
 
@@ -486,11 +703,9 @@ Pi cambia de IP, cámbiala en `host`.
 ### ¿Por qué `profile = "real"` en el hardware?
 
 Un motor o un sensor de verdad se marca con `profile = "real"`. Así la
-simulación nunca lo arranca, aunque lo olvides. Los avisos de Agmen tampoco
-sugieren correr ese hardware en la laptop: si el motor está en la Raspberry Pi y
-corres el perfil `real`, el aviso ofrece la simulación (caso 3), donde ese nodo
-no corre. En otro perfil no ofrece simulación: solo dice que hace falta
-`agmen agent`.
+simulación nunca lo arranca, aunque lo olvides. Si el motor está en la Raspberry
+Pi, en el perfil `real` la laptop lo arranca a través de `agmen agent`, y solo
+si el agente de la Pi está corriendo. En simulación (caso 3) ese nodo no corre.
 
 Un nodo **sin** `profile` corre en todos los perfiles, incluida la simulación. Si
 es un motor, la simulación en la laptop podría intentar moverlo. Por eso el
@@ -501,8 +716,9 @@ hardware siempre lleva `profile = "real"`.
 - A describir tu robot en un archivo y levantarlo con **un comando**.
 - A tener un solo `robot.toml` para el robot y para simulación, con perfiles
   (`profile`, `--sim` y `--profile`), y a marcar el hardware con `profile = "real"`.
-- A decir en qué computadora corre cada nodo con `[[machine]]` y `machine`, qué
-  funciona hoy (sin `agmen agent`) y cómo leer lo que dice la terminal.
+- A decir en qué computadora corre cada nodo con `[[machine]]` y `machine`, a
+  arrancar los nodos de la Raspberry Pi desde tu laptop con `agmen agent` y una
+  clave, y a leer lo que dice la terminal. También sabes qué todavía no hace.
 - A controlar y depurar todo **desde el navegador**: nodos, logs, sensores y manejo.
 - Que Agmen te avisa claro cuando algo está mal, en el archivo o en un nodo.
 

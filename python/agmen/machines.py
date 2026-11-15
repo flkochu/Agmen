@@ -12,11 +12,19 @@ para que un nombre que no existe no cuelgue el arranque.
 La regla de seguridad: ante la duda, una [[machine]] es OTRA computadora. Un
 error de más ("no arranca y lo dice") se arregla en un minuto; un driver de
 motor que arranca en la computadora equivocada, no.
+
+AGMEN_REMOTE_HOSTS (para pruebas y para el CI de Windows, RFC 0011 §6 reto 9): una
+lista separada por comas de IP o nombres, ej. AGMEN_REMOTE_HOSTS=127.0.0.2. Una
+[[machine]] cuyo host (o alguna de sus direcciones) está en la lista se trata como
+OTRA computadora aunque sea esta: así agmen agent en 127.0.0.2 y agmen run en
+127.0.0.1 son dos computadoras en una sola máquina. Solo convierte "aquí" en
+"otra" (la dirección segura), nunca al revés.
 """
 
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import socket
 import threading
@@ -282,6 +290,10 @@ def check_hosts(hosts: list[str], timeout: float = RESOLVE_TIMEOUT) -> dict[str,
                                                  f"pon la IP en host")
         else:
             result[host] = Place(False, "other", f"'{host}' es {shown}, que no es de esta computadora")
+    forced = forced_remote()
+    if forced:
+        loopback = {"localhost": ["127.0.0.1", "::1"]}
+        _apply_forced(result, {**{h: loopback.get(h.lower().rstrip("."), []) for h in result}, **resolved}, forced)
     return result
 
 
@@ -298,6 +310,69 @@ def _distinct_ips(ips: list[str]) -> list[str]:
             key = (ip, None)
         out.setdefault(key, ip)
     return list(out.values())
+
+
+REMOTE_HOSTS_ENV = "AGMEN_REMOTE_HOSTS"
+
+
+def _norm(host: str) -> str:
+    host = host.strip().lower().rstrip(".")
+    try:
+        return str(unwrap(ipaddress.ip_address(host.split("%", 1)[0])))
+    except ValueError:
+        return host
+
+
+def forced_remote(env: dict | None = None) -> set[str]:
+    """Los host de AGMEN_REMOTE_HOSTS, normalizados (vacío si no está). Cada entrada se
+    escribe como un host de [[machine]]: con o sin puerto ("127.0.0.2:7391", que se ignora),
+    IPv6 entre corchetes, nombres sin importar mayúsculas ni el punto final. ValueError si
+    una entrada no se entiende: es una variable de pruebas, mejor fallar que ignorarla."""
+    value = (os.environ if env is None else env).get(REMOTE_HOSTS_ENV, "")
+    out = set()
+    for entry in value.split(","):
+        if not entry.strip():
+            continue
+        text = entry.strip()
+
+        def bad(why: str) -> ValueError:   # qué entrada (una vez), por qué y un ejemplo de la variable
+            return ValueError(f"{REMOTE_HOSTS_ENV}: la entrada {text!r} no se entiende: {why}. Es una lista de "
+                              f"IP o nombres separados por comas, ej. {REMOTE_HOSTS_ENV}=192.168.1.20,"
+                              f"robot.local:7391")
+
+        if "://" in text or "/" in text:
+            raise bad("lleva http:// o una ruta; pon solo la IP o el nombre")
+        bracket = re.fullmatch(r"\[([^\]]+)\](?::(.*))?", text)
+        if bracket:
+            host, port_text = bracket.group(1), bracket.group(2)
+        elif text.count(":") == 1:
+            host, _, port_text = text.partition(":")
+        else:
+            host, port_text = text, None
+        if port_text is not None and (not (port_text.isascii() and port_text.isdigit())
+                                      or not 1 <= int(port_text) <= 65535):
+            raise bad("el puerto debe ser un número entre 1 y 65535, o quítalo (aquí se ignora)")
+        try:
+            ipaddress.ip_address(host.split("%", 1)[0])   # cualquier IP se entiende (aunque no sea de nadie)
+        except ValueError:
+            if bracket:
+                raise bad("entre corchetes va una IPv6, ej. [fe80::1]") from None
+            try:
+                host, _ = split_host(host)               # un nombre bien escrito (sin consultar el DNS)
+            except ValueError:
+                raise bad("no es una IP ni un nombre de computadora válido (un nombre lleva letras sin acentos, "
+                          "dígitos, '-' y '_', separados por puntos)") from None
+        out.add(_norm(host))
+    return out
+
+
+def _apply_forced(result: dict[str, Place], addresses: dict[str, list[str]], forced: set[str]) -> None:
+    for host, place in result.items():
+        if not place.here:
+            continue   # nunca al revés: "otra" se queda "otra"
+        if _norm(host) in forced or any(_norm(ip) in forced for ip in addresses.get(host, [])):
+            result[host] = Place(False, "other", f"'{host}' está en {REMOTE_HOSTS_ENV}: se trata como otra "
+                                                 f"computadora")
 
 
 def these_are_here(hosts: list[str], timeout: float = RESOLVE_TIMEOUT) -> dict[str, bool]:
@@ -344,29 +419,10 @@ def _nodes_on(config, machine: str) -> list[str]:
     return [n.name for n in config.nodes if n.machine == machine]
 
 
-def hardware_remote(config, remote: list[str]) -> bool:
-    """¿Hay hardware entre los nodos que corren en las computadoras `remote`? Sí si el
-    perfil activo es "real", o si alguno de esos nodos nombra "real" en su profile
-    (ej. profile = ["real", "mesa"]). Un nodo sin profile no cuenta: lo que toca
-    hardware se marca profile = "real" (un nodo sin perfil corre también en
-    simulación). Si hay hardware, no se sugiere correr esos nodos aquí."""
-    return config.profile == "real" or any(
-        n.machine in remote and "real" in n.profiles for n in config.nodes)
-
-
-def _sim_is_safe(config, remote: list[str]) -> bool:
-    """¿Sugerir [profile.sim] local = true no traería aquí hardware de las otras computadoras?
-    No, si algún nodo remoto es a la vez de "real" y de "sim" (ej. profile = ["real", "sim"]).
-    Solo ve config.nodes (los del perfil activo): la respuesta es completa solo en el perfil
-    "real", donde están todos los nodos de hardware. Por eso solo se usa en "real"."""
-    return config.profile != "sim" and not any(
-        n.machine in remote and "real" in n.profiles and "sim" in n.profiles for n in config.nodes)
-
-
 def remote_error(config, places: dict[str, Place]) -> str:
-    """El error si algún nodo del perfil activo es de otra computadora (esta
-    versión todavía no los arranca allá: llega con agmen agent), o "" si no.
-    Nunca medio robot en silencio. El "qué hacer" es algo que sí se puede hacer."""
+    """El error si algún nodo del perfil activo es de otra computadora y no hay conexión
+    con su agmen agent (un Launcher armado sin ella), o "" si no. agmen run abre esas
+    conexiones solo (agmen.agent.AgentLink). Nunca medio robot en silencio."""
     used = [m for m in config.machines if m.name in places]
     remote = [m for m in used if not places[m.name].here]
     if not remote:
@@ -376,28 +432,25 @@ def remote_error(config, places: dict[str, Place]) -> str:
         names = _nodes_on(config, m.name)
         parts.append(f"{and_names(names)} {'corre' if len(names) == 1 else 'corren'} en '{m.name}' ({_address(m)})")
     notes = "".join(f" {n[0].upper()}{n[1:]}." for n in (places[m.name].note for m in remote) if n)
-    remote_names = [m.name for m in remote]
-    # Con hardware entre los remotos nunca se sugiere correrlos aquí: serían los drivers del robot en esta
-    # computadora. Solo, si no lo trae, probar en simulación.
-    hardware = hardware_remote(config, remote_names)
-    sim = "[profile.sim] local = true y agmen run --sim"
-    local = f"[profile.{config.profile}] local = true para correr todo aquí"
-    if len(used) == 1:
-        text = (f"{parts[0]} y esta versión todavía no arranca nodos en otra computadora (llega con agmen agent)."
-                f"{notes} Mientras tanto: corre agmen run en esa computadora")
-        if not hardware:
-            return f"{text}, o usa {local}"
-        if config.profile == "real" and _sim_is_safe(config, remote_names):
-            return f"{text}. Para probar aquí en simulación: {sim}"
-        return f"{text}."
-    every = ", ".join(f"'{m.name}'" for m in used)
-    text = (f"{'; '.join(parts)}. Con nodos en varias computadoras ({every}) hace falta agmen agent, que llega "
-            f"en una versión próxima.{notes}")
-    if not hardware:
-        return f"{text} Mientras tanto: usa {local}"
-    if config.profile == "real" and _sim_is_safe(config, remote_names):
-        return f"{text} Mientras tanto, para probar aquí en simulación: {sim}"
-    return text
+    which = " y ".join(f"'{m.name}'" for m in remote)
+    return (f"{'; '.join(parts)} y no hay conexión con su agmen agent.{notes} Corre agmen agent en {which} "
+            f"y agmen run aquí: se conecta solo")
+
+
+# Por qué no se intenta ni conectar: la dirección misma no sirve (RFC 0011 §3.4, parte 3a).
+UNREACHABLE = ("unresolved", "timeout", "zone", "mixed", "special")
+
+
+def address_error(config, places: dict[str, Place]) -> str:
+    """El error si la dirección de alguna computadora remota no sirve para conectarse
+    (un nombre que no se resuelve, una IPv6 link-local sin %interfaz, un nombre con IP
+    de aquí y de fuera…), con la nota de qué hacer; o "" si todas se pueden intentar."""
+    bad = [m for m in config.machines if m.name in places and not places[m.name].here
+           and places[m.name].why in UNREACHABLE]
+    if not bad:
+        return ""
+    return "; ".join(f"no puedo conectarme con '{m.name}' ({_address(m)}): {places[m.name].note or 'su host no sirve'}"
+                     for m in bad) + ". Corrige host en robot.toml"
 
 
 def placement_lines(config, places: dict[str, Place]) -> list[str]:

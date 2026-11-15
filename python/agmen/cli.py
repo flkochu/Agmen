@@ -1,6 +1,7 @@
 """El comando `agmen`.
 
     agmen run [robot.toml]     lanza todo el robot + panel web, con un solo comando
+    agmen agent [robot.toml]   en otra computadora del robot: espera a agmen run y corre sus nodos
     agmen web [ARCHIVO.mcap]   solo el panel web (sin administrar nodos), o para ver una grabación
     agmen mux --out ... --in   prioridad de comandos: ¿quién manda al motor?
     agmen echo IP:PUERTO       muestra cualquier mensaje que llegue (sin código del tipo)
@@ -17,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import signal
 import sys
@@ -38,9 +40,93 @@ def _wait_for_ctrl_c(stop: threading.Event) -> None:
         pass
 
 
+def _ctrl_break_like_ctrl_c() -> None:
+    """Windows: Ctrl+Break (CTRL_BREAK_EVENT, lo único que se le puede mandar a un grupo de
+    procesos) llega como SIGBREAK, y Python no le pone manejador: el de la consola termina
+    el proceso en el acto (código 0xC000013A), sin limpiar nada. Con esto Ctrl+Break es lo
+    mismo que Ctrl+C: un KeyboardInterrupt. No hace nada fuera de Windows."""
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, signal.default_int_handler)
+
+
+# Las señales cuyo manejador cambia agmen run (_CtrlC, _wait_for_ctrl_c); cmd_run deja las de antes al salir.
+_RUN_SIGNALS = tuple(getattr(signal, s) for s in ("SIGINT", "SIGTERM", "SIGBREAK") if hasattr(signal, s))
+
+
+class _CtrlC:
+    """Ctrl+C (en Windows también Ctrl+Break) mientras agmen run arranca, hasta que empieza a
+    esperar en _wait_for_ctrl_c (RFC 0011, parte 3b; regla 1).
+
+    Con catch(), Ctrl+C no corta a la mitad lo que se está haciendo (un nodo recién arrancado
+    que nadie anotó quedaría vivo): se anota en `pressed`, se prende `stop` y cmd_run lo revisa
+    entre una fase y otra. Solo lo que puede tardar sin fin y sabe cancelarse (pedir la clave,
+    conectarse, los comandos de [robot] before) corre dentro de interruptible(), donde Ctrl+C es
+    el KeyboardInterrupt de siempre. Un segundo Ctrl+C mientras se limpia solo se anota."""
+
+    def __init__(self, stop: threading.Event) -> None:
+        self.stop = stop
+        self.pressed = False
+
+    def _note(self, signum, frame) -> None:
+        self.pressed = True
+        self.stop.set()
+
+    def catch(self) -> None:
+        signal.signal(signal.SIGINT, self._note)
+        if hasattr(signal, "SIGBREAK"):  # Windows
+            signal.signal(signal.SIGBREAK, self._note)
+
+    @contextlib.contextmanager
+    def interruptible(self):
+        try:   # dentro del try: si Ctrl+C llega recién puesto default_int_handler, el finally pone el que anota
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+            _ctrl_break_like_ctrl_c()
+            if self.pressed:   # se anotó justo antes de entrar: que no se pierda
+                raise KeyboardInterrupt
+            yield
+        finally:   # queda una ventana de microsegundos: un Ctrl+C ya aquí dentro, antes de que catch() ponga
+            self.catch()   # el que anota, sale como KeyboardInterrupt; en Python no se puede cerrar del todo
+
+
+def _finish_all(remotes: dict) -> str:
+    """detener_todo y adios a cada agente. Devuelve la frase que lo cuenta, o "" si a ninguno se le
+    mandó nada: un enlace que se perdió o que nunca se abrió no recibe nada, y no se dice que sí."""
+    told = 0
+    for link in remotes.values():
+        told += link.channel is not None and not link.lost
+        link.finish()
+    return " (les avisé a las otras computadoras)" if told else ""
+
+
+def _cancelled(when: str, what: str) -> int:
+    print(f"\nagmen │ cancelado (Ctrl+C) {when}: {what}", file=sys.stderr)
+    return 130
+
+
 def cmd_run(args) -> int:
+    """agmen run. Al salir deja los manejadores de señales como estaban (llamado desde Python,
+    como en las pruebas, el proceso no se queda con los de agmen run)."""
+    if threading.current_thread() is not threading.main_thread():
+        # Python solo deja poner manejadores de señales (Ctrl+C) en el hilo principal: sin ellos agmen run no
+        # podría detener el robot con Ctrl+C. Mejor decirlo antes de arrancar nada que un ValueError de signal.
+        print("error: agmen run necesita el hilo principal de Python para atender Ctrl+C, y lo llamaste desde "
+              "otro hilo. Llámalo desde el hilo principal, o córrelo en otro proceso "
+              "(ej. subprocess.run([sys.executable, \"-m\", \"agmen\", \"run\", \"robot.toml\"]))", file=sys.stderr)
+        return 2
+    saved = [(s, signal.getsignal(s)) for s in _RUN_SIGNALS]
+    try:
+        return _run(args)
+    finally:
+        for s, handler in saved:
+            if handler is not None:
+                signal.signal(s, handler)
+
+
+def _run(args) -> int:
     from .panel import Panel, Teleop
     from .run import ConfigError, Launcher, load_config, prepare_hub
+
+    _ctrl_break_like_ctrl_c()   # mientras lee el archivo: Ctrl+Break como Ctrl+C (luego, _CtrlC)
 
     # El perfil (RFC 0011 §3.2): --profile X, --sim (= --profile sim) o, con --play, "replay".
     if args.sim and args.profile not in (None, "sim"):
@@ -61,10 +147,19 @@ def cmd_run(args) -> int:
     except ConfigError as e:
         print(f"error en {args.archivo}: {e}", file=sys.stderr)
         return 2
+    if args.forget_key is not None:
+        return _forget_key(config, args.forget_key, args.archivo)
     if config.profile == "replay" and not args.play:
         print(f"error: el perfil replay es el de --play: agmen run {args.archivo} --play ARCHIVO.mcap",
               file=sys.stderr)
         return 2
+    stop = threading.Event()
+    ctrl_c = _CtrlC(stop)
+    ctrl_c.catch()   # desde aquí Ctrl+C se revisa entre fases (y corta lo que puede tardar sin fin)
+
+    def _cancelled_or(code: int, when: str = "antes de arrancar los nodos", what: str = "no arrancó ningún nodo") -> int:
+        """Si Ctrl+C ya se anotó, gana la cancelación (130), aunque además haya salido un error."""
+        return _cancelled(when, what) if ctrl_c.pressed else code
 
     try:
         if config.hub and any(name == "hub" for name, _ in config.skipped):   # igual en todos los perfiles
@@ -94,26 +189,52 @@ def cmd_run(args) -> int:
     places = {}   # RFC 0011 §3.4: dónde corre cada [[machine]]; nunca medio robot en silencio.
     # Después de los errores del archivo: esta consulta puede tardar hasta 1.5 s (DNS)
     player = None
+    remotes: dict = {}   # [[machine]] de otra computadora → su agmen agent (agent.AgentLink)
     if config.machines:
-        from .machines import place_machines, remote_error
+        from .machines import address_error, place_machines
 
         if args.play:   # la grabación tampoco depende de la red: se revisa antes
             from .play import Player
 
             try:
-                player = Player(args.play, args.play_topic or None, paused=True)
+                with ctrl_c.interruptible():   # una grabación cortada se recorre entera: puede tardar
+                    player = Player(args.play, args.play_topic or None, paused=True)
+            except KeyboardInterrupt:
+                if player is not None:
+                    player.stop()
+                return _cancelled("mientras abría la grabación", "no arrancó nada")
             except (ValueError, OSError) as e:
                 print(f"error: --play: {e}", file=sys.stderr)
-                return 2
+                return _cancelled_or(2, "antes de conectarme", "no arrancó nada")
         places = place_machines(config)
-        remote = remote_error(config, places)
+        remote = address_error(config, places)
+        keys = {}
+        if not remote:
+            from .agent import AgentError, KeyPromptCancelled
+
+            if ctrl_c.pressed:   # mientras consultaba dónde está cada [[machine]] (DNS)
+                if player is not None:
+                    player.stop()
+                return _cancelled("antes de conectarme", "no arrancó nada")
+            try:
+                with ctrl_c.interruptible():
+                    remotes, keys = _links_for(config, places, args.archivo)
+            except AgentError as e:   # no hay clave, o keys.toml no se puede leer
+                remote = str(e)
+            except (KeyboardInterrupt, KeyPromptCancelled) as e:   # Ctrl+C o Ctrl+D mientras pedía la clave
+                if player is not None:
+                    player.stop()
+                tecla = "Ctrl+D" if isinstance(e, KeyPromptCancelled) else "Ctrl+C"
+                print(f"\nagmen │ cancelado ({tecla}) antes de conectarme: no arrancó nada", file=sys.stderr)
+                return 130
         if remote:
             if player is not None:
                 player.stop()
             print(f"error: {remote}", file=sys.stderr)
-            return 2
+            return _cancelled_or(2, "antes de conectarme", "no arrancó nada")
 
-    launcher = Launcher(config, places=places)
+    lost: list[str] = []
+    launcher = Launcher(config, places=places, remotes=remotes)
     out = _SayTo(launcher)
     launcher.say(f"Agmen {__version__} · robot '{config.name}' · {len(config.nodes)} nodos · {hub_note}")
     if args.play or config.profile != "real" or config.skipped:   # un robot.toml sin perfiles se ve como antes
@@ -130,6 +251,31 @@ def cmd_run(args) -> int:
                          f"Si tocan hardware, se van a mover con datos grabados (también si los arrancas "
                          f"desde el panel): quítalos con --skip"
                          + (f", o corre sin --profile {args.profile}" if args.profile else ""))
+    if remotes:   # ANTES de arrancar nada: si una computadora falla, no arranca nada en ninguna
+        if ctrl_c.pressed:
+            launcher.printer.close()
+            if player is not None:
+                player.stop()
+            return _cancelled("antes de conectarme", "no arrancó nada")
+        try:
+            with ctrl_c.interruptible():
+                error = _connect(launcher, config, remotes, keys, "replay" if args.play else config.clock.mode,
+                                 lost, stop)
+        except KeyboardInterrupt:   # _connect ya mandó adios a todas (si ya había vuelto, se les manda aquí)
+            for link in remotes.values():
+                link.close()
+            launcher.printer.close()
+            if player is not None:
+                player.stop()
+            print("\nagmen │ cancelado (Ctrl+C) mientras me conectaba con las otras computadoras: les avisé y no "
+                  "arrancó nada", file=sys.stderr)
+            return 130
+        if error:
+            launcher.printer.close()
+            if player is not None:
+                player.stop()
+            print(f"error: {error}", file=sys.stderr)
+            return _cancelled_or(2, "mientras me conectaba con las otras computadoras", "les avisé y no arrancó nada")
     for warning in config.warnings:
         launcher.say(f"⚠ {warning}")
     for note in skip_notes:
@@ -139,13 +285,39 @@ def cmd_run(args) -> int:
 
         for line in other_robot(config):
             launcher.say(line)
-    try:
-        ready = launcher.run_before()
-    except BaseException:           # Ctrl+C en un comando de before: la grabación ya abierta se cierra
+    if lost:   # una computadora se perdió mientras me conectaba con otra: no se arranca nada de aquí
+        told = _finish_all(remotes)
+        launcher.printer.close()
         if player is not None:
             player.stop()
+        return _cancelled_or(1, what=f"no arrancó ningún nodo{told}")
+
+    def cancel_before_nodes(when: str) -> int:   # todavía no arrancó ningún nodo: adios a los agentes y sale
+        ctrl_c.catch()
+        told = _finish_all(remotes)
+        launcher.printer.close()
+        if player is not None:
+            player.stop()
+        return _cancelled(when, f"no arrancó ningún nodo{told}")
+
+    if ctrl_c.pressed:
+        return cancel_before_nodes("antes de arrancar los nodos")
+    try:
+        with ctrl_c.interruptible():   # subprocess.run mata al comando que corría antes de relanzarlo
+            ready = launcher.run_before()
+    except KeyboardInterrupt:
+        return cancel_before_nodes("mientras corría [robot] before")
+    except BaseException:           # otro error en before: la grabación ya abierta se cierra, adios a los agentes
+        if player is not None:
+            player.stop()
+        for link in remotes.values():
+            link.finish()
         raise
-    if not ready:
+    if ctrl_c.pressed:
+        return cancel_before_nodes("antes de arrancar los nodos")
+    if not ready or lost:
+        for link in remotes.values():
+            link.finish()
         launcher.printer.close()
         if player is not None:
             player.stop()
@@ -157,11 +329,16 @@ def cmd_run(args) -> int:
             from .play import Player
 
             try:
-                player = Player(args.play, args.play_topic or None, paused=True, out=out)
+                with ctrl_c.interruptible():   # una grabación cortada se recorre entera: puede tardar
+                    player = Player(args.play, args.play_topic or None, paused=True, out=out)
+            except KeyboardInterrupt:
+                return cancel_before_nodes("mientras abría la grabación")
             except (ValueError, OSError) as e:
+                for link in remotes.values():   # (aquí no hay: con [[machine]] la grabación se abre antes)
+                    link.finish()
                 launcher.printer.close()
                 print(f"error: --play: {e}", file=sys.stderr)
-                return 2
+                return _cancelled_or(2)
         if config.clock.mode == "sim":
             launcher.say("⚠ --play usa el tiempo de la grabación: no aplica [clock] mode = \"sim\"")
         player.start()
@@ -173,17 +350,16 @@ def cmd_run(args) -> int:
         if clock_note:
             launcher.say(clock_note)
     recording = _recording_for(config, args, out)
-    if args.record or (config.record is not None and config.record.auto):
+    if not lost and not ctrl_c.pressed and (args.record or (config.record is not None and config.record.auto)):
         err = recording.start()
         if err:
             launcher.say(f"⚠ no se pudo grabar: {err}")
     launcher.recording = recording
-    stop = threading.Event()
     watch = _watch_for(config, launcher, stop)    # [[topic]] max_gap_ms (RFC 0012)
     launcher.watch = watch
 
     panel = None
-    if config.web.enabled and not args.no_web:
+    if config.web.enabled and not args.no_web and not lost and not ctrl_c.pressed:
         teleop = Teleop(config.web.teleop.target, config.web.teleop.max_speed) if config.web.teleop else None
         commands = _commands_for(config)
         http = _http_for(args.http or config.web.http, args.red)
@@ -191,13 +367,22 @@ def cmd_run(args) -> int:
             panel = Panel(http, config.web.listen, config.name, launcher, teleop,
                           token=config.web.token, allow_origins=config.web.allow_origins, clock=clock_server,
                           commands=commands, profile=config.profile, playing=bool(args.play))
-        except OSError as e:
+        except OSError as e:   # ningún nodo arrancó aún: se cierra lo que ya estaba abierto, como en los otros caminos
             for c in commands:
                 c.close()
+            stop.set()                      # el vigilante de max_gap_ms
+            for link in remotes.values():   # detener_todo y adios a las otras computadoras
+                link.finish()
+            if recording.rec is not None:
+                recording.stop()
+            if player is not None:
+                player.stop()
+            elif clock_server:
+                clock_server.close()
             launcher.printer.close()
             print(f"no se pudo abrir el panel web en {http}: {e}. "
                   f"¿Ya hay otro 'agmen run' corriendo? Usa --http 127.0.0.1:8081", file=sys.stderr)
-            return 1
+            return _cancelled_or(1)
         panel.start(open_browser=config.web.open_browser and not args.no_browser)
         for line in _panel_lines(panel):
             launcher.say(line)
@@ -209,9 +394,11 @@ def cmd_run(args) -> int:
             ctl = f" · {len(c.cfg.controls)} controles" if c.cfg.controls else ""
             launcher.say(f"mando '{c.cfg.name}' en el panel: {c.cfg.layout.name} → {c.cfg.target}{to} · {what}{ctl}")
 
-    launcher.start_all()
-    launcher.say("todo arrancado. Ctrl+C para detener todo.")
-    if player is not None:   # que los nodos alcancen a suscribirse antes del primer mensaje
+    if not stop.is_set():   # una computadora se perdió (o Ctrl+C) mientras se preparaba lo de aquí: no se arranca
+        launcher.start_all()
+        if not ctrl_c.pressed:
+            launcher.say("todo arrancado. Ctrl+C para detener todo.")
+    if player is not None and not ctrl_c.pressed:   # que los nodos alcancen a suscribirse antes del primer mensaje
         threading.Timer(2.0, player.resume).start()
 
     def close_recording():
@@ -228,6 +415,174 @@ def cmd_run(args) -> int:
             player.stop()
         elif clock_server:
             clock_server.close()
+    if ctrl_c.pressed:   # antes de "todo arrancado": lo que alcanzó a arrancar ya se detuvo arriba
+        return _cancelled("mientras arrancaba", "detuve todo lo que alcanzó a arrancar")
+    return 1 if lost else 0
+
+
+def _forget_key(config, name: str, archivo: str) -> int:
+    """agmen run --forget-key NOMBRE: borra la clave guardada de esa [[machine]] y sale."""
+    import difflib
+
+    from .agent import AgentError, client_keys_path, forget_client_key, machine_address
+
+    m = next((x for x in config.machines if x.name == name), None)
+    if m is None:
+        names = [x.name for x in config.machines]
+        hint = difflib.get_close_matches(name, names, n=1)
+        extra = (f" ¿Quisiste decir '{hint[0]}'?" if hint else
+                 f" Hay: {', '.join(names)}." if names else " No declara ninguna.")
+        print(f"error: --forget-key {name}: {archivo} no tiene una [[machine]] con ese nombre.{extra}", file=sys.stderr)
+        return 2
+    address = machine_address(m.host, m.port)
+    try:
+        had = forget_client_key(address)
+    except AgentError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if had:
+        print(f"agmen │ borré la clave de {name} ({address}) de {client_keys_path()}: la próxima vez agmen run te la pide")
+    else:
+        print(f"agmen │ no había una clave guardada para {name} ({address}): nada que borrar")
+    return 0
+
+
+def _links_for(config, places: dict, archivo: str) -> tuple[dict, dict]:
+    """Una conexión (sin abrir) por cada [[machine]] de otra computadora, y su clave:
+    de keys.toml, de AGMEN_AGENT_KEY o pedida en la terminal (RFC 0011 §3.4, D9)."""
+    from .agent import AgentLink, get_key
+
+    links, keys = {}, {}
+    for m in config.machines:
+        if m.name in places and not places[m.name].here:
+            link = AgentLink(m, toml_hint=archivo)
+            links[m.name] = link
+            keys[m.name] = get_key(m.name, link.address)
+    return links, keys
+
+
+def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list, stop) -> str:
+    """Abre la sesión con cada agente, una tras otra. Devuelve "" si todas se abrieron;
+    si no, el error, y las que ya estaban abiertas reciben adios (no arranca nada)."""
+    from .agent import AgentError, save_client_key, session_message
+
+    def on_lost(link, text):
+        lost.append(text)
+        launcher.say(f"✖ {text}", "error")
+        stop.set()
+
+    opened = []
+    try:
+        for name, link in remotes.items():
+            if lost:   # otra ya se perdió: no se abre ninguna más (las abiertas reciben adios en cmd_run)
+                break
+            key, source = keys[name]
+
+            def keep(link=link, key=key, source=source):
+                if source == "escrita":   # solo tras una conexión aceptada (la clave probó ser buena)
+                    save_client_key(link.address, key)
+                    launcher.say(f"guardé la clave de {link.name} en tu usuario (agmen run --forget-key {link.name} "
+                                 f"la borra)")
+
+            launcher.say(f"conectando con {name} ({link.shown})…")
+            link.on_lost = on_lost   # ANTES de open(): una pérdida justo después de abrir no se olvida
+            try:
+                link.open(key, session_message(config, name, clock), on_key_ok=keep, stop=stop)
+            except AgentError as e:
+                if lost:   # otra se perdió mientras esta preparaba la sesión: ya recibió adios; cmd_run sale con 1
+                    break
+                code = getattr(e, "code", "")
+                text = str(e)
+                if code == "clave":
+                    text += {"guardada": f". La clave guardada ya no sirve (¿alguien corrió agmen agent --new-key?): "
+                                         f"bórrala con agmen run --forget-key {name} y vuelve a correr agmen run "
+                                         f"(te pide la nueva)",
+                             "variable": ". Pon en AGMEN_AGENT_KEY la que muestra agmen agent al arrancar",
+                             "escrita": ". Vuelve a correr agmen run y escribe la que muestra agmen agent al arrancar, "
+                                        f"en la terminal de {name}"}[source]
+                for other in opened:
+                    other.close()
+                return text
+            opened.append(link)
+            if lost:   # se perdió (esta u otra) mientras abría: no se dice "conectado"
+                break
+            launcher.say(f"{name} ({link.shown}): conectado · Agmen {link.version}")
+            from ._version import __version__ as mine
+
+            if link.version != mine:
+                launcher.say(f"⚠ {name} tiene Agmen {link.version} y esta computadora Agmen {mine}: se entienden "
+                             f"(mismo protocolo), pero conviene la misma versión en las dos (pip install -U agmen)")
+    except BaseException:   # Ctrl+C mientras se conecta (o el before de un agente): adios a todas
+        for link in remotes.values():
+            link.close()
+        raise
+    return ""
+
+
+def cmd_agent(args) -> int:
+    """agmen agent (RFC 0011 §3.4, D6, D7, D9): en la computadora del robot, espera a
+    agmen run y corre los nodos de SU robot.toml que dicen machine = esta computadora."""
+    from .agent import AgentError, AgentServer, agent_key_path, load_agent_key, pick_machine
+    from .machines import _address
+    from .run import ConfigError, Printer, load_config
+
+    try:
+        config = load_config(args.archivo)
+    except ConfigError as e:
+        print(f"error en {args.archivo}: {e}", file=sys.stderr)
+        return 2
+    try:
+        me = pick_machine(config, args.machine)
+    except AgentError as e:
+        print(f"error en {args.archivo}: {e}", file=sys.stderr)
+        return 2
+    if args.port is not None and not 1 <= args.port <= 65535:
+        print(f"error: --port {args.port}: el puerto es un número entre 1 y 65535", file=sys.stderr)
+        return 2
+    port = args.port if args.port is not None else me.port
+    host = f"[{me.host}]" if ":" in me.host else me.host
+    printer = Printer(["agmen agent"])
+
+    def say(text: str, kind: str = "agmen") -> None:
+        printer("agmen agent", text, kind)
+
+    # Primero el puerto y luego la clave: con el puerto ocupado, --new-key no tira la clave de antes.
+    server = AgentServer(args.archivo, me.name, None, port=port, shown=f"{host}:{port}", say=say)
+    try:
+        server.bind()
+    except OSError as e:
+        why = str(e.strerror or e).split(" (while")[0]
+        print(f"error: no pude escuchar en el puerto {port} ({why}): ¿ya corre otro agmen agent en esta "
+              f"computadora? Detenlo (Ctrl+C en su terminal), o usa otro con --port N y ponlo también en host de "
+              f"[[machine]] '{me.name}' (ej. host = \"{host}:{port + 1}\")", file=sys.stderr)
+        printer.close()
+        return 2
+    try:
+        key, created = load_agent_key(new=args.new_key)
+    except AgentError as e:
+        server.sock.close()
+        printer.close()
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    server.use_key(key)
+    here = [n.name for n in config.nodes if n.machine == me.name]
+    say(f"Agmen {__version__} · robot '{config.name}' · esta computadora es '{me.name}' ({_address(me)}) · "
+        f"nodos de aquí (perfil {config.profile}): {', '.join(here) or 'ninguno'}")
+    if args.port is not None and args.port != me.port:
+        say(f"⚠ --port {args.port}: en tu laptop, host de [[machine]] '{me.name}' debe decir \"{host}:{port}\"")
+    if created:
+        say(f"clave {'nueva' if args.new_key else 'creada'} (guardada en {agent_key_path()}): agmen run te la pide "
+            f"la primera vez que se conecta" + ("; la clave anterior ya no sirve" if args.new_key else ""))
+    say(f"{server.waiting_line()} · clave: {key}", "out")
+    stop = threading.Event()
+    threading.Thread(target=server.serve, args=(stop,), daemon=True, name="agmen-agent").start()
+    try:
+        _wait_for_ctrl_c(stop)
+    finally:
+        say("deteniendo…")
+        server.close()
+        say("listo. ¡Hasta luego!")
+        printer.close()
     return 0
 
 
@@ -485,7 +840,19 @@ def main(argv: list[str] | None = None) -> int:
                         "(default: [robot] profile o real; con --play, replay)")
     p.add_argument("--sim", action="store_true",
                    help="lo mismo que --profile sim: el simulador en vez del robot, con reloj de simulación")
+    p.add_argument("--forget-key", metavar="NOMBRE",
+                   help="borrar la clave guardada de agmen agent de esa [[machine]] (y salir)")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("agent", help="en otra computadora del robot: espera a agmen run y corre ahí sus nodos")
+    p.add_argument("archivo", nargs="?", default="robot.toml", help="archivo del robot (default: robot.toml)")
+    p.add_argument("--machine", metavar="NOMBRE",
+                   help="qué [[machine]] es esta computadora (default: la única cuyo host es de aquí)")
+    p.add_argument("--port", type=int, metavar="N",
+                   help="dónde escuchar (default: el puerto del host de su [[machine]], 7391)")
+    p.add_argument("--new-key", action="store_true",
+                   help="crear una clave nueva (la anterior deja de servir; la laptop la pide otra vez)")
+    p.set_defaults(func=cmd_agent)
 
     p = sub.add_parser("web", help="solo el panel web (sin administrar nodos); o una grabación: agmen web vuelta1.mcap")
     p.add_argument("archivo", nargs="?", metavar="ARCHIVO.mcap",
@@ -560,6 +927,14 @@ def main(argv: list[str] | None = None) -> int:
 
     ensure_utf8_output()
     args = ap.parse_args(argv)
+    if args.cmd in ("run", "agent"):   # AGMEN_REMOTE_HOSTS (pruebas, RFC 0011 §6 reto 9): mal escrita, error
+        from .machines import forced_remote
+
+        try:
+            forced_remote()
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
     if args.cmd in ("run", "record", "play", "topic", "node", "web", "echo", "mux"):
         # Su nombre para el hub ("▶ 'agmen play' publica /imu"), si no trae AGMEN_NODE.
         from .pubsub import set_default_node_name

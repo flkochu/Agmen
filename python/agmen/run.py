@@ -824,8 +824,16 @@ class LogBook:
             notify()
 
     def since(self, idx: int) -> tuple[list[dict], int]:
+        """Las líneas desde la `idx` (en orden). Recorre solo las nuevas, desde el final:
+        el agente la llama por cada línea (RFC 0011 §3.4) y no debe recorrer las 5000."""
         with self.lock:
-            return [line for line in self.lines if line["i"] >= idx], self.next_idx
+            out = []
+            for line in reversed(self.lines):
+                if line["i"] < idx:
+                    break
+                out.append(line)
+            out.reverse()
+            return out, self.next_idx
 
 
 # ---------------------------------------------------------------------------
@@ -842,12 +850,25 @@ class Node:
         self.printer = printer
         self.lock = threading.RLock()
         self.proc: subprocess.Popen | None = None
+        # Quién quiere saber de cada cambio de estado (agmen agent, RFC 0011 §3.4). Se llama
+        # con el nodo, ya con su proc y exit_code nuevos, y con self.lock tomado: no debe esperar.
+        self.on_state: Callable[[Node], None] | None = None
         self.state = "detenido"          # corriendo | detenido | falló | reiniciando | terminó
         self.started_at: float | None = None
         self.restarts = 0
         self.exit_code: int | None = None
         self.wanted = False              # ¿el usuario quiere que esté corriendo?
         self._generation = 0
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @state.setter
+    def state(self, value: str) -> None:
+        self._state = value
+        if self.on_state is not None:
+            self.on_state(self)
 
     # --- estado para el panel ---
     def info(self) -> dict:
@@ -908,12 +929,12 @@ class Node:
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace", bufsize=1, **kwargs)
         except OSError as e:
-            self.state, self.exit_code = "falló", None
+            self.exit_code, self.state = None, "falló"   # el estado al final: on_state ve todo lo nuevo
             self._log(f"no se pudo arrancar '{self.cfg.cmd[0]}': {e.strerror or e}. "
                       f"¿Compilaste el proyecto y la ruta es correcta (relativa a robot.toml)?", "error")
             return
         self._generation += 1
-        self.state, self.started_at, self.exit_code = "corriendo", time.time(), None
+        self.started_at, self.exit_code, self.state = time.time(), None, "corriendo"
         self._log(f"▶ iniciado (pid {self.proc.pid})", "agmen")
         threading.Thread(target=self._pump, args=(self.proc, self._generation), daemon=True).start()
 
@@ -1048,11 +1069,14 @@ class Printer:
                 text = f"\x1b[2m{text}\x1b[0m" if kind == "agmen" else f"\x1b[31m{text}\x1b[0m"
         return f"{tag} │ {text}"
 
-    def __call__(self, node: str, text: str, kind: str = "out") -> None:
+    def __call__(self, node: str, text: str, kind: str = "out", droppable: bool | None = None) -> None:
+        """`droppable`: ¿se puede descartar si la terminal no da abasto? Por defecto, solo las
+        líneas "out": los avisos de agmen y los errores de aquí nunca. Lo que llega de otra
+        computadora (agmen agent) siempre se puede: un agente roto no llena la memoria aquí."""
         line = self._format(node, text, kind)
         with self.cond:
-            if len(self.queue) >= self.max_queue and kind == "out":
-                self.dropped += 1   # los avisos de agmen y los errores nunca se descartan
+            if len(self.queue) >= self.max_queue and (kind == "out" if droppable is None else droppable):
+                self.dropped += 1
                 return
             self.queue.append(line)
             self.cond.notify()
@@ -1107,23 +1131,40 @@ class Printer:
 # ---------------------------------------------------------------------------
 
 class Launcher:
-    def __init__(self, config: RobotConfig, stream=None, *, places: dict | None = None) -> None:
+    def __init__(self, config: RobotConfig, stream=None, *, places: dict | None = None,
+                 remotes: dict | None = None) -> None:
         """`places`: dónde corre cada [[machine]] ({nombre: machines.Place}, de
         machines.place_machines), si quien construye el Launcher ya lo decidió; si
-        no, se decide aquí. Si ningún nodo dice machine, no se consulta nada. Esta
-        versión solo arranca nodos en esta computadora: si alguno es de otra, o su
-        machine no está declarada, ConfigError antes de crear nada (RFC 0011 §3.4:
-        nunca medio robot en silencio)."""
-        self.places = self._check_places(config, places)
+        no, se decide aquí. Si ningún nodo dice machine, no se consulta nada.
+        `remotes`: {nombre de [[machine]]: agent.AgentLink} de las computadoras que
+        no son esta (RFC 0011 §3.4): sus nodos son agent.RemoteNode, nodos como los
+        demás cuyas órdenes viajan a su agmen agent. Si un nodo es de otra
+        computadora sin AgentLink, o su machine no está declarada, ConfigError antes
+        de crear nada (nunca medio robot en silencio)."""
+        remotes = remotes or {}
+        self.places = self._check_places(config, places, remotes)
         self.config = config
+        self.remotes = remotes
         self.logs = LogBook()
-        self.printer = Printer([n.name for n in config.nodes] + ["agmen"], stream=stream)
-        self.nodes = {n.name: Node(n, config.base_dir, self.logs, self.printer) for n in config.nodes}
+        shown = [f"{n.machine}/{n.name}" if n.machine in remotes else n.name for n in config.nodes]
+        self.printer = Printer(shown + list(remotes) + ["agmen"], stream=stream)
+        self.nodes: dict[str, Node] = {}
+        for n in config.nodes:
+            if n.machine in remotes:
+                from .agent import RemoteNode
+
+                node = RemoteNode(n, config.base_dir, self.logs, self.printer, remotes[n.machine])
+                remotes[n.machine].nodes[n.name] = node
+            else:
+                node = Node(n, config.base_dir, self.logs, self.printer)
+            self.nodes[n.name] = node
+        for link in remotes.values():
+            link.attach(self.logs, self.printer)
         self.stopping = threading.Event()
         self.recording = None    # el control de grabación (RFC 0010); lo pone agmen run
 
     @staticmethod
-    def _check_places(config: RobotConfig, places: dict | None) -> dict:
+    def _check_places(config: RobotConfig, places: dict | None, remotes: dict | None = None) -> dict:
         used = {n.machine for n in config.nodes if n.machine}
         if not used:
             return {}   # ningún nodo dice machine: todo corre aquí, sin consultar nada
@@ -1144,7 +1185,10 @@ class Launcher:
         if missing:
             raise ValueError(f"Launcher: places no dice dónde corre {', '.join(missing)} "
                              f"(usa machines.place_machines(config))")
-        error = remote_error(config, places)
+        from .machines import Place
+
+        error = remote_error(config, {m: (Place(True, "agent") if m in (remotes or {}) else p)
+                                      for m, p in places.items()})
         if error:
             raise ConfigError(error)
         return places
@@ -1178,7 +1222,14 @@ class Launcher:
             return
         self.stopping.set()
         self.say("deteniendo todos los nodos…")
-        threads = [threading.Thread(target=n.stop) for n in self.nodes.values()]
+        # Primero las otras computadoras (detener_todo, sus estado, adios); luego lo de aquí.
+        threads = [threading.Thread(target=link.finish) for link in self.remotes.values()]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        local = [n for n in self.nodes.values() if n.cfg.machine not in self.remotes]
+        threads = [threading.Thread(target=n.stop) for n in local]
         for t in threads:
             t.start()
         for t in threads:
