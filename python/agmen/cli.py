@@ -399,13 +399,22 @@ def _run(args) -> int:
             launcher.say(f"mando '{c.cfg.name}' en el panel: {c.cfg.layout.name} → {c.cfg.target}{to} · {what}{ctl}")
 
     # RFC 0011, parte 3c: desde aquí, perder una computadora ya no detiene todo: se reintenta hasta Ctrl+C.
-    # DECISIÓN PENDIENTE: antes de este punto (mientras se conecta con las demás, corre el before local o abre el
-    # panel) sigue valiendo la 3b: una computadora perdida no deja arrancar nada y agmen run sale con 1. Opciones:
-    # (a) así (lo conservador: nada arrancó aún); (b) reconectar también ahí y arrancar al volver.
+    # Antes de este punto (mientras se conecta con las demás, corre el before local o abre el panel) sigue
+    # valiendo la 3b (decidido, §8-9): una computadora perdida no deja arrancar nada y agmen run sale con 1.
     for name, link in remotes.items():
         source = keys[name][1]
         if not link.keep_trying(hint=lambda code, name=name, source=source: _key_hint(name, source, code)):
             stop.set()   # ya se había perdido: on_lost lo cuenta (y agmen run sale con 1, como en la 3b)
+    # La que se perdió entre keep_trying y aquí (ya reintentando) también cuenta como "antes de arrancar" (§9):
+    # después de esta revisión no queda nada en medio hasta start_all.
+    for name, link in remotes.items():
+        if link.down_since is not None and not stop.is_set():
+            text = (f"{name} ({link.shown}): se perdió la conexión justo antes de arrancar los nodos: no arranco "
+                    f"nada. Revisa {name} (¿se apagó, se cayó la red o se cerró agmen agent?) y vuelve a correr "
+                    f"agmen run")
+            lost.append(text)
+            launcher.say(f"✖ {text}", "error")
+            stop.set()
     if not stop.is_set():   # una computadora se perdió (o Ctrl+C) mientras se preparaba lo de aquí: no se arranca
         launcher.start_all()
         if not ctrl_c.pressed:

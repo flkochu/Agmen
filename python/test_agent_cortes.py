@@ -897,7 +897,7 @@ class TestCortesDeRed(CortesBase):
                                 r"Sus nodos siguen ~\d+ s por si vuelve; reintento…")
         n = int(re.search(r"Sus nodos siguen ~(\d+) s", texto).group(1))
         self.assertTrue(1 <= n <= 10, f"nunca promete más de la gracia: ~{n} s")
-        self.assertRegex(texto, rf"robot \(127\.0\.0\.1:{self.px.puerto}\): reconectado a los \d+ s · no se reinició nada")
+        self.assertRegex(texto, rf"robot \(127\.0\.0\.1:{self.px.puerto}\): reconectado tras \d+ s sin conexión · no se reinició nada")
         self.assertNotIn("se perdieron", texto, "no se perdió ninguna línea de log")
         self.assertNotIn("ya había detenido", texto)
         self.assertEqual(self.cuenta("): se perdió la conexión ("), 1, "el aviso de pérdida va una sola vez")
@@ -986,7 +986,7 @@ class TestCortesDeRed(CortesBase):
         self.px.levantar()
         self.esperar_linea("pero ya había detenido sus nodos. Arráncalos desde el panel (o reinicia agmen run)", 40,
                            que="agmen run no abrió una sesión nueva")
-        self.assertRegex(self.texto(self.lr), rf"robot \(127\.0\.0\.1:{self.px.puerto}\): reconectado a los \d+ s, pero ya "
+        self.assertRegex(self.texto(self.lr), rf"robot \(127\.0\.0\.1:{self.px.puerto}\): reconectado tras \d+ s sin conexión, pero ya "
                                               r"había detenido sus nodos")
         self.assertNotIn("no se reinició nada", self.texto(self.lr))
         self.assertTrue(self.espera_estado("motor", "detenido") and self.espera_estado("imu", "detenido"),
