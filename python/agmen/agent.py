@@ -1740,11 +1740,16 @@ class _Session:
         self._guarded(channel, self._loop, channel)
         return True
 
-    def _confirm(self, channel: Channel) -> None:
-        """§13.1: llegó el primer mensaje de la laptop por la conexión reanudada: ahora sí se cancela la gracia."""
+    def _confirm(self, channel: Channel) -> bool:
+        """§13.1: llegó el primer mensaje de la laptop por la conexión reanudada: ahora sí se cancela la gracia.
+        §15: devuelve si la confirmación tuvo efecto (o ya no hacía falta). False si la sesión está terminando (la
+        gracia venció justo ahora) o la conexión ya no es la actual: entonces el mensaje no se atiende ni se contesta,
+        para que la laptop no reciba un pong que diga "reconectado" con los nodos ya detenidos."""
         with self._end_lock:
-            if self._ending or self.unconfirmed is not channel or channel is not self.channel:
-                return
+            if self._ending or channel is not self.channel:
+                return False
+            if self.unconfirmed is not channel:
+                return True
             lost_at, timer = self.lost_at, self._grace_timer
             self.unconfirmed, self.lost_at, self._grace_timer = None, None, None
             self._grace_token += 1   # si el temporizador ya disparó y espera el candado, ya no hace nada
@@ -1757,9 +1762,10 @@ class _Session:
         if replaced is not None:
             self.say(f"la laptop volvió a conectarse desde {self.ip} antes de que se perdiera la conexión de "
                      f"{replaced}: la sustituí y sigo con la misma sesión (no se reinició nada)", "out")
-            return
+            return True
         self.say(f"la laptop ({self.ip}) volvió a los {time.monotonic() - (lost_at or time.monotonic()):.0f} s: sigo "
                  f"con la misma sesión (no se reinició nada)", "out")
+        return True
 
     def _run(self, first: dict) -> None:
         from .run import ConfigError, Launcher
@@ -1906,8 +1912,10 @@ class _Session:
             if self._ending or channel is not self.channel:
                 return
             self.last_rx = time.monotonic()
-            if self.unconfirmed is channel:   # §13.1: la laptop oye por esta conexión: la gracia se cancela
-                self._confirm(channel)
+            if self.unconfirmed is channel and not self._confirm(channel):
+                # §13.1: la laptop oye por esta conexión y la gracia se cancela; §15: si no tuvo efecto (la gracia
+                # venció entre la revisión de arriba y el candado), no se atiende ni se contesta nada.
+                return
             if self._order(msg):
                 return
 
@@ -2229,6 +2237,10 @@ class AgentLink:
         self._hint: Callable[[str], str] | None = None
         self._retry_stop = threading.Event()
         self._pending = False               # keep_trying sin go() todavía: una pérdida es "antes de arrancar"
+        # §15: mientras se espera el pong de confirmación de una reanudación, un Event que se marca al terminar esa
+        # espera; _resume_bye dice si al terminar se despidió por esa conexión (Ctrl+C: finish() no dice "no se enteró")
+        self._resuming: threading.Event | None = None
+        self._resume_bye = False
         self._pace: float = RETRY_EVERY     # el ritmo de los reintentos de ahora (1 s, o 5 s tras un rechazo)
 
     @property
@@ -2466,9 +2478,9 @@ class AgentLink:
             if connected:
                 return {**out, "state": "conectado", "detail": "conectado"}
             return {**out, "detail": "sin conexión · todavía no se conecta"}
-        # DECISIÓN PENDIENTE: la §4 no da el texto de esta línea tras el adios del agente (§10); este repite lo que
-        # dice la terminal. Igual con "agmen run se está cerrando", "se perdió la conexión: agmen run se detiene" y
-        # "todavía no se conecta" (estados de paso que la especificación no nombra).
+        # El texto de esta línea tras el adios del agente (§10) repite lo que dice la terminal; él y los de los
+        # estados de paso ("agmen run se está cerrando", "se perdió la conexión: agmen run se detiene", "todavía no
+        # se conecta") los fijó la §15.
         if farewell:   # §10: lo cerraron allá a propósito, con los nodos ya detenidos (no hay gracia que contar)
             return {**out, "detail": f"sin conexión · cerraron agmen agent allá ({farewell}) · sus nodos están "
                                      f"detenidos · reintentando"}
@@ -2699,7 +2711,9 @@ class AgentLink:
             while True:
                 now = time.monotonic()
                 safe_end = self.safe_end()
-                if not told_grace and now >= safe_end:
+                if not told_grace and self.farewell:   # §15: se despidió a media reanudación: "ya pasaron" no aplica
+                    told_grace, next_note = True, now + RETRY_NOTE_EVERY
+                elif not told_grace and now >= safe_end:
                     told_grace, next_note = True, now + RETRY_NOTE_EVERY
                     self._notice(f"{self.name}: ya pasaron {self.grace:g} s: {self.name} habrá detenido sus nodos. "
                                  f"Sigo intentando (Ctrl+C para salir)")
@@ -2735,13 +2749,21 @@ class AgentLink:
                     _bye(channel)
                     return None
                 if msg["op"] == "reanudar_ok":
-                    got = self._confirm_resume(channel)
-                    if got is None:   # stop
-                        _bye(channel)
+                    ended, self._resume_bye = threading.Event(), False
+                    self._resuming = ended
+                    try:
+                        got = self._confirm_resume(channel)
+                        if got is None:   # stop
+                            _bye(channel)
+                            self._resume_bye = True
+                            return None
+                        early, contact = got
+                        self._resume_bye = self._install(channel, threading.Event(), resumed=msg, contact=contact,
+                                                         early=early)
                         return None
-                    early, contact = got
-                    self._install(channel, threading.Event(), resumed=msg, contact=contact, early=early)
-                    return None
+                    finally:
+                        self._resuming = None
+                        ended.set()
                 channel.close()
                 if msg["op"] != "sesion_error":
                     return self._refused(LinkError("protocolo", f"{self.name} ({self.shown}) contestó '"
@@ -2819,8 +2841,9 @@ class AgentLink:
                 continue
             if msg["op"] == "pong" and msg.get("t") == t:
                 return early, t
-            if msg["op"] == "adios":   # lo cerraron allá a media reanudación: el siguiente intento abre otra
-                raise ChannelClosed("se despidió antes de confirmar")
+            if msg["op"] == "adios":   # §15: lo cerraron allá a media reanudación: vale la §10
+                self._farewell_resuming(channel, msg)
+                raise ChannelClosed("cerraron agmen agent allá antes de confirmar")
             if msg["op"] == "log":
                 # Los log se muestran al llegar, al ritmo de la red como haría el lector: juntarlos y soltarlos de
                 # golpe al instalar desborda la terminal (miles tras un corte largo). Ya mostrados cuentan en
@@ -2829,6 +2852,23 @@ class AgentLink:
             else:
                 early.append(msg)   # estado y demás: se aplican al instalar, después de reanudar_ok (si no, nada)
         return None
+
+    def _farewell_resuming(self, channel: Channel, msg: dict) -> None:
+        """§15: el adios del agente llegó mientras se esperaba el pong de confirmación: vale la §10 (lo cerraron
+        allá, con sus nodos ya detenidos). Se contesta con adios, la sesión ya no existe (al volver, una nueva), sus
+        nodos quedan detenido y se dice una vez. Se sigue reintentando por si vuelve a arrancar."""
+        motive = self._motive(msg)
+        _bye(channel)   # §12: también se le dice adios
+        self._resume_bye = True
+        with self._lock:
+            if self._closing:
+                return
+            self.farewell, self.session_id = motive, ""
+            self.state_since = time.monotonic()
+        for node in self.nodes.values():
+            node.remote_state("detenido", None, None)
+        self._notice(f"{self.name} ({self.shown}): cerraron agmen agent allá ({motive}): sus nodos están detenidos. "
+                     f"Reintento por si vuelve a arrancar (Ctrl+C para salir)", "error")
 
     def _refused(self, e: LinkError, said: set[str]) -> float:
         """Un rechazo al reconectar: se dice una vez por código, con su "qué hacer", y se sigue intentando."""
@@ -2839,10 +2879,11 @@ class AgentLink:
         return RETRY_REFUSED
 
     def _install(self, channel: Channel, done: threading.Event, ok: dict | None = None,
-                 resumed: dict | None = None, contact: float | None = None, early: list[dict] | None = None) -> None:
+                 resumed: dict | None = None, contact: float | None = None, early: list[dict] | None = None) -> bool:
         """La conexión nueva pasa a ser la actual: su lector arranca (y su ping, si no lo tenía).
         Si algo falla a medias, se deshace (vuelve a quedar sin conexión, la conexión se cierra y
-        el error sube a _retry, que sigue intentando): nunca una conexión actual sin lector."""
+        el error sube a _retry, que sigue intentando): nunca una conexión actual sin lector. Devuelve True si
+        no la instaló porque agmen run se cerraba (Ctrl+C): entonces se despidió por ella."""
         with self._lock:
             closing = self._closing
             if not closing:
@@ -2856,7 +2897,7 @@ class AgentLink:
         if closing:   # Ctrl+C mientras reconectaba: que el agente lo sepa
             done.set()
             _bye(channel)
-            return
+            return True
         try:
             away = max(0, math.floor(time.monotonic() - last_ok))   # desde el último contacto confirmado (§9)
             where = f"{self.name} ({self.shown})"
@@ -2905,16 +2946,24 @@ class AgentLink:
                     node.went_offline()
                 raise
             self._notice(f"✖ {self.name}: error inesperado al reconectar ({_clean(repr(e), 200)})", "error")
+        return False
+
+    def unreachable(self, op: str, node: str) -> str | None:
+        """§15: si ahora no hay conexión, el texto con el que se rechaza '<op> <node>' (para decirlo en la respuesta
+        del panel, no solo en el log); None si hay conexión (la orden se puede mandar)."""
+        if self.channel is not None and not self.lost:
+            return None
+        if self.down_since is not None:
+            why = "cerraron agmen agent allá" if self.farewell else "se perdió la conexión"
+            return (f"no hay conexión con {self.name}: '{op} {node}' no se hizo ({why}; "
+                    f"reintento cada {RETRY_EVERY:g} s)")
+        return f"no hay conexión con {self.name}: '{op} {node}' no se hizo"
 
     def order(self, op: str, node: str) -> str | None:
         """Manda arrancar/detener/reiniciar. Devuelve un error en texto, o None."""
         channel = self.channel
         if channel is None or self.lost:
-            if self.down_since is not None:
-                why = "cerraron agmen agent allá" if self.farewell else "se perdió la conexión"
-                return (f"no hay conexión con {self.name}: '{op} {node}' no se hizo ({why}; "
-                        f"reintento cada {RETRY_EVERY:g} s)")
-            return f"no hay conexión con {self.name}: '{op} {node}' no se hizo"
+            return self.unreachable(op, node) or f"no hay conexión con {self.name}: '{op} {node}' no se hizo"
         counts = channel is self.channel   # §14: se decide antes de mandarla
         try:
             channel.send({"op": op, "nodo": node})
@@ -2932,7 +2981,12 @@ class AgentLink:
         channel = self.channel
         if channel is None:
             if self.down_since is not None and not self._closing:
+                resuming = self._resuming
                 self.close()
+                # §15: si esperaba el pong de confirmación, el hilo que reintenta se despide por esa conexión
+                # (lo ve en STOP_POLL): el agente sí se entera.
+                if resuming is not None and resuming.wait(STOP_POLL + BYE_TIMEOUT + 1.0) and self._resume_bye:
+                    return
                 if not self.farewell and not self._pending:   # (§14: antes de arrancar no dio ninguna orden allá)
                     self._notice(f"{self.name} no se enteró (sin conexión): detiene sus nodos solo, {self.grace:g} "
                                  f"s después de perder a la laptop")
@@ -2999,7 +3053,18 @@ class RemoteNode(Node):
         self.logs.add(self.cfg.name, text, kind)
         self.printer(self.label, text, kind, droppable=not own)
 
+    _OPS = {"start": "arrancar", "stop": "detener", "restart": "reiniciar"}
+
+    def refusal(self, what: str) -> str | None:
+        """§15: Launcher.action la consulta antes de aceptar una orden del panel: si su computadora no tiene
+        conexión, el texto del rechazo (el mismo que dejaría _order en el log); None si la orden puede salir.
+        'stop' de un nodo que no corre ni está sin conexión no manda nada (como stop()): no se rechaza."""
+        if what == "stop" and not (self.state in _RUNNING or self.state == OFFLINE):
+            return None
+        return self.link.unreachable(self._OPS.get(what, what), self.cfg.name)
+
     def _order(self, op: str) -> None:
+        # Si la conexión se pierde entre la revisión de refusal() y aquí, el log es el respaldo.
         err = self.link.order(op, self.cfg.name)
         if err:
             self._log(err, "error", own=True)

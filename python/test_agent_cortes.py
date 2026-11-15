@@ -934,8 +934,8 @@ class TestCortesDeRed(CortesBase):
         self.assertEqual(est["ia"], "corriendo", self.diag("el nodo local siguió"))
         self.assertTrue(self.vivo("ia"), self.diag("ia murió"))
         self.assertTrue(self.vivo("motor") and self.vivo("imu"), self.diag("los nodos del robot siguen en gracia"))
-        # (12) una orden sobre un nodo sin conexión se rechaza con el texto de la sección 8
-        self.assertEqual(self.orden("motor", "start"), 200)
+        # (12) una orden sobre un nodo sin conexión se rechaza con el texto de la sección 8 (§15: con 409, y en el log)
+        self.assertEqual(self.orden("motor", "start"), 409)
         esperado = ("no hay conexión con robot: 'arrancar motor' no se hizo "
                     "(se perdió la conexión; reintento cada 1 s)")
         self.esperar_linea(esperado, 15, que="la orden sobre un nodo sin conexión no se rechazó con el texto de la spec")
@@ -1271,7 +1271,9 @@ class AgenteDeMentira:
       mudo              acepta la conexión y no contesta el saludo (el intento queda colgado en el saludo);
       vencida           contesta sesion_error 'sesion' a un reanudar (el agente ya detuvo sus nodos) y sesion_ok a una
                         sesión nueva.
-    Con sin_pong=True no contesta ningún ping (contesta el reanudar, pero no confirma que oye: §14).
+    Con sin_pong=True no contesta ningún ping (contesta el reanudar, pero no confirma que oye: §14). Con
+    adios_al_confirmar="<motivo>", al ping de confirmación de un reanudar contesta con su adios (lo cerraron allá a
+    media reanudación, §15), una vez, y pasa a modo cierra.
     Apunta lo que le llega para que las pruebas lo comprueben: visto (hora, op) de lo que manda el cliente tras
     sesion/reanudar, reanudares leídos, cierres_en_saludo (conexiones que el cliente cerró sin mandar sesion/reanudar:
     un intento que falló a medias) y adios_cliente (llegó el adios del cliente). Con espera_adios, tras los `extras`
@@ -1290,6 +1292,7 @@ class AgenteDeMentira:
         self.adios_cliente = threading.Event()
         self.espera_adios = False
         self.sin_pong = False
+        self.adios_al_confirmar = ""
         self.fake = ta.FakeAgent(self._atender)
         test.addCleanup(self.fake.close)
         self.port = self.fake.port
@@ -1386,6 +1389,10 @@ class AgenteDeMentira:
             except ChannelError:
                 return
             self.visto.append((time.monotonic(), m["op"]))
+            if m["op"] == "ping" and msg["op"] == "reanudar" and self.adios_al_confirmar:
+                motivo, self.adios_al_confirmar, self.modo = self.adios_al_confirmar, "", "cierra"
+                ch.send({"op": "adios", "motivo": motivo})
+                continue
             if m["op"] == "ping" and not self.sin_pong and not self._pong(ch, m):
                 return
             if m["op"] == "adios":
@@ -1993,6 +2000,34 @@ class TestReanudarSinConfirmar(ReanudarCase):
         self.assertFalse(self.dijo("no volvió"), self.lista_dicha())
         self.assertIs(self.server.session, sesion)
 
+    def test_si_la_gracia_vence_entre_la_revision_y_la_confirmacion_no_se_contesta_el_ping(self):
+        """§15: carrera forzada. El lector ya revisó que la sesión no terminaba; justo antes de que _confirm tome el
+        candado, vence la gracia (end() desde el temporizador). La confirmación no tiene efecto, así que el ping NO se
+        atiende ni se contesta: la laptop no recibe un pong que la haría decir "reconectado… no se reinició nada" con
+        los nodos ya detenidos."""
+        self.parchea(agent, "GRACE", 30.0)     # el temporizador real no dispara: el fin de la gracia lo fuerza la prueba
+        sid, t_ping, t_pong, sesion = self.abrir_y_perder()
+        cli = self.reanudo_ok(sid)
+        original = sesion._confirm
+        corrio = threading.Event()
+
+        def carrera(channel):
+            # el fin de la gracia, en otro hilo como el temporizador, entre la revisión del lector y _confirm
+            threading.Thread(target=sesion._expire, args=(sesion._grace_token,), daemon=True).start()
+            self.assertTrue(self.espera(lambda: sesion._ending, 10, paso=0.005), "end() no empezó")
+            corrio.set()
+            return original(channel)
+
+        sesion._confirm = carrera
+        cli.send({"op": "ping", "t": 7})
+        self.assertTrue(corrio.wait(20), f"el ping no llegó a confirmar\n{self.lista_dicha()}")
+        self.assertTrue(sesion.done.wait(30), f"end() no terminó\n{self.lista_dicha()}")
+        self.assertFalse(cli.wait(cli.hay("pong", t=7), 2),
+                         f"la sesión terminaba y aun así se contestó el ping: {cli.msgs}")
+        self.assertTrue(self.todos_muertos(15), f"los nodos siguen vivos\n{self.lista_dicha()}")
+        self.assertTrue(self.dijo("intentó volver pero no confirmó que me oye: detuve los nodos"), self.lista_dicha())
+        self.assertFalse(self.dijo("no se reinició nada"), self.lista_dicha())
+
     def test_un_mensaje_invalido_por_la_conexion_sin_confirmar_termina_la_sesion_sin_gracia(self):
         self.parchea(agent, "GRACE", 30.0)
         sid, t_ping, t_pong, sesion = self.abrir_y_perder()
@@ -2089,6 +2124,61 @@ class TestCuentasDelCliente(EnlaceCase):
         self.assertNotIn("no se reinició nada", self.texto())
         self.assertIsNone(link.down_since)
         self.assertEqual(estados[-1], "detenido", estados)
+
+
+class TestEsperandoLaConfirmacion(EnlaceCase):
+    """§15: lo que pasa mientras el cliente espera el pong de su ping de confirmación tras reanudar_ok."""
+
+    def setUp(self):
+        super().setUp()
+        self.parchea(agent, "RETRY_EVERY", 0.1)
+        for nombre, valor in (("RESUME_CONFIRM", 0.3), ("STOP_BUDGET", 0.3), ("NET_MARGIN", 0.2)):
+            self.parchea(agent, nombre, valor)
+
+    def perder(self, falso):
+        estados: list[str] = []
+        link = self.abrir(falso)
+        link.nodes = {"motor": SimpleNamespace(remote_state=lambda estado, *a, **k: estados.append(estado),
+                                               went_offline=lambda: estados.append("sin conexión"))}
+        falso.modo = "cierra"
+        falso.soltar.set()
+        self.perdido()
+        return link, estados
+
+    def test_el_adios_del_agente_en_esa_espera_vale_la_seccion_10(self):
+        """El agente contesta reanudar_ok y, al ping de confirmación, su adios. El cliente: contesta con su adios, la
+        sesión ya no existe, el nodo queda detenido, dice una vez que cerraron el agente, no dice "ya pasaron" (aunque
+        venza la cuenta segura) y sigue reintentando: al volver el agente, sesión nueva con los nodos detenidos."""
+        self.parchea(agent, "SILENCE_TIMEOUT", 0.4)
+        falso = AgenteDeMentira(self, gracia=1.0)
+        link, estados = self.perder(falso)
+        inicio = time.monotonic()
+        falso.adios_al_confirmar, falso.modo = "Ctrl+C en robot", "bueno"
+        self.assertTrue(self.espera(self.hay("cerraron agmen agent allá (Ctrl+C en robot)"), 15), self.texto())
+        h, texto = self.nota("cerraron agmen agent allá")
+        self.assertIn("sus nodos están detenidos. Reintento por si vuelve a arrancar (Ctrl+C para salir)", texto)
+        self.assertTrue(falso.adios_cliente.wait(5), "el cliente no contestó con su adios (§12)")
+        self.assertEqual(estados, ["sin conexión", "detenido"], estados)
+        self.assertEqual((link.session_id, link.farewell), ("", "Ctrl+C en robot"))
+        self.assertIsNone(self.nota("reconectado"), self.texto())
+        # pasada de sobra la cuenta segura: no se dice "ya pasaron…" (el agente ya dijo que los detuvo)
+        self.assertTrue(self.espera(lambda: time.monotonic() > max(link.safe_end(), inicio) + 0.5, 15))
+        self.assertIsNone(self.nota("ya pasaron"), self.texto())
+        self.assertEqual(sum("cerraron agmen agent" in t for _, t in self.notas), 1, self.texto())
+        self.assertTrue(self.hilo_de_reintentos())
+        falso.modo = "bueno"      # vuelve a arrancar: sesión nueva, nada arranca solo
+        self.assertTrue(self.espera(self.hay("reconectado tras"), 15), self.texto())
+        self.assertIn("pero ya había detenido sus nodos", self.nota("reconectado tras")[1])
+
+    def test_ctrl_c_en_esa_espera_se_despide_y_no_dice_que_no_se_entero(self):
+        self.parchea(agent, "SILENCE_TIMEOUT", 3.0)     # la espera del pong dura 3.3 s: hay tiempo de sobra
+        falso = AgenteDeMentira(self, gracia=1.0)
+        link, estados = self.perder(falso)
+        falso.sin_pong, falso.modo = True, "bueno"
+        self.assertTrue(self.espera(lambda: any(op == "ping" for _, op in list(falso.visto)), 15), self.texto())
+        link.finish()
+        self.assertTrue(falso.adios_cliente.wait(5), "no se despidió por la conexión que esperaba el pong")
+        self.assertIsNone(self.nota("no se enteró"), f"sí se enteró: se le dijo adios\n{self.texto()}")
 
 
 class TestAdiosDelAgenteEnElCliente(EnlaceCase):
@@ -2525,19 +2615,18 @@ class TestPanelMachines(PanelDeDosComputadoras):
         antes = self.f2.conexiones
         req = urllib.request.Request(f"http://127.0.0.1:{self.panel.port}/api/node/hombro/start", data=b"{}",
                                      method="POST", headers={"Content-Type": "application/json", "X-Agmen": "1"})
-        try:
-            with urllib.request.urlopen(req, timeout=5) as r:
-                cuerpo = r.read().decode("utf-8")
-        except urllib.error.HTTPError as e:
-            cuerpo = e.read().decode("utf-8")
-        def razon():
-            lineas, _ = self.launcher.logs.since(0)
-            return [l["text"] for l in lineas if "no hay conexión con brazo" in l["text"]] or \
-                   (["(en la respuesta)"] if "no hay conexión con brazo" in cuerpo else [])
-        self.assertTrue(self.espera(razon, 5), f"no dijo por qué no hizo nada. respuesta={cuerpo!r}\n"
-                        f"{[l['text'] for l in self.launcher.logs.since(0)[0]]}")
-        texto = " ".join(razon() + [cuerpo])
-        self.assertIn("no se hizo", texto)
+        # §15: se rechaza EN LA RESPUESTA (409 con el motivo), no solo en el log
+        with self.assertRaises(urllib.error.HTTPError, msg="una orden sin conexión no debe responder 200") as e:
+            urllib.request.urlopen(req, timeout=5).close()
+        self.assertEqual(e.exception.code, 409)
+        error = json.loads(e.exception.read().decode("utf-8"))["error"]
+        self.assertIn("no hay conexión con brazo: 'arrancar hombro' no se hizo (se perdió la conexión", error)
+        # el log, de respaldo, también lo dice
+        self.assertTrue(self.espera(lambda: any(error in l["text"] for l in self.launcher.logs.since(0)[0]), 5),
+                        [l["text"] for l in self.launcher.logs.since(0)[0]])
+        # el WebSocket del panel manda {"op": "error", "msg": <lo que devuelve action>}: el mismo texto
+        ws = self.launcher.action("hombro", "restart")
+        self.assertIn("no hay conexión con brazo: 'reiniciar hombro' no se hizo", ws or "")
         self.assertEqual(self.launcher.nodes["hombro"].state, "sin conexión", "la orden no debe cambiar su estado")
         self.assertNotIn("falló", [n["state"] for n in self.api()["nodes"] if n["name"] == "hombro"])
 

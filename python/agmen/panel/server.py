@@ -778,8 +778,10 @@ class Panel:
                                    HTTPStatus.BAD_REQUEST)
                         return
                     err = panel.launcher.action(parts[2], parts[3])
-                    self._json({"error": err} if err else {"ok": True},
-                               HTTPStatus.BAD_REQUEST if err else HTTPStatus.OK)
+                    from ..run import NoConnection
+                    status = (HTTPStatus.CONFLICT if isinstance(err, NoConnection)    # §15: sin conexión con su
+                              else HTTPStatus.BAD_REQUEST if err else HTTPStatus.OK)  # computadora: 409
+                    self._json({"error": str(err)} if err else {"ok": True}, status)
                 elif parts == ["api", "record"]:
                     err = panel.record_action(str(body.get("action", "")))
                     self._json({"error": err} if err else {"ok": True, "recording": panel.recording_info()},
