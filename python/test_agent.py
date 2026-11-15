@@ -2762,6 +2762,57 @@ class TestCortes(ServerCase):
         self.assertTrue(cli.wait(cli.hay("pong", t=1)))
 
 
+def _pila_corta(frame) -> str:
+    """El tope de la pila de un hilo, resumido: 'función:línea<llamadora' (para saber en qué está parado)."""
+    try:
+        partes = []
+        while frame is not None and len(partes) < 2:
+            partes.append(f"{frame.f_code.co_name}:{frame.f_lineno}")
+            frame = frame.f_back
+        return "<".join(partes)
+    except Exception:
+        return "?"
+
+
+def _tcp_resumen(sock) -> str:
+    """Diagnóstico de un socket (solo Linux; donde no se pueda, '?'): bytes sin leer / sin salir y TCP_INFO."""
+    try:
+        import fcntl
+        import termios
+        fd = sock.fileno()
+        buf = bytearray(4)
+        fcntl.ioctl(fd, termios.FIONREAD, buf)
+        sin_leer = int.from_bytes(buf, sys.byteorder, signed=True)
+        buf = bytearray(4)
+        fcntl.ioctl(fd, termios.TIOCOUTQ, buf)
+        sin_salir = int.from_bytes(buf, sys.byteorder, signed=True)
+    except Exception:
+        sin_leer = sin_salir = "?"
+    try:
+        info = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 256)
+        import struct
+        estado, _ca, retrans_p, probes, backoff = struct.unpack_from("5B", info, 0)
+        if len(info) >= 104:
+            (rto, _ato, _mss, _rmss, unacked, _sacked, _lost, retrans, _f, _ds, _as, _dr, _ar, _pmtu, rcv_ssthresh,
+             _rtt, _rttvar, _ssthresh, cwnd, _adv, _reord, _rcv_rtt, rcv_space, tot) = struct.unpack_from("24I", info, 8)
+            tcp = (f"est={estado} rto={rto // 1000}ms bo={backoff} pr={probes} unack={unacked} retr={retrans}/{tot} "
+                   f"cwnd={cwnd} rcvsp={rcv_space} rcvss={rcv_ssthresh}")
+        else:
+            tcp = f"est={estado} bo={backoff} pr={probes}"
+    except Exception:
+        tcp = "?"
+    return f"in={sin_leer} out={sin_salir} {tcp}"
+
+
+def _sysctl(nombre: str) -> str:
+    try:
+        with open("/proc/sys/" + nombre.replace(".", "/")) as f:
+            return " ".join(f.read().split())
+    except Exception:
+        return "?"
+
+
+
 class TestClienteQueNoLee(ServerCase):
     def abrir_sin_leer(self):
         """Una laptop que abre la sesión y luego NO lee nada más (su buffer de recepción es mínimo)."""
@@ -2845,27 +2896,80 @@ class TestClienteQueNoLee(ServerCase):
             cli.ch.sock.settimeout(20)
             t0 = time.monotonic()
             enviados = 0
+            est = {"n": 0, "desde": None}      # lo que hace el hilo del cliente (solo lo lee el muestreador)
+            filas: list[str] = []
+            parar_muestreo = threading.Event()
+            self.addCleanup(parar_muestreo.set)
+
+            def muestrear():
+                # Solo lee (sin candados del agente): si algo falla, '?'. Una fila cada 0.25 s.
+                while not parar_muestreo.is_set():
+                    try:
+                        ahora = time.monotonic()
+                        out, ch = sesion.out, sesion.channel
+                        marcos = sys._current_frames()
+                        lector = next((_pila_corta(f) for f in marcos.values() if any(
+                            c.f_code.co_name == "_loop" and c.f_code.co_filename == agent.__file__
+                            for c in _cadena(f))), "?")
+                        sender = _pila_corta(marcos.get(sesion.sender.ident))
+                        desde = est["desde"]
+                        fila = (f"{ahora - t0:6.2f}s cli: n={est['n']} "
+                                f"{'en send ' + format(ahora - desde, '.2f') + 's' if desde else 'fuera de send'} | "
+                                f"agente: rep={out.replies} items={len(out.items)} bytes={out.bytes} "
+                                f"sending={out.sending} closed={out.closed} ending={sesion._ending} "
+                                f"leidos={ch._received} media_linea={len(ch._lines.buf)} | lector={lector} "
+                                f"sender={sender} | sock agente: {_tcp_resumen(ch.sock)} | sock cliente: "
+                                f"{_tcp_resumen(cli.ch.sock)}")
+                    except Exception as e:
+                        fila = f"{time.monotonic() - t0:6.2f}s ? ({type(e).__name__}: {e})"
+                    filas.append(fila)
+                    parar_muestreo.wait(0.25)
+
+            def _cadena(f):
+                while f is not None:
+                    yield f
+                    f = f.f_back
+
+            def linea_de_tiempo() -> str:
+                if len(filas) > 55:
+                    filas_vistas = filas[:15] + [f"... ({len(filas) - 55} filas omitidas)"] + filas[-40:]
+                else:
+                    filas_vistas = filas
+                return ("\nlínea de tiempo (muestreada cada 0.25 s):\n" + "\n".join(filas_vistas) +
+                        "\nsysctl: " + "; ".join(f"{k}={_sysctl(k)}" for k in
+                                                  ("net.ipv4.tcp_rmem", "net.ipv4.tcp_wmem", "net.ipv4.tcp_mem")))
+
+            threading.Thread(target=muestrear, daemon=True, name="muestreador-ping").start()
             try:
                 # Sin tope de cantidad: cuántas respuestas caben en los buffers del kernel (hasta tcp_wmem máx.,
                 # 4 MB en Linux por omisión, más en otros) cambia de una máquina a otra; si el tope de pings
                 # cabía entero en ellos, el agente nunca veía "sin leer" y cerraba por silencio. Se manda hasta
                 # que el agente cierra la sesión (el envío falla) o se acaba el tiempo.
                 while time.monotonic() - t0 < 30 and not sesion._ending:
-                    cli.ch.send({"op": "ping", "t": "x" * 60})
+                    est["desde"] = time.monotonic()
+                    try:
+                        cli.ch.send({"op": "ping", "t": "x" * 60})
+                    finally:
+                        est["desde"] = None
                     enviados += 1
+                    est["n"] = enviados
                     if enviados % 50 == 0 and sesion is not None:
                         maximo = max(maximo, self.cola(sesion))
             except ChannelError:
                 pass
             maximo = max(maximo, self.cola(sesion))
-            self.assertLessEqual(maximo, getattr(agent, "OUT_MAX_REPLIES", 1000) + 5, f"la cola de respuestas llegó a {maximo}")
-            self.assertGreater(enviados, 100)
+            self.assertLessEqual(maximo, getattr(agent, "OUT_MAX_REPLIES", 1000) + 5,
+                                 f"la cola de respuestas llegó a {maximo}" + linea_de_tiempo())
+            self.assertGreater(enviados, 100, linea_de_tiempo())
             # el agente da la sesión por perdida, detiene los nodos y queda libre
-            self.assertTrue(self.espera(lambda: self.server.session is None, 30), "el agente no se recuperó")
-            self.assertTrue(self.espera(lambda: not self.vivo("motor"), 30))
-            self.assertEqual(self.cola(sesion), 0, "la memoria de la cola no se liberó al cerrar")
+            self.assertTrue(self.espera(lambda: self.server.session is None, 30),
+                            "el agente no se recuperó" + linea_de_tiempo())
+            self.assertTrue(self.espera(lambda: not self.vivo("motor"), 30), linea_de_tiempo())
+            self.assertEqual(self.cola(sesion), 0, "la memoria de la cola no se liberó al cerrar" + linea_de_tiempo())
+        parar_muestreo.set()
         self.assertTrue(any("no lee" in t for t, _ in self.said),
-                        f"{enviados} ping en {time.monotonic() - t0:.1f} s, cola máx. {maximo}; el agente dijo: {self.said}")
+                        f"{enviados} ping en {time.monotonic() - t0:.1f} s, cola máx. {maximo}; el agente dijo: "
+                        f"{self.said}" + linea_de_tiempo())
 
     def test_ordenes_con_error_sin_leer_tambien_acotan_la_cola(self):
         with mock.patch.object(agent, "SEND_TIMEOUT", 1.5):
