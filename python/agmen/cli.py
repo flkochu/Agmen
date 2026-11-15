@@ -28,8 +28,12 @@ from . import _backend
 from ._version import __version__
 
 
-def _wait_for_ctrl_c(stop: threading.Event) -> None:
+def _wait_for_ctrl_c(stop: threading.Event, got: list | None = None) -> None:
+    """Espera a Ctrl+C (o Ctrl+Break, SIGTERM) o a que alguien prenda `stop`. En `got`, si se da,
+    queda el número de la señal que llegó."""
     def handler(signum, frame):
+        if got is not None and not got:
+            got.append(signum)
         stop.set()
 
     signal.signal(signal.SIGINT, handler)
@@ -588,11 +592,15 @@ def cmd_agent(args) -> int:
     say(f"{server.waiting_line()} · clave: {key}", "out")
     stop = threading.Event()
     threading.Thread(target=server.serve, args=(stop,), daemon=True, name="agmen-agent").start()
+    got: list = []
     try:
-        _wait_for_ctrl_c(stop)
+        _wait_for_ctrl_c(stop, got)
     finally:
         say("deteniendo…")
-        server.close()
+        names = {signal.SIGINT: "Ctrl+C", signal.SIGTERM: "SIGTERM"}
+        if hasattr(signal, "SIGBREAK"):
+            names[signal.SIGBREAK] = "Ctrl+Break"
+        server.close(names.get(got[0], "Ctrl+C") if got else "Ctrl+C")   # el motivo va en el adios (§10)
         say("listo. ¡Hasta luego!")
         printer.close()
     return 0
