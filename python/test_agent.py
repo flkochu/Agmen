@@ -4839,3 +4839,24 @@ class TestClaveDelAgenteComoServicio(E2EBase):
         self.assertEqual(m.group(1), r.stdout.strip(), "con terminal la línea trae la clave de verdad")
         self.assertNotIn("guardada en", espera)
         self.assertEqual(self.detener(p), 0, ver())
+
+
+class TestServicioDeSystemd(unittest.TestCase):
+    """§15: examples/tutorial/agmen-agent.service dice la verdad y no se rinde (revisión del archivo, sin systemd)."""
+
+    def test_machine_reintentos_sin_limite_y_tiempo_para_despedirse(self):
+        texto = (ROOT / "examples" / "tutorial" / "agmen-agent.service").read_text(encoding="utf-8")
+        campos = {}
+        for linea in texto.splitlines():
+            if linea and not linea.startswith("#") and "=" in linea:
+                k, v = linea.split("=", 1)
+                campos[k.strip()] = v.strip()
+        self.assertRegex(campos["ExecStart"], r" agent .* --machine \S+", "sin --machine, sin IP al encender sale con 2")
+        self.assertRegex(texto, r"--machine.*<-- EDITA|<-- EDITA.*\n(#.*\n)*ExecStart=.*--machine")
+        self.assertEqual(campos["StartLimitIntervalSec"], "0", "systemd no debe rendirse al arrancar sin red")
+        self.assertEqual(campos["Restart"], "on-failure")
+        self.assertTrue(1 <= float(campos["RestartSec"]) <= 30, campos["RestartSec"])
+        # el peor caso de end(): 2 órdenes a medias (15 s c/u), nodos y hub (STOP_BUDGET c/u), lo pendiente y el adios
+        peor = 2 * 15 + 2 * agent.STOP_BUDGET + 2.0 + 2 * agent.BYE_TIMEOUT + 1.0
+        self.assertGreaterEqual(float(campos["TimeoutStopSec"]), peor + 5, f"peor caso ~{peor:g} s, con margen")
+        self.assertNotIn("escucha en la IP", texto, "el agente escucha en todas las interfaces")

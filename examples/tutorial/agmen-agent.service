@@ -8,7 +8,7 @@
 #
 #   1. Cópiala:     sudo cp examples/tutorial/agmen-agent.service /etc/systemd/system/
 #   2. Edítala:     sudo nano /etc/systemd/system/agmen-agent.service
-#                   (cambia lo marcado con  <-- EDITA: tu usuario y tus rutas)
+#                   (cambia lo marcado con  <-- EDITA: tu usuario, tus rutas y el nombre de esta [[machine]])
 #   3. Actívala:    sudo systemctl daemon-reload
 #                   sudo systemctl enable --now agmen-agent
 #   4. Su log:      journalctl -u agmen-agent -f
@@ -22,12 +22,13 @@
 
 [Unit]
 Description=agmen agent (los nodos de esta computadora del robot)
-# Que la red ya esté lista: el agente escucha en la IP de su [[machine]].
+# Mejor si la red ya está lista. El agente escucha en todas las interfaces (no solo en la IP de su
+# [[machine]]), así que no depende de qué IP tenga al encender; y si aún no puede arrancar, se reintenta.
 Wants=network-online.target
 After=network-online.target
-# Si falla muchas veces seguidas (p. ej. un error en robot.toml), deja de intentar: míralo con journalctl.
-StartLimitIntervalSec=120
-StartLimitBurst=5
+# Nunca deja de reintentar: al encender sin red (o con un error en robot.toml) se reintenta cada RestartSec
+# en vez de rendirse tras unos cuantos fallos. Si se queda en un ciclo de fallos, míralo con journalctl.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -36,20 +37,26 @@ User=pi
 Group=pi
 # La carpeta del proyecto: las rutas de cmd en robot.toml son relativas al robot.toml. <-- EDITA
 WorkingDirectory=/home/pi/Agmen
-# El python del entorno donde instalaste Agmen (tu venv) y TU robot.toml.  <-- EDITA las dos rutas
+# El python del entorno donde instalaste Agmen (tu venv), TU robot.toml y el nombre de esta computadora
+# en su [[machine]] (--machine).                                             <-- EDITA las dos rutas y robot
+# Con --machine el agente no tiene que adivinar cuál [[machine]] es por su IP: sin él, si al encender
+# aún no hay IP (o cambió), no se reconoce y sale con código 2.
 # (si instalaste Agmen con pip en ese venv, también sirve /home/pi/agmen-venv/bin/agmen agent ...)
-ExecStart=/home/pi/agmen-venv/bin/python -m agmen agent /home/pi/Agmen/examples/tutorial/robot_dos.toml
+ExecStart=/home/pi/agmen-venv/bin/python -m agmen agent /home/pi/Agmen/examples/tutorial/robot_dos.toml --machine robot
 # Que cada línea llegue al log en el momento (y con acentos).
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONIOENCODING=utf-8
 # Al detenerlo, systemd manda SIGTERM solo a agmen agent (KillMode=mixed): el agente lo trata
 # como Ctrl+C, detiene sus nodos él mismo y le manda su adios a la laptop, que dice "cerraron
 # agmen agent allá (SIGTERM)" en vez de esperar 10 s. Si en TimeoutStopSec queda algo vivo,
-# systemd lo termina (SIGKILL) a la fuerza.
+# systemd lo termina (SIGKILL) a la fuerza. 60 s cubren el peor caso con margen: hasta 15 s por cada
+# orden a medias que espera (2), 5 s por los nodos (3 s tras la señal + 2 s tras matarlos, todos a la
+# vez) y 5 s por el hub, y unos 4 s para mandar lo pendiente y el adios (~44 s).
 KillSignal=SIGTERM
 KillMode=mixed
-TimeoutStopSec=20
-# Si se cae con error, se vuelve a levantar a los 5 s. Detenerlo a propósito (stop) no cuenta.
+TimeoutStopSec=60
+# Si sale con error (o al encender aún no hay red), se vuelve a levantar a los 5 s, sin rendirse
+# (StartLimitIntervalSec=0 arriba). Detenerlo a propósito (stop) no cuenta.
 Restart=on-failure
 RestartSec=5
 
