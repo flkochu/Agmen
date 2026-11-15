@@ -16,6 +16,7 @@ y si un topic obligatorio se queda sin nadie que lo publique.
 from __future__ import annotations
 
 import difflib
+import os
 import socket
 import sys
 import threading
@@ -57,6 +58,28 @@ class Endpoint:
     local_since: float | None = None  # sub local sin net=1 en modo red: desde cuándo
 
 
+def net_ip_from_env() -> str | None:
+    """AGMEN_NET_IP (variable para pruebas, RFC 0011 §2 y §7): la IP de "esta computadora" para tener dos
+    en una (127.0.0.1 y 127.0.0.2). None si no está. Inválida o que no es de esta computadora: error claro."""
+    text = os.environ.get("AGMEN_NET_IP", "").strip()
+    if not text:
+        return None
+    try:
+        hp.parse_ipv4(text)
+    except hp.ProtocolError as e:
+        raise hp.ProtocolError(f"AGMEN_NET_IP={text}: {e}. Es una variable para pruebas: quítala si no la "
+                               f"pusiste tú") from None
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.bind((text, 0))
+    except OSError as e:
+        raise OSError(f"AGMEN_NET_IP={text} no es una IP de esta computadora ({e}): pon una que tenga (para "
+                      f"pruebas, una de 127.0.0.x) o quita la variable") from None
+    finally:
+        s.close()
+    return text
+
+
 @dataclass
 class Expected:
     topic: str
@@ -68,6 +91,8 @@ class Hub:
     def __init__(self, listen: str = hp.DEFAULT_HUB, expected: list[Expected] | None = None,
                  log=print, grace_s: float = 5.0, robot: str = "") -> None:
         host, port = listen.rsplit(":", 1)
+        # Con AGMEN_NET_IP (solo pruebas), esa IP también es "esta computadora" (§7). Antes del socket.
+        self.net_ip = net_ip_from_env()
         self.listen = listen
         self.robot = robot        # el robot que lo arrancó (agmen run): así otro agmen run sabe de quién es
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -105,11 +130,12 @@ class Hub:
         """'nodo' (de esta computadora: el texto de siempre) o 'nodo' (de la computadora 'robot')."""
         return f"'{e.node}' (de la computadora '{e.machine}')" if e.machine else f"'{e.node}'"
 
-    # DECISIÓN PENDIENTE: "desde esta computadora" es exactamente 127.0.0.1 (no todo 127.0.0.0/8).
-    # Con AGMEN_NET_IP=127.0.0.2 (§2), el Subscriber debe seguir latiendo al hub desde 127.0.0.1.
+    # "Desde esta computadora" es exactamente 127.0.0.1 (no todo 127.0.0.0/8) y, solo con la variable de
+    # pruebas AGMEN_NET_IP, también esa IP: un Subscriber en modo red late desde su socket atado a ella (§7).
     def _check_local_origin(self, what: str, addr: tuple[str, int]) -> None:
-        if addr[0] != hp.LOCALHOST:
-            raise hp.ProtocolError(f"{what} solo se acepta desde esta computadora ({hp.LOCALHOST}) y llegó de "
+        if addr[0] != hp.LOCALHOST and addr[0] != self.net_ip:
+            here = f"{hp.LOCALHOST} o {self.net_ip}" if self.net_ip else hp.LOCALHOST
+            raise hp.ProtocolError(f"{what} solo se acepta desde esta computadora ({here}) y llegó de "
                                    f"{addr[0]}: otra computadora no puede abrir este hub a la red. Las tablas "
                                    f"de las otras computadoras llegan por 'agmen agent'")
 

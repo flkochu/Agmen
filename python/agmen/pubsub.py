@@ -36,6 +36,9 @@ from . import hubproto as hp
 from . import wire
 
 ANNOUNCE_EVERY_S = 1.0
+# Modo red (RFC 0011 §2): los sockets de antes se siguen leyendo este rato tras la confirmación del hub.
+NET_OLD_S = 1.0
+_OTRA_VEZ = object()   # _recv_udp(): leyó control y cambiaron los sockets; quien lo llamó vuelve a empezar
 # _same_port_tcp: cuántos números seguidos que no sirven en UDP puede cruzar (en Windows, los rangos
 # apartados son de cientos de puertos). Cada intento son dos sockets: el total tarda milisegundos.
 _SAME_PORT_TRIES = 2000
@@ -48,6 +51,13 @@ def _addr(text: str) -> tuple[str, int]:
 
 def hub_address() -> str:
     return os.environ.get("AGMEN_HUB", hp.DEFAULT_HUB)
+
+
+def _net_ip() -> str | None:
+    """AGMEN_NET_IP (solo pruebas, RFC 0011 §2): validada al abrir; error claro si no sirve."""
+    from .hub import net_ip_from_env
+
+    return net_ip_from_env()
 
 
 _default_name = ""
@@ -85,6 +95,8 @@ class _HubLink:
         self._on_tick = on_tick
         self.hub = _addr(hub_address())
         self.beat_msg = hp.encode(**beat)
+        self._fields = dict(beat)
+        self._out = (sock, self.beat_msg)   # socket y latido juntos: el hilo de latidos los lee de una vez
         self.id = beat["id"]
         self.last_reply: float | None = None
         self.started = time.monotonic()
@@ -97,10 +109,19 @@ class _HubLink:
         self._thread.start()
 
     def beat(self) -> None:
+        sock, msg = self._out
         try:
-            self.sock.sendto(self.beat_msg, self.hub)
+            sock.sendto(msg, self.hub)
         except OSError:
             pass
+
+    def move(self, sock: socket.socket, **fields) -> None:
+        """Late desde `sock` con estos campos cambiados (el Subscriber que pasa a la red), ya mismo."""
+        self._fields.update(fields)
+        self.beat_msg = hp.encode(**self._fields)
+        self.sock = sock
+        self._out = (sock, self.beat_msg)
+        self.beat()
 
     def _loop(self) -> None:
         while not self._stop.wait(hp.BEAT_S):
@@ -122,7 +143,7 @@ class _HubLink:
     def close(self) -> None:
         self._stop.set()
         try:
-            self.sock.sendto(hp.encode("bye", id=self.id), self.hub)
+            self._out[0].sendto(hp.encode("bye", id=self.id), self.hub)
         except OSError:
             pass
 
@@ -152,7 +173,14 @@ class _PurePublisher:
             hp.check_topic(to)
         self.topic = to if hp.is_topic(to) else (topic if topic is not None else "/" + msg_type.NAME)
         self._topic_id = wire.topic_id(self.topic)
-        self._tcp = _tcp.Fanout(self.topic, self.source_id, self._topic_id) if self.arrow else None
+        # Modo red (RFC 0011 §3): los destinos que no son 127.0.0.1 salen por otro socket (_net_sock).
+        self._net_ip = _net_ip() if hp.is_topic(to) else None
+        self._net_sock: socket.socket | None = None
+        self._remote: frozenset | None = None    # destinos de otra computadora; None = todos locales
+        self._unreachable = 0
+        self._unreach_warned: set = set()
+        self._tcp = (_tcp.Fanout(self.topic, self.source_id, self._topic_id, net=hp.is_topic(to),
+                                 net_ip=self._net_ip) if self.arrow else None)
         if hp.is_topic(to):
             self.dests: list[tuple[str, int]] = []
             self._sock.bind(("127.0.0.1", 0))   # local (nivel 2): Windows no pregunta por el firewall
@@ -185,6 +213,41 @@ class _PurePublisher:
         except OSError:
             return False
 
+    def _send_net(self, data: bytes, dest) -> bool:
+        """A un destino de otra computadora: por el socket que no está atado a 127.0.0.1. Si no sale,
+        no frena a los demás: se cuenta y se avisa una vez por destino."""
+        try:
+            self._net_sock.sendto(data, dest)
+            return True
+        except ConnectionResetError:   # Windows: un "nadie escuchaba" de un envío anterior (como en _send)
+            return False
+        except (OSError, AttributeError) as e:   # AttributeError: el socket de red no se pudo abrir
+            self._unreachable += 1
+            if dest not in self._unreach_warned:
+                self._unreach_warned.add(dest)
+                why = e.strerror if isinstance(e, OSError) and e.strerror else str(e)
+                print(_tcp.unreachable_text(self.topic, dest, why), file=sys.stderr, flush=True)
+            return False
+
+    def _send_any(self, data: bytes, dest) -> bool:
+        remote = self._remote
+        return self._send_net(data, dest) if remote is not None and dest in remote else self._send(data, dest)
+
+    def _open_net_sock(self) -> None:
+        """La primera vez que hay un destino de otra computadora (con self._lock)."""
+        if self._net_sock is not None:
+            return
+        s = wire.udp_socket()
+        try:
+            s.bind((self._net_ip or "0.0.0.0", 0))   # AGMEN_NET_IP: los envíos salen desde esa IP
+            s.setblocking(False)
+        except OSError as e:
+            s.close()
+            print(f"[agmen] ⚠ '{self.topic}': no pude abrir el socket para mandar a otra computadora: {e}. "
+                  f"Lo que vaya a otra computadora no sale (se cuenta en unreachable).", file=sys.stderr, flush=True)
+            return
+        self._net_sock = s
+
     def _announcement(self) -> bytes:
         return wire.encode_announcement(self.type.SCHEMA_TEXT, self.topic, source_id=self.source_id, seq=self.seq)
 
@@ -194,7 +257,7 @@ class _PurePublisher:
             self._tcp.send(ann)
         else:
             for d in list(self.dests):
-                self._send(ann, d)
+                self._send_any(ann, d)
         self._announced_at = time.monotonic()
 
     def _drain_locked(self) -> None:
@@ -232,10 +295,14 @@ class _PurePublisher:
                         self._tcp.update(new, self._announcement())
                     else:
                         new = [_addr(a) for a in f.get("to", "").split(",") if a]
+                        remote = frozenset(d for d in new if d[0] != hp.LOCALHOST)
+                        if remote:
+                            self._open_net_sock()
+                        self._remote = remote or None
                         ann = self._announcement()
                         for d in new:
                             if d not in self.dests:   # recién llegado: que sepa el esquema desde ya
-                                self._send(ann, d)
+                                self._send_any(ann, d)   # por el mismo camino que sus datos
                     self.dests = new
                     self._link.error = None
                 elif op == "error":
@@ -244,12 +311,14 @@ class _PurePublisher:
     def publish(self, msg, t_data: int | None = None) -> bool:
         """Manda `msg`. t_data = instante al que corresponden los datos (default: ahora).
         Devuelve False si no se pudo entregar a nadie (no es un error)."""
+        remote = None
         if self._link is not None:
             with self._lock:
                 if self._closed:
                     raise RuntimeError(_PUB_CERRADO)
                 self._drain()
                 dests = list(self.dests)
+                remote = self._remote
             if self._link.error:
                 raise wire.HubRejected(f"el hub rechazó publicar en '{self.topic}': {self._link.error}")
         else:
@@ -274,13 +343,22 @@ class _PurePublisher:
             data = wire.encode(msg, self.seq, t_data, topic=self.topic, source_id=self.source_id)
             self.seq += 1
         ok = False
-        for d in dests:
-            ok = self._send(data, d) or ok
+        if remote is None:   # todos en esta computadora: lo de siempre, sin trabajo de más
+            for d in dests:
+                ok = self._send(data, d) or ok
+        else:
+            for d in dests:
+                ok = (self._send_net(data, d) if d in remote else self._send(data, d)) or ok
         return ok
 
     @property
     def subscribers(self) -> int:
         return len(self.dests)
+
+    @property
+    def unreachable(self) -> int:
+        """Mensajes que no salieron hacia un destino de otra computadora (RFC 0011 §3)."""
+        return self._unreachable + (self._tcp.unreachable if self._tcp is not None else 0)
 
     @property
     def dropped(self) -> int:
@@ -320,6 +398,8 @@ class _PurePublisher:
         if self._tcp is not None:
             self._tcp.close()
         self._sock.close()
+        if self._net_sock is not None:
+            self._net_sock.close()
 
 
 # Los textos de los errores tras close(): los mismos que el núcleo nativo (python/src/core.cpp).
@@ -349,12 +429,22 @@ class _Receiver:
 
     def __init__(self, where: str, schema: str, type_name: str = "", tcp: bool = True, shm: bool = False,
                  node: str | None = None) -> None:
+        by_topic = hp.is_topic(where) or where == "*"
+        # Modo red (RFC 0011 §2): solo por topic, y solo cuando el hub lo dice (un `ok` con peers).
+        self._net_ip = _net_ip() if by_topic else None   # antes de abrir nada: si no sirve, error claro
+        self._net = False                       # ya escucha en la red
+        self._allowed: frozenset | None = None  # de qué IP acepta; None = escucha solo en 127.0.0.1 (sin filtro)
+        self._old_udp: socket.socket | None = None   # el socket de antes, mientras se cambia
+        self._old_until: float | None = None    # hasta cuándo se lee (NET_OLD_S tras la confirmación)
+        self._net_failed = False
+        self._rejected = 0
+        self._rejected_ips: set = set()
         self._sock = wire.udp_socket()
         self.announced: dict[int, tuple[str, str]] = {}   # schema_id → (topic, esquema)
         self._link = None
         # Los mensajes arrow llegan por TCP (RFC 0008): un puerto más, que se registra en el hub.
         self._tcp: _tcp.Listener | None = None
-        if hp.is_topic(where) or where == "*":
+        if by_topic:
             hp.check_topic(where, allow_wildcard=True)
             self.topic = where
             self._sock.bind(("127.0.0.1", 0))
@@ -427,42 +517,67 @@ class _Receiver:
         """Puerto TCP donde recibe mensajes arrow (0 si este tipo no los usa)."""
         return self._tcp.port if self._tcp is not None else 0
 
+    @property
+    def rejected(self) -> int:
+        """Datos (datagramas o conexiones TCP) descartados por venir de una IP que no es de esta
+        computadora ni de [[machine]] (RFC 0011 §2). Siempre 0 mientras no escuche en la red."""
+        return self._rejected
+
     def filenos(self) -> list:
         """Los sockets que hay que vigilar (para select)."""
-        return [self._sock, *(self._tcp.filenos() if self._tcp is not None else [])]
+        old = [self._old_udp] if self._old_udp is not None else []
+        return [self._sock, *old, *(self._tcp.filenos() if self._tcp is not None else [])]
 
     def _recv(self, deadline: float | None, failed=None):
         """Siguiente paquete de DATOS, (bytes, "ip:puerto", conexión TCP o None), o None si venció
         `deadline`. Si select() falla, `failed` (None por omisión). Los de control se procesan aquí."""
-        if self._tcp is None:
-            return self._recv_udp(deadline)
         while True:
-            if self._tcp.ready:
+            if self._tcp is None and self._old_udp is None:   # un solo socket UDP: lo de siempre
+                got = self._recv_udp(self._sock, deadline)
+                if got is _OTRA_VEZ:
+                    continue
+                return got
+            if self._tcp is not None and self._tcp.ready:
                 return self._tcp.ready.pop(0)
-            left = None if deadline is None else max(0.0, deadline - time.monotonic())
+            now = time.monotonic()
+            if self._old_until is not None and now >= self._old_until:
+                self._retire_old()
+                continue
+            left = None if deadline is None else max(0.0, deadline - now)
+            last = True   # ¿esta espera llega hasta `deadline`? (o hasta cerrar los sockets de antes)
+            if self._old_until is not None and (left is None or self._old_until - now < left):
+                left, last = max(0.0, self._old_until - now), False
             try:
                 r, _, _ = select.select(self.filenos(), [], [], left)
             except (OSError, ValueError):
                 return failed
             if not r:
-                return None
-            if self._sock in r:
-                got = self._recv_udp(0.0)
-                if got is not None:
-                    return got
-                r.remove(self._sock)
-            self._tcp.service(r)
+                if last:
+                    return None
+                continue
+            for udp in (self._sock, self._old_udp):
+                if udp is not None and udp in r:
+                    got = self._recv_udp(udp, 0.0)
+                    if got is not None and got is not _OTRA_VEZ:
+                        return got
+                    r.remove(udp)
+            if self._tcp is not None:
+                self._tcp.service(r)
 
-    def _recv_udp(self, deadline: float | None):
-        """Siguiente datagrama de DATOS (los de control se procesan aquí)."""
+    def _recv_udp(self, sock: socket.socket, deadline: float | None):
+        """Siguiente datagrama de DATOS de `sock` (los de control se procesan aquí)."""
         while True:
             left = None if deadline is None else max(0.0, deadline - time.monotonic())
-            self._sock.settimeout(left)
+            sock.settimeout(left)
             try:
-                data, sender = self._sock.recvfrom(65536)
+                data, sender = sock.recvfrom(65536)
             except (socket.timeout, BlockingIOError):
                 return None
             except ConnectionResetError:
+                continue
+            allowed = self._allowed   # None hasta que escucha en la red: sin trabajo de más
+            if allowed is not None and sender[0] not in allowed:
+                self._reject(sender[0])
                 continue
             if self._link is not None and hp.is_control(data):
                 try:
@@ -470,12 +585,76 @@ class _Receiver:
                         if f.get("id") == self._link.id:
                             self._link.got_reply()
                             self._link.error = f.get("msg", "error del hub") if op == "error" else None
+                            if op == "ok":
+                                self._on_ok(f, sock)
                 except hp.ProtocolError:
                     pass
                 if self._link.error:
                     raise wire.HubRejected(f"el hub rechazó escuchar '{self.topic}': {self._link.error}")
+                if sock is not self._sock:
+                    return _OTRA_VEZ   # el socket de antes, o recién se cambió: que _recv vuelva a empezar
                 continue
             return data, f"{sender[0]}:{sender[1]}", None
+
+    # --- modo red (RFC 0011 §2) ---
+    def _on_ok(self, f: dict[str, str], sock: socket.socket) -> None:
+        """Un `ok` del hub: con `peers`, el hub está en modo red."""
+        peers = f.get("peers")
+        if peers is not None and not self._net:
+            self._go_net()
+        if not self._net:
+            return
+        if sock is self._sock and self._old_udp is not None and self._old_until is None:
+            self._old_until = time.monotonic() + NET_OLD_S   # el hub confirmó el registro nuevo
+        # Sin peers (el hub volvió a modo local): los mismos sockets, pero solo lo local.
+        self._set_allowed(hp.split_list(peers) if peers else [])
+
+    def _go_net(self) -> None:
+        """Sockets nuevos en todas las interfaces (o en AGMEN_NET_IP); se registra con ellos y net=1.
+        Los de antes se siguen leyendo hasta NET_OLD_S después de que el hub confirme."""
+        ip = self._net_ip or "0.0.0.0"
+        udp = wire.udp_socket()
+        try:
+            udp.bind((ip, 0))
+            if self._tcp is not None:
+                self._tcp.rebind((ip, 0))   # si falla, el Listener queda como estaba
+        except OSError as e:
+            udp.close()
+            if not self._net_failed:
+                self._net_failed = True
+                print(f"[agmen] ⚠ '{self.topic}': el hub está en modo red pero no pude escuchar en {ip}: {e}. "
+                      f"Sigo solo en esta computadora (127.0.0.1); lo vuelvo a intentar con cada latido.",
+                      file=sys.stderr, flush=True)
+            return
+        self._old_udp, self._sock = self._sock, udp
+        self._net = True
+        port = udp.getsockname()[1]
+        self.listen = f"{ip}:{port}"
+        self._link.move(udp, port=port, tcp=self._tcp.port if self._tcp is not None else "", net=1)
+
+    def _set_allowed(self, ips: list[str]) -> None:
+        local = (hp.LOCALHOST, self._net_ip) if self._net_ip else (hp.LOCALHOST,)
+        allowed = frozenset((*local, *ips))
+        if allowed != self._allowed:
+            self._allowed = allowed
+            if self._tcp is not None:
+                self._tcp.set_allow(allowed, self._reject)
+
+    def _reject(self, ip: str) -> None:
+        self._rejected += 1
+        # Una vez por IP; con un tope, para que una avalancha de IP distintas no llene la salida.
+        if ip not in self._rejected_ips and len(self._rejected_ips) < 256:
+            self._rejected_ips.add(ip)
+            print(f"[agmen] '{self.topic}': llegó un dato de {ip}, que no es una computadora de [[machine]]: "
+                  f"lo descarté (¿otra red, otro robot?)", file=sys.stderr, flush=True)
+
+    def _retire_old(self) -> None:
+        """Cierra los sockets de antes (las conexiones TCP ya aceptadas siguen)."""
+        old, self._old_udp, self._old_until = self._old_udp, None, None
+        if old is not None:
+            old.close()
+        if self._tcp is not None:
+            self._tcp.retire_old()
 
     def close(self) -> None:
         if self._link is not None:
@@ -483,6 +662,8 @@ class _Receiver:
         if self._tcp is not None:
             self._tcp.close()
         self._sock.close()
+        if self._old_udp is not None:
+            self._old_udp.close()
 
 
 class _PureSubscriber(_Receiver):
@@ -600,6 +781,8 @@ class _PureSubscriber(_Receiver):
             if self._tcp is not None:
                 self._tcp.close()
             self._sock.close()
+            if self._old_udp is not None:
+                self._old_udp.close()
 
     def __del__(self) -> None:
         # Un close() que quedó pendiente: sin referencias, ningún hilo puede estar en receive().

@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 import unittest
+import unittest.mock
 from dataclasses import dataclass
 
 import agmen
@@ -513,6 +514,52 @@ class TestModoRed(unittest.TestCase):
         self.assertEqual(len(self.hub.endpoints), 3000)
         self.red(peers="")
         self.assertEqual(self.hub.endpoints, {})
+
+class TestNetIp(unittest.TestCase):
+    """AGMEN_NET_IP en el hub (RFC 0011, precisión §7): "desde esta computadora" es 127.0.0.1 y, solo con
+    la variable, también esa IP (un Subscriber en modo red late desde su socket atado a ella)."""
+
+    def hub(self, net_ip):
+        env = {"AGMEN_NET_IP": net_ip} if net_ip else {}
+        with unittest.mock.patch.dict(os.environ, env):
+            if not net_ip:
+                os.environ.pop("AGMEN_NET_IP", None)
+            h = H.Hub(f"127.0.0.1:{free_port()}", log=lambda t: None, grace_s=0.0)
+        self.addCleanup(h.sock.close)
+        sent = []
+        h._send = lambda data, addr: sent.append((hp.parse(data)[0], addr))
+        return h, sent
+
+    def sub(self, h, sent, src):
+        sent.clear()
+        h.handle(hp.encode("sub", id="s1", node="n", pid=1, topic="/cmd", schema="00000000000000aa", type="Cmd",
+                           port=6000, net=1), src, 0.0)
+        return sent
+
+    def test_con_agmen_net_ip_esa_ip_tambien_es_esta_computadora(self):
+        h, sent = self.hub("127.0.0.2")
+        h.handle(hp.encode("red", peers=f"robot@{ROBOT}"), ("127.0.0.2", 5000), 0.0)
+        self.assertEqual(sent[-1][0], ("red_ok", {"peers": "1"}))
+        got = self.sub(h, sent, ("127.0.0.2", 5000))
+        self.assertEqual(got, [(("ok", {"id": "s1", "peers": ROBOT}), ("127.0.0.2", 6000))])
+        self.assertTrue(h.endpoints["s1"].net)
+        ((op, f), _), = self.sub(h, sent, ("127.0.0.3", 5000))     # otra IP: no
+        self.assertEqual(op, "error")
+        self.assertIn("(127.0.0.1 o 127.0.0.2) y llegó de 127.0.0.3", f["msg"])
+
+    def test_sin_agmen_net_ip_solo_127_0_0_1(self):
+        h, sent = self.hub("")
+        h.handle(hp.encode("red", peers=f"robot@{ROBOT}"), LOCAL, 0.0)
+        ((op, f), _), = self.sub(h, sent, ("127.0.0.2", 5000))
+        self.assertEqual(op, "error")
+        self.assertIn("(127.0.0.1) y llegó de 127.0.0.2", f["msg"])
+
+    def test_agmen_net_ip_que_no_sirve(self):
+        with self.assertRaisesRegex(hp.ProtocolError, "AGMEN_NET_IP=300.1.1.1"):
+            self.hub("300.1.1.1")
+        with self.assertRaisesRegex(OSError, "AGMEN_NET_IP=192.0.2.77 no es una IP de esta computadora"):
+            self.hub("192.0.2.77")
+
 
 if __name__ == "__main__":
     unittest.main()
