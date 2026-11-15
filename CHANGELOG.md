@@ -15,7 +15,9 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   MuJoCo (bloque 2, abajo), `[[machine]]` (bloque 3, parte 3a, abajo) y
   `agmen agent` con clave (parte 3b, abajo), y la reconexión tras un corte, el
   panel con varias computadoras, el servicio de arranque y el capítulo 18 (parte
-  3c, abajo). Falta: topics entre computadoras y relojes (bloques 4 y 5 del plan
+  3c, abajo), y la base de los topics entre computadoras (parte 4a, abajo). Falta:
+  el puente que pasa las tablas de topics (parte 4b), lo visible en herramientas y
+  panel (parte 4c) y los relojes (bloque 5 del plan
   del RFC).
 
 ### Agregado
@@ -114,6 +116,21 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   nuevos `reanudar` y `reanudar_ok` (con los `log` que la laptop no tenía); el
   `adios` del agente; `sesion_error` `sesion` y `ocupado` con los segundos que
   quedan. El agente guarda 2 000 líneas de log (1 MiB) para reanudar.
+- **Topics entre computadoras, parte 4a (RFC 0011 §3.5): la base, sin encender**.
+  El hub `agmen-hub/1` gana la operación `red` (modo red: `peers=nombre@ip`, que se
+  repite cada 2 s y caduca a los 6 s), `pong red=1`, `ok … peers=`, `sub … net=1` y
+  las entradas de otra computadora (`sub` y `pub` con `machine`; `addr` en `sub`),
+  con sus reglas de aceptación. `query` (`state`) lleva `machine` y `net`. Los dos
+  núcleos (C++ y Python) escuchan en la red solo cuando su hub se lo dice, aceptan
+  datos solo de las computadoras declaradas, y mandan a otra computadora (UDP los
+  chicos, TCP los grandes, sin memoria compartida). Contadores nuevos: `rejected`
+  (datos o control que no vienen de una computadora declarada o de su hub) y
+  `unreachable` (destinos de otra computadora que no se alcanzan).
+  `RawPublisher` (el del `[[mux]]`) ya manda a otra computadora igual que un
+  Publisher. **Un topic todavía no cruza entre computadoras**: `agmen run` y
+  `agmen agent` aún no pasan las tablas a su hub. Eso es la parte 4b (el puente);
+  la vista en herramientas y panel, la 4c. Protocolo en `docs/PROTOCOLO.md`
+  ("Topics y hub: `agmen-hub/1`").
 - **Lo que todavía no existe**: topics entre computadoras (bloque 4: cada
   computadora tiene su propio hub) y medir la diferencia de reloj entre
   computadoras (bloque 5). Una laptop a la vez por agente.
