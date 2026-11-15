@@ -523,6 +523,7 @@ void hub_modo_red() {
         {"ro bot@1.2.3.4", "nombre de computadora"},
         {"robót@1.2.3.4", "nombre de computadora"},
         {"robot@127.0.0.1", "esta misma computadora"},
+        {"robot@127.0.0.4", "con AGMEN_NET_IP"},   // RFC 0011 §9.6: una 127.x solo en pruebas
         {"robot@0.0.0.0", "dirección especial"},
         {"robot@224.0.0.1", "dirección especial"},
         {"robot@255.255.255.255", "dirección especial"},
@@ -538,6 +539,10 @@ void hub_modo_red() {
     for (const auto& [bad, why] : malos) {
         espera_rechazo([bad = bad] { (void)hub::parse_peers(bad); }, why, bad);
     }
+    // Con AGMEN_NET_IP (pruebas), una 127.x vale como otra computadora; 127.0.0.1, nunca.
+    CHECK(hub::parse_peers("a@127.0.0.4", true) ==
+          (std::vector<std::pair<std::string, std::string>>{{"a", "127.0.0.4"}}));
+    espera_rechazo([] { (void)hub::parse_peers("a@127.0.0.1", true); }, "esta misma computadora", "127.0.0.1");
     CHECK(hub::parse_hostport("192.168.1.20:7500") ==
           std::make_pair(std::string("192.168.1.20"), std::uint16_t{7500}));
     CHECK(hub::parse_port("65535") == 65535);

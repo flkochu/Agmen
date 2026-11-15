@@ -278,7 +278,8 @@ class Hub:
             if "peers" not in f:
                 raise hp.ProtocolError("'red' sin peers: manda peers=nombre@ip,... (o peers= vacío para volver "
                                        "a modo local)")
-            peers = hp.parse_peers(f["peers"])
+            # Una 127.x como otra computadora solo en pruebas, con AGMEN_NET_IP (RFC 0011 §9.6).
+            peers = hp.parse_peers(f["peers"], loopback=self.net_ip is not None)
             self._set_red(peers, now)
             self._send(hp.encode("red_ok", peers=len(peers)), addr)
         elif op == "query":

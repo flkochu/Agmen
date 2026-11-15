@@ -212,13 +212,19 @@ std::string parse_ipv4(std::string_view text) {
     return std::string(text);
 }
 
-void check_peer_ip(std::string_view ip) {
+void check_peer_ip(std::string_view ip, bool loopback) {
     (void)parse_ipv4(ip);
     const int first = std::stoi(std::string(ip.substr(0, ip.find('.'))));
     if (ip == kLocalhost) {
         throw std::invalid_argument(
             "127.0.0.1 es esta misma computadora, no otra: pon la IP con la que esta computadora ve a "
             "la otra, ej. 192.168.1.20");
+    }
+    if (first == 127 && !loopback) {
+        throw std::invalid_argument(
+            std::string(ip) +
+            " es esta misma computadora (las 127.x no salen de ella), no otra: pon la IP con la que esta "
+            "computadora ve a la otra, ej. 192.168.1.20 (las 127.x solo valen en pruebas, con AGMEN_NET_IP)");
     }
     if (ip == "0.0.0.0" || ip == "255.255.255.255" || (first >= 224 && first <= 239)) {
         throw std::invalid_argument(
@@ -253,7 +259,7 @@ std::pair<std::string, std::uint16_t> parse_hostport(std::string_view text) {
     return {std::move(ip), parse_port(text.substr(colon + 1))};
 }
 
-std::vector<std::pair<std::string, std::string>> parse_peers(std::string_view text) {
+std::vector<std::pair<std::string, std::string>> parse_peers(std::string_view text, bool loopback) {
     std::vector<std::pair<std::string, std::string>> out;
     std::map<std::string, std::string, std::less<>> names;  // en minúsculas → como vino
     std::map<std::string, std::string, std::less<>> ips;    // IP → nombre
@@ -266,7 +272,7 @@ std::vector<std::pair<std::string, std::string>> parse_peers(std::string_view te
         std::string name = item.substr(0, at);
         std::string ip = item.substr(at + 1);
         check_machine(name);
-        check_peer_ip(ip);
+        check_peer_ip(ip, loopback);
         if (names.count(lower(name)) != 0) {
             throw std::invalid_argument("la computadora '" + name +
                                         "' está dos veces en peers: cada una va una sola vez");
@@ -336,9 +342,21 @@ std::string hex16(std::uint64_t v) {
 
 Link::Link(std::string id, std::string beat)
     : hub_(net::Address::resolve(hub_address())),
+      hub_from_(hub_.to_string()),
       id_(std::move(id)),
       beat_(std::move(beat)),
-      started_(std::chrono::steady_clock::now()) {}
+      started_(std::chrono::steady_clock::now()) {
+    // Un hub en 0.0.0.0 contesta desde 127.0.0.1 (igual que _hub_from en python/agmen/pubsub.py).
+    if (hub_from_.rfind("0.0.0.0:", 0) == 0) hub_from_ = "127.0.0.1" + hub_from_.substr(7);
+}
+
+void Link::warn_foreign(std::string_view topic, const std::string& from) {
+    constexpr std::size_t kMaxWarned = 256;   // remitentes distintos que se avisan (los demás solo se cuentan)
+    if (foreign_warned_.size() >= kMaxWarned || !foreign_warned_.insert(from).second) return;
+    log::write("[agmen] ⚠ '" + std::string(topic) + "': llegó un mensaje de control de " + from +
+               ", que no es el hub (" + hub_from_ +
+               "): lo descarté sin hacerle caso. Si no es tuyo, algo en la red se hace pasar por el hub.");
+}
 
 void Link::beat(net::UdpSocket& socket) {
     const wire::ByteView data(reinterpret_cast<const std::uint8_t*>(beat_.data()), beat_.size());

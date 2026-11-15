@@ -8,11 +8,13 @@ C++ → Python y Python → C++. Sin el núcleo nativo, se salta.
 """
 
 import socket
+import time
 import unittest
 
 from agmen import _backend, pubsub, wire
+from agmen import hubproto as hp
 
-from test_red import BIG, Base, Chico, Grande, receive_all, until
+from test_red import AVISO_CONTROL, BIG, Base, Chico, Grande, raw_sock, receive_all, until
 
 
 @unittest.skipUnless(_backend.NATIVE, "sin el núcleo nativo (agmen._core)")
@@ -21,7 +23,7 @@ class TestCruzadoConPython(Base):
 
     def setUp(self):
         super().setUp()
-        self.ha, self.hb = self.hub(), self.hub("127.0.0.2")
+        self.ha, self.hb = self.hub("127.0.0.3"), self.hub("127.0.0.2")
         self.hb.red("a@127.0.0.3")
         self.ha.red("b@127.0.0.2")
 
@@ -89,3 +91,64 @@ class TestCruzadoConPython(Base):
         aviso = ("[agmen] '/x': llegó un dato de 127.0.0.5, que no es una computadora de [[machine]]: lo descarté "
                  "(¿otra red, otro robot?)")
         self.assertEqual(self.err.getvalue().count(aviso), 1)          # una vez por IP
+
+
+@unittest.skipUnless(_backend.NATIVE, "sin el núcleo nativo (agmen._core)")
+class TestNativoControlYContadores(Base):
+    """RFC 0011 §9.1 y §9.7 en el núcleo nativo: el control solo vale si es del hub; `rejected`,
+    `unreachable` y `.listen` se ven desde Python."""
+
+    def ep(self, h, kind, topic):
+        with h.hub.lock:
+            for e in h.hub.endpoints.values():
+                if e.kind == kind and e.topic == topic and not e.machine:
+                    return e
+        return None
+
+    def test_ok_y_error_falsos_al_subscriber(self):
+        h = self.hub()
+        sub = self.open(h, pubsub._NativeSubscriber, Chico, "/a")
+        self.assertTrue(until(lambda: self.ep(h, "sub", "/a"), every=lambda: sub.receive(0.05)))
+        sid = self.ep(h, "sub", "/a").id
+        falso = raw_sock(self, "127.0.0.1")
+        for _ in range(2):
+            falso.sendto(hp.encode("ok", id=sid, peers="10.9.9.9"), ("127.0.0.1", sub.port))
+            falso.sendto(hp.encode("error", id=sid, msg="falso"), ("127.0.0.1", sub.port))
+        for _ in range(5):
+            self.assertIsNone(sub.receive(0.1))                     # el `error` falso no lanza
+        self.assertEqual(sub.listen, "127.0.0.1:%d" % sub.port)    # no pasó a la red
+        self.assertEqual(sub._core.listen_ip, "127.0.0.1")
+        self.assertFalse(self.ep(h, "sub", "/a").net)
+        self.assertEqual(sub.rejected, 4)
+        quien = "127.0.0.1:%d" % falso.getsockname()[1]
+        self.assertEqual(self.err.getvalue().count(AVISO_CONTROL.format(quien)), 1)
+
+    def test_subs_falso_al_publisher(self):
+        h = self.hub()
+        pub = self.open(h, pubsub._NativePublisher, Chico, "/c")
+        self.assertTrue(until(lambda: self.ep(h, "pub", "/c")))
+        pid = self.ep(h, "pub", "/c").id
+        sink = raw_sock(self, "127.0.0.9")
+        sink.settimeout(0.3)
+        falso = raw_sock(self, "127.0.0.1")
+        pub_addr = self.ep(h, "pub", "/c").addr
+        for _ in range(2):
+            falso.sendto(hp.encode("subs", id=pid, topic="/c", to="127.0.0.9:%d" % sink.getsockname()[1]), pub_addr)
+        time.sleep(0.05)
+        pub.publish(Chico(1, 1))
+        with self.assertRaises(socket.timeout):
+            sink.recvfrom(65536)
+        self.assertEqual((pub.subscribers, pub.rejected, pub.unreachable), (0, 2, 0))
+        quien = "127.0.0.1:%d" % falso.getsockname()[1]
+        self.assertEqual(self.err.getvalue().count(AVISO_CONTROL.format(quien)), 1)
+
+    def test_listen_al_dia_tras_pasar_a_la_red(self):
+        h = self.hub("127.0.0.2")
+        h.red("a@127.0.0.3")
+        sub = self.open(h, pubsub._NativeSubscriber, Chico, "/l", net_ip="127.0.0.2")
+        self.assertTrue(until(lambda: sub.listen.startswith("127.0.0.2:"), every=lambda: sub.receive(0.05)))
+        self.assertEqual(sub.listen, "127.0.0.2:%d" % sub.port)
+        raw_sock(self, "127.0.0.9").sendto(wire.encode(Chico(1, 1), 1, topic="/l"), ("127.0.0.2", sub.port))
+        self.assertTrue(until(lambda: sub.rejected == 1, every=lambda: sub.receive(0.05)))
+        sub.close()
+        self.assertEqual(sub.listen.split(":")[0], "127.0.0.2")    # tras close(), el último

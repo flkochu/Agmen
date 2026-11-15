@@ -6,6 +6,7 @@
 // hub). Para tener dos computadoras en una se usan IP de 127.0.0.x con AGMEN_NET_IP. Nada espera un
 // tiempo fijo: se espera cada condición, con tope.
 #include <agmen/agmen.hpp>
+#include <agmen/shm.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -154,6 +155,7 @@ public:
         std::string tcp;
         bool sub = false;
         bool net = false;
+        std::string from;   // "ip:puerto" desde donde late
     };
 
     FakeHub() : sock_(net::UdpSocket::bind("127.0.0.1:0")) {
@@ -168,6 +170,20 @@ public:
     void set_peers(std::optional<std::string> p) {
         std::lock_guard lock(mu_);
         peers_ = std::move(p);
+    }
+    /// Calla al hub: deja de contestar (como un hub que se cerró).
+    void set_silent(bool s) { silent_ = s; }
+    void clear_remote(const std::string& topic) {
+        std::lock_guard lock(mu_);
+        remote_.erase(topic);
+    }
+    /// El id y el remitente del endpoint (sub o pub) de `topic`.
+    std::optional<std::pair<std::string, std::string>> id_of(const std::string& topic, bool sub) {
+        std::lock_guard lock(mu_);
+        for (const auto& [id, e] : eps_) {
+            if (e.sub == sub && e.topic == topic) return std::make_pair(id, e.from);
+        }
+        return std::nullopt;
     }
     void add_remote(const std::string& topic, const std::string& to, const std::string& tcp = "") {
         std::lock_guard lock(mu_);
@@ -196,6 +212,7 @@ private:
     net::UdpSocket sock_;
     std::thread thread_;
     std::atomic<bool> stop_{false};
+    std::atomic<bool> silent_{false};
     std::mutex mu_;
     std::optional<std::string> peers_;
     std::map<std::string, Ep> eps_;
@@ -211,7 +228,7 @@ private:
         std::vector<std::uint8_t> buf(65536);
         while (!stop_) {
             const auto rx = sock_.recv_from(buf, 50ms);
-            if (!rx) continue;
+            if (!rx || silent_) continue;
             std::vector<hub::Line> lines;
             try {
                 lines = hub::parse(ByteView(buf.data(), rx->size));
@@ -225,7 +242,7 @@ private:
                     std::lock_guard lock(mu_);
                     auto& e = eps_[l.get("id")];
                     e = Ep{l.get("topic"), ip_of(rx->from), l.get("port"), l.get("tcp"), l.op == "sub",
-                           l.get("net") == "1"};
+                           l.get("net") == "1", rx->from};
                     if (e.sub) {
                         std::vector<std::pair<std::string, std::string>> f{{"id", l.get("id")}};
                         if (peers_) f.emplace_back("peers", *peers_);
@@ -595,6 +612,158 @@ void test_un_destino_inalcanzable_no_frena_a_los_demas() {
 #endif
 }
 
+Bytes text_bytes(const std::string& s) { return Bytes(s.begin(), s.end()); }
+
+std::string aviso_control(const net::UdpSocket& s, const std::string& ip) {
+    return "llegó un mensaje de control de " + ip + ":" + std::to_string(s.local_port()) + ", que no es el hub";
+}
+
+/// RFC 0011 §9.1: `ok`, `error` y `subs` solo valen si vienen del hub (IP y puerto).
+void test_control_que_no_es_del_hub() {
+    Logs logs;
+    FakeHub h;
+    auto sub = opened<agmen::Subscriber<Chico>>(h, "/a");
+    auto pub = opened<agmen::Publisher<Chico>>(h, "/c");
+    CHECK(until([&] { return h.id_of("/a", true) && h.id_of("/c", false); }, [&] { (void)sub->receive(20ms); }));
+    const auto sid = h.id_of("/a", true)->first;
+    auto falso = net::UdpSocket::bind("127.0.0.1:0");
+    const auto to_sub = net::Address::resolve("127.0.0.1:" + std::to_string(sub->local_port()));
+    for (int i = 0; i < 2; ++i) {
+        (void)falso.send_to(text_bytes(hub::line("ok", {{"id", sid}, {"peers", "10.9.9.9"}})), to_sub);
+        (void)falso.send_to(text_bytes(hub::line("error", {{"id", sid}, {"msg", "falso"}})), to_sub);
+    }
+    bool threw = false;
+    for (int i = 0; i < 5; ++i) {
+        try {
+            (void)sub->receive(100ms);
+        } catch (const std::exception&) {
+            threw = true;   // el `error` falso no debe tumbar receive()
+        }
+    }
+    CHECK(!threw);
+    CHECK(sub->listen_ip() == "127.0.0.1");      // no pasó a la red
+    CHECK(sub->native_handles().size() == 1);
+    CHECK(!h.any_net());
+    CHECK(sub->rejected() == 4);
+    CHECK(logs.count(aviso_control(falso, "127.0.0.1")) == 1);   // una vez por remitente
+    // Publisher: un `subs` falso no le cambia los destinos.
+    const auto [pid, pub_from] = *h.id_of("/c", false);
+    auto sink = net::UdpSocket::bind("127.0.0.9:0");
+    for (int i = 0; i < 2; ++i) {
+        (void)falso.send_to(text_bytes(hub::line("subs", {{"id", pid},
+                                                          {"to", "127.0.0.9:" + std::to_string(sink.local_port())},
+                                                          {"tcp", ""}})),
+                            net::Address::resolve(pub_from));
+    }
+    std::this_thread::sleep_for(50ms);
+    (void)pub->publish(Chico{1, 1});
+    std::vector<std::uint8_t> buf(65536);
+    CHECK(!sink.recv_from(buf, 300ms));
+    CHECK(pub->subscribers() == 0);
+    CHECK(pub->rejected() == 2);
+    CHECK(pub->unreachable() == 0);
+    CHECK(logs.count(aviso_control(falso, "127.0.0.1")) == 2);   // el del Subscriber y el del Publisher
+
+    // En modo red: un `peer` no amplía la lista ni tumba receive().
+    FakeHub h2;
+    h2.set_peers("127.0.0.4");
+    auto sub2 = opened<agmen::Subscriber<Chico>>(h2, "/b");
+    CHECK(until([&] { return sub2->listen_ip() == "0.0.0.0" && sub2->native_handles().size() == 1; },
+                [&] { (void)sub2->receive(20ms); }));
+    const auto sid2 = h2.id_of("/b", true)->first;
+    auto peer = net::UdpSocket::bind("127.0.0.4:0");
+    const auto to_sub2 = net::Address::resolve("127.0.0.1:" + std::to_string(sub2->local_port()));
+    (void)peer.send_to(text_bytes(hub::line("ok", {{"id", sid2}, {"peers", "127.0.0.4,127.0.0.9"}})), to_sub2);
+    (void)peer.send_to(text_bytes(hub::line("error", {{"id", sid2}, {"msg", "falso"}})), to_sub2);
+    threw = false;
+    try {
+        (void)sub2->receive(200ms);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    CHECK(!threw);
+    auto ext = net::UdpSocket::bind("127.0.0.9:0");
+    (void)ext.send_to(chico_packet("/b", 7, 7), to_sub2);
+    std::vector<agmen::Sample<Chico>> got;
+    receive_all(*sub2, got, 200ms);
+    CHECK(got.empty());
+    CHECK(sub2->rejected() == 3);   // 2 de control + 1 dato de 127.0.0.9
+    CHECK(logs.count(aviso_control(peer, "127.0.0.4")) == 1);
+}
+
+/// RFC 0011 §9.2: sin ningún `ok` del hub en kNetExpire (6 s), solo lo local; se dice una vez.
+void test_hub_callado() {
+    Logs logs;
+    FakeHub h;
+    h.set_peers("127.0.0.4");
+    auto sub = opened<agmen::Subscriber<Chico>>(h, "/s");
+    CHECK(until([&] { return sub->listen_ip() == "0.0.0.0" && sub->native_handles().size() == 1; },
+                [&] { (void)sub->receive(20ms); }));
+    auto par = net::UdpSocket::bind("127.0.0.4:0");
+    const auto dest = net::Address::resolve("127.0.0.1:" + std::to_string(sub->local_port()));
+    (void)par.send_to(chico_packet("/s", 1, 0), dest);
+    std::vector<agmen::Sample<Chico>> got;
+    receive_all(*sub, got, 100ms);
+    CHECK(got.size() == 1);
+    h.set_silent(true);
+    const auto end = std::chrono::steady_clock::now() + hub::kNetExpire + 500ms;
+    while (std::chrono::steady_clock::now() < end) (void)sub->receive(100ms);
+    got.clear();
+    for (std::uint32_t n = 2; n <= 3; ++n) (void)par.send_to(chico_packet("/s", n, 0), dest);
+    receive_all(*sub, got, 100ms);
+    CHECK(got.empty());
+    CHECK(sub->rejected() == 2);
+    CHECK(logs.count("el hub no contesta hace más de 6 s") == 1);
+}
+
+/// RFC 0011 §9.3: sin destinos de otra computadora, el Publisher cierra su socket de red.
+void test_cierra_el_socket_de_red() {
+    Logs logs;
+    DosComputadoras d;
+    auto pub = opened<agmen::Publisher<Chico>>(d.ha, "/x", "127.0.0.3");
+    std::vector<agmen::Sample<Chico>> got;
+    CHECK(until([&] { return !got.empty(); }, [&] {
+        (void)pub->publish(Chico{1, 1});
+        receive_all(*d.sub, got);
+    }));
+    const std::string net_from = got.empty() ? std::string("127.0.0.3:1") : got[0].from;
+    CHECK(ip_of(net_from) == "127.0.0.3");
+    CHECK(!udp_free(net_from));   // abierto mientras hay a quién mandarle
+    d.ha.clear_remote("/x");
+    CHECK(until([&] { return udp_free(net_from); }, [&] {
+        (void)pub->publish(Chico{2, 2});
+        std::this_thread::sleep_for(20ms);
+    }));
+    CHECK(pub->subscribers() == 0);
+    CHECK(pub->unreachable() == 0);
+}
+
+/// RFC 0011 §9.5: un destino en AGMEN_NET_IP es de esta computadora (socket de siempre, memoria compartida).
+void test_agmen_net_ip_es_local() {
+    Logs logs;
+    DosComputadoras d;
+    auto pub = opened<agmen::Publisher<Chico>>(d.hb, "/x", "127.0.0.2");
+    auto pubg = opened<agmen::Publisher<Grande>>(d.hb, "/xg", "127.0.0.2");
+    std::vector<agmen::Sample<Chico>> got;
+    std::vector<agmen::Sample<Grande>> gotg;
+    const auto data = big();
+    CHECK(until([&] { return !got.empty() && !gotg.empty(); }, [&] {
+        (void)pub->publish(Chico{4, 4});
+        (void)pubg->publish(Grande{4, data});
+        receive_all(*d.sub, got);
+        receive_all(*d.subg, gotg);
+    }));
+    CHECK(!got.empty() && ip_of(got[0].from) == "127.0.0.1");   // salió por el socket de siempre
+    if (agmen::shm::enabled()) {
+        CHECK(until([&] { return pubg->shm_subscribers() == 1; }, [&] {
+            (void)pubg->publish(Grande{5, data});
+            receive_all(*d.subg, gotg);
+        }));
+    }
+    CHECK(pub->unreachable() + pubg->unreachable() == 0);
+    CHECK(logs.count("memoria compartida") == 0);
+}
+
 void test_agmen_net_ip_que_no_sirve() {
     FakeHub h;
     const auto expect = [&](auto open) {
@@ -640,6 +809,10 @@ int main() {
     test_chico_y_grande_cruzan();
     test_un_destino_inalcanzable_no_frena_a_los_demas();
     test_agmen_net_ip_que_no_sirve();
+    test_control_que_no_es_del_hub();
+    test_hub_callado();
+    test_cierra_el_socket_de_red();
+    test_agmen_net_ip_es_local();
     if (g_failures == 0) std::printf("test_red: todo bien\n");
     return g_failures == 0 ? 0 : 1;
 }

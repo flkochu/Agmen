@@ -45,6 +45,21 @@ BIG_BUFFER = 4 << 20          # SO_SNDBUF / SO_RCVBUF que se pide fuera de Linux
 READ_CHUNK = 1 << 18
 SHM_NO, SHM_PROBING, SHM_YES = 0, 1, 2
 LOCAL_IP = "127.0.0.1"
+
+
+def _error_text(err: int) -> str:
+    """El motivo de un código de error de socket (SO_ERROR, connect_ex). En Windows son códigos de Winsock
+    (10061...), que os.strerror no conoce ("Unknown error"): el texto lo da el sistema (RFC 0011 §9.9)."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            text = ctypes.FormatError(err).strip()
+            if text:
+                return text
+        except (ImportError, AttributeError, OSError, ValueError):
+            pass
+    return os.strerror(err)
 # Conectar a OTRA computadora (RFC 0011 §3) no bloquea a nadie: la conexión se termina en el hilo del
 # Fanout, y si no contesta en este tiempo se da por fallida (se reintenta cada Fanout.RETRY_S).
 # DECISIÓN PENDIENTE: 3 s (la especificación no da el número; a 127.0.0.1 se sigue esperando 1 s, bloqueando).
@@ -166,7 +181,7 @@ class Outgoing:
             return
         if err not in _IN_PROGRESS:
             s.close()
-            self.error = os.strerror(err)
+            self.error = _error_text(err)
             return
         self.sock = s
         self.alive = True
@@ -181,7 +196,7 @@ class Outgoing:
             self.error = str(e)
             return False
         if err:
-            self.error = os.strerror(err)
+            self.error = _error_text(err)
             return False
         self.connecting = False
         return True
@@ -330,7 +345,7 @@ class Fanout:
             c = self.conns.get(a)
             if c is not None and c.alive:
                 continue
-            remote = self.net and a[0] != LOCAL_IP
+            remote = self.net and a[0] != LOCAL_IP and a[0] != self.net_ip   # AGMEN_NET_IP es local (§9.5)
             if not force and now - self._last_try.get(a, 0.0) < self.RETRY_S:
                 if remote and msg:
                     self.unreachable += 1
@@ -717,6 +732,7 @@ class Listener:
         self.old: list[socket.socket] = []
         self.allow: frozenset | None = None
         self.on_reject = None
+        self.net_ip: str | None = None   # AGMEN_NET_IP: también es esta computadora (memoria compartida, §9.5)
 
     @staticmethod
     def _open(bind: tuple[str, int]) -> socket.socket:
@@ -785,7 +801,7 @@ class Listener:
                 inc = _Incoming(c, f"{peer[0]}:{peer[1]}")
                 self.conns[c] = inc
                 # En modo red, la memoria compartida solo con esta computadora (en local, lo de siempre).
-                if self.shm and (self.allow is None or peer[0] == LOCAL_IP):
+                if self.shm and (self.allow is None or peer[0] == LOCAL_IP or peer[0] == self.net_ip):
                     # El suscriptor habla primero (RFC 0009 §3.3): un publicador de
                     # 0.10 nunca lee esto, y uno de 0.11 sabe que puede probar.
                     inc.hello = True

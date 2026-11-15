@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -85,7 +86,8 @@ void check_machine(std::string_view name);
 [[nodiscard]] std::string parse_ipv4(std::string_view text);
 
 /// La IP de OTRA computadora: válida, que no sea 127.0.0.1 ni una dirección especial o de grupo.
-void check_peer_ip(std::string_view ip);
+/// `loopback`: acepta las demás 127.x (solo pruebas con AGMEN_NET_IP, RFC 0011 §9.6).
+void check_peer_ip(std::string_view ip, bool loopback = false);
 
 /// Puerto de 1 a 65535. `what` nombra el campo en el error.
 [[nodiscard]] std::uint16_t parse_port(std::string_view text, std::string_view what = "puerto");
@@ -95,7 +97,9 @@ void check_peer_ip(std::string_view ip);
 
 /// "robot@192.168.1.20,laptop@10.0.0.5" → {{"robot", "192.168.1.20"}, ...}; "" = ninguna.
 /// Nombres repetidos (sin importar mayúsculas) o IP repetidas: std::invalid_argument.
-[[nodiscard]] std::vector<std::pair<std::string, std::string>> parse_peers(std::string_view text);
+/// `loopback`: acepta IP 127.x (pruebas con AGMEN_NET_IP; ver check_peer_ip).
+[[nodiscard]] std::vector<std::pair<std::string, std::string>> parse_peers(std::string_view text,
+                                                                          bool loopback = false);
 
 [[nodiscard]] std::string format_peers(const std::vector<std::pair<std::string, std::string>>& peers);
 
@@ -143,9 +147,16 @@ public:
     [[nodiscard]] std::uint64_t oks() const { return oks_; }
     /// Cambia la línea del latido (el Subscriber que pasa a la red: puerto nuevo y net=1).
     void set_beat(std::string beat) { beat_ = std::move(beat); }
+    /// ¿`from` ("ip:puerto", el remitente de un datagrama) es el hub? El control de cualquier otro se
+    /// descarta sin efecto (RFC 0011 §9.1).
+    [[nodiscard]] bool from_hub(std::string_view from) const { return from == hub_from_; }
+    /// Llegó control de `from`, que no es el hub: se avisa una vez por remitente (con tope).
+    void warn_foreign(std::string_view topic, const std::string& from);
 
 private:
     net::Address hub_;
+    std::string hub_from_;   // "ip:puerto" del que llegan sus respuestas (hub_ resuelto)
+    std::set<std::string> foreign_warned_;
     std::string id_;
     std::string beat_;
     std::chrono::steady_clock::time_point started_;

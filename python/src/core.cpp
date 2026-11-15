@@ -629,6 +629,8 @@ public:
     [[nodiscard]] std::size_t shm_subscribers() { return live().shm_subscribers(); }
     [[nodiscard]] std::uint64_t shm_fallbacks() { return live().shm_fallbacks(); }
     [[nodiscard]] std::size_t shm_bytes() { return live().shm_bytes(); }
+    [[nodiscard]] std::uint64_t unreachable() { return live().unreachable(); }
+    [[nodiscard]] std::uint64_t rejected() { return live().rejected(); }
 
 private:
     agmen::PublisherCore& live() {
@@ -742,6 +744,8 @@ public:
     [[nodiscard]] std::uint16_t port() { return live().local_port(); }
     [[nodiscard]] std::uint16_t tcp_port() { return live().tcp_port(); }
     [[nodiscard]] std::size_t shm_mapped() { return live().shm_mapped(); }
+    [[nodiscard]] std::string listen_ip() { return live().listen_ip(); }
+    [[nodiscard]] std::uint64_t rejected() { return live().rejected(); }
 
 private:
     agmen::SubscriberCore& live() {
@@ -1068,7 +1072,9 @@ NB_MODULE(_core, m) {
         .def_prop_ro("dropped", &PyPublisher::dropped)
         .def_prop_ro("shm_subscribers", &PyPublisher::shm_subscribers)
         .def_prop_ro("shm_fallbacks", &PyPublisher::shm_fallbacks)
-        .def_prop_ro("shm_bytes", &PyPublisher::shm_bytes);
+        .def_prop_ro("shm_bytes", &PyPublisher::shm_bytes)
+        .def_prop_ro("unreachable", &PyPublisher::unreachable)
+        .def_prop_ro("rejected", &PyPublisher::rejected);
 
     nb::class_<ShmPayload>(m, "ShmPayload", nb::type_slots(shm_payload_slots),
                            "Un payload en la memoria compartida del publicador (RFC 0009): úsalo con "
@@ -1090,6 +1096,8 @@ NB_MODULE(_core, m) {
         .def_prop_ro("port", &PySubscriber::port)
         .def_prop_ro("tcp_port", &PySubscriber::tcp_port)
         .def_prop_ro("shm_mapped", &PySubscriber::shm_mapped)
+        .def_prop_ro("listen_ip", &PySubscriber::listen_ip)
+        .def_prop_ro("rejected", &PySubscriber::rejected)
         .def_prop_ro("closed", &PySubscriber::closed)
         .def("close", &PySubscriber::close);
 

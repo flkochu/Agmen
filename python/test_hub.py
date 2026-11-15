@@ -293,6 +293,7 @@ class TestModoRedProtocolo(unittest.TestCase):
         for bad, why in [("robot", "nombre@ip"), ("robot@", "IP válida"), ("@1.2.3.4", "nombre de computadora"),
                          ("ro bot@1.2.3.4", "nombre de computadora"), ("robót@1.2.3.4", "nombre de computadora"),
                          ("robot@127.0.0.1", "esta misma computadora"), ("robot@0.0.0.0", "dirección especial"),
+                         ("robot@127.0.0.4", "con AGMEN_NET_IP"),
                          ("robot@224.0.0.1", "dirección especial"), ("robot@255.255.255.255", "dirección especial"),
                          ("robot@1.2.3.4,ROBOT@1.2.3.5", "dos veces"), ("a@1.2.3.4,b@1.2.3.4", "misma IP"),
                          ("robot@1.2.3", "IP válida"), ("robot@1.2.3.256", "IP válida"),
@@ -546,6 +547,23 @@ class TestNetIp(unittest.TestCase):
         ((op, f), _), = self.sub(h, sent, ("127.0.0.3", 5000))     # otra IP: no
         self.assertEqual(op, "error")
         self.assertIn("(127.0.0.1 o 127.0.0.2) y llegó de 127.0.0.3", f["msg"])
+
+    def test_una_127_como_peer_solo_con_agmen_net_ip(self):
+        """§9.6: sin AGMEN_NET_IP, una 127.x como otra computadora es un error claro; con ella (pruebas), vale."""
+        self.assertEqual(hp.parse_peers("a@127.0.0.4", loopback=True), [("a", "127.0.0.4")])
+        with self.assertRaisesRegex(hp.ProtocolError, "esta misma computadora"):
+            hp.parse_peers("a@127.0.0.1", loopback=True)            # 127.0.0.1, nunca
+        h, sent = self.hub("")
+        h.handle(hp.encode("red", peers="a@127.0.0.4"), LOCAL, 0.0)
+        ((op, f), _), = sent
+        self.assertEqual(op, "error")
+        self.assertIn("127.0.0.4 es esta misma computadora", f["msg"])
+        self.assertIn("solo valen en pruebas, con AGMEN_NET_IP", f["msg"])
+        self.assertFalse(h.net_mode)
+        h, sent = self.hub("127.0.0.2")
+        h.handle(hp.encode("red", peers="a@127.0.0.4"), LOCAL, 0.0)
+        self.assertEqual(sent, [(("red_ok", {"peers": "1"}), LOCAL)])
+        self.assertTrue(h.net_mode)
 
     def test_sin_agmen_net_ip_solo_127_0_0_1(self):
         h, sent = self.hub("")

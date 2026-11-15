@@ -518,7 +518,8 @@ private:
         const auto now = std::chrono::steady_clock::now();
         for (const auto& a : want_) {
             if (const auto it = conns_.find(a); it != conns_.end() && it->second.alive()) continue;
-            const bool remote = net_ && host_of(a) != hub::kLocalhost;
+            const auto host = host_of(a);   // AGMEN_NET_IP también es esta computadora (RFC 0011 §9.5)
+            const bool remote = net_ && host != hub::kLocalhost && host != net_ip_;
             if (!force) {
                 if (const auto t = last_try_.find(a); t != last_try_.end() && now - t->second < kRetryEvery) {
                     if (remote && msg) ++unreachable_;
@@ -846,6 +847,7 @@ struct Listener {
     std::vector<net::TcpListener> old;
     std::optional<std::vector<std::string>> allow;
     std::function<void(const std::string&)> on_reject;
+    std::string net_ip;   // AGMEN_NET_IP: también es esta computadora (memoria compartida, RFC 0011 §9.5)
 
     Listener(std::string_view bind, bool can_shm) : listener(net::TcpListener::bind(bind)), shm(can_shm) {}
 
@@ -895,7 +897,7 @@ struct Listener {
             c->from = s->peer();
             c->peer->stream = std::move(*s);
             // En modo red, la memoria compartida solo con esta computadora (en local, lo de siempre).
-            if (shm && (!allow || ip == hub::kLocalhost)) {
+            if (shm && (!allow || ip == hub::kLocalhost || (!net_ip.empty() && ip == net_ip))) {
                 // El suscriptor habla primero (RFC 0009 §3.3): un publicador de
                 // 0.10 nunca lee esto, y uno de 0.11 sabe que puede probar.
                 c->peer->hello = true;
@@ -991,6 +993,7 @@ struct PublisherCore::State {
     bool any_remote = false;                    // false = todos locales: lo de siempre, sin trabajo de más
     std::atomic<std::uint64_t> unreachable{0};
     std::set<std::string> unreach_warned;
+    std::atomic<std::uint64_t> rejected{0};   // control que no vino del hub (RFC 0011 §9.1)
 
     State(const std::string& to, TypeInfo t, std::string label)
         // Por topic todo es local (nivel 2): 127.0.0.1, así Windows no pregunta por el firewall.
@@ -1053,9 +1056,16 @@ struct PublisherCore::State {
     /// Lee las respuestas del hub (a quién mandarle los datos).
     void drain(std::chrono::milliseconds wait) {
         while (const auto rx = socket.recv_from(buf, wait)) {
+            wait = std::chrono::milliseconds(0);
+            const wire::ByteView data(buf.data(), rx->size);
+            if (hub::is_control(data) && !link->from_hub(rx->from)) {   // RFC 0011 §9.1: solo el hub
+                rejected.fetch_add(1);
+                link->warn_foreign(topic, rx->from);
+                continue;
+            }
             std::optional<std::vector<std::string>> subs;
             std::optional<std::vector<std::string>> tcp;
-            link->handle(wire::ByteView(buf.data(), rx->size), subs, &tcp);
+            link->handle(data, subs, &tcp);
             if (subs && fanout) {
                 tcp_dests = tcp ? *tcp : std::vector<std::string>{};
                 fanout->update(tcp_dests, std::make_shared<const wire::Bytes>(announcement()));
@@ -1066,10 +1076,17 @@ struct PublisherCore::State {
                 fresh_remote.reserve(subs->size());
                 for (const auto& a : *subs) {
                     fresh.push_back(net::Address::resolve(a));
-                    fresh_remote.push_back(host_of(a) != hub::kLocalhost ? 1 : 0);
+                    // AGMEN_NET_IP también es esta computadora (RFC 0011 §9.5).
+                    const auto host = host_of(a);
+                    fresh_remote.push_back(static_cast<char>(host != hub::kLocalhost && host != net_ip ? 1 : 0));
                 }
-                const bool fresh_any = std::find(fresh_remote.begin(), fresh_remote.end(), 1) != fresh_remote.end();
-                if (fresh_any) open_net_socket();
+                const bool fresh_any =
+                    std::find(fresh_remote.begin(), fresh_remote.end(), char{1}) != fresh_remote.end();
+                if (fresh_any) {
+                    open_net_socket();
+                } else {
+                    net_socket.reset();   // sin destinos de otra computadora: ningún puerto abierto a la red (§9.3)
+                }
                 const auto ann = announcement();
                 std::vector<char> known(fresh.size(), 0);
                 for (std::size_t i = 0; i < fresh.size(); ++i) {
@@ -1082,7 +1099,6 @@ struct PublisherCore::State {
                     if (!known[i]) (void)send_any(ann, i);   // recién llegado: por el mismo camino que sus datos
                 }
             }
-            wait = std::chrono::milliseconds(0);
         }
     }
 
@@ -1202,6 +1218,7 @@ std::size_t PublisherCore::shm_bytes() const { return s_->fanout ? s_->fanout->s
 std::uint64_t PublisherCore::unreachable() const {
     return s_->unreachable.load() + (s_->fanout ? s_->fanout->unreachable() : 0);
 }
+std::uint64_t PublisherCore::rejected() const { return s_->rejected.load(); }
 
 // ---------------------------------------------------------------------------
 // SubscriberCore
@@ -1236,6 +1253,8 @@ struct SubscriberCore::State {
     std::uint64_t moves = 0;                            // cuántas veces cambiaron los sockets
     std::atomic<std::uint64_t> rejected{0};
     std::set<std::string> rejected_ips;
+    std::chrono::steady_clock::time_point last_ok{};   // el último `ok` del hub (modo red, RFC 0011 §9.2)
+    bool expired = false;                              // ya volvió a solo lo local por falta de `ok` (avisado)
 
     void forget_idle_blocks(bool now_please) {
         const auto now = std::chrono::steady_clock::now();
@@ -1253,6 +1272,7 @@ struct SubscriberCore::State {
         if (type.arrow) {
             // Los mensajes arrow llegan por TCP: con dirección fija, la misma IP y el mismo puerto.
             tcp = hub::is_topic(w) ? std::make_unique<Listener>("127.0.0.1:0", shm::enabled()) : same_port_listener(w);
+            tcp->net_ip = net_ip;
         }
         if (hub::is_topic(w)) {
             check_topic_or_throw(w);
@@ -1279,6 +1299,8 @@ struct SubscriberCore::State {
     /// donde llegó.
     void on_ok(std::intptr_t via) {
         const auto peers = link->peers();
+        last_ok = std::chrono::steady_clock::now();
+        if (peers && !peers->empty()) expired = false;
         if (peers && !net) go_net();
         if (!net) return;
         if (via == socket.native_handle() && old_udp && !old_until) {
@@ -1327,6 +1349,22 @@ struct SubscriberCore::State {
         if (allowed && *allowed == fresh) return;
         allowed = fresh;
         if (tcp) tcp->set_allow(std::move(fresh), [this](const std::string& ip) { reject(ip); });
+    }
+
+    /// Ningún `ok` del hub en kNetExpire: como un `ok` sin peers, solo lo local (RFC 0011 §9.2). Solo se
+    /// llama con la lista de IP ya armada (en modo red).
+    void expire_check() {
+        if (std::chrono::steady_clock::now() - last_ok <= hub::kNetExpire) return;
+        const std::size_t n_local = net_ip.empty() ? 1 : 2;
+        if (allowed && allowed->size() == n_local) return;   // ya solo lo local
+        set_allowed({});
+        if (!expired) {
+            expired = true;
+            log::write("[agmen] ⚠ '" + topic + "': el hub no contesta hace más de " +
+                       std::to_string(hub::kNetExpire.count() / 1000) +
+                       " s; dejo de aceptar datos de otras computadoras hasta que vuelva (¿se cerró 'agmen hub' o "
+                       "'agmen run'?)");
+        }
     }
 
     void reject(const std::string& ip) {
@@ -1513,8 +1551,17 @@ struct SubscriberCore::State {
 
     /// Un datagrama UDP: control del hub, o datos. `via`: el socket por donde llegó.
     std::optional<RawSample> handle_datagram(wire::ByteView data, std::string from, std::intptr_t via) {
-        if (allowed && !ip_in(from, *allowed)) {   // sin valor hasta que escucha en la red: sin trabajo de más
-            reject(host_of(from));
+        if (allowed) {   // sin valor hasta que escucha en la red: sin trabajo de más
+            expire_check();
+            if (!ip_in(from, *allowed)) {
+                reject(host_of(from));
+                return std::nullopt;
+            }
+        }
+        if (link && hub::is_control(data) && !link->from_hub(from)) {   // RFC 0011 §9.1: solo si es del hub
+            rejected.fetch_add(1);
+            std::lock_guard lock(link_mu);
+            link->warn_foreign(topic, from);
             return std::nullopt;
         }
         if (link) {
@@ -1570,6 +1617,7 @@ std::optional<RawSample> SubscriberCore::receive_raw(std::chrono::milliseconds t
             if (auto out = s.handle_packet(got.packet, std::move(got.from), got.peer)) return out;
             continue;
         }
+        if (s.allowed) s.expire_check();   // antes de aceptar conexiones TCP (RFC 0011 §9.2)
         bool last = true;   // ¿esta espera llega hasta `deadline`? (o hasta cerrar los sockets de antes)
         if (s.old_until) {
             if (now >= *s.old_until) {

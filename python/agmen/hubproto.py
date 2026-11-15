@@ -168,13 +168,18 @@ def parse_ipv4(text: str) -> str:
     return text
 
 
-def check_peer_ip(ip: str) -> None:
-    """La IP de OTRA computadora: válida, y que no sea esta ni una dirección de grupo."""
+def check_peer_ip(ip: str, loopback: bool = False) -> None:
+    """La IP de OTRA computadora: válida, y que no sea esta ni una dirección de grupo. `loopback`: se aceptan
+    las 127.x (salvo 127.0.0.1), solo para pruebas con AGMEN_NET_IP (RFC 0011, precisión §9.6)."""
     parse_ipv4(ip)
     first = int(ip.split(".")[0])
     if ip == LOCALHOST:
         raise ProtocolError("127.0.0.1 es esta misma computadora, no otra: pon la IP con la que esta computadora "
                             "ve a la otra, ej. 192.168.1.20")
+    if first == 127 and not loopback:
+        raise ProtocolError(f"{ip} es esta misma computadora (las 127.x no salen de ella), no otra: pon la IP "
+                            f"con la que esta computadora ve a la otra, ej. 192.168.1.20 (las 127.x solo valen "
+                            f"en pruebas, con AGMEN_NET_IP)")
     if ip in ("0.0.0.0", "255.255.255.255") or 224 <= first <= 239:
         raise ProtocolError(f"{ip} no es la IP de una computadora (es una dirección especial o de grupo): pon la "
                             f"IP con la que esta computadora ve a la otra, ej. 192.168.1.20")
@@ -194,8 +199,9 @@ def parse_hostport(text: str) -> tuple[str, int]:
     return parse_ipv4(ip), parse_port(port)
 
 
-def parse_peers(text: str) -> list[tuple[str, str]]:
-    """'robot@192.168.1.20,laptop@192.168.1.5' → [('robot', '192.168.1.20'), ...]. '' = ninguna."""
+def parse_peers(text: str, loopback: bool = False) -> list[tuple[str, str]]:
+    """'robot@192.168.1.20,laptop@192.168.1.5' → [('robot', '192.168.1.20'), ...]. '' = ninguna.
+    `loopback`: acepta IP 127.x (pruebas con AGMEN_NET_IP; ver check_peer_ip)."""
     out: list[tuple[str, str]] = []
     names: dict[str, str] = {}     # en minúsculas → como vino
     ips: dict[str, str] = {}       # IP → nombre
@@ -204,7 +210,7 @@ def parse_peers(text: str) -> list[tuple[str, str]]:
         if not sep:
             raise ProtocolError(f"'{item}' en peers no es nombre@ip, ej. robot@192.168.1.20")
         check_machine(name)
-        check_peer_ip(ip)
+        check_peer_ip(ip, loopback)
         if name.lower() in names:
             raise ProtocolError(f"la computadora '{name}' está dos veces en peers: cada una va una sola vez")
         if ip in ips:
