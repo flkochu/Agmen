@@ -493,6 +493,7 @@ class TestProtocoloGracia(ProtocoloCase):
             actual = self.reanudar(sid)
             r = self.respuesta(actual)
             self.assertEqual(r["op"], "reanudar_ok", (vuelta, r, self.lista_dicha()))
+            actual.send({"op": "ping", "t": vuelta})   # §13.1: el primer mensaje tras reanudar_ok confirma
             self.assertTrue(self.espera(lambda: self.server.session.lost_at is None))
         self.assertEqual(self.pids("motor"), pid)
         self.assertTrue(self.vivos("motor", "imu"))
@@ -1021,8 +1022,13 @@ class TestCortesDeRed(CortesBase):
         # la red caída): se enteró a los 6 s de silencio, así que quedan ~4 s, no ~9
         self.assertTrue(2 <= quedan <= 4, self.diag(f"agmen run prometió {quedan} s de gracia a los 6 s de silencio (~4)"))
         h_perdio, h_pasaron = self.lr.hora_de("): se perdió la conexión ("), self.lr.hora_de("ya pasaron 10 s")
-        self.assertLess(abs((h_pasaron - h_perdio) - quedan), 1.8,
-                        self.diag(f"'ya pasaron 10 s' debe salir cuando se acaba lo prometido ({quedan} s)"))
+        # §13.2: 'ya pasaron' sale con la cuenta segura (lo último MANDADO + 10 + 1 + 0.5 s), no con la pesimista: nunca
+        # antes de que el robot detenga de verdad, y a más tardar 11.5 s después de lo último mandado (≤ la pérdida)
+        t_detuvo = self.la.hora_de("no volvió en 10 s: detuve los nodos")
+        self.assertGreaterEqual(h_pasaron, t_detuvo - 0.3,
+                                self.diag("'ya pasaron 10 s' salió antes de que el robot detuviera sus nodos"))
+        self.assertLessEqual(h_pasaron - h_perdio, 11.5 + 0.8,
+                             self.diag(f"'ya pasaron 10 s' salió {h_pasaron - h_perdio:.1f} s después de la pérdida"))
         # nunca una línea por intento: de agmen run, solo esas dos hasta aquí
         propias = [l for l in self.lr if re.match(r"agmen\s+│ robot", l) and "): conectado" not in l]
         self.assertEqual(len(propias), 2, self.diag(f"agmen run dijo más de la cuenta durante el corte: {propias}"))
@@ -1442,7 +1448,10 @@ class TestGraciaDelCliente(EnlaceCase):
         hora, texto = self.perdido()
         self.assertNotRegex(texto, r"~0 s", f"nunca 'siguen ~0 s'\n{texto}")
         self.assertNotIn("Sus nodos siguen", texto)
-        self.assertIn("habrá detenido sus nodos", texto)
+        # §13.2: con la pesimista vencida y la segura no, no se afirma nada ("puede que…"); "habrá detenido" sale
+        # cuando vence la segura (lo último mandado + gracia + 1 + 0.5 s), una sola vez
+        self.assertNotIn("habrá detenido", texto)
+        self.assertTrue(self.espera(self.hay("habrá detenido sus nodos"), 8), self.texto())
         time.sleep(0.5)
         self.assertEqual(sum("ya pasaron" in t.lower() for _, t in self.notas), 1, f"se dice una sola vez\n{self.texto()}")
 
@@ -1665,8 +1674,12 @@ class TestRedCongeladaEnUnSentido(CortesBase):
         n = int(m.group(1))
         queda = t_agente - t_dijo
         self.assertLessEqual(n, queda + 0.7, self.diag(f"agmen run prometió ~{n} s y al robot le quedaban {queda:.1f} s"))
-        self.assertLessEqual(t_pasaron - t_agente, 1.5, self.diag(
-            f"'ya pasaron 10 s' salió {t_pasaron - t_agente:.1f} s después de que el robot detuvo sus nodos"))
+        # §13.2: con la cuenta segura, 'ya pasaron' nunca sale antes de que el robot detenga, y a más tardar 11.5 s
+        # después de lo último que la laptop mandó (que es antes de notar la pérdida)
+        self.assertGreaterEqual(t_pasaron, t_agente - 0.3, self.diag(
+            f"'ya pasaron 10 s' salió {t_agente - t_pasaron:.1f} s ANTES de que el robot detuviera sus nodos"))
+        self.assertLessEqual(t_pasaron - t_dijo, 11.5 + 0.8, self.diag(
+            f"'ya pasaron 10 s' salió {t_pasaron - t_dijo:.1f} s después de la pérdida (la cuenta segura es 11.5 s)"))
         self.assertTrue(self.ninguno_vivo(("motor", "imu")), self.diag("el robot debía haber detenido sus nodos"))
         self.assertEqual(self.cuenta("ya pasaron"), 1)
         self.assertEqual(self.cuenta("): se perdió la conexión ("), 1)

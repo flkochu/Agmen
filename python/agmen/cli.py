@@ -403,15 +403,20 @@ def _run(args) -> int:
     # valiendo la 3b (decidido, §8-9): una computadora perdida no deja arrancar nada y agmen run sale con 1.
     for name, link in remotes.items():
         source = keys[name][1]
-        if not link.keep_trying(hint=lambda code, name=name, source=source: _key_hint(name, source, code)):
+        if not link.keep_trying(hint=lambda code, name=name, source=source: _key_hint(name, source, code), pending=True):
             stop.set()   # ya se había perdido: on_lost lo cuenta (y agmen run sale con 1, como en la 3b)
-    # La que se perdió entre keep_trying y aquí (ya reintentando) también cuenta como "antes de arrancar" (§9):
-    # después de esta revisión no queda nada en medio hasta start_all.
+    # La que se perdió entre keep_trying y aquí también cuenta como "antes de arrancar" (§9, §12): hasta go() una
+    # pérdida solo se anota (sin "reintento…"); go() la cuenta, y desde go() hasta start_all no queda nada en medio.
     for name, link in remotes.items():
-        if link.down_since is not None and not stop.is_set():
-            text = (f"{name} ({link.shown}): se perdió la conexión justo antes de arrancar los nodos: no arranco "
-                    f"nada. Revisa {name} (¿se apagó, se cayó la red o se cerró agmen agent?) y vuelve a correr "
-                    f"agmen run")
+        if not stop.is_set() and not link.go():
+            if link.farewell:
+                text = (f"{name} ({link.shown}): cerraron agmen agent allá ({link.farewell}) justo antes de arrancar "
+                        f"los nodos: no arranco nada. Vuelve a correr agmen run cuando agmen agent esté corriendo "
+                        f"otra vez en {name}")
+            else:
+                text = (f"{name} ({link.shown}): se perdió la conexión justo antes de arrancar los nodos: no arranco "
+                        f"nada. Revisa {name} (¿se apagó, se cayó la red o se cerró agmen agent?) y vuelve a correr "
+                        f"agmen run")
             lost.append(text)
             launcher.say(f"✖ {text}", "error")
             stop.set()

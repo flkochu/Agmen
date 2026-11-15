@@ -86,6 +86,7 @@ GRACE = 10.0                    # gracia (3c): sin laptop, sus nodos siguen esto
 RESUME_LOG_LINES = 2000         # para reanudar: las últimas líneas de log de la sesión que se guardan…
 RESUME_LOG_BYTES = 1024 * 1024  # … y con tope en bytes
 RESUME_MAX_NODES = 1024         # reanudar: entradas de 'logs' que se aceptan
+RESUME_CONFIRM = 1.0            # §13: un reanudar al final de la gracia la prorroga hasta esto (una vez por gracia)
 
 WRITTEN_KEYS = ("cmd", "env", "cwd", "restart", "autostart", "profile")   # lo escrito que se compara (D7)
 CLOCKS = ("real", "sim", "replay")
@@ -1415,6 +1416,11 @@ class _Session:
         self.lost_at: float | None = None    # en gracia desde (None: con conexión)
         self._grace_timer: threading.Timer | None = None
         self._grace_token = 0
+        self.deadline = 0.0                  # en gracia: cuándo vence (V, §13.1; monotonic)
+        self._extended = False               # ¿ya se dio la prórroga de RESUME_CONFIRM en esta gracia?
+        # §13.1: la conexión reanudada que aún no confirma que la laptop oye (None: ninguna). Mientras haya
+        # una, lost_at sigue puesto y el temporizador de la gracia sigue armado: si vence, los nodos se detienen.
+        self.unconfirmed: Channel | None = None
         self._memory: deque[tuple[str, int, str, int]] = deque()   # (nodo, n, línea, bytes): para reanudar
         self._memory_bytes = 0
         self.out = _Outbox()
@@ -1586,7 +1592,20 @@ class _Session:
                 self.end("", quiet=True)
 
     def grace_left(self) -> float:
+        if self.lost_at is not None:
+            return self.deadline - time.monotonic()
         return GRACE - (time.monotonic() - self.last_rx)
+
+    def _arm(self, deadline: float) -> None:
+        """Con self._end_lock: arma (y arranca) el temporizador que vence la gracia en `deadline`. Si no se
+        puede, lanza la excepción y el temporizador de antes (si había) sigue armado: nunca queda sin ninguno."""
+        token = self._grace_token + 1
+        timer = threading.Timer(max(0.0, deadline - time.monotonic()), self._expire, args=(token,))
+        timer.daemon = True
+        timer.start()   # con el candado: si vence ya, _expire espera a que se suelte (y ve el token bueno)
+        old, self._grace_timer, self._grace_token, self.deadline = self._grace_timer, timer, token, deadline
+        if old is not None:
+            old.cancel()   # (aunque no se cancelara: su token ya no es el bueno y _expire no hace nada)
 
     def _lost(self, channel: Channel, cause: str, early: str) -> None:
         """La conexión `channel` se perdió (silencio, cierre sin adios, no lee). Con la sesión lista:
@@ -1596,23 +1615,29 @@ class _Session:
         Invariante (§9): el temporizador que vence la gracia se arma y arranca ANTES de avisar o
         cerrar nada; si no se puede arrancar, la sesión termina (ante la duda, nodos detenidos)."""
         failed: BaseException | None = None
+        again = False
         with self._end_lock:
-            if self._ending or channel is not self.channel or self.lost_at is not None:
-                return   # ya terminó, ya está en gracia, o es una conexión vieja que otra sustituyó
-            grace = self.ready.is_set()
-            if grace:
-                now = time.monotonic()
-                self.lost_at = now
-                left = max(0.0, GRACE - (now - self.last_rx))
-                self._grace_token += 1
-                try:   # con el candado: si vence ya, _expire espera a que se suelte (y ve el token bueno)
-                    timer = threading.Timer(left, self._expire, args=(self._grace_token,))
-                    timer.daemon = True
-                    timer.start()
-                    self._grace_timer = timer
-                except Exception as e:
-                    failed = e
+            if self._ending or channel is not self.channel:
+                return   # ya terminó, o es una conexión vieja que otra sustituyó
+            if self.lost_at is not None:
+                if self.unconfirmed is not channel:
+                    return   # ya está en gracia (sin conexión)
+                # §13.1: se perdió la reanudada sin confirmar: la gracia sigue con su temporizador (no se toca).
+                self.unconfirmed = None
+                again, grace = True, True
+                left = max(0.0, self.deadline - time.monotonic())
                 out = self.out
+            else:
+                grace = self.ready.is_set()
+                if grace:
+                    self.lost_at = time.monotonic()
+                    self._extended = False
+                    left = max(0.0, GRACE - (self.lost_at - self.last_rx))
+                    try:
+                        self._arm(self.last_rx + GRACE)
+                    except Exception as e:
+                        failed = e
+                    out = self.out
         if not grace:
             self.end(early, "error")
             return
@@ -1623,8 +1648,12 @@ class _Session:
         try:
             out.close()
             channel.close()
-            self.say(f"la laptop ({self.ip}) dejó de contestar: sus nodos siguen {int(left)} s más por si vuelve "
-                     f"({cause})", "error")
+            if again:
+                self.say(f"la laptop ({self.ip}) se volvió a perder antes de confirmar que me oye ({cause}): sus "
+                         f"nodos siguen {int(left)} s más por si vuelve", "error")
+            else:
+                self.say(f"la laptop ({self.ip}) dejó de contestar: sus nodos siguen {int(left)} s más por si vuelve "
+                         f"({cause})", "error")
         except Exception as e:   # la gracia ya corre: solo que no sea en silencio
             self.say(f"error inesperado al dar por perdida a la laptop ({self.ip}): {_clean(repr(e), 200)}", "error")
 
@@ -1632,54 +1661,86 @@ class _Session:
         self.end(f"la laptop ({self.ip}) no volvió en {GRACE:g} s: detuve los nodos", "error", grace_token=token)
 
     def resume(self, channel: Channel, ip: str, have: dict) -> bool:
-        """'reanudar' con el identificador bueno: esta conexión sustituye a la anterior (perdida, o que aún no se
-        daba por perdida). Manda reanudar_ok y los log que la laptop no tiene, y lee esta conexión hasta que
-        termine. False si la sesión ya estaba terminando (no se retomó)."""
+        """'reanudar' con el identificador bueno: esta conexión sustituye a la anterior (perdida, sin confirmar,
+        o que aún no se daba por perdida). Manda reanudar_ok y los log que la laptop no tiene, y lee esta
+        conexión hasta que termine. False si la sesión ya estaba terminando (no se retomó).
+
+        §13.1: la gracia NO se cancela aquí. La sesión queda "reanudada sin confirmar" (self.unconfirmed) con
+        el temporizador armado hasta que llegue por esta conexión el primer mensaje de la laptop (_confirm). Si
+        aún no había gracia (se sustituye una conexión viva), empieza una, desde lo último recibido. Si faltaba
+        menos de RESUME_CONFIRM para que venciera, se prorroga hasta ahora + RESUME_CONFIRM, una sola vez."""
         out = _Outbox()
         with self._end_lock:
             if self._ending:
                 return False
-            old_channel, old_out, timer, lost_at = self.channel, self.out, self._grace_timer, self.lost_at
-            self._grace_token += 1
-            self._grace_timer = None
-            # Con los dos candados: ningún estado ni log nuevo se cuela antes de reanudar_ok ni se pierde después.
-            with self._state_lock, self._log_lock:
-                nodes = {name: {"estado": s, "pid": p, "codigo": c} for name, (s, p, c) in self._last_state.items()}
-                logs, lost = self._replay(have)
-                reply: dict = {"op": "reanudar_ok", "nodos": nodes}
-                if lost:
-                    reply["perdidos"] = lost
-                reply["gracia"] = _grace_number()
-                out.put(reply)
-                for item in logs:
-                    out.put(item, droppable=True)
-                self.channel, self.out = channel, out
-                self._unread.clear()   # el lector de la nueva es este hilo (en _guarded, abajo)
-                self.lost_at = None
-                self.last_rx = time.monotonic()
-                old_ip, self.ip = self.ip, ip
-        # Desde aquí la conexión nueva es la actual: si algo falla antes de que tenga quien mande y quien lea
-        # (este hilo, en _guarded), la sesión termina (§9: nunca una conexión reanudada sin lector).
+            now = time.monotonic()
+            if self.lost_at is None:   # una conexión viva que se sustituye: empieza la gracia, como al perderla
+                try:
+                    self._arm(self.last_rx + GRACE)
+                except Exception as e:
+                    failed: BaseException | None = e
+                else:
+                    failed = None
+                    self.lost_at, self._extended, substituted = now, False, True
+            else:
+                failed, substituted = None, False
+                if not self._extended and self.deadline - now < RESUME_CONFIRM:
+                    try:
+                        self._arm(now + RESUME_CONFIRM)
+                        self._extended = True
+                    except Exception as e:   # sin prórroga: el temporizador de antes sigue armado
+                        self.say(f"⚠ no pude prorrogar la gracia de la laptop ({ip}): {_clean(repr(e), 200)}", "error")
+            if failed is None:
+                old_channel, old_out = self.channel, self.out
+                # Con los dos candados: ningún estado ni log nuevo se cuela antes de reanudar_ok ni se pierde después.
+                with self._state_lock, self._log_lock:
+                    nodes = {name: {"estado": s, "pid": p, "codigo": c} for name, (s, p, c) in self._last_state.items()}
+                    logs, lost = self._replay(have)
+                    reply: dict = {"op": "reanudar_ok", "nodos": nodes}
+                    if lost:
+                        reply["perdidos"] = lost
+                    reply["gracia"] = _grace_number()
+                    out.put(reply)
+                    for item in logs:
+                        out.put(item, droppable=True)
+                    self.channel, self.out, self.unconfirmed = channel, out, channel
+                    self._unread.clear()   # el lector de la nueva es este hilo (en _guarded, abajo)
+                    old_ip, self.ip = self.ip, ip
+        if failed is not None:
+            self.end(f"la laptop volvió a conectarse desde {ip} y no pude esperar a que confirme "
+                     f"({_clean(repr(failed), 200)}): detengo los nodos", "error")
+            return True
+        # Desde aquí la conexión nueva es la actual, sin confirmar: el temporizador de la gracia sigue armado. Si
+        # algo falla antes de que tenga quien mande y quien lea (este hilo, en _guarded), la sesión termina.
         try:
-            if timer is not None:
-                timer.cancel()   # (aunque no se cancelara: el token ya cambió y _expire no hace nada)
             old_out.close()
             old_channel.close()   # si aún se leía (no se daba por perdida), su lector ve que ya no es la actual
             self.sender = self._start_sender(channel, out)
-            with self.server.lock:
-                self.server.trusted = _ip_key(ip)
-            if lost_at is not None:
-                self.say(f"la laptop ({ip}) volvió a los {time.monotonic() - lost_at:.0f} s: sigo con la misma "
-                         f"sesión (no se reinició nada)", "out")
-            else:
+            if substituted:
                 self.say(f"la laptop volvió a conectarse desde {ip} antes de que se perdiera la conexión de "
-                         f"{old_ip}: la sustituyo y sigo con la misma sesión (no se reinició nada)", "out")
+                         f"{old_ip}: la sustituyo y espero a que confirme que me oye", "out")
         except Exception as e:
             self.end(f"error inesperado al retomar la sesión de {ip} ({_clean(repr(e), 200)}): detengo los nodos",
                      "error")
             return True
         self._guarded(channel, self._loop, channel)
         return True
+
+    def _confirm(self, channel: Channel) -> None:
+        """§13.1: llegó el primer mensaje de la laptop por la conexión reanudada: ahora sí se cancela la gracia."""
+        with self._end_lock:
+            if self._ending or self.unconfirmed is not channel or channel is not self.channel:
+                return
+            lost_at, timer = self.lost_at, self._grace_timer
+            self.unconfirmed, self.lost_at, self._grace_timer = None, None, None
+            self._grace_token += 1   # si el temporizador ya disparó y espera el candado, ya no hace nada
+            self._extended = False
+        if timer is not None:
+            timer.cancel()
+        with self.server.lock:
+            self.server.trusted = _ip_key(self.ip)
+        self.say(f"la laptop ({self.ip}) volvió a los {time.monotonic() - (lost_at or time.monotonic()):.0f} s: sigo "
+                 f"con la misma sesión (no se reinició nada)", "out")
 
     def _run(self, first: dict) -> None:
         from .run import ConfigError, Launcher
@@ -1826,6 +1887,8 @@ class _Session:
             if self._ending or channel is not self.channel:
                 return
             self.last_rx = time.monotonic()
+            if self.unconfirmed is channel:   # §13.1: la laptop oye por esta conexión: la gracia se cancela
+                self._confirm(channel)
             if self._order(msg):
                 return
 
@@ -1921,7 +1984,7 @@ class _Session:
                 return
             self._ending = True
             timer = self._grace_timer
-            bye = bool(farewell) and self.lost_at is None
+            bye = bool(farewell) and (self.lost_at is None or self.unconfirmed is not None)   # hay conexión
         if timer is not None:
             timer.cancel()
         me = threading.current_thread()
@@ -2115,6 +2178,10 @@ class AgentLink:
         # aquí. No basta "lo último recibido": si solo falla el sentido laptop→robot, aquí siguen llegando log
         # y se prometería de más; ni "lo último mandado": con la red caída los envíos solo llegan al buffer.
         self.last_ok = 0.0
+        # La cuenta segura (§13.2): lo último que se MANDÓ por la conexión instalada (ping, orden). El robot no
+        # pudo oír a la laptop después de esto, así que a más tardar en last_tx + gracia + RESUME_CONFIRM + 0.5 s
+        # ya detuvo sus nodos. Un 'reanudar' no la mueve (por sí solo ya no alarga la gracia del robot).
+        self.last_tx = 0.0
         self.down_since: float | None = None   # sin conexión, reintentando, desde (monotonic)
         self.farewell = ""                  # el motivo del adios del agente (§10): lo cerraron a propósito allá
         self._closing = False
@@ -2133,6 +2200,8 @@ class AgentLink:
         self._resilient = False
         self._hint: Callable[[str], str] | None = None
         self._retry_stop = threading.Event()
+        self._pending = False               # keep_trying sin go() todavía: una pérdida es "antes de arrancar"
+        self._pace: float = RETRY_EVERY     # el ritmo de los reintentos de ahora (1 s, o 5 s tras un rechazo)
 
     @property
     def on_lost(self) -> Callable[[AgentLink, str], None] | None:
@@ -2300,6 +2369,7 @@ class AgentLink:
         self.grace = float(grace) if isinstance(grace, (int, float)) and not isinstance(grace, bool) \
             and 0 < grace <= 3600 else GRACE
         self.last_ok = contact
+        self.last_tx = time.monotonic()   # (todo lo mandado hasta aquí salió antes de que llegara sesion_ok)
 
     def _handshake_error(self, e: HandshakeError, where: str) -> LinkError:
         if e.code == "clave":
@@ -2319,16 +2389,34 @@ class AgentLink:
         return LinkError(e.code, f"{where}: {_clean(e, 400)}")   # sin control: puede traer texto de allá
 
     # --- la sesión abierta ---
-    def _start_ping(self, channel: Channel, done: threading.Event) -> None:
-        threading.Thread(target=self._ping_loop, args=(channel, done), daemon=True,
+    def _start_ping(self, channel: Channel, done: threading.Event, now: bool = False) -> None:
+        threading.Thread(target=self._ping_loop, args=(channel, done, now), daemon=True,
                          name=f"agmen-ping-{self.name}").start()
 
-    def _ping_loop(self, channel: Channel, done: threading.Event) -> None:
-        while not done.wait(PING_EVERY):
+    def _ping_loop(self, channel: Channel, done: threading.Event, now: bool = False) -> None:
+        """Un ping cada PING_EVERY s; con `now`, el primero de inmediato (el que confirma un reanudar, §13.1)."""
+        while now or not done.wait(PING_EVERY):
+            now = False
             try:
                 channel.send({"op": "ping", "t": time.monotonic()})
             except AgentError:
                 return   # el lector se entera
+            self._sent(channel)
+
+    def _sent(self, channel: Channel) -> None:
+        """Algo salió por `channel`: si es la conexión instalada, sube la cuenta segura (§13.2)."""
+        if channel is self.channel:
+            self.last_tx = time.monotonic()
+
+    def safe_end(self) -> float:
+        """Cuándo, a más tardar, el robot ya detuvo sus nodos si no volvió a oír a la laptop (§13.2)."""
+        return self.last_tx + self.grace + RESUME_CONFIRM + 0.5
+
+    def grace_left(self) -> float:
+        """Lo que le queda seguro a la gracia del robot (la cuenta pesimista, §13.2): para el panel."""
+        if self.down_since is None:
+            return self.grace
+        return max(0.0, self.grace - (time.monotonic() - self.last_ok))
 
     def _read_loop(self, channel: Channel, gen: int) -> None:
         try:
@@ -2352,6 +2440,7 @@ class AgentLink:
             if gen != self._gen:
                 return
             if msg["op"] == "adios":   # §10: cerraron agmen agent allá, con sus nodos ya detenidos
+                _bye(channel)   # §12: también se le dice adios (si allá quedaba algo vivo, la sesión termina ya)
                 self._lose("", gen, farewell=self._motive(msg))
                 return
             self._dispatch(msg)
@@ -2399,13 +2488,14 @@ class AgentLink:
     def _lose(self, why: str, gen: int | None = None, farewell: str = "") -> None:
         """La conexión se perdió (`why`), o el agente se despidió (`farewell`: lo cerraron allá, §10).
         Sin keep_trying: perdida para siempre (on_lost). Con keep_trying: sus nodos sin conexión (o
-        detenidos, si se despidió) y un hilo que reintenta."""
+        detenidos, si se despidió) y un hilo que reintenta. Entre keep_trying y go() (justo antes de
+        arrancar los nodos) solo se anota: go() devuelve False y agmen run sale sin decir "reintento"."""
         now = time.monotonic()
         where = f"{self.name} ({self.shown})"
         with self._lock:
             if self._closing or self.lost or self.down_since is not None or (gen is not None and gen != self._gen):
                 return
-            resilient = self._resilient
+            resilient, pending = self._resilient, self._pending
             if resilient:
                 self.down_since = now
                 self.farewell = farewell
@@ -2429,40 +2519,74 @@ class AgentLink:
                     node.remote_state("falló", None, None, log=f"✖ se perdió la conexión con {self.name}")
             self._tell_lost()   # si todavía no hay manejador, queda guardada y se entrega al asignarlo
             return
-        told = True   # ¿ya se dijo que la gracia pasó (o que no aplica)? Entonces _retry no lo repite
+        told = True   # ¿ya se dijo que el robot habrá detenido sus nodos (o que no aplica)? Entonces no se repite
         try:
             if channel is not None:
                 channel.close()
-            if farewell:
-                for node in self.nodes.values():
+            for node in self.nodes.values():
+                if farewell:
                     node.remote_state("detenido", None, None)
+                else:
+                    node.went_offline()
+            if pending:
+                return   # antes de arrancar: lo dice agmen run al ver go() == False (y no se reintenta)
+            if farewell:
                 self._notice(f"{where}: cerraron agmen agent allá ({farewell}): sus nodos están detenidos. Reintento "
                              f"por si vuelve a arrancar (Ctrl+C para salir)", "error")
             else:
-                for node in self.nodes.values():
-                    node.went_offline()
-                left = math.floor(self.grace - (now - self.last_ok))   # hacia abajo: nunca promete de más
+                left = math.floor(self.grace - (now - self.last_ok))   # la cuenta pesimista: nunca promete de más
                 if left > 0:
                     told = False
                     self._notice(f"{where}: se perdió la conexión ({why}). Sus nodos siguen ~{left} s por si vuelve; "
                                  f"reintento…", "error")
+                elif now < self.safe_end():   # §13.2: entre las dos cuentas no se afirma nada
+                    told = False
+                    self._notice(f"{where}: se perdió la conexión ({why}). Puede que {self.name} ya haya detenido "
+                                 f"sus nodos; reintento…", "error")
                 else:
                     self._notice(f"{where}: se perdió la conexión ({why}). Ya pasaron {self.grace:g} s desde el "
                                  f"último contacto: {self.name} habrá detenido sus nodos. Sigo intentando (Ctrl+C "
                                  f"para salir)", "error")
         finally:   # pase lo que pase al avisar: el hilo que reintenta arranca (si no, nadie reconecta)
-            threading.Thread(target=self._retry, args=(told,), daemon=True,
-                             name=f"agmen-reconectar-{self.name}").start()
+            if not pending:
+                try:
+                    threading.Thread(target=self._retry, args=(told,), daemon=True,
+                                     name=f"agmen-reconectar-{self.name}").start()
+                except Exception as e:
+                    self._give_up(f"no pude arrancar el hilo que reintenta ({_clean(repr(e), 200)})")
+
+    def _give_up(self, why: str) -> None:
+        """§12: sin poder reintentar, se dice y agmen run termina como en la 3b (on_lost: se detiene todo, 1)."""
+        with self._lock:
+            if self._closing or self.lost:
+                return
+            self._resilient = False
+            self.lost = (f"{self.name} ({self.shown}): se perdió la conexión con agmen agent y {why}. Se detiene todo. "
+                         f"Revisa {self.name} y vuelve a correr agmen run")
+        self._retry_stop.set()
+        for node in self.nodes.values():
+            node.remote_state("falló", None, None, log=f"✖ se perdió la conexión con {self.name}")
+        self._tell_lost()
 
     # --- reconectar (3c) ---
-    def keep_trying(self, hint: Callable[[str], str] | None = None) -> bool:
+    def keep_trying(self, hint: Callable[[str], str] | None = None, pending: bool = False) -> bool:
         """Desde ahora, perder la conexión no la termina: se reintenta hasta reconectar o close().
         hint(código) añade el "qué hacer" a un rechazo (ej. de dónde salió la clave). False si
-        la conexión ya se había perdido (o nunca se abrió)."""
+        la conexión ya se había perdido (o nunca se abrió). Con `pending` (agmen run, justo antes de
+        arrancar los nodos), hasta go() una pérdida solo se anota: es "antes de arrancar" (§12)."""
         with self._lock:
             if self.lost or self._closing or self.channel is None:
                 return False
-            self._resilient, self._hint = True, hint
+            self._resilient, self._hint, self._pending = True, hint, pending
+            return True
+
+    def go(self) -> bool:
+        """Justo antes de arrancar los nodos: desde aquí una pérdida se reintenta y se dice. False si se perdió
+        (o el agente se despidió: ver `farewell`) entre keep_trying() y aquí: eso es "antes de arrancar"."""
+        with self._lock:
+            if self.lost or self._closing or self.down_since is not None:
+                return False
+            self._pending = False
             return True
 
     def _retry(self, told_grace: bool) -> None:
@@ -2471,39 +2595,57 @@ class AgentLink:
         Un intento que falla (no contesta, un rechazo, se cae a medias, también entre el saludo y la
         sesión) es un intento más (_attempt). Un error inesperado de verdad (un bug) se atrapa SOLO
         aquí: se dice una vez y se sigue intentando (§9: este hilo solo termina con Ctrl+C).
-        told_grace: _lose ya dijo que la gracia pasó (o el agente se despidió): no se repite."""
-        stop = self._retry_stop
-        grace_end = self.last_ok + self.grace
-        next_note = time.monotonic() + RETRY_NOTE_EVERY if told_grace else 0.0
+        Los avisos de tiempo los da otro hilo (_announce), para que salgan a su hora aunque un intento
+        se quede colgado esperando respuesta (§12). told_grace: ya se dijo que habrá detenido sus nodos."""
+        stop, finished = self._retry_stop, threading.Event()
+        try:
+            threading.Thread(target=self._announce, args=(told_grace, finished), daemon=True,
+                             name=f"agmen-avisos-{self.name}").start()
+        except Exception as e:
+            self._give_up(f"no pude arrancar el hilo de los avisos ({_clean(repr(e), 200)})")
+            return
         said: set[str] = set()   # los rechazos ya dichos (uno por código), y "inesperado"
-        pace: float = RETRY_EVERY   # el ritmo de ahora: RETRY_EVERY, o RETRY_REFUSED tras un rechazo
-        next_try = time.monotonic() + RETRY_EVERY
-        while not stop.is_set():
-            try:
+        self._pace = RETRY_EVERY
+        try:
+            while not stop.wait(self._pace):
+                try:
+                    got = self._attempt(said)
+                    if got is None:
+                        return
+                    self._pace = got
+                except Exception as e:
+                    if "inesperado" not in said:
+                        said.add("inesperado")
+                        self._notice(f"✖ {self.name}: error inesperado al reconectar ({_clean(repr(e), 200)}). Sigo "
+                                     f"intentando cada {RETRY_EVERY:g} s (Ctrl+C para salir)", "error")
+                    self._pace = RETRY_EVERY
+        finally:
+            finished.set()
+
+    def _announce(self, told_grace: bool, finished: threading.Event) -> None:
+        """Los avisos de tiempo mientras se reintenta: "ya pasaron…" cuando vence la cuenta segura (§13.2) y
+        luego un recordatorio cada RETRY_NOTE_EVERY s con el ritmo real. Termina al reconectar o con close()."""
+        stop = self._retry_stop
+        next_note = time.monotonic() + RETRY_NOTE_EVERY if told_grace else 0.0
+        try:
+            while True:
                 now = time.monotonic()
-                if not told_grace and now >= grace_end:
+                safe_end = self.safe_end()
+                if not told_grace and now >= safe_end:
                     told_grace, next_note = True, now + RETRY_NOTE_EVERY
                     self._notice(f"{self.name}: ya pasaron {self.grace:g} s: {self.name} habrá detenido sus nodos. "
                                  f"Sigo intentando (Ctrl+C para salir)")
                 elif told_grace and now >= next_note:
                     next_note += RETRY_NOTE_EVERY
                     self._notice(f"{self.name} ({self.shown}): sigo sin conexión desde hace "
-                                 f"{now - (self.down_since or now):.0f} s; reintento cada {pace:g} s (Ctrl+C para "
-                                 f"salir)")
-                if now < next_try:
-                    stop.wait(max(0.01, min(next_try, next_note if told_grace else grace_end) - now))
-                    continue
-                got = self._attempt(said)
-                if got is None:
+                                 f"{now - (self.down_since or now):.0f} s; reintento cada {self._pace:g} s (Ctrl+C "
+                                 f"para salir)")
+                wait = (next_note if told_grace else safe_end) - time.monotonic()
+                if finished.wait(max(0.01, wait)) or stop.is_set():
                     return
-                pace = got
-            except Exception as e:
-                if "inesperado" not in said:
-                    said.add("inesperado")
-                    self._notice(f"✖ {self.name}: error inesperado al reconectar ({_clean(repr(e), 200)}). Sigo "
-                                 f"intentando cada {RETRY_EVERY:g} s (Ctrl+C para salir)", "error")
-                pace = RETRY_EVERY
-            next_try = time.monotonic() + pace
+        except Exception as e:   # nunca en silencio (los reintentos siguen en su hilo)
+            self._notice(f"⚠ {self.name}: error inesperado en los avisos de reconexión ({_clean(repr(e), 200)}): "
+                         f"sigo intentando, pero ya no aviso del tiempo", "error")
 
     def _attempt(self, said: set[str]) -> float | None:
         """Un intento de reconectar. None: listo (reconectó, o se dejó de intentar); si no, la pausa
@@ -2558,6 +2700,10 @@ class AgentLink:
             if channel is not None:
                 channel.close()
             return RETRY_EVERY
+        except BaseException:   # un error inesperado de verdad: lo dice _retry; el canal de este intento, cerrado
+            if channel is not None and channel is not self.channel:
+                channel.close()
+            raise
 
     def _first_reply(self, channel: Channel, contact: float) -> tuple[dict | None, float]:
         """La respuesta a reanudar (None si se dejó de intentar). AgentError si no llega o no sirve."""
@@ -2609,7 +2755,7 @@ class AgentLink:
             now = time.monotonic()
             if resumed is not None:
                 self.last_ok = contact if contact is not None else now
-                self._start_ping(channel, done)
+                self._start_ping(channel, done, now=True)   # §13.1: el ping que confirma que se oye al agente
                 nodes = resumed.get("nodos")
                 for name, node in self.nodes.items():
                     st = nodes.get(name) if isinstance(nodes, dict) else None
@@ -2660,6 +2806,7 @@ class AgentLink:
             channel.send({"op": op, "nodo": node})
         except AgentError as e:
             return f"no pude mandarle '{op} {node}' a {self.name}: {e}"
+        self._sent(channel)
         return None
 
     def finish(self, timeout: float = FINISH_TIMEOUT) -> None:
