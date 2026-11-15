@@ -2280,5 +2280,386 @@ class TestSinCambios(ta.E2EBase):
         self.assertNotIn("Traceback", texto)
 
 
+# ===========================================================================
+# 6. Panel con varias computadoras (especificacion_3c.md §4, §13.2 y §14): lo que dice /api/state de cada
+#    computadora, sus nodos sin conexión y el index.html
+# ===========================================================================
+
+SIGUEN = re.compile(r"^sin conexión · reintentando · sus nodos siguen (\d+) s$")
+PUEDE = "sin conexión · puede que ya haya detenido sus nodos"
+YA_HABRA = "sin conexión · ya habrá detenido sus nodos"
+CAMPOS_MAQUINA = {"name", "host", "here", "state", "since", "grace_left", "detail"}
+# Lo que traía cada nodo antes de la 3c (Node.info); la 3c solo añade `machine`.
+CLAVES_NODO_ANTES = {"name", "cmd", "state", "pid", "uptime", "restarts", "exit_code", "restart"}
+
+
+class TestEstadoDeUnaComputadora(EnlaceCase):
+    """§4, §13.2 y §14 en proceso: el `status()` del enlace, que es lo que el panel muestra, con tiempos parchados.
+    La cuenta pesimista (`grace_left`) y la segura (`safe_end`) se mueven a mano (last_ok / last_tx): nada de dormir."""
+
+    def setUp(self):
+        super().setUp()
+        self.parchea(agent, "RETRY_EVERY", 0.1)
+        self.parchea(agent, "STOP_BUDGET", 0.5)
+        self.parchea(agent, "NET_MARGIN", 0.2)
+
+    def caido(self, gracia: float = 3.0):
+        falso = AgenteDeMentira(self, gracia=gracia)
+        link = self.abrir(falso)
+        falso.modo = "cierra"
+        falso.soltar.set()
+        self.perdido()
+        return falso, link
+
+    def test_conectado(self):
+        falso = AgenteDeMentira(self)
+        link = self.abrir(falso)
+        st = link.status()
+        self.assertEqual(st["state"], "conectado", st)
+        self.assertEqual(st["detail"], "conectado")
+        self.assertIsNone(st["grace_left"])
+        self.assertIsInstance(st["since"], (int, float))
+        self.assertGreaterEqual(st["since"], 0)
+
+    def test_sin_conexion_dentro_de_la_gracia_dice_cuantos_segundos_y_nunca_de_mas(self):
+        falso, link = self.caido(3.0)
+        link.last_ok = time.monotonic() - 1.5            # a la cuenta pesimista le quedan ~1.5 s
+        st = link.status()
+        despues = link.grace_left()
+        self.assertEqual(st["state"], "sin conexión", st)
+        m = SIGUEN.match(st["detail"])
+        self.assertIsNotNone(m, f"detail inesperado: {st}")
+        self.assertLessEqual(int(m.group(1)), int(despues) + 1, f"promete {m.group(1)} s y quedan {despues:.2f} s")
+        self.assertEqual(int(m.group(1)), 1, f"{st} con grace_left={despues:.2f}: es el entero hacia abajo, no el redondeo")
+        self.assertLessEqual(st["grace_left"], 1.5 + 0.01, st)
+        self.assertGreater(st["grace_left"], 0.5, st)
+        # recién caída, con casi toda la gracia: el entero baja, nunca sube
+        link.last_ok = time.monotonic() - 0.2            # ~2.8 s
+        self.assertEqual(SIGUEN.match(link.status()["detail"]).group(1), "2")
+
+    def test_entre_la_cuenta_pesimista_y_la_segura_no_afirma_nada(self):
+        falso, link = self.caido(3.0)
+        link.last_ok = time.monotonic() - (link.grace + 0.1)     # la pesimista ya venció
+        self.assertLess(time.monotonic(), link.safe_end(), "la prueba parte de que la segura aún no vence")
+        st = link.status()
+        self.assertEqual(st["detail"], PUEDE, st)
+        self.assertEqual(st["state"], "sin conexión")
+        self.assertEqual(st["grace_left"], 0.0)
+        for malo in ("ya habrá", "siguen", "ya detuvo"):
+            self.assertNotIn(malo, st["detail"])
+
+    def test_pasada_la_cuenta_segura_dice_ya_habra_detenido(self):
+        falso, link = self.caido(3.0)
+        link.last_ok = time.monotonic() - (link.grace + 0.1)
+        link.last_tx = time.monotonic() - (link.grace + agent.RESUME_CONFIRM + agent.STOP_BUDGET + agent.NET_MARGIN + 0.2)
+        self.assertGreater(time.monotonic(), link.safe_end())
+        st = link.status()
+        self.assertEqual(st["detail"], YA_HABRA, st)
+        self.assertEqual(st["grace_left"], 0.0)
+
+    def test_tras_el_adios_del_agente_dice_que_cerraron_el_agente_y_sus_nodos_estan_detenidos(self):
+        falso = AgenteDeMentira(self, gracia=1.0)
+        falso.extras = [{"op": "adios", "motivo": "Ctrl+C"}]
+        falso.espera_adios = True
+        link = self.abrir(falso)
+        self.assertTrue(self.espera(self.hay("cerraron agmen agent allá"), 5), self.texto())
+        falso.modo, falso.extras, falso.espera_adios = "cierra", [], False
+        st = link.status()
+        self.assertEqual(st["state"], "sin conexión", st)
+        self.assertIn("cerraron agmen agent", st["detail"], st)
+        self.assertIn("sus nodos están detenidos", st["detail"], st)
+        self.assertNotIn("siguen", st["detail"])
+        self.assertNotIn("puede que", st["detail"])
+        self.assertIsNone(st["grace_left"], "no hay gracia que contar: los nodos ya se detuvieron")
+
+    def test_reanudar_sin_el_pong_de_confirmacion_sigue_sin_conexion(self):
+        self.parchea(agent, "SILENCE_TIMEOUT", 0.4)
+        self.parchea(agent, "RESUME_CONFIRM", 0.3)
+        falso = AgenteDeMentira(self, gracia=5.0)
+        link = self.abrir(falso)
+        falso.modo = "cierra"
+        falso.soltar.set()
+        self.perdido()
+        falso.sin_pong, falso.modo = True, "bueno"
+        pings = lambda: sum(op == "ping" for _, op in list(falso.visto))
+        self.assertTrue(self.espera(lambda: falso.reanudares >= 3 and pings() >= 3, 15), self.texto())
+        for _ in range(10):      # a lo largo de varios intentos fallidos nunca dice "conectado"
+            st = link.status()
+            self.assertEqual(st["state"], "sin conexión", f"dio por buena una reanudación sin confirmar: {st}")
+            self.assertNotEqual(st["detail"], "conectado")
+            time.sleep(0.05)
+
+
+class PanelDeDosComputadoras(EnlaceCase):
+    """Un Launcher de verdad con dos computadoras de mentira (robot conectada, brazo sin conexión) y una local, en el
+    orden robot, laptop, brazo; y un Panel real encima."""
+
+    TOML = '''\
+[robot]
+name = "dos"
+
+[[machine]]
+name = "robot"
+host = "127.0.0.1:{p1}"
+
+[[machine]]
+name = "laptop"
+host = "127.0.0.1"
+
+[[machine]]
+name = "brazo"
+host = "127.0.0.1:{p2}"
+
+[[node]]
+name = "motor"
+cmd = ["python", "-c", "pass"]
+machine = "robot"
+
+[[node]]
+name = "ia"
+cmd = ["python", "-c", "pass"]
+
+[[node]]
+name = "pc"
+cmd = ["python", "-c", "pass"]
+machine = "laptop"
+
+[[node]]
+name = "hombro"
+cmd = ["python", "-c", "pass"]
+machine = "brazo"
+'''
+
+    def setUp(self):
+        super().setUp()
+        import io
+        import tempfile
+        from agmen.machines import Place
+        from agmen.panel.server import Panel
+        from agmen.run import Launcher, load_config
+
+        self.parchea(agent, "RETRY_EVERY", 0.1)
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, self.dir, True)
+        self.f1, self.f2 = AgenteDeMentira(self, gracia=3.0), AgenteDeMentira(self, gracia=3.0)
+        self.l1, self.l2 = self.abrir(self.f1), self.abrir(self.f2)
+        self.l2.name = "brazo"      # (abrir las llama a todas "robot")
+        toml = self.dir / "robot.toml"
+        toml.write_text(self.TOML.format(p1=self.f1.port, p2=self.f2.port), encoding="utf-8")
+        self.config = load_config(toml)
+        places = {"robot": Place(False, "other"), "laptop": Place(True, "loopback"), "brazo": Place(False, "other")}
+        self.launcher = Launcher(self.config, stream=io.StringIO(), places=places,
+                                 remotes={"robot": self.l1, "brazo": self.l2})
+        self.panel = Panel("127.0.0.1:0", None, "dos", self.launcher, None, topics=False)
+        self.panel.start()
+        self.addCleanup(self.panel.shutdown)
+        self.launcher.nodes["hombro"].remote_state("corriendo", 4242, None)    # lo último que se supo del brazo
+        self.launcher.nodes["motor"].remote_state("corriendo", 4141, None)
+
+    def api(self) -> dict:
+        import urllib.request
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.panel.port}/api/state", timeout=5) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    def pierde_el_brazo(self):
+        self.f2.modo = "cierra"
+        self.f2.soltar.set()
+        self.assertTrue(self.espera(lambda: self.l2.down_since is not None, 15), "el brazo no notó el corte")
+        self.assertTrue(self.espera(lambda: self.launcher.nodes["hombro"].state == "sin conexión", 5))
+
+
+class TestPanelMachines(PanelDeDosComputadoras):
+    def test_api_state_trae_machines_en_el_orden_del_toml_con_todos_sus_campos(self):
+        self.pierde_el_brazo()
+        st = self.api()
+        ms = st["machines"]
+        self.assertEqual([m["name"] for m in ms], ["robot", "laptop", "brazo"], ms)
+        for m in ms:
+            self.assertEqual(set(m), CAMPOS_MAQUINA, m)
+            self.assertIsInstance(m["host"], str)
+            self.assertIsInstance(m["here"], bool)
+            self.assertIsInstance(m["detail"], str)
+            self.assertIsInstance(m["since"], (int, float))
+        robot, laptop, brazo = ms
+        self.assertEqual((robot["state"], robot["here"], robot["detail"]), ("conectado", False, "conectado"))
+        self.assertIn("127.0.0.1", robot["host"])
+        self.assertEqual((laptop["state"], laptop["here"]), ("aquí", True))
+        self.assertEqual((brazo["state"], brazo["here"]), ("sin conexión", False))
+        self.assertTrue(brazo["detail"].startswith("sin conexión"), brazo)
+        self.assertIn(str(self.f2.port), brazo["host"])
+        # grace_left: número del lado remoto sin conexión; None donde no aplica
+        self.assertIsNone(robot["grace_left"])
+        self.assertIsNone(laptop["grace_left"])
+        self.assertIsInstance(brazo["grace_left"], (int, float))
+        self.assertLessEqual(brazo["grace_left"], 3.0)
+
+    def test_cada_nodo_trae_machine_y_el_snapshot_del_websocket_lo_mismo(self):
+        self.pierde_el_brazo()
+        snap = self.panel.snapshot()
+        http = self.api()
+        for fuente, st in (("snapshot", snap), ("http", http)):
+            por_nombre = {n["name"]: n["machine"] for n in st["nodes"]}
+            # §4: el nombre para los de otra computadora; None para el que corre aquí sin machine
+            self.assertEqual(por_nombre["motor"], "robot", fuente)
+            self.assertEqual(por_nombre["hombro"], "brazo", fuente)
+            self.assertIsNone(por_nombre["ia"], fuente)
+            self.assertEqual(por_nombre["pc"], "laptop", fuente)
+            self.assertEqual([m["name"] for m in st["machines"]], ["robot", "laptop", "brazo"], fuente)
+            for m in st["machines"]:
+                self.assertEqual(set(m), CAMPOS_MAQUINA, (fuente, m))
+
+    def test_los_nodos_de_una_computadora_sin_conexion_salen_sin_conexion_con_su_ultimo_estado(self):
+        self.pierde_el_brazo()
+        nodos = {n["name"]: n for n in self.api()["nodes"]}
+        h = nodos["hombro"]
+        self.assertEqual(h["state"], "sin conexión", h)
+        self.assertNotIn(h["state"], ("falló", "detenido"))
+        self.assertEqual(h["known_state"], "corriendo", "debe conservar lo último que se supo")
+        self.assertEqual(nodos["motor"]["state"], "corriendo", "los de la computadora conectada no cambian")
+        self.assertEqual(nodos["ia"]["state"], "detenido")
+
+    def test_una_orden_a_un_nodo_sin_conexion_se_rechaza_diciendo_por_que(self):
+        import urllib.error
+        import urllib.request
+        self.pierde_el_brazo()
+        antes = self.f2.conexiones
+        req = urllib.request.Request(f"http://127.0.0.1:{self.panel.port}/api/node/hombro/start", data=b"{}",
+                                     method="POST", headers={"Content-Type": "application/json", "X-Agmen": "1"})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                cuerpo = r.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            cuerpo = e.read().decode("utf-8")
+        def razon():
+            lineas, _ = self.launcher.logs.since(0)
+            return [l["text"] for l in lineas if "no hay conexión con brazo" in l["text"]] or \
+                   (["(en la respuesta)"] if "no hay conexión con brazo" in cuerpo else [])
+        self.assertTrue(self.espera(razon, 5), f"no dijo por qué no hizo nada. respuesta={cuerpo!r}\n"
+                        f"{[l['text'] for l in self.launcher.logs.since(0)[0]]}")
+        texto = " ".join(razon() + [cuerpo])
+        self.assertIn("no se hizo", texto)
+        self.assertEqual(self.launcher.nodes["hombro"].state, "sin conexión", "la orden no debe cambiar su estado")
+        self.assertNotIn("falló", [n["state"] for n in self.api()["nodes"] if n["name"] == "hombro"])
+
+
+class TestPanelSinMachines(unittest.TestCase):
+    """§4: sin [[machine]] el JSON es el de siempre más `machines: []` y `machine: null` en cada nodo; igual con
+    [profile.X] local = true."""
+
+    def api(self, toml: str, perfil: str | None = None):
+        import io
+        import shutil
+        import tempfile
+        import urllib.request
+        from agmen.panel.server import Panel
+        from agmen.run import Launcher, load_config
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "robot.toml").write_text(toml, encoding="utf-8")
+        launcher = Launcher(load_config(d / "robot.toml", perfil), stream=io.StringIO())
+        panel = Panel("127.0.0.1:0", None, "x", launcher, None, topics=False)
+        panel.start()
+        self.addCleanup(panel.shutdown)
+        with urllib.request.urlopen(f"http://127.0.0.1:{panel.port}/api/state", timeout=5) as r:
+            return json.loads(r.read().decode("utf-8")), panel.snapshot()
+
+    NODOS = '[[node]]\nname = "a"\ncmd = ["python", "-c", "pass"]\n\n[[node]]\nname = "b"\ncmd = ["python", "-c", "pass"]\n'
+
+    def comprobar(self, http, snap):
+        for fuente, st in (("http", http), ("snapshot", snap)):
+            self.assertEqual(st["machines"], [], fuente)
+            self.assertEqual([n["name"] for n in st["nodes"]], ["a", "b"], fuente)
+            for n in st["nodes"]:
+                self.assertIsNone(n["machine"], (fuente, n))
+                self.assertEqual(set(n) - {"machine"}, CLAVES_NODO_ANTES, f"{fuente}: solo debe añadirse `machine`: {n}")
+            self.assertEqual(st["robot"], "x")
+
+    def test_sin_machine_nada_cambia(self):
+        http, snap = self.api('[robot]\nname = "x"\n\n' + self.NODOS)
+        self.comprobar(http, snap)
+
+    def test_con_perfil_local_y_machine_se_ve_como_sin_machine(self):
+        toml = ('[robot]\nname = "x"\n\n[[machine]]\nname = "robot"\nhost = "192.0.2.77"\n\n'
+                '[profile.sim]\nlocal = true\n\n' +
+                self.NODOS.replace('"pass"]', '"pass"]\nmachine = "robot"'))
+        http, snap = self.api(toml, "sim")
+        self.comprobar(http, snap)
+
+
+class TestIndexHtmlDeLasComputadoras(unittest.TestCase):
+    """Sin navegador: se revisa el código de la página, como el letrero del perfil en test_web.py."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = (Path(agent.__file__).resolve().parent / "panel" / "index.html").read_text(encoding="utf-8")
+
+    def test_tiene_el_contenedor_de_las_computadoras_y_lee_machines_del_estado(self):
+        self.assertIn('"machines"', self.html)
+        self.assertIn("function renderMachines", self.html)
+        self.assertTrue(re.search(r"renderMachines\(box,\s*machines\)", self.html))
+        self.assertTrue(re.search(r"state\.machines|m\.machines", self.html), "lee `machines` del estado")
+        self.assertIn(".machine ", self.html, "tiene estilo para la línea de cada computadora")
+
+    def test_pinta_maquina_barra_nombre_y_escapa_el_texto(self):
+        self.assertTrue(re.search(r"\$\{esc\(m\.name\)\}/</span>.{0,12}\$\{esc\(n\.name\)\}", self.html),
+                        "debe pintar robot/motor: esc(m.name) + '/' + esc(n.name)")
+        for linea in self.html.splitlines():       # ningún texto de la computadora entra sin escapar al HTML
+            if "innerHTML" in linea:
+                self.assertNotRegex(linea, r"m\.(detail|host)\b", linea.strip())
+                self.assertNotRegex(linea, r"\$\{m\.name\}", linea.strip())
+
+    def test_deshabilita_los_botones_con_title_cuando_no_hay_conexion(self):
+        self.assertTrue(re.search(r"away\s*=.*OFFLINE", self.html))
+        self.assertTrue(re.search(r"b\.title\s*=\s*away\s*\?\s*why", self.html))
+        self.assertTrue(re.search(r"b\.disabled\s*=\s*away\s*\|\|", self.html))
+        self.assertIn("no hay conexión con", self.html)
+
+
+class TestPanelCongeladoDePuntaAPunta(CortesBase):
+    """§4, §13.2: dos procesos de verdad; con la red congelada el panel pasa por "sus nodos siguen N s" y luego por
+    "puede que ya haya detenido sus nodos". (No espera la cuenta segura real, 17 s: eso lo cubre
+    TestEstadoDeUnaComputadora.) Tiempos reales."""
+
+    web = True
+
+    def maquina(self) -> dict | None:
+        try:
+            return next(m for m in self.estado_panel()["machines"] if m["name"] == "robot")
+        except (OSError, ValueError, StopIteration, KeyError):
+            return None
+
+    def test_el_panel_pasa_de_sus_nodos_siguen_a_puede_que_ya_haya_detenido(self):
+        self.iniciar()
+        m = self.maquina()
+        self.assertIsNotNone(m, self.diag())
+        self.assertEqual((m["state"], m["detail"]), ("conectado", "conectado"), self.diag())
+        nodos = {n["name"]: n for n in self.estado_panel()["nodes"]}
+        self.assertEqual((nodos["motor"]["machine"], nodos["ia"]["machine"]), ("robot", None))
+        self.px.congelar()
+        vistos: list[str] = []
+        fin = time.monotonic() + 45
+        while time.monotonic() < fin:
+            m = self.maquina()
+            if m is not None and (not vistos or vistos[-1] != m["detail"]):
+                vistos.append(m["detail"])
+            if m is not None and m["detail"] == PUEDE:
+                break
+            time.sleep(0.15)
+        self.assertEqual(vistos[-1], PUEDE, self.diag(f"nunca llegó a 'puede que ya haya detenido': {vistos}"))
+        siguen = [SIGUEN.match(d) for d in vistos if d.startswith("sin conexión · reintentando")]
+        self.assertTrue(siguen and all(siguen), self.diag(f"debía pasar por 'sus nodos siguen N s': {vistos}"))
+        segs = [int(s.group(1)) for s in siguen]
+        self.assertEqual(segs, sorted(segs, reverse=True), self.diag(f"la cuenta solo baja: {vistos}"))
+        self.assertLessEqual(segs[0], int(agent.GRACE), vistos)
+        self.assertNotIn("ya habrá detenido sus nodos", " ".join(vistos), vistos)
+        m = self.maquina()
+        self.assertEqual(m["state"], "sin conexión")
+        estados = self.estados()
+        self.assertEqual((estados["motor"], estados["imu"]), ("sin conexión", "sin conexión"), self.diag())
+        self.assertEqual(estados["ia"], "corriendo", self.diag("el nodo local no debe verse afectado"))
+        codigo, _ = self.ctrl_c_a_run()
+        self.assertIsNotNone(codigo, self.diag("agmen run no salió con Ctrl+C"))
+
+
 if __name__ == "__main__":
     unittest.main()
