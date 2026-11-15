@@ -358,7 +358,7 @@ class Hub:
         if kind == "pub" and not machine:
             self._push_subs(e)
         else:
-            # DECISIÓN PENDIENTE: un pub de otra computadora no recibe `subs` (§1.2); para que quien lo
+            # (Decidido: queda así.) Un pub de otra computadora no recibe `subs` (§1.2); para que quien lo
             # registra sepa que se aceptó, se le contesta `ok` (como a un sub). La especificación no lo dice.
             # En modo red: "ok id=… peers=ip,ip" (ya escrito una vez por `red`); sin él, los bytes de siempre.
             ok = hp.encode("ok", id=eid) + self._ok_peers

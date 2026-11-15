@@ -62,7 +62,7 @@ def _error_text(err: int) -> str:
     return os.strerror(err)
 # Conectar a OTRA computadora (RFC 0011 §3) no bloquea a nadie: la conexión se termina en el hilo del
 # Fanout, y si no contesta en este tiempo se da por fallida (se reintenta cada Fanout.RETRY_S).
-# DECISIÓN PENDIENTE: 3 s (la especificación no da el número; a 127.0.0.1 se sigue esperando 1 s, bloqueando).
+# 3 s (la especificación no da el número; a 127.0.0.1 se sigue esperando 1 s, bloqueando).
 REMOTE_CONNECT_S = 3.0
 _IN_PROGRESS = {0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EAGAIN, getattr(errno, "WSAEWOULDBLOCK", 10035)}
 

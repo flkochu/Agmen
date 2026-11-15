@@ -46,7 +46,7 @@ std::string host_of(const std::string& address) {
 // ---------------------------------------------------------------------------
 
 /// Conectar por TCP a otra computadora espera hasta esto, sin frenar a nadie (a 127.0.0.1, kConnectTimeout).
-// DECISIÓN PENDIENTE: 3 s, como REMOTE_CONNECT_S en Python (la especificación no da el número).
+// 3 s, como REMOTE_CONNECT_S en Python (la especificación no da el número).
 constexpr std::chrono::milliseconds kRemoteConnect{3000};
 /// Tras la confirmación del hub, los sockets de antes se siguen leyendo esto (NET_OLD_S en Python).
 constexpr std::chrono::milliseconds kNetOld{1000};
