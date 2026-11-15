@@ -228,6 +228,220 @@ ef cd ab 89 67 45 23 01                          source_id
 
 Los bytes exactos de este y otros ejemplos están en los vectores de prueba.
 
+## Topics y hub: `agmen-hub/1`
+
+> **Estado:** el modo local (lo de siempre) está implementado desde Agmen 0.5.0
+> ([RFC 0004](rfc/0004-topics-y-descubrimiento.md), §4.2). Lo marcado
+> **(desde 0.14.0)** es la base de los topics entre computadoras
+> ([RFC 0011](rfc/0011-sim-real-y-varias-computadoras.md), §3.5, parte 4a): el hub
+> y los dos núcleos (C++ y Python) ya lo entienden. **Todavía nadie enciende el
+> modo red.** `agmen run` y `agmen agent` aún no pasan las tablas de sus hubs (eso
+> es la parte 4b). Hasta entonces, un topic no cruza entre computadoras.
+
+Es el protocolo de control entre los nodos y su **hub** (`agmen hub`, o el que
+arranca `agmen run`). Los datos no pasan por aquí: el hub solo dice a quién
+mandarle cada topic. Referencia de código: `python/agmen/hubproto.py` (el
+docstring tiene la lista completa) y `include/agmen/hubproto.hpp`.
+
+### Forma de la línea
+
+```
+agmen-hub/1 <operación> clave=valor clave=valor ...
+```
+
+- Un datagrama UDP trae una línea de texto UTF-8. La respuesta `state` trae varias.
+- Los valores escriben `%XX` por cada byte que no sea letra, dígito o `_ . / : , * -`.
+  Por eso `@` sale como `%40` y el espacio como `%20`. Al leer se aceptan las dos
+  formas: `robot@192.168.1.20` y `robot%40192.168.1.20` son lo mismo.
+- Los datos (`AGM…`) y el control (`agmen-hub/1…`) llegan al mismo socket. Se
+  distinguen por los primeros bytes.
+- El hub escucha en `127.0.0.1:7390` (o en `AGMEN_HUB`).
+- Cada endpoint late cada 1 s (`BEAT_S`). Sin latir 3 s (`EXPIRE_S`), el hub lo
+  da por muerto.
+
+### Operaciones de siempre (desde 0.5.0)
+
+| De → a | Operación | Campos | Para qué |
+|---|---|---|---|
+| nodo → hub | `pub` | `id node pid topic schema type text` | Registrar o latir un Publisher |
+| nodo → hub | `sub` | `id node pid topic schema type port [tcp]` | Registrar o latir un Subscriber. `topic=*` = todos; `schema=*` = cualquier tipo. `tcp` = puerto TCP para mensajes grandes (RFC 0008) |
+| nodo → hub | `bye` | `id` | El endpoint se va. Si no llega, expira a los 3 s |
+| nodo → hub | `stat` | `node pid kind name …` | Cuentas de un `agmen.Node` (RFC 0006), cada segundo |
+| herramienta → hub | `query` | — | Pide el estado completo: líneas `state`, `topic`, `ep` y `stat` |
+| herramienta → hub | `ping` | — | ¿Hay hub? Contesta `pong` |
+| hub → Publisher | `subs` | `id topic to=ip:puerto,… [tcp=…]` | A quién mandarle los datos. `to` son los puertos UDP y `tcp` los TCP. Se repite en cada latido |
+| hub → Subscriber | `ok` | `id` | Latido recibido |
+| hub → nodo | `error` | `id msg` | Registro rechazado (nombre inválido, un topic con dos tipos) |
+| hub → herramienta | `pong` | `version` | Respuesta a `ping` |
+
+Ejemplos (generados con `hubproto.encode`):
+
+```
+agmen-hub/1 pub id=2f9c1e0a7b3d4a11 node=cam pid=7 topic=/imu schema=00000000000000aa type=Imu text=Imu%7Bf32%20a%7D
+agmen-hub/1 sub id=a1 node=imu pid=4321 topic=/imu schema=00000000000000aa type=Imu port=6000 tcp=6001
+agmen-hub/1 subs id=2f9c1e0a7b3d4a11 topic=/imu to=127.0.0.1:6000,127.0.0.1:6010 tcp=6001
+agmen-hub/1 ok id=a1
+agmen-hub/1 error id=a1 msg=%27/imu%27%20ya%20es%20de%20tipo%20Imu
+```
+
+### Modo red (desde 0.14.0)
+
+El hub arranca en **modo local**: como hoy, todo se queda en esta computadora.
+Pasa a **modo red** cuando recibe de su propia computadora la operación `red`. Las
+otras computadoras van en `peers`, con su nombre de `[[machine]]` y la IP con la
+que **esta** computadora las ve:
+
+```
+agmen-hub/1 red peers=robot%40192.168.1.20,laptop%40192.168.1.5
+agmen-hub/1 red_ok peers=2
+agmen-hub/1 red peers=
+agmen-hub/1 red_ok peers=0
+```
+
+- `red_ok peers=<n>`: cuántas computadoras aceptó. `error msg=…` si un nombre o una
+  IP no sirven, si se repiten, o si la IP es `127.0.0.1` (es esta computadora).
+- Un nombre es como `[[machine]] name` (letras, dígitos, `_` o `-`). Una IP son
+  cuatro números de 0 a 255, sin ser `0.0.0.0`, una de grupo (224 a 239) ni
+  `255.255.255.255`.
+- `peers=` vacío vuelve a modo local.
+- El modo red **caduca**. Quien lo encendió lo repite cada 2 s (`NET_BEAT_S`). Si
+  en 6 s (`NET_EXPIRE_S`) no llega otro `red`, el hub vuelve a modo local y lo
+  escribe en su log. Así, si muere quien lo encendió, nada queda abierto a la red.
+- En modo red, `pong` lleva `red=1` y cada `ok` lleva `peers` (las IP de las que
+  puede aceptar datos; sin nombres). En modo local, esos campos no van:
+
+```
+agmen-hub/1 ping
+agmen-hub/1 pong version=0.13.0 red=1
+agmen-hub/1 ok id=s1 peers=192.168.1.20,192.168.1.5
+```
+
+(`version` es la de tu Agmen. Hoy el código dice 0.13.0.)
+
+- Al volver a modo local, el hub quita las entradas de otra computadora y avisa a
+  los Publisher con `subs`, como cuando un Subscriber se va.
+
+**Quién puede mandar estas operaciones.** `red`, `machine`, `addr` y `net` solo se
+aceptan desde `127.0.0.1` (o desde `AGMEN_NET_IP`, ver abajo). Si llegan de otra IP,
+el hub contesta `error`: otra computadora no puede abrir el hub a la red. Las tablas
+de las otras computadoras llegan por `agmen agent` (ver
+[`agmen-agent/1`](#conexión-con-clave-agmen-agent1-desde-agmen-0140)).
+
+#### Entradas de otra computadora (desde 0.14.0)
+
+En modo red, un proceso de esta computadora (en la 4b, el puente) puede registrar
+endpoints **en nombre de otra computadora**:
+
+```
+agmen-hub/1 sub id=r1 node=cam pid=7 topic=/cmd schema=00000000000000aa type=Cmd machine=robot addr=192.168.1.20:7600 tcp=7700
+agmen-hub/1 pub id=r2 node=mando pid=8 topic=/cmd schema=00000000000000aa type=Cmd text=Cmd%7Bf32%20v%7D machine=laptop
+```
+
+- `sub … machine=<nombre> addr=<ip>:<puerto> [tcp=<puerto>]`: un Subscriber que vive
+  en `<nombre>`. Los datos van a `addr`.
+- `pub … machine=<nombre>`: un Publisher de `<nombre>`. No lleva dirección, y el hub
+  **no** le manda `subs`: eso lo hace el hub de su computadora. El hub contesta
+  `ok` al proceso que lo registró.
+
+Reglas (si no se cumplen, `error` con el porqué):
+
+- Solo en modo red. Si el hub está en modo local, el error dice que primero hay que
+  encender el modo red con `peers`.
+- `machine` debe ser un nombre de `peers`. La IP de `addr` debe ser la de ese nombre.
+- `net=1` no va en un endpoint de otra computadora.
+- Caducan como cualquier endpoint: 3 s sin latir.
+- Cuentan para todo lo demás: "un topic, un tipo" (también entre computadoras; el
+  error dice de qué computadora es cada uno) y los `[[topic]]` esperados y
+  obligatorios.
+- Los `subs` a los Publisher de esta computadora incluyen a los Subscriber de fuera,
+  con su `ip:puerto` y su `tcp`.
+
+#### Subscriber local que escucha en la red (desde 0.14.0)
+
+```
+agmen-hub/1 sub id=a1 node=imu pid=4321 topic=/imu schema=00000000000000aa type=Imu port=6000 net=1
+```
+
+`net=1` quiere decir "mi puerto escucha en la red". Un Subscriber local **sin**
+`net=1` mientras el hub está en modo red no es un error: su núcleo todavía no
+cambió. Pero si pasan 5 s (`NET_LOCAL_WARN_S`) sin `net=1`, el hub lo avisa una vez
+en su log, porque ese nodo no va a recibir de las otras computadoras. Casi siempre
+es un Agmen anterior.
+
+#### `state` con entradas de otra computadora (desde 0.14.0)
+
+`query` contesta lo de siempre. Cada endpoint de otra computadora lleva `machine`, y
+cada Subscriber local que escucha en la red lleva `net=1`:
+
+```
+agmen-hub/1 ep id=r1 kind=sub node=cam pid=7 topic=/cmd type=Cmd addr=192.168.1.20:7600 tcp=7700 age=0.4 machine=robot
+```
+
+### Qué hacen los nodos (desde 0.14.0)
+
+Los nodos cambian solo cuando su hub está en modo red. Con el modo local, sus bytes y
+sus puertos (`127.0.0.1`) son los de siempre.
+
+**Subscriber** (un Subscriber por topic; uno por dirección no cambia):
+
+1. Cuando llega un `ok` con `peers` y el Subscriber escucha por topic, abre sockets
+   nuevos en **todas las interfaces** (o en `AGMEN_NET_IP`): UDP y el escucha TCP.
+   Se registra con el puerto nuevo, `tcp=` nuevo y `net=1`.
+2. Sigue leyendo los sockets viejos hasta 1 s después de que el hub confirme el
+   registro nuevo. Luego los cierra. Las conexiones TCP ya aceptadas no se cortan.
+   Casi ningún mensaje se pierde; como mucho, los UDP que iban en vuelo.
+3. Si no puede abrir los sockets nuevos, sigue como estaba, avisa una vez y lo
+   reintenta con cada `ok`.
+4. **De quién acepta datos** en modo red: de `127.0.0.1`, de `AGMEN_NET_IP` (si
+   existe) y de las IP de `peers` del último `ok`. Un datagrama o una conexión TCP de
+   otra IP se descarta, se cuenta en `rejected` y se avisa una vez por IP. Lo que
+   viene de una computadora declarada, pero con el hub callado, también se descarta,
+   con otro texto que dice la verdad.
+5. Si un `ok` llega sin `peers` (el hub volvió a modo local), sigue con sus sockets y
+   acepta solo lo local.
+6. **Si el hub calla 6 s** (`NET_EXPIRE_S`) en modo red, vuelve a aceptar solo lo
+   local, y lo dice una vez. Cuando el hub vuelve, vuelve a aceptar a los `peers`.
+7. **El control solo vale si viene del hub.** Un mensaje `agmen-hub/1` que no sale de
+   la dirección del hub (IP y puerto) se descarta sin efecto: no abre puertos, no
+   cambia destinos ni la lista de IP. Se cuenta en `rejected` y se avisa una vez por
+   remitente.
+8. La caducidad se revisa **antes** de entregar lo que ya estaba leído de TCP. Pasado
+   el plazo, no se entrega ni un mensaje más de una computadora de fuera.
+
+**Publisher** (y el `RawPublisher` del `[[mux]]`):
+
+1. Los destinos `127.0.0.1` (y `AGMEN_NET_IP`) van como siempre, por el socket de
+   esta computadora. La **memoria compartida** solo se ofrece a estos destinos.
+2. Un destino de otra IP en `subs` sale por un **socket de red aparte**, que se abre
+   la primera vez que hace falta. Los mensajes chicos van por UDP; los grandes, por TCP
+   (RFC 0008). El anuncio de esquema va por el mismo camino.
+3. Si un destino de otra computadora no se alcanza, no frena a los demás: se cuenta
+   en `unreachable` y se avisa una vez por destino, con la IP. Un envío que falla
+   porque el búfer está lleno no cuenta como "inalcanzable".
+4. Cuando ya no tiene destinos de otra computadora, cierra su socket de red. No queda
+   un puerto abierto a la red.
+5. Conectar por TCP a otra computadora espera hasta 3 s (`REMOTE_CONNECT_S`) sin
+   frenar a los demás. A `127.0.0.1` son 1 s, como siempre.
+6. Un receptor lento de otra computadora no frena a nadie y se cuenta.
+
+### Compatibilidad (desde 0.14.0)
+
+- Los campos y las operaciones nuevos solo se **añaden**. Un nodo o un hub anterior
+  que no los conozca sigue funcionando en modo local.
+- Un nodo nuevo con un hub anterior: el hub nunca manda `peers`, así que el nodo
+  queda en local.
+- La **memoria compartida** sigue siendo de cada computadora. Entre computadoras, un
+  mensaje grande va por TCP, como cualquier mensaje a otra computadora.
+
+### Variable para pruebas: `AGMEN_NET_IP`
+
+`AGMEN_NET_IP=<ip>` es **una variable para pruebas**, no para uso normal. En modo
+red, los sockets se abren en esa IP en vez de en todas las interfaces, y los envíos a
+otra computadora salen desde ella. Sirve para tener "dos computadoras" en una sola:
+`127.0.0.1` y `127.0.0.2`. Con ella, el hub también acepta una 127.x como
+`peer`. Una IP inválida, o que no es de esta computadora, da un error claro al
+abrir.
+
 ## Conexión con clave: `agmen-agent/1` (desde Agmen 0.14.0)
 
 > **Estado:** implementado en las partes 3b y 3c del RFC 0011 (`python/agmen/agent.py`,
