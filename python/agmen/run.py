@@ -38,6 +38,11 @@ class ConfigError(Exception):
     """Error en robot.toml, con un mensaje que dice exactamente qué corregir."""
 
 
+class NoConnection(str):
+    """El error de Launcher.action cuando el nodo es de otra computadora sin conexión (RFC 0011 parte 3c §15):
+    es texto como cualquier otro error, pero el panel lo responde con HTTP 409 (no 400: la orden era válida)."""
+
+
 # ---------------------------------------------------------------------------
 # Configuración
 # ---------------------------------------------------------------------------
@@ -1162,6 +1167,7 @@ class Launcher:
             link.attach(self.logs, self.printer)
         self.stopping = threading.Event()
         self.recording = None    # el control de grabación (RFC 0010); lo pone agmen run
+        self._born = time.monotonic()
 
     @staticmethod
     def _check_places(config: RobotConfig, places: dict | None, remotes: dict | None = None) -> dict:
@@ -1240,15 +1246,51 @@ class Launcher:
         self.printer.close()
 
     def action(self, name: str, what: str) -> str | None:
-        """Acción desde el panel. Devuelve un error en texto, o None si salió bien."""
+        """Acción desde el panel. Devuelve un error en texto, o None si salió bien. Si el nodo es de otra
+        computadora sin conexión, el error es un NoConnection (el panel responde 409)."""
         node = self.nodes.get(name)
         if node is None:
             return f"no existe el nodo '{name}'"
         if what not in ("start", "stop", "restart"):
             return f"acción desconocida '{what}'"
+        refusal = getattr(node, "refusal", None)   # RFC 0011 §15: un nodo de otra computadora sin conexión
+        err = refusal(what) if refusal is not None else None
+        if err:
+            node._log(err, "error", own=True)   # también en la terminal y el log, como siempre
+            return NoConnection(err)
         self.say(f"panel web: {what} '{name}'")
         threading.Thread(target=getattr(node, what), daemon=True).start()
         return None
 
     def nodes_info(self) -> list[dict]:
-        return [n.info() for n in self.nodes.values()]
+        """Los nodos para el panel; cada uno con `machine` (RFC 0011 parte 3c §4): el nombre de su
+        [[machine]], o None si corre aquí sin [[machine]] (o con [profile.X] local = true)."""
+        out = []
+        for n in self.nodes.values():
+            info = n.info()
+            info["machine"] = None if self.config.local else (info.get("machine") or n.cfg.machine or None)
+            out.append(info)
+        return out
+
+    def machines_info(self) -> list[dict]:
+        """Las [[machine]] que usa el perfil activo, en el orden de robot.toml, para el panel (RFC 0011
+        parte 3c §4): name, host, here, state ("aquí", "conectado" o "sin conexión"), since (s en ese
+        estado), grace_left (s que le quedan seguro a la gracia del robot; None si no aplica) y detail
+        (en palabras). Vacía sin [[machine]] o con [profile.X] local = true: el panel se ve como siempre."""
+        if self.config.local:
+            return []
+        from .machines import _address
+
+        out = []
+        for m in self.config.machines:
+            if m.name not in self.places:
+                continue   # ningún nodo de este perfil corre ahí
+            link = self.remotes.get(m.name)
+            entry = {"name": m.name, "host": _address(m), "here": link is None}
+            if link is None:   # es esta computadora (el texto de `detail` lo fijó la §15)
+                entry.update(state="aquí", since=round(time.monotonic() - self._born, 1), grace_left=None,
+                             detail="aquí (esta computadora)")
+            else:
+                entry.update(link.status())
+            out.append(entry)
+        return out

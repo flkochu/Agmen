@@ -30,6 +30,7 @@ de C++ **o** de Python. No necesitas saber de redes ni de ROS.
 | 15 | [Memoria compartida: imágenes sin copiar entre procesos](15-memoria-compartida.md) | La misma cámara, ahora sin copiar la imagen de un proceso a otro; lo mides contra TCP, ves cuándo no se puede (otra computadora, Docker) y mandas imágenes por la red | 0.11.0 |
 | 16 | [Grabar y reproducir: tu robot como dataset](16-grabar-y-reproducir.md) | Grabas el robot en un `.mcap` sin frenar a nadie, lo reproduces con su tiempo original en vez de los sensores, lo ves en el panel (con barra de tiempo) y en Foxglove, y lo conviertes en tablas Parquet para entrenar | 0.12.0 |
 | 17 | [El mismo robot en simulación y en el mundo real](17-simulacion-y-real.md) | El robot del tutorial con física (MuJoCo): `agmen run --sim`, el panel en simulación, pausa y velocidad del mundo, la cámara simulada, y la clase `Mundo` para usarla en tu propio código | 0.14.0 |
+| 18 | [Un robot, varias computadoras](18-un-robot-varias-computadoras.md) | El robot del tutorial en dos computadoras: `[[machine]]` y `machine`, la clave del agente, `agmen agent` como servicio de systemd, el panel con una línea por computadora, y qué pasa cuando se cae el WiFi (la gracia de 10 s y la reconexión sola) | 0.14.0 |
 
 ## Convenciones
 

@@ -13,10 +13,10 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   perfiles en `robot.toml`, un mundo de MuJoCo de ejemplo y `agmen agent` en
   cada computadora). Hechos: los perfiles (bloque 1, abajo), el mundo de
   MuJoCo (bloque 2, abajo), `[[machine]]` (bloque 3, parte 3a, abajo) y
-  `agmen agent` con clave (parte 3b, abajo). Falta: reconectar tras un corte,
-  la etiqueta de la computadora en el panel, el servicio de arranque y el
-  capítulo 18 (parte 3c); topics entre computadoras y relojes (bloques 4 y 5
-  del plan del RFC).
+  `agmen agent` con clave (parte 3b, abajo), y la reconexión tras un corte, el
+  panel con varias computadoras, el servicio de arranque y el capítulo 18 (parte
+  3c, abajo). Falta: topics entre computadoras y relojes (bloques 4 y 5 del plan
+  del RFC).
 
 ### Agregado
 - **Perfiles en `robot.toml`** (RFC 0011 §3.2): `profile = "real"`, `"sim"`,
@@ -90,20 +90,44 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   `[[machine]]` y sale.
 - **Logs y Ctrl+C con nodos remotos**: los logs de los nodos de otra
   computadora llevan el prefijo `robot/motor │`. Ctrl+C en la laptop detiene
-  los nodos de todas las computadoras. Si se pierde la conexión, el agente
-  detiene sus nodos y `agmen run` detiene todo y lo dice.
-- **Lo que todavía no existe**: reconectar tras un corte (y el tiempo de gracia
-  de 10 s), la etiqueta de la computadora en el panel, el servicio de arranque
-  del agente y el capítulo 18 (parte 3c). Los topics todavía no cruzan entre
-  computadoras (bloque 4): cada computadora tiene su propio hub, y un nodo de la
-  laptop no recibe los topics del robot. Medir la diferencia de reloj entre
-  computadoras es el bloque 5. Una laptop a la vez por agente.
-- **Capítulo 5 del tutorial, sección 7**: cómo declarar `[[machine]]`, qué
-  funciona hoy, arrancar nodos desde la laptop con `agmen agent` (con los tres
-  errores más comunes), la IP contra el nombre y por qué el hardware va con
-  `profile = "real"`.
+  los nodos de todas las computadoras.
+- **Reconectar tras un corte** (RFC 0011 §3.4, parte 3c): si se corta el WiFi, el
+  agente da 10 s de gracia (sus nodos siguen) y `agmen run` reintenta solo hasta
+  Ctrl+C. Si la laptop vuelve a tiempo, nada se reinicia y los logs que se
+  perdieron llegan. Si vuelve tarde, los nodos de esa computadora ya están
+  detenidos y ninguno arranca solo; la laptop lo dice y se puede arrancarlos
+  desde el panel.
+- **Cerrar el agente a propósito**: Ctrl+C o SIGTERM en `agmen agent` detienen
+  sus nodos al momento, y la laptop lo dice (`cerraron agmen agent allá`) en vez de
+  esperar 10 s. Protocolo: `adios` del agente (ver `docs/PROTOCOLO.md`).
+- **Panel con varias computadoras**: una línea por computadora (`aquí`,
+  `conectado`, `sin conexión` con cuántos segundos de gracia quedan), los nodos
+  de otra computadora como `robot/motor`, y sus botones apagados cuando no hay
+  conexión, con el motivo en el texto del botón.
+- **`agmen agent --show-key`** imprime la clave guardada y sale. Cuando la salida
+  no es una terminal (un servicio), el agente no escribe la clave en el log: dice
+  dónde está guardada.
+- **Servicio de arranque**: `examples/tutorial/agmen-agent.service`, una unidad
+  de systemd de ejemplo (usuario normal, reintentos que no se rinden, tiempo para
+  despedirse).
+- **Protocolo `agmen-agent/1`, parte 3c**: `sesion_ok` trae `sesion` y `gracia`;
+  nuevos `reanudar` y `reanudar_ok` (con los `log` que la laptop no tenía); el
+  `adios` del agente; `sesion_error` `sesion` y `ocupado` con los segundos que
+  quedan. El agente guarda 2 000 líneas de log (1 MiB) para reanudar.
+- **Lo que todavía no existe**: topics entre computadoras (bloque 4: cada
+  computadora tiene su propio hub) y medir la diferencia de reloj entre
+  computadoras (bloque 5). Una laptop a la vez por agente.
+- **Capítulo 5 del tutorial, sección 7**: resumen de `[[machine]]`, qué corre en
+  cada computadora y por qué el hardware va con `profile = "real"`.
+- **Capítulo 18 del tutorial, "Un robot, varias computadoras"**: el recorrido de
+  dos computadoras con `robot_dos.toml`, la clave, el agente como servicio y qué
+  pasa cuando se cae el WiFi, con salidas reales de las pruebas.
 
 ### Cambiado
+- **Al perder una computadora, `agmen run` ya no se detiene**: los nodos de esa
+  computadora pasan a `sin conexión` (sin perder su último estado), las órdenes
+  sobre ellos se rechazan diciendo por qué, y los demás nodos siguen. Antes, la
+  parte 3b detenía todo y salía con error.
 - **`agmen run` con nodos en otra computadora** ya no sale con el error de la
   parte 3a: se conecta con `agmen agent` (ver arriba). Si el agente no contesta,
   la clave es mala o los `robot.toml` no dicen lo mismo, sale con código 2, no

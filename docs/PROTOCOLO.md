@@ -230,9 +230,10 @@ Los bytes exactos de este y otros ejemplos están en los vectores de prueba.
 
 ## Conexión con clave: `agmen-agent/1` (desde Agmen 0.14.0)
 
-> **Estado:** implementado en la parte 3b del RFC 0011 (`python/agmen/agent.py`,
+> **Estado:** implementado en las partes 3b y 3c del RFC 0011 (`python/agmen/agent.py`,
 > `agmen agent` y `agmen run`). Diseño y razones en el
-> [RFC 0011, §3.4](rfc/0011-sim-real-y-varias-computadoras.md) (D6, D7 y D9).
+> [RFC 0011, §3.4 y §6](rfc/0011-sim-real-y-varias-computadoras.md) (D6, D7 y D9; reto 4).
+> La gracia y la reconexión (3c) están en [La gracia y reanudar](#la-gracia-y-reanudar).
 > Las pruebas de formato están en `python/test_agent.py`, con los vectores de
 > la sección [Vectores](#vectores-de-agmen-agent1).
 
@@ -334,8 +335,23 @@ JSON sea un objeto con `"op"`. Si algo falla, cierra la conexión.
   - `no_arrancar`: lista de nombres de `nodos` que el agente **no** arranca solo.
     La laptop los arranca después, cuando todas las computadoras aceptaron.
 - `arrancar`, `detener`, `reiniciar`: `nodo` (el nombre).
-- `detener_todo`, `adios`: sin campos.
-- `ping`: `t` (un número). El agente lo repite en `pong`.
+- `detener_todo`, `adios`: sin campos. El `adios` de la laptop se manda al
+  terminar a propósito; si el agente ya se despidió, se manda como respuesta
+  (ver [Despedida del agente](#despedida-del-agente)).
+- `ping`: `t` (un número). El agente lo repite en `pong`. El primer `ping` de una
+  conexión reanudada se manda en seguida, sin esperar los 2 s: es el que confirma
+  la reanudación.
+- `reanudar`: `sesion` (el identificador que dio `sesion_ok`) y `logs`
+  (`{nodo: k}`, el último `n` de `log` que la laptop recibió de ese nodo; `"agmen"`
+  también cuenta; un nodo que no aparece vale 0). Solo como primer mensaje de una
+  conexión nueva, para volver a una sesión que sigue en gracia (ver
+  [La gracia y reanudar](#la-gracia-y-reanudar)).
+
+Ejemplo de un `reanudar` (la firma va al final, aquí se omite):
+
+```
+1 {"op":"reanudar","sesion":"<32 hex>","logs":{"imu":412,"agmen":3}} <firma>
+```
 
 Ejemplo de un `sesion` (la firma va al final de la línea, aquí se omite):
 
@@ -345,11 +361,17 @@ Ejemplo de un `sesion` (la firma va al final de la línea, aquí se omite):
 
 ### Mensajes del agente a la laptop
 
-- `sesion_ok`: `maquina`, `agmen` (la versión del agente) y `nodos` (la lista de
-  nombres, en el orden del archivo). Después de esto, el agente arranca sus
-  nodos con `autostart`.
+- `sesion_ok`: `maquina`, `agmen` (la versión del agente), `nodos` (la lista de
+  nombres, en el orden del archivo), `sesion` (32 caracteres hexadecimales al
+  azar, para reanudar) y `gracia` (los segundos de gracia del agente: 10). Después
+  de esto, el agente arranca sus nodos con `autostart`.
 - `sesion_error`: `codigo` y `texto`. El agente cierra después de mandarlo.
-  - `ocupado`: ya hay otra laptop conectada (el texto dice desde qué IP).
+  - `ocupado`: ya hay otra laptop conectada (el texto dice desde qué IP). Si esa
+    laptop se cortó y el agente la tiene en gracia, el texto dice cuántos segundos
+    le quedan (`le quedan N s`).
+  - `sesion`: un `reanudar` cuyo `sesion` no es el de la sesión en gracia, o no hay
+    sesión en gracia. El texto dice que la sesión ya terminó y que sus nodos están
+    detenidos: la laptop abre una sesión nueva.
   - `maquina`: el nombre de `maquina` no es el de este agente.
   - `distinto`: un nodo o el reloj no coinciden con el robot.toml del agente. El
     texto trae **todas** las diferencias.
@@ -375,21 +397,107 @@ Ejemplo de un `sesion` (la firma va al final de la línea, aquí se omite):
 - `pong`: `t`. Repite el `t` del `ping` si es un número o un texto de hasta 64
   caracteres; si no, `null`.
 
+- `reanudar_ok`: `nodos` (como en `sesion_ok`, con el estado actual de cada nodo),
+  `gracia`, y `perdidos` solo si hay alguno: `{nodo: cuántas}`, las líneas de `log`
+  que el agente ya no tenía. Después van los `log` guardados con `n` mayor que el
+  `k` de la laptop, en orden; luego todo sigue como en una sesión normal.
+- `adios`: `motivo` (texto corto, por ejemplo `Ctrl+C` o `SIGTERM`). Ver
+  [Despedida del agente](#despedida-del-agente).
+
 ### Quién cierra la conexión
 
-| Cierra (y el agente detiene sus nodos) | No cierra: contesta `error` |
+| Qué pasa | Qué hace el agente |
 |---|---|
-| Línea que no es `<n> <json> <firma>`, firma mala, `n` fuera de orden, JSON inválido, o más de 64 KiB | Orden desconocida (`op` que no existe) |
-| Silencio de 6 s: sin ninguna línea, ni un `ping` | `arrancar`, `detener` o `reiniciar` de un nodo que no existe |
-| La laptop cierra sin `adios` | Una segunda `sesion` en la misma conexión |
-| `adios`: la laptop se despide | Más de 64 órdenes pendientes |
-| `sesion_error`: después de mandarlo | |
-| Saludo que no termina en 10 s, o cualquier error del saludo | |
+| Línea que no es `<n> <json> <firma>`, firma mala, `n` fuera de orden, JSON inválido, o más de 64 KiB | Cierra y detiene los nodos **en el acto**. Sin gracia: es un error o un ataque, no una red caída |
+| `adios` de la laptop | Termina la sesión, detiene los nodos y cierra. Sin gracia |
+| Ctrl+C o SIGTERM en el agente | Detiene los nodos, manda su [`adios`](#despedida-del-agente) y cierra. Sin gracia |
+| Silencio de 6 s sin ninguna línea (ni un `ping`), cierre sin `adios`, o no se le puede mandar a la laptop | **Entra en gracia**: los nodos siguen 10 s (ver [La gracia y reanudar](#la-gracia-y-reanudar)) |
+| Error interno del agente | Detiene los nodos y cierra. Sin gracia |
+| `sesion_error`: después de mandarlo | Cierra la conexión |
+| Saludo que no termina en 10 s, o cualquier error del saludo | Cierra (todavía no hay sesión) |
+| Orden desconocida (`op` que no existe) | Contesta `error` |
+| `arrancar`, `detener` o `reiniciar` de un nodo que no existe | Contesta `error` |
+| Una segunda `sesion` en la misma conexión, o más de 64 órdenes pendientes | Contesta `error` |
 
 La laptop manda `ping` cada 2 s desde que manda `sesion`, así que 6 s de silencio
 sí quiere decir que se perdió la conexión.
 
-### Límites
+### La gracia y reanudar
+
+Cuando se corta la red, el agente no detiene los nodos de inmediato. Da una
+**gracia** de 10 s (`GRACE`), contados desde la última línea que recibió de la
+laptop. Así un corte corto no reinicia nada, y una laptop apagada no deja el robot
+corriendo para siempre. La gracia no se configura.
+
+- **Entrar en gracia.** Los nodos y el hub siguen corriendo. El agente lo dice una
+  vez, por ejemplo:
+  `la laptop (192.168.1.7) dejó de contestar: sus nodos siguen 3 s más por si vuelve (no dijo nada en 6 s)`.
+  Si la conexión se cerró sin `adios`, el paréntesis dice `cerró la conexión sin despedirse`.
+- **Durante la gracia**, el agente sigue aceptando conexiones:
+  - `reanudar` con el `sesion` de la sesión en gracia: se reanuda (abajo).
+  - `sesion` de otra laptop: `sesion_error` `ocupado`, con los segundos que quedan.
+  - `reanudar` con otro `sesion`, o sin sesión en gracia: `sesion_error` `sesion`.
+- **Si la gracia vence**, el agente detiene los nodos y el hub, lo dice y la sesión
+  termina: `la laptop (192.168.1.7) no volvió en 10 s: detuve los nodos`. Si la
+  laptop intentó volver pero no confirmó que la oye, el texto es
+  `la laptop (192.168.1.7) intentó volver pero no confirmó que me oye: detuve los nodos`.
+  Los nodos no vuelven a arrancar solos.
+
+**Reanudar.** La laptop manda `reanudar` (ver arriba). El agente contesta `reanudar_ok`
+y manda los `log` que la laptop no tiene. Los `estado` no se guardan: `reanudar_ok`
+trae el actual.
+
+- **Memoria para reanudar.** El agente guarda las últimas 2 000 líneas de `log` de la
+  sesión, con tope de 1 MiB (`RESUME_LOG_LINES` y `RESUME_LOG_BYTES`). No solo las de
+  la gracia: una línea mandada justo antes del corte pudo no llegar. Lo que ya no
+  está se cuenta en `perdidos`, por nodo, y el cliente lo dice.
+- **`reanudar` con `logs` de más de 1 024 nodos** (`RESUME_MAX_NODES`): `sesion_error`
+  `protocolo`, y la conexión se cierra.
+- **Reanudada sin confirmar.** La reanudación no cancela la gracia. Se confirma con el
+  primer mensaje firmado que llega por la conexión nueva: el `ping` que la laptop
+  manda en cuanto la instala. Solo entonces el agente cancela el temporizador. Así
+  una laptop que no recibe lo que manda el agente no puede alargarle la gracia.
+- **Prórroga.** Si el `reanudar` llega con menos de 1 s (`RESUME_CONFIRM`) para que
+  venza la gracia, esta se prorroga hasta 1 s desde ese momento. Solo una vez por
+  gracia: un `reanudar` repetido sin confirmar no vuelve a moverla.
+- **Otro `reanudar`** mientras hay una reanudación sin confirmar reemplaza a la
+  conexión anterior, con las mismas reglas.
+- **Si la gracia vence en el mismo instante** en que llega la confirmación, la sesión
+  termina y no se contesta nada.
+
+**La laptop, en el mismo caso.** Tiene dos cuentas del tiempo. La **pesimista** es lo
+último que se sabe que el agente oyó (el momento del último `ping` que tuvo `pong`);
+con ella dice "sus nodos siguen N s", y nunca promete de más. La **segura** es lo
+último que mandó por una conexión instalada, más la gracia, la prórroga de 1 s, la
+espera de 5 s que puede tardar en detener un nodo y 1 s de margen; con ella dice
+"habrá detenido sus nodos". Un `reanudar` no mueve la segura. Es una presunción con
+margen, no una garantía: sin conexión no hay forma de saberlo.
+
+| Lado de la laptop (`agmen run`) | Valor |
+|---|---|
+| Intento de reconexión | cada 1 s (`RETRY_EVERY`), hasta Ctrl+C |
+| Tope para abrir la conexión TCP en un intento | 2 s (`RETRY_CONNECT_TIMEOUT`) |
+| Pausa tras un rechazo (clave, `ocupado`, `distinto`…) | 5 s (`RETRY_REFUSED`) |
+| Espera del `pong` de confirmación | 1 s + 6 s (`RESUME_CONFIRM` + `SILENCE_TIMEOUT`); si no llega, el intento falla |
+| Recordatorio tras pasar la gracia | cada 60 s (`RETRY_NOTE_EVERY`) |
+| Gracia de la cuenta pesimista | 10 s desde el último contacto confirmado |
+| Gracia de la cuenta segura | último envío por una conexión instalada + 10 s + 1 s + 5 s (`STOP_BUDGET`) + 1 s (`NET_MARGIN`) |
+
+### Despedida del agente
+
+Cuando el agente termina a propósito (Ctrl+C, Ctrl+Break o SIGTERM) y ya detuvo sus
+nodos, manda `{"op":"adios","motivo":"Ctrl+C"}` (o el motivo que corresponda) justo
+antes de cerrar. Es con cierre ordenado y un plazo corto (`BYE_TIMEOUT`, 0.5 s). Es de
+cortesía: si no llega, la laptop lo trata como una pérdida normal, con gracia.
+
+- También se manda si lo cierran mientras prepara la sesión (antes de `sesion_ok`).
+  Entonces la laptop no arranca ningún nodo y sale con código 2.
+- No se manda al vencer la gracia, con un mensaje inválido ni con un error interno.
+- La laptop contesta con su propio `adios` antes de cerrar. Si el agente lo mandó
+  con nodos vivos por error, la sesión termina en el acto y no se queda en gracia.
+- Con los nodos ya detenidos, la laptop no dice "sus nodos siguen N s": dice que
+  cerraron el agente y que sus nodos están detenidos, y reintenta por si vuelve a
+  arrancar. Al volver, abre sesión nueva y ningún nodo arranca solo.### Límites
 
 | Qué | Valor |
 |---|---|
@@ -399,7 +507,12 @@ sí quiere decir que se perdió la conexión.
 | Conexiones sin saludar a la vez, por IP | 4 |
 | Conexiones sin saludar a la vez, en total | 32 (una queda reservada para la IP de la última sesión aceptada) |
 | Tiempo para completar el saludo | 10 s |
-| Silencio antes de dar la conexión por perdida | 6 s |
+| Silencio antes de dar la conexión por perdida (entra en gracia) | 6 s |
+| Gracia: sin laptop, sus nodos siguen esto desde lo último recibido de ella | 10 s (`GRACE`) |
+| Prórroga de una reanudación sin confirmar, una vez por gracia | 1 s (`RESUME_CONFIRM`) |
+| Memoria para reanudar, por sesión | 2 000 líneas de `log` y 1 MiB (`RESUME_LOG_LINES`, `RESUME_LOG_BYTES`) |
+| Nodos en `logs` de un `reanudar` | 1 024 (`RESUME_MAX_NODES`) |
+| Despedida del agente (`adios`), plazo de envío | 0.5 s (`BYE_TIMEOUT`) |
 | `ping` de la laptop | cada 2 s |
 | Órdenes pendientes por sesión | 64 |
 | Línea firmada | 64 KiB |
@@ -407,6 +520,22 @@ sí quiere decir que se perdió la conexión.
 | Cola de salida del agente, para los `log` | 5 000 mensajes o 4 MiB. Lo que no cabe se descarta y su `n` sigue subiendo |
 | Respuestas (`pong`, `error`) sin leer por la laptop | 1 000. Si pasan 6 s sin que las lea, el agente cierra la sesión |
 | Avisos en la terminal del agente por conexiones sin clave | Uno por IP y tipo, por minuto; 20 por minuto en total |
+
+### Compatibilidad
+
+- **Cliente de la 3b con agente de la 3c.** El cliente de la 3b ignora lo que no
+  conoce: `sesion_ok` con campos nuevos, y el `adios` del agente (no hace nada con
+  él). Al cerrarse la conexión, lo trata como antes: `agmen run` detiene todo. El
+  agente nuevo no sabe qué versión es la laptop, así que aplica la gracia igual.
+- **Agente de la 3b con cliente de la 3c.** El agente de la 3b no manda `sesion` ni
+  `gracia`, así que el cliente nuevo no puede reanudar: al volver, abre una sesión
+  nueva. Como no recibe la gracia, la toma como cero: nunca dice "sus nodos siguen
+  N s" (ese agente detiene sus nodos en cuanto pierde a la laptop), sino que puede
+  que ya los haya detenido. Aun así, usen la misma versión de Agmen en las dos
+  computadoras.
+- Los mensajes nuevos (`reanudar`, `reanudar_ok`, `adios`) van firmados igual que los
+  de antes, con el mismo `n` y la misma forma de la línea. El formato de la red no
+  cambió.
 
 ### Vectores de `agmen-agent/1`
 
@@ -427,4 +556,5 @@ El primer mensaje de la laptop (`n = 1`, sentido `c`) con `{"op":"ping","t":1.5}
 ```
 
 Estos valores vienen de la referencia `hmac`/`hashlib` y los comprueban las
-pruebas de `python/test_agent.py`.
+pruebas de `python/test_agent.py`. Los mensajes de la 3c no tienen vectores propios:
+se firman igual que estos.

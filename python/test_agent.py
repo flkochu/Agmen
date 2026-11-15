@@ -1586,7 +1586,7 @@ class TestColaDeSalida(unittest.TestCase):
         self.assertEqual(res[0][0], "estado")
 
 
-class TestCortes(unittest.TestCase):
+class TestCortarLineas(unittest.TestCase):   # antes TestCortes: la tapaba la otra TestCortes y no corría
     def test_cortar_y_limpiar(self):
         self.assertEqual(agent._cut("hola"), "hola")
         largo = agent._cut("é" * 20000)
@@ -1856,7 +1856,10 @@ class TestSesion(ServerCase):
         self.start_server()
         cli, ok = self.sesion()
         self.assertEqual(ok["op"], "sesion_ok")
-        self.assertEqual(ok, {"op": "sesion_ok", "maquina": "robot", "agmen": __version__, "nodos": ["motor", "imu"]})
+        self.assertRegex(ok.get("sesion", ""), r"^[0-9a-f]{32}$")   # 3c: el identificador para reanudar…
+        self.assertEqual(ok.get("gracia"), 10)                        # … y la gracia
+        self.assertEqual(ok, {"op": "sesion_ok", "maquina": "robot", "agmen": __version__, "nodos": ["motor", "imu"],
+                              "sesion": ok["sesion"], "gracia": 10})
         self.assertTrue(cli.wait(lambda ms: any(m["op"] == "estado" and m["nodo"] == "motor" and m["estado"] == "corriendo"
                                                for m in ms)))
         self.assertTrue(cli.wait(cli.hay("estado", nodo="imu", estado="corriendo")))
@@ -3420,10 +3423,15 @@ class E2EBase(unittest.TestCase):
         if hub_env:
             env["AGMEN_HUB"] = hub_env
         p, lineas = self.lanzar(["agent", str(toml or self.toml), "--machine", "robot", "--port", str(self.port)], env)
-        self.assertTrue(self.espera(lambda: any("clave: " in l for l in lineas) or p.poll() is not None, 40),
-                        "".join(lineas))
+        self.assertTrue(self.espera(lambda: any("esperando a agmen run" in l for l in lineas) or p.poll() is not None,
+                                    40), "".join(lineas))
         self.assertIsNone(p.poll(), "".join(lineas))
-        clave = next(l for l in lineas if "clave: " in l).rsplit("clave: ", 1)[1].strip()
+        # Con la salida por una tubería el agente no imprime la clave (3c §5): se pide con --show-key,
+        # con la misma carpeta de configuración.
+        r = subprocess.run([sys.executable, "-m", "agmen", "agent", "--show-key"], env=env, capture_output=True,
+                           text=True, encoding="utf-8", timeout=60, stdin=subprocess.DEVNULL)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        clave = r.stdout.strip()
         return p, lineas, clave
 
     def correr(self, clave: str | None = KEY, args: tuple = ("--no-web",), toml: Path | None = None, **extra):
@@ -3627,7 +3635,8 @@ class E2E(E2EBase):
         self.assertIsNone(pa.poll(), "el agente sigue esperando")
 
     # --- cortes
-    def test_matar_el_agente_con_todo_corriendo_agmen_run_sale_distinto_de_0_y_lo_dice(self):
+    def test_matar_el_agente_con_todo_corriendo_agmen_run_sigue_reintenta_y_lo_dice(self):
+        # 3c: perder un agente ya no detiene todo: agmen run lo dice, sigue con lo local y reintenta hasta Ctrl+C
         pa, la, clave = self.agente()
         pr, lr = self.correr(clave=clave)
         self.assertTrue(self.espera(lambda: any("robot/motor │ HOLA motor" in l for l in lr) or pr.poll() is not None, 60),
@@ -3635,13 +3644,26 @@ class E2E(E2EBase):
         self.assertTrue(self.espera(lambda: self.vivo("ia") and self.vivo("motor"), 30))
         pa.kill()
         pa.wait()
-        code = pr.wait(40)
-        self.assertNotEqual(code, 0, self.texto(lr))
+        self.assertTrue(self.espera(lambda: any("se perdió la conexión" in l for l in lr), 30), self.texto(lr))
+        t_perdio = time.monotonic()
+        self.assertIsNone(pr.poll(), "agmen run ya no sale por perder un agente\n" + self.texto(lr))
+        self.assertTrue(self.vivo("ia"), "lo local sigue corriendo")
+        # sigue vivo pasados ~12 s (la gracia de 10 s ya acabó), lo dice una vez y no escribe una línea por intento
+        self.assertTrue(self.espera(lambda: any("ya pasaron 10 s" in l for l in lr), 30), self.texto(lr))
+        self.assertTrue(self.espera(lambda: time.monotonic() - t_perdio >= 12.0, 15))
+        self.assertIsNone(pr.poll(), "agmen run salió pasada la gracia\n" + self.texto(lr))
+        self.assertTrue(self.vivo("ia"), "lo local sigue corriendo pasada la gracia")
         t = self.texto(lr)
-        self.assertIn("se perdió la conexión con agmen agent", t)
-        self.assertIn("Se detiene todo", t)
+        self.assertEqual(sum("): se perdió la conexión (" in l for l in lr), 1, t)
+        self.assertEqual(sum("ya pasaron 10 s" in l for l in lr), 1, t)
+        propias = [l for l in lr if re.match(r"agmen\s+│ robot", l) and "): conectado" not in l]
+        self.assertEqual(len(propias), 2, "agmen run dice solo la pérdida y el 'ya pasaron': nada por intento\n" + t)
+        self.assertEqual(self.detener(pr), 0, self.texto(lr))
+        t = self.texto(lr)
+        self.assertIn("reintento", t)
+        self.assertIn("robot no se enteró (sin conexión)", t)
         self.assertNotIn("Traceback", t)
-        self.assertTrue(self.espera(lambda: not self.vivo("ia"), 30), "lo local debe detenerse al perderse la otra computadora")
+        self.assertTrue(self.espera(lambda: not self.vivo("ia"), 30), "Ctrl+C detiene lo local")
         # (los nodos del agente quedaron huérfanos porque se mató al agente sin avisarle: los limpia _limpiar)
 
     def test_matar_agmen_run_el_agente_detiene_sus_nodos_y_acepta_otra(self):
@@ -4658,3 +4680,183 @@ class TestTerminalInteractiva(E2EBase):
         self.assertNotIn("EOFError", texto)
         self.assertFalse(list(self.marks.iterdir()))
         self.assertFalse((self.dir / "cfg-run" / "keys.toml").exists())
+
+
+# ===========================================================================
+# Parte 3c §5: la clave del agente como servicio (agmen agent --show-key) y la línea de espera sin la clave
+# ===========================================================================
+
+FORMA_CLAVE = re.compile(r"^[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$")
+
+
+class TestClaveDelAgenteComoServicio(E2EBase):
+    """agmen agent --show-key: imprime solo la clave y sale, sin robot.toml ni puertos; y con la salida por una
+    tubería (journalctl) la línea de espera no lleva la clave."""
+
+    def cfg_env(self) -> dict:
+        return self.env("agente")
+
+    def show(self, *args: str, env: dict | None = None, cwd: Path | None = None):
+        return subprocess.run([sys.executable, "-m", "agmen", "agent", "--show-key", *args], env=env or self.cfg_env(),
+                              capture_output=True, text=True, encoding="utf-8", timeout=60, stdin=subprocess.DEVNULL,
+                              cwd=cwd or self.dir)
+
+    def crear_clave(self) -> str:
+        """Crea la clave de la carpeta cfg-agente como lo hace agmen agent la primera vez (sin abrir puertos)."""
+        with mock.patch.dict(os.environ, {"AGMEN_CONFIG_DIR": str(self.dir / "cfg-agente"), "AGMEN_AGENT_KEY": ""}):
+            clave, creada = agent.load_agent_key()
+            self.assertTrue(creada)
+            return clave
+
+    def archivo_clave(self) -> Path:
+        return self.dir / "cfg-agente" / "agent.key"
+
+    def sin_robot_toml(self) -> Path:
+        carpeta = self.dir / "vacia"
+        carpeta.mkdir()
+        self.addCleanup(shutil.rmtree, carpeta, True)
+        return carpeta
+
+    def test_con_clave_imprime_solo_la_clave_y_sale_con_0_sin_robot_toml(self):
+        clave = self.crear_clave()
+        vacia = self.sin_robot_toml()
+        r = self.show(cwd=vacia)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, clave + "\n", "stdout debe ser solo la clave")
+        self.assertRegex(r.stdout.strip(), FORMA_CLAVE)
+        self.assertEqual(r.stderr, "", "sin avisos cuando no se le da nada más")
+        self.assertEqual(list(vacia.iterdir()), [], "no debe crear archivos junto a donde corre")
+
+    def test_no_abre_ningun_puerto_ni_crea_ni_cambia_la_clave(self):
+        import contextlib
+        from agmen import cli
+        clave = self.crear_clave()
+        antes = self.archivo_clave().read_bytes()
+        vacia = self.sin_robot_toml()
+        salida, err = io.StringIO(), io.StringIO()
+
+        def prohibido(*a, **k):
+            raise AssertionError("--show-key no debe abrir ni escuchar en ningún puerto")
+
+        viejo = os.getcwd()
+        os.chdir(vacia)
+        self.addCleanup(os.chdir, viejo)
+        with mock.patch.dict(os.environ, {"AGMEN_CONFIG_DIR": str(self.dir / "cfg-agente"), "AGMEN_AGENT_KEY": ""}), \
+                mock.patch.object(socket.socket, "bind", prohibido), mock.patch.object(socket.socket, "listen", prohibido), \
+                mock.patch.object(socket.socket, "connect", prohibido), \
+                contextlib.redirect_stdout(salida), contextlib.redirect_stderr(err):
+            codigo = cli.main(["agent", "--show-key"])
+        self.assertEqual(codigo, 0, err.getvalue())
+        self.assertEqual(salida.getvalue(), clave + "\n")
+        self.assertEqual(self.archivo_clave().read_bytes(), antes)
+        self.assertEqual(list(vacia.iterdir()), [])
+
+    def test_sin_clave_creada_error_en_espanol_que_dice_como_se_crea_y_no_la_crea(self):
+        r = self.show()
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertEqual(r.stdout, "", "el error va a stderr; stdout queda vacío para los scripts")
+        self.assertTrue(r.stderr.startswith("error:"), r.stderr)
+        self.assertIn("agmen agent robot.toml", r.stderr, "debe decir cómo se crea la clave")
+        self.assertIn("todavía no hay clave", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertFalse(self.archivo_clave().exists(), "--show-key no debe crear la clave")
+        self.assertFalse((self.dir / "cfg-agente").exists() and any((self.dir / "cfg-agente").iterdir()),
+                         "ni dejar nada en la carpeta de configuración")
+
+    def test_junto_con_new_key_se_niega_y_no_toca_la_clave(self):
+        clave = self.crear_clave()
+        antes = self.archivo_clave().read_bytes()
+        r = self.show("--new-key")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual(r.stdout, "", "no imprime ninguna clave: no queda claro cuál se pidió")
+        self.assertIn("--show-key y --new-key no van juntas", r.stderr)
+        self.assertNotIn(clave, r.stderr)
+        self.assertEqual(self.archivo_clave().read_bytes(), antes, "la clave sigue igual")
+        # y sin clave previa tampoco la crea
+        self.archivo_clave().unlink()
+        r = self.show("--new-key")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertFalse(self.archivo_clave().exists(), "--new-key junto a --show-key no debe crear nada")
+
+    def test_junto_con_un_robot_toml_lo_ignora_avisa_por_stderr_y_no_cambia_nada(self):
+        clave = self.crear_clave()
+        antes = self.archivo_clave().read_bytes()
+        for args in ([str(self.toml)], [str(self.dir / "no_existe.toml")], [str(self.toml), "--machine", "robot", "--port", "9"]):
+            with self.subTest(args=args):
+                r = self.show(*args)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(r.stdout, clave + "\n", "stdout sigue siendo solo la clave")
+                self.assertIn("nota: --show-key no usa", r.stderr)
+                self.assertNotIn(clave, r.stderr)
+                self.assertEqual(self.archivo_clave().read_bytes(), antes)
+        self.assertFalse(list(self.marks.iterdir()), "no arrancó ningún nodo")
+
+    def test_con_la_salida_por_una_tuberia_la_linea_de_espera_no_lleva_la_clave(self):
+        p, lineas, clave = self.agente()
+        espera = next(l for l in lineas if "esperando a agmen run" in l)
+        ruta = self.archivo_clave()
+        self.assertIn(f"clave: guardada en {ruta} (agmen agent --show-key la muestra)", espera)
+        self.assertNotIn("clave: " + clave, espera)
+        self.assertTrue(self.espera(lambda: any("clave creada" in l for l in lineas), 10), "".join(lineas))
+        self.assertEqual(self.detener(p), 0, "".join(lineas))
+        texto = "".join(lineas)
+        for forma in (clave, clave.replace("-", ""), clave.upper()):
+            self.assertNotIn(forma, texto, "la clave no debe salir en ninguna línea del agente sin terminal")
+        self.assertRegex(clave, FORMA_CLAVE)
+
+    @unittest.skipUnless(os.name == "posix", "necesita una terminal de verdad (pty): solo POSIX")
+    def test_con_una_terminal_de_verdad_la_linea_de_espera_si_lleva_la_clave(self):
+        import pty
+
+        env = self.env("agente")
+        maestro, esclavo = pty.openpty()
+        p = subprocess.Popen([sys.executable, "-m", "agmen", "agent", str(self.toml), "--machine", "robot", "--port",
+                              str(self.port)], env=env, stdin=subprocess.DEVNULL, stdout=esclavo, stderr=esclavo,
+                             cwd=self.dir, start_new_session=True)
+        os.close(esclavo)
+        self.procs.append(p)
+        salida = bytearray()
+
+        def leer():
+            while True:
+                try:
+                    d = os.read(maestro, 4096)
+                except OSError:
+                    return
+                if not d:
+                    return
+                salida.extend(d)
+
+        threading.Thread(target=leer, daemon=True).start()
+        self.addCleanup(os.close, maestro)
+        ver = lambda: bytes(salida).decode("utf-8", "replace").replace("\r", "")
+        self.assertTrue(self.espera(lambda: "esperando a agmen run" in ver(), 40), ver())
+        espera = next(l for l in ver().splitlines() if "esperando a agmen run" in l)
+        m = re.search(r"clave: (\S+)", espera)
+        self.assertIsNotNone(m, espera)
+        r = self.show(env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(m.group(1), r.stdout.strip(), "con terminal la línea trae la clave de verdad")
+        self.assertNotIn("guardada en", espera)
+        self.assertEqual(self.detener(p), 0, ver())
+
+
+class TestServicioDeSystemd(unittest.TestCase):
+    """§15: examples/tutorial/agmen-agent.service dice la verdad y no se rinde (revisión del archivo, sin systemd)."""
+
+    def test_machine_reintentos_sin_limite_y_tiempo_para_despedirse(self):
+        texto = (ROOT / "examples" / "tutorial" / "agmen-agent.service").read_text(encoding="utf-8")
+        campos = {}
+        for linea in texto.splitlines():
+            if linea and not linea.startswith("#") and "=" in linea:
+                k, v = linea.split("=", 1)
+                campos[k.strip()] = v.strip()
+        self.assertRegex(campos["ExecStart"], r" agent .* --machine \S+", "sin --machine, sin IP al encender sale con 2")
+        self.assertRegex(texto, r"--machine.*<-- EDITA|<-- EDITA.*\n(#.*\n)*ExecStart=.*--machine")
+        self.assertEqual(campos["StartLimitIntervalSec"], "0", "systemd no debe rendirse al arrancar sin red")
+        self.assertEqual(campos["Restart"], "on-failure")
+        self.assertTrue(1 <= float(campos["RestartSec"]) <= 30, campos["RestartSec"])
+        # el peor caso de end(): 2 órdenes a medias (15 s c/u), nodos y hub (STOP_BUDGET c/u), lo pendiente y el adios
+        peor = 2 * 15 + 2 * agent.STOP_BUDGET + 2.0 + 2 * agent.BYE_TIMEOUT + 1.0
+        self.assertGreaterEqual(float(campos["TimeoutStopSec"]), peor + 5, f"peor caso ~{peor:g} s, con margen")
+        self.assertNotIn("escucha en la IP", texto, "el agente escucha en todas las interfaces")

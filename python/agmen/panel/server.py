@@ -426,13 +426,27 @@ class Panel:
         for c in self.commands:
             c.close()
 
+    def nodes_info(self) -> list[dict]:
+        """Los nodos, cada uno con `machine` (RFC 0011 parte 3c §4; None si corre aquí sin [[machine]])."""
+        nodes = self.launcher.nodes_info() if self.launcher else []
+        for n in nodes:
+            n.setdefault("machine", None)
+        return nodes
+
+    def machines_info(self) -> list[dict]:
+        """Las computadoras del robot y cómo está la conexión con cada una (RFC 0011 parte 3c §4).
+        Vacía sin [[machine]] (o con un Launcher que no las conoce): el panel se ve como siempre."""
+        get = getattr(self.launcher, "machines_info", None) if self.launcher is not None else None
+        return get() if get is not None else []
+
     def snapshot(self) -> dict:
         return {
             "robot": self.robot_name,
             "profile": self.profile,
             "playing": self.playing,
             "version": __version__,
-            "nodes": self.launcher.nodes_info() if self.launcher else [],
+            "nodes": self.nodes_info(),
+            "machines": self.machines_info(),
             "managed": self.launcher is not None,
             "teleop": self.teleop.info() if self.teleop else None,
             "commands": [c.info() for c in self.commands],
@@ -764,8 +778,10 @@ class Panel:
                                    HTTPStatus.BAD_REQUEST)
                         return
                     err = panel.launcher.action(parts[2], parts[3])
-                    self._json({"error": err} if err else {"ok": True},
-                               HTTPStatus.BAD_REQUEST if err else HTTPStatus.OK)
+                    from ..run import NoConnection
+                    status = (HTTPStatus.CONFLICT if isinstance(err, NoConnection)    # §15: sin conexión con su
+                              else HTTPStatus.BAD_REQUEST if err else HTTPStatus.OK)  # computadora: 409
+                    self._json({"error": str(err)} if err else {"ok": True}, status)
                 elif parts == ["api", "record"]:
                     err = panel.record_action(str(body.get("action", "")))
                     self._json({"error": err} if err else {"ok": True, "recording": panel.recording_info()},
