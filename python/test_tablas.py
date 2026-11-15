@@ -57,9 +57,9 @@ class Lado:
             self.sent.append(data)
             real_send(data)
 
-        def read(now):
+        def read(now, names=()):
             self.ticks += 1
-            return real_read(now)
+            return real_read(now, names)
 
         self.bridge._send, self.bridge._read_hub = send, read
         self.bridge.start()
@@ -236,6 +236,30 @@ class TestDosComputadoras(Base):
         (got,) = self.cruza([pub], [sub])
         self.assertEqual(got[0].message, TR.Chico(5, 6))
 
+    def test_si_la_tabla_del_hub_no_cabe_se_dice_eso_y_no_que_no_contesta(self):
+        """§8.3: un hub vivo con 60 topics de esquemas de ~1000 caracteres: su respuesta a `query` no cabe en un
+        datagrama. El puente lo dice (no "no contesta"), al otro le manda una tabla vacía, y el hub lo dice en su log."""
+        sub = self.lb.open(self, pubsub._PureSubscriber, TR.Chico, "/x")
+        pub = self.la.open(self, pubsub._PurePublisher, TR.Chico, "/x")
+        self.cruza([pub], [sub])
+        self.assertTrue(self.canal.pb.table[0])                 # el robot tiene la tabla de la laptop
+        texto = "Largo{" + ", ".join(f"f32 campo{i}" for i in range(80)) + "}"
+        for i in range(60):
+            self.la.hub.keep(hp.encode("pub", id=f"largo{i}", node="largo", pid=1, topic=f"/largo{i}",
+                                       schema=f"{0xabc000 + i:016x}", type=f"Largo{i}", text=texto))
+        with mock.patch.object(T, "HUB_QUIET_S", 0.0):
+            ok = until(lambda: any("no cabe en una respuesta" in t for t in self.la.said))
+        self.assertTrue(ok, self.la.said)
+        self.assertIn("⚠ la tabla de mi hub no cabe en una respuesta (demasiados topics o esquemas muy largos): no "
+                      "puedo pasarle mis topics a 'robot'", self.la.said)
+        self.assertFalse(any("no contesta" in t for t in self.la.said), self.la.said)
+        self.assertTrue(until(lambda: self.canal.pb.table == ([], [])))   # sin dejarle al robot una tabla vieja
+        self.assertTrue(until(lambda: not self.lb.remotas("laptop")))
+        avisos = [t for t in self.la.hub.logs if "la respuesta a 'query' no cabe en un datagrama" in t]
+        self.assertEqual(len(avisos), 1, self.la.hub.logs[-5:])
+        self.assertRegex(avisos[0], r"\(\d+ bytes, máximo 65507; \d+ endpoints\)")
+        self.assertEqual(sum("no cabe en una respuesta" in t for t in self.la.said), 1)
+
     def test_el_reproductor_manda_a_otra_computadora(self):
         sub = self.lb.open(self, pubsub._PureSubscriber, TR.Chico, "/r")
         rp = self.la.open(self, play._ReplayPublisher, TR.Chico, "/r", 77)
@@ -345,10 +369,10 @@ class TestTabla(Base):
                           "subs": [*malos, ep_sub(0)]})
         self.assertEqual([d["id"] for d in peer.table[0]], ["p2"])
         self.assertEqual([d["id"] for d in peer.table[1]], ["s0"])
-        avisos = [t for t in said if "endpoint inválido" in t]
-        # Uno por motivo (dos id mal escritos, o dos puertos fuera de rango, son el mismo), aunque llegue dos veces.
-        self.assertEqual(len(avisos), len(set(avisos)))
-        self.assertEqual(len(avisos), len(malos) + 1 - 2)
+        avisos = [t for t in said if "endpoint(s) inválido(s)" in t]
+        # §8.5: UN aviso por tipo de problema, con cuántas y un ejemplo, aunque la tabla llegue dos veces.
+        self.assertEqual(len(avisos), 1, said)
+        self.assertIn(f"trae {len(malos) + 1} endpoint(s) inválido(s) (p. ej.: ", avisos[0])
         for ln in peer.hub_lines():
             self.assertNotIn(b"\n", ln)
             self.assertEqual(len(hp.parse(ln)), 1)                  # una sola línea, sin espacios ni saltos sin escapar
@@ -362,7 +386,7 @@ class TestTabla(Base):
                     {"n": 3, "parte": 1, "de": 1, "pubs": [], "subs": [ep_sub(i) for i in range(101)]}):
             peer.receive({"op": "tablas", **bad})
         self.assertEqual([d["id"] for d in peer.table[1]], ["s0"])
-        self.assertEqual(sum("no sirve" in t for t in said), 3)          # (los dos primeros, el mismo motivo)
+        self.assertEqual(sum("no sirve" in t for t in said), 1)          # §8.5: uno por tipo de problema
 
     def test_la_ip_la_pone_el_receptor(self):
         b = bridge_sin_hub(self)
@@ -385,7 +409,7 @@ class TestTabla(Base):
         b._sock = mock.Mock()
         b._sock.recvfrom.side_effect = BlockingIOError
         b._send = sent.append
-        b._read_hub = lambda now: ([], [])
+        b._read_hub = lambda now, names=(): ([], [])
         peer = b.add_peer("robot", lambda part: None)
         peer.receive({"op": "tablas", "n": 1, "parte": 1, "de": 1, "pubs": [], "subs": [ep_sub(1)]})
         self.assertIsNone(peer.table)
@@ -463,6 +487,7 @@ class TestCapacidad(Base):
         peer = b.add_peer("robot", link.send_table)
         link.bridge(peer)                           # sin conexión todavía: nada
         chan = SimpleNamespace(sock=SimpleNamespace(getpeername=lambda: (ROBOT_IP, 7391)))
+        link.channel = chan
         for ok in ({"op": "sesion_ok"}, {"op": "sesion_ok", "tablas": True}, {"op": "sesion_ok", "tablas": "1"}):
             link._tables = A._says_tables(ok)
             link._bridge_up(chan)
@@ -470,7 +495,7 @@ class TestCapacidad(Base):
         self.assertEqual(len(notes), 1)
         self.assertIn("no dice 'tablas'", notes[0])
         self.assertIn("Actualiza Agmen en robot", notes[0])
-        link._tables = A._says_tables({"op": "sesion_ok", "tablas": 1})
+        link._set_tables({"op": "sesion_ok", "tablas": 1})
         link._bridge_up(chan)
         self.assertTrue(peer.confirmed)
         self.assertEqual(peer.ip, ROBOT_IP)
@@ -501,6 +526,313 @@ class TestCapacidad(Base):
 
 
 # ---------------------------------------------------------------------------
+# Lo que pidió la revisión (§8 de la especificación de la 4b)
+# ---------------------------------------------------------------------------
+
+def tabla(n, pubs=(), subs=(), parte=1, de=1):
+    return {"op": "tablas", "n": n, "parte": parte, "de": de, "pubs": list(pubs), "subs": list(subs)}
+
+
+def ep_pub(i, **kw):
+    d = {"id": f"p{i}", "node": "n", "pid": "1", "topic": f"/t{i}", "schema": "00000000000000aa", "type": "X",
+         "text": "X{u32 a}"}
+    d.update(kw)
+    return d
+
+
+def link_de_prueba(case):
+    """Un AgentLink con un canal de mentira (sin red) y el Peer de un puente sin hub."""
+    link = A.AgentLink(SimpleNamespace(name="robot", host=ROBOT_IP, port=7391))
+    notes = []
+    link._notice = lambda text, kind="agmen": notes.append(text)
+    b = bridge_sin_hub(case)
+    peer = b.add_peer("robot", link.send_table)
+    link.bridge(peer)
+    return link, peer, notes
+
+
+class TestEnvioQueFalla(Base):
+    """§8.1: un envío que falla a medias deja el canal inservible y es una pérdida de la conexión."""
+
+    def test_tras_un_envio_a_medias_el_canal_no_escribe_nada_mas(self):
+        escrito = []
+
+        def sendall(data):
+            escrito.append(data[: len(data) // 2])   # salió la mitad de la línea y se agotó el tiempo
+            raise socket.timeout()
+
+        sock = mock.Mock()
+        sock.sendall.side_effect = sendall
+        ch = A.Channel(sock, b"k" * 32, "c", lines=mock.Mock())
+        with self.assertRaises(A.ChannelError):
+            ch.send(tabla(1))
+        for obj in ({"op": "ping", "t": 1.0}, {"op": "detener_todo"}):
+            with self.assertRaises(A.ChannelClosed):
+                ch.send(obj)
+        self.assertEqual(len(escrito), 1)                      # nada detrás de la línea a medias
+        self.assertEqual(sock.sendall.call_count, 1)
+
+    def test_la_laptop_lo_trata_como_perdida_y_no_manda_las_demas_partes(self):
+        link, peer, _ = link_de_prueba(self)
+        mandado = []
+
+        def send(obj):
+            mandado.append(obj)
+            raise A.ChannelError("la otra punta no lee hace 6 s")
+
+        link.channel = SimpleNamespace(send=send, close=lambda: None,
+                                       sock=SimpleNamespace(getpeername=lambda: (ROBOT_IP, 7391)))
+        link._set_tables({"op": "sesion_ok", "tablas": 1})
+        link._bridge_up(link.channel)
+        self.assertTrue(peer.confirmed)
+        peer.offer([tabla(1, parte=i, de=3) for i in (1, 2, 3)])
+        self.assertTrue(until(lambda: link.lost, 5), mandado)
+        self.assertIn("no pude mandarle la tabla de topics", link.lost)
+        self.assertFalse(peer.confirmed)
+        time.sleep(0.2)                                         # (el hilo del Peer ya no manda nada más)
+        self.assertEqual(len(mandado), 1)
+
+    def test_no_cabe_no_es_una_perdida(self):
+        link, peer, _ = link_de_prueba(self)
+
+        def send(obj):
+            raise A.MessageTooLarge("el mensaje 'tablas' mide 70000 bytes")
+
+        link.channel = SimpleNamespace(send=send, sock=SimpleNamespace(getpeername=lambda: (ROBOT_IP, 7391)))
+        link._set_tables({"op": "sesion_ok", "tablas": 1})
+        link._bridge_up(link.channel)
+        with self.assertRaises(A.MessageTooLarge):
+            link.send_table(tabla(1))
+        self.assertEqual(link.lost, "")
+        self.assertTrue(peer.confirmed)
+
+
+class TestConfirmarYPerderNoSeCruzan(Base):
+    """§8.2: si la pérdida llega entre la revisión y el confirm, el Peer queda sin confirmar (no repite `red`)."""
+
+    def test_laptop(self):
+        link, peer, _ = link_de_prueba(self)
+        chan = SimpleNamespace(sock=SimpleNamespace(getpeername=lambda: (ROBOT_IP, 7391)), close=lambda: None)
+        link.channel = chan
+        link._set_tables({"op": "sesion_ok", "tablas": 1})
+        real = A._show_ip
+
+        def pierde_justo_ahora(ip):
+            link._lose("se cortó", link._gen)                  # el lector pierde la conexión en este instante
+            return real(ip)
+
+        with mock.patch.object(A, "_show_ip", side_effect=pierde_justo_ahora):
+            link._bridge_up(chan)
+        self.assertTrue(link.lost)
+        self.assertFalse(peer.confirmed)
+
+    def sesion(self, unconfirmed: bool):
+        s = A._Session.__new__(A._Session)
+        ch = mock.Mock()
+        now = time.monotonic()
+        s.__dict__.update(_end_lock=threading.Lock(), _ending=False, channel=ch, unconfirmed=ch if unconfirmed else None,
+                          lost_at=now if unconfirmed else None, _grace_timer=None, _grace_token=0, _extended=False,
+                          deadline=now + 10, out=mock.Mock(), ip="::ffff:127.0.0.3", _replaced=None,
+                          say=lambda *a, **k: None, server=SimpleNamespace(lock=threading.Lock(), trusted=None),
+                          ready=threading.Event(), last_rx=now, peer=None, bridge=None,
+                          _first={"desde": "laptop"}, launcher=SimpleNamespace(say=lambda *a, **k: None))
+        s.ready.set()
+        s._arm = lambda deadline: None                          # (sin temporizador de verdad)
+        return s, ch
+
+    def test_agente_al_reanudar(self):
+        s, ch = self.sesion(unconfirmed=True)
+        s.peer = bridge_sin_hub(self).add_peer("laptop", lambda part: None)
+        real = A._show_ip
+
+        def pierde_justo_ahora(ip):
+            s._lost(ch, "dejó de contestar", "x")
+            return real(ip)
+
+        with mock.patch.object(A, "_show_ip", side_effect=pierde_justo_ahora):
+            s._confirm(ch)
+        self.assertFalse(s.peer.confirmed)
+
+    def test_agente_al_arrancar_el_puente(self):
+        s, ch = self.sesion(unconfirmed=False)
+        real = A._show_ip
+
+        def pierde_justo_ahora(ip):
+            s._lost(ch, "dejó de contestar", "x")
+            return real(ip)
+
+        with mock.patch("agmen.pubsub.hub_address", return_value="127.0.0.1:9"), \
+                mock.patch.object(A, "_show_ip", side_effect=pierde_justo_ahora):
+            s._start_bridge()
+        self.addCleanup(s.bridge.close)
+        self.assertIsNotNone(s.peer)
+        self.assertFalse(s.peer.confirmed)
+
+
+class TestTopesYAvisos(Base):
+    def peer(self, said):
+        b = bridge_sin_hub(self, said)
+        peer = b.add_peer("robot", lambda part: None)
+        peer.confirm(ROBOT_IP)
+        return peer
+
+    def test_un_endpoint_que_no_cabe_en_una_linea_del_hub_se_descarta_y_se_dice(self):
+        """§8.4: TEXT_MAX va en caracteres; escapado para el hub, un esquema de 16 000 'é' pasa de 64 KiB."""
+        said = []
+        peer = self.peer(said)
+        largo = ep_pub(1, text="é" * T.TEXT_MAX)
+        peer.receive(tabla(1, pubs=[largo, ep_pub(2)]))
+        self.assertEqual([d["id"] for d in peer.table[0]], ["p2"])
+        self.assertTrue(all(len(ln) <= T.HUB_LINE_MAX for ln in peer.hub_lines()))
+        avisos = [t for t in said if "no caben en una línea para el agmen hub" in t]
+        self.assertEqual(len(avisos), 1, said)
+        self.assertIn("trae 1 endpoint(s)", avisos[0])
+
+    def test_una_tabla_no_pasa_de_1_mib_escapada(self):
+        said = []
+        peer = self.peer(said)
+        m = 8
+        for i in range(1, m + 1):   # 800 endpoints de ~1.6 KB por línea: ~1.3 MB
+            peer.receive(tabla(1, pubs=[ep_pub(i * 1000 + k, text="X" * 1500) for k in range(100)], parte=i, de=m))
+        lines = peer.hub_lines()
+        self.assertLess(len(lines), 800)
+        self.assertLessEqual(sum(len(ln) for ln in lines), T.TABLE_MAX_BYTES)
+        avisos = [t for t in said if "pasa de 1024 KiB" in t]
+        self.assertEqual(len(avisos), 1, said)
+        self.assertIn(f"descarto {800 - len(lines)} endpoint(s)", avisos[0])
+
+    def test_al_mandar_no_sale_un_endpoint_que_el_otro_no_podria_pasar_a_su_hub(self):
+        said = []
+        b = bridge_sin_hub(self, said)
+        parts = b._parts([ep_pub(1, text="é" * T.TEXT_MAX), ep_pub(2)], [])
+        self.assertEqual([d["id"] for p in parts for d in p["pubs"]], ["p2"])
+        self.assertEqual(sum("demasiado grande" in t for t in said), 1, said)
+
+    def test_cientos_de_rechazos_son_un_aviso_por_tipo_con_cuantas_y_un_ejemplo(self):
+        """§8.5: 300 endpoints inválidos en 3 partes, varias veces: un aviso (no 300, ni uno cada SAID_MAX)."""
+        said = []
+        peer = self.peer(said)
+        for n in range(1, 4):
+            for i in range(1, 4):
+                malos = [ep_sub(i * 1000 + k, topic=f"/x y{k}", node=f"nodo{k}") for k in range(100)]
+                peer.receive(tabla(n, subs=malos, parte=i, de=3))
+        avisos = [t for t in said if "inválido" in t]
+        self.assertEqual(len(avisos), 1, said[:5])
+        self.assertIn("trae 300 endpoint(s) inválido(s) (p. ej.: nombre de topic inválido '/x y0'", avisos[0])
+        self.assertEqual(peer.table, ([], []))
+        # y el registro de avisos no se vacía (si se vaciara, volverían a salir los de antes)
+        b = peer.bridge
+        for k in range(T.SAID_MAX + 5):
+            b.say_once(("x", k), f"aviso {k}")
+        b.say_once(("ep", "robot"), "otra vez")
+        self.assertNotIn("otra vez", said)
+        self.assertEqual(sum("no digo los nuevos" in t for t in said), 1)
+
+
+class TestSinTablasDiceLaCausa(Base):
+    """§8.6: si el agente dice por qué no hace puente, la laptop lo dice tal cual (y no "actualiza Agmen")."""
+
+    def test_la_laptop_dice_la_causa_que_da_el_agente(self):
+        link, peer, notes = link_de_prueba(self)
+        chan = SimpleNamespace(sock=SimpleNamespace(getpeername=lambda: (ROBOT_IP, 7391)))
+        link.channel = chan
+        link._set_tables({"op": "sesion_ok", "sin_tablas": "en robot [hub] enabled = false"})
+        link._bridge_up(chan)
+        self.assertFalse(peer.confirmed)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("robot no pasa topics entre computadoras (en robot [hub] enabled = false)", notes[0])
+        self.assertNotIn("Actualiza", notes[0])
+
+    def test_el_agente_dice_por_que_en_su_sesion_ok(self):
+        s = SimpleNamespace(_first={"op": "sesion", "tablas": 1, "desde": "laptop"}, ip="::ffff:127.0.0.3",
+                            plan=SimpleNamespace(config=SimpleNamespace(hub=False)),
+                            server=SimpleNamespace(machine="robot"), launcher=SimpleNamespace(say=lambda *a, **k: None),
+                            _no_tables="")
+        self.assertFalse(A._Session._wants_tables(s))
+        self.assertEqual(s._no_tables, "en robot [hub] enabled = false")
+
+
+class TestSinTablasDeVerdad(TA.ServerCase):
+    """§8.6 con un agente de verdad ([hub] enabled = false en ServerCase): sesion_ok trae "sin_tablas"."""
+
+    def test_sesion_ok_trae_sin_tablas(self):
+        self.start_server()
+        _, ok = self.sesion(msg=self.mensaje(tablas=1, desde="laptop"))
+        self.assertEqual(ok["op"], "sesion_ok", ok)
+        self.assertNotIn("tablas", ok)
+        self.assertEqual(ok["sin_tablas"], "en robot [hub] enabled = false")
+
+
+class TestTablasNoEstorban(Base):
+    """§8.7: las tablas no le quitan sitio a lo importante."""
+
+    def test_en_la_cola_del_agente_una_tabla_pendiente_se_sustituye_y_no_hace_descartar_log(self):
+        out = A._Outbox()
+        for n in (1, 2):
+            for i in (1, 2, 3):
+                self.assertTrue(out.put(tabla(n, parte=i, de=3)))
+        self.assertEqual([json.loads(b)["n"] for _, b, *_ in out.items], [2, 2, 2])
+        for k in range(A.OUT_MAX_MSGS - 1):
+            self.assertTrue(out.put({"op": "log", "nodo": "a", "n": k, "linea": "x"}, droppable=True))
+        self.assertTrue(out.put(tabla(3, subs=[ep_sub(k) for k in range(100)])))
+        self.assertTrue(out.put({"op": "log", "nodo": "a", "n": 9999, "linea": "x"}, droppable=True))
+        self.assertEqual(out.dropped, 0)
+        self.assertEqual(out.replies, 0)
+        self.assertEqual(out.tables, 1)
+        out.drop_tables()                                        # al cerrar: el adios no espera detrás de una tabla
+        self.assertFalse(any(op == "tablas" for op, *_ in out.items))
+        self.assertTrue(out.put({"op": "adios"}))
+
+    def test_al_cerrar_la_laptop_no_manda_mas_tablas(self):
+        """Desde que empieza finish() (Ctrl+C), el hilo del Peer ya no mete tablas delante de detener_todo y adios."""
+        link, peer, _ = link_de_prueba(self)
+        mandado = []
+
+        def send(obj):
+            mandado.append(obj["op"])
+            if obj["op"] == "detener_todo":
+                link.send_table(tabla(9))                     # el hilo del Peer, justo ahora
+
+        link.channel = mock.Mock(send=send)
+        link.channel.sock.getpeername.return_value = (ROBOT_IP, 7391)
+        link._set_tables({"op": "sesion_ok", "tablas": 1})
+        link._bridge_up(link.channel)
+        self.assertTrue(peer.confirmed)
+        with mock.patch.object(A, "_bye", lambda channel, reader=None: channel.send({"op": "adios"})):
+            link.finish(0)
+        self.assertEqual(mandado, ["detener_todo", "adios"])
+        self.assertFalse(peer.confirmed)
+
+    def test_cerrar_el_puente_no_espera_un_segundo_por_cada_peer_atorado(self):
+        b = T.Bridge("127.0.0.1:9", lambda *a: None)
+        suelta = threading.Event()
+        self.addCleanup(suelta.set)
+        peers = [b.add_peer(f"r{i}", lambda part: suelta.wait(10)) for i in range(3)]
+        for i, p in enumerate(peers):
+            p.confirm(f"127.0.0.{10 + i}")
+            p.offer([tabla(1)])
+        self.assertTrue(until(lambda: all(p._outgoing is None for p in peers), 5))
+        t0 = time.monotonic()
+        b.close()
+        self.assertLess(time.monotonic() - t0, 1.8)
+
+
+class TestHubQueNoContesta(Base):
+    """(e) y §8.3: "no contesta" solo cuando de verdad no contesta."""
+
+    def test_un_hub_que_no_esta_se_dice_una_vez(self):
+        said = []
+        b = bridge_sin_hub(self, said)
+        b._sock = mock.Mock()
+        b._sock.recvfrom.side_effect = BlockingIOError
+        with mock.patch.object(T, "HUB_QUIET_S", 0.0), mock.patch.object(T, "QUERY_TIMEOUT", 0.05):
+            for _ in range(3):
+                b.tick()
+        self.assertEqual(sum("no contesta" in t for t in said), 1, said)
+        self.assertFalse(any("no cabe" in t for t in said))
+
+
+# ---------------------------------------------------------------------------
 # De punta a punta: dos procesos de verdad
 # ---------------------------------------------------------------------------
 
@@ -523,14 +855,26 @@ class Cmd(wire.Message):
     SCHEMA = "PuenteCmd{u32 v}"
     v: int
 
+@dataclass
+class Grande(wire.Message):
+    SCHEMA = "PuenteGrande{u32 n;bytes data}"
+    n: int
+    data: bytes
+
 modo, marks = sys.argv[1], sys.argv[2]
+with open(os.path.join(marks, "arranque_" + modo), "a") as f:
+    f.write(str(os.getpid()) + "\\n")
 fin = time.time() + 120
 try:
     if modo == "pub":
         pub = agmen.Publisher(Imu, "/imu")
+        pubg = agmen.Publisher(Grande, "/grande")
+        datos = bytes(range(256)) * 400      # 100 KiB: más que un datagrama (va por TCP)
         n = 0
         while time.time() < fin:
             pub.publish(Imu(n))
+            if n % 5 == 0:
+                pubg.publish(Grande(n, datos))
             n += 1
             time.sleep(0.1)
     else:
@@ -558,6 +902,56 @@ class Cmd(wire.Message):
     v: int
 
 
+@dataclass
+class Grande(wire.Message):
+    SCHEMA = "PuenteGrande{u32 n;bytes data}"
+    n: int
+    data: bytes
+
+
+def hub_en_red(hub: str) -> bool | None:
+    """¿El hub está en modo red? (su pong dice red=1). None si no contesta."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(0.5)
+    try:
+        s.sendto(hp.encode("ping"), pubsub._addr(hub))
+        data, _ = s.recvfrom(65536)
+    except OSError:
+        return None
+    finally:
+        s.close()
+    return any(op == "pong" and f.get("red") == "1" for op, f in hp.parse(data))
+
+
+def remotas_de(hub: str) -> list[dict] | None:
+    """Las entradas de otra computadora en el hub (None si no contesta)."""
+    from agmen.hub import query
+
+    try:
+        return [f for op, f in query(hub, 0.5) if op == "ep" and f.get("machine")]
+    except (ConnectionError, OSError):
+        return None
+
+
+def abrir_en(hub: str, ip: str, *cosas):
+    """Abre Subscriber/Publisher (clase, tipo, topic) como un nodo de la computadora de `hub`, que está en `ip`."""
+    p = TR.env(AGMEN_HUB=hub, AGMEN_NET_IP=ip)
+    try:
+        return [cls(t, topic) for cls, t, topic in cosas]
+    finally:
+        p.stop()
+
+
+def publisher_cpp():
+    from pathlib import Path
+
+    base = Path(__file__).resolve().parent.parent / "build" / "bin"
+    for nombre in ("publisher", "publisher.exe", "Release/publisher.exe"):
+        if (base / nombre).is_file():
+            return base / nombre
+    return None
+
+
 @unittest.skipUnless(hay_ips(LAPTOP_IP, ROBOT_IP), "hace falta 127.0.0.2 y 127.0.0.3 (en Linux siempre están)")
 class TestPuntaAPunta(TA.E2EBase):
     hub_real = True
@@ -577,25 +971,24 @@ class TestPuntaAPunta(TA.E2EBase):
         rp, rlines = self.lanzar(["run", str(toml), "--no-browser", "--no-web"], env)
         self.assertTrue(self.espera(lambda: any("todo arrancado" in ln for ln in rlines) or rp.poll() is not None),
                         "".join(rlines))
-        p = TR.env(AGMEN_HUB=env["AGMEN_HUB"], AGMEN_NET_IP=LAPTOP_IP)
-        try:
-            sub = pubsub._PureSubscriber(Imu, "/imu")
-            pub = pubsub._PurePublisher(Cmd, "/cmd")
-        finally:
-            p.stop()
-        self.addCleanup(sub.close)
-        self.addCleanup(pub.close)
-        got = []
+        sub, subg, pub = abrir_en(env["AGMEN_HUB"], LAPTOP_IP, (pubsub._PureSubscriber, Imu, "/imu"),
+                                  (pubsub._PureSubscriber, Grande, "/grande"), (pubsub._PurePublisher, Cmd, "/cmd"))
+        for o in (sub, subg, pub):
+            self.addCleanup(o.close)
+        got, gotg = [], []
         recibido = self.marks / "cmd_recibido"
 
         def paso():
             pub.publish(Cmd(42))
             got.extend(TR.receive_all(sub, 0.05))
+            gotg.extend(TR.receive_all(subg, 0.01))
 
-        ok = until(lambda: got and recibido.exists(), 60, every=paso)
+        ok = until(lambda: got and gotg and recibido.exists(), 60, every=paso)
         salida = f"--- agmen run ---\n{''.join(rlines)}\n--- agmen agent ---\n{''.join(alines)}"
         self.assertTrue(ok, salida)
         self.assertEqual(got[0].sender.split(":")[0], ROBOT_IP)          # del nodo del robot a la laptop
+        self.assertEqual(gotg[0].message.data, bytes(range(256)) * 400)   # (d) un mensaje de 100 KiB, entero
+        self.assertEqual(gotg[0].sender.split(":")[0], ROBOT_IP)
         v, sender = recibido.read_text(encoding="utf-8").split(" ")
         self.assertEqual((v, sender.split(":")[0]), ("42", LAPTOP_IP))   # y de la laptop al nodo del robot
         self.assertEqual(self.detener(rp), 0, salida)
@@ -604,6 +997,79 @@ class TestPuntaAPunta(TA.E2EBase):
         if out:
             with open(out, "w", encoding="utf-8") as f:
                 f.write(f"--- agmen run ---\n{''.join(rlines)}\n--- agmen agent ---\n{''.join(alines)}")
+
+
+    def lanzar_par(self, toml):
+        ap, alines, clave = self.agente(toml, AGMEN_NET_IP=ROBOT_IP)
+        env = self.env("run", AGMEN_REMOTE_HOSTS=ROBOT_IP, AGMEN_NET_IP=LAPTOP_IP, AGMEN_AGENT_KEY=clave)
+        rp, rlines = self.lanzar(["run", str(toml), "--no-browser", "--no-web"], env)
+        self.assertTrue(self.espera(lambda: any("todo arrancado" in ln for ln in rlines) or rp.poll() is not None),
+                        "".join(rlines))
+        return ap, alines, rp, rlines, env
+
+    def test_el_nodo_de_cpp_del_tutorial_en_el_robot_llega_a_python_en_la_laptop(self):
+        """(c) Como examples/tutorial/robot_dos.toml: `publisher --rate 100 --to /imu` (C++) en el robot."""
+        binario = publisher_cpp()
+        if binario is None:
+            self.skipTest("no está build/bin/publisher (compila con cmake --build build): sin él no hay nodo de C++")
+        toml = self.dir / "tutorial.toml"
+        toml.write_text(
+            f'[robot]\nname = "tutorial"\n\n[[machine]]\nname = "robot"\nhost = "{ROBOT_IP}:{self.port}"\n\n'
+            f'[[node]]\nname = "imu"\ncmd = [{json.dumps(str(binario))}, "--rate", "100", "--to", "/imu"]\n'
+            f'machine = "robot"\n\n[web]\nenabled = false\n', encoding="utf-8")
+        ap, alines, rp, rlines, env = self.lanzar_par(toml)
+        (sub,) = abrir_en(env["AGMEN_HUB"], LAPTOP_IP, (pubsub._PureSubscriber, wire.ImuSample, "/imu"))
+        self.addCleanup(sub.close)
+        got = []
+        # (a 100 Hz no hay pausas: receive_all no acabaría; se recibe de uno en uno)
+        def uno():
+            m = sub.receive(0.05)
+            if m is not None:
+                got.append(m)
+
+        ok = until(lambda: len(got) >= 10, 40, every=uno)
+        salida = f"--- agmen run ---\n{''.join(rlines)}\n--- agmen agent ---\n{''.join(alines)}"
+        self.assertTrue(ok, salida)
+        self.assertEqual(got[0].sender.split(":")[0], ROBOT_IP)
+        self.assertIsInstance(got[-1].message, wire.ImuSample)
+        self.assertEqual(self.detener(rp), 0, salida)
+
+
+class TestSinPuente(TA.E2EBase):
+    """(a) §1, §7: sin [[machine]], o con [profile.X] local = true, no hay puente ni modo red: el hub nunca recibe
+    `red` (lo diría en su log, que agmen run muestra) y su pong nunca dice red=1."""
+
+    hub_real = True
+
+    def comprobar(self, toml_text: str, *extra):
+        script = self.dir / "nodo_red.py"
+        script.write_text(NODO_RED_PY, encoding="utf-8")
+        toml = self.dir / "local.toml"
+        toml.write_text(toml_text.format(cmd=f'["python", {json.dumps(str(script))}, "pub", '
+                                             f'{json.dumps(str(self.marks))}]'), encoding="utf-8")
+        env = self.env("run", AGMEN_REMOTE_HOSTS=ROBOT_IP)
+        rp, rlines = self.lanzar(["run", str(toml), "--no-browser", "--no-web", *extra], env)
+        self.assertTrue(self.espera(lambda: any("todo arrancado" in ln for ln in rlines) or rp.poll() is not None),
+                        "".join(rlines))
+        vistos = []
+        fin = time.monotonic() + T.hp.NET_BEAT_S + 1.0          # más que un `red` (cada 2 s) si lo hubiera
+        while time.monotonic() < fin:
+            vistos.append(hub_en_red(env["AGMEN_HUB"]))
+            time.sleep(0.1)
+        texto = "".join(rlines)
+        self.assertIn(False, vistos, texto)                     # el hub contestó…
+        self.assertNotIn(True, vistos, texto)                   # … y nunca en modo red
+        self.assertNotIn("modo red", texto)
+        self.assertNotIn("puente", texto)
+        self.assertEqual(self.detener(rp), 0, texto)
+
+    def test_sin_machine(self):
+        self.comprobar('[robot]\nname = "solo"\n\n[[node]]\nname = "imu"\ncmd = {cmd}\n\n[web]\nenabled = false\n')
+
+    def test_con_perfil_local(self):
+        self.comprobar(f'[robot]\nname = "sim"\n\n[[machine]]\nname = "robot"\nhost = "{ROBOT_IP}"\n\n'
+                       '[profile.sim]\nlocal = true\n\n[[node]]\nname = "imu"\ncmd = {cmd}\nmachine = "robot"\n\n'
+                       '[web]\nenabled = false\n', "--sim")
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ from ._version import __version__
 
 
 # Topics que pone Agmen mismo: no hace falta declararlos en robot.toml.
+QUERY_MAX = 65507                       # la respuesta a `query` va en UN datagrama UDP (IPv4)
 BUILTIN_TOPICS = {"/clock": "Clock"}   # el tiempo de la simulación (RFC 0006)
 BUILTIN_PREFIXES = {"/mux/": "MuxEstado"}   # quién manda en cada [[mux]] (RFC 0012)
 
@@ -283,7 +284,16 @@ class Hub:
             self._set_red(peers, now)
             self._send(hp.encode("red_ok", peers=len(peers)), addr)
         elif op == "query":
-            self._send(self.state_text().encode(), addr)
+            data = self.state_text().encode()
+            try:
+                self.sock.sendto(data, addr)
+            except OSError:   # nunca en silencio: con muchos endpoints la respuesta no cabe en un datagrama
+                if len(data) > QUERY_MAX:
+                    self._warn_once("query-no-cabe",
+                                    f"la respuesta a 'query' no cabe en un datagrama ({len(data)} bytes, máximo "
+                                    f"{QUERY_MAX}; {len(self.endpoints)} endpoints): agmen topic, el panel y el puente "
+                                    f"entre computadoras no pueden leer este hub. Menos nodos o esquemas más cortos")
+                # (lo demás, como en _send: quien preguntó ya no está)
         elif op == "bye":
             e = self.endpoints.pop(f["id"], None)
             if e is not None:

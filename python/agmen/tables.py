@@ -32,9 +32,13 @@ from . import hubproto as hp
 PART_MAX = 100              # endpoints por parte de una tabla (§3)
 MAX_ENDPOINTS = 1000        # endpoints por tabla, como mucho (lo demás se descarta y se dice)
 PART_BYTES = 48 * 1024      # una parte en JSON, como mucho (la línea del agente admite 64 KiB)
+TABLE_MAX_BYTES = 1024 * 1024   # una tabla recibida, como mucho, en bytes de sus líneas para el hub (ya escapadas)
+HUB_LINE_MAX = 65507        # una línea para el hub, como mucho: lo que cabe en un datagrama UDP (IPv4)
 HUB_QUIET_S = 3.0           # el hub sin contestar este tiempo: se dice (una vez)
 QUERY_TIMEOUT = 0.3         # lo que se espera la respuesta de `query` (el hub está en esta computadora)
-SAID_MAX = 100              # avisos distintos que se recuerdan (para decir cada uno una vez)
+SAID_MAX = 1000             # avisos distintos que se recuerdan (para decir cada uno una vez)
+_WORST_NAME = "x" * 64      # para medir, al mandar, la línea más larga que el otro lado puede armar
+_WORST_IP = "255.255.255.255"
 
 # Tamaños y formas de lo que llega en una tabla (lo inválido se descarta y se dice una vez).
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")     # sin '.': el id en el hub es "<computadora>.<id>"
@@ -43,7 +47,7 @@ _PID_RE = re.compile(r"^[0-9]{0,20}$")
 NODE_MAX = 128
 TYPE_MAX = 128
 TOPIC_MAX = 256
-TEXT_MAX = 16 * 1024
+TEXT_MAX = 16 * 1024        # en caracteres: un primer filtro; el tope de verdad va en bytes (HUB_LINE_MAX)
 NAME_MAX = 64               # el nombre de la computadora de agmen run ('desde')
 
 
@@ -122,6 +126,35 @@ def check_endpoint(kind: str, d) -> dict:
     return out
 
 
+def hub_line(name: str, ip: str, kind: str, d: dict) -> bytes:
+    """La línea con la que se registra en el hub el endpoint `d` (ya validado) de la computadora `name`, que este
+    lado ve en `ip` (kind "pubs" o "subs")."""
+    hid = f"{name}.{d['id']}"
+    if kind == "pubs":
+        return hp.encode("pub", id=hid, node=d["node"], pid=d["pid"], topic=d["topic"], schema=d["schema"],
+                         type=d["type"], text=d["text"], machine=name)
+    fields = dict(id=hid, node=d["node"], pid=d["pid"], topic=d["topic"], schema=d["schema"], type=d["type"],
+                  machine=name, addr=f"{ip}:{d['port']}")
+    if d["tcp"]:
+        fields["tcp"] = d["tcp"]
+    return hp.encode("sub", **fields)
+
+
+class _Problems:
+    """Lo que se descartó, por tipo de problema: cuántas veces y un ejemplo (para decir UN aviso por tipo, §8.5)."""
+
+    def __init__(self) -> None:
+        self.kinds: dict[str, list] = {}
+
+    def add(self, kind: str, example: str, n: int = 1) -> None:
+        entry = self.kinds.setdefault(kind, [0, example])
+        entry[0] += n
+
+    def merge(self, other: _Problems) -> None:
+        for kind, (n, example) in other.kinds.items():
+            self.add(kind, example, n)
+
+
 def local_table(msgs: list[tuple[str, dict[str, str]]]) -> tuple[list[dict], list[dict]]:
     """Lo LOCAL de la respuesta a `query` (§2.2): todos los Publisher y los Subscriber con net=1, sin
     nada que haya venido de otra computadora (no hay bucles). `ep` no trae schema ni text: son los de su
@@ -166,6 +199,8 @@ class Peer:
         self._asm_m = 0
         self._asm_parts: dict[int, tuple[list[dict], list[dict]]] = {}
         self._asm_count = 0
+        self._asm_bytes = 0
+        self._asm_bad = _Problems()            # lo descartado de la tabla que se está armando (se dice al completarla)
         self._last_n: int | None = None        # la última tabla completa (una repetida no se vuelve a armar)
         self._cond = threading.Condition()
         self._outgoing: list[dict] | None = None
@@ -196,15 +231,16 @@ class Peer:
             self.table = None
             self.registered = set()
             self._asm_n, self._asm_parts, self._asm_count, self._last_n = None, {}, 0, None
+            self._asm_bytes, self._asm_bad = 0, _Problems()
         with self._cond:
             self._outgoing = None
 
-    def close(self) -> None:
+    def close(self, wait: bool = True) -> None:
         self.lose()
         with self._cond:
             self._closed = True
             self._cond.notify_all()
-        if self._thread is not threading.current_thread():
+        if wait and self._thread is not threading.current_thread():
             self._thread.join(1.0)
 
     # --- mandar lo de aquí ---
@@ -227,7 +263,9 @@ class Peer:
                     break
                 try:
                     self._send(part)
-                except Exception as e:   # la conexión se cayó (su lector lo ve), o la tabla no cabe
+                except Exception as e:
+                    # §8.1: "no cabe" no escribió nada; cualquier otra cosa la trata quien manda (`send`) como una
+                    # pérdida de la conexión (ese canal ya no se usa). Aquí, nunca otra parte detrás.
                     if type(e).__name__ == "MessageTooLarge":
                         self.bridge.say_once(("grande", self.name), f"⚠ no pude mandarle a '{self.name}' la tabla de "
                                                                     f"topics: {e}", "error")
@@ -235,7 +273,8 @@ class Peer:
 
     # --- recibir lo del otro ---
     def receive(self, msg: dict) -> None:
-        """Una parte de la tabla del otro (desde el hilo que lee la conexión: solo valida y guarda)."""
+        """Una parte de la tabla del otro (desde el hilo que lee la conexión: solo valida y guarda). Lo descartado se
+        dice al completar la tabla: un aviso por tipo de problema, con cuántas y un ejemplo (§8.5)."""
         say = self.bridge.say_once
         try:
             n, i, m = msg.get("n"), msg.get("parte"), msg.get("de")
@@ -251,49 +290,80 @@ class Peer:
                     raise hp.ProtocolError(f"una parte trae más de {PART_MAX} endpoints en '{kind}'")
                 lists.append(items)
         except hp.ProtocolError as e:
-            say(("tabla", self.name, str(e)), f"⚠ la tabla de topics de '{self.name}' no sirve ({e}): la descarto",
-                "error")
+            say(("tabla", self.name), f"⚠ la tabla de topics de '{self.name}' no sirve ({e}): la descarto (no lo "
+                                      f"vuelvo a decir)", "error")
             return
+        bad = _Problems()
         good: list[list[dict]] = [[], []]
         for slot, kind in enumerate(("pubs", "subs")):
             for d in lists[slot]:
                 try:
                     good[slot].append(check_endpoint(kind, d))
                 except hp.ProtocolError as e:
-                    say(("ep", self.name, str(e)), f"⚠ la tabla de topics de '{self.name}' trae un endpoint inválido "
-                                                   f"({e}): lo descarto", "error")
+                    bad.add("ep", str(e))
+        done: _Problems | None = None
         with self.bridge.lock:
-            if not self.confirmed or n == self._last_n:
+            if not self.confirmed or n == self._last_n or self.ip is None:
                 return   # sin conexión confirmada no se importa nada; una tabla repetida, nada nuevo
             if n != self._asm_n:
                 self._asm_n, self._asm_m, self._asm_parts, self._asm_count = n, m, {}, 0
+                self._asm_bytes, self._asm_bad = 0, _Problems()
             if m != self._asm_m:
-                say(("partes", self.name), f"⚠ la tabla de topics de '{self.name}' llegó mal partida (dice {m} "
-                                           f"partes y antes {self._asm_m}): la descarto", "error")
                 self._asm_n, self._asm_parts, self._asm_count = None, {}, 0
-                return
-            if i in self._asm_parts:
-                return
-            room = MAX_ENDPOINTS - self._asm_count
-            if len(good[0]) + len(good[1]) > room:
-                say(("tope", self.name), f"⚠ la tabla de topics de '{self.name}' trae más de {MAX_ENDPOINTS} "
-                                         f"endpoints: uso solo los primeros {MAX_ENDPOINTS}", "error")
-                good[0] = good[0][:room]
-                good[1] = good[1][:max(0, room - len(good[0]))]
-            self._asm_parts[i] = (good[0], good[1])
-            self._asm_count += len(good[0]) + len(good[1])
-            if len(self._asm_parts) < m:
-                return
-            pubs, subs, seen = [], [], set()
-            for k in sorted(self._asm_parts):
-                for slot, out in ((0, pubs), (1, subs)):
-                    for d in self._asm_parts[k][slot]:
-                        if d["id"] in seen:
+                bad_m = self._asm_m
+            else:
+                bad_m = None
+            if bad_m is None and i not in self._asm_parts:
+                kept: list[list[dict]] = [[], []]
+                for slot, kind in enumerate(("pubs", "subs")):
+                    for d in good[slot]:
+                        if self._asm_count >= MAX_ENDPOINTS:
+                            bad.add("tope", "")
                             continue
-                        seen.add(d["id"])
-                        out.append(d)
-            self.table, self._last_n = (pubs, subs), n
-            self._asm_n, self._asm_parts, self._asm_count = None, {}, 0
+                        size = len(hub_line(self.name, self.ip, kind, d))
+                        if size > HUB_LINE_MAX:   # el hub no la aceptaría (§8.4)
+                            bad.add("linea", f"'{d['node']}' en {d['topic']}: {size} bytes")
+                            continue
+                        if self._asm_bytes + size > TABLE_MAX_BYTES:
+                            bad.add("bytes", "")
+                            continue
+                        kept[slot].append(d)
+                        self._asm_count += 1
+                        self._asm_bytes += size
+                self._asm_parts[i] = (kept[0], kept[1])
+                self._asm_bad.merge(bad)
+                if len(self._asm_parts) == m:
+                    pubs, subs, seen = [], [], set()
+                    for k in sorted(self._asm_parts):
+                        for slot, out in ((0, pubs), (1, subs)):
+                            for d in self._asm_parts[k][slot]:
+                                if d["id"] in seen:
+                                    continue
+                                seen.add(d["id"])
+                                out.append(d)
+                    self.table, self._last_n = (pubs, subs), n
+                    done = self._asm_bad
+                    self._asm_n, self._asm_parts, self._asm_count = None, {}, 0
+                    self._asm_bytes, self._asm_bad = 0, _Problems()
+        if bad_m is not None:
+            say(("partes", self.name), f"⚠ la tabla de topics de '{self.name}' llegó mal partida (dice {m} partes y "
+                                       f"antes {bad_m}): la descarto", "error")
+        if done is not None:
+            self._tell(done)
+
+    def _tell(self, bad: _Problems) -> None:
+        """Lo descartado de una tabla del otro: un aviso por tipo de problema (una sola vez), con cuántas y un ejemplo."""
+        who = f"la tabla de topics de '{self.name}'"
+        for kind, (count, example) in bad.kinds.items():
+            text = {
+                "ep": f"⚠ {who} trae {count} endpoint(s) inválido(s) (p. ej.: {example}): los descarto",
+                "linea": f"⚠ {who} trae {count} endpoint(s) que no caben en una línea para el agmen hub ({HUB_LINE_MAX} "
+                         f"bytes; p. ej. {example}, su esquema es muy largo): los descarto",
+                "bytes": f"⚠ {who} pasa de {TABLE_MAX_BYTES // 1024} KiB: descarto {count} endpoint(s) (los que no caben)",
+                "tope": f"⚠ {who} trae más de {MAX_ENDPOINTS} endpoints: uso solo los primeros {MAX_ENDPOINTS} "
+                        f"(descarto {count})",
+            }[kind]
+            self.bridge.say_once((kind, self.name), text, "error")
 
     def hub_lines(self) -> list[bytes]:
         """Con bridge.lock: lo que hay que mandarle al hub en este latido (los `bye` de lo que ya no viene
@@ -301,20 +371,13 @@ class Peer:
         if not self.confirmed or self.table is None or self.ip is None:
             return []
         lines, now = [], set()
-        pubs, subs = self.table
-        for d in pubs:
-            hid = f"{self.name}.{d['id']}"
-            now.add(hid)
-            lines.append(hp.encode("pub", id=hid, node=d["node"], pid=d["pid"], topic=d["topic"], schema=d["schema"],
-                                   type=d["type"], text=d["text"], machine=self.name))
-        for d in subs:
-            hid = f"{self.name}.{d['id']}"
-            now.add(hid)
-            fields = dict(id=hid, node=d["node"], pid=d["pid"], topic=d["topic"], schema=d["schema"],
-                          type=d["type"], machine=self.name, addr=f"{self.ip}:{d['port']}")
-            if d["tcp"]:
-                fields["tcp"] = d["tcp"]
-            lines.append(hp.encode("sub", **fields))
+        for kind, eps in zip(("pubs", "subs"), self.table):
+            for d in eps:
+                line = hub_line(self.name, self.ip, kind, d)
+                if len(line) > HUB_LINE_MAX:   # (ya se dijo al recibirla; solo si la IP cambió y ya no cabe)
+                    continue
+                now.add(f"{self.name}.{d['id']}")
+                lines.append(line)
         byes = [hp.encode("bye", id=hid) for hid in sorted(self.registered - now)]
         self.registered = now
         return byes + lines
@@ -341,6 +404,7 @@ class Bridge:
         self._red_at = 0.0
         self._quiet_since: float | None = None
         self._quiet_told = False
+        self._too_big = False       # el hub contesta `ping` pero no `query` (su tabla no cabe en un datagrama)
         self._stop = threading.Event()
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
@@ -350,7 +414,12 @@ class Bridge:
             if key in self._said:
                 return
             if len(self._said) >= SAID_MAX:
-                self._said.clear()
+                # Nunca se vacía (los avisos se repetirían): pasado el tope se dice una vez y lo nuevo ya no sale.
+                if ("demasiados",) in self._said:
+                    return
+                key, kind = ("demasiados",), "error"
+                text = (f"⚠ el puente de topics ya dijo {SAID_MAX} avisos distintos: desde aquí no digo los nuevos. "
+                        f"Revisa los de arriba")
             self._said.add(key)
         try:
             self.say(text, kind)
@@ -382,8 +451,12 @@ class Bridge:
             self._thread.join(2.0)
         with self.lock:
             peers, self.peers = list(self.peers), []
+        for p in peers:   # §8.7: todos dejan de mandar a la vez; un Peer atorado no hace esperar a los demás
+            p.close(wait=False)
+        end = time.monotonic() + 1.0
         for p in peers:
-            p.close()
+            if p._thread is not threading.current_thread():
+                p._thread.join(max(0.0, end - time.monotonic()))
         if self._sock is not None:
             self._sock.close()
 
@@ -400,9 +473,9 @@ class Bridge:
     # --- un latido ---
     def tick(self) -> None:
         now = time.monotonic()
-        local = self._read_hub(now)
         with self.lock:
             peers = [p for p in self.peers if p.confirmed and p.ip]
+        local = self._read_hub(now, [p.name for p in peers])
         if local is not None and peers:
             parts = self._parts(*local)
             for p in peers:
@@ -425,17 +498,31 @@ class Bridge:
             self._robots(peers)
 
     def _send(self, data: bytes) -> None:
+        if len(data) > HUB_LINE_MAX:   # (no debería pasar: hub_lines no las arma) nunca en silencio
+            self.say_once(("hub-linea",), f"⚠ el puente de topics tenía una línea de {len(data)} bytes para el agmen "
+                                          f"hub y el máximo es {HUB_LINE_MAX}: no la mandé", "error")
+            return
         try:
             self._sock.sendto(data, _hub_addr(self.hub))
         except OSError:
             pass   # el hub no está (lo dice _read_hub); se repite en el próximo latido
 
-    def _read_hub(self, now: float):
-        from .hub import query
+    def _read_hub(self, now: float, names: list[str] = ()):
+        from .hub import ping, query
 
         try:
             msgs = query(self.hub, timeout=QUERY_TIMEOUT)
         except (ConnectionError, OSError, hp.ProtocolError, ValueError):
+            # §8.3: si `ping` sí contesta, el hub está vivo y lo que no cabe es su respuesta a `query` (un datagrama):
+            # no se dice "no contesta"; al otro lado se le manda una tabla vacía (no se queda con una vieja).
+            if ping(self.hub, timeout=QUERY_TIMEOUT) is not None:
+                self._quiet_since, self._quiet_told = None, False
+                if names and not self._too_big:
+                    self._too_big = True
+                    who = "', '".join(sorted(names))
+                    self.say(f"⚠ la tabla de mi hub no cabe en una respuesta (demasiados topics o esquemas muy "
+                             f"largos): no puedo pasarle mis topics a '{who}'", "error")
+                return [], []
             if self._quiet_since is None:
                 self._quiet_since = now
             if not self._quiet_told and now - self._quiet_since >= HUB_QUIET_S:
@@ -445,27 +532,33 @@ class Bridge:
             return None
         if self._quiet_told:
             self.say(f"el puente de topics ya habla con el agmen hub de esta computadora ({self.hub})")
-        self._quiet_since, self._quiet_told = None, False
+        if self._too_big:
+            self.say("la tabla de mi hub ya cabe en una respuesta: vuelvo a pasar mis topics")
+        self._quiet_since, self._quiet_told, self._too_big = None, False, False
         return local_table(msgs)
 
     def _parts(self, pubs: list[dict], subs: list[dict]) -> list[dict]:
         """La tabla de aquí en partes de como mucho PART_MAX endpoints (y PART_BYTES en JSON)."""
         items = []
+        bad = _Problems()
         for kind, eps in (("pubs", pubs), ("subs", subs)):
             for d in eps:
+                where = f"'{d.get('node', '?')}' en {d.get('topic', '?')}"
                 try:
                     check_endpoint(kind, d)
                 except hp.ProtocolError as e:
-                    self.say_once(("local", str(e)), f"⚠ no paso a las otras computadoras un endpoint de "
-                                                     f"'{d.get('node', '?')}' en {d.get('topic', '?')}: {e}", "error")
+                    bad.add("local", f"{where}: {e}")
                     continue
                 size = len(json.dumps(d, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
-                if size > PART_BYTES:
-                    self.say_once(("local-grande", d.get("id")), f"⚠ no paso a las otras computadoras el endpoint de "
-                                                                 f"'{d.get('node', '?')}' en {d.get('topic', '?')}: "
-                                                                 f"mide {size} bytes (su esquema es muy largo)", "error")
+                line = len(hub_line(_WORST_NAME, _WORST_IP, kind, d))
+                if size > PART_BYTES or line > HUB_LINE_MAX:
+                    bad.add("local-grande", f"{where}: {max(size, line)} bytes")
                     continue
                 items.append((kind, d, size))
+        for kind, (count, example) in bad.kinds.items():
+            what = "inválido(s)" if kind == "local" else "demasiado grande(s) (su esquema es muy largo)"
+            self.say_once((kind,), f"⚠ no paso a las otras computadoras {count} endpoint(s) {what}; p. ej. {example}",
+                          "error")
         if len(items) > MAX_ENDPOINTS:
             self.say_once(("local-tope",), f"⚠ esta computadora tiene {len(items)} endpoints: a las otras solo les "
                                            f"paso los primeros {MAX_ENDPOINTS}", "error")
@@ -501,7 +594,7 @@ class Bridge:
             for op, f in msgs:
                 if op == "error":
                     text = f.get("msg", "")[:500]
-                    self.say_once(("hub", text), f"⚠ el agmen hub de esta computadora no aceptó lo que le pasó el "
+                    self.say_once(("hub", re.sub(r"\d+", "#", text)[:120]), f"⚠ el agmen hub de esta computadora no aceptó lo que le pasó el "
                                                  f"puente de topics: {text}", "error")
 
     def _robots(self, peers: list[Peer]) -> None:
