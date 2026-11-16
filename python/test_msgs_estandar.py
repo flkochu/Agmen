@@ -259,6 +259,39 @@ def _imu_sin_orientacion() -> "msgs.Imu":
     return msgs.Imu(angular_velocity=msgs.Vector3f(0.0, 0.0, 0.25), linear_acceleration=msgs.Vector3f(0.0, 0.0, 9.75))
 
 
+class TestGrabacionUsaAgmenMsgs(unittest.TestCase):
+    """agmen.Recording resuelve los tipos estándar siempre a la clase de agmen.msgs, aunque en el
+    mismo proceso ya exista otra con el mismo esquema (la de msgs.types(numpy=True), o la de un
+    agmen.load que importa agmen/msgs.agmen)."""
+
+    def test_clase_de_agmen_msgs(self):
+        if _has_numpy():
+            otra = msgs.types(numpy=True)
+            self.assertIsNot(otra.Imu, msgs.Imu)
+        with tempfile.TemporaryDirectory() as d:
+            # Un tipo de usuario con el mismo texto canónico que MuxEstado, definido antes de grabar.
+            class MuxEstado(wire.Message):          # noqa: F811 — a propósito: mismo nombre y esquema
+                SCHEMA = msgs.MuxEstado.SCHEMA
+
+            path = os.path.join(d, "estandar.mcap")
+            w = _mcap.Writer(path)
+            t0 = 1_700_000_000_000_000_000
+            for k, (topic, m) in enumerate([("/imu", msgs.Imu()), ("/odom", msgs.Odometry()), ("/cmd_vel", msgs.Twist()),
+                                            ("/mux/ruedas", msgs.MuxEstado(mux="ruedas"))]):
+                lay = type(m).LAYOUT
+                cid = w.add_channel(topic, "agmen", w.add_schema(lay.name, "agmen", lay.text.encode()))
+                w.add_message(cid, t0 + k, t0 + k, 0, wire.encode(m, 0, t_data=t0 + k, t_pub=t0 + k, topic=topic))
+            w.close()
+            with agmen.Recording(path) as rec:
+                self.assertIs(rec.topics["/imu"], msgs.Imu)
+                self.assertIs(rec.topics["/odom"], msgs.Odometry)
+                self.assertIs(rec.topics["/cmd_vel"], msgs.Twist)
+                self.assertIs(rec.topics["/mux/ruedas"], msgs.MuxEstado)
+                got = {s.topic: s.message for s in rec.messages()}
+                self.assertIsInstance(got["/imu"], msgs.Imu)
+                self.assertEqual(got["/mux/ruedas"].mux, "ruedas")
+
+
 class TestNanEnJson(unittest.TestCase):
     """Una IMU sin orientación (NaN, lo normal con estos tipos) por todo lo que pasa mensajes a JSON."""
 
@@ -309,7 +342,7 @@ class TestNanEnJson(unittest.TestCase):
                 w.add_message(cid, t0 + i, t0 + i, i, pkt)
             w.close()
             with agmen.Recording(path) as rec:
-                self.assertEqual(rec.topics["/imu"].SCHEMA_ID, msgs.Imu.SCHEMA_ID)
+                self.assertIs(rec.topics["/imu"], msgs.Imu)
                 got = list(rec.messages())
                 self.assertEqual(len(got), 3)
                 self.assertTrue(math.isnan(got[0].message.orientation.w))
