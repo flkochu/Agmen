@@ -789,6 +789,22 @@ class TestPongSinCola(unittest.TestCase):
         self.assertEqual(json.loads(body), {"op": "pong", "t": 3.0, "reloj": {"rx": rx, "tx": rx + 7 * MS}})
 
 
+class TestHoraDePared(unittest.TestCase):
+    def test_la_hora_es_la_del_sistema_y_no_avanza_a_saltos(self):
+        # En Windows con Python <= 3.12, time.time_ns() avanza de ~15.6 ms en ~15.6 ms; la medición usa la hora fina.
+        self.assertLess(abs(R.hora_ns() - time.time_ns()), 100_000_000)   # el mismo reloj (a 0.1 s)
+        fin, vistas = time.monotonic() + 0.2, set()
+        while time.monotonic() < fin:
+            vistas.add(R.hora_ns())
+        self.assertGreater(len(vistas), 100, "la hora de pared avanza a saltos: la medición no serviría")
+        self.assertLessEqual(R.resolucion_ns(), 1_000_000)
+
+    def test_sin_hora_fina_se_usa_la_de_siempre_con_su_resolucion(self):
+        with mock.patch.object(R, "_HORA_FINA", None):
+            self.assertLess(abs(R.hora_ns() - time.time_ns()), 100_000_000)
+            self.assertGreaterEqual(R.resolucion_ns(), 0)
+
+
 class TestResolucion(unittest.TestCase):
     """8.4: la resolución de los relojes de pared cuenta en la incertidumbre."""
 

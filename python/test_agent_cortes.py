@@ -2576,7 +2576,8 @@ class TestPanelMachines(PanelDeDosComputadoras):
         ms = st["machines"]
         self.assertEqual([m["name"] for m in ms], ["robot", "laptop", "brazo"], ms)
         for m in ms:
-            self.assertEqual(set(m), CAMPOS_MAQUINA, m)
+            # (bloque 5: las que no son esta computadora traen además `clock`, la diferencia de reloj)
+            self.assertEqual(set(m), CAMPOS_MAQUINA | (set() if m["here"] else {"clock"}), m)
             self.assertIsInstance(m["host"], str)
             self.assertIsInstance(m["here"], bool)
             self.assertIsInstance(m["detail"], str)
@@ -2607,7 +2608,7 @@ class TestPanelMachines(PanelDeDosComputadoras):
             self.assertEqual(por_nombre["pc"], "laptop", fuente)
             self.assertEqual([m["name"] for m in st["machines"]], ["robot", "laptop", "brazo"], fuente)
             for m in st["machines"]:
-                self.assertEqual(set(m), CAMPOS_MAQUINA, (fuente, m))
+                self.assertEqual(set(m), CAMPOS_MAQUINA | (set() if m["here"] else {"clock"}), (fuente, m))
 
     def test_los_nodos_de_una_computadora_sin_conexion_salen_sin_conexion_con_su_ultimo_estado(self):
         self.pierde_el_brazo()

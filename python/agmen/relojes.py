@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import sys
 import threading
 import time
 from collections import deque
@@ -54,14 +55,41 @@ MOTIVOS = {
 RES_MAX_NS = 1_000_000_000           # una resolución de reloj de más de 1 s no es creíble: se ignora
 
 
+def _hora_fina_windows() -> Callable[[], int] | None:
+    """En Windows, la hora de pared con resolución de 100 ns (GetSystemTimePreciseAsFileTime, Windows 8+). Es el
+    mismo reloj que time.time_ns(), que con Python ≤ 3.12 solo avanza de ~15.6 ms en ~15.6 ms: con esos saltos
+    la medición no sirve (incertidumbre de ±31 ms). None si no es Windows o no se puede."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        f = ctypes.windll.kernel32.GetSystemTimePreciseAsFileTime
+        f.argtypes = [ctypes.POINTER(ctypes.c_uint64)]   # FILETIME: 64 bits, en pasos de 100 ns desde 1601
+        f.restype = None
+
+        def hora() -> int:
+            ft = ctypes.c_uint64()
+            f(ctypes.byref(ft))
+            return (ft.value - 116_444_736_000_000_000) * 100
+        return hora if abs(hora() - time.time_ns()) < 1_000_000_000 else None   # (si no cuadra, no se usa)
+    except Exception:   # sin esa función (Windows 7) o sin ctypes: la de siempre, con su resolución
+        return None
+
+
+_HORA_FINA = _hora_fina_windows()
+
+
 def hora_ns() -> int:
-    """La hora "de pared" de esta computadora en ns: la misma que usa agmen.clock en modo real para `t_data`
-    (time.time_ns), no el reloj monótono."""
-    return time.time_ns()
+    """La hora "de pared" de esta computadora en ns: el mismo reloj que usa agmen.clock en modo real para
+    `t_data` (time.time_ns), no el monótono. En Windows se lee con más resolución (ver _hora_fina_windows)."""
+    return _HORA_FINA() if _HORA_FINA is not None else time.time_ns()
 
 
 def resolucion_ns() -> int:
-    """La resolución de ese reloj de pared en ns (8.4): ~15.6 ms en Windows con Python ≤ 3.12, 1 ns en Linux."""
+    """La resolución de ese reloj de pared en ns (8.4): 100 ns en Windows con la hora fina; si no se pudo,
+    ~15.6 ms en Windows con Python ≤ 3.12; 1 ns en Linux."""
+    if _HORA_FINA is not None:
+        return 100
     try:
         res = time.get_clock_info("time").resolution
     except (ValueError, OSError):
