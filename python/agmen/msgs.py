@@ -108,7 +108,13 @@ def _from_wxyz(cls, *wxyz):
     from_wxyz(w, x, y, z) o from_wxyz(arreglo_de_4) (una lista, una tupla o un
     numpy.ndarray, ej. data.qpos[3:7]). Solo cambia el orden: no normaliza."""
     values = wxyz[0] if len(wxyz) == 1 else wxyz
+    text = (str, bytes, bytearray)      # float("1") y list(b"1234") "funcionan": un texto no es un cuaternión
     try:
+        if isinstance(values, text):
+            raise TypeError
+        values = list(values)               # una vez: también si es un iterador
+        if any(isinstance(v, text) for v in values):
+            raise TypeError
         w, x, y, z = (float(v) for v in values)
     except (TypeError, ValueError):
         raise wire.WireError(f"{cls.__name__}.from_wxyz: se esperaban 4 números (w, x, y, z), w primero; llegó "

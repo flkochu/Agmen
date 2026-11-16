@@ -138,7 +138,15 @@ def main() -> int:
     try:
         time.sleep(1.0)
         n = 40
-        for backend in ("native", "pure"):
+        from agmen import _backend
+
+        backends = ("native", "pure") if _backend.NATIVE else ("pure",)
+        if not _backend.NATIVE:
+            print("OMITIDO el núcleo de C++ (agmen._core no está compilado): solo Python puro")
+        if not Path(peer).exists():
+            print(f"FALLA no existe {peer}: compila antes (cmake --build build --config Release)")
+            return 1
+        for backend in backends:
             env = {**env0, "AGMEN_BACKEND": backend}
             for kind in ("odometry", "imu"):
                 topic = f"/{kind}_{backend}"
@@ -220,13 +228,12 @@ def main() -> int:
 
         # 4) record -> info -> play -> export
         mcap = str(Path(tmp.name) / "imu.mcap")
-        rec = start(py + ["-m", "agmen", "record", "/imu_rec", "-o", mcap, "--quiet"], env0)
+        # --duration: el grabador termina solo y cierra el archivo, sin señales (igual en Windows y Linux).
+        rec = start(py + ["-m", "agmen", "record", "/imu_rec", "-o", mcap, "--quiet", "--duration", "6s"], env0)
         procs.append(rec)
         time.sleep(1.5)
         subprocess.run([peer, "pub", "imu", "/imu_rec", "40"], capture_output=True, text=True, env=env0, timeout=60)
-        time.sleep(1.0)
-        rec.terminate()                     # SIGTERM: el grabador cierra el archivo
-        rec_out = rec.communicate(timeout=20)[0]
+        rec_out = rec.communicate(timeout=60)[0]
         check("agmen record cierra el archivo", os.path.exists(mcap) and os.path.getsize(mcap) > 0, rec_out)
 
         def cli(*args, timeout=60):
@@ -248,10 +255,13 @@ def main() -> int:
         check("agmen play reproduce la Imu con NaN (un receptor la recibe)",
               play.returncode == 0 and len(rx_lines(out)) >= 1 and "Traceback" not in play.stderr,
               f"{play.stdout}{play.stderr}\n{out}")
-        pq = str(Path(tmp.name) / "pq")
-        exp = cli("export", mcap, "--parquet", pq)
-        check("agmen export --parquet con NaN", exp.returncode == 0 and "Traceback" not in exp.stderr,
-              exp.stdout + exp.stderr)
+        if _has_module("pyarrow"):
+            pq = str(Path(tmp.name) / "pq")
+            exp = cli("export", mcap, "--parquet", pq)
+            check("agmen export --parquet con NaN", exp.returncode == 0 and "Traceback" not in exp.stderr,
+                  exp.stdout + exp.stderr)
+        else:
+            print("OMITIDO agmen export --parquet: falta pyarrow (pip install pyarrow)")
         fox = str(Path(tmp.name) / "fox.mcap")
         exp2 = cli("export", mcap, "--foxglove", fox)
         check("agmen export --foxglove con NaN", exp2.returncode == 0 and os.path.exists(fox),
@@ -308,6 +318,11 @@ const M = require(process.argv[2]), A = require(process.argv[3]), fs = require("
         tmp.cleanup()
     print(f"\n{'TODO BIEN' if not failures else str(failures) + ' FALLAS'}")
     return 1 if failures else 0
+
+
+def _has_module(name: str) -> bool:
+    import importlib.util
+    return importlib.util.find_spec(name) is not None
 
 
 def _has(cmd: str) -> bool:

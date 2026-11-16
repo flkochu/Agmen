@@ -509,6 +509,10 @@ class _Py:
                 return f"field(default_factory=lambda: {self.zero(fd)})"
             if fd.kind == "string":
                 return repr(fd.default) if fd.default is not None else '""'
+            if _is_nan(fd.default):
+                # Un NaN nuevo en cada instancia: con uno compartido, Python 3.11 y 3.12 dirían que
+                # Imu() == Imu() (las tuplas miran primero si es el mismo objeto); 3.13 y C++, que no.
+                return 'field(default_factory=lambda: float("nan"))'
             return self.elem_value(fd, fd.default) if fd.default is not None else self.zero(fd)
         if fd.default is not None:
             return f"field(default_factory=lambda: [{', '.join(self.elem_value(fd, x) for x in fd.default)}])"

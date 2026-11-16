@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import math
 import os
@@ -23,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import weakref
 from dataclasses import asdict
 from pathlib import Path
 
@@ -200,6 +202,42 @@ class TestVectores(unittest.TestCase):
         self.assertTrue(math.isnan(msgs.Imu.decode_payload(payload).orientation.x))
 
 
+class TestIgualdadConNan(unittest.TestCase):
+    """Un NaN nunca es igual a otro, como en C++: el resultado no depende de la versión de Python
+    (en 3.11 y 3.12 un NaN compartido entre instancias hacía Imu() == Imu())."""
+
+    def test_dos_por_defecto_no_son_iguales(self):
+        for numpy in (False, True) if _has_numpy() else (False,):
+            with self.subTest(numpy=numpy):
+                t = msgs.types(numpy)
+                self.assertNotEqual(t.Imu(), t.Imu())
+                self.assertNotEqual(t.Quaternionf(), t.Quaternionf())
+                self.assertIsNot(t.Quaternionf().x, t.Quaternionf().x, "cada instancia con su propio NaN")
+                self.assertNotEqual(t.Imu.decode_payload(t.Imu().encode_payload()), t.Imu())
+                # Sin NaN, todo igual que siempre.
+                self.assertEqual(t.Pose(), t.Pose())
+                self.assertEqual(t.Odometry.decode_payload(t.Odometry().encode_payload()), t.Odometry())
+
+    def test_agmen_load_y_el_py_generado(self):
+        from agmen import gen
+
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "conan.agmen"
+            p.write_text("message A {\n    f32 x = nan\n    f64[2] v = nan\n    u8 k = 1\n}\n", encoding="utf-8")
+            mod = agmen.load(p)
+            self.assertNotEqual(mod.A(), mod.A())
+            self.assertIn('x: float = field(default_factory=lambda: float("nan"))', gen.python(idl.parse_file(p)))
+
+    def test_lo_que_no_tiene_nan_no_cambia(self):
+        """Solo los campos en nan llevan default_factory: los demás se generan como antes."""
+        from agmen import gen
+
+        py = gen.python(idl.parse_file(msgs.PATH))
+        self.assertIn("w: float = 1.0", py)
+        self.assertIn('encoding: str = \'rgb8\'', py)
+        self.assertEqual(py.count('default_factory=lambda: float("nan")'), 4)
+
+
 class TestCuaternion(unittest.TestCase):
     # 0.7 rad sobre el eje (1, 2, 3): cada campo vale distinto.
     Q = {"x": 0.0916432938695913, "y": 0.1832865877391826, "z": 0.2749298816087739, "w": 0.9393727128473789}
@@ -212,6 +250,7 @@ class TestCuaternion(unittest.TestCase):
         back = msgs.Quaternion.from_wxyz(0.9393727128473789, 0.0916432938695913, 0.1832865877391826, 0.2749298816087739)
         self.assertEqual(back, q)
         self.assertIsInstance(msgs.Quaternion.from_wxyz(1, 0, 0, 0), msgs.Quaternion)
+        self.assertEqual(msgs.Quaternion.from_wxyz(iter(q.wxyz())), q)       # también un iterador
 
     def test_quaternionf_y_numpy(self):
         qf = msgs.Quaternionf.from_wxyz(4.0, 1.0, 2.0, 3.0)
@@ -229,7 +268,8 @@ class TestCuaternion(unittest.TestCase):
             self.assertEqual(msgs.types(True).Quaternion.from_wxyz(1, 2, 3, 4).wxyz(), (1.0, 2.0, 3.0, 4.0))
 
     def test_errores_claros(self):
-        for bad in ((1, 2, 3), ([1, 2, 3, 4, 5],), ("a", 0, 0, 0), (None,)):
+        for bad in ((1, 2, 3), ([1, 2, 3, 4, 5],), ("a", 0, 0, 0), (None,), ("1234",), (b"1234",),
+                    (bytearray(b"1234"),), ("1", 0, 0, 0)):
             with self.subTest(bad):
                 with self.assertRaisesRegex(wire.WireError, r"from_wxyz: se esperaban 4 números \(w, x, y, z\)"):
                     msgs.Quaternion.from_wxyz(*bad)
@@ -268,11 +308,21 @@ class TestGrabacionUsaAgmenMsgs(unittest.TestCase):
         if _has_numpy():
             otra = msgs.types(numpy=True)
             self.assertIsNot(otra.Imu, msgs.Imu)
-        with tempfile.TemporaryDirectory() as d:
-            # Un tipo de usuario con el mismo texto canónico que MuxEstado, definido antes de grabar.
-            class MuxEstado(wire.Message):          # noqa: F811 — a propósito: mismo nombre y esquema
-                SCHEMA = msgs.MuxEstado.SCHEMA
+        # Un tipo de usuario con el mismo nombre y texto canónico que MuxEstado, vivo mientras se lee.
+        # Al terminar se borra (y se comprueba que ya no existe), para no afectar a otras pruebas.
+        imitacion = type("MuxEstado", (wire.Message,), {"SCHEMA": msgs.MuxEstado.SCHEMA})
+        ref = weakref.ref(imitacion)
+        try:
+            self._grabar_y_leer()
+        finally:
+            del imitacion
+            gc.collect()
+        self.assertIsNone(ref(), "la clase de prueba sigue viva")
+        self.assertNotIn("MuxEstado", [c.__name__ for c in wire.Message.__subclasses__() if c.__module__ != "agmen.msgs"
+                                       and not c.__module__.startswith("agmen_msgs")])
 
+    def _grabar_y_leer(self):
+        with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "estandar.mcap")
             w = _mcap.Writer(path)
             t0 = 1_700_000_000_000_000_000
@@ -290,6 +340,14 @@ class TestGrabacionUsaAgmenMsgs(unittest.TestCase):
                 got = {s.topic: s.message for s in rec.messages()}
                 self.assertIsInstance(got["/imu"], msgs.Imu)
                 self.assertEqual(got["/mux/ruedas"].mux, "ruedas")
+
+    def test_la_lista_de_estandar_esta_completa(self):
+        """recording.STANDARD_MESSAGES tiene todos los message de agmen/msgs.agmen (y nada más): si
+        agregas uno allá y no aquí, una grabación podría darte una copia en vez de la clase de agmen.msgs."""
+        from agmen import recording
+
+        self.assertEqual(sorted(recording.STANDARD_MESSAGES),
+                         sorted(s.name for s in idl.parse_file(msgs.PATH).messages))
 
 
 class TestNanEnJson(unittest.TestCase):
@@ -326,7 +384,11 @@ class TestNanEnJson(unittest.TestCase):
         row = layout.unpack(_imu_sin_orientacion().encode_payload())
         texto = json.dumps(foxglove_row(layout, row), separators=(",", ":"))
         self.assertEqual(_estricto(texto), SIN_ORIENTACION)
-        self.assertEqual(foxglove_name(layout), "Imu")          # el mapeo a esquemas de Foxglove es del bloque 3
+        # El RFC 0013 §7 pone "el puente de Foxglove" en el bloque 1; el orquestador lo pasó al bloque 3
+        # porque completar foxglove.PoseInFrame / foxglove.Odometry necesita los marcos de robot.toml.
+        # Mientras, Imu se anuncia con su propio nombre. CAMBIA ESTA PRUEBA cuando entre ese mapeo.
+        self.assertEqual(foxglove_name(layout), "Imu", "¿ya entró el mapeo a esquemas de Foxglove (bloque 3)? "
+                                                        "Actualiza esta prueba")
         json.dumps(foxglove_schema(layout), allow_nan=False)
 
     def test_grabacion_y_export(self):

@@ -351,6 +351,19 @@ class TestErrores(Tmp):
         ("const f32 X = nan\n", "x.agmen:1:15:", "no en una constante"),
         ("message A {\n    f32 x = NaN\n}\n", "x.agmen:2:13:", "se escribe 'nan', en minúsculas"),
         ("message A {\n    string s = nan\n}\n", "x.agmen:2:16:", "va entre comillas"),
+        # Primero el tipo, después cómo se escribe: un u8 no lleva NaN, se escriba como se escriba.
+        ("message A {\n    u8 x = NaN\n}\n", "x.agmen:2:12:", "u8 es entero y no tiene NaN"),
+        # inf y nan con signo no existen: el único valor especial es nan.
+        ("message A {\n    f64 x = inf\n}\n", "x.agmen:2:13:", "'inf' no vale como valor: el único valor especial"),
+        ("message A {\n    f32 x = -inf\n}\n", "x.agmen:2:13:", "'-inf' no vale como valor"),
+        ("message A {\n    f64 x = infinity\n}\n", "x.agmen:2:13:", "'infinity' no vale como valor"),
+        ("message A {\n    f32 x = +nan\n}\n", "x.agmen:2:13:", "'+nan' no vale como valor"),
+        ("message A {\n    f64 x = -nan\n}\n", "x.agmen:2:13:", "'-nan' no vale como valor"),
+        ("message A {\n    f32[2] x = [1, -inf]\n}\n", "x.agmen:2:20:", "'-inf' no vale como valor"),
+        # Un número que se vuelve infinito (antes tronaba después, sin posición).
+        ("message A {\n    f64 x = 1e999\n}\n", "x.agmen:2:13:", "no cabe en f64: se vuelve infinito"),
+        ("message A {\n    f32 x = -1e39\n}\n", "x.agmen:2:13:", "no cabe en f32"),
+        ("const f64 X = 1e999\n", "x.agmen:1:15:", "se vuelve infinito"),
     ]
 
     def test_errores_con_linea_y_columna(self):
@@ -360,6 +373,27 @@ class TestErrores(Tmp):
                 self.assertIn(where, err)
                 self.assertIn(msg, err)
                 self.assertIn("^", err)          # señala la columna
+
+    def test_constante_que_se_llama_nan(self):
+        """Una constante NAN (o INF) usada como valor no recibe "se escribe 'nan', en minúsculas"."""
+        for name in ("NAN", "INF"):
+            with self.subTest(name):
+                err = self.error(f"const f32 {name} = 1.0\nmessage A {{\n    f32 x = {name}\n}}\n")
+                self.assertIn("x.agmen:3:13:", err)
+                self.assertNotIn("minúsculas", err)
+                self.assertNotIn("valor especial", err)
+        # Y un valor de enum que se llame NAN sigue siendo un valor del enum.
+        msgs = agmen.load(self.write("e.agmen", "enum M { A, NAN }\nmessage B {\n    M m = NAN\n}\n"))
+        self.assertIs(msgs.B().m, msgs.M.NAN)
+
+    def test_choque_con_un_tipo_de_agmen_msgs(self):
+        """Un .agmen de 0.14 que importaba agmen/msgs.agmen y tenía su propio Pose: el error da las dos salidas."""
+        err = self.error('import "agmen/msgs.agmen"\nmessage Pose {\n    f32 x\n}\n')
+        self.assertIn("x.agmen:2:9:", err)
+        self.assertIn("'Pose' ya existe en agmen/msgs.agmen (importado)", err)
+        self.assertIn("usa ese 'Pose' y borra el tuyo", err)
+        self.assertIn("cámbiale el nombre al tuyo", err)
+        self.assertIn("cambiar el nombre cambia su schema_id", err)
 
     def test_import_circular(self):
         self.write("a.agmen", 'import "b.agmen"\nmessage A { f32 x }\n')
@@ -412,7 +446,7 @@ class TestNan(Tmp):
         self.assertIn("agmen::wire::filled<float, 3>(std::bit_cast<float>(0x7FC00000U))", cpp)
         self.assertNotIn("#include <bit>", gen.cpp(idl.parse_file(VECTORS / "v1.agmen")), "solo si hace falta")
         py = gen.python(f)
-        self.assertIn('a: float = float("nan")', py)
+        self.assertIn('a: float = field(default_factory=lambda: float("nan"))', py)   # un NaN por instancia
         # El .py que escribe agmen gen se importa y da los mismos bytes.
         out = self.dir / "py"
         out.mkdir()

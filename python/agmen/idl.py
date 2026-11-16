@@ -44,6 +44,7 @@ import difflib
 import keyword
 import math
 import re
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -231,6 +232,7 @@ _TOKEN = re.compile(r"""
     (?P<nl>\n) | (?P<ws>[ \t\r]+) | (?P<comment>\#[^\n]*)
   | (?P<number>-?(?:0[xX][0-9A-Fa-f_]+|\d[\d_]*(?:\.\d*)?(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?))
   | (?P<ident>[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)
+  | (?P<signed>[+-][A-Za-z_][A-Za-z0-9_]*)    # -inf, +nan...: solo para decir que no valen
   | (?P<string>"[^"\n]*")
   | (?P<sym>[{}\[\]=:;,<>])
 """, re.X)
@@ -430,6 +432,9 @@ class _Parser:
                 return float(v) if any(c in v for c in ".eE") else int(v)
             except ValueError:
                 raise self.f.error(f"número inválido '{t.value}'", t.pos) from None
+        if t.kind == "signed":
+            self.next()
+            return _Name(t.value, t.pos)
         if t.kind == "ident":
             self.next()
             if t.value in ("true", "false"):
@@ -577,11 +582,29 @@ def _alias_hint(name: str) -> str:
     return f": usa '{alias}'" if alias else ""
 
 
-def _check_nan(f: AgmenFile, prim: str, value, pos: Pos, enum: EnumDef | None, allow_nan: bool):
+_SPECIAL = {"nan", "inf", "infinity"}       # con o sin signo: solo 'nan' (sin signo) vale (RFC 0013)
+
+
+def _special(f: AgmenFile, value, enum: EnumDef | None) -> bool:
+    """¿`value` es nan, inf, -inf, +nan... escrito como valor? (No si es el nombre de un valor
+    del enum del campo o de una constante, que se revisan como siempre.)"""
+    if not isinstance(value, _Name) or value.name.lstrip("+-").lower() not in _SPECIAL:
+        return False
+    if enum is not None and value.name in dict(enum.members):
+        return False
+    consts = {c.name for x in (f, *f.imports) for c in x.consts}
+    return value.name not in consts
+
+
+def _check_special(f: AgmenFile, prim: str, value, pos: Pos, enum: EnumDef | None, allow_nan: bool):
     """`nan` (RFC 0013): "no se mide o no se manda". Solo vale como valor por
-    defecto de un campo f32 o f64; en lo demás, un error que dice qué hacer."""
-    if value.name != "nan":
-        raise f.error(f"se escribe 'nan', en minúsculas (no '{value.name}')", value.pos)
+    defecto de un campo f32 o f64; en lo demás (y con inf, -inf, -nan...), un
+    error que dice qué hacer. Primero el tipo y al final cómo se escribe, para
+    no pedir dos arreglos uno tras otro."""
+    name = value.name
+    if name.lower() != "nan":
+        raise f.error(f"'{name}' no vale como valor: el único valor especial de .agmen es nan, sin signo y solo en "
+                      f"campos f32 y f64 (lo que no se mide). Para un límite usa un número (ej. 1e30)", value.pos)
     if not allow_nan:
         raise f.error("'nan' solo vale como valor por defecto de un campo f32 o f64, no en una constante: "
                       "usa un número", pos)
@@ -592,14 +615,31 @@ def _check_nan(f: AgmenFile, prim: str, value, pos: Pos, enum: EnumDef | None, a
         what = "un bool lleva true o false" if prim == "bool" else (
             f"{prim} es entero y no tiene NaN: usa un número que signifique 'no hay' (ej. 0 o -1)")
         raise f.error(f"'nan' solo vale en campos f32 y f64; {what}", pos)
+    if name != "nan":
+        raise f.error(f"se escribe 'nan', en minúsculas (no '{name}')", value.pos)
     return math.nan
 
 
+def _check_float(f: AgmenFile, prim: str, value, pos: Pos) -> float:
+    """Un número para un f32 o f64: que no se vuelva infinito (ej. 1e999) ni se salga de un f32."""
+    try:
+        x = float(value)
+    except OverflowError:                      # un entero de cientos de cifras
+        x = math.inf
+    if not math.isfinite(x):
+        raise f.error(f"el número no cabe en {prim}: se vuelve infinito. Usa uno más chico (f64 llega a "
+                      f"±1.79e308; f32, a ±3.4e38)", pos)
+    if prim == "f32":
+        try:
+            struct.pack("<f", x)
+        except OverflowError:
+            raise f.error(f"{x:g} no cabe en f32 (llega a ±3.4e38): usa f64 o un número más chico", pos) from None
+    return x
+
+
 def _check_scalar(f: AgmenFile, prim: str, value, pos: Pos, enum: EnumDef | None, allow_nan: bool = False):
-    # 'nan' en minúsculas no puede ser el nombre de un valor de enum (van en MAYÚSCULAS);
-    # 'NaN' o 'NAN' en un campo de número es casi seguro un nan mal escrito.
-    if isinstance(value, _Name) and (value.name == "nan" or (enum is None and value.name.lower() == "nan")):
-        return _check_nan(f, prim, value, pos, enum, allow_nan)
+    if _special(f, value, enum):
+        return _check_special(f, prim, value, pos, enum, allow_nan)
     if enum is not None:
         names = [m for m, _ in enum.members]
         if not isinstance(value, _Name):
@@ -618,7 +658,7 @@ def _check_scalar(f: AgmenFile, prim: str, value, pos: Pos, enum: EnumDef | None
     if isinstance(value, bool):
         raise f.error(f"true/false es para bool; el campo es {prim}", pos)
     if prim in FLOATS:
-        return float(value)
+        return _check_float(f, prim, value, pos)
     if not isinstance(value, int):
         raise f.error(f"{prim} es entero: {value} tiene decimales", pos)
     lo, hi = INT_RANGES[prim]
@@ -641,7 +681,12 @@ def _resolve(f: AgmenFile) -> None:
             visible[n] = d
     for n, d in f.types().items():
         if n in visible:
-            raise f.error(f"'{n}' ya existe en {visible[n].file.path.name} (importado): usa otro nombre", d.pos)
+            other = visible[n].file
+            where = next((k for k, v in BUILTIN.items() if v.resolve() == other.path.resolve()), other.path.name)
+            raise f.error(f"'{n}' ya existe en {where} (importado). Dos salidas: (1) usa ese '{n}' y borra el tuyo "
+                          f"(revisa que sus campos te sirvan: si son otros, también cambia el schema_id); o (2) cámbiale el nombre al tuyo "
+                          f"(ej. Mi{n}). Ojo: cambiar el nombre cambia su schema_id, y los nodos y las grabaciones "
+                          f"que usaban el '{n}' de antes ya no lo reconocen", d.pos)
     local = f.types()
     if len(local) != len(f.enums) + len(f.structs):
         seen: set[str] = set()
