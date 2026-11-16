@@ -11,6 +11,8 @@ sistema ("Bad file descriptor") y no pierde ni duplica donde no debe:
   - publicar/recibir × close(): close() termina y los demás reciben "el Publisher/Subscriber ya se
     cerró" (o el valor de "nada" del método), nunca otro error; close() dos veces o desde dos hilos es
     inofensivo;
+  - lo mismo en modo red (hub con [[machine]], AGMEN_NET_IP: socket de red del Publisher y paso del Subscriber
+    a la red; casos "red_*");
   - RawPublisher, RawSubscriber, Node con hilos del usuario, agmen.clock.
 
 Cada caso corre en un SUBPROCESO (un aborto del núcleo no tumba la suite) con tope de tiempo. Un caso pasa
@@ -591,6 +593,192 @@ for r in range(RONDAS):
 termina()
 ''')
 
+# --- Modo red (varias computadoras, [[machine]], RFC 0011) entre hilos ------------------------------
+# Un hub en un hilo del propio proceso que es la computadora "a" (127.0.0.3) y conoce a "b" (127.0.0.2).
+# Los objetos se abren con AGMEN_NET_IP=127.0.0.3: el Publisher abre su socket de red y el Subscriber, en
+# su primer receive(), pasa de los sockets locales a los de la red (el cambio de sockets). En "b" hay un
+# suscriptor remoto registrado a mano: UDP a un socket que nadie lee (compact) o TCP a un puerto cerrado
+# (arrow: eso sube `unreachable`). Lo que se prueba es lo de siempre: nada aborta, no se cuelga, valores
+# coherentes y "ya se cerró" como único error.
+
+RED = r'''
+sys.path.insert(0, os.environ["AGMEN_HILOS_PY"])
+import socket as _socket
+import test_red as TR
+HR = TR.Hub("127.0.0.3")
+HR.red("b@127.0.0.2")
+_REMOTOS = []
+
+def _puerto_tcp_cerrado():
+    s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    s.bind(("127.0.0.2", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+def red_par(nombre, calienta=True):
+    """(Publisher, Subscriber) de "a" en el mismo topic, más un suscriptor remoto en "b". Con calienta=False
+    se devuelven recién abiertos (el Subscriber aún no ha pasado a la red)."""
+    global TOPIC
+    TOPIC = topic = "/hilos/red_%s_%d/%s%d" % (TIPO_N, PID, nombre, next(_cont))
+    sub = TR.opened(HR, agmen.Subscriber, TIPO, topic, net_ip="127.0.0.3")
+    pub = TR.opened(HR, agmen.Publisher, TIPO, topic, net_ip="127.0.0.3")
+    u = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    u.bind(("127.0.0.2", 0))
+    _REMOTOS.append(u)
+    HR.remote_sub("r%d" % next(_cont), TIPO, topic, "b", "127.0.0.2", u.getsockname()[1],
+                  tcp=0 if TIPO is Chico else _puerto_tcp_cerrado())
+    if calienta:
+        fin = time.monotonic() + 8
+        while time.monotonic() < fin and not red_lista(topic):
+            pub.publish(mk(99, 0))
+            sub.receive(0.02)
+        if not red_lista(topic):
+            falla("el Subscriber no pasó a la red en 8 s")
+        while sub.receive(0.02) is not None:
+            pass
+    return pub, sub
+
+def red_lista(topic):
+    """El hub ya tiene al Subscriber local de `topic` con sockets de red."""
+    with HR.hub.lock:
+        return any(e.kind == "sub" and e.topic == topic and not e.machine and e.net
+                   for e in HR.hub.endpoints.values())
+
+def red_cierra():
+    HR.close()
+    for u in _REMOTOS:
+        u.close()
+'''
+
+caso("red_pub_x_props", modos=("red",))(RED + PUBLICA + DRENA + r'''
+# 4 hilos publican por el socket de red y 3 leen unreachable, rejected, subscribers, seq (y el resto):
+# enteros >= 0 y los contadores nunca bajan. Al final seq cuenta todo lo publicado.
+PROPS = ("seq", "subscribers", "dropped", "shm_subscribers", "unreachable", "rejected")
+def lee(pub, alto):
+    ant = {}
+    while not alto.is_set():
+        for p in PROPS:
+            v = getattr(pub, p)
+            if not isinstance(v, int) or v < 0:
+                falla("%s = %r" % (p, v))
+            if p in ("seq", "dropped", "unreachable", "rejected") and v < ant.get(p, 0):
+                falla("%s bajó de %d a %d" % (p, ant[p], v))
+            ant[p] = v
+        time.sleep(0)
+for r in range(RONDAS):
+    pub, sub = red_par("rp%d" % r)
+    base = pub.seq
+    alto = threading.Event(); cuenta = [0] * 4
+    dren = lanza(trabajo(drena, sub, alto))
+    hs = lanza(*[trabajo(publicador, pub, h, alto, cuenta, permite_cierre=False) for h in range(4)],
+               *[trabajo(lee, pub, alto, permite_cierre=False) for _ in range(3)])
+    fin = time.monotonic() + 0.4
+    while time.monotonic() < fin:
+        time.sleep(0.02)
+    alto.set()
+    espera(hs, 15, "publicar (red) x leer propiedades")
+    espera(dren, 15, "drenaje")
+    if pub.seq != base + sum(cuenta):
+        falla("ronda %d: pub.seq = %d, debía ser %d" % (r, pub.seq, base + sum(cuenta)))
+    pub.close(); sub.close()
+red_cierra()
+termina()
+''')
+
+caso("red_sub_x_props", modos=("red",), tipos=("arrow",))(RED + PUBLICA + SUB_PROPS + r'''
+# El Subscriber recién abierto (aún en sockets locales) recibe en un hilo mientras otros leen announced,
+# port, tcp_port, listen, rejected, fileno(), filenos(): el paso a la red ocurre EN MEDIO de las lecturas.
+for r in range(RONDAS):
+    pub, sub = red_par("rs%d" % r, calienta=False)
+    topic = TOPIC
+    alto = threading.Event(); cuenta = [0]; ya = threading.Event()
+    def recibe():
+        while not alto.is_set():
+            sub.receive(0.02)
+    def anuncia():
+        while not alto.is_set():
+            pub.announce()
+            time.sleep(0.002)
+    hs = lanza(trabajo(publicador, pub, 0, alto, cuenta, permite_cierre=False), trabajo(recibe, permite_cierre=False),
+               trabajo(anuncia, permite_cierre=False),
+               *[trabajo(lee, sub, alto, ya, True, permite_cierre=False) for _ in range(3)])
+    fin = time.monotonic() + 8
+    while time.monotonic() < fin and not red_lista(topic):
+        time.sleep(0.01)
+    if not red_lista(topic):
+        falla("ronda %d: el Subscriber no pasó a la red en 8 s" % r)
+    time.sleep(0.2)   # y un rato más ya en la red
+    alto.set()
+    espera(hs, 15, "recibir x leer propiedades (paso a la red)")
+    pub.close(); sub.close()
+red_cierra()
+termina()
+''')
+
+caso("red_pub_x_close", modos=("red",))(RED + PUBLICA + DRENA + r'''
+# Hilos publican por el socket de red y el principal cierra el Publisher: close() termina; publish() sigue
+# o lanza "el Publisher ya se cerró".
+for r in range(RONDAS):
+    pub, sub = red_par("rc%d" % r)
+    alto = threading.Event(); ya = [threading.Event() for _ in range(4)]; cuenta = [0] * 4
+    dren = lanza(trabajo(drena, sub, alto))
+    def lee():
+        while not alto.is_set():
+            pub.unreachable, pub.rejected, pub.subscribers, pub.seq
+    hs = lanza(*[trabajo(publicador, pub, h, alto, cuenta, ya[h]) for h in range(4)], trabajo(lee))
+    for e in ya:
+        e.wait(10)
+    mide(pub.close, 10, "Publisher.close() (red)")
+    mide(pub.close, 10, "Publisher.close() (red) por segunda vez")
+    try:
+        pub.publish(mk(0, 0))
+    except RuntimeError as e:
+        if not cerrado(e):
+            falla("publish tras close: %s" % e)
+    alto.set()
+    espera(hs, 15, "publicadores (red) tras close()")
+    espera(dren, 15, "drenaje")
+    sub.close()
+red_cierra()
+termina()
+''')
+
+caso("red_sub_x_close", modos=("red",))(RED + PUBLICA + r'''
+# Receptores dentro de receive() (con el paso a la red en curso o recién hecho) y el principal cierra
+# el Subscriber: close() termina en poco; los receive() vuelven con None o "ya se cerró".
+for r in range(RONDAS):
+    pub, sub = red_par("rx%d" % r, calienta=False)
+    alto = threading.Event(); cuenta = [0]; dentro = [threading.Event() for _ in range(4)]
+    def recibe(i):
+        while not alto.is_set():
+            dentro[i].set()
+            sub.receive(0.3)
+    def lee_red():
+        while not alto.is_set():
+            sub.listen, sub.port, sub.rejected, sub.filenos()
+    hs = lanza(trabajo(publicador, pub, 0, alto, cuenta), trabajo(lee_red),
+               *[trabajo(recibe, i) for i in range(4)])
+    for e in dentro:
+        e.wait(10)
+    if r % 2:   # en rondas alternas se espera a que el paso a la red termine; en las otras, se cierra en pleno cambio
+        fin = time.monotonic() + 8
+        while time.monotonic() < fin and not red_lista(TOPIC):
+            time.sleep(0.01)
+    mide(sub.close, 5, "Subscriber.close() (red)")
+    mide(sub.close, 5, "Subscriber.close() (red) por segunda vez")
+    try:
+        sub.receive(0.01)
+    except RuntimeError as e:
+        if not cerrado(e):
+            falla("receive tras close: %s" % e)
+    alto.set()
+    espera(hs, 15, "receptores (red) tras close()")
+    pub.close()
+red_cierra()
+termina()
+''')
+
 # --- RawPublisher y RawSubscriber (siempre con el hub: topic) ----------------------------------------
 
 RAW = r'''
@@ -926,6 +1114,7 @@ class _Base(unittest.TestCase):
     def corre(self, nombre, modo, tipo):
         cuerpo = CASOS[nombre][0]
         env = {**os.environ, "AGMEN_HUB": self.addr, "AGMEN_BACKEND": self.backend}
+        env["AGMEN_HILOS_PY"] = str(AQUI)
         for v in ("AGMEN_CLOCK", "AGMEN_NET_IP", "AGMEN_NODE"):
             env.pop(v, None)
         if TSAN:
