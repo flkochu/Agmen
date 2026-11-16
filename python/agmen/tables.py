@@ -513,7 +513,7 @@ class Bridge:
 
     def __init__(self, hub: str, say: Callable[[str, str], None], *, robots: bool = False,
                  beat: float = hp.BEAT_S, owned: Callable[[], list[int]] | None = None,
-                 session: str = "simulación") -> None:
+                 session: str = "simulación", modo: str = "") -> None:
         self.hub = hub
         self.session = session   # cómo se llama la sesión en el aviso de §9.2: "simulación" o "reproducción"
         # §9.2: en una sesión de simulación o reproducción (del lado del robot), los pids de los nodos que arrancó el
@@ -540,6 +540,14 @@ class Bridge:
         self._stop = threading.Event()
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
+        # Bloque 5 (§6.1): el modo del reloj de la sesión (real, sim o replay), que va en `modo` de cada `red` para
+        # que las herramientas sueltas (agmen node list) lo sepan por el hub. "" = no se sabe: `red` sin `modo`.
+        # Uno desconocido no tumba el puente (los topics cruzan igual): se dice y el hub queda sin saberlo.
+        self.modo = modo if modo in hp.MODOS_RELOJ else ""
+        if modo and not self.modo:
+            self.say_once(("modo",), f"⚠ el puente de topics recibió un modo de reloj desconocido ({modo[:40]!r}; "
+                                     f"conozco real, sim y replay): no se lo digo al hub y agmen node list no "
+                                     f"sabrá si la sesión usa el reloj real", "error")
 
     def say_once(self, key, text: str, kind: str = "agmen") -> None:
         with self._said_lock:
@@ -616,7 +624,8 @@ class Bridge:
         active = sorted((p.name, p.ip) for p in peers)
         if active:
             if active != self._red or now - self._red_at >= hp.NET_BEAT_S:
-                lines.append(hp.encode("red", peers=hp.format_peers(active), **self._relojes(peers)))
+                modo = {"modo": self.modo} if self.modo else {}
+                lines.append(hp.encode("red", peers=hp.format_peers(active), **self._relojes(peers), **modo))
                 self._red, self._red_at = active, now
         else:
             self._red = None   # deja de repetir `red`: el hub vuelve a modo local en NET_EXPIRE_S

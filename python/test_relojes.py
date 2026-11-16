@@ -405,6 +405,77 @@ class TestHub(unittest.TestCase):
         self.assertEqual(hub.peers, [("robot", "192.168.1.20"), ("pi", "192.168.1.30")])
 
 
+class TestHubModo(unittest.TestCase):
+    """§6.1/§6.4: el `modo` de `red` va en la línea `state`, solo en modo red, y caduca con él."""
+
+    def red(self, hub, now=None, **campos):
+        hub.handle(hp.encode("red", peers="robot@192.168.1.20", **campos), LOCAL,
+                   time.monotonic() if now is None else now)
+
+    def cabecera(self, hub) -> dict:
+        return next(f for op, f in hp.parse(hub.state_text().encode()) if op == "state")
+
+    def test_red_con_y_sin_modo(self):
+        hub = hub_de_prueba()
+        self.addCleanup(hub.sock.close)
+        for modo in ("real", "sim", "replay"):
+            with self.subTest(modo=modo):
+                self.red(hub, modo=modo)
+                self.assertEqual(hub._sent[-1], hp.encode("red_ok", peers=1))
+                self.assertEqual(self.cabecera(hub)["modo"], modo)
+                primera = hub.state_text().split("\n")[0]
+                self.assertTrue(primera.endswith(f" robot={hp.quote(hub.robot)} modo={modo}"), primera)
+        # un `red` sin `modo` (un puente anterior): se acepta igual y el hub ya no lo sabe
+        self.red(hub)
+        self.assertEqual(hub._sent[-1], hp.encode("red_ok", peers=1))
+        self.assertTrue(hub.net_mode)
+        self.assertNotIn("modo", self.cabecera(hub))
+
+    def test_desconocido_se_ignora_y_se_dice(self):
+        dicho = []
+        hub = hub_de_prueba()
+        hub.log = dicho.append
+        self.addCleanup(hub.sock.close)
+        self.red(hub, modo="real")
+        self.red(hub, modo="marciano")
+        self.assertEqual(hub._sent[-1], hp.encode("red_ok", peers=1))
+        self.assertTrue(hub.net_mode)
+        self.assertNotIn("modo", self.cabecera(hub))
+        self.assertTrue(any("modo de reloj desconocido" in d and "marciano" in d for d in dicho), dicho)
+
+    def test_sin_modo_red_state_identico(self):
+        hub = hub_de_prueba()
+        self.addCleanup(hub.sock.close)
+        antes = hub.state_text()
+        self.red(hub, modo="real")
+        self.assertIn(" modo=real", hub.state_text())
+        hub.handle(hp.encode("red", peers=""), LOCAL, time.monotonic())   # vuelta a modo local pedida
+        self.assertEqual(hub.state_text(), antes)
+        self.assertEqual(hub.modo, "")
+
+    def test_caduca_con_el_modo_red(self):
+        hub = hub_de_prueba()
+        self.addCleanup(hub.sock.close)
+        antes = hub.state_text()
+        now = time.monotonic()
+        self.red(hub, now, modo="sim")
+        hub._check_net(now + hp.NET_EXPIRE_S / 2)
+        self.assertEqual(self.cabecera(hub)["modo"], "sim")
+        hub._check_net(now + hp.NET_EXPIRE_S + 0.1)
+        self.assertFalse(hub.net_mode)
+        self.assertEqual(hub.state_text(), antes)
+
+    def test_un_hub_anterior_ignora_el_campo(self):
+        """Un hub anterior (sin _set_modo): contesta red_ok igual y su `state` no cambia."""
+        hub = hub_de_prueba()
+        self.addCleanup(hub.sock.close)
+        with mock.patch.object(H.Hub, "_set_modo", lambda self, modo: None):
+            self.red(hub, modo="real")
+        self.assertEqual(hub._sent[-1], hp.encode("red_ok", peers=1))
+        self.assertEqual(hub.peers, [("robot", "192.168.1.20")])
+        self.assertNotIn("modo", self.cabecera(hub))
+
+
 class TestHerramientasIgnoranMaq(unittest.TestCase):
     """§2.2: agmen topic list/info ignoran la línea `maq`: su salida no cambia. (agmen node list sí la usa desde la
     parte B, §4.1: ver test_relojes_ver.py; aquí se comprueba que la tabla y las cuentas no cambian.)"""
@@ -432,10 +503,11 @@ class TestHerramientasIgnoranMaq(unittest.TestCase):
 # ===========================================================================
 
 class TestPuente(unittest.TestCase):
-    def puente(self, reloj=None):
+    def puente(self, reloj=None, modo="", dicho=None):
         hub = hub_de_prueba()
         self.addCleanup(hub.sock.close)
-        b = T.Bridge(hub.listen, lambda *a, **k: None)
+        b = T.Bridge(hub.listen, (lambda t, k="agmen": dicho.append(t)) if dicho is not None else
+                     (lambda *a, **k: None), modo=modo)
         b._sock = mock.Mock()
         sent = []
         b._sock.sendto = lambda data, addr: sent.append(data)
@@ -455,6 +527,20 @@ class TestPuente(unittest.TestCase):
         self.assertEqual(got, [b"agmen-hub/1 red peers=robot%40192.168.1.20 relojes=robot:2000000:600000:250"])
         got = self.puente(lambda: R.Estado(False, motivo="esperando"))
         self.assertEqual(got, [b"agmen-hub/1 red peers=robot%40192.168.1.20 relojes=robot:-:esperando:-"])
+
+    def test_con_modo(self):
+        for modo in ("real", "sim", "replay"):
+            with self.subTest(modo=modo):
+                self.assertEqual(self.puente(modo=modo), [f"agmen-hub/1 red peers=robot%40192.168.1.20 "
+                                                          f"modo={modo}".encode()])
+        got = self.puente(lambda: R.Estado(True, 2 * MS, 600_000, 0.25), modo="real")
+        self.assertEqual(got, [b"agmen-hub/1 red peers=robot%40192.168.1.20 relojes=robot:2000000:600000:250 "
+                               b"modo=real"])
+
+    def test_modo_desconocido_no_va_y_se_dice(self):
+        dicho = []
+        self.assertEqual(self.puente(modo="marciano", dicho=dicho), [b"agmen-hub/1 red peers=robot%40192.168.1.20"])
+        self.assertTrue(any("modo de reloj desconocido" in d for d in dicho), dicho)
 
     def test_un_reloj_que_falla_no_tumba_el_red(self):
         def roto():

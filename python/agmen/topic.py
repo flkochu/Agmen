@@ -129,7 +129,8 @@ def cmd_node_list(args) -> int:
     for line in _table(rows, header):
         print(line)
     msgs = hubmod.query(hub_address())
-    for line in clock_lines(relojes.maquinas_del_hub(msgs), session_mode()):
+    head = next((f for op, f in msgs if op == "state"), {})
+    for line in clock_lines(relojes.maquinas_del_hub(msgs), session_mode(head)):
         print(line)
     stats = [f for op, f in msgs if op == "stat"]
     for line in stats_lines(stats):
@@ -137,11 +138,16 @@ def cmd_node_list(args) -> int:
     return 0
 
 
-def session_mode() -> str:
-    """El modo del reloj de la sesión, si esta herramienta lo puede saber: solo por AGMEN_CLOCK (agmen run se lo
-    pasa a sus nodos). Desde una terminal cualquiera no se sabe: "" (el hub no lo dice)."""
+def session_mode(head: dict | None = None) -> str:
+    """El modo del reloj de la sesión, si esta herramienta lo puede saber (bloque 5, §6.2). Manda el hub: el
+    `modo` de su línea `state` (head), que le dice el puente en modo red; uno desconocido es "" (no se sabe; nunca
+    se toma por real ni por sim). Si el hub no lo dice (hub anterior, sin agmen run, caducado): AGMEN_CLOCK, como
+    antes (agmen run se lo pasa a sus nodos). Desde una terminal cualquiera, sin nada de eso: ""."""
+    modos = ("real", "sim", "replay")
+    if head and "modo" in head:
+        return head["modo"] if head["modo"] in modos else ""
     m = os.environ.get("AGMEN_CLOCK", "")
-    return m if m in ("real", "sim", "replay") else ""
+    return m if m in modos else ""
 
 
 def clock_lines(maquinas: dict, mode: str) -> list[str]:

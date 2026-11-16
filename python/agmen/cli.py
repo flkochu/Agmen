@@ -432,7 +432,7 @@ def _run(args) -> int:
             stop.set()
     bridge = None
     if remotes and config.hub and not stop.is_set():   # 4b: el puente con los robots (antes de arrancar los nodos)
-        bridge = _bridge_for(launcher, remotes)
+        bridge = _bridge_for(launcher, remotes, "replay" if args.play else config.clock.mode)
     if not stop.is_set():   # una computadora se perdió (o Ctrl+C) mientras se preparaba lo de aquí: no se arranca
         launcher.start_all()
         if not ctrl_c.pressed:
@@ -514,14 +514,15 @@ def _key_hint(name: str, source: str, code: str) -> str:
                        f"en la terminal de {name}"}[source]
 
 
-def _bridge_for(launcher, remotes: dict):
+def _bridge_for(launcher, remotes: dict, modo: str = ""):
     """El puente de agmen run (RFC 0011 parte 4b): un hilo con el hub de aquí y un Peer por cada robot. Si no
-    se puede arrancar, se dice y todo sigue sin topics entre computadoras."""
+    se puede arrancar, se dice y todo sigue sin topics entre computadoras. `modo`: el del reloj de la sesión (el
+    mismo que va a los agentes), que el puente le dice al hub en `red` (bloque 5, §6.1)."""
     from .pubsub import hub_address
     from .tables import Bridge
 
     try:
-        bridge = Bridge(hub_address(), launcher.say, robots=len(remotes) > 1)
+        bridge = Bridge(hub_address(), launcher.say, robots=len(remotes) > 1, modo=modo)
         bridge.start()
     except Exception as e:
         launcher.say(f"⚠ no pude arrancar el puente de topics con las otras computadoras ({e!r}): los topics no "

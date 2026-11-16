@@ -118,6 +118,69 @@ class TestNodeListConUnHubDeVerdad(TM.TR.Base):
         self.assertIsNotNone(pub)
 
 
+def con_modo(msgs: list, modo: str) -> list:
+    """Las mismas líneas, con `modo` en la línea `state` (como la da un hub en modo red al que el puente se lo dijo)."""
+    return [(op, {**f, "modo": modo} if op == "state" else f) for op, f in msgs]
+
+
+class TestNodeListConElModoDelHub(unittest.TestCase):
+    """§6.2: el modo de la sesión lo dice el hub (`modo` en `state`); AGMEN_CLOCK ya no decide si el hub lo dice."""
+
+    def test_los_cuatro_casos(self):
+        bien = "robot: reloj +2.1 ms (±0.6)"
+        # real y mal: ⚠ con el qué hacer (aunque AGMEN_CLOCK diga otra cosa: manda el hub)
+        for clock in (None, "sim"):
+            with self.subTest(caso="real mal", clock=clock):
+                (linea,) = bloque_relojes(node_list(con_modo(con_maq(MAL), "real"), clock))
+                self.assertTrue(linea.startswith("⚠ robot: reloj -35.0 ms (±0.6) — más de 10 ms: revisa la hora"),
+                                linea)
+                self.assertIn("chrony", linea)
+        with self.subTest(caso="real bien"):
+            self.assertEqual(bloque_relojes(node_list(con_modo(con_maq(MEDIDO), "real"), "sim")), [bien])
+        for modo, nota in (("sim", "(no afecta en sim)"), ("replay", "(no afecta en reproducción)")):
+            with self.subTest(caso=modo):
+                (linea,) = bloque_relojes(node_list(con_modo(con_maq(MAL), modo), "real"))
+                self.assertEqual(linea, f"robot: reloj -35.0 ms (±0.6) {nota}")
+        with self.subTest(caso="sin modo"):   # hub anterior, sin agmen run o caducado: el texto condicional
+            (linea,) = bloque_relojes(node_list(con_maq(MAL)))
+            self.assertFalse(linea.startswith("⚠"), linea)
+            self.assertIn("si la sesión usa el reloj real", linea)
+            self.assertNotIn("no afecta", linea)
+
+    def test_modo_desconocido_no_es_real_ni_sim(self):
+        for clock in (None, "real", "sim"):
+            with self.subTest(clock=clock):
+                (linea,) = bloque_relojes(node_list(con_modo(con_maq(MAL), "marciano"), clock))
+                self.assertFalse(linea.startswith("⚠"), linea)
+                self.assertIn("si la sesión usa el reloj real", linea)
+                self.assertNotIn("no afecta", linea)
+
+    def test_sin_modo_del_hub_se_usa_agmen_clock(self):
+        (linea,) = bloque_relojes(node_list(con_maq(MAL), "real"))
+        self.assertTrue(linea.startswith("⚠"), linea)
+
+    def test_sin_maquinas_identico_con_modo(self):
+        self.assertEqual(node_list(con_modo(TM.lineas(), "real")), TM.ANTES_NODES)
+
+
+class TestNodeListModoConUnHubDeVerdad(TM.TR.Base):
+    """El puente (aquí, a mano) dice `modo=real` en `red`: el hub lo da en `state` y node list marca el ⚠."""
+
+    def test_real_mal(self):
+        h = self.hub("127.0.0.6")
+        h.keep(hp.encode("red", peers="robot@127.0.0.4", relojes="robot:-35000000:600000:500", modo="real"))
+        self.assertTrue(TM.TR.until(lambda: h.hub.relojes and h.hub.modo == "real"))
+        pub = self.open(h, TM.pubsub._PurePublisher, TM.TR.Chico, "/x")
+        self.assertTrue(TM.TR.until(lambda: h.hub.endpoints))
+        env = {k: v for k, v in os.environ.items() if k != "AGMEN_CLOCK"}
+        env["AGMEN_HUB"] = h.addr
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out):
+            topic.cmd_node_list(SimpleNamespace())
+        self.assertIn("\n⚠ robot: reloj -35.0 ms (±0.6) — más de 10 ms: revisa la hora", out.getvalue())
+        self.assertIsNotNone(pub)
+
+
 # ---------------------------------------------------------------------------
 # El panel
 # ---------------------------------------------------------------------------

@@ -2082,7 +2082,8 @@ class _Session:
         owned = self._node_pids if self._first.get("reloj") in ("sim", "replay") else None
         try:
             bridge = Bridge(hub_address(), self.launcher.say, owned=owned,
-                            session="reproducción" if self._first.get("reloj") == "replay" else "simulación")
+                            session="reproducción" if self._first.get("reloj") == "replay" else "simulación",
+                            modo=str(self._first.get("reloj") or ""))   # bloque 5 (§6.1): el modo, al hub en `red`
             peer = bridge.add_peer(self._first["desde"], lambda part: self.send(part), reloj=self._reloj.estado)
             bridge.start()
         except Exception as e:   # nunca en silencio; la sesión sigue sin puente
