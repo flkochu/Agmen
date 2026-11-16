@@ -398,9 +398,6 @@ salidas reales de un corte de WiFi.
 
 > **Lo que todavía no hace (Agmen 0.14.0).**
 >
-> - **Los topics no cruzan entre computadoras.** El `cerebro` de la laptop no
->   recibe `/imu` de la Pi: cada computadora tiene su propio hub. Eso llega en el
->   bloque 4 del RFC 0011.
 > - **Nada de relojes.** Medir la diferencia de reloj entre computadoras llega en
 >   el bloque 5.
 
