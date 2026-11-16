@@ -345,7 +345,8 @@ class Recorder:
             for op, f in hubmod.query(hub_address(), timeout=0.2):
                 if op == "topic" and f.get("name") and f.get("schema") and f.get("text"):
                     self._names[wire.topic_id(f["name"])] = f["name"]
-                    self._schemas[int(f["schema"], 16)] = f["text"]
+                    if f.get("cortado") != "1":   # un esquema recortado por el hub (no cabía) no se guarda: no sirve
+                        self._schemas[int(f["schema"], 16)] = f["text"]
         except (ConnectionError, OSError, ValueError):
             pass
 

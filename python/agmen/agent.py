@@ -1956,7 +1956,8 @@ class _Session:
         # agente (y sus descendientes); en una sesión `real`, todo (como siempre).
         owned = self._node_pids if self._first.get("reloj") in ("sim", "replay") else None
         try:
-            bridge = Bridge(hub_address(), self.launcher.say, owned=owned)
+            bridge = Bridge(hub_address(), self.launcher.say, owned=owned,
+                            session="reproducción" if self._first.get("reloj") == "replay" else "simulación")
             peer = bridge.add_peer(self._first["desde"], lambda part: self.send(part))
             bridge.start()
         except Exception as e:   # nunca en silencio; la sesión sigue sin puente

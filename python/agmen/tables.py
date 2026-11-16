@@ -501,8 +501,10 @@ class Bridge:
     de un topic que se publica en un robot y se escucha en otro (laptop con varios robots, §4)."""
 
     def __init__(self, hub: str, say: Callable[[str, str], None], *, robots: bool = False,
-                 beat: float = hp.BEAT_S, owned: Callable[[], list[int]] | None = None) -> None:
+                 beat: float = hp.BEAT_S, owned: Callable[[], list[int]] | None = None,
+                 session: str = "simulación") -> None:
         self.hub = hub
+        self.session = session   # cómo se llama la sesión en el aviso de §9.2: "simulación" o "reproducción"
         # §9.2: en una sesión de simulación o reproducción (del lado del robot), los pids de los nodos que arrancó el
         # agente: solo lo suyo se exporta, y lo importado lleva `solo` (None: sin restricción, como siempre).
         self.owned = owned
@@ -702,7 +704,7 @@ class Bridge:
             elif mine is False and who:   # (None: el proceso ya no está; su entrada caduca sola en el hub, sin aviso)
                 node = f.get("node", "?")
                 self.say_once(("ajeno", node), f"'{node}' (pid {f.get('pid') or '?'}) no lo arranqué yo y esta es una "
-                                               f"sesión de simulación: no lo conecto con {who} (ni recibe ni manda). "
+                                               f"sesión de {self.session}: no lo conecto con {who} (ni recibe ni manda). "
                                                f"Si es parte del robot, ponlo en robot.toml", "error")
         self.solo = solo
         pubs, subs = table
