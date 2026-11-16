@@ -87,6 +87,7 @@ RESUME_LOG_LINES = 2000         # para reanudar: las últimas líneas de log de 
 RESUME_LOG_BYTES = 1024 * 1024  # … y con tope en bytes
 RESUME_MAX_NODES = 1024         # reanudar: entradas de 'logs' que se aceptan
 RESUME_CONFIRM = 1.0            # §13: un reanudar al final de la gracia la prorroga hasta esto (una vez por gracia)
+ESPERA_SIGUE_S = 30.0           # 4c §5.1: tras sonda_espera, lo que el agente espera el `sigue` de la laptop
 
 WRITTEN_KEYS = ("cmd", "env", "cwd", "restart", "autostart", "profile")   # lo escrito que se compara (D7)
 CLOCKS = ("real", "sim", "replay")
@@ -1501,6 +1502,11 @@ class _Session:
         self._probe = False
         self._probing: Channel | None = None
         self._probe_lock = threading.Lock()
+        # 4c §5.1: con la prueba de red primero, el agente contesta sonda_espera y no corre nada (ni [robot] before,
+        # ni el hub, ni nodos) hasta el `sigue` de la laptop; con tope ESPERA_SIGUE_S (con self._end_lock).
+        self._tables_known = False           # ¿ya se decidió el puente (antes de sonda_espera)?
+        self._awaiting = False               # dijo sonda_espera y aún no llega `sigue`
+        self._await_timer: threading.Timer | None = None
         self.bridge = None
         self.peer = None
         self.sender = self._start_sender(channel, self.out)
@@ -1707,6 +1713,8 @@ class _Session:
                 # de esta conexión (vieja) nunca llega después del confirm() de la nueva (que también lo toma).
                 self.peer.lose()
         if not grace:
+            if self._awaiting:   # 4c §5.1: sin sesión lista no hay gracia (y no corrió nada que cuidar)
+                early = f"la laptop ({self.ip}) {cause} durante la prueba de red: no preparé nada"
             self.end(early, "error")
             return
         if failed is not None:
@@ -1865,11 +1873,60 @@ class _Session:
         if "hub" not in launcher.nodes and plan.config.hub:
             launcher.say(f"⚠ en {self.server.machine} ya corría un agmen hub sin nodos: lo reuso (sus [[topic]] no "
                          f"se revisan). Si no es tuyo, detenlo y vuelve a correr agmen run")
+        if _says_probe(first):
+            # 4c §5.1: la laptop pide la prueba de red. Si va a haber puente (decidido sin arrancar nada), primero la
+            # prueba: sonda_espera, y nada corre aquí hasta su `sigue`. Sin puente, como antes (sesion_ok directo).
+            self._tables, self._tables_known = self._wants_tables(), True
+            self._probe = self._tables
+            if self._tables:
+                self._await_probe()
+                self._loop(self._first_channel)
+                return
+        self._start_setup()
+        self._loop(self._first_channel)
+
+    def _start_setup(self) -> None:
         self._setup_thread = threading.Thread(target=self._setup, daemon=True, name="agmen-agent-setup")
         with self._end_lock:
             if not self._ending:
                 self._setup_thread.start()
-        self._loop(self._first_channel)
+
+    def _await_probe(self) -> None:
+        """4c §5.1: contesta sonda_espera y espera el `sigue` de la laptop, como mucho ESPERA_SIGUE_S (si no llega,
+        sesion_error "sonda" y el agente queda libre). Mientras, solo sonda, ping y adios (lo lee _loop)."""
+        timer = threading.Timer(ESPERA_SIGUE_S, self._no_go)
+        timer.daemon = True
+        with self._end_lock:
+            if self._ending:
+                return
+            self._awaiting, self._await_timer = True, timer
+            timer.start()
+        self.send({"op": "sonda_espera"})
+        self.say(f"laptop {self.ip}: primero la prueba de red; no preparo nada ([robot] before, hub, nodos) hasta "
+                 f"que la laptop diga que sigue", "out")
+
+    def _no_go(self) -> None:
+        with self._end_lock:
+            if not self._awaiting or self._ending:
+                return
+            self._awaiting, self._await_timer = False, None
+        self._refused("sonda", f"{self.server.machine}: la laptop no terminó la prueba de red en "
+                               f"{ESPERA_SIGUE_S:g} s; vuelve a correr agmen run")
+
+    def _go_on(self) -> None:
+        """Llegó `sigue` (4c §5.1): ahora sí, lo de siempre (before, nodos ajenos, hub, sesion_ok, puente)."""
+        with self._end_lock:
+            waiting = self._awaiting and not self._ending
+            timer = self._await_timer
+            if waiting:
+                self._awaiting, self._await_timer = False, None
+        if not waiting:
+            self._error(f"'sigue' solo vale después de sonda_espera, al abrir la sesión ({self.server.machine} no "
+                        f"esperaba la prueba de red)")
+            return
+        if timer is not None:
+            timer.cancel()
+        self._start_setup()
 
     def _setup(self) -> None:
         from .pubsub import hub_address
@@ -1899,8 +1956,9 @@ class _Session:
                 return
             if own:
                 launcher.nodes["hub"].start()   # el hub de esta computadora, como en agmen run
-            self._tables = self._wants_tables()
-            self._probe = self._tables and _says_probe(self._first)   # 4c: solo con puente, y si la laptop lo dijo
+            if not self._tables_known:   # (con la prueba de red primero ya se decidió, antes de sonda_espera)
+                self._tables = self._wants_tables()
+                self._probe = self._tables and _says_probe(self._first)   # 4c: solo con puente, y si la laptop lo dijo
             ok = {"op": "sesion_ok", "maquina": m, "agmen": __version__, "nodos": list(plan.names),
                   "sesion": self.id, "gracia": _grace_number()}
             if self._tables:
@@ -2069,13 +2127,22 @@ class _Session:
     def _order(self, msg: dict) -> bool:
         """Atiende una orden. Devuelve True si la sesión terminó."""
         op = msg["op"]
+        if self._awaiting and op not in ("ping", "adios", "sonda", "sigue"):   # 4c §5.1: aún no corre nada aquí
+            self._error(f"{self.server.machine} espera la prueba de red y el 'sigue' de la laptop antes de preparar "
+                        f"nada: '{_clean(op, 40)}' no se hizo")
+            return False
         if op == "ping":
             t = msg.get("t")
             ok = (isinstance(t, (int, float)) and not isinstance(t, bool)) or (isinstance(t, str) and len(t) <= PONG_T_MAX)
             self.send({"op": "pong", "t": t if ok else None})
         elif op == "adios":
-            self.end(f"la laptop ({self.ip}) se despidió")
+            if self._awaiting:   # 4c §5.5
+                self.end(f"la laptop ({self.ip}) se despidió tras la prueba de red: no preparé nada")
+            else:
+                self.end(f"la laptop ({self.ip}) se despidió")
             return True
+        elif op == "sigue":   # 4c §5.1: la laptop terminó la prueba de red (de todos sus robots) y sigue
+            self._go_on()
         elif op == "detener_todo":
             self.cancel.set()
             before = self._before
@@ -2114,27 +2181,40 @@ class _Session:
         """Llegó `sonda` por la conexión actual: la prueba corre en su propio hilo (no estorba a ping, detener_todo ni
         adios) y lo que contesta va solo por esta conexión (si se sustituye, ya no contesta nada). La IP a la que se
         manda se toma aquí, junto con la conexión (4c §4.3). Si no la puede hacer, contesta sonda_fin con "error"."""
+        from . import sonda
+
         channel, out, ip = self.channel, self.out, self.ip
+        try:
+            ident = sonda.ident(msg)   # 4c §5.4: sonda_ok y sonda_fin lo repiten
+        except ValueError as e:
+            self._probe_failed(out, f"la de la laptop llegó mal formada ({e}). ¿Las dos computadoras tienen la misma "
+                                    f"versión de Agmen?", None)
+            return
         with self._probe_lock:
             if self._probing is channel:
-                self._probe_failed(out, "ya está haciendo una prueba de red por esta conexión: espera a que termine")
+                self._probe_failed(out, "ya está haciendo una prueba de red por esta conexión: espera a que termine",
+                                   ident)
                 return
             self._probing = channel
         try:
-            threading.Thread(target=self._run_probe, args=(msg, channel, out, ip), daemon=True,
+            threading.Thread(target=self._run_probe, args=(msg, channel, out, ip, ident), daemon=True,
                              name="agmen-agent-sonda").start()
         except Exception as e:   # nunca en silencio, y la sesión sigue
             with self._probe_lock:
                 self._probing = None
-            self._probe_failed(out, f"no pudo arrancarla ({_clean(e, 200)})")
+            self._probe_failed(out, f"no pudo arrancarla ({_clean(e, 200)})", ident)
 
-    def _probe_failed(self, out: _Outbox, why: str) -> None:
+    def _probe_failed(self, out: _Outbox, why: str, ident: int | None) -> None:
         """4c §4.2: la prueba no se pudo hacer: se dice aquí y la laptop lo sabe por sonda_fin con su "error" (`why`,
-        dicho desde la laptop: "<robot> no pudo hacer la prueba de red: <why>")."""
+        dicho desde la laptop: "<robot> no pudo hacer la prueba de red: <why>"), con el `id` de su sonda (§5.4; sin
+        él si el `id` mismo llegó mal: esa laptop no espera nada bien formado)."""
         self.say(f"⚠ {self.server.machine} no pudo hacer la prueba de red con la laptop: {why}", "error")
-        out.put({"op": "sonda_fin", "udp": False, "tcp": False, "error": _cut(why, 2000)})
+        fin: dict = {"op": "sonda_fin", "udp": False, "tcp": False, "error": _cut(why, 2000)}
+        if ident is not None:
+            fin["id"] = ident
+        out.put(fin)
 
-    def _run_probe(self, msg: dict, channel: Channel, out: _Outbox, peer_ip: str) -> None:
+    def _run_probe(self, msg: dict, channel: Channel, out: _Outbox, peer_ip: str, ident: int) -> None:
         """La prueba de red del lado del agente (4c §1.3): abre sus sockets, manda el dato de la laptop a los puertos
         de ella (a la IP con la que la ve en la conexión, nunca a una que venga en el mensaje), contesta sonda_ok con
         los suyos, espera lo suyo hasta SONDA_S y dice en sonda_fin lo que recibió. Sus errores son "falló" (con su
@@ -2148,32 +2228,32 @@ class _Session:
                 udp, tcp, dato = sonda.oferta(msg)
             except ValueError as e:
                 self._probe_failed(out, f"la de la laptop llegó mal formada ({e}). ¿Las dos computadoras tienen la "
-                                        f"misma versión de Agmen?")
+                                        f"misma versión de Agmen?", ident)
                 return
             try:
                 ip = sonda.ipv4(_show_ip(peer_ip))
             except ValueError as e:   # (la laptop volvió desde una IPv6)
-                self._probe_failed(out, f"la laptop llegó desde {e}")
+                self._probe_failed(out, f"la laptop llegó desde {e}", ident)
                 return
             try:
                 lado = sonda.Lado(net_ip_from_env())
             except sonda.SinSockets as e:
                 self._probe_failed(out, f"no pudo abrir sus sockets en {e.ip} ({_clean(e.detalle, 200)}). Revisa "
-                                        f"AGMEN_NET_IP y que la red de {m} esté arriba")
+                                        f"AGMEN_NET_IP y que la red de {m} esté arriba", ident)
                 return
             except (OSError, ValueError) as e:   # (AGMEN_NET_IP mal escrita, p. ej.)
-                self._probe_failed(out, f"no pudo abrir sus sockets ({_clean(e, 200)}). Revisa AGMEN_NET_IP")
+                self._probe_failed(out, f"no pudo abrir sus sockets ({_clean(e, 200)}). Revisa AGMEN_NET_IP", ident)
                 return
             with lado:
                 lado.listen(ip)
                 lado.send(ip, udp, tcp, dato)
-                if not out.put({"op": "sonda_ok", **lado.offer(), "so": sonda.sistema()}):
+                if not out.put({"op": "sonda_ok", "id": ident, **lado.offer(), "so": sonda.sistema()}):
                     return   # esta conexión ya no es la actual (o se cerró)
                 lado.wait(time.monotonic() + sonda.SONDA_S, lambda: self._ending or self.channel is not channel)
                 got_udp, got_tcp = lado.got_udp.is_set(), lado.got_tcp.is_set()
             if self._ending or self.channel is not channel:
                 return
-            out.put({"op": "sonda_fin", "udp": got_udp, "tcp": got_tcp})
+            out.put({"op": "sonda_fin", "id": ident, "udp": got_udp, "tcp": got_tcp})
             if lado.send_errors:   # 4.5: lo que no pude mandar, dicho del lado que no pudo
                 why = "; ".join(f"{via}: {_clean(t, 200)}" for via, t in sorted(lado.send_errors.items()))
                 self.say(f"⚠ prueba de red: no pude mandarle a la laptop ({ip}): {why}", "error")
@@ -2183,7 +2263,7 @@ class _Session:
                 self.say(f"⚠ prueba de red: no me llega nada de la laptop ({ip}) {what}: la laptop te dice qué "
                          f"hacer", "error")
         except Exception as e:   # nunca en silencio; la sesión sigue
-            self._probe_failed(out, f"error inesperado ({_clean(repr(e), 200)})")
+            self._probe_failed(out, f"error inesperado ({_clean(repr(e), 200)})", ident)
         finally:
             with self._probe_lock:
                 if self._probing is channel:
@@ -2247,8 +2327,11 @@ class _Session:
                           if reason else reason)
             timer = self._grace_timer
             bye = bool(farewell) and (self.lost_at is None or self.unconfirmed is not None)   # hay conexión
+            await_timer, self._await_timer, self._awaiting = self._await_timer, None, False
         if timer is not None:
             timer.cancel()
+        if await_timer is not None:
+            await_timer.cancel()
         me = threading.current_thread()
         try:
             if self.bridge is not None:
@@ -2448,11 +2531,40 @@ class _Prueba:
     """Una prueba de red en curso del lado de la laptop (4c §4.3): la conexión por la que va, lo que le llega
     (sonda_ok, sonda_fin), el sonda_fin con "error" si el agente no pudo hacerla, y si otra más nueva la sustituyó."""
 
-    def __init__(self, channel: Channel) -> None:
+    def __init__(self, channel: Channel, ident: int = 0) -> None:
         self.channel = channel
+        self.id = ident                      # §5.4: el `id` de su `sonda` (lo que traiga otro no es de esta)
         self.box: queue.Queue = queue.Queue()
         self.error: dict | None = None
         self.cancelled = False
+
+
+class _Espera:
+    """4c §5.1: una sesión que el agente dejó esperando la prueba de red (contestó sonda_espera, no corrió nada).
+    Mientras, un hilo lee la conexión (`thread`: reparte sonda_ok/sonda_fin a la prueba y, tras `sigue`, espera el
+    sesion_ok). `halt`: dejar de esperar (adios y se cierra); `ok`/`error`: cómo acabó (`done`). `retry`: es la de
+    un reintento (3c), no la del arranque: sus fallos los ve quien reintenta, no on_lost."""
+
+    def __init__(self, channel: Channel, contact: float, retry: bool) -> None:
+        self.channel = channel
+        self.contact = contact
+        self.retry = retry
+        self.halt = threading.Event()
+        self.done = threading.Event()
+        self.go = False                      # ya se mandó `sigue`
+        self.ok: dict | None = None
+        self.error: LinkError | None = None
+        self.thread: threading.Thread | None = None
+
+
+class _AnyStop:
+    """is_set() de varios Event (o ninguno): para _wait_ok, que solo pregunta eso."""
+
+    def __init__(self, *events) -> None:
+        self.events = [e for e in events if e is not None]
+
+    def is_set(self) -> bool:
+        return any(e.is_set() for e in self.events)
 
 
 class AgentLink:
@@ -2535,6 +2647,9 @@ class AgentLink:
         self._net_ok: bool | None = None
         self._told_probe = False
         self.before_probe: Callable[[], None] | None = None
+        self._probe_n = 0                   # §5.4: el `id` de la última prueba (cada una, el siguiente)
+        # §5.1: la sesión que el agente dejó esperando la prueba de red (sonda_espera), hasta proceed(); None: ninguna.
+        self._waiting: _Espera | None = None
 
     @property
     def on_lost(self) -> Callable[[AgentLink, str], None] | None:
@@ -2591,18 +2706,114 @@ class AgentLink:
         done = self._done
         self._start_ping(channel, done)
         try:
-            ok, contact = self._wait_ok(channel, session, stop)
+            ok, contact = self._wait_ok(channel, session, stop, probe=_says_probe(session))
+            if ok["op"] == "sonda_espera":   # 4c §5.1: el agente espera la prueba de red; no corrió nada allá
+                self._wait_probe(channel, contact, retry=False)
+                return
         except BaseException:
             done.set()
             self.channel = None
             raise
+        self._opened(channel, ok, contact, waited=False)
+
+    def _opened(self, channel: Channel, ok: dict, contact: float, waited: bool) -> None:
+        """Llegó sesion_ok (al abrir, o tras `sigue`): la sesión queda abierta y su lector arranca."""
         self._took(ok, contact)
-        self._set_tables(ok)
+        self._set_tables(ok, probe_ok=waited)
         self.version = _clean(channel.peer_version, 40)
         self.state_since = time.monotonic()
         self._reader = threading.Thread(target=self._read_loop, args=(channel, self._gen), daemon=True,
                                         name=f"agmen-agent-{self.name}")
         self._reader.start()
+
+    @property
+    def waiting(self) -> bool:
+        """¿El agente espera la prueba de red y el `sigue` de esta laptop (4c §5.1)?"""
+        return self._waiting is not None
+
+    def _wait_probe(self, channel: Channel, contact: float, retry: bool) -> _Espera:
+        """sonda_espera: un hilo lee la conexión mientras se hace la prueba y, tras `sigue`, hasta el sesion_ok."""
+        esp = _Espera(channel, contact, retry)
+        esp.thread = threading.Thread(target=self._wait_read, args=(esp,), daemon=True,
+                                      name=f"agmen-espera-{self.name}")
+        if not retry:
+            self._waiting = esp
+            self._probe_cap = True   # (dijo sonda_espera: sabe hacerla)
+        esp.thread.start()
+        return esp
+
+    def _wait_read(self, esp: _Espera) -> None:
+        """El lector de una sesión en espera (4c §5.1). Si la conexión se pierde, el agente la rechaza o se despide
+        ANTES de `sigue`, al arrancar es una conexión perdida (on_lost: no arranca nada; sale con 1, como en §4.4);
+        después de `sigue` lo dice proceed() (como un sesion_error de siempre)."""
+        stop = _AnyStop(esp.halt, self._retry_stop if esp.retry else None)
+        try:
+            esp.ok, esp.contact = self._wait_ok(esp.channel, None, stop, contact=esp.contact,
+                                                doing="esperaba la prueba de red")
+        except LinkError as e:
+            esp.error = e
+        except BaseException as e:   # nunca en silencio
+            esp.error = LinkError("interno", f"{self.name} ({self.shown}): error inesperado mientras esperaba la "
+                                             f"prueba de red ({_clean(repr(e), 200)})")
+            esp.channel.close()
+        finally:
+            esp.done.set()
+        e = esp.error
+        if e is None or e.code == "detenido" or esp.retry or esp.go:
+            return
+        with self._lock:
+            mine = self._waiting is esp and not self._closing and not self.lost
+            if mine:
+                self.lost = f"{e}. No arrancó nada; vuelve a correr agmen run"
+                self.state_since = time.monotonic()
+        if mine:
+            self._done.set()
+            self._tell_lost()
+
+    def proceed(self, stop: threading.Event | None = None) -> None:
+        """4c §5.1: la prueba de red ya se hizo con todas: `sigue` al agente que esperaba y espera su sesion_ok (su
+        [robot] before y su hub corren ahora). LinkError si no llega. Sin sesión en espera, nada."""
+        esp = self._waiting
+        if esp is None:
+            return
+        self.go_on()
+        self.wait_ok(stop)
+
+    def go_on(self) -> None:
+        """Manda `sigue` (sin esperar el sesion_ok: wait_ok). Varias computadoras: a todas, y luego se espera."""
+        esp = self._waiting
+        if esp is None or esp.go:
+            return
+        esp.go = True
+        if esp.done.is_set():
+            return   # se perdió antes: lo dice wait_ok
+        try:
+            esp.channel.send({"op": "sigue"})
+        except AgentError:
+            pass   # (el lector de la espera ve que se cayó y lo dice wait_ok)
+
+    def wait_ok(self, stop: threading.Event | None = None) -> None:
+        """Tras go_on(): espera el sesion_ok de la sesión que esperaba (LinkError si no) y la deja abierta."""
+        esp = self._waiting
+        if esp is None:
+            return
+        try:
+            while not esp.done.wait(STOP_POLL):
+                if stop is not None and stop.is_set():
+                    esp.halt.set()   # su lector se despide (adios) y cierra
+        except BaseException:   # Ctrl+C: que el agente lo sepa
+            esp.halt.set()
+            esp.done.wait(STOP_POLL + BYE_TIMEOUT + 1.0)
+            raise
+        if esp.error is not None:
+            with self._lock:
+                if self._waiting is esp:
+                    self._waiting, self.channel = None, None
+            self._done.set()
+            raise esp.error
+        with self._lock:
+            self._waiting = None
+        self._opened(esp.channel, esp.ok or {}, esp.contact, waited=True)
 
     def _dial(self, key: str, connect_timeout: float) -> Channel:
         """Conecta y saluda. LinkError si no se puede. Con AGMEN_NET_IP (pruebas), la conexión sale desde esa IP:
@@ -2638,32 +2849,37 @@ class AgentLink:
             sock.close()
             raise
 
-    def _wait_ok(self, channel: Channel, session: dict, stop: threading.Event | None) -> tuple[dict, float]:
+    def _wait_ok(self, channel: Channel, session: dict | None, stop, *, probe: bool = False,
+                 contact: float | None = None, doing: str = "preparaba la sesión") -> tuple[dict, float]:
         """Manda `session` y espera sesion_ok. Devuelve (sesion_ok, último contacto confirmado: cuándo se
         mandó `session`, o el t del último pong que llegó mientras el agente preparaba la sesión; §11).
-        LinkError si no; en cualquier error, adios al agente y se cierra la conexión."""
+        LinkError si no; en cualquier error, adios al agente y se cierra la conexión.
+        4c §5.1: con `probe` (esta laptop dijo "sonda"), también vuelve con sonda_espera. Sin `session` no manda
+        nada (ya se mandó: el lector de la espera, que reparte sonda_ok/sonda_fin a la prueba de esta conexión)."""
         where = f"{self.name} ({self.shown})"
         try:
-            contact = time.monotonic()   # antes de mandarla: el agente la recibió en este momento o después
-            try:
-                channel.send(session)
-            except ChannelError as e:   # se cayó (o se reinició) justo tras el saludo: no es un bug
-                raise LinkError("perdida", f"{where} cerró la conexión antes de que le mandara la sesión ({e}): "
-                                           f"mira la terminal de agmen agent en {self.name}") from None
+            if contact is None:
+                contact = time.monotonic()   # antes de mandarla: el agente la recibió en este momento o después
+            if session is not None:
+                try:
+                    channel.send(session)
+                except ChannelError as e:   # se cayó (o se reinició) justo tras el saludo: no es un bug
+                    raise LinkError("perdida", f"{where} cerró la conexión antes de que le mandara la sesión ({e}): "
+                                               f"mira la terminal de agmen agent en {self.name}") from None
             silent_until = time.monotonic() + SILENCE_TIMEOUT
             while True:
                 if stop is not None and stop.is_set():
-                    raise LinkError("detenido", f"{where}: dejé de esperar a que preparara la sesión porque se "
-                                                f"perdió otra computadora")
+                    raise LinkError("detenido", f"{where}: dejé de esperar a que preparara la sesión (se perdió "
+                                                f"otra computadora, o agmen run se cierra)")
                 try:   # en tramos cortos, para ver stop entre uno y otro (lo leído a medias se guarda)
                     msg = channel.recv(min(STOP_POLL, max(0.0, silent_until - time.monotonic())))
                 except ChannelTimeout:
                     if time.monotonic() < silent_until:
                         continue
-                    raise LinkError("perdida", f"{where} dejó de contestar mientras preparaba la sesión "
+                    raise LinkError("perdida", f"{where} dejó de contestar mientras {doing} "
                                                f"({SILENCE_TIMEOUT:g} s sin nada): ¿se apagó o se cayó la red?")
                 except ChannelClosed:
-                    raise LinkError("perdida", f"{where} cerró la conexión mientras preparaba la sesión: mira la "
+                    raise LinkError("perdida", f"{where} cerró la conexión mientras {doing}: mira la "
                                                f"terminal de agmen agent en {self.name}")
                 except ChannelError as e:
                     raise LinkError("protocolo", f"{where} mandó un mensaje inválido ({e}): ¿las dos "
@@ -2675,13 +2891,15 @@ class AgentLink:
                     raise self._session_error(msg)
                 if op == "adios":   # §10: lo cerraron allá mientras preparaba la sesión
                     raise LinkError("cerrado", f"{where}: cerraron agmen agent allá ({self._motive(msg)}) mientras "
-                                               f"preparaba la sesión. Vuelve a correr agmen run cuando agmen agent "
+                                               f"{doing}. Vuelve a correr agmen run cuando agmen agent "
                                                f"esté corriendo otra vez en {self.name}")
+                if op == "sonda_espera" and probe:
+                    return msg, contact
                 silent_until = time.monotonic() + SILENCE_TIMEOUT
                 if op == "pong":
                     contact = self._confirmed(msg, contact)
                 elif op != "estado":   # antes de sesion_ok no debería llegar ninguno: se ignora
-                    self._dispatch(msg)
+                    self._dispatch(msg, channel)   # (sonda_ok/sonda_fin: a la prueba de ESTA conexión, si hay)
         except BaseException:
             _bye(channel)   # Ctrl+C, stop o un error mientras se preparaba: que el agente lo sepa (y cierra)
             raise
@@ -2866,7 +3084,8 @@ class AgentLink:
                 peer.receive(msg)
         elif op in ("sonda_ok", "sonda_fin"):   # la prueba de red (4c): a la de ESTA conexión (si no hay, nada)
             prueba = self._probing
-            if prueba is not None and channel is not None and prueba.channel is channel:
+            if prueba is not None and channel is not None and prueba.channel is channel \
+                    and type(msg.get("id")) is int and msg["id"] == prueba.id:   # §5.4: de otra prueba, nada
                 if op == "sonda_fin" and "error" in msg:
                     prueba.error = msg   # §4.2: el agente no pudo hacerla: falla ya, con su motivo
                 prueba.box.put(msg)
@@ -2881,10 +3100,11 @@ class AgentLink:
         if channel is not None and self.down_since is None:
             self._bridge_up(channel)
 
-    def _set_tables(self, ok: dict | None) -> None:
-        """Lo que dijo el agente del puente en sesion_ok/reanudar_ok: "tablas" (lo hace) o "sin_tablas" (por qué no)."""
+    def _set_tables(self, ok: dict | None, probe_ok: bool = True) -> None:
+        """Lo que dijo el agente del puente en sesion_ok/reanudar_ok: "tablas" (lo hace) o "sin_tablas" (por qué no).
+        `probe_ok`: 4c §5.2: un sesion_ok con "sonda" que no pasó por sonda_espera cuenta como "no hubo prueba"."""
         self._tables = _says_tables(ok)
-        self._probe_cap = self._tables and _says_probe(ok)
+        self._probe_cap = self._tables and _says_probe(ok) and probe_ok
         why = (ok or {}).get("sin_tablas")
         self._no_tables = _clean(why, 200) if isinstance(why, str) and why.strip() else ""
 
@@ -2934,16 +3154,20 @@ class AgentLink:
 
     # --- la prueba de red (4c) ---
     def net_check(self, stop: Callable[[], bool] | None = None):
-        """La prueba de red con este robot por la conexión actual (agmen run, al conectar, antes de arrancar nada).
+        """La prueba de red con este robot por la conexión actual (agmen run, al conectar, antes de arrancar nada:
+        4c §5.1, con el agente esperando en sonda_espera, sin haber corrido nada allá).
         Devuelve un sonda.Resultado, o None si no hay prueba: sin puente, con --no-net-check, el agente no la sabe
-        hacer (eso se dice una vez). SinConexion si la conexión se perdió o se cerró antes o a media prueba (4c §4.4:
-        no es "todo bien": quien llama no arranca nada)."""
+        hacer (contestó sesion_ok directo: eso se dice una vez; §5.2). SinConexion si la conexión se perdió o se
+        cerró antes o a media prueba (4c §4.4: no es "todo bien": quien llama no arranca nada)."""
         with self._lock:
-            channel, gen = self.channel, self._gen
+            channel, gen, esp = self.channel, self._gen, self._waiting
         if channel is None or self._closing or self.lost or self.down_since is not None:
             return SinConexion(self.lost or "ya no hay conexión con el agente")
-        if not self._wants_probe():
+        if esp is None:   # §5.2: sin sonda_espera no hay prueba al conectar (la de después de sesion_ok se quitó)
+            self._wants_probe()   # (solo el aviso, si toca)
             return None
+        if esp.done.is_set():   # la espera ya terminó (se perdió): no es un resultado
+            return SinConexion(self.lost or (str(esp.error) if esp.error else "ya no hay conexión con el agente"))
         return self._probe(channel, gen, stop)
 
     def _wants_probe(self) -> bool:
@@ -2960,11 +3184,12 @@ class AgentLink:
             return False
         return True
 
-    def _probe(self, channel: Channel, gen: int, stop: Callable[[], bool] | None):
+    def _probe(self, channel: Channel, gen: int, stop: Callable[[], bool] | None, esp: _Espera | None = None):
         """La prueba de red del lado de la laptop (4c §1.3). No toma el candado de la conexión más que para mirar
         (ping, órdenes, detener_todo y adios siguen como siempre). Todo acaba en ≤ SONDA_S + MARGEN_S; los sockets
         se cierran siempre. Devuelve un sonda.Resultado, o SinConexion si se dejó de probar (stop, close, la conexión
-        ya no es la actual, o una prueba más nueva la sustituyó: 4c §4.3)."""
+        ya no es la actual, o una prueba más nueva la sustituyó: 4c §4.3). Con `esp` de un reintento (§5.3), la
+        conexión es la de ese intento (aún no es la actual): vale mientras su espera siga y no se deje de intentar."""
         from . import sonda
         from .hub import net_ip_from_env
 
@@ -2988,17 +3213,26 @@ class AgentLink:
         except (OSError, ValueError) as e:
             res.error = f"no pude hacer la prueba de red con {where}: {_clean(e, 300)}. Revisa AGMEN_NET_IP"
             return res
-        prueba = _Prueba(channel)
+        self._probe_n += 1
+        prueba = _Prueba(channel, self._probe_n)
+
+        def gone() -> str | None:
+            """Por qué esta conexión ya no sirve para la prueba (None: sirve)."""
+            if esp is not None and esp.done.is_set():
+                return self.lost or (str(esp.error) if esp.error else "se perdió la conexión con el agente")
+            if esp is not None and esp.retry:
+                return "se dejó de intentar" if self._closing or self._retry_stop.is_set() else None
+            if (self._closing or self.lost or self.down_since is not None or self._gen != gen
+                    or self.channel is not channel):
+                return self.lost or "se perdió la conexión con el agente"
+            return None
 
         def lost_why() -> str | None:
             if stop is not None and stop():
                 return "se dejó de esperar"
             if prueba.cancelled or self._probing is not prueba:
                 return "otra prueba de red la sustituyó"
-            if (self._closing or self.lost or self.down_since is not None or self._gen != gen
-                    or self.channel is not channel):
-                return self.lost or "se perdió la conexión con el agente"
-            return None
+            return gone()
 
         def next_msg(until: float) -> dict | None:
             while lost_why() is None and prueba.error is None:
@@ -3025,10 +3259,10 @@ class AgentLink:
             return True
 
         with self._lock:   # §4.3: lo que esta prueba espera es suyo; una más vieja de este enlace se descarta
-            if (self._closing or self.lost or self.down_since is not None or self._gen != gen
-                    or self.channel is not channel):
+            why = gone()
+            if why is not None:
                 lado.close()
-                return SinConexion(self.lost or "se perdió la conexión con el agente")
+                return SinConexion(why)
             old, self._probing = self._probing, prueba
             if old is not None:
                 old.cancelled = True
@@ -3038,7 +3272,7 @@ class AgentLink:
                 deadline = start + sonda.SONDA_S + sonda.MARGEN_S
                 lado.listen(robot_ip)
                 try:
-                    channel.send({"op": "sonda", **lado.offer()})
+                    channel.send({"op": "sonda", "id": prueba.id, **lado.offer()})
                 except AgentError as e:   # la conexión se cayó: lo ve su lector (y es otra pérdida, no un firewall)
                     return SinConexion(f"no pude mandarle la prueba de red: {e}")
                 ok = next_msg(deadline)
@@ -3112,13 +3346,20 @@ class AgentLink:
             res = self._probe(channel, gen, None)
             if isinstance(res, SinConexion):   # se perdió o la sustituyó otra: lo dice quien lo ve
                 return
+            self._report_net(res, gen)
+        except Exception as e:   # nunca en silencio; la conexión sigue
+            self._notice(f"⚠ {self.name}: error inesperado en la prueba de red ({_clean(repr(e), 200)})", "error")
+
+    def _report_net(self, res, gen: int, still: str = "sus nodos siguen corriendo; no detengo nada") -> None:
+        """Al reconectar (D-b): si la prueba no pasó, solo un aviso (una vez por cambio de estado); si vuelve a pasar,
+        una línea de que ya pasa. Nunca detiene nada (`still`: lo que sigue corriendo, en palabras)."""
+        try:
             with self._lock:
                 if self._gen != gen or self._closing:
                     return
                 was, self._net_ok = self._net_ok, res.ok
             if not res.ok and was is not False:
-                self._notice(f"⚠ la prueba de red con '{self.name}' no pasó al reconectar (sus nodos siguen "
-                             f"corriendo; no detengo nada):", "error")
+                self._notice(f"⚠ la prueba de red con '{self.name}' no pasó al reconectar ({still}):", "error")
                 for line in self.probe_lines(res):
                     self._notice(f"⚠   {line}", "error")
             elif res.ok and was is False:
@@ -3352,12 +3593,21 @@ class AgentLink:
             self._log_n = {}
             done = threading.Event()
             self._start_ping(channel, done)
+            net = None
             try:
-                ok, contact = self._wait_ok(channel, self._session, stop)
+                ok, contact = self._wait_ok(channel, self._session, stop, probe=_says_probe(self._session))
+                if ok["op"] == "sonda_espera":
+                    # 4c §5.3: también aquí la prueba va primero, pero los nodos de esta laptop ya corren (D-b): `sigue`
+                    # pase o no pase, y si no pasó solo un aviso (al instalar).
+                    got = self._probe_waiting(channel, contact)
+                    if got is None:   # se dejó de intentar (su lector ya se despidió)
+                        done.set()
+                        return None
+                    net, ok, contact = got
             except BaseException:
                 done.set()
                 raise
-            self._install(channel, done, ok, contact=contact)
+            self._install(channel, done, ok, contact=contact, net=net)
             return None
         except LinkError as e:
             if channel is not None:
@@ -3373,6 +3623,38 @@ class AgentLink:
             if channel is not None and channel is not self.channel:
                 channel.close()
             raise
+
+    def _probe_waiting(self, channel: Channel, contact: float):
+        """4c §5.3: la sesión nueva de un reintento quedó esperando la prueba de red: se hace, `sigue` (pase o no) y
+        su sesion_ok. Devuelve (el resultado de la prueba, sesion_ok, contacto), o None si se dejó de intentar.
+        LinkError (un intento fallido) si la conexión se pierde o el agente la rechaza."""
+        esp = self._wait_probe(channel, contact, retry=True)
+        try:
+            res = self._probe(channel, self._gen, None, esp)
+            if isinstance(res, SinConexion):
+                if esp.error is None and (self._closing or self._retry_stop.is_set()):
+                    esp.halt.set()
+                    esp.done.wait(STOP_POLL + BYE_TIMEOUT + 1.0)
+                    return None
+                from . import sonda   # (si se perdió a media prueba lo dice esp.error, abajo)
+
+                res = sonda.Resultado(error=f"no se pudo hacer la prueba de red con {self.name}: {res.motivo}")
+            esp.go = True
+            if not esp.done.is_set():
+                try:
+                    channel.send({"op": "sigue"})
+                except AgentError:
+                    pass   # su lector ve que se cayó
+            while not esp.done.wait(STOP_POLL):
+                pass   # (el lector de la espera mira _retry_stop: con Ctrl+C se despide y termina)
+        except BaseException:
+            esp.halt.set()
+            raise
+        if esp.error is not None:
+            if esp.error.code == "detenido":
+                return None
+            raise esp.error
+        return res, esp.ok or {}, esp.contact
 
     def _first_reply(self, channel: Channel, contact: float) -> tuple[dict | None, float]:
         """La respuesta a reanudar (None si se dejó de intentar). AgentError si no llega o no sirve."""
@@ -3452,7 +3734,8 @@ class AgentLink:
         return RETRY_REFUSED
 
     def _install(self, channel: Channel, done: threading.Event, ok: dict | None = None,
-                 resumed: dict | None = None, contact: float | None = None, early: list[dict] | None = None) -> bool:
+                 resumed: dict | None = None, contact: float | None = None, early: list[dict] | None = None,
+                 net=None) -> bool:
         """La conexión nueva pasa a ser la actual: su lector arranca (y su ping, si no lo tenía).
         Si algo falla a medias, se deshace (vuelve a quedar sin conexión, la conexión se cierra y
         el error sube a _retry, que sigue intentando): nunca una conexión actual sin lector. Devuelve True si
@@ -3506,11 +3789,17 @@ class AgentLink:
             reader.start()
             self._reader = reader
             # 4b: confirmada (tras sesion_ok, o tras el pong de confirmación de un reanudar): vuelve el puente.
-            self._set_tables(resumed if resumed is not None else ok)
+            # 4c §5.2: un sesion_ok sin sonda_espera antes (`net`) es "no hubo prueba".
+            self._set_tables(resumed if resumed is not None else ok, probe_ok=resumed is not None or net is not None)
             self._bridge_up(channel)
-            if self._wants_probe():   # 4c: se repite la prueba de red, en su hilo (si falla, solo avisa)
-                threading.Thread(target=self._recheck, args=(channel, gen), daemon=True,
-                                 name=f"agmen-sonda-{self.name}").start()
+            if resumed is not None:
+                if self._wants_probe():   # 4c: se repite la prueba de red, en su hilo (si falla, solo avisa)
+                    threading.Thread(target=self._recheck, args=(channel, gen), daemon=True,
+                                     name=f"agmen-sonda-{self.name}").start()
+            elif net is not None:   # §5.3: la sesión nueva ya hizo la suya antes de `sigue`: solo se dice (D-b)
+                self._report_net(net, gen, "los nodos de aquí siguen corriendo; no detengo nada")
+            else:
+                self._wants_probe()   # (solo el aviso, si toca: §5.2)
         except BaseException as e:
             with self._lock:   # ¿sigue siendo la actual? (si su lector ya la perdió, otro hilo reintenta)
                 mine = self._gen == gen and self.down_since is None and not self._closing
@@ -3573,7 +3862,7 @@ class AgentLink:
                     self._notice(f"{self.name} no se enteró (sin conexión): detiene sus nodos solo, {self.grace:g} "
                                  f"s después de perder a la laptop")
             return
-        if not self.lost:
+        if not self.lost and self._waiting is None:   # (4c §5.1: un agente en espera no corrió nada: solo adios)
             try:
                 channel.send({"op": "detener_todo"})
                 end = time.monotonic() + timeout
@@ -3593,11 +3882,19 @@ class AgentLink:
                 self.state_since = time.monotonic()
             self._closing = True
             channel, self.channel = self.channel, None
+            esp = self._waiting
         self._retry_stop.set()
         self._done.set()
         if self._peer is not None:
             self._peer.lose()
         if channel is None:
+            return
+        if esp is not None and esp.channel is channel and not esp.done.is_set():
+            # 4c §5.1: el agente esperaba la prueba de red (no corrió nada allá): el lector de la espera se despide
+            # (adios) y cierra; nunca dos lectores
+            esp.halt.set()
+            if not esp.done.wait(STOP_POLL + BYE_TIMEOUT + 1.0):
+                channel.close()
             return
         if not self.lost:
             _bye(channel, self._reader)   # adios, y lee lo que el agente aún mande hasta que cierre

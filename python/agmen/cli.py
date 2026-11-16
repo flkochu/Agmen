@@ -537,7 +537,9 @@ def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list
     """Abre la sesión con cada agente, una tras otra. Devuelve "" si todas se abrieron;
     si no, el error, y las que ya estaban abiertas reciben adios (no arranca nada). Con
     `net_check` (y puente), la prueba de red con todas a la vez (4c): si falla con alguna,
-    es un error como "no contesta" (no arranca nada)."""
+    es un error como "no contesta" (no arranca nada). 4c §5.1: los agentes al día esperan la
+    prueba sin preparar nada (sonda_espera); solo cuando pasó con TODAS reciben `sigue` (a la
+    vez: cada uno espera como mucho 30 s) y se espera el sesion_ok de cada una."""
     from .agent import AgentError, save_client_key, session_message
 
     def on_lost(link, text):
@@ -585,6 +587,19 @@ def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list
                 for other in opened:   # como cuando un agente no contesta: adios a todas, en orden
                     other.close()
                 return failed
+        waiting = [link for link in opened if link.waiting]
+        if waiting and not lost:
+            for link in waiting:   # (sin prueba, o si una se perdió, ninguna recibe `sigue`: D-a)
+                link.go_on()
+            for link in waiting:
+                try:
+                    link.wait_ok(stop)
+                except AgentError as e:
+                    if lost:   # otra se perdió mientras esta preparaba la sesión: cmd_run sale con 1
+                        break
+                    for other in opened:
+                        other.close()
+                    return str(e) + _key_hint(link.name, keys[link.name][1], getattr(e, "code", ""))
     except BaseException:   # Ctrl+C mientras se conecta (o el before de un agente): adios a todas
         for link in remotes.values():
             link.close()
@@ -670,6 +685,11 @@ def _net_checks(launcher, links: list, stop, lost: list) -> str:
     for link, res in failures:
         parts.append(f"la prueba de red con '{link.name}' no pasó, así que no arranqué nada:")
         parts += [f"  {line}" for line in link.probe_lines(res)]
+    for link in links:   # 4c §5.5: un agente que no esperó a la prueba (p. ej. un Agmen anterior) ya se preparó
+        if not link.waiting:
+            parts.append(f"(en '{link.name}' sí corrió su preparación, [robot] before y su hub, porque su agmen agent "
+                         f"no esperó a la prueba de red: es un Agmen anterior, o no pasa topics con esta computadora. "
+                         f"Al despedirme se detiene)")
     parts.append(f"Si sabes que la red está bien, puedes saltártela: agmen run {links[0].toml_hint} --no-net-check "
                  f"(pero entonces, si un firewall bloquea los topics, Agmen no te lo va a decir)")
     return "\n".join(parts)

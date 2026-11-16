@@ -302,12 +302,29 @@ def free_port(udp=False) -> int:
         s.close()
 
 
+ANTES_PY = """\
+import json, os, sys
+try:
+    red = os.readlink("/proc/self/ns/net")   # solo Linux
+except (OSError, AttributeError):
+    red = ""
+with open(os.path.join(sys.argv[1], "before_%d.json" % os.getpid()), "w") as f:
+    f.write(json.dumps({"red": red, "net_ip": os.environ.get("AGMEN_NET_IP", "")}))
+"""
+
+
 def toml_del_robot(dest: Path, ip: str, puerto: int) -> Path:
     """El robot de dos computadoras del tutorial, con la IP de esta corrida y dos nodos de apoyo.
-    Las rutas son absolutas (el archivo vive en otra carpeta)."""
+    Las rutas son absolutas (el archivo vive en otra carpeta). Con un [robot] before que deja una marca
+    (`before_<pid>.json`, con su red y su AGMEN_NET_IP: se sabe en qué computadora corrió; 4c §5.6)."""
     texto = (ROOT / "examples" / "tutorial" / "robot_dos.toml").read_text(encoding="utf-8")
     base = ROOT.as_posix()
-    for viejo, nuevo in (('host = "192.168.1.20"', f'host = "{ip}:{puerto}"'),
+    antes = dest.parent / "antes.py"
+    antes.write_text(ANTES_PY, encoding="utf-8")
+    before = json.dumps(f"python {antes.as_posix()} {(dest.parent / 'marcas').as_posix()}")
+    titulo = 'name = "robot del tutorial, en dos computadoras"\n'
+    for viejo, nuevo in ((titulo, f"{titulo}before = [{before}]\n"),
+                         ('host = "192.168.1.20"', f'host = "{ip}:{puerto}"'),
                          ("../../build/bin/publisher", f"{base}/build/bin/publisher"),
                          ("python cerebro.py", f"python {base}/examples/tutorial/cerebro.py")):
         if viejo not in texto:
@@ -393,6 +410,18 @@ def main():
         if aislado:
             os.chown(toml, aislado.uid, aislado.gid)
 
+        def befores_del_robot() -> int:
+            """Cuántas veces corrió el [robot] before EN EL ROBOT (por su marca; el de la laptop no cuenta)."""
+            n = 0
+            for f in marcas.glob("before_*.json"):
+                try:
+                    d = json.loads(f.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if (d.get("red") == aislado.red_de("robot")) if aislado else (d.get("net_ip") == ip_robot):
+                    n += 1
+            return n
+
         def lanzar(donde, nombre, args):
             p = Proc(nombre, args, envs[donde], tmp, pref[donde], tmp / f"pilas_{nombre}.txt")
             procs.append(p)
@@ -418,11 +447,19 @@ def main():
             wait_for(lambda: run.dijo("todo arrancado") or not run.vivo(), 60, 0.05)
             return run
 
+        def hubs_del_robot() -> int:
+            """Cuántas veces arrancó el agente su agmen hub (su línea "hub │ ▶ iniciado" en la salida del agente)."""
+            return sum(1 for ln in list(agente.lines) if "▶ iniciado" in ln and ln.lstrip().startswith("hub"))
+
         run = correr("run")
         check("agmen run se conecta al agente y arranca todo",
               run.vivo() and run.dijo("todo arrancado"), run.out)
         check("la prueba de red pasa y lo dice",
               run.dijo("red con 'robot'") and run.dijo("los topics pasan en los dos sentidos"), run.out)
+        check("tras la prueba de red, el robot corrió su [robot] before (su marca existe) y arrancó su hub",
+              wait_for(lambda: befores_del_robot() >= 1 and hubs_del_robot() >= 1, 10)
+              and agente.dijo("primero la prueba de red; no preparo nada"),
+              f"before en el robot: {befores_del_robot()}, hub: {hubs_del_robot()}\n{agente.out}")
         mar = marcas
 
         def marca(nombre):
@@ -524,7 +561,7 @@ def main():
                 no_probado("con la entrada UDP bloqueada en el robot, agmen run no arranca nada",
                            "no hay iptables ni nft que funcione aquí" + (f" ({ultimo})" if "ultimo" in locals() else ""))
             else:
-                n0 = arranques()
+                n0, b0, h0, l0 = arranques(), befores_del_robot(), hubs_del_robot(), len(agente.lines)
                 bloq = correr("run_bloqueado")
                 wait_for(lambda: not bloq.vivo(), 60)
                 code = bloq.p.poll()
@@ -538,6 +575,13 @@ def main():
                       code == 2 and not bloq.dijo("todo arrancado") and arranques() == n0
                       and len(udp) == 1 and "por UDP (mensajes chicos)" in udp[0] and "TCP" not in udp[0]
                       and "--no-net-check" in bloq.out, f"código {code}\n{bloq.out}")
+                # 4c §5.1: la prueba fue primero: en el robot no corrió nada (ni su before ni su hub)
+                wait_for(lambda: "no preparé nada" in "".join(agente.lines[l0:]), 10)
+                check("con UDP bloqueado, en el robot no corrió nada: ni su [robot] before (su marca no está) ni su hub",
+                      befores_del_robot() == b0 and hubs_del_robot() == h0
+                      and "se despidió tras la prueba de red: no preparé nada" in "".join(agente.lines[l0:]),
+                      f"before en el robot: {b0} → {befores_del_robot()}, hub: {h0} → {hubs_del_robot()}\n"
+                      + "".join(agente.lines[l0:]))
                 saltada = correr("run_sin_prueba", ["--no-net-check"])
                 wait_for(lambda: arranques() > n0, 30)
                 check("con --no-net-check sí arranca, y avisa que se saltó la prueba",

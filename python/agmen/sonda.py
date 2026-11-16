@@ -4,7 +4,9 @@ Los datos de los topics van directo de nodo a nodo: UDP a un puerto cualquiera d
 grandes, una conexión TCP a otro puerto cualquiera. La sonda prueba justo eso, en los dos sentidos: cada lado abre
 un socket UDP y un escucha TCP en puertos efímeros (como los nodos en modo red: todas las interfaces, o
 AGMEN_NET_IP si está), le dice sus puertos al otro por la conexión del agente (`sonda` / `sonda_ok`) y el otro le
-manda ahí el dato de prueba:
+manda ahí el dato de prueba (cada `sonda` lleva su `id`, que `sonda_ok`/`sonda_fin` repiten: §5.4). Al abrir la
+sesión la prueba va ANTES de que el robot prepare nada (§5.1): el agente contesta `sonda_espera` y espera el
+`sigue` de la laptop:
 
     agmen-sonda/1 <dato>\\n        (UDP: el datagrama entero, 3 veces; TCP: lo único que se manda, y cierra)
 
@@ -68,6 +70,18 @@ def oferta(msg: dict) -> tuple[int, int, str]:
     if not isinstance(dato, str) or not _DATO.fullmatch(dato):
         raise ValueError("'dato' tiene que ser de 32 caracteres hexadecimales")
     return udp, tcp, dato
+
+
+ID_MAX = 2**31 - 1
+
+
+def ident(msg: dict) -> int:
+    """El `id` de un `sonda` (4c §5.4: sonda_ok y sonda_fin lo repiten; la laptop descarta los de otra prueba).
+    ValueError si falta o no es un entero de 0 a ID_MAX."""
+    value = msg.get("id")
+    if type(value) is not int or not 0 <= value <= ID_MAX:
+        raise ValueError(f"'id' tiene que ser un entero de 0 a {ID_MAX}")
+    return value
 
 
 def fin(msg: dict) -> tuple[bool, bool]:

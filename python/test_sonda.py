@@ -165,6 +165,12 @@ class TestLado(unittest.TestCase):
                 sonda.motivo(malo)
         with self.assertRaises(ValueError):
             sonda.ipv4("fe80::1")
+        # §5.4: el `id` de la prueba
+        self.assertEqual(sonda.ident({"id": 0}), 0)
+        self.assertEqual(sonda.ident({"id": sonda.ID_MAX}), sonda.ID_MAX)
+        for malo in ({}, {"id": -1}, {"id": True}, {"id": 1.0}, {"id": "1"}, {"id": sonda.ID_MAX + 1}):
+            with self.assertRaises(ValueError, msg=malo):
+                sonda.ident(malo)
 
     def test_explicar_dice_el_lado_por_donde_y_que_hacer(self):
         R = sonda.Resultado
@@ -311,6 +317,104 @@ class TestConElAgente(SondaCase):
         self.assertFalse([n for n in self.notas if "red" in n], self.notas)   # (el de --no-net-check: agmen run)
 
 
+ANTES_PY = "import sys\nopen(sys.argv[1], 'w').write('x')\n"
+
+
+def con_before(case) -> None:
+    """Un [robot] before que deja una marca (case.marca), fuera de marcas/ (ahí solo escriben los nodos)."""
+    (case.dir / "antes.py").write_text(ANTES_PY, encoding="utf-8")
+    case.marca = case.dir / "before_corrio"
+    case.antes = f'before = ["python {(case.dir / "antes.py").as_posix()} {case.marca.as_posix()}"]\n'
+
+
+class TestPrimeroLaSonda(SondaCase):
+    """4c §5.1: con la prueba de red primero, el agente no corre su [robot] before ni arranca su hub hasta `sigue`.
+    Sin hub ajeno vivo (sin_hub): el agente arranca el suyo, y se ve si arrancó."""
+
+    sin_hub = True
+
+    def setUp(self):
+        super().setUp()
+        con_before(self)
+        self.write_toml(**{"[hub]\nenabled = false": "[hub]\nenabled = true",
+                           '[robot]\nname = "r"\n': f'[robot]\nname = "r"\n{self.antes}'})
+        self.pasos: list[str] = []
+        orig_before, orig_probe, orig_send = agent._Session._run_before, agent._Session._run_probe, agent._Session.send
+        orig_start = __import__("agmen.run", fromlist=["Node"]).Node.start
+        pasos = self.pasos
+
+        def run_before(self_, cmd):
+            pasos.append("before")
+            return orig_before(self_, cmd)
+
+        def run_probe(self_, *a):
+            pasos.append("sonda")
+            return orig_probe(self_, *a)
+
+        def send(self_, obj, droppable=False):
+            if obj.get("op") in ("sonda_espera", "sesion_ok"):
+                pasos.append(obj["op"])
+            return orig_send(self_, obj, droppable)
+
+        def start(self_):
+            if self_.cfg.name == "hub":
+                pasos.append("hub")
+            return orig_start(self_)
+
+        from agmen import run as R
+        for p in (mock.patch.object(agent._Session, "_run_before", run_before),
+                  mock.patch.object(agent._Session, "_run_probe", run_probe),
+                  mock.patch.object(agent._Session, "send", send), mock.patch.object(R.Node, "start", start)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def hub(self):
+        s = self.server.session
+        node = s.launcher.nodes.get("hub") if s is not None and s.launcher is not None else None
+        return node
+
+    def test_pasando_el_orden_es_sonda_before_hub_sesion_ok(self):
+        link = self.abrir()
+        self.assertTrue(link.waiting)
+        res = link.net_check()
+        self.assertTrue(res.ok, res)
+        self.assertEqual(self.pasos, ["sonda_espera", "sonda"])
+        self.assertFalse(self.marca.exists())
+        self.assertIsNone(self.hub().proc)
+        self.assertTrue(any("primero la prueba de red; no preparo nada" in t for t, _ in self.said), self.said)
+        link.proceed()
+        self.assertFalse(link.waiting)
+        self.assertEqual(self.pasos, ["sonda_espera", "sonda", "before", "hub", "sesion_ok"])
+        self.assertTrue(self.marca.exists())
+        self.assertTrue(link._tables and link._probe_cap)
+        self.assertIsNone(link.net_check())   # §5.2: ya abierta, al conectar no hay otra prueba
+        self.assertIsNotNone(link._reader)
+
+    def test_con_la_sonda_fallando_no_corre_el_before_ni_el_hub(self):
+        mal_manda(self, "laptop", "udp")
+        link = self.abrir()
+        with mock.patch.object(sonda, "SONDA_S", 1.0):
+            res = link.net_check()
+        self.assertFalse(res.ok)
+        link.close()   # como agmen run: adios, sin `sigue`
+        self.assertTrue(until(lambda: self.server.session is None), self.said)
+        self.assertEqual(self.pasos, ["sonda_espera", "sonda"])
+        self.assertFalse(self.marca.exists(), "corrió el [robot] before")
+        self.sin_arrancar_nada()
+        self.assertTrue(any(t == "la laptop (127.0.0.1) se despidió tras la prueba de red: no preparé nada"
+                            for t, _ in self.said), self.said)
+
+    def test_la_conexion_que_se_pierde_en_la_espera_termina_la_sesion_sin_correr_nada(self):
+        link = self.abrir()
+        link.channel.sock.shutdown(socket.SHUT_RDWR)   # se corta (sin adios)
+        self.assertTrue(until(lambda: self.server.session is None), self.said)
+        self.assertTrue(any("cerró la conexión sin despedirse durante la prueba de red: no preparé nada" in t
+                            for t, _ in self.said), self.said)
+        self.assertNotIn("before", self.pasos)
+        self.assertFalse(self.marca.exists())
+        link.close()
+
+
 class TestAgenteCrudo(TA.ServerCase):
     """El agente de verdad, hablándole directo (una laptop de mentira)."""
 
@@ -323,13 +427,71 @@ class TestAgenteCrudo(TA.ServerCase):
         c.send({"op": "ping", "t": t})
         self.assertTrue(c.wait(lambda ms: any(m["op"] == "pong" and m.get("t") == t for m in ms)), c.msgs)
 
+    def en_espera(self, **cambios):
+        """§5.1: `sesion` con "sonda": el agente contesta sonda_espera (y nada más: ni sesion_ok)."""
+        c = self.conectar()
+        c.send(self.mensaje(tablas=1, desde="laptop", sonda=1, **cambios))
+        self.assertTrue(c.wait(c.hay("sonda_espera")), c.msgs)
+        return c
+
+    def sigue(self, c):
+        c.send({"op": "sigue"})
+        self.assertTrue(c.wait(lambda ms: any(m["op"] in ("sesion_ok", "sesion_error") for m in ms)), c.msgs)
+        return c.first("sesion_ok") or c.first("sesion_error")
+
     def test_dice_sonda_en_sesion_ok_y_reanudar_ok(self):
-        c, ok = self.sesion(msg=self.mensaje(tablas=1, desde="laptop", sonda=1))
+        c = self.en_espera()
+        ok = self.sigue(c)
         self.assertEqual((ok.get("tablas"), ok.get("sonda")), (1, 1), ok)
         r = self.conectar()
         r.send({"op": "reanudar", "sesion": ok["sesion"], "logs": {}})
         self.assertTrue(r.wait(lambda ms: any(m["op"] == "reanudar_ok" for m in ms)), r.msgs)
         self.assertEqual(r.first("reanudar_ok").get("sonda"), 1)
+
+    def test_sigue_que_no_llega_es_sesion_error_sonda_y_queda_libre(self):
+        with mock.patch.object(agent, "ESPERA_SIGUE_S", 0.5):
+            c = self.en_espera()
+            self.assertTrue(c.wait(c.hay("sesion_error")), c.msgs)
+        self.assertEqual(c.first("sesion_error")["codigo"], "sonda")
+        self.assertEqual(c.first("sesion_error")["texto"],
+                         "robot: la laptop no terminó la prueba de red en 0.5 s; vuelve a correr agmen run")
+        self.assertTrue(until(lambda: self.server.session is None))
+        self.assertIsNone(c.first("sesion_ok"))
+        c2, ok = self.sesion(msg=self.mensaje(tablas=1, desde="laptop"))   # libre para otra laptop
+        self.assertEqual(ok["op"], "sesion_ok", ok)
+
+    def test_otra_orden_antes_de_sigue_es_un_error_y_la_conexion_sigue(self):
+        c = self.en_espera()
+        for orden in ({"op": "arrancar", "nodo": "motor"}, {"op": "detener_todo"}, {"op": "tablas", "n": 1},
+                      {"op": "inventada"}):
+            c.send(orden)
+        self.ping(c)   # ping sí, y en orden: los cuatro error ya llegaron
+        errores = c.all("error")
+        self.assertEqual(len(errores), 4, c.msgs)
+        for e, op in zip(errores, ("arrancar", "detener_todo", "tablas", "inventada")):
+            self.assertEqual(e["texto"], f"robot espera la prueba de red y el 'sigue' de la laptop antes de preparar "
+                                         f"nada: '{op}' no se hizo")
+        self.assertIsNone(c.first("sesion_ok"))
+        self.sin_arrancar_nada()
+        self.assertEqual(self.sigue(c)["op"], "sesion_ok")
+        c.send({"op": "sigue"})   # otro `sigue`, ya sin espera: un error claro
+        self.assertTrue(c.wait(lambda ms: len([m for m in ms if m["op"] == "error"]) == 5), c.msgs)
+        self.assertIn("'sigue' solo vale después de sonda_espera", c.all("error")[-1]["texto"])
+
+    def test_laptop_que_no_dice_sonda_como_antes(self):
+        """§5.2: sin "sonda", sesion_ok directo (sin sonda_espera) y un `sigue` no se espera."""
+        c, ok = self.sesion(msg=self.mensaje(tablas=1, desde="laptop"))
+        self.assertEqual(ok["op"], "sesion_ok")
+        self.assertIsNone(c.first("sonda_espera"))
+
+    def test_sin_puente_sesion_ok_directo_aunque_diga_sonda(self):
+        """§5.2: agente sin puente (aquí, [hub] enabled = false): sesion_ok directo con sin_tablas, como antes."""
+        self.write_toml()   # (el TOML de ServerCase: sin hub)
+        c, ok = self.sesion(msg=self.mensaje(tablas=1, desde="laptop", sonda=1))
+        self.assertEqual(ok["op"], "sesion_ok", ok)
+        self.assertIn("sin_tablas", ok)
+        self.assertNotIn("sonda", ok)
+        self.assertIsNone(c.first("sonda_espera"))
 
     def test_sin_sonda_de_la_laptop_no_la_dice_e_ignora_un_sonda(self):
         c, ok = self.sesion(msg=self.mensaje(tablas=1, desde="laptop"))
@@ -340,11 +502,11 @@ class TestAgenteCrudo(TA.ServerCase):
         self.assertFalse([m for m in c.msgs if m["op"] in ("sonda_ok", "sonda_fin", "error")], c.msgs)
 
     def test_un_sonda_mal_formado_es_un_error_y_la_conexion_sigue(self):
-        c, ok = self.sesion(msg=self.mensaje(tablas=1, desde="laptop", sonda=1))
-        c.send({"op": "sonda", "udp": 0, "tcp": 4001, "dato": "a" * 32})
+        c = self.en_espera()   # (en la espera de §5.1, que es cuando la laptop la hace al conectar)
+        c.send({"op": "sonda", "id": 1, "udp": 0, "tcp": 4001, "dato": "a" * 32})
         self.assertTrue(c.wait(lambda ms: any(m["op"] == "sonda_fin" for m in ms)), c.msgs)
         malo = c.first("sonda_fin")   # §4.2: con su campo "error", no un `error` genérico
-        self.assertEqual((malo["udp"], malo["tcp"]), (False, False))
+        self.assertEqual((malo["udp"], malo["tcp"], malo["id"]), (False, False, 1))
         self.assertIn("la de la laptop llegó mal formada", malo["error"])
         self.assertIn("'udp' tiene que ser un puerto", malo["error"])
         self.ping(c)
@@ -354,12 +516,20 @@ class TestAgenteCrudo(TA.ServerCase):
         # ... y la siguiente, bien formada, se hace (con un "laptop" que no contesta: sonda_fin dice que no llegó nada)
         with sonda.Lado() as lado, mock.patch.object(sonda, "SONDA_S", 0.5):
             lado.listen("127.0.0.1")
-            c.send({"op": "sonda", **lado.offer()})
+            c.send({"op": "sonda", "id": 2, **lado.offer()})
             self.assertTrue(c.wait(lambda ms: any(m["op"] == "sonda_fin" for m in ms)), c.msgs)
             self.assertTrue(lado.wait(time.monotonic() + TOPE_S))   # el agente sí mandó el dato de aquí
-        self.assertEqual(c.first("sonda_fin"), {"op": "sonda_fin", "udp": False, "tcp": False})
+        self.assertEqual(c.first("sonda_fin"), {"op": "sonda_fin", "id": 2, "udp": False, "tcp": False})
         self.assertIn(c.first("sonda_ok")["so"], sonda.SISTEMAS)
+        self.assertEqual(c.first("sonda_ok")["id"], 2)
         self.ping(c, "y")
+        # §5.4: un `id` mal formado también es "mal formada" (y sin id en la respuesta: no hay a cuál repetir)
+        c.msgs.clear()
+        c.send({"op": "sonda", "id": "x", "udp": 4000, "tcp": 4001, "dato": "a" * 32})
+        self.assertTrue(c.wait(lambda ms: any(m["op"] == "sonda_fin" for m in ms)), c.msgs)
+        self.assertIn("'id' tiene que ser un entero", c.first("sonda_fin")["error"])
+        self.assertNotIn("id", c.first("sonda_fin"))
+        self.assertEqual(self.sigue(c).get("op"), "sesion_ok")   # y la sesión sigue: sigue → sesion_ok
 
 
 # --- un agente de mentira ---
@@ -368,13 +538,20 @@ SID = "ab" * 16
 
 class Falso:
     """Un agmen agent de mentira: saluda bien (con la clave), contesta sesion/reanudar con "tablas" (y "sonda" si
-    `capaz`), contesta ping, y a cada `sonda` responde según el siguiente modo de `modos` (o "bien")."""
+    `capaz`), contesta ping, y a cada `sonda` responde según el siguiente modo de `modos` (o "bien"). Como el de
+    verdad (4c §5.1): si `capaz` y la laptop dijo "sonda", a `sesion` contesta sonda_espera y el sesion_ok sale tras
+    `sigue` (`espera=False`: sesion_ok directo con "sonda", lo que no existe en campo: §5.2). `ordenes`: lo que llegó."""
 
-    def __init__(self, case, modos=(), capaz=True, barrera: threading.Barrier | None = None):
+    def __init__(self, case, modos=(), capaz=True, barrera: threading.Barrier | None = None, espera: bool = True,
+                 sin_reanudar: bool = False):
+        self.sin_reanudar = sin_reanudar   # a `reanudar`, sesion_error "sesion" (perdió la gracia): sesión nueva
         self.modos = list(modos)
         self.capaz = capaz
+        self.espera = espera
         self.barrera = barrera
         self.sondas = 0
+        self.sigues = 0
+        self.ordenes: list[str] = []
         self.chans: list = []
         self.agente = TA.FakeAgent(self._atender)
         case.addCleanup(self.agente.close)
@@ -385,15 +562,25 @@ class Falso:
         self.chans.append(ch)
         first = ch.recv(5)
         extra = {"tablas": 1, **({"sonda": 1} if self.capaz else {})}
+        ok = {"op": "sesion_ok", "maquina": "robot", "agmen": "0", "nodos": [], "sesion": SID, "gracia": 10, **extra}
         if first["op"] == "sesion":
-            ch.send({"op": "sesion_ok", "maquina": "robot", "agmen": "0", "nodos": [], "sesion": SID, "gracia": 10,
-                     **extra})
+            if self.capaz and self.espera and first.get("sonda") == 1:
+                ch.send({"op": "sonda_espera"})
+            else:
+                ch.send(ok)
+        elif self.sin_reanudar:
+            ch.send({"op": "sesion_error", "codigo": "sesion", "texto": "robot: esa sesión ya terminó"})
+            return
         else:
             ch.send({"op": "reanudar_ok", "nodos": {}, "gracia": 10, **extra})
         ip = c.getpeername()[0]
         while True:
             msg = ch.recv(30)
-            if msg["op"] == "ping":
+            self.ordenes.append(msg["op"])
+            if msg["op"] == "sigue":
+                self.sigues += 1
+                ch.send(ok)
+            elif msg["op"] == "ping":
                 ch.send({"op": "pong", "t": msg.get("t")})
             elif msg["op"] == "sonda":
                 self.sondas += 1
@@ -411,12 +598,15 @@ class Falso:
 
     def _sonda_de_verdad(self, ch, msg, ip, modo):
         udp, tcp, dato = sonda.oferta(msg)
+        n = sonda.ident(msg)
+        if modo == "otro_id":   # §5.4: contesta con el id de otra prueba (una respuesta tardía): se descarta
+            n += 1000
         if modo == "error":   # (como el agente de verdad cuando no puede: §4.2, campo propio)
-            ch.send({"op": "sonda_fin", "udp": False, "tcp": False,
+            ch.send({"op": "sonda_fin", "id": n, "udp": False, "tcp": False,
                      "error": "no pudo abrir sus sockets en 0.0.0.0 (prueba). Revisa AGMEN_NET_IP"})
             return
         if modo == "error_vacio":
-            ch.send({"op": "sonda_fin", "udp": False, "tcp": False, "error": ""})
+            ch.send({"op": "sonda_fin", "id": n, "udp": False, "tcp": False, "error": ""})
             return
         if modo == "corta":   # la conexión se pierde a media prueba
             ch.sock.shutdown(socket.SHUT_RDWR)
@@ -432,19 +622,19 @@ class Falso:
             lado.send(ip, udp, tcp, sonda.nuevo_dato() if modo == "dato_malo" else dato)
             if modo == "no_ok":
                 return
-            ok = {"op": "sonda_ok", **lado.offer(), "so": "windows" if modo == "windows" else "linux"}
+            ok = {"op": "sonda_ok", "id": n, **lado.offer(), "so": "windows" if modo == "windows" else "linux"}
             if modo == "ok_malo":
                 ok["tcp"] = 70000
             ch.send(ok)
             if modo == "error_tras_ok":
-                ch.send({"op": "sonda_fin", "udp": False, "tcp": False, "error": "error inesperado (prueba)"})
+                ch.send({"op": "sonda_fin", "id": n, "udp": False, "tcp": False, "error": "error inesperado (prueba)"})
                 return
             if self.barrera is not None:
                 self.barrera.wait(TOPE_S)   # las dos sondas a la vez: si fueran una tras otra, no pasa
             lado.wait(time.monotonic() + sonda.SONDA_S)
             if modo == "no_fin":
                 return
-            fin = {"op": "sonda_fin", "udp": lado.got_udp.is_set(), "tcp": lado.got_tcp.is_set()}
+            fin = {"op": "sonda_fin", "id": n, "udp": lado.got_udp.is_set(), "tcp": lado.got_tcp.is_set()}
             if modo == "fin_malo":
                 fin["udp"] = "sí"
             if modo == "dice_no_udp":
@@ -585,11 +775,13 @@ class TestConAgenteDeMentira(FalsoCase):
         self.assertTrue(until(lados.cerrados))
         # Lo que llega se reparte por conexión: el de otra conexión no entra en la prueba.
         mia, otra = link.channel, object()
-        prueba = agent._Prueba(mia)
+        prueba = agent._Prueba(mia, 7)
         link._probing = prueba
-        fin = {"op": "sonda_fin", "udp": False, "tcp": False, "error": "x"}
+        fin = {"op": "sonda_fin", "id": 7, "udp": False, "tcp": False, "error": "x"}
         link._dispatch(fin, otra)
         link._dispatch(fin)   # (sin conexión: antes de sesion_ok o al reanudar)
+        for malo in ({**fin, "id": 8}, {**fin, "id": True}, {k: v for k, v in fin.items() if k != "id"}):
+            link._dispatch(malo, mia)   # §5.4: el de otra prueba (u otro id) tampoco
         self.assertTrue(prueba.box.empty())
         self.assertIsNone(prueba.error)
         link._dispatch(fin, mia)
@@ -635,11 +827,51 @@ class TestConAgenteDeMentira(FalsoCase):
         self.assertIsNotNone(link.channel)
         self.assertEqual(falso.sondas, 4)
 
+    def test_el_id_equivocado_se_descarta(self):
+        """§5.4: un sonda_ok/sonda_fin con el id de otra prueba no cuenta: la prueba no se da por contestada."""
+        res, _ = self.probar("otro_id")
+        self.assertIn("no contestó la prueba de red (no llegó su sonda_ok", res.error)
+
+    def test_sesion_ok_con_sonda_sin_espera_es_no_hubo_prueba(self):
+        """§5.2: un sesion_ok con "sonda" que no pasó por sonda_espera: el aviso del agente anterior, sin prueba."""
+        falso = Falso(self, espera=False)
+        link = self.link(falso)
+        self.assertFalse(link.waiting)
+        self.assertFalse(link._probe_cap)
+        self.assertIsNone(link.net_check())
+        self.assertEqual(len([n for n in self.notas if "no puedo probar la red con robot" in n]), 1, self.notas)
+        self.assertEqual(falso.sondas, 0)
+
+    def test_sesion_nueva_tras_perder_la_gracia_sigue_aunque_falle_y_solo_avisa(self):
+        """§5.3 (D-b): tras perder la gracia, la sesión nueva también espera la prueba; la laptop la hace y manda
+        `sigue` aunque no pase (sus nodos ya corren): solo un aviso."""
+        falso = Falso(self, ["bien", "dice_no_udp"], sin_reanudar=True)
+        link = self.link(falso)
+        link.took_probe(link.net_check().ok)
+        link.proceed()
+        self.assertEqual(falso.sigues, 1)
+        self.assertTrue(link.keep_trying())
+        self.assertTrue(link.go())
+        with mock.patch.object(sonda, "SONDA_S", 0.5):
+            falso.chans[0].sock.close()   # el corte; al volver, el agente ya no tiene la sesión
+            self.assertTrue(until(lambda: falso.sigues == 2 and link.channel is not None and link.down_since is None
+                                  and any("no pasó al reconectar" in n for n in self.notas), 30), self.notas)
+        self.assertEqual(falso.sondas, 2)
+        malas = [n for n in self.notas if "no pasó al reconectar" in n]
+        self.assertEqual(malas, ["⚠ la prueba de red con 'robot' no pasó al reconectar (los nodos de aquí siguen "
+                                 "corriendo; no detengo nada):"], self.notas)
+        self.assertTrue(any("robot no recibe de esta computadora por UDP" in n for n in self.notas), self.notas)
+        self.assertFalse(link.waiting)
+        self.assertIsNone(link.lost or None)
+        # y no hay otra prueba tras ese sesion_ok (§5.2): solo las dos
+        self.assertEqual(falso.ordenes.count("sonda"), 2)
+
     def test_al_reanudar_se_repite_sola(self):
         """Tras un corte, la conexión reanudada repite la prueba (en su hilo) y, si falla, solo avisa."""
         falso = Falso(self, ["bien", "dice_no_udp"])
         link = self.link(falso)
         link.took_probe(link.net_check().ok)
+        link.proceed()
         self.assertTrue(link.keep_trying())
         self.assertTrue(link.go())
         with mock.patch.object(sonda, "SONDA_S", 0.5):
@@ -720,6 +952,57 @@ class TestAgmenRun(TA.LinkCase):
 
 
 class TestVariosRobots(FalsoCase):
+    def conectar(self, falsos, nombres=("robot", "brazo")):
+        """cli._connect de verdad con agentes de mentira: abre, prueba y (si todas pasan) `sigue` a todas."""
+        remotes = {n: agent.AgentLink(SimpleNamespace(name=n, host="127.0.0.1", port=f.port))
+                   for f, n in zip(falsos, nombres)}
+        for link in remotes.values():
+            link.attach(None, lambda who, text, kind, droppable=False: self.notas.append(text))
+            self.addCleanup(link.close)
+        said: list[str] = []
+        launcher = SimpleNamespace(say=lambda t, k="agmen": said.append(t))
+
+        def mensaje(config, name, clock, desde=None, sonda=False):
+            return {"op": "sesion", "perfil": "real", "reloj": "real", "agmen": "0", "maquina": name, "nodos": {},
+                    "no_arrancar": [], "tablas": 1, "desde": desde, **({"sonda": 1} if sonda else {})}
+
+        lost: list[str] = []
+        with mock.patch.object(agent, "session_message", mensaje), mock.patch.object(sonda, "SONDA_S", 0.5):
+            error = cli._connect(launcher, None, remotes, {n: (TA.KEY, "env") for n in remotes}, "real", lost,
+                                 threading.Event(), "laptop", net_check=True)
+        return error, said, lost, remotes
+
+    def test_si_una_falla_ninguna_recibe_sigue(self):
+        a, b = Falso(self), Falso(self, ["dice_no_udp"])
+        error, said, lost, remotes = self.conectar([a, b])
+        self.assertIn("la prueba de red con 'brazo' no pasó, así que no arranqué nada:", error)
+        self.assertEqual((a.sigues, b.sigues), (0, 0))
+        self.assertTrue(until(lambda: a.ordenes[-1:] == ["adios"] and b.ordenes[-1:] == ["adios"]),
+                        (a.ordenes, b.ordenes))
+        self.assertNotIn("sí corrió su preparación", error)
+
+    def test_si_todas_pasan_todas_reciben_sigue_y_quedan_abiertas(self):
+        a, b = Falso(self), Falso(self)
+        error, said, lost, remotes = self.conectar([a, b])
+        self.assertEqual(error, "", said)
+        self.assertEqual((a.sigues, b.sigues), (1, 1))
+        for link in remotes.values():
+            self.assertFalse(link.waiting)
+            self.assertIsNotNone(link._reader)
+        # el `sigue` salió hacia las dos solo después de las dos pruebas
+        for f in (a, b):
+            self.assertLess(f.ordenes.index("sonda"), f.ordenes.index("sigue"))
+
+    def test_con_un_agente_anterior_se_dice_que_ahi_si_corrio_su_preparacion(self):
+        """§5.5: el anterior contestó sesion_ok directo (ya corrió su before y su hub): se dice en el error."""
+        a, b = Falso(self, capaz=False), Falso(self, ["dice_no_udp"])
+        error, said, lost, remotes = self.conectar([a, b])
+        self.assertIn("la prueba de red con 'brazo' no pasó", error)
+        self.assertIn("(en 'robot' sí corrió su preparación, [robot] before y su hub", error)
+        self.assertNotIn("en 'brazo' sí corrió", error)
+        self.assertEqual(b.sigues, 0)
+
+
     def test_dos_robots_en_paralelo(self):
         barrera = threading.Barrier(2)
         a, b = Falso(self, barrera=barrera), Falso(self, barrera=barrera)
