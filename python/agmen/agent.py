@@ -1496,6 +1496,11 @@ class _Session:
         self._first: dict = {}
         self._tables = False
         self._no_tables = ""                 # la laptop pidió puente y este agente no lo hace: por qué (4b §8.6)
+        # La prueba de red (4c): si con el puente la laptop dijo "sonda" (y este agente lo dice en sesion_ok y
+        # reanudar_ok), y la conexión en la que corre una ahora (una a la vez por conexión).
+        self._probe = False
+        self._probing: Channel | None = None
+        self._probe_lock = threading.Lock()
         self.bridge = None
         self.peer = None
         self.sender = self._start_sender(channel, self.out)
@@ -1765,6 +1770,8 @@ class _Session:
                     reply["gracia"] = _grace_number()
                     if self._tables:
                         reply["tablas"] = 1
+                        if self._probe:
+                            reply["sonda"] = 1
                     elif self._no_tables:
                         reply["sin_tablas"] = self._no_tables
                     out.put(reply)
@@ -1893,10 +1900,13 @@ class _Session:
             if own:
                 launcher.nodes["hub"].start()   # el hub de esta computadora, como en agmen run
             self._tables = self._wants_tables()
+            self._probe = self._tables and _says_probe(self._first)   # 4c: solo con puente, y si la laptop lo dijo
             ok = {"op": "sesion_ok", "maquina": m, "agmen": __version__, "nodos": list(plan.names),
                   "sesion": self.id, "gracia": _grace_number()}
             if self._tables:
                 ok["tablas"] = 1
+                if self._probe:
+                    ok["sonda"] = 1
             elif self._no_tables:
                 ok["sin_tablas"] = self._no_tables   # §8.6: la laptop pidió puente y aquí no se hace: por qué
             self.send(ok)
@@ -2091,11 +2101,89 @@ class _Session:
         elif op == "tablas":   # la tabla del hub de la laptop (4b): solo si hay puente
             if self.peer is not None:
                 self.peer.receive(msg)
+        elif op == "sonda":   # la prueba de red (4c): en su hilo, nunca en este (que lee) ni en el de las órdenes
+            if self._probe:   # (un `sonda` de quien no dijo la capacidad se ignora)
+                self._on_probe(msg)
         elif op in ("sesion", "reanudar"):
             self._error("esta conexión ya tiene su sesión abierta")
         else:
             self._error(f"orden desconocida '{_clean(op, 40)}' (este agente es Agmen {__version__})")
         return False
+
+    def _on_probe(self, msg: dict) -> None:
+        """Llegó `sonda` por la conexión actual: la prueba corre en su propio hilo (no estorba a ping, detener_todo ni
+        adios) y lo que contesta va solo por esta conexión (si se sustituye, ya no contesta nada)."""
+        channel, out = self.channel, self.out
+        with self._probe_lock:
+            if self._probing is channel:
+                self._error(f"{self.server.machine} ya está haciendo una prueba de red por esta conexión: espera a "
+                            f"que termine")
+                return
+            self._probing = channel
+        try:
+            threading.Thread(target=self._run_probe, args=(msg, channel, out), daemon=True,
+                             name="agmen-agent-sonda").start()
+        except Exception as e:   # nunca en silencio, y la sesión sigue
+            with self._probe_lock:
+                self._probing = None
+            self.say(f"⚠ no pude arrancar la prueba de red con la laptop ({_clean(repr(e), 200)})", "error")
+            self._error(f"{self.server.machine}: no pude hacer la prueba de red ({_clean(e, 200)})")
+
+    def _run_probe(self, msg: dict, channel: Channel, out: _Outbox) -> None:
+        """La prueba de red del lado del agente (4c §1.3): abre sus sockets, manda el dato de la laptop a los puertos
+        de ella (a la IP con la que la ve en la conexión, nunca a una que venga en el mensaje), contesta sonda_ok con
+        los suyos, espera lo suyo hasta SONDA_S y dice en sonda_fin lo que recibió. Sus errores son "falló" (con su
+        porqué), nunca un fin de sesión. Los sockets se cierran siempre."""
+        from . import sonda
+        from .hub import net_ip_from_env
+
+        m = self.server.machine
+        try:
+            try:
+                udp, tcp, dato = sonda.oferta(msg)
+            except ValueError as e:
+                text = (f"{m}: la prueba de red de la laptop llegó mal formada ({e}): no la hice. ¿Las dos "
+                        f"computadoras tienen la misma versión de Agmen?")
+                self.say(f"⚠ {text}", "error")
+                out.put({"op": "error", "texto": _cut(text, 2000)})
+                return
+            try:
+                ip = sonda.ipv4(_show_ip(self.ip))
+            except ValueError as e:   # (la laptop volvió desde una IPv6)
+                text = f"{m}: la prueba de red no se pudo hacer: la laptop llegó desde {e}"
+                self.say(f"⚠ {text}", "error")
+                out.put({"op": "error", "texto": _cut(text, 2000)})
+                return
+            try:
+                lado = sonda.Lado(net_ip_from_env())
+            except (OSError, ValueError) as e:
+                text = f"{m}: {_clean(e, 300)}: la prueba de red no se pudo hacer"
+                self.say(f"⚠ {text}", "error")
+                out.put({"op": "error", "texto": _cut(text, 2000)})
+                return
+            with lado:
+                lado.listen(ip)
+                lado.send(ip, udp, tcp, dato)
+                if not out.put({"op": "sonda_ok", **lado.offer(), "so": sonda.sistema()}):
+                    return   # esta conexión ya no es la actual (o se cerró)
+                lado.wait(time.monotonic() + sonda.SONDA_S, lambda: self._ending or self.channel is not channel)
+                got_udp, got_tcp = lado.got_udp.is_set(), lado.got_tcp.is_set()
+            if self._ending or self.channel is not channel:
+                return
+            out.put({"op": "sonda_fin", "udp": got_udp, "tcp": got_tcp})
+            if not (got_udp and got_tcp):
+                what = ("ni por UDP ni por TCP" if not got_udp and not got_tcp else
+                        "por UDP" if not got_udp else "por TCP")
+                self.say(f"⚠ prueba de red: no me llega nada de la laptop ({ip}) {what}: la laptop te dice qué "
+                         f"hacer", "error")
+        except Exception as e:   # nunca en silencio; la sesión sigue
+            self.say(f"⚠ error inesperado en la prueba de red: {_clean(repr(e), 200)}", "error")
+            out.put({"op": "error", "texto": _cut(f"{m}: error inesperado en la prueba de red ({_clean(e, 200)})",
+                                                   2000)})
+        finally:
+            with self._probe_lock:
+                if self._probing is channel:
+                    self._probing = None
 
     def _stop_nodes(self, hub: bool) -> None:
         """Detiene los nodos de la sesión (todos a la vez); el hub al final, si `hub`."""
@@ -2303,23 +2391,32 @@ def get_key(name: str, address: str, *, interactive: bool | None = None,
     raise AssertionError("inalcanzable")
 
 
-def session_message(config, machine: str, clock: str, desde: str | None = None) -> dict:
+def session_message(config, machine: str, clock: str, desde: str | None = None, sonda: bool = False) -> dict:
     """El `sesion` para el agente de `machine`. no_arrancar = todos sus nodos: agmen run
     los arranca después, cuando TODAS las computadoras aceptaron (y en el orden del
     archivo; los de --skip o autostart = false, nunca solos). Con `desde` (agmen run con
-    hub, RFC 0011 parte 4b §3): "tablas": 1 y cómo se llama esta computadora allá."""
+    hub, RFC 0011 parte 4b §3): "tablas": 1 y cómo se llama esta computadora allá. Con
+    `sonda` (y `desde`; bloque 4c): "sonda": 1, la prueba de red (sin --no-net-check)."""
     nodes = written_nodes(config, machine)
     msg = {"op": "sesion", "perfil": config.profile, "reloj": clock, "agmen": __version__, "maquina": machine,
            "nodos": nodes, "no_arrancar": list(nodes)}
     if desde is not None:
         msg["tablas"] = 1
         msg["desde"] = desde
+        if sonda:
+            msg["sonda"] = 1
     return msg
 
 
 def _says_tables(msg: dict | None) -> bool:
     """¿El otro lado dijo que sabe pasar las tablas de su hub (RFC 0011 parte 4b §3)?"""
     value = (msg or {}).get("tablas")
+    return type(value) is int and value == 1
+
+
+def _says_probe(msg: dict | None) -> bool:
+    """¿El otro lado dijo que sabe hacer la prueba de red (bloque 4c: "sonda": 1, como "tablas")?"""
+    value = (msg or {}).get("sonda")
     return type(value) is int and value == 1
 
 
@@ -2403,6 +2500,14 @@ class AgentLink:
         self._no_tables = ""                # por qué el agente no hace puente, si lo dijo ("sin_tablas", §8.6)
         self._told_tables = False
         self._stopping = False              # finish()/close(): ya no sale ninguna tabla (§8.7)
+        # La prueba de red (4c): si el agente dijo "sonda" en su último sesion_ok/reanudar_ok; la que espera ahora sus
+        # sonda_ok/sonda_fin (una cola; None: ninguna); cómo salió la última (None: no se sabe) y si ya se dijo que
+        # ese agente no la hace. before_probe(): se llama antes de cada prueba (agmen run: el aviso de Windows, una vez).
+        self._probe_cap = False
+        self._probing: queue.Queue | None = None
+        self._net_ok: bool | None = None
+        self._told_probe = False
+        self.before_probe: Callable[[], None] | None = None
 
     @property
     def on_lost(self) -> Callable[[AgentLink, str], None] | None:
@@ -2730,6 +2835,10 @@ class AgentLink:
             peer = self._peer
             if peer is not None and self._tables:
                 peer.receive(msg)
+        elif op in ("sonda_ok", "sonda_fin"):   # la prueba de red (4c): a la que la espera (si no hay, nada)
+            probing = self._probing
+            if probing is not None:
+                probing.put(msg)
         # lo que no conozca (un agente más nuevo): nada
 
     # --- el puente (RFC 0011 parte 4b) ---
@@ -2744,6 +2853,7 @@ class AgentLink:
     def _set_tables(self, ok: dict | None) -> None:
         """Lo que dijo el agente del puente en sesion_ok/reanudar_ok: "tablas" (lo hace) o "sin_tablas" (por qué no)."""
         self._tables = _says_tables(ok)
+        self._probe_cap = self._tables and _says_probe(ok)
         why = (ok or {}).get("sin_tablas")
         self._no_tables = _clean(why, 200) if isinstance(why, str) and why.strip() else ""
 
@@ -2790,6 +2900,158 @@ class AgentLink:
         except AgentError as e:
             self._lose(f"no pude mandarle la tabla de topics: {e}", gen)
             raise
+
+    # --- la prueba de red (4c) ---
+    def net_check(self, stop: Callable[[], bool] | None = None):
+        """La prueba de red con este robot por la conexión actual (agmen run, al conectar, antes de arrancar nada).
+        Devuelve un sonda.Resultado, o None si no hay prueba: sin puente, con --no-net-check, el agente no la sabe
+        hacer (eso se dice una vez) o la conexión se perdió/cerró mientras tanto (eso lo dice quien lo ve)."""
+        with self._lock:
+            channel, gen = self.channel, self._gen
+        if not self._wants_probe():
+            return None
+        return self._probe(channel, gen, stop)
+
+    def _wants_probe(self) -> bool:
+        """¿Toca prueba de red? Con puente y si esta laptop la pidió ("sonda" en su sesion): si el agente no dijo
+        "sonda" (un Agmen anterior a la 4c), un aviso, una vez, y la sesión sigue (no es fallo)."""
+        if self.channel is None or not self._tables or not _says_probe(self._session):
+            return False
+        if not self._probe_cap:
+            if not self._told_probe:
+                self._told_probe = True
+                self._notice(f"⚠ no puedo probar la red con {self.name}: su agmen agent es un Agmen anterior (no dice "
+                             f"'sonda'). Los topics se pasan igual, pero si un firewall los bloquea Agmen no te lo va "
+                             f"a decir. Actualiza Agmen en {self.name} (pip install -U agmen)", "error")
+            return False
+        return True
+
+    def _probe(self, channel: Channel, gen: int, stop: Callable[[], bool] | None):
+        """La prueba de red del lado de la laptop (4c §1.3). No toma el candado de la conexión más que para mirar
+        (ping, órdenes, detener_todo y adios siguen como siempre). Todo acaba en ≤ SONDA_S + MARGEN_S; los sockets
+        se cierran siempre. None si se dejó de probar (stop, close, la conexión ya no es la actual)."""
+        from . import sonda
+        from .hub import net_ip_from_env
+
+        def gone() -> bool:
+            return (self._closing or self._gen != gen or self.channel is not channel
+                    or (stop is not None and stop()))
+
+        res = sonda.Resultado()
+        where = f"{self.name} ({self.shown})"
+        try:
+            robot_ip = sonda.ipv4(_show_ip(channel.sock.getpeername()[0]))
+        except OSError:
+            return None   # ya se cerró: su lector lo ve
+        except ValueError as e:
+            res.error = f"no pude hacer la prueba de red con {where}: {e}"
+            return res
+        if self.before_probe is not None:
+            self.before_probe()
+        try:
+            lado = sonda.Lado(net_ip_from_env())
+        except (OSError, ValueError) as e:
+            res.error = f"no pude hacer la prueba de red con {where}: {_clean(e, 300)}"
+            return res
+        box: queue.Queue = queue.Queue()
+
+        def next_msg(until: float) -> dict | None:
+            while not gone():
+                left = until - time.monotonic()
+                if left <= 0:
+                    return None
+                try:
+                    return box.get(timeout=min(STOP_POLL, left))
+                except queue.Empty:
+                    continue
+            return None
+
+        with lado:
+            self._probing = box
+            try:
+                start = time.monotonic()
+                deadline = start + sonda.SONDA_S + sonda.MARGEN_S
+                lado.listen(robot_ip)
+                try:
+                    channel.send({"op": "sonda", **lado.offer()})
+                except AgentError:
+                    return None   # la conexión se cayó: lo ve su lector (y es otra pérdida, no un firewall)
+                ok = next_msg(deadline)
+                if gone():
+                    return None
+                if ok is None or ok["op"] != "sonda_ok":
+                    why = "no llegó su sonda_ok" if ok is None else "mandó sonda_fin antes de sonda_ok"
+                    res.error = (f"{where} no contestó la prueba de red ({why} en {sonda.SONDA_S + sonda.MARGEN_S:g} "
+                                 f"s): mira la terminal de agmen agent en {self.name}")
+                    return res
+                try:
+                    udp, tcp, dato = sonda.oferta(ok)
+                except ValueError as e:
+                    res.error = (f"{where} contestó mal la prueba de red ({e}): ¿las dos computadoras tienen la misma "
+                                 f"versión de Agmen?")
+                    return res
+                so = ok.get("so")
+                res.so_alla = so if so in sonda.SISTEMAS else ""   # uno que no conozco: el consejo general
+                lado.send(robot_ip, udp, tcp, dato)
+                lado.wait(min(deadline, time.monotonic() + sonda.SONDA_S), gone)
+                if gone():
+                    return None
+                res.aqui_udp, res.aqui_tcp = lado.got_udp.is_set(), lado.got_tcp.is_set()
+                end = next_msg(deadline)
+                if gone():
+                    return None
+                if end is None or end["op"] != "sonda_fin":
+                    why = "no llegó su sonda_fin" if end is None else "mandó otro sonda_ok"
+                    res.error = (f"{where} no contestó la prueba de red ({why} en {sonda.SONDA_S + sonda.MARGEN_S:g} "
+                                 f"s): mira la terminal de agmen agent en {self.name}")
+                    return res
+                try:
+                    res.alla_udp, res.alla_tcp = sonda.fin(end)
+                except ValueError as e:
+                    res.error = (f"{where} contestó mal la prueba de red ({e}): ¿las dos computadoras tienen la misma "
+                                 f"versión de Agmen?")
+                return res
+            finally:
+                if self._probing is box:
+                    self._probing = None
+
+    def probe_lines(self, res) -> list[str]:
+        """Lo que falló de `res`, en palabras: qué computadora no recibe de cuál, por dónde y qué hacer."""
+        from . import sonda
+
+        channel = self.channel
+        try:
+            robot_ip = _show_ip(channel.sock.getpeername()[0]) if channel is not None else self.machine.host
+            laptop_ip = _show_ip(channel.sock.getsockname()[0]) if channel is not None else "esta computadora"
+        except OSError:
+            robot_ip, laptop_ip = self.machine.host, "<la IP de esta computadora>"
+        return sonda.explicar(res, self.name, robot_ip, laptop_ip)
+
+    def took_probe(self, ok: bool) -> None:
+        """agmen run, al conectar: cómo salió la prueba (para avisar al reconectar solo si cambia)."""
+        self._net_ok = ok
+
+    def _recheck(self, channel: Channel, gen: int) -> None:
+        """4c §1.4: al reanudar o reconectar (los nodos ya corren) se repite la prueba; si falla, solo un aviso (una
+        vez por cambio de estado) y nada se detiene; cuando vuelve a pasar, una línea de que ya pasa."""
+        try:
+            res = self._probe(channel, gen, None)
+            if res is None:
+                return
+            with self._lock:
+                if self._gen != gen or self._closing:
+                    return
+                was, self._net_ok = self._net_ok, res.ok
+            if not res.ok and was is not False:
+                self._notice(f"⚠ la prueba de red con '{self.name}' no pasó al reconectar (sus nodos siguen "
+                             f"corriendo; no detengo nada):", "error")
+                for line in self.probe_lines(res):
+                    self._notice(f"⚠   {line}", "error")
+            elif res.ok and was is False:
+                self._notice(f"✔ red con '{self.name}': la prueba de red ya pasa (los topics pasan en los dos "
+                             f"sentidos, UDP y TCP)")
+        except Exception as e:   # nunca en silencio; la conexión sigue
+            self._notice(f"⚠ {self.name}: error inesperado en la prueba de red ({_clean(repr(e), 200)})", "error")
 
     def _note_once(self, what: str, text: str) -> None:
         """Un aviso propio de agmen run sobre lo que manda el agente: una vez por conexión."""
@@ -3172,6 +3434,9 @@ class AgentLink:
             # 4b: confirmada (tras sesion_ok, o tras el pong de confirmación de un reanudar): vuelve el puente.
             self._set_tables(resumed if resumed is not None else ok)
             self._bridge_up(channel)
+            if self._wants_probe():   # 4c: se repite la prueba de red, en su hilo (si falla, solo avisa)
+                threading.Thread(target=self._recheck, args=(channel, gen), daemon=True,
+                                 name=f"agmen-sonda-{self.name}").start()
         except BaseException as e:
             with self._lock:   # ¿sigue siendo la actual? (si su lector ya la perdió, otro hilo reintenta)
                 mine = self._gen == gen and self.down_since is None and not self._closing
