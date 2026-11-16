@@ -267,10 +267,14 @@ def _run(args) -> int:
             from .tables import laptop_name
 
             desde = laptop_name(config, places)
+        if desde is not None and args.no_net_check:   # 4c (D-d): una vez, en rojo
+            from .sonda import SALTADA
+
+            launcher.say(SALTADA, "error")
         try:
             with ctrl_c.interruptible():
                 error = _connect(launcher, config, remotes, keys, "replay" if args.play else config.clock.mode,
-                                 lost, stop, desde)
+                                 lost, stop, desde, net_check=not args.no_net_check)
         except KeyboardInterrupt:   # _connect ya mandó adios a todas (si ya había vuelto, se les manda aquí)
             for link in remotes.values():
                 link.close()
@@ -528,9 +532,16 @@ def _bridge_for(launcher, remotes: dict):
     return bridge
 
 
-def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list, stop, desde=None) -> str:
+def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list, stop, desde=None,
+             net_check: bool = False) -> str:
     """Abre la sesión con cada agente, una tras otra. Devuelve "" si todas se abrieron;
-    si no, el error, y las que ya estaban abiertas reciben adios (no arranca nada)."""
+    si no, el error, y las que ya estaban abiertas reciben adios (no arranca nada). Con
+    `net_check` (y puente), la prueba de red con todas a la vez (4c): si falla con alguna,
+    es un error como "no contesta" (no arranca nada). 4c §5.1: los agentes al día esperan la
+    prueba sin preparar nada (sonda_espera); solo cuando pasó con TODAS reciben `sigue` (a la
+    vez) y se espera el sesion_ok de cada una. §6.1: la espera de cada agente dura mientras esta
+    laptop le mande ping (lo hace el hilo de ping de su enlace, no este), aunque abrir la sesión
+    con otra tarde minutos."""
     from .agent import AgentError, save_client_key, session_message
 
     def on_lost(link, text):
@@ -554,7 +565,8 @@ def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list
             launcher.say(f"conectando con {name} ({link.shown})…")
             link.on_lost = on_lost   # ANTES de open(): una pérdida justo después de abrir no se olvida
             try:
-                link.open(key, session_message(config, name, clock, desde), on_key_ok=keep, stop=stop)
+                link.open(key, session_message(config, name, clock, desde, sonda=net_check), on_key_ok=keep,
+                          stop=stop)
             except AgentError as e:
                 if lost:   # otra se perdió mientras esta preparaba la sesión: ya recibió adios; cmd_run sale con 1
                     break
@@ -571,11 +583,124 @@ def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list
             if link.version != mine:
                 launcher.say(f"⚠ {name} tiene Agmen {link.version} y esta computadora Agmen {mine}: se entienden "
                              f"(mismo protocolo), pero conviene la misma versión en las dos (pip install -U agmen)")
+        if net_check and desde is not None and opened and not lost:
+            failed = _net_checks(launcher, opened, stop, lost)
+            if failed:
+                for other in opened:   # como cuando un agente no contesta: adios a todas, en orden
+                    other.close()
+                return failed
+        waiting = [link for link in opened if link.waiting]
+        if waiting and not lost:
+            for link in waiting:   # (sin prueba, o si una se perdió, ninguna recibe `sigue`: D-a)
+                if lost or stop.is_set():
+                    # 4c §6.2: antes de CADA `sigue`, otra vez: si una se perdió (o se pidió parar) entre la prueba y
+                    # aquí, no sale ningún `sigue` más y adios a todas (las que ya lo recibieron detienen lo suyo).
+                    for other in opened:
+                        other.close()
+                    return "" if lost else ("se dejó de esperar a las otras computadoras antes de arrancar: no "
+                                            "arranqué nada")
+                link.go_on()
+            for link in waiting:
+                try:
+                    link.wait_ok(stop)
+                except AgentError as e:
+                    if lost:   # otra se perdió mientras esta preparaba la sesión: cmd_run sale con 1
+                        break
+                    for other in opened:
+                        other.close()
+                    return str(e) + _key_hint(link.name, keys[link.name][1], getattr(e, "code", ""))
     except BaseException:   # Ctrl+C mientras se conecta (o el before de un agente): adios a todas
         for link in remotes.values():
             link.close()
         raise
     return ""
+
+
+def _net_checks(launcher, links: list, stop, lost: list) -> str:
+    """La prueba de red con cada robot, todas a la vez (4c §1.4), antes de arrancar nada. Devuelve "" si pasaron
+    (una línea corta por robot) o el error que lo explica todo (agmen run no arranca nada). Si la conexión con un
+    robot se perdió o se cerró a media prueba (4c §4.4), es el caso de siempre de conexión perdida: va a `lost` (lo
+    dice una vez), devuelve "" y cmd_run no arranca nada (sale con 1). Nunca "todo bien" sin haber probado."""
+    from . import sonda
+    from .agent import SinConexion
+    from .sonda import LIMITE, PASA, WINDOWS, Resultado
+
+    warned, warn_lock = [], threading.Lock()
+
+    def windows_once() -> None:   # §1.3: antes de la primera prueba, una vez por agmen run
+        if sonda.sistema() != "windows":
+            return
+        with warn_lock:
+            if warned:
+                return
+            warned.append(True)
+        launcher.say(f"⚠ {WINDOWS}")
+
+    cancel = threading.Event()
+    results: dict = {}
+
+    def one(link) -> None:
+        try:
+            results[link.name] = link.net_check(lambda: stop.is_set() or cancel.is_set())
+        except Exception as e:   # nunca en silencio: cuenta como fallo, con su porqué
+            results[link.name] = Resultado(error=f"error inesperado en la prueba de red con {link.name} ({e!r})")
+
+    threads = []
+    for link in links:
+        link.before_probe = windows_once   # (también para las pruebas al reconectar)
+        threads.append(threading.Thread(target=one, args=(link,), daemon=True, name=f"agmen-sonda-{link.name}"))
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            while t.is_alive():   # en tramos cortos: Ctrl+C llega aquí también en Windows
+                t.join(0.2)
+    finally:
+        cancel.set()   # (Ctrl+C) que las que sigan cierren sus sockets ya
+        for t in threads:
+            t.join(1.0)
+    for link in links:
+        res = results.get(link.name)
+        if isinstance(res, SinConexion) and not stop.is_set():
+            text = link.lost or (f"{link.name} ({link.shown}): se perdió la conexión con agmen agent a media prueba "
+                                 f"de red ({res.motivo}). Revisa {link.name} (¿se apagó, se cayó la red o se cerró "
+                                 f"agmen agent?) y vuelve a correr agmen run")
+            link.close()   # (así su lector ya no lo vuelve a contar: se dice una vez)
+            if text not in lost:
+                lost.append(text)
+                launcher.say(f"✖ {text}", "error")
+            stop.set()
+    if lost or stop.is_set():   # una computadora se perdió mientras tanto: lo cuenta cmd_run (sale con 1)
+        return ""
+    failures, ran, windows = [], False, sonda.sistema() == "windows"
+    for link in links:
+        res = results.get(link.name)
+        if res is None:   # sin prueba con este robot (su agente no la sabe hacer: ya se dijo)
+            continue
+        if not isinstance(res, Resultado):   # (no llega aquí: SinConexion ya dejó `lost`; por si acaso, nunca "bien")
+            failures.append((link, Resultado(error=f"no se pudo hacer la prueba de red con {link.name}")))
+            continue
+        ran, windows = True, windows or res.so_alla == "windows"
+        link.took_probe(res.ok)
+        if res.ok:
+            launcher.say(PASA.format(robot=link.name))
+        else:
+            failures.append((link, res))
+    if ran and windows:   # §1.6: el límite (C++ en Windows) solo si alguna de las computadoras de la prueba es Windows
+        launcher.say(LIMITE)
+    if not failures:
+        return ""
+    parts = []
+    for link, res in failures:
+        parts.append(f"la prueba de red con '{link.name}' no pasó, así que no arranqué nada:")
+        parts += [f"  {line}" for line in link.probe_lines(res)]
+    for link in links:   # 4c §5.5: un agente que no esperó a la prueba (p. ej. un Agmen anterior) ya se preparó
+        if not link.waiting:
+            parts.append(f"(en '{link.name}' sí corrió su preparación, porque su agmen agent no esperó a la prueba de "
+                         f"red: es un Agmen anterior, o no pasa topics con esta computadora. Al despedirme se detiene)")
+    parts.append(f"Si sabes que la red está bien, puedes saltártela: agmen run {links[0].toml_hint} --no-net-check "
+                 f"(pero entonces, si un firewall bloquea los topics, Agmen no te lo va a decir)")
+    return "\n".join(parts)
 
 
 def cmd_agent(args) -> int:
@@ -936,6 +1061,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="reproducir una grabación: todos los nodos usan el tiempo de la grabación")
     p.add_argument("--play-topic", action="append", default=[], metavar="TOPIC",
                    help="con --play: reproducir solo este topic (se puede repetir)")
+    p.add_argument("--no-net-check", action="store_true",
+                   help="no hacer la prueba de red con las otras computadoras (el firewall; RFC 0011 §3.5)")
     p.add_argument("--skip", action="append", default=[], metavar="NODO",
                    help="no arrancar este nodo (ej. el de la cámara, si --play la reproduce)")
     p.add_argument("--profile", metavar="PERFIL",

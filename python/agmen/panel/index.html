@@ -811,6 +811,12 @@ function toggleTopic(t, ev) {
   lastTopicsKey = ""; layoutCharts(); renderInspector(true);
   if (rec) recSeek(rec.pos);                          // la historia del topic nuevo, desde el archivo
 }
+// De qué computadora sale un topic y a cuál llega (4c §2.4): "robot → laptop". Vacío sin [[machine]] (sin las listas).
+function placeOf(t) {
+  const pubs = Array.isArray(t.publishers_at) ? t.publishers_at : [], subs = Array.isArray(t.subscribers_at) ? t.subscribers_at : [];
+  if (!pubs.length && !subs.length) return "";
+  return `${pubs.join(", ") || "—"} → ${subs.join(", ") || "—"}`;
+}
 function renderTopics(topics) {
   const names = Object.keys(topics).filter((t) => t.startsWith("/")).sort();
   // Al principio, el topic con más mensajes por segundo (normalmente un sensor). /clock no:
@@ -821,7 +827,8 @@ function renderTopics(topics) {
     const best = pool.reduce((a, b) => (topics[b].rate_hz > topics[a].rate_hz ? b : a));
     toggleTopic(best);
   }
-  const k = JSON.stringify(names.map((t) => [t, Math.round(topics[t].rate_hz)])) + [...selected].join() + focus;
+  const k = JSON.stringify(names.map((t) => [t, Math.round(topics[t].rate_hz), ...(placeOf(topics[t]) ? [placeOf(topics[t])] : [])])) +
+    [...selected].join() + focus;
   if (k === lastTopicsKey) return;
   lastTopicsKey = k;
   const box = $("topicchips"); box.innerHTML = "";
@@ -830,6 +837,12 @@ function renderTopics(topics) {
     b.className = "chip" + (selected.has(t) ? " on" : "") + (t === focus ? " focus" : "");
     const heavy = topics[t].bytes_s >= 100000 ? ` · ${(topics[t].bytes_s / 1e6).toFixed(1)} MB/s` : "";
     b.innerHTML = `${esc(t)} <small>${esc(topics[t].type)} · ${topics[t].rate_hz.toFixed(0)} Hz${heavy}</small>`;
+    const where = placeOf(topics[t]);
+    if (where) {                                       // de dónde sale (4c §2.4); como texto: los nombres vienen de la red
+      const w = document.createElement("small"); w.className = "at";
+      w.textContent = " · " + where;
+      b.appendChild(w);
+    }
     b.title = selected.has(t) ? (t === focus ? "clic: quitar la gráfica" : "clic: ver sus datos arriba y en el inspector") : "clic: graficar";
     b.onclick = () => toggleTopic(t);
     box.appendChild(b);

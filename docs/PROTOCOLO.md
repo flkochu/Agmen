@@ -236,8 +236,10 @@ Los bytes exactos de este y otros ejemplos están en los vectores de prueba.
 > ([RFC 0011](rfc/0011-sim-real-y-varias-computadoras.md), §3.5, partes 4a y 4b): el
 > hub y los dos núcleos (C++ y Python) ya lo entienden, y `agmen run` y `agmen agent`
 > encienden el modo red y pasan las tablas de sus hubs por la conexión del agente
-> (ver [El puente de topics](#el-puente-de-topics-tablas-desde-0140)). Lo que falta
-> (la prueba del firewall y lo que se ve en herramientas y panel) es la parte 4c.
+> (ver [El puente de topics](#el-puente-de-topics-tablas-desde-0140)). La prueba de red
+> (parte 4c) está en [La prueba de red](#la-prueba-de-red-sonda-desde-0140). Lo que se ve
+> en herramientas y panel no cambia el protocolo: usa `machine=`, que ya existe en las
+> entradas de otra computadora.
 
 Es el protocolo de control entre los nodos y su **hub** (`agmen hub`, o el que
 arranca `agmen run`). Los datos no pasan por aquí: el hub solo dice a quién
@@ -596,6 +598,9 @@ JSON sea un objeto con `"op"`. Si algo falla, cierra la conexión.
     laptop tiene hub (`[hub] enabled = false` no lo manda). Desde la 4b.
   - `desde`: cómo se llama la laptop para las herramientas del robot (texto; solo va
     con `tablas`). Reglas en [El puente de topics](#el-puente-de-topics-tablas-desde-0140).
+  - `sonda`: `1` si la laptop va a hacer la prueba de red con este agente (solo va con
+    `tablas`; con `--no-net-check` no va). Desde la 4c; ver
+    [La prueba de red](#la-prueba-de-red-sonda-desde-0140).
   - `nodos`: objeto de nombre → lo escrito de ese nodo, con las claves `cmd`,
     `env`, `cwd`, `restart`, `autostart` y `profile`. Una clave que no está
     escrita no aparece.
@@ -636,6 +641,10 @@ Ejemplo de un `sesion` (la firma va al final de la línea, aquí se omite):
     `sin_tablas: "<motivo corto>"` si la laptop lo pidió y aquí no se puede (por
     ejemplo, sin hub, con IPv6 o con un `desde` inválido). Si no dice nada, es un
     agente anterior.
+  - Desde la 4c, además: `sonda: 1` junto a `tablas: 1`, si el agente hace la prueba de
+    red con esta laptop (ver [La prueba de red](#la-prueba-de-red-sonda-desde-0140)).
+    Con `sonda` y sin haber contestado antes `sonda_espera`, la laptop no cuenta
+    ninguna prueba (es un agente que no esperó a la prueba).
 - `sesion_error`: `codigo` y `texto`. El agente cierra después de mandarlo.
   - `ocupado`: ya hay otra laptop conectada (el texto dice desde qué IP). Si esa
     laptop se cortó y el agente la tiene en gracia, el texto dice cuántos segundos
@@ -651,6 +660,8 @@ Ejemplo de un `sesion` (la firma va al final de la línea, aquí se omite):
     (por ejemplo, un hub con nodos de otra sesión).
   - `antes`: falló `[robot] before`. Su salida llegó antes, como `log`.
   - `config`: el robot.toml del agente tiene un error.
+  - `sonda`: la laptop dejó de contestar mientras el agente esperaba su `sigue` (la
+    prueba de red). No se preparó nada, y el agente queda libre. Desde la 4c.
   - `protocolo`: campos inválidos, lo primero no fue `sesion`, o `no_arrancar`
     nombra nodos que no son del agente.
   - `interno`: falló algo inesperado en el agente.
@@ -664,7 +675,8 @@ Ejemplo de un `sesion` (la firma va al final de la línea, aquí se omite):
   - `linea` tiene como máximo 8 KiB: una línea más larga se corta.
 - `error`: `texto`. Una orden que no se pudo cumplir: nodo desconocido, orden que
   llega mientras el agente todavía prepara la sesión, orden desconocida o más de
-  64 órdenes pendientes.
+  64 órdenes pendientes. Desde la 4c, también cualquier orden que no sea `ping`,
+  `adios`, `sonda` o `sigue` mientras el agente espera la prueba de red.
 - `pong`: `t`. Repite el `t` del `ping` si es un número o un texto de hasta 64
   caracteres; si no, `null`.
 
@@ -672,7 +684,9 @@ Ejemplo de un `sesion` (la firma va al final de la línea, aquí se omite):
   `gracia`, y `perdidos` solo si hay alguno: `{nodo: cuántas}`, las líneas de `log`
   que el agente ya no tenía. Después van los `log` guardados con `n` mayor que el
   `k` de la laptop, en orden; luego todo sigue como en una sesión normal.
-  Desde la 4b, `tablas` y `sin_tablas` van igual que en `sesion_ok`.
+  Desde la 4b, `tablas` y `sin_tablas` van igual que en `sesion_ok`. Desde la 4c,
+  `sonda: 1` va junto a `tablas`, si el agente hace la prueba de red (ver
+  [La prueba de red](#la-prueba-de-red-sonda-desde-0140)).
 - `adios`: `motivo` (texto corto, por ejemplo `Ctrl+C` o `SIGTERM`). Ver
   [Despedida del agente](#despedida-del-agente).
 
@@ -687,6 +701,7 @@ Ejemplo de un `sesion` (la firma va al final de la línea, aquí se omite):
 | Error interno del agente | Detiene los nodos y cierra. Sin gracia |
 | `sesion_error`: después de mandarlo | Cierra la conexión |
 | Saludo que no termina en 10 s, o cualquier error del saludo | Cierra (todavía no hay sesión) |
+| Silencio de 6 s mientras espera el `sigue` de la prueba de red (`sonda_espera`) | Manda `sesion_error` `sonda` y queda libre. **No** entra en gracia: no corrió nada que cuidar |
 | Orden desconocida (`op` que no existe) | Contesta `error` |
 | `arrancar`, `detener` o `reiniciar` de un nodo que no existe | Contesta `error` |
 | Una segunda `sesion` en la misma conexión, o más de 64 órdenes pendientes | Contesta `error` |
@@ -917,6 +932,136 @@ Con `AGMEN_NET_IP`, la conexión de `agmen run` con el agente sale desde esa IP,
 que el agente vea a la laptop en la IP donde escuchan sus nodos. Es una variable para
 pruebas (ver [Variable para pruebas](#variable-para-pruebas-agmen_net_ip)). Sin ella,
 la conexión sale como siempre.
+
+### La prueba de red (`sonda`, desde 0.14.0)
+
+> **Estado:** implementada en la parte 4c del RFC 0011: `python/agmen/sonda.py` (los
+> sockets y el formato de la línea), con sus enganches en `python/agmen/agent.py`
+> (`agmen agent`) y `python/agmen/cli.py` (`agmen run`). Las pruebas están en
+> `python/test_sonda.py`. Diseño y razones en el
+> [RFC 0011](rfc/0011-sim-real-y-varias-computadoras.md), §3.5 y §6 (reto 2), y en su
+> sección 5 (el orden: la prueba va antes de que el robot prepare nada).
+
+Los topics van directo de nodo a nodo: UDP para los mensajes chicos y una conexión TCP
+para los grandes, a puertos cualquiera del otro lado. La prueba de red comprueba justo
+eso, en los dos sentidos, antes de arrancar nada. Así un firewall que bloquea el paso se
+dice al conectar, y no como topics que nunca llegan.
+
+**Cuándo hay prueba.** Solo cuando va a haber puente (los dos lados dicen `tablas`) y la
+laptop dice `sonda: 1` en `sesion`. El agente lo dice en `sesion_ok` y en `reanudar_ok`,
+junto a `tablas`, solo si hace la prueba. Sin puente no hay prueba.
+
+**Capacidad.** `"sonda": 1` es un campo nuevo y añadido, como `tablas`. Quien no lo
+conoce lo ignora, y la conexión sigue como en la 4b.
+
+#### El orden al conectar
+
+| # | Quién | Mensaje | Qué pasa |
+|---|---|---|---|
+| 1 | laptop → agente | `sesion` (con `tablas`, `desde` y `sonda`) | Como siempre |
+| 2 | agente → laptop | `sonda_espera` | El agente **no** corre `[robot] before`, ni arranca su hub, ni ningún nodo. Lo dice en su terminal |
+| 3 | laptop → agente | `sonda` (con `id`, `udp`, `tcp`, `dato`) | La laptop abrió sus sockets y da sus puertos y su dato |
+| 4 | agente → laptop | (datos) y luego `sonda_ok` | El agente abre sus sockets, manda su dato a los dos puertos de la laptop (UDP ×3, TCP ×1) y contesta `sonda_ok` con los suyos |
+| 5 | laptop → agente | (datos) | La laptop manda su dato a los dos puertos del agente |
+| 6 | agente → laptop | `sonda_fin` | Al cabo de hasta 2 s, dice lo que **él** recibió de la laptop |
+| 7 | laptop | — | Junta los cuatro resultados de cada robot. Si alguno falla, ningún robot recibe `sigue` (ver abajo) |
+| 8 | laptop → agente | `sigue` | Solo cuando pasó con **todos** los robots, a todos a la vez |
+| 9 | agente | `before`, comprobación de nodos ajenos, hub, `sesion_ok` | Lo de siempre, ahora sí. `sesion_ok` lleva `tablas` y `sonda` |
+
+Si la laptop decide no seguir, manda `adios` (o cierra) y el agente termina sin haber
+preparado nada.
+
+#### Mensajes
+
+Todos van firmados como el resto de `agmen-agent/1`. Ninguno tiene campos fuera de los
+de esta tabla.
+
+| Mensaje | Campos | Quién lo manda |
+|---|---|---|
+| `sonda_espera` | (ninguno) | agente |
+| `sonda` | `id`: entero de 0 a 2 147 483 647 · `udp`, `tcp`: puertos de 1 a 65 535 · `dato`: 32 caracteres hexadecimales (minúsculas) | laptop |
+| `sonda_ok` | `id` (el de su `sonda`) · `udp`, `tcp`: puertos del agente · `dato`: 32 hex, el del agente · `so`: `linux`, `windows` o `darwin` | agente |
+| `sonda_fin` | `id` · `udp`, `tcp`: `true` o `false`, lo que el **agente** recibió de la laptop · `error` (solo si no pudo hacer la prueba): texto con el motivo | agente |
+| `sigue` | (ninguno) | laptop |
+
+- `id` es el número de cada prueba. `sonda_ok` y `sonda_fin` lo repiten, y la laptop
+  descarta las respuestas de otra prueba (por ejemplo, de una vieja en la misma conexión).
+- Si el agente no puede hacer la prueba (un `sonda` mal formado, no pudo abrir sus
+  sockets, ya hay otra prueba por esa conexión), manda `sonda_fin` con `udp` y `tcp` en
+  `false` y `error` con el motivo corto. La laptop falla la prueba en ese momento, con
+  ese motivo, sin esperar el resto.
+- Si el agente recibe un `sigue` sin haber mandado `sonda_espera`, contesta `error`.
+
+#### El dato en la red
+
+La línea que viaja por UDP y por TCP es texto, y no va firmada:
+
+```
+agmen-sonda/1 <dato>\n
+```
+
+Son 47 bytes: 14 del prefijo (`agmen-sonda/1 `), 32 hex del dato y el `\n`. Por UDP se manda
+el datagrama entero, tres veces, separadas 0,1 s. Por TCP se abre una conexión, se manda
+la línea y se cierra. Solo cuenta si el dato es el esperado **y** viene de la IP del otro
+lado. Lo demás se ignora, sin avisar por paquete.
+
+Las IP son las que ve cada lado en la conexión firmada: nunca se usa una dirección que
+venga en un mensaje. Solo IPv4.
+
+#### Tiempos y límites
+
+| Qué | Valor |
+|---|---|
+| Espera de cada lado por lo del otro (`SONDA_S`) | 2 s. Termina antes si ya llegó todo |
+| Plazo de la laptop para tener `sonda_ok` y `sonda_fin` (`SONDA_S` + `MARGEN_S`) | 4 s desde que manda `sonda`. Si no llegan, la prueba falla con "no contestó la prueba de red" |
+| Datagramas UDP por prueba | 3, separados 0,1 s |
+| Conexiones TCP abiertas a la vez en el escucha | 8 (las demás se cierran) |
+| `ping` de la laptop durante la espera de `sigue` | cada 2 s, desde `sonda_espera` hasta `sigue` o `adios` |
+| Silencio que da por perdida la espera (de cualquiera de los dos lados) | 6 s (`SILENCE_TIMEOUT`). Es el mismo de siempre |
+| Aviso en la terminal del agente mientras espera `sigue` | cada 60 s (`AVISO_ESPERA_S`), una línea |
+| Espera del `sigue` | Sin tope fijo: dura mientras la laptop siga mandando `ping`. Puede tardar minutos si la laptop abre antes otra computadora (que corre su `before` primero) |
+
+**Varios robots.** La laptop hace las pruebas de todos a la vez. No manda `sigue` a
+ninguno hasta tener el resultado de todos. Si uno falla al conectar, manda `adios` a
+todos y no arranca nada. Un robot que espera `sigue` mientras la laptop abre la sesión
+con otro sigue esperando, mientras la laptop le mande `ping`.
+
+**Al reanudar o reconectar.** La prueba se repite, pero solo avisa si falla (ver el
+siguiente bloque). Nunca detiene ni cierra nada.
+
+#### Qué pasa con el resultado
+
+- **Al conectar** (antes de arrancar nada): si algún resultado es falso, `agmen run` no
+  arranca nada, despide a los agentes y sale con código 2, igual que cuando un agente no
+  contesta. El mensaje dice, por cada sentido que falla, qué computadora no recibe de
+  cuál, si es por UDP, por TCP o por los dos, y qué hacer según el sistema de la que no
+  recibe.
+- **Al reanudar o reconectar** (los nodos ya corren): si falla, solo avisa, una vez por
+  cambio de estado. Cuando vuelve a pasar, lo dice en una línea. No detiene nada y no
+  cierra la conexión.
+- **Un fallo a medias** (UDP sí y TCP no, o al revés) cuenta como fallo, y dice cuál de los
+  dos no pasa.
+
+#### Compatibilidad
+
+| Quién | Qué pasa |
+|---|---|
+| Laptop sin `sonda` (anterior a la 4c, o con `--no-net-check`) | El agente no hace la prueba: contesta `sesion_ok` directo, como en la 4b. Nada cambia |
+| Agente anterior a la 4c (no dice `sonda`) | La laptop no recibe `sonda_espera`: lo dice una vez (es un Agmen anterior) y la sesión sigue. No es un fallo. Ese agente ya corrió su `before` y su hub, porque no sabe esperar |
+| Agente que no hace el puente (sin hub, IPv6, `desde` inválido) | `sesion_ok` con `sin_tablas`, sin `sonda_espera`. No hay prueba |
+| Sin puente (laptop sin hub) | No hay `sonda` |
+| Sesión nueva tras perder la gracia (reintento) | El agente también espera `sonda_espera`. La laptop hace la prueba y manda `sigue` **pase o no pase**, porque los nodos de la laptop ya corren. Si falló, lo dice una vez |
+
+Lo que no cambia: el sobre, la clave, la firma, los números `n` y el formato de cada
+línea firmada.
+
+#### Nota de seguridad
+
+La línea de la prueba (`agmen-sonda/1 <dato>`) va por UDP y TCP **sin cifrar ni firmar**:
+el `dato` viaja en claro. Quien esté en el camino podría leerlo y mandarlo él mismo, y así
+hacer pasar la parte UDP de la prueba aunque el firewall la bloquee. La prueba detecta
+firewalls que bloquean el paso. **No** detecta a un atacante en la red. Los datos de los
+topics no cambian por esto: la firma de `agmen-agent/1` protege la conexión de control.
 
 ### Compatibilidad del puente (desde 0.14.0)
 

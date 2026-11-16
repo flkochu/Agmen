@@ -333,6 +333,9 @@ con código 2, sin arrancar nada.
 
    Qué hacer: haz `git pull` en las dos, o copia el mismo archivo.
 
+Si `agmen run` sale con un mensaje que empieza con `la prueba de red con '...' no pasó`,
+no es ninguno de estos: es el firewall. La sección 10 lo explica.
+
 ## 9. Qué pasa cuando se cae el WiFi
 
 Esta es la parte importante. Un robot real vive con cortes: el WiFi se cae un
@@ -458,14 +461,139 @@ Si vuelves a correr `agmen agent`, la laptop reconecta y lo dice:
 `reconectado tras 6 s sin conexión, pero ya había detenido sus nodos. Arráncalos desde el panel (o reinicia agmen run)`.
 (Esa línea es de otra corrida de prueba; el texto es el que escribe el programa.)
 
-## 10. Los topics cruzan entre la laptop y la Pi
+## 10. La prueba de red: el firewall
+
+Los topics viajan directo de una computadora a la otra. Un firewall puede bloquear
+ese paso **sin dar ningún error**: el topic simplemente no llega. Por eso, antes de
+arrancar nada, `agmen run` **prueba la red**. Manda un mensaje de prueba en cada
+sentido, y lo hace por dos caminos:
+
+- **UDP**, para los mensajes chicos.
+- **TCP**, para los mensajes grandes.
+
+Son cuatro comprobaciones por robot: tu laptop recibe de la Pi (UDP y TCP), y la Pi
+recibe de tu laptop (UDP y TCP). La prueba se hace solo si hay topics que cruzar, es
+decir, si las dos computadoras tienen `[hub]` encendido.
+
+### Qué se ve cuando pasa
+
+```
+agmen     │ conectando con robot (192.168.1.20:7391)…
+agmen     │ robot (192.168.1.20:7391): conectado · Agmen 0.13.0
+agmen     │ ✔ red con 'robot': los topics pasan en los dos sentidos (UDP y TCP)
+```
+
+Hay una línea así por cada robot. Después, todo arranca como en la sección 5.
+
+### Qué se ve cuando falla
+
+En este ejemplo, el firewall de la Pi (`ufw`) no deja entrar los mensajes chicos
+(UDP) desde tu laptop. Esto es lo que ves en tu laptop:
+
+```
+agmen     │ conectando con robot (192.168.1.20:7391)…
+agmen     │ robot (192.168.1.20:7391): conectado · Agmen 0.13.0
+error: la prueba de red con 'robot' no pasó, así que no arranqué nada:
+  robot no recibe de esta computadora por UDP (mensajes chicos): ¿un firewall (ufw) bloquea la entrada? En robot: sudo ufw allow from 192.168.1.7
+Si sabes que la red está bien, puedes saltártela: agmen run examples/tutorial/robot_dos.toml --no-net-check (pero entonces, si un firewall bloquea los topics, Agmen no te lo va a decir)
+```
+
+`agmen run` sale con código 2. Y en la terminal de la Pi se ve esto:
+
+```
+agmen agent │ ⚠ prueba de red: no me llega nada de la laptop (192.168.1.7) por UDP: la laptop te dice qué hacer
+agmen agent │ la laptop (192.168.1.7) se despidió tras la prueba de red: no preparé nada
+```
+
+La línea que empieza con `robot no recibe` dice **qué computadora no recibe** (`robot`)
+y **por dónde** (`UDP`, `TCP`, o los dos). Si solo falla un camino, dice cuál: si el UDP
+falla y el TCP pasa, dice que solo falla UDP.
+
+### Qué hacer, según la computadora que no recibe
+
+Ve a la computadora que la línea nombra, y haz lo que dice su sistema:
+
+| Sistema de esa computadora | Qué hacer |
+|---|---|
+| **Windows** | Permite Python en redes privadas: Firewall de Windows → Permitir una aplicación → Python, con la casilla **Privada** marcada |
+| **Linux** | Permite la entrada desde la otra computadora. El mensaje te da el comando, por ejemplo `sudo ufw allow from 192.168.1.7` |
+| **macOS** | Permite las conexiones entrantes a Python: Ajustes del Sistema → Red → Firewall → Opciones |
+
+Luego vuelve a correr `agmen run`. Si el firewall es el problema, la prueba pasa.
+
+### Qué no arranca cuando falla
+
+Si la prueba falla **al conectar**, no arranca nada: ni los nodos de tu laptop, ni los
+de la Pi, ni el `[robot] before` de la Pi (el comando que prepara al robot antes de
+arrancar sus nodos). La prueba va antes de todo, así que el fallo se ve en segundos.
+
+### Qué pasa si el WiFi se corta y vuelve
+
+Cuando la laptop se vuelve a conectar, los nodos ya corren. Por eso la prueba se
+repite, pero **solo avisa**: no detiene nada ni cierra la conexión.
+
+```
+⚠ la prueba de red con 'robot' no pasó al reconectar (sus nodos siguen corriendo; no detengo nada):
+⚠   robot no recibe de esta computadora por UDP (mensajes chicos): ¿un firewall (ufw) bloquea la entrada? En robot: sudo ufw allow from 192.168.1.7
+```
+
+Cuando vuelve a pasar, lo dice en una línea:
+
+```
+✔ red con 'robot': la prueba de red ya pasa (los topics pasan en los dos sentidos, UDP y TCP)
+```
+
+Agmen avisa una vez por cada cambio: si sigue fallando, no repite el aviso.
+
+### Saltarla: `--no-net-check`
+
+Si sabes que la red está bien, puedes saltar la prueba:
+
+```
+agmen run examples/tutorial/robot_dos.toml --no-net-check
+```
+
+Agmen lo dice en rojo, al arrancar:
+
+```
+⚠ --no-net-check: me salté la prueba de red. Si un firewall bloquea los topics entre computadoras, Agmen no te lo va a decir
+```
+
+Este aviso solo sale si tu laptop tiene `[hub]`. Sin `[hub]` no hay topics que probar.
+Úsalo con cuidado: si un firewall bloquea los topics, nadie te lo dirá.
+
+### En Windows, la primera vez
+
+La primera vez que `agmen run` prueba la red en tu laptop con Windows, avisa antes:
+
+```
+⚠ voy a probar la red con las otras computadoras: Windows puede preguntarte si dejas que Python use la red. Di que sí en redes privadas (si dices que no, los topics de las otras computadoras no llegan)
+```
+
+Si Windows te pregunta, di que sí en redes privadas.
+
+### El límite de la prueba
+
+La prueba la hace **Python**. En Windows, el permiso del firewall es por programa:
+un nodo escrito en C++ puede seguir bloqueado aunque la prueba pase. Si la prueba
+pasa y los topics de un nodo de C++ no llegan, permite ese programa también. Agmen
+lo dice una vez, si alguna de las computadoras de la prueba es Windows:
+
+```
+la prueba de red la hace Python: en Windows el firewall da permiso por programa, así que un nodo en C++ puede seguir bloqueado aunque la prueba pase (si no le llegan los topics, permítelo también)
+```
+
+La prueba no detecta a alguien que escuche tu red: solo revisa que el paso esté
+abierto.
+
+## 11. Los topics cruzan entre la laptop y la Pi
 
 Hasta aquí, cada computadora tenía su propio hub, y un topic se quedaba en la
 computadora donde se publicó. Ya no: **un topic cruza entre la laptop y cada robot**,
 y no tienes que configurar nada. Con el mismo `robot_dos.toml` de este capítulo, el
 `/imu` de la Pi llega a tu laptop.
 
-Esto necesita que las dos computadoras tengan esta versión de Agmen (ver la sección 11,
+Esto necesita que las dos computadoras tengan esta versión de Agmen (ver la sección 12,
 sobre la misma versión), y que `[hub]` no esté apagado en ninguna.
 
 ### Qué se ve
@@ -492,6 +620,50 @@ promedio   100.00 Hz   entre mensajes: min   9.90 ms  max  10.10 ms  desv  0.05 
 
 No hizo falta reiniciar ningún nodo. El cruce se arma solo, en un par de segundos
 después de que la laptop y la Pi se ven.
+
+### De qué computadora es cada topic
+
+Cuando hay nodos en otra computadora, las herramientas lo dicen. Si no hay ninguno, la
+salida es igual que antes.
+
+**`agmen topic list`** tiene una columna nueva, `publica`: las computadoras que publican
+cada topic. `aquí` es tu laptop.
+
+```
+topic  tipo       emisores  receptores  publica
+─────  ─────────  ────────  ──────────  ───────
+/imu   ImuSample  1         1           robot
+```
+
+Si un topic lo publican las dos computadoras, verás `aquí, robot`. Los números de
+`emisores` y `receptores` son los de siempre, de todo el sistema.
+
+**`agmen topic info /imu`** dice dónde corre cada emisor y cada receptor:
+
+```
+emisores (1):
+  imu  pid 2150  192.168.1.20:…  latió hace 0.2 s  · en robot
+receptores (1):
+  cerebro  pid 4417  127.0.0.1:…  latió hace 0.1 s  · aquí
+```
+
+**`agmen node list`** tiene una columna `computadora`:
+
+```
+nodo     computadora  pid   publica  escucha  último latido
+───────  ───────────  ────  ───────  ───────  ─────────────
+cerebro  aquí         4417  —        /imu     hace 0.1 s
+imu      robot        2150  /imu     —        hace 0.2 s
+```
+
+Los números (`pid`, las direcciones y los latidos) cambian. Lo que importa es la
+columna o la marca de dónde corre cada cosa.
+
+**En el panel**, cada topic de la lista lleva una etiqueta pequeña con de dónde sale y a
+dónde llega. Por ejemplo, `robot → laptop`: lo publica la Pi y lo recibe tu laptop.
+Tu laptop aparece con el nombre que `agmen run` le da: si no está en `robot.toml` como
+`[[machine]]`, es el nombre de tu computadora. Si nadie publica o nadie recibe, aparece
+`—`. La etiqueta sale solo si `robot.toml` tiene `[[machine]]`.
 
 ### Cómo funciona, en corto
 
@@ -539,6 +711,11 @@ un topic se publica en un robot y se escucha en otro, `agmen run` lo avisa una v
 
 Pon el nodo en tu laptop, o en uno de los dos robots, para que el topic llegue.
 
+Con dos robots, `agmen run` hace la prueba de red con los dos a la vez. Si pasa con
+todos, manda la orden de arrancar a los dos al mismo tiempo: el `[robot] before` de cada
+Pi corre a la vez que el de la otra, cada uno en su computadora. Si el `before` de una
+falla, `agmen run` despide a la otra computadora, y el `before` de esa se detiene.
+
 ### Límites de los topics entre computadoras
 
 | Qué | Valor |
@@ -548,15 +725,12 @@ Pon el nodo en tu laptop, o en uno de los dos robots, para que el topic llegue.
 | Nodo cuyo proceso padre murió (huérfano), en simulación | Pasa a ser ajeno: no cruza |
 | Dos robots | No se pasan topics entre sí (ver arriba) |
 | Direcciones | Solo IPv4 en esta versión. Si no se ven por IPv4, no hay puente y el agente lo dice |
-| Firewall | **Todavía no lo comprobamos.** Si el firewall de la laptop o de la Pi bloquea el paso, los topics no llegan y Agmen todavía no lo dice. La comprobación llega en la parte 4c del RFC 0011 |
+| Firewall | Se prueba al conectar (sección 10). Si falla, `agmen run` no arranca nada. La prueba la hace Python: en Windows, un nodo en C++ puede seguir bloqueado aunque la prueba pase |
 
-## 11. Lo que todavía no hace
+## 12. Lo que todavía no hace
 
 Esto es honesto: el capítulo 18 cubre el robot con dos computadoras, pero no todo.
 
-- **No se ve en qué computadora está cada topic.** `agmen topic list` y el panel
-  todavía no muestran desde qué computadora publica cada uno. Llega en la parte 4c del
-  [RFC 0011](../rfc/0011-sim-real-y-varias-computadoras.md).
 - **No medimos la hora.** Si el reloj de la Pi está atrasado (no tiene pila),
   las dos computadoras no coinciden. Medir eso y avisarte llega en el bloque 5.
 - **Una laptop a la vez** con cada agente.
@@ -583,7 +757,10 @@ del motor deja de recibir órdenes, se detiene solo, como viste en el
 - Un topic **cruza** entre la laptop y la Pi sin configurar nada. `agmen topic hz /imu`,
   en tu laptop, muestra el `/imu` de la Pi. En simulación (`--sim`), solo cruzan los
   nodos que arrancó el agente.
+- Antes de arrancar, `agmen run` prueba que los topics pasan por el firewall en los dos
+  sentidos. Si no pasan, no arranca nada, y dice qué computadora no recibe y qué hacer.
+- `agmen topic list`, `topic info` y `node list` dicen de qué computadora sale cada topic
+  y cada nodo.
 
-**Siguiente (nivel 10):** que se vea en qué computadora está cada topic, la comprobación
-del firewall (parte 4c del RFC 0011) y medir la diferencia de reloj (bloque 5). Todavía
-no hay capítulo para eso.
+**Siguiente (nivel 10):** medir la diferencia de reloj entre las computadoras (bloque 5)
+y cerrar el nivel. Todavía no hay capítulo para eso.

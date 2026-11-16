@@ -354,6 +354,7 @@ class Panel:
         self._rec_reader = None
         self._rec_lock = threading.Lock()
         self.rhythm: list[dict] = []  # cuentas de los agmen.Node (del hub)
+        self.endpoints: list[dict] = []   # las líneas ep del hub (4c §2.4: de qué computadora es cada topic)
         self.listen = listen
         self.topics = topics
         self.robot_name = robot_name
@@ -572,11 +573,51 @@ class Panel:
             except Exception:  # noqa: BLE001 — sin hub, no hay cuentas
                 msgs = []
             self.rhythm = [f for op, f in msgs if op == "stat"]
+            self.endpoints = [f for op, f in msgs if op == "ep"]   # (incompleta: lo que llegó; no se inventa nada)
+
+    def here_name(self, machines: list[dict]) -> str:
+        """Cómo se llama esta computadora en el panel (4c §2.4): la [[machine]] local o, si esta no es una
+        [[machine]], el nombre que agmen run usa como `desde` (tables.laptop_name). "" sin [[machine]]."""
+        if not machines:
+            return ""
+        here = next((m["name"] for m in machines if m.get("here")), None)
+        if here:
+            return here
+        config, places = getattr(self.launcher, "config", None), getattr(self.launcher, "places", None)
+        if config is None or places is None:
+            return ""
+        from ..tables import laptop_name
+        return laptop_name(config, places)
+
+    @staticmethod
+    def topics_at(endpoints: list[dict], here: str) -> dict[str, tuple[list[str], list[str]]]:
+        """topic → (publishers_at, subscribers_at): las computadoras que publican y que reciben cada topic, sin repetir
+        (primero esta y luego las demás por orden alfabético). Una línea ep sin `machine` es de esta (`here`). Los
+        receptores de todos los topics ("*", como el panel mismo) no cuentan: no dicen a dónde va un topic."""
+        sets: dict[str, tuple[set, set]] = {}
+        for e in endpoints:
+            topic, kind = e.get("topic", ""), e.get("kind")
+            if topic == "*" or kind not in ("pub", "sub"):
+                continue
+            pubs, subs = sets.setdefault(topic, (set(), set()))
+            (pubs if kind == "pub" else subs).add(e.get("machine") or here)
+
+        def ordered(names: set) -> list[str]:
+            return ([here] if here in names else []) + sorted(names - {here}, key=lambda n: (n.lower(), n))
+
+        return {t: (ordered(p), ordered(s)) for t, (p, s) in sets.items()}
 
     def state(self) -> dict:
         """Lo que ven el panel y /api/state. `cpu_s`: CPU usada por este proceso
         (el puente): con dos lecturas se saca cuánto le cuesta al robot."""
-        return {**self.snapshot(), "stats": self.hub.snapshot(), "bridge": self.bridge.info(),
+        snap, stats = self.snapshot(), self.hub.snapshot()
+        # 4c §2.4: cada topic dice de qué computadoras sale y a cuáles llega (vacías sin [[machine]]).
+        here = self.here_name(snap["machines"])
+        at = self.topics_at(self.endpoints, here) if here else {}
+        for key, t in stats.get("topics", {}).items():
+            pubs, subs = at.get(t.get("topic") or key, ([], []))
+            t["publishers_at"], t["subscribers_at"] = pubs, subs
+        return {**snap, "stats": stats, "bridge": self.bridge.info(),
                 "cpu_s": round(time.process_time(), 4), "lan": self.lan}
 
     def _handler(self):

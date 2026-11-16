@@ -16,8 +16,9 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   `agmen agent` con clave (parte 3b, abajo), y la reconexión tras un corte, el
   panel con varias computadoras, el servicio de arranque y el capítulo 18 (parte
   3c, abajo), la base de los topics entre computadoras (parte 4a, abajo) y el puente
-  que pasa las tablas de topics (parte 4b, abajo). Falta: lo visible en herramientas y
-  panel (parte 4c) y los relojes (bloque 5 del plan del RFC).
+  que pasa las tablas de topics (parte 4b, abajo), y la prueba de red y lo visible en
+  herramientas y panel (parte 4c, abajo). Falta: los relojes (bloque 5 del plan del RFC)
+  y el cierre del nivel.
 
 ### Agregado
 - **Perfiles en `robot.toml`** (RFC 0011 §3.2): `profile = "real"`, `"sim"`,
@@ -147,12 +148,46 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   robots, los topics no cruzan entre ellos: `agmen run` lo avisa una vez por topic. Si
   un lado no dice `tablas`, no hay puente, y se dice una vez. Los dos cambios son
   añadidos: quien no los conoce sigue como antes. Protocolo en `docs/PROTOCOLO.md`
-  ("El puente de topics"). Falta: la prueba del firewall y lo visible en herramientas
-  y panel (parte 4c).
-- **Lo que todavía no existe**: la prueba del firewall y lo visible de los topics
-  entre computadoras en herramientas y panel (parte 4c, bloque 4), y medir la
-  diferencia de reloj entre computadoras (bloque 5). Dos robots no se pasan topics
-  entre sí. Una laptop a la vez por agente.
+  ("El puente de topics"). La prueba de red y lo visible en herramientas y panel llegaron
+  con la parte 4c (abajo).
+- **La prueba de red, parte 4c (RFC 0011 §3.5 y §6, reto 2)**: antes de arrancar nada,
+  `agmen run` prueba el paso de los topics con cada robot, en los dos sentidos, por UDP
+  (mensajes chicos) y por TCP (mensajes grandes). Son cuatro comprobaciones por robot. Si
+  alguna falla al conectar, no arranca nada: ni los nodos de la laptop, ni el `[robot] before`
+  ni el hub de los robots (su agente espera la prueba antes de preparar nada). Despide a los
+  agentes y sale con código 2. El mensaje dice qué computadora no recibe de cuál, por dónde
+  (UDP, TCP o los dos) y qué hacer según su sistema (Windows, Linux o macOS). Al reconectar
+  tras un corte, la prueba solo avisa: nada se detiene. Solo se hace cuando hay puente (los
+  dos lados con `[hub]`) y los dos la saben hacer. Con varios robots, las pruebas van a la
+  vez, y ningún robot recibe la orden de arrancar hasta que pasan todas. En Windows, avisa
+  antes de la primera prueba que Windows puede preguntar por el firewall. Un límite: la
+  prueba la hace Python, así que un nodo en C++ puede seguir bloqueado en Windows aunque la
+  prueba pase; Agmen lo dice una vez.
+- **`agmen run --no-net-check`**: se salta la prueba de red, con un aviso en rojo de que se
+  saltó y de que, si un firewall bloquea los topics, Agmen no lo va a decir.
+- **De qué computadora es cada topic (parte 4c, RFC 0011 §3.5)**: `agmen topic list` gana la
+  columna `publica` (las computadoras que publican cada topic; `aquí` es esta). `agmen topic
+  info` dice `· aquí` o `· en <computadora>` en cada emisor y receptor. `agmen node list`
+  gana la columna `computadora`. Sin otras computadoras, la salida es la de antes, byte a
+  byte. `/api/state` trae `publishers_at` y `subscribers_at` en cada topic, y el panel
+  muestra una etiqueta (`robot → laptop`) cuando `robot.toml` tiene `[[machine]]`.
+- **`scripts/maquinas_smoke.py` en el CI** (RFC 0011 §6, reto 9): dos "computadoras" en los
+  tres sistemas, con `examples/tutorial/robot_dos.toml`. En Linux (x86-64 y ARM64), son
+  espacios de nombres de red y de montaje, con su propio `/dev/shm` del kernel: el mismo
+  aislamiento de un contenedor, sin imágenes. Ahí el modo `aislado` es obligatorio, y si no
+  se puede, el script falla diciendo qué faltó. Fuera del CI, el script usa dos IP de
+  loopback (`127.0.0.1` y `127.0.0.2`, con `AGMEN_SHM=0`), salvo que se pida
+  `AGMEN_SMOKE_MODO=aislado`. Comprueba la prueba de red, que los nodos corren en el robot,
+  los topics en los dos sentidos, un mensaje grande y, en el modo aislado, el firewall con
+  UDP bloqueado (si hay `iptables` o `nft`), y que Ctrl+C detiene todo.
+- **Protocolo `agmen-agent/1`, parte 4c**: la capacidad `"sonda": 1` (junto a `tablas`), y los
+  mensajes `sonda_espera`, `sigue`, `sonda`, `sonda_ok` y `sonda_fin`, más el `sesion_error`
+  `sonda`. Son añadidos: quien no los conoce sigue como en la 4b. Formato en
+  `docs/PROTOCOLO.md` ("La prueba de red").
+- **Capítulo 18 del tutorial**: la sección 10, "La prueba de red: el firewall"; la de topics
+  muestra la columna `publica`, `topic info`, `node list` y la etiqueta del panel.
+- **Lo que todavía no existe**: medir la diferencia de reloj entre computadoras (bloque 5).
+  Dos robots no se pasan topics entre sí. Una laptop a la vez por agente.
 - **Capítulo 5 del tutorial, sección 7**: resumen de `[[machine]]`, qué corre en
   cada computadora y por qué el hardware va con `profile = "real"`.
 - **Capítulo 18 del tutorial, "Un robot, varias computadoras"**: el recorrido de
@@ -161,6 +196,10 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   sección 10 explica los topics entre la laptop y la Pi (sin salidas de prueba aún).
 
 ### Cambiado
+- **Con la prueba de red, el robot espera antes de preparar nada** (parte 4c, RFC 0011 §5):
+  cuando la laptop y el agente hacen la prueba (con puente), el agente no corre su
+  `[robot] before` ni arranca su hub hasta que la laptop diga `sigue`. Antes, esto corría al
+  conectar. Con agentes o laptops anteriores, o con `--no-net-check`, todo sigue como antes.
 - **Al perder una computadora, `agmen run` ya no se detiene**: los nodos de esa
   computadora pasan a `sin conexión` (sin perder su último estado), las órdenes
   sobre ellos se rechazan diciendo por qué, y los demás nodos siguen. Antes, la

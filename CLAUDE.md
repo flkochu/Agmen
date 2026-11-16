@@ -70,6 +70,7 @@ python scripts/run_smoke.py      # agmen run
 python scripts/topics_smoke.py
 python scripts/paralelo_check.py
 python scripts/tutorial_check.py
+python scripts/maquinas_smoke.py   # dos computadoras (en Linux, aisladas: AGMEN_SMOKE_MODO=aislado)
 ```
 
 Lista completa en `.github/workflows/ci.yml`.

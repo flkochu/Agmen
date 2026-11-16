@@ -101,6 +101,13 @@ jobs:
       - name: Node y reloj de Agmen (sim ×2, pausa desde el panel, simulador paso a paso)
         run: python scripts/node_check.py
 
+      - name: Herramientas de red para las dos computadoras (ip; las dos "computadoras" son espacios de nombres del kernel)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y iproute2 util-linux
+
+      - name: Dos computadoras (agmen agent + agmen run en dos redes y dos /dev/shm; en Windows, dos IP de loopback)
+        run: python scripts/maquinas_smoke.py
+
       - name: Instalar el paquete (compila agmen._core) y probarlo
         run: |
           python -m pip install .
