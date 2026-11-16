@@ -21,7 +21,7 @@ import socket
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 SONDA_S = 2.0          # lo que cada lado espera lo suyo (termina antes si ya llegaron los dos)
@@ -71,11 +71,32 @@ def oferta(msg: dict) -> tuple[int, int, str]:
 
 
 def fin(msg: dict) -> tuple[bool, bool]:
-    """Lo que el agente dice que recibió en `sonda_fin`. ValueError si está mal formado."""
+    """Lo que el agente dice que recibió en `sonda_fin`. ValueError si está mal formado (también su "error", si
+    lo trae: un texto no vacío)."""
     udp, tcp = msg.get("udp"), msg.get("tcp")
     if type(udp) is not bool or type(tcp) is not bool:
         raise ValueError("'udp' y 'tcp' tienen que ser true o false")
+    motivo(msg)
     return udp, tcp
+
+
+def motivo(msg: dict) -> str:
+    """El "error" de un `sonda_fin` (4c §4.2: el agente no pudo hacer la prueba, y por qué), o "" si no trae.
+    ValueError si lo trae y no es un texto no vacío."""
+    if "error" not in msg:
+        return ""
+    value = msg["error"]
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("'error' tiene que ser un texto (el motivo)")
+    return value
+
+
+class SinSockets(OSError):
+    """Lado no pudo abrir sus sockets: en qué IP (`ip`) y el porqué del sistema (`detalle`)."""
+
+    def __init__(self, ip: str, detalle: str) -> None:
+        super().__init__(f"no pude abrir mis sockets en {ip} ({detalle})")
+        self.ip, self.detalle = ip, detalle
 
 
 def ipv4(ip: str) -> str:
@@ -92,14 +113,15 @@ class Lado:
     `net_ip` (AGMEN_NET_IP), como los nodos en modo red. listen() espera el dato propio de `peer`; send() manda el
     dato del otro a sus puertos. close() (o salir del `with`) cierra todo: nada queda escuchando.
 
-    OSError al abrir (con el porqué): para quien lo usa es un resultado "falló", nunca una excepción que tumbe algo."""
+    SinSockets (un OSError, con la IP y el porqué) al abrir: para quien lo usa es un resultado "falló", nunca una
+    excepción que tumbe algo. `send_errors`: por qué no se pudo mandar, el primero de cada uno ("UDP", "TCP")."""
 
     def __init__(self, net_ip: str | None = None, dato: str | None = None) -> None:
         self.dato = dato or nuevo_dato()
         self.net_ip = net_ip
         self.got_udp = threading.Event()
         self.got_tcp = threading.Event()
-        self.send_errors: list[str] = []    # por qué no se pudo mandar (diagnóstico; el resultado lo da el otro lado)
+        self.send_errors: dict[str, str] = {}   # por qué no se pudo mandar (el resultado lo da el otro lado)
         self._closed = threading.Event()
         self._threads: list[threading.Thread] = []
         self.udp = self.tcp = None
@@ -119,7 +141,7 @@ class Lado:
             self.tcp.setblocking(False)
         except OSError as e:
             self.close()
-            raise OSError(f"no pude abrir los sockets de la prueba de red en {ip} ({e.strerror or e})") from None
+            raise SinSockets(ip, str(e.strerror or e)) from None
 
     def __enter__(self) -> Lado:
         return self
@@ -219,19 +241,19 @@ class Lado:
             except (OSError, AttributeError) as e:
                 if self._closed.is_set():
                     return
-                self.send_errors.append(f"UDP: {getattr(e, 'strerror', None) or e}")
+                self.send_errors.setdefault("UDP", str(getattr(e, "strerror", None) or e))
 
     def _send_tcp(self, peer: str, port: int, data: bytes) -> None:
         try:
             s = socket.create_connection((peer, port), timeout=SONDA_S,
                                          source_address=(self.net_ip, 0) if self.net_ip else None)
         except OSError as e:
-            self.send_errors.append(f"TCP: {e.strerror or e}")
+            self.send_errors.setdefault("TCP", str(e.strerror or e))
             return
         try:
             s.sendall(data)
         except OSError as e:
-            self.send_errors.append(f"TCP: {e.strerror or e}")
+            self.send_errors.setdefault("TCP", str(e.strerror or e))
         finally:
             s.close()
 
@@ -253,7 +275,8 @@ class Lado:
 class Resultado:
     """Lo que salió de la sonda con un robot, visto desde la laptop. `aqui_*`: lo que recibió esta computadora del
     robot; `alla_*`: lo que el robot dice que recibió de aquí (sonda_fin). None: no se llegó a saber. `error`: por qué
-    no se pudo hacer (no contestó, mal formado, sockets): también es fallo."""
+    no se pudo hacer (no contestó, mal formado, sockets): también es fallo. `envio`: por qué no pudo mandar esta
+    computadora ({"UDP": ..., "TCP": ...}; sale en la línea del sentido que falló)."""
 
     aqui_udp: bool | None = None
     aqui_tcp: bool | None = None
@@ -261,6 +284,7 @@ class Resultado:
     alla_tcp: bool | None = None
     so_alla: str = ""
     error: str = ""
+    envio: dict = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -286,14 +310,20 @@ def _hacer(so: str, donde: str, otro_ip: str) -> str:
     return f"¿un firewall bloquea la entrada en {donde}? Deja entrar UDP y TCP desde {otro_ip}"
 
 
+def _no_mando(envio: dict, udp: bool | None, tcp: bool | None) -> str:
+    """Si esta computadora no pudo mandar por donde falló (p. ej. "No route to host"), el porqué; si no, ""."""
+    why = [f"{via}: {envio[via]}" for via, falla in (("UDP", udp), ("TCP", tcp)) if falla is False and via in envio]
+    return f" (esta computadora no pudo mandarle: {'; '.join(why)})" if why else ""
+
+
 def explicar(res: Resultado, robot: str, robot_ip: str, laptop_ip: str) -> list[str]:
     """Una línea por cada cosa que falló, con qué computadora no recibe de cuál, por dónde, y qué hacer."""
     lines = []
     if res.error:
         lines.append(res.error)
     if res.alla_udp is False or res.alla_tcp is False:
-        lines.append(f"{robot} no recibe de esta computadora {_via(res.alla_udp, res.alla_tcp)}: "
-                     f"{_hacer(res.so_alla, robot, laptop_ip)}")
+        lines.append(f"{robot} no recibe de esta computadora {_via(res.alla_udp, res.alla_tcp)}"
+                     f"{_no_mando(res.envio, res.alla_udp, res.alla_tcp)}: {_hacer(res.so_alla, robot, laptop_ip)}")
     if res.aqui_udp is False or res.aqui_tcp is False:
         lines.append(f"esta computadora no recibe de {robot} {_via(res.aqui_udp, res.aqui_tcp)}: "
                      f"{_hacer(sistema(), 'esta computadora', robot_ip)}")

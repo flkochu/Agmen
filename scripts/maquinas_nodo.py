@@ -67,14 +67,14 @@ def main() -> None:
     with open(marcas / f"{modo}.arranques", "a", encoding="utf-8") as f:
         f.write(f"{os.getpid()}\n")
     print(f"[{modo}] listo, pid {os.getpid()}", flush=True)
-    fin = time.time() + 300      # tope: nunca queda vivo para siempre si nadie lo detiene
+    fin = time.monotonic() + 300   # tope: nunca queda vivo para siempre si nadie lo detiene (regla 5: no el reloj del SO)
     latido = marcas / f"{modo}.latido"
     try:
         if modo == "robot":
             pub = agmen.Publisher(Grande, "/grande")
             sub = agmen.Subscriber(Ping, "/ping")
             n = 0
-            while time.time() < fin:
+            while time.monotonic() < fin:
                 pub.publish(Grande(n, DATOS))
                 n += 1
                 for _ in range(2):            # 5 veces por segundo, tocando el latido
@@ -87,7 +87,7 @@ def main() -> None:
             sub = agmen.Subscriber(Grande, "/grande")
             pub = agmen.Publisher(Ping, "/ping")
             v = 0
-            while time.time() < fin:
+            while time.monotonic() < fin:
                 pub.publish(Ping(42))
                 v += 1
                 latido.touch()

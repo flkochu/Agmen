@@ -137,9 +137,12 @@ class TestLado(unittest.TestCase):
             socket.create_connection(("127.0.0.1", port), timeout=2).close()
 
     def test_si_no_puede_abrir_es_un_oserror_que_lo_dice(self):
-        with self.assertRaises(OSError) as ctx:
+        with self.assertRaises(sonda.SinSockets) as ctx:
             sonda.Lado("203.0.113.7")   # una IP que no es de esta computadora
-        self.assertIn("no pude abrir los sockets de la prueba de red", str(ctx.exception))
+        self.assertIsInstance(ctx.exception, OSError)
+        self.assertIn("no pude abrir mis sockets en 203.0.113.7 (", str(ctx.exception))
+        self.assertEqual(ctx.exception.ip, "203.0.113.7")
+        self.assertTrue(ctx.exception.detalle)
 
     def test_mensajes_mal_formados(self):
         bueno = {"udp": 4000, "tcp": 4001, "dato": "a" * 32}
@@ -150,9 +153,16 @@ class TestLado(unittest.TestCase):
             with self.assertRaises(ValueError, msg=malo):
                 sonda.oferta(malo)
         self.assertEqual(sonda.fin({"udp": True, "tcp": False}), (True, False))
-        for malo in ({"udp": 1, "tcp": True}, {"udp": True}, {"udp": "true", "tcp": True}):
+        for malo in ({"udp": 1, "tcp": True}, {"udp": True}, {"udp": "true", "tcp": True},
+                     {"udp": False, "tcp": False, "error": ""}, {"udp": False, "tcp": False, "error": 3}):
             with self.assertRaises(ValueError, msg=malo):
                 sonda.fin(malo)
+        # §4.2: el "error" de sonda_fin, campo propio
+        self.assertEqual(sonda.motivo({"udp": True, "tcp": True}), "")
+        self.assertEqual(sonda.motivo({"udp": False, "tcp": False, "error": "no pudo"}), "no pudo")
+        for malo in ({"error": ""}, {"error": "  "}, {"error": None}, {"error": ["x"]}):
+            with self.assertRaises(ValueError, msg=malo):
+                sonda.motivo(malo)
         with self.assertRaises(ValueError):
             sonda.ipv4("fe80::1")
 
@@ -174,6 +184,13 @@ class TestLado(unittest.TestCase):
                                           "(mensajes grandes)"), dos)
         self.assertIn("En robot: sudo ufw allow from 10.0.0.1",
                       sonda.explicar(R(True, True, True, False, "linux"), "robot", "10.0.0.2", "10.0.0.1")[0])
+        # §4.5: si esta computadora no pudo mandar, el porqué va en la línea de ese sentido (y solo en esa)
+        con = sonda.explicar(R(True, True, False, True, "linux", envio={"UDP": "No route to host", "TCP": "x"}),
+                             "robot", "10.0.0.2", "10.0.0.1")
+        self.assertEqual(len(con), 1)
+        self.assertTrue(con[0].startswith("robot no recibe de esta computadora por UDP (mensajes chicos) (esta "
+                                          "computadora no pudo mandarle: UDP: No route to host): "), con)
+        self.assertNotIn("TCP: x", con[0])
         self.assertFalse(R(True, True, True, True).ok is False)
         self.assertFalse(R(True, True, True, True, error="x").ok)
         self.assertFalse(R(True, True, None, None).ok)
@@ -229,7 +246,9 @@ class TestConElAgente(SondaCase):
     def test_el_robot_no_recibe_tcp(self):
         res, lines = self.falla("laptop", "tcp")
         self.assertEqual((res.aqui_udp, res.aqui_tcp, res.alla_udp, res.alla_tcp), (True, True, True, False))
-        self.assertTrue(lines[0].startswith("robot no recibe de esta computadora por TCP (mensajes grandes): "), lines)
+        # (a un puerto cerrado, así que esta computadora además ve "Connection refused": §4.5, va en la línea)
+        self.assertTrue(lines[0].startswith("robot no recibe de esta computadora por TCP (mensajes grandes)"), lines)
+        self.assertIn("(esta computadora no pudo mandarle: TCP: ", lines[0])
 
     def test_la_laptop_no_recibe_udp(self):
         res, lines = self.falla("robot", "udp")
@@ -244,12 +263,13 @@ class TestConElAgente(SondaCase):
             self.assertIn("En esta computadora: sudo ufw allow from 127.0.0.1", lines[0])
 
     def test_si_el_agente_no_puede_abrir_sus_sockets_falla_ya_con_ese_motivo(self):
-        """§1.6 con el agente de verdad: contesta `error` y la laptop no espera los SONDA_S + MARGEN_S."""
+        """§1.6/§4.2 con el agente de verdad: contesta sonda_fin con "error" y la laptop no espera SONDA_S + MARGEN_S;
+        §4.5: una frase, sin repetirse, con qué hacer."""
         orig = sonda.Lado.__init__
 
         def init(self_, *a, **kw):
             if threading.current_thread().name == "agmen-agent-sonda":
-                raise OSError("no pude abrir los sockets de la prueba de red en 0.0.0.0 (prueba)")
+                raise sonda.SinSockets("0.0.0.0", "prueba")
             orig(self_, *a, **kw)
 
         link = self.abrir()
@@ -258,9 +278,30 @@ class TestConElAgente(SondaCase):
             res = link.net_check()
         self.assertLess(time.monotonic() - t0, 1.5)
         self.assertFalse(res.ok)
-        self.assertIn("no pudo hacer la prueba de red: robot: no pude abrir los sockets de la prueba de red", res.error)
-        self.assertIn("la prueba de red no se pudo hacer", res.error)
+        self.assertRegex(res.error, r"^robot \(127\.0\.0\.1[^)]*\) no pudo hacer la prueba de red: no pudo abrir sus "
+                                    r"sockets en 0\.0\.0\.0 \(prueba\)\. Revisa AGMEN_NET_IP y que la red de robot esté "
+                                    r"arriba$")
+        self.assertEqual(res.error.count("prueba de red"), 1)
+        self.assertEqual(link.probe_lines(res), [res.error])
         self.assertIsNotNone(link.channel)
+        self.assertTrue(link.net_check().ok)   # la siguiente no arrastra el error de antes
+
+    def test_el_lado_que_no_pudo_mandar_lo_dice(self):
+        """§4.5: la laptop no pudo mandar UDP (p. ej. "No route to host"): el motivo va en la línea de ese sentido;
+        y el agente que no pudo mandar lo dice en su terminal."""
+        def send_udp(self_, peer, port, data):   # ninguno de los dos lados logra mandar UDP
+            self_.send_errors.setdefault("UDP", "No route to host")
+
+        with mock.patch.object(sonda.Lado, "_send_udp", send_udp), mock.patch.object(sonda, "SONDA_S", 1.0):
+            link = self.abrir()
+            res = link.net_check()
+        self.assertEqual((res.aqui_udp, res.alla_udp), (False, False), res)
+        lines = link.probe_lines(res)
+        self.assertTrue(lines[0].startswith("robot no recibe de esta computadora por UDP (mensajes chicos) (esta "
+                                            "computadora no pudo mandarle: UDP: No route to host): "), lines)
+        self.assertTrue(lines[1].startswith("esta computadora no recibe de robot por UDP (mensajes chicos): "), lines)
+        self.assertTrue(until(lambda: any("no pude mandarle a la laptop (127.0.0.1): UDP: No route to host" in t
+                                          for t, _ in self.said)), self.said)
 
     def test_sin_sonda_de_la_laptop_no_hay_prueba_y_el_agente_no_la_dice(self):
         link = self.abrir(sonda_tambien=False)
@@ -301,11 +342,15 @@ class TestAgenteCrudo(TA.ServerCase):
     def test_un_sonda_mal_formado_es_un_error_y_la_conexion_sigue(self):
         c, ok = self.sesion(msg=self.mensaje(tablas=1, desde="laptop", sonda=1))
         c.send({"op": "sonda", "udp": 0, "tcp": 4001, "dato": "a" * 32})
-        self.assertTrue(c.wait(lambda ms: any(m["op"] == "error" for m in ms)), c.msgs)
-        self.assertIn("la prueba de red de la laptop llegó mal formada", c.first("error")["texto"])
-        self.assertIn("'udp' tiene que ser un puerto", c.first("error")["texto"])
+        self.assertTrue(c.wait(lambda ms: any(m["op"] == "sonda_fin" for m in ms)), c.msgs)
+        malo = c.first("sonda_fin")   # §4.2: con su campo "error", no un `error` genérico
+        self.assertEqual((malo["udp"], malo["tcp"]), (False, False))
+        self.assertIn("la de la laptop llegó mal formada", malo["error"])
+        self.assertIn("'udp' tiene que ser un puerto", malo["error"])
         self.ping(c)
         self.assertIsNone(c.first("sonda_ok"))
+        self.assertIsNone(c.first("error"))
+        c.msgs.remove(malo)
         # ... y la siguiente, bien formada, se hace (con un "laptop" que no contesta: sonda_fin dice que no llegó nada)
         with sonda.Lado() as lado, mock.patch.object(sonda, "SONDA_S", 0.5):
             lado.listen("127.0.0.1")
@@ -359,13 +404,29 @@ class Falso:
                 return
 
     def _sonda(self, ch, msg, ip, modo):
+        try:
+            self._sonda_de_verdad(ch, msg, ip, modo)
+        except agent.ChannelClosed:   # la laptop cerró a media prueba (fin de la prueba de la que sea): nada que hacer
+            pass
+
+    def _sonda_de_verdad(self, ch, msg, ip, modo):
         udp, tcp, dato = sonda.oferta(msg)
-        if modo == "error":   # (como el agente de verdad cuando no puede: §1.6)
-            ch.send({"op": "error", "texto": "robot: no pude abrir los sockets de la prueba de red en 0.0.0.0 "
-                                             "(prueba): la prueba de red no se pudo hacer"})
+        if modo == "error":   # (como el agente de verdad cuando no puede: §4.2, campo propio)
+            ch.send({"op": "sonda_fin", "udp": False, "tcp": False,
+                     "error": "no pudo abrir sus sockets en 0.0.0.0 (prueba). Revisa AGMEN_NET_IP"})
+            return
+        if modo == "error_vacio":
+            ch.send({"op": "sonda_fin", "udp": False, "tcp": False, "error": ""})
+            return
+        if modo == "corta":   # la conexión se pierde a media prueba
+            ch.sock.shutdown(socket.SHUT_RDWR)
+            return
+        if modo == "mudo":   # no contesta nada (la laptop la deja por tiempo, o porque otra la sustituye)
             return
         if modo == "otro_error":   # un error que no es de la prueba: se dice como siempre y la prueba sigue
             ch.send({"op": "error", "texto": "robot: no conozco el nodo 'x'"})
+        if modo == "error_que_habla_de_la_prueba":   # (antes se reconocía por el texto: ya no, §4.2)
+            ch.send({"op": "error", "texto": "robot: algo que dice prueba de red pero no es de esta"})
         with sonda.Lado() as lado:
             lado.listen(ip)
             lado.send(ip, udp, tcp, sonda.nuevo_dato() if modo == "dato_malo" else dato)
@@ -376,7 +437,7 @@ class Falso:
                 ok["tcp"] = 70000
             ch.send(ok)
             if modo == "error_tras_ok":
-                ch.send({"op": "error", "texto": "robot: error inesperado en la prueba de red (prueba)"})
+                ch.send({"op": "sonda_fin", "udp": False, "tcp": False, "error": "error inesperado (prueba)"})
                 return
             if self.barrera is not None:
                 self.barrera.wait(TOPE_S)   # las dos sondas a la vez: si fueran una tras otra, no pasa
@@ -461,17 +522,18 @@ class TestConAgenteDeMentira(FalsoCase):
         self.assertIn("por UDP (mensajes chicos)", lines[0])
 
     def test_si_el_agente_contesta_error_falla_ya_con_ese_motivo(self):
-        """§1.6: sin esperar los SONDA_S + MARGEN_S; el motivo va en el error de la prueba (no se dice dos veces)."""
+        """§4.2: sonda_fin con "error" (aunque llegue antes que sonda_ok): sin esperar los SONDA_S + MARGEN_S; el
+        motivo va en el error de la prueba (no se dice dos veces)."""
         lados = Lados(self)
         link = self.link(Falso(self, ["error"]))
         t0 = time.monotonic()
         res = link.net_check()   # SONDA_S de verdad (2 s): si esperara, tardaría 4
         self.assertLess(time.monotonic() - t0, 1.5)
         self.assertFalse(res.ok)
-        self.assertIn("robot (127.0.0.1", res.error)
-        self.assertIn("no pudo hacer la prueba de red: robot: no pude abrir los sockets de la prueba de red", res.error)
+        self.assertRegex(res.error, r"^robot \(127\.0\.0\.1[^)]*\) no pudo hacer la prueba de red: no pudo abrir sus "
+                                    r"sockets en 0\.0\.0\.0 \(prueba\)\. Revisa AGMEN_NET_IP$")
         self.assertEqual(link.probe_lines(res)[0], res.error)
-        self.assertFalse(any("no pude abrir los sockets" in n for n in self.notas), self.notas)
+        self.assertFalse(any("no pudo abrir sus sockets" in n for n in self.notas), self.notas)
         self.assertTrue(until(lados.cerrados))
         self.assertIsNotNone(link.channel)
         self.assertTrue(link.net_check().ok)   # la siguiente no arrastra el error de antes
@@ -483,14 +545,70 @@ class TestConAgenteDeMentira(FalsoCase):
         with mock.patch.object(sonda, "SONDA_S", 5.0):
             res = link.net_check()
         self.assertLess(time.monotonic() - t0, 3.0)
-        self.assertIn("no pudo hacer la prueba de red: robot: error inesperado en la prueba de red", res.error)
+        self.assertIn("no pudo hacer la prueba de red: error inesperado (prueba)", res.error)
         self.assertTrue(until(lados.cerrados))
 
+    def test_un_error_vacio_en_sonda_fin_es_mal_formado(self):
+        res, _ = self.probar("error_vacio")
+        self.assertIn("contestó mal la prueba de red ('error' tiene que ser un texto", res.error)
+
     def test_un_error_que_no_es_de_la_prueba_se_dice_y_la_prueba_sigue(self):
-        link = self.link(Falso(self, ["otro_error"]))
-        res = link.net_check()
-        self.assertTrue(res.ok, res)
-        self.assertIn("robot: no conozco el nodo 'x'", self.notas)
+        for modo, texto in (("otro_error", "robot: no conozco el nodo 'x'"),
+                            ("error_que_habla_de_la_prueba", "robot: algo que dice prueba de red pero no es de esta")):
+            with self.subTest(modo=modo):
+                link = self.link(Falso(self, [modo]))
+                res = link.net_check()
+                self.assertTrue(res.ok, res)
+                self.assertIn(texto, self.notas)
+
+    def test_dos_pruebas_que_se_cruzan_no_se_pisan(self):
+        """§4.3: la primera (el agente no le contesta) queda esperando; la segunda la sustituye: la vieja acaba ya
+        como SinConexion (nunca un resultado), la nueva pasa, y lo que llegue por otra conexión no es de ninguna."""
+        lados = Lados(self)
+        falso = Falso(self, ["mudo", "bien"])
+        link = self.link(falso)
+        vieja: list = []
+        t = threading.Thread(target=lambda: vieja.append(link.net_check()))
+        t.start()
+        self.assertTrue(until(lambda: falso.sondas == 1 and link._probing is not None))
+        primera = link._probing
+        t0 = time.monotonic()
+        nueva = link.net_check()
+        t.join(TOPE_S)
+        self.assertTrue(nueva.ok, nueva)
+        self.assertEqual(len(vieja), 1)
+        self.assertIsInstance(vieja[0], agent.SinConexion)
+        self.assertIn("otra prueba de red la sustituyó", vieja[0].motivo)
+        self.assertTrue(primera.cancelled)
+        self.assertLess(time.monotonic() - t0, sonda.SONDA_S + sonda.MARGEN_S)
+        self.assertIsNone(link._probing)
+        self.assertTrue(until(lados.cerrados))
+        # Lo que llega se reparte por conexión: el de otra conexión no entra en la prueba.
+        mia, otra = link.channel, object()
+        prueba = agent._Prueba(mia)
+        link._probing = prueba
+        fin = {"op": "sonda_fin", "udp": False, "tcp": False, "error": "x"}
+        link._dispatch(fin, otra)
+        link._dispatch(fin)   # (sin conexión: antes de sesion_ok o al reanudar)
+        self.assertTrue(prueba.box.empty())
+        self.assertIsNone(prueba.error)
+        link._dispatch(fin, mia)
+        self.assertEqual(prueba.box.get_nowait(), fin)
+        self.assertEqual(prueba.error, fin)
+        link._probing = None
+
+    def test_una_prueba_vieja_que_arranca_tarde_no_se_registra(self):
+        """§4.3: la de una conexión que ya no es la actual no sustituye a nada: SinConexion, sin mandar nada."""
+        falso = Falso(self)
+        link = self.link(falso)
+        actual = agent._Prueba(link.channel)
+        link._probing = actual
+        res = link._probe(link.channel, link._gen - 1, None)   # (una generación anterior)
+        self.assertIsInstance(res, agent.SinConexion)
+        self.assertIs(link._probing, actual)
+        self.assertFalse(actual.cancelled)
+        self.assertEqual(falso.sondas, 0)
+        link._probing = None
 
     def test_sonda_ok_que_no_se_espera_se_ignora(self):
         falso = Falso(self)
@@ -653,6 +771,30 @@ class TestVariosRobots(FalsoCase):
         error, said = self.net_checks([Falso(self, capaz=False)], sistema="windows")
         self.assertEqual(error, "")
         self.assertNotIn(sonda.LIMITE, said)
+
+    def test_si_la_conexion_se_pierde_a_media_prueba_no_dice_todo_bien(self):
+        """§4.4: al conectar, la conexión perdida a media prueba es el caso de siempre: va a `lost` (una vez), no
+        sale "✔" y cmd_run no arranca nada (sale con 1, como con cualquier conexión perdida al conectar)."""
+        falso = Falso(self, ["corta"])
+        link = self.link(falso)
+        said: list[str] = []
+        launcher = SimpleNamespace(say=lambda t, k="agmen": said.append(t))
+        lost: list[str] = []
+        stop = threading.Event()
+        error = cli._net_checks(launcher, [link], stop, lost)
+        self.assertEqual(error, "")
+        self.assertEqual(len(lost), 1, said)
+        self.assertIn("robot (127.0.0.1", lost[0])
+        self.assertIn("vuelve a correr agmen run", lost[0])
+        self.assertTrue(stop.is_set())
+        self.assertNotIn(sonda.PASA.format(robot="robot"), said)
+        self.assertEqual([t for t in said if t.startswith("✖")], [f"✖ {lost[0]}"])
+
+    def test_net_check_sin_conexion_no_es_un_resultado(self):
+        link = self.link(Falso(self))
+        link.close()
+        res = link.net_check()
+        self.assertIsInstance(res, agent.SinConexion)
 
     def test_si_se_deja_de_esperar_cierra_todo(self):
         lados = Lados(self)

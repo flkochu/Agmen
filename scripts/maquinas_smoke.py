@@ -11,9 +11,12 @@ Dos modos; la primera línea de la salida dice cuál se usó:
 - loopback (Windows, macOS, o Linux sin permisos): las dos en esta máquina, en dos IP de
   loopback (AGMEN_NET_IP), con hubs en puertos distintos y AGMEN_SHM=0.
 
-Se elige con AGMEN_SMOKE_MODO=aislado|loopback; sin ella, aislado si se puede y si no
-loopback (diciéndolo). En el CI de Linux (variable CI) aislado es obligatorio: si no se
-puede, falla y dice qué faltó. Todo lo creado se borra, también si falla o con Ctrl+C.
+Se elige con AGMEN_SMOKE_MODO=aislado|loopback. Sin ella, loopback (el script no se
+vuelve root por su cuenta), salvo en el CI de Linux (variable CI), donde aislado es
+obligatorio: si no se puede, falla y dice qué faltó. Si hace falta, se re-ejecuta con
+`sudo -n`, con un entorno mínimo. Todo lo creado se borra, también si falla o con Ctrl+C.
+Solo se mata a los procesos que el script lanzó (y a sus grupos), nunca a un pid leído
+de un archivo.
 
 Requiere haber compilado antes (usa build/bin/publisher). Solo librería estándar.
 
@@ -53,6 +56,14 @@ def no_probado(name, motivo):
     print(f"NO SE PUDO PROBAR {name} — {motivo}", flush=True)
 
 
+SISTEMA_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"   # el PATH fijo del modo aislado (las herramientas de root, de aquí)
+
+
+def herramienta(nombre: str) -> str | None:
+    """La ruta absoluta de `nombre` en el PATH del sistema (nunca en el PATH del usuario: corre como root)."""
+    return shutil.which(nombre, path=SISTEMA_PATH)
+
+
 def wait_for(pred, timeout=15.0, paso=0.1):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -72,8 +83,11 @@ class Falta(Exception):
 # ---------------------------------------------------------------- los dos modos
 
 def _sudo_n() -> bool:
+    sudo, true = herramienta("sudo"), herramienta("true")
+    if not sudo or not true:
+        return False
     try:
-        return subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=20).returncode == 0
+        return subprocess.run([sudo, "-n", true], capture_output=True, timeout=20).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
 
@@ -82,17 +96,18 @@ def _requisitos_aislado() -> str | None:
     """None si el modo aislado se puede; si no, qué falta."""
     if not LINUX:
         return "solo existe en Linux"
-    faltan = [t for t in ("ip", "unshare", "nsenter") if not shutil.which(t)]
+    faltan = [t for t in ("ip", "unshare", "nsenter", "true", "env") if not herramienta(t)]
     if faltan:
-        return f"faltan {', '.join(faltan)} (en Debian/Ubuntu: sudo apt-get install -y iproute2 util-linux)"
-    if os.geteuid() != 0 and not (shutil.which("sudo") and _sudo_n()):
+        return (f"faltan {', '.join(faltan)} en {SISTEMA_PATH} (en Debian/Ubuntu: sudo apt-get install -y iproute2 "
+                f"util-linux)")
+    if os.geteuid() != 0 and not _sudo_n():
         return "hace falta ser root o tener `sudo -n` (sudo sin contraseña) para crear espacios de nombres de red"
+    prueba = [herramienta("unshare"), "--net", "--mount", herramienta("true")]
     try:   # ¿el entorno deja crearlos? (algunos contenedores no)
         if os.geteuid() == 0:
-            r = subprocess.run(["unshare", "--net", "--mount", "true"], capture_output=True, text=True, timeout=20)
+            r = subprocess.run(prueba, capture_output=True, text=True, timeout=20)
         else:
-            r = subprocess.run(["sudo", "-n", "unshare", "--net", "--mount", "true"], capture_output=True, text=True,
-                               timeout=20)
+            r = subprocess.run([herramienta("sudo"), "-n", *prueba], capture_output=True, text=True, timeout=20)
     except (OSError, subprocess.TimeoutExpired) as e:
         return f"unshare no corrió: {e}"
     if r.returncode != 0:
@@ -100,22 +115,25 @@ def _requisitos_aislado() -> str | None:
     return None
 
 
-def elegir_modo() -> str:
+def elegir_modo() -> tuple[str, str]:
+    """El modo y, si se eligió solo, por qué (se dice después de la primera línea). aislado solo si se pide
+    (AGMEN_SMOKE_MODO=aislado) o en el CI de Linux (variable CI); y ahí es obligatorio. Si no, loopback: el script
+    no se vuelve root por su cuenta."""
     pedido = os.environ.get("AGMEN_SMOKE_MODO", "").strip().lower()
     if pedido not in ("", "aislado", "loopback"):
         sys.exit(f"AGMEN_SMOKE_MODO={pedido!r} no es válido: usa 'aislado' o 'loopback' (o quita la variable).")
-    obligatorio = pedido == "aislado" or (not pedido and LINUX and bool(os.environ.get("CI")))
     if pedido == "loopback":
-        return "loopback"
+        return "loopback", ""
+    if not pedido and not (LINUX and os.environ.get("CI")):
+        return "loopback", ("(sin AGMEN_SMOKE_MODO uso loopback: el modo aislado necesita root, y no me vuelvo root "
+                            "por mi cuenta. Para pedirlo, en Linux con root o `sudo -n`: "
+                            "AGMEN_SMOKE_MODO=aislado python scripts/maquinas_smoke.py)")
     falta = _requisitos_aislado()
     if falta is None:
-        return "aislado"
-    if obligatorio:
-        sys.exit(f"FALLA modo aislado no disponible: {falta}.\n"
-                 + ("(En el CI de Linux este modo es obligatorio.)" if not pedido else
-                    "(Lo pediste con AGMEN_SMOKE_MODO=aislado.)"))
-    print(f"(aislado no disponible: {falta}; uso loopback)")
-    return "loopback"
+        return "aislado", ""
+    sys.exit(f"FALLA modo aislado no disponible: {falta}.\n"
+             + ("(En el CI de Linux este modo es obligatorio.)" if not pedido else
+                "(Lo pediste con AGMEN_SMOKE_MODO=aislado.)"))
 
 
 def uid_normal() -> tuple[int, int]:
@@ -146,6 +164,8 @@ class Aislado:
         self.sufijo = str(os.getpid())
         self.holders: dict[str, subprocess.Popen] = {}
         self.workdir = workdir
+        self.veth: tuple[str, ...] = ()
+        self.ip, self.unshare, self.nsenter = herramienta("ip"), herramienta("unshare"), herramienta("nsenter")
 
     def _root(self, args: list[str], **kw):
         return subprocess.run(args, capture_output=True, text=True, timeout=30, **kw)
@@ -154,7 +174,7 @@ class Aislado:
         for nombre in ("laptop", "robot"):
             # unshare crea el espacio y ahí se monta un /dev/shm propio. Muere solo en 30 min si nadie lo recoge.
             self.holders[nombre] = subprocess.Popen(
-                ["unshare", "--net", "--mount", "--", "sh", "-c",
+                [self.unshare, "--net", "--mount", "--", herramienta("sh") or "/bin/sh", "-c",
                  "mount -t tmpfs -o mode=1777 tmpfs /dev/shm && exec sleep 1800"],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         host_shm = os.stat("/dev/shm").st_dev
@@ -164,16 +184,16 @@ class Aislado:
                             f"{h.stdout.read().decode(errors='replace') if h.poll() is not None else 'sin /dev/shm propio'}")
         a, b = f"vl{self.sufijo}", f"vr{self.sufijo}"
         self.veth = (a, b)
-        pasos = [(["ip", "link", "add", a, "type", "veth", "peer", "name", b], None),
-                 (["ip", "link", "set", a, "netns", str(self.holders["laptop"].pid)], None),
-                 (["ip", "link", "set", b, "netns", str(self.holders["robot"].pid)], None)]
-        for args, _ in pasos:
+        pasos = [[self.ip, "link", "add", a, "type", "veth", "peer", "name", b],
+                 [self.ip, "link", "set", a, "netns", str(self.holders["laptop"].pid)],
+                 [self.ip, "link", "set", b, "netns", str(self.holders["robot"].pid)]]
+        for args in pasos:
             r = self._root(args)
             if r.returncode:
                 raise Falta(f"`{' '.join(args)}` falló: {r.stderr.strip()}")
         for nombre, dev, ip in (("laptop", a, self.IPS[0]), ("robot", b, self.IPS[1])):
-            for args in (["ip", "addr", "add", f"{ip}/24", "dev", dev], ["ip", "link", "set", dev, "up"],
-                         ["ip", "link", "set", "lo", "up"]):
+            for args in ([self.ip, "addr", "add", f"{ip}/24", "dev", dev], [self.ip, "link", "set", dev, "up"],
+                         [self.ip, "link", "set", "lo", "up"]):
                 r = self.en(nombre, args)
                 if r.returncode:
                     raise Falta(f"en '{nombre}', `{' '.join(args)}` falló: {r.stderr.strip()}")
@@ -181,11 +201,12 @@ class Aislado:
 
     def en(self, nombre: str, args: list[str]):
         """Un comando como root dentro de la red de `nombre` (ip, iptables...)."""
-        return self._root(["nsenter", "-t", str(self.holders[nombre].pid), "-n", "--", *args])
+        return self._root([self.nsenter, "-t", str(self.holders[nombre].pid), "-n", "--", *args])
 
     def prefijo(self, nombre: str) -> list[str]:
         """Para lanzar un proceso del usuario normal dentro de `nombre`."""
-        return ["nsenter", "-t", str(self.holders[nombre].pid), "-n", "-m", "-S", str(self.uid), "-G", str(self.gid), "--"]
+        return [self.nsenter, "-t", str(self.holders[nombre].pid), "-n", "-m", "-S", str(self.uid), "-G", str(self.gid),
+                "--"]
 
     def red_de(self, nombre: str) -> str:
         return os.readlink(f"/proc/{self.holders[nombre].pid}/ns/net")
@@ -202,6 +223,10 @@ class Aislado:
             if h.stdout:
                 h.stdout.close()
         self.holders.clear()
+        # Si `ip link set … netns` falló, el veth quedó aquí (en la red de esta máquina): se borra (con uno, el par).
+        for dev in self.veth:
+            if Path(f"/sys/class/net/{dev}").exists():
+                self._root([self.ip, "link", "del", dev])
 
 
 # ---------------------------------------------------------------- procesos
@@ -215,11 +240,13 @@ class Proc:
         # Cada 20 s deja sus pilas en un archivo, que solo se muestra si algo falla (como run_smoke).
         con_pilas = ("import faulthandler, runpy; faulthandler.dump_traceback_later(20, repeat=True, "
                      f"file=open({str(pilas)!r}, 'w')); runpy.run_module('agmen', run_name='__main__', alter_sys=True)")
-        kw = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if NT else {}
+        # Su propio grupo: al limpiar se mata a ese grupo (lo que el script lanzó), nunca a un pid de un archivo.
+        kw = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if NT else {"start_new_session": True}
         self.p = subprocess.Popen([*prefijo, sys.executable, "-c", con_pilas, *args], cwd=cwd, env=env,
                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                   text=True, encoding="utf-8", errors="replace", **kw)
         self.lines: list[str] = []
+        self.matado = False   # ¿hubo que matarlo (no salió solo con Ctrl+C)?
         self.reader = threading.Thread(target=lambda: self.lines.extend(self.p.stdout), daemon=True)
         self.reader.start()
 
@@ -239,13 +266,30 @@ class Proc:
         try:
             self.p.wait(timeout)
         except subprocess.TimeoutExpired:
+            self.matado = True
             self.p.kill()
             self.p.wait()
+        self.matar_grupo()
         self.reader.join(10)
         return self.p.returncode
 
+    def matar_grupo(self):
+        """Lo que quede del grupo que el script lanzó (Linux/macOS; su pgid es el pid de su Popen)."""
+        if NT:
+            return
+        try:
+            os.killpg(self.p.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
     def vivo(self) -> bool:
         return self.p.poll() is None
+
+
+def pid_vivo(pid) -> bool:
+    """¿Sigue vivo `pid`? Solo mira (Linux: /proc); nunca manda una señal. Donde no se puede mirar, False (lo
+    cubren los latidos)."""
+    return LINUX and isinstance(pid, int) and Path(f"/proc/{pid}").exists()
 
 
 def free_port(udp=False) -> int:
@@ -282,15 +326,22 @@ def toml_del_robot(dest: Path, ip: str, puerto: int) -> Path:
 # ---------------------------------------------------------------- la prueba
 
 def main():
-    modo = elegir_modo()
+    modo, porque = elegir_modo()
     if modo == "aislado" and os.geteuid() != 0:
-        # Hace falta root para los espacios de nombres: se vuelve a lanzar con sudo, conservando el entorno.
-        print("(pido sudo para crear los espacios de nombres)", flush=True)
-        os.execvp("sudo", ["sudo", "-n", "-E", "env", f"PATH={os.environ.get('PATH', '')}", sys.executable,
-                           str(Path(__file__).resolve()), *sys.argv[1:]])
+        # Hace falta root para los espacios de nombres (aquí solo se llega si se pidió o en el CI de Linux): se vuelve
+        # a lanzar con sudo, con un entorno mínimo (sin -E): el PATH del sistema, quién es el usuario normal (los
+        # procesos de dentro corren como él) y las variables del smoke. El intérprete y el script, por su ruta absoluta.
+        print("(pido sudo -n para crear los espacios de nombres)", file=sys.stderr, flush=True)
+        # (`env -i` vacía también lo que pone sudo: SUDO_UID/SUDO_GID se pasan aquí, con los mismos valores)
+        entorno = [f"PATH={SISTEMA_PATH}", f"SUDO_UID={os.getuid()}", f"SUDO_GID={os.getgid()}"]
+        entorno += [f"{k}={v}" for k, v in sorted(os.environ.items()) if k.startswith("AGMEN_SMOKE_") or k == "CI"]
+        os.execv(herramienta("sudo"), [herramienta("sudo"), "-n", herramienta("env"), "-i", *entorno,
+                                       os.path.abspath(sys.executable), str(Path(__file__).resolve()), *sys.argv[1:]])
     print(f"modo: {modo}" + (" (dos espacios de nombres de red y de /dev/shm, procesos como usuario normal)"
                               if modo == "aislado" else
                               " (dos IP de loopback, AGMEN_SHM=0, hubs en puertos distintos)"), flush=True)
+    if porque:
+        print(porque, flush=True)
     t0 = time.monotonic()
     if not NT:   # kill <pid> o cerrar la terminal también limpian (como Ctrl+C)
         for sig in (signal.SIGTERM, signal.SIGHUP):
@@ -300,12 +351,12 @@ def main():
         base_tmp = "/tmp"   # el TMPDIR de aquí no lo puede cruzar el usuario normal: la carpeta de trabajo va en /tmp
     tmp = Path(tempfile.mkdtemp(prefix="agmen_maquinas_", dir=base_tmp))
     aislado = Aislado(tmp) if modo == "aislado" else None
-    if aislado:
-        os.chown(tmp, aislado.uid, aislado.gid)
-    os.chmod(tmp, 0o777)
     marcas = tmp / "marcas"
-    marcas.mkdir()
-    os.chmod(marcas, 0o777)
+    marcas.mkdir(mode=0o700)
+    for d in (tmp, marcas):   # de quien corre los procesos, y de nadie más (nunca 0o777)
+        if aislado:
+            os.chown(d, aislado.uid, aislado.gid)
+        os.chmod(d, 0o700)
     procs: list[Proc] = []
     exito = False
     try:
@@ -315,13 +366,16 @@ def main():
                     "HOME": str(tmp), "AGMEN_REMOTE_HOSTS": "", "AGMEN_AGENT_KEY": ""}
         for v in ("AGMEN_HUB", "AGMEN_NET_IP", "AGMEN_SHM"):
             base_env.pop(v, None)
+        if aislado:   # (con sudo, el PATH es el del sistema: el `python` de los nodos es el de este intérprete)
+            base_env["PATH"] = f"{Path(sys.executable).parent}{os.pathsep}{base_env.get('PATH', SISTEMA_PATH)}"
         if aislado:
             aislado.crear()
             ip_laptop, ip_robot = aislado.IPS
             puerto = 7391
             envs = {"laptop": dict(base_env), "robot": dict(base_env)}
             pref = {n: aislado.prefijo(n) for n in ("laptop", "robot")}
-            ping = aislado.en("laptop", ["ping", "-c", "1", "-W", "2", ip_robot]) if shutil.which("ping") else None
+            ping = aislado.en("laptop", [herramienta("ping"), "-c", "1", "-W", "2", ip_robot]) if herramienta("ping") \
+                else None
             if ping is not None and ping.returncode:
                 raise Falta(f"las dos computadoras no se ven por el veth: {ping.stdout.strip()} {ping.stderr.strip()}")
         else:
@@ -379,13 +433,7 @@ def main():
         check("los nodos de apoyo arrancaron", cond, run.out + agente.out)
         if cond:
             rr, ll = marca("robot"), marca("laptop")
-            vivos = []
-            for m in (rr, ll):
-                try:
-                    os.kill(m["pid"], 0) if not NT else None
-                    vivos.append(True)
-                except OSError:
-                    vivos.append(False)
+            vivos = [pid_vivo(m["pid"]) for m in (rr, ll)]   # (se mira, no se le manda nada)
             if aislado:
                 dentro = rr["red"] == aislado.red_de("robot") and ll["red"] == aislado.red_de("laptop")
                 check("los nodos del robot corren en el robot, no en la laptop (su pid está en la red del robot)",
@@ -457,13 +505,14 @@ def main():
                        "solo se puede en modo aislado (hace falta un firewall propio en el robot)")
         else:
             regla = None
-            for nombre, cmds in (("iptables", [["iptables", "-A", "INPUT", "-p", "udp", "-j", "DROP"]]),
-                                 ("nft", [["nft", "add", "table", "inet", "agmen_smoke"],
-                                          ["nft", "add", "chain", "inet", "agmen_smoke", "entrada",
+            ipt, nft = herramienta("iptables"), herramienta("nft")
+            for nombre, cmds in (("iptables", [[ipt, "-A", "INPUT", "-p", "udp", "-j", "DROP"]]),
+                                 ("nft", [[nft, "add", "table", "inet", "agmen_smoke"],
+                                          [nft, "add", "chain", "inet", "agmen_smoke", "entrada",
                                            "{ type filter hook input priority 0 ; }"],
-                                          ["nft", "add", "rule", "inet", "agmen_smoke", "entrada", "meta", "l4proto",
+                                          [nft, "add", "rule", "inet", "agmen_smoke", "entrada", "meta", "l4proto",
                                            "udp", "drop"]])):
-                if not shutil.which(nombre):
+                if not herramienta(nombre):
                     continue
                 rs = [aislado.en("robot", c) for c in cmds]
                 if all(x.returncode == 0 for x in rs):
@@ -481,10 +530,13 @@ def main():
                 code = bloq.p.poll()
                 if code is None:
                     code = bloq.detener()
-                check(f"con UDP bloqueado en el robot ({regla}): agmen run no arranca nada, sale con error y dice "
-                      "que el robot no recibe por UDP",
-                      code not in (0, None) and not bloq.dijo("todo arrancado") and arranques() == n0
-                      and "no recibe de esta computadora" in bloq.out and "UDP" in bloq.out
+                # El código exacto del caso "el agente no contesta" (2) y la línea del robot que no recibe por UDP,
+                # sin nombrar TCP (TCP sí pasa).
+                udp = [ln for ln in bloq.out.splitlines() if "robot no recibe de esta computadora" in ln]
+                check(f"con UDP bloqueado en el robot ({regla}): agmen run no arranca nada, sale con 2 (como si el "
+                      "agente no contestara) y dice que el robot no recibe solo por UDP",
+                      code == 2 and not bloq.dijo("todo arrancado") and arranques() == n0
+                      and len(udp) == 1 and "por UDP (mensajes chicos)" in udp[0] and "TCP" not in udp[0]
                       and "--no-net-check" in bloq.out, f"código {code}\n{bloq.out}")
                 saltada = correr("run_sin_prueba", ["--no-net-check"])
                 wait_for(lambda: arranques() > n0, 30)
@@ -494,22 +546,28 @@ def main():
 
         # --- fin: se detiene el agente
         code = agente.detener()
-        check("Ctrl+C en el robot detiene el agente", code is not None and not agente.vivo(), agente.out)
+        check("Ctrl+C en el robot detiene el agente (código 0 y su despedida, sin matarlo)",
+              code == 0 and not agente.matado and agente.dijo("listo. ¡Hasta luego!"),
+              f"código {code}{' (hubo que matarlo)' if agente.matado else ''}\n{agente.out}")
         exito = all(results)
     except Falta as e:
         check("el modo aislado se pudo armar", False, str(e))
     finally:
-        for p in procs:
+        for p in procs:   # solo lo que este script lanzó (y sus grupos)
             if p.vivo():
                 p.detener(15)
-        # ningún proceso de los nodos queda vivo (los pids que anotaron)
+            p.matar_grupo()
+        # ¿Quedó vivo algún nodo? Se mira (Linux: /proc), no se le manda nada: un pid de un archivo no es nuestro.
+        quedan = []
         for f in marcas.glob("*.json"):
             try:
                 pid = json.loads(f.read_text(encoding="utf-8"))["pid"]
-                if not NT:
-                    os.kill(pid, signal.SIGKILL)
-            except (OSError, ValueError, KeyError):
-                pass
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            if not wait_for(lambda pid=pid: not pid_vivo(pid), 10):
+                quedan.append(f"{f.stem} (pid {pid})")
+        if quedan:
+            check("no queda vivo ningún nodo", False, ", ".join(quedan))
         if aislado:
             aislado.borrar()
         # Primero se limpia todo; recién entonces se imprime (si la salida se cierra, ya no queda nada).

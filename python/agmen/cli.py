@@ -594,8 +594,11 @@ def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list
 
 def _net_checks(launcher, links: list, stop, lost: list) -> str:
     """La prueba de red con cada robot, todas a la vez (4c §1.4), antes de arrancar nada. Devuelve "" si pasaron
-    (una línea corta por robot) o el error que lo explica todo (agmen run no arranca nada)."""
+    (una línea corta por robot) o el error que lo explica todo (agmen run no arranca nada). Si la conexión con un
+    robot se perdió o se cerró a media prueba (4c §4.4), es el caso de siempre de conexión perdida: va a `lost` (lo
+    dice una vez), devuelve "" y cmd_run no arranca nada (sale con 1). Nunca "todo bien" sin haber probado."""
     from . import sonda
+    from .agent import SinConexion
     from .sonda import LIMITE, PASA, WINDOWS, Resultado
 
     warned, warn_lock = [], threading.Lock()
@@ -632,12 +635,26 @@ def _net_checks(launcher, links: list, stop, lost: list) -> str:
         cancel.set()   # (Ctrl+C) que las que sigan cierren sus sockets ya
         for t in threads:
             t.join(1.0)
+    for link in links:
+        res = results.get(link.name)
+        if isinstance(res, SinConexion) and not stop.is_set():
+            text = link.lost or (f"{link.name} ({link.shown}): se perdió la conexión con agmen agent a media prueba "
+                                 f"de red ({res.motivo}). Revisa {link.name} (¿se apagó, se cayó la red o se cerró "
+                                 f"agmen agent?) y vuelve a correr agmen run")
+            link.close()   # (así su lector ya no lo vuelve a contar: se dice una vez)
+            if text not in lost:
+                lost.append(text)
+                launcher.say(f"✖ {text}", "error")
+            stop.set()
     if lost or stop.is_set():   # una computadora se perdió mientras tanto: lo cuenta cmd_run (sale con 1)
         return ""
     failures, ran, windows = [], False, sonda.sistema() == "windows"
     for link in links:
         res = results.get(link.name)
         if res is None:   # sin prueba con este robot (su agente no la sabe hacer: ya se dijo)
+            continue
+        if not isinstance(res, Resultado):   # (no llega aquí: SinConexion ya dejó `lost`; por si acaso, nunca "bien")
+            failures.append((link, Resultado(error=f"no se pudo hacer la prueba de red con {link.name}")))
             continue
         ran, windows = True, windows or res.so_alla == "windows"
         link.took_probe(res.ok)
