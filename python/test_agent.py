@@ -2867,11 +2867,13 @@ def _sysctl(nombre: str) -> str:
 
 
 class TestClienteQueNoLee(ServerCase):
-    def abrir_sin_leer(self):
-        """Una laptop que abre la sesión y luego NO lee nada más (su buffer de recepción es mínimo)."""
+    def abrir_sin_leer(self, rcvbuf: int | None = 4096):
+        """Una laptop que abre la sesión y luego NO lee nada más (su buffer de recepción es mínimo; con
+        `rcvbuf=None`, el de siempre: para las pruebas en que la laptop además no para de mandar)."""
         self.start_server()
         s = socket.socket()
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        if rcvbuf is not None:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
         s.settimeout(5)
         s.connect(("127.0.0.1", self.port))
         ch = client_handshake(s, K())
@@ -2928,6 +2930,23 @@ class TestClienteQueNoLee(ServerCase):
             self.assertLessEqual(sesion.out.bytes, agent.OUT_MAX_BYTES + 20_000)
             self.assertGreater(sesion.out.dropped, 0, "tantos logs debieron descartar algunos")
 
+    def abrir_sin_leer_mandando(self):
+        """Una laptop que no lee PERO sigue mandando; devuelve (cli, sesion). El agente debe llegar a "no lee".
+
+        El CI falló varias veces con "no dijo nada en 6 s" en vez de "no lee", y la línea de tiempo dijo por qué:
+        con el buffer de recepción de 4096 bytes de `abrir_sin_leer`, lo que mandaba la laptop se atascaba en su
+        propio kernel (1.7 MB en cola, sondeando una ventana que creía cerrada) mientras el agente ya había leído
+        todo y tenía sitio; sus respuestas cabían enteras en su buffer de envío (que el kernel agranda solo, hasta
+        4 MB) y, sin más pings, quien envía nunca se bloqueaba: el agente veía silencio, y con razón. Aquí la
+        laptop usa su buffer de siempre (su ventana se cierra sin atascar lo que manda) y el buffer de envío del
+        agente queda fijo y chico: quien envía se bloquea tras unas mil respuestas, lleguen o no más mensajes."""
+        cli = self.abrir_sin_leer(rcvbuf=None)
+        cli.send(self.mensaje())
+        self.leer_hasta_sesion_ok(cli)
+        sesion = self.server.session
+        sesion.channel.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8192)
+        return cli, sesion
+
     def abrir_sin_leer_sesion(self):
         cli = self.abrir_sin_leer()
         cli.send(self.mensaje())
@@ -2936,12 +2955,8 @@ class TestClienteQueNoLee(ServerCase):
 
     def test_ping_sin_leer_las_respuestas_acota_la_cola_y_cierra(self):
         with mock.patch.object(agent, "SEND_TIMEOUT", 1.5):
-            cli = self.abrir_sin_leer()
-            msg = self.mensaje()
-            cli.send(msg)
-            self.leer_hasta_sesion_ok(cli)
+            cli, sesion = self.abrir_sin_leer_mandando()
             maximo = 0
-            sesion = self.server.session
             # El cliente NO se rinde antes que el agente: su envío tenía el mismo tiempo límite (1.5 s) que el
             # agente para decidir "no lee"; al empatarse, el cliente podía rendirse a media línea (sendall no es
             # atómico) justo cuando el agente volvía a leer, y el agente esperaba el resto de esa línea hasta dar
@@ -3026,10 +3041,7 @@ class TestClienteQueNoLee(ServerCase):
 
     def test_ordenes_con_error_sin_leer_tambien_acotan_la_cola(self):
         with mock.patch.object(agent, "SEND_TIMEOUT", 1.5):
-            cli = self.abrir_sin_leer()
-            cli.send(self.mensaje())
-            self.leer_hasta_sesion_ok(cli)
-            sesion = self.server.session
+            cli, sesion = self.abrir_sin_leer_mandando()
             cli.ch.sock.settimeout(20)      # como en la prueba del ping: el cliente no se rinde antes que el agente
             maximo, enviados = 0, 0
             try:
