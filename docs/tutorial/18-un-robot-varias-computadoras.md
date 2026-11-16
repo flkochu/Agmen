@@ -593,7 +593,7 @@ computadora donde se publicó. Ya no: **un topic cruza entre la laptop y cada ro
 y no tienes que configurar nada. Con el mismo `robot_dos.toml` de este capítulo, el
 `/imu` de la Pi llega a tu laptop.
 
-Esto necesita que las dos computadoras tengan esta versión de Agmen (ver la sección 12,
+Esto necesita que las dos computadoras tengan esta versión de Agmen (ver la sección 13,
 sobre la misma versión), y que `[hub]` no esté apagado en ninguna.
 
 ### Qué se ve
@@ -727,12 +727,135 @@ falla, `agmen run` despide a la otra computadora, y el `before` de esa se detien
 | Direcciones | Solo IPv4 en esta versión. Si no se ven por IPv4, no hay puente y el agente lo dice |
 | Firewall | Se prueba al conectar (sección 10). Si falla, `agmen run` no arranca nada. La prueba la hace Python: en Windows, un nodo en C++ puede seguir bloqueado aunque la prueba pase |
 
-## 12. Lo que todavía no hace
+## 12. Los relojes de las dos computadoras
+
+Cada computadora tiene su propio reloj. Agmen pone la hora de cada mensaje con el
+reloj de la computadora que lo publica. Si los dos relojes no coinciden, el mismo
+instante se ve distinto en cada una.
+
+Por ejemplo: el `/imu` de la Pi dice que un dato es de las 12:00:00.035, pero tu
+laptop, en ese mismo instante, dice 12:00:00.000. El dato está bien; lo que no
+coincide es la hora de cada computadora.
+
+### Por qué importa
+
+- **Las latencias.** El panel calcula cuánto tarda un mensaje en llegar: resta la hora
+  de envío de la hora de llegada. Si los dos relojes no coinciden, la latencia sale
+  corrida por la diferencia entre ellos.
+- **Las grabaciones.** Cada mensaje guarda su hora. Si la Pi va atrasada, al
+  reproducir la grabación con tu laptop, los datos del robot llegan "tarde".
+- **Una Raspberry Pi sin pila.** La Pi no tiene un reloj que siga contando sin
+  energía. Al arrancar, muchas veces pone una hora vieja, como la de ayer, hasta que
+  se sincroniza con internet. Es el caso más común.
+
+### Qué ves
+
+Agmen mide la diferencia cada 2 segundos, y la ves en tres lugares.
+
+**En `agmen node list`**, debajo de la tabla de nodos. Sale solo cuando hay otra
+computadora en modo red (con el robot de este capítulo, cuando `agmen run` la
+conecta):
+
+```
+# relojes de las otras computadoras (respecto al de esta)
+robot: reloj +2.1 ms (±0.6)
+```
+
+Léelo así: `+2.1 ms` quiere decir que el reloj del robot va 2.1 milisegundos
+**adelantado** respecto al de tu laptop. Un signo `-` quiere decir que va atrasado.
+El `±0.6` es qué tan segura es la medición: el reloj del robot está entre 1.5 y 2.7 ms
+adelantado.
+
+Estas son las líneas que puedes ver (los números son de ejemplo):
+
+| Lo que ves | Qué significa |
+|---|---|
+| `robot: reloj +2.1 ms (±0.6)` | Medido y bien: menos de 10 ms |
+| `⚠ robot: reloj +35.0 ms (±0.6) — más de 10 ms: revisa la hora de las dos (Linux/Raspberry Pi: chrony; Windows: w32tm /resync)` | Medido y corrido, en una sesión real. Hay que arreglarlo (ver "Qué hacer") |
+| `robot: reloj +35.0 ms (±0.6) (no afecta en sim)` | Medido en simulación. Se muestra, pero no cuenta: la simulación usa su propio reloj |
+| `robot: reloj +35.0 ms (±0.6) (no afecta en reproducción)` | Lo mismo, con `--play` |
+| `robot: reloj +12.0 ms (±14.0) — la red está demasiado lenta para afirmar si va corrido` | La incertidumbre pasa de 10 ms: con eso no se puede decir nada |
+| `robot: reloj sin medir (aún no hay medición)` | Acabas de conectar: espera unos segundos |
+| `robot: reloj sin medir (el otro lado tiene un Agmen anterior, que no mide el reloj)` | El robot tiene una versión vieja de Agmen. Actualízala |
+| `robot: reloj sin medir (las mediciones salen absurdas: ¿la red tarda más de 2 s?)` | Las medidas salen fuera de lo normal: revisa la red |
+| `robot: reloj sin medir (sin conexión con esa computadora)` | Se perdió ese robot, y hay otro más conectado (ver los límites) |
+
+Si el hub no sabe el modo de la sesión, en vez de `⚠` la línea dice «si la sesión usa
+el reloj real, revisa la hora de las dos». Así no suponemos si tu sesión es real o de
+simulación.
+
+**En el panel**, en la lista de computadoras, junto al robot: `· reloj +2.1 ms (±0.6)`
+en gris. Si está corrido, aparece en rojo con `⚠` y, debajo, una línea con qué hacer.
+Si no hay medición, dice `reloj sin medir` con el motivo.
+
+**En la terminal de `agmen run`**, cuando el reloj pasa de 10 ms. El aviso sale en una
+sola línea (aquí lo partimos para leerlo):
+
+```
+agmen     │ ⚠ el reloj de robot va 35.0 ms adelantado respecto al de esta computadora (±0.6 ms): los t_data de sus topics no coinciden con los de aquí, así que las latencias y las grabaciones salen corridas. No se sabe cuál de los dos relojes está mal: revisa los dos. Qué hacer: en Linux o Raspberry Pi, instala chrony (sudo apt install chrony); sin internet, pon la hora a mano (sudo date -s '2026-01-31 12:00:00') o apunta chrony a la otra computadora; en Windows, w32tm /resync (en una terminal de administrador)
+```
+
+Si Agmen sabe que el robot es Windows, pone primero `w32tm /resync`. Cuando el reloj
+baja de 8 ms, `agmen run` lo dice con una línea `✓ el reloj de robot ya coincide con
+el de esta computadora: +1.2 ms (±0.6 ms)`. Mientras siga mal, te lo recuerda cada 10
+minutos, con `⚠ sigue igual:`.
+
+### Qué hacer
+
+Agmen **no cambia la hora** de ninguna computadora. Eso lo haces tú. Y como no sabe
+cuál de los dos relojes está mal, revisa los dos:
+
+- **Linux o Raspberry Pi**: instala `chrony` con `sudo apt install chrony`. Con
+  internet, se sincroniza solo. Sin internet, pon la hora a mano con `sudo date -s`, o
+  apunta chrony a tu laptop.
+- **Windows**: en una terminal de administrador, `w32tm /resync`.
+
+Después de sincronizar, espera unos segundos: la medición se actualiza cada 2 s.
+
+### Lo que Agmen sí hace
+
+Agmen **no cambia ningún `t_data`**: cada computadora pone su hora como siempre. Hace
+otras dos cosas:
+
+- **Corrige las latencias del panel**, cuando hay una medición vigente y la sesión es
+  real. La cuenta es: latencia real = latencia cruda + diferencia. Por ejemplo, el robot
+  va 35 ms adelantado, publica cuando tu laptop marca 1000 ms, y el dato llega a los
+  1075 ms. La cruda da 40 ms (1075 − 1035), y la real, 75 ms (40 + 35). Si no se puede
+  corregir (no hay medición, o dos computadoras publican el mismo topic), la latencia
+  sale marcada como `(sin corregir)`. En simulación y reproducción no se corrige nada.
+- **Guarda un resumen en las grabaciones.** `agmen record` escribe, por cada
+  computadora, la diferencia al empezar y al terminar, la mínima, la máxima, la
+  incertidumbre y cuántas medidas hubo. `agmen info` lo muestra así (ejemplo):
+
+```
+  reloj de robot: +35.0 ms al empezar, +35.0 ms al terminar (mín +35.0 ms, máx +35.0 ms, ±0.6 ms, 12 muestras)
+```
+
+Si la mínima y la máxima se separan más de 10 ms, `agmen info` lo marca con `⚠`: el
+reloj cambió durante la grabación (alguien lo ajustó).
+
+### Los límites
+
+| Qué | Valor |
+|---|---|
+| Cuándo avisa `agmen run` | Cuando el reloj pasa de 10 ms (solo en sesión real) |
+| Cuándo dice que ya está bien | Cuando baja de 8 ms |
+| Recordatorio mientras sigue mal | Cada 10 minutos |
+| Cada cuánto se mide | Cada 2 segundos. Se usa la mejor de las últimas 8 medidas |
+| Cuánto dura una medida | 10 segundos. Después, la computadora sale «sin medir» |
+| Se pierde un robot, y hay otro conectado | Sale «sin medir (sin conexión con esa computadora)» |
+| Se pierde el único robot | Ya no sale ninguna línea de reloj: el hub vuelve a modo local en unos 6 segundos |
+| Un salto brusco del reloj a mitad de una grabación | No se reconstruye. La mínima y la máxima lo delatan |
+| Mediciones absurdas (ida y vuelta de más de 2 s) | Se descartan. Si no queda ninguna buena, sale «sin medir» con su motivo |
+| Sincronizar los relojes | No se hace aquí: es del nivel 11 |
+
+## 13. Lo que todavía no hace
 
 Esto es honesto: el capítulo 18 cubre el robot con dos computadoras, pero no todo.
 
-- **No medimos la hora.** Si el reloj de la Pi está atrasado (no tiene pila),
-  las dos computadoras no coinciden. Medir eso y avisarte llega en el bloque 5.
+- **No sincronizamos la hora.** Agmen mide la diferencia entre los relojes y te
+  avisa (ver la sección 12), pero no corrige ninguno. Sincronizarlos de verdad es del
+  nivel 11.
 - **Una laptop a la vez** con cada agente.
 - **Usa la misma versión de Agmen en las dos computadoras.** Con una Pi en una
   versión anterior, que no aguanta cortes, la laptop no puede reanudar: la Pi
@@ -761,6 +884,7 @@ del motor deja de recibir órdenes, se detiene solo, como viste en el
   sentidos. Si no pasan, no arranca nada, y dice qué computadora no recibe y qué hacer.
 - `agmen topic list`, `topic info` y `node list` dicen de qué computadora sale cada topic
   y cada nodo.
+- `agmen node list` y el panel muestran la diferencia de reloj con el robot, y
+  `agmen run` te avisa si pasa de 10 ms y te dice qué hacer.
 
-**Siguiente (nivel 10):** medir la diferencia de reloj entre las computadoras (bloque 5)
-y cerrar el nivel. Todavía no hay capítulo para eso.
+**Siguiente (nivel 10):** cerrar el nivel. Todavía no hay capítulo para eso.

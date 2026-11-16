@@ -398,8 +398,9 @@ salidas reales de un corte de WiFi.
 
 > **Lo que todavía no hace (Agmen 0.14.0).**
 >
-> - **Nada de relojes.** Medir la diferencia de reloj entre computadoras llega en
->   el bloque 5.
+> - **Los relojes se miden, pero no se sincronizan.** `agmen run` avisa si la hora
+>   de dos computadoras difiere más de 10 ms y te dice qué hacer. Corregir los
+>   relojes es del nivel 11. Ver el [capítulo 18, sección 12](18-un-robot-varias-computadoras.md#12-los-relojes-de-las-dos-computadoras).
 
 ### ¿Por qué poner la IP y no el nombre?
 
