@@ -1,6 +1,6 @@
 # Capítulo 17 — El mismo robot en simulación y en el mundo real
 
-*Disponible desde Agmen 0.14.0 (aún sin publicar) · ⏱ 40 minutos*
+*Disponible desde Agmen 0.14.0 · ⏱ 40 minutos*
 
 En el [capítulo 5](05-un-solo-comando.md#6-perfiles-el-mismo-robottoml-para-el-robot-y-para-simulación)
 aprendiste los **perfiles**: un mismo `robot.toml` que sirve para el robot
@@ -63,7 +63,7 @@ La primera vez verás líneas de `cmake`: es la compilación que `robot.toml`
 hace antes de arrancar. Lo que importa empieza aquí:
 
 ```
-agmen   │ Agmen 0.13.0 · robot 'robot del tutorial' · 4 nodos · agmen hub en 127.0.0.1:7390
+agmen   │ Agmen 0.14.0 · robot 'robot del tutorial' · 4 nodos · agmen hub en 127.0.0.1:7390
 agmen   │ perfil sim · reloj de simulación (×1) · no corren: imu, motor (perfil real)
 agmen   │ reloj: simulación ×1, lo manda agmen run en /clock (pausa, paso y velocidad en el panel)
 agmen   │ vigilo que lleguen: /imu (100 ms)
@@ -74,15 +74,12 @@ ruedas  │ ▶ iniciado (pid 915)
 mundo   │ ▶ iniciado (pid 917)
 agmen   │ 'cerebro' no arranca solo (autostart = false); inícialo desde el panel
 agmen   │ todo arrancado. Ctrl+C para detener todo.
-mundo   │ [mundo] Agmen 0.13.0 · MuJoCo 4.0.1 · robot.xml · pasos de 2 ms · escucho /cmd · publico /imu y /camara
+mundo   │ [mundo] Agmen 0.14.0 · MuJoCo 4.0.1 · robot.xml · pasos de 2 ms · escucho /cmd · publico /imu y /camara
 mundo   │ [mundo] t=   1.0 s · ruedas izq=+0.00 der=+0.00 · x=-0.00 m y=-0.00 m rumbo=  -0°
 ```
 
 Abre <http://127.0.0.1:8080/>. Arriba del panel verás **SIMULACIÓN** en
 grande: así sabes en qué mundo estás.
-
-> La primera línea dice 0.13.0 porque en este repositorio la versión 0.14.0
-> todavía no está publicada. Cuando se publique, dirá 0.14.0.
 
 ## 3. Qué corre y qué no (y por qué)
 

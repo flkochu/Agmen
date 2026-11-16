@@ -42,7 +42,7 @@ como paquetes opcionales.
   mandan al mismo motor, **un `[[mux]]` decide quién manda**: tú le ganas al
   modo autónomo y al soltar lo retoma solo.
 
-**Versión actual: 0.13.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
+**Versión actual: 0.14.0** ([CHANGELOG](CHANGELOG.md) · [política de versiones](docs/VERSIONES.md)) · Licencia MIT
 
 | Para… | Lee |
 |---|---|
@@ -57,7 +57,7 @@ como paquetes opcionales.
 | Imágenes, tensores y texto (datos grandes) | [RFC 0008](docs/rfc/0008-datos-grandes.md) (aceptado, implementado en 0.10.0) |
 | Memoria compartida: imágenes sin copiar entre procesos | [RFC 0009](docs/rfc/0009-memoria-compartida.md) (aceptado, implementado en 0.11.0; D6 a′ en 0.11.1) |
 | Grabar, reproducir y exportar a Parquet | [RFC 0010](docs/rfc/0010-grabar-y-reproducir.md) (aceptado, implementado en 0.12.0) · [el perfil `agmen` de MCAP](docs/PROTOCOLO.md#grabaciones-mcap-desde-agmen-012) |
-| Simulación y real; nodos en varias computadoras (nivel 10) | [RFC 0011](docs/rfc/0011-sim-real-y-varias-computadoras.md) (aceptado el 2026-11-13; en curso en 0.14.0: hechos los perfiles, el mundo de MuJoCo, `[[machine]]`, `agmen agent` con clave, la reconexión, el panel con varias computadoras y el servicio (partes 3a, 3b y 3c); las partes 4a (base de los topics entre computadoras: el hub y los núcleos), 4b (el puente: los topics cruzan entre la laptop y cada robot) y 4c (la prueba de red, y de qué computadora es cada topic) están hechas; faltan relojes (bloque 5) y el cierre) |
+| Simulación y real; nodos en varias computadoras (nivel 10) | [RFC 0011](docs/rfc/0011-sim-real-y-varias-computadoras.md) (aceptado el 2026-11-13; implementado en 0.14.0: perfiles, el mundo de MuJoCo, `[[machine]]`, `agmen agent` con clave, la reconexión, el panel con varias computadoras, los topics entre computadoras, la prueba de red, los relojes medidos y el banco `bench/dos_computadoras.py`) |
 | Mandos del panel para cualquier tipo y quién manda en el mux | [RFC 0012](docs/rfc/0012-mandos-del-panel-y-quien-manda.md) (aceptado, implementado en 0.13.0) |
 | Publicar versiones | [`docs/PUBLICAR.md`](docs/PUBLICAR.md) |
 
@@ -77,7 +77,8 @@ como paquetes opcionales.
 | 0.10.0 ✅ | 7 | Imágenes, tensores y texto: `string`, `bytes`, `T[]` y `tensor<T,N>` en tus `.agmen` (codificación `arrow`, por TCP), `agmen.msgs.Imagen`, cámara en el panel y en Foxglove |
 | 0.11.0 ✅ | 8 | Memoria compartida: en la misma computadora, las imágenes y los tensores no se copian entre procesos (C++ y Python); en computadoras distintas, TCP |
 | 0.12.0 ✅ | 9 | Grabar y reproducir: `agmen record`, `agmen play` con el tiempo de la grabación, el `.mcap` en el panel (barra de tiempo) y en Foxglove, y `agmen export --parquet` / `agmen.Recording` para entrenar |
-| **0.13.0 ✅** | **—** | **El panel manda cualquier tipo: botones con un mensaje fijo y deslizadores, con hombre muerto; el mux dice quién manda (`/mux/<nombre>`) y `max_gap_ms` avisa cuando un topic deja de llegar** |
+| 0.13.0 ✅ | — | El panel manda cualquier tipo: botones con un mensaje fijo y deslizadores, con hombre muerto; el mux dice quién manda (`/mux/<nombre>`) y `max_gap_ms` avisa cuando un topic deja de llegar |
+| **0.14.0 ✅** | **10** | **Simulación y real: el robot del tutorial en MuJoCo o en el mundo real con `--sim` y perfiles en `robot.toml`; nodos y topics en varias computadoras de la misma red (`[[machine]]`, `agmen agent` con clave, reconexión); la diferencia de reloj se mide y se avisa; `bench/dos_computadoras.py` mide la latencia y los MB/s entre dos computadoras** |
 | … | 10–14 | Ver [`docs/VISION.md`](docs/VISION.md#7-roadmap-por-niveles) |
 
 ## Estructura
@@ -110,7 +111,7 @@ agmen/
 │   └── panel/               panel web: servidor, puente (bridge.py), agmen.js, mcap.js (grabaciones) y la página
 ├── cmake/                   AgmenMessages.cmake: agmen_add_messages()
 ├── scripts/                 interop, web, foxglove, run, grabar, paralelo, topics, gen, tutorial y check_version (todos corren en el CI)
-├── bench/                   mediciones que respaldan decisiones de diseño (shm_vs_tcp.py: RFC 0009; grabar.py: RFC 0010)
+├── bench/                   mediciones que respaldan decisiones de diseño (shm_vs_tcp.py: RFC 0009; grabar.py: RFC 0010; dos_computadoras.py: RFC 0011, capítulo 18)
 ├── docs/                    tutorial/, VISION, PROTOCOLO, VERSIONES, PUBLICAR, rfc/
 └── .github/workflows/       ci.yml (3 sistemas, ARM incluido, + sanitizers y fuzzing) · release.yml (PyPI + GitHub Release)
 ```

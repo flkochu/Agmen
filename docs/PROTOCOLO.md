@@ -180,7 +180,7 @@ abre, lo recorta y lo junta; para entender los mensajes basta este documento.
 | `Schema` | `name` = el nombre del tipo (`Imagen`), `encoding = "agmen"`, `data` = el esquema canónico en UTF-8 (`agmen/1 Imagen{…}`), el mismo texto que viaja en el anuncio |
 | `Channel` | uno por topic: `topic = "/camara"`, `message_encoding = "agmen"`; en sus metadatos, `schema_id` (16 cifras hexadecimales) y `encoding` (`compact` o `arrow`) |
 | `Message` | `data` = **el paquete de Agmen completo** (sobre de 64 bytes + payload, como arriba); `publish_time` = `t_pub`; `log_time` = cuándo lo recibió el grabador (en el reloj del robot: real, sim o replay); `sequence` = los 32 bits bajos de `seq` |
-| `Metadata` | `agmen.grabacion`: `version`, `computadora`, `reloj` (real, sim, replay), `inicio`, `topics` y, con `agmen run`, `robot`, `comando` y `perfil` (opcional, desde 0.14.0: el perfil con que corrió `agmen run`, ej. `real`, `sim`, `replay`; `agmen record` suelto no lo escribe, y las grabaciones sin este campo se leen igual). `agmen.perdidos`: `"<topic> <motivo>"` → cuántos se perdieron (`disco`, `antes de llegar` = huecos de `seq`, `sin anuncio`) y `total` |
+| `Metadata` | `agmen.grabacion`: `version`, `computadora`, `reloj` (real, sim, replay), `inicio`, `topics` y, con `agmen run`, `robot`, `comando` y `perfil` (opcional, desde 0.14.0: el perfil con que corrió `agmen run`, ej. `real`, `sim`, `replay`; `agmen record` suelto no lo escribe, y las grabaciones sin este campo se leen igual). `agmen.perdidos`: `"<topic> <motivo>"` → cuántos se perdieron (`disco`, `antes de llegar` = huecos de `seq`, `sin anuncio`) y `total`. `agmen.relojes` (desde 0.14.0, solo si hubo medición de otra computadora): una clave por computadora, con su resumen de la diferencia de reloj (ver abajo) |
 | `Attachment` | con `agmen run`, el `robot.toml` (`text/plain`) |
 | *Chunks* | de unos 4 MiB o 1 s, con `MessageIndex`; sin comprimir o con `zstd`/`lz4`; resumen completo (`ChunkIndex`, `Statistics`, `MetadataIndex`…) al cerrar |
 
@@ -194,21 +194,20 @@ abre, lo recorta y lo junta; para entender los mensajes basta este documento.
   JavaScript (`python/agmen/panel/mcap.js`, el del panel) y la biblioteca
   oficial de MCAP. Los tres leen igual el vector
   [`tests/vectors/grabacion.mcap`](../tests/vectors/grabacion.mcap).
-- **La diferencia de relojes** (desde 0.14.0, bloque 5, RFC 0011 §3.6). Si hubo otra
-  computadora con medición, `agmen record` (y `agmen run --record`) guarda en
-  `agmen.grabacion` la clave opcional `relojes`, con un objeto JSON en texto:
-  `{"<computadora>": {"inicio_ns", "fin_ns", "min_ns", "max_ns", "error_ns",
-  "muestras"}}`. Cada valor es la diferencia respecto a la computadora que graba
-  (positivo = la otra va adelantada), tomada al empezar, cada ~10 s y al terminar.
-  `inicio_ns` y `fin_ns` son la primera y la última medida; `min_ns` y `max_ns`, la
-  mínima y la máxima; `error_ns` es la mayor incertidumbre, y `muestras` cuántas
-  medidas se usaron. Sin otras computadoras, o sin ninguna medición, la clave no
-  aparece: la grabación es igual a la de antes. `agmen info` la muestra.
-- Al cerrar, si hubo `relojes`, el grabador escribe un **segundo** registro
-  `agmen.grabacion`, igual al primero más esa clave. Los lectores de Python
-  (`agmen info`, `agmen.Recording`) usan el último. El visor del panel usa el
-  primero, que no la trae. Si el grabador muere antes de cerrar, queda solo el primero.
-  - Pendiente de decisión del autor: pasarlo a un registro aparte `agmen.relojes`.
+- **La diferencia de relojes** (desde 0.14.0, bloque 5, RFC 0011 §3.6). `agmen.grabacion`
+  se escribe una sola vez, al empezar, y no lleva nada de relojes. Al cerrar cada
+  archivo, si hubo alguna medición de otra computadora, `agmen record` (y `agmen run
+  --record`) escribe un registro de metadatos aparte, `agmen.relojes`: **una clave por
+  computadora**, y de valor su resumen en JSON compacto (texto, como todos los
+  metadatos de MCAP):
+  `"<computadora>": {"inicio_ns", "fin_ns", "min_ns", "max_ns", "error_ns", "muestras"}`.
+  Cada valor es la diferencia respecto a la computadora que graba (positivo = la otra
+  va adelantada), tomada al empezar, cada ~10 s y al terminar. `inicio_ns` y `fin_ns`
+  son la primera y la última medida; `min_ns` y `max_ns`, la mínima y la máxima;
+  `error_ns` es la mayor incertidumbre, y `muestras` cuántas medidas se usaron.
+  Sin otras computadoras, o sin ninguna medición, el registro no se escribe: la
+  grabación queda como la de antes. Si el grabador muere antes de cerrar, tampoco
+  hay `agmen.relojes`. `agmen info` lo muestra; el visor del panel no lo usa.
 - Riesgo aceptado: un salto brusco del reloj a media grabación no se reconstruye
   (se consulta cada ~10 s); la mínima y la máxima solo lo delatan.
 
@@ -332,11 +331,11 @@ agmen-hub/1 red_ok peers=0
 
 ```
 agmen-hub/1 ping
-agmen-hub/1 pong version=0.13.0 red=1
+agmen-hub/1 pong version=0.14.0 red=1
 agmen-hub/1 ok id=s1 peers=192.168.1.20,192.168.1.5
 ```
 
-(`version` es la de tu Agmen. Hoy el código dice 0.13.0.)
+(`version` es la de tu Agmen. Hoy el código dice 0.14.0.)
 
 - Al volver a modo local, el hub quita las entradas de otra computadora y avisa a
   los Publisher con `subs`, como cuando un Subscriber se va.
@@ -709,7 +708,7 @@ Ejemplo de un `reanudar` (la firma va al final, aquí se omite):
 Ejemplo de un `sesion` (la firma va al final de la línea, aquí se omite):
 
 ```
-1 {"op":"sesion","perfil":"real","reloj":"real","agmen":"0.13.0","maquina":"robot","nodos":{"motor":{"cmd":"python latido.py motor","restart":"on-failure"}},"no_arrancar":["motor"]} <firma>
+1 {"op":"sesion","perfil":"real","reloj":"real","agmen":"0.14.0","maquina":"robot","nodos":{"motor":{"cmd":"python latido.py motor","restart":"on-failure"}},"no_arrancar":["motor"]} <firma>
 ```
 
 ### Mensajes del agente a la laptop
