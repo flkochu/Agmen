@@ -9,6 +9,7 @@ es. Esperas con tope; puertos elegidos por el sistema."""
 from __future__ import annotations
 
 import io
+import json
 import os
 import signal
 import socket
@@ -324,7 +325,8 @@ def con_before(case) -> None:
     """Un [robot] before que deja una marca (case.marca), fuera de marcas/ (ahí solo escriben los nodos)."""
     (case.dir / "antes.py").write_text(ANTES_PY, encoding="utf-8")
     case.marca = case.dir / "before_corrio"
-    case.antes = f'before = ["python {(case.dir / "antes.py").as_posix()} {case.marca.as_posix()}"]\n'
+    # §6.2: como lista de argumentos (una ruta con espacios no lo rompe)
+    case.antes = f'before = [{json.dumps(["python", (case.dir / "antes.py").as_posix(), case.marca.as_posix()])}]\n'
 
 
 class TestPrimeroLaSonda(SondaCase):
@@ -415,6 +417,112 @@ class TestPrimeroLaSonda(SondaCase):
         link.close()
 
 
+    def conectar_cli(self, otros: dict | None = None):
+        """cli._connect de verdad con este agente (y, si hay, `otros`: {nombre: Falso}). Ctrl+C: KeyboardInterrupt."""
+        cfg, m = self.machine()
+        link = agent.AgentLink(m, toml_hint=str(self.toml))
+        remotes = {"robot": link}
+        for nombre, falso in (otros or {}).items():
+            remotes[nombre] = agent.AgentLink(SimpleNamespace(name=nombre, host="127.0.0.1", port=falso.port))
+        for l in remotes.values():
+            l.attach(None, lambda who, text, kind, droppable=False: self.notas.append(text))
+            self.addCleanup(l.close)
+        said: list[str] = []
+        launcher = SimpleNamespace(say=lambda t, k="agmen": said.append(t))
+        real = agent.session_message
+
+        def mensaje(config, name, clock, desde=None, sonda=False):
+            if name == "robot":
+                return real(cfg, "robot", clock, desde, sonda=sonda)
+            return {"op": "sesion", "perfil": "real", "reloj": "real", "agmen": "0", "maquina": name, "nodos": {},
+                    "no_arrancar": [], "tablas": 1, "desde": desde, **({"sonda": 1} if sonda else {})}
+
+        self.addCleanup(signal.signal, signal.SIGINT, signal.getsignal(signal.SIGINT))
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        lost: list[str] = []
+        with mock.patch.object(agent, "session_message", mensaje):
+            err = cli._connect(launcher, None, remotes, {n: (TA.KEY, "env") for n in remotes}, "real", lost,
+                               threading.Event(), "laptop", net_check=True)
+        return err, lost, said, remotes
+
+    def test_varios_robots_con_apertura_lenta_el_al_dia_espera_sin_caducar(self):
+        """§6.1 (el defecto de la revisión): las sesiones se abren una tras otra; mientras se abre la de 'brazo' (un
+        agente anterior cuyo before tarda más que el silencio), 'robot' (al día, en sonda_espera) sigue esperando:
+        la laptop le manda ping. Con un tope fijo como el de antes (ESPERA_SIGUE_S, aquí 1 s si existiera), 'robot'
+        rechazaba la sesión y no arrancaba nada."""
+        lento = Falso(self, capaz=False, tarda=2.5)
+        with mock.patch.object(agent, "SILENCE_TIMEOUT", 1.0), mock.patch.object(agent, "PING_EVERY", 0.2), \
+                mock.patch.object(agent, "AVISO_ESPERA_S", 0.4), \
+                mock.patch.object(agent, "ESPERA_SIGUE_S", 1.0, create=True):
+            err, lost, said, remotes = self.conectar_cli({"brazo": lento})
+        self.assertEqual((err, lost), ("", []), (said, self.said))
+        robot, brazo = remotes["robot"], remotes["brazo"]
+        self.assertFalse(robot.waiting)
+        self.assertTrue(robot.session_id and brazo.session_id)
+        self.assertIsNotNone(robot._reader)
+        self.assertEqual(self.pasos, ["sonda_espera", "sonda", "before", "hub", "sesion_ok"])
+        self.assertTrue(self.marca.exists())
+        self.assertGreaterEqual(lento.ordenes.count("ping"), 3, lento.ordenes)
+        avisos = [t for t, _ in self.said if "sigo esperando a que la laptop termine con las otras computadoras" in t]
+        self.assertTrue(avisos, self.said)
+        self.assertEqual(avisos[0], "laptop 127.0.0.1: sigo esperando a que la laptop termine con las otras "
+                                    "computadoras (la prueba de red, abrir sus sesiones; llevo 1 min): no preparo "
+                                    "nada hasta su 'sigue'")
+        self.assertFalse([t for t, _ in self.said if "dejó de contestar" in t], self.said)
+
+    def test_ctrl_c_en_connect_durante_la_prueba_despide_sin_correr_nada(self):
+        """§6.3: Ctrl+C dentro de cli._connect mientras se hacen las pruebas (_net_checks)."""
+        orig = sonda.Lado.listen
+
+        def listen(self_, peer):
+            orig(self_, peer)
+            if threading.current_thread().name.startswith("agmen-sonda-"):
+                signal.raise_signal(signal.SIGINT)
+
+        with mock.patch.object(sonda.Lado, "listen", listen), self.assertRaises(KeyboardInterrupt):
+            self.conectar_cli()
+        self.assertTrue(until(lambda: self.server.session is None), self.said)
+        self.assertEqual(self.pasos, ["sonda_espera", "sonda"])
+        self.assertFalse(self.marca.exists(), "corrió el [robot] before")
+        self.sin_arrancar_nada()
+        self.assertTrue(any(t == "la laptop (127.0.0.1) se despidió tras la prueba de red: no preparé nada"
+                            for t, _ in self.said), self.said)
+
+    def test_ctrl_c_en_connect_esperando_el_sesion_ok_despide(self):
+        """§6.3: Ctrl+C dentro de cli._connect tras `sigue`, mientras se espera el sesion_ok (wait_ok)."""
+        orig = agent._Session._run_before
+
+        def run_before(self_, cmd):
+            signal.raise_signal(signal.SIGINT)   # (llega al hilo principal: el de wait_ok)
+            time.sleep(1.0)
+            return orig(self_, cmd)
+
+        with mock.patch.object(agent._Session, "_run_before", run_before), self.assertRaises(KeyboardInterrupt):
+            self.conectar_cli()
+        self.assertTrue(until(lambda: self.server.session is None), self.said)
+        self.assertNotIn("sesion_ok", self.pasos)
+        self.sin_arrancar_nada()
+        self.assertTrue(any(t == "la laptop (127.0.0.1) se despidió" for t, _ in self.said), self.said)
+
+    def test_sesion_nueva_tras_perder_la_gracia_con_el_agente_de_verdad(self):
+        """§5.3 y §6.3: el agente ya no tiene la sesión (la terminó): al reconectar, la sesión nueva también espera la
+        prueba (sonda_espera), la laptop la hace y manda `sigue`; su before corre después de la prueba."""
+        link = self.abrir()
+        link.took_probe(link.net_check().ok)
+        link.proceed()
+        self.assertTrue(link.keep_trying())
+        self.assertTrue(link.go())
+        primera, n = self.server.session, len(self.pasos)
+        primera.end("prueba: el agente terminó la sesión (como si hubiera vencido la gracia)")
+        self.assertTrue(until(lambda: self.server.session not in (None, primera) and self.server.session.ready.is_set()
+                              and link.channel is not None and link.down_since is None, 30), (self.pasos, self.notas))
+        nuevos = self.pasos[n:]
+        self.assertEqual(nuevos[:3], ["sonda_espera", "sonda", "before"], nuevos)
+        self.assertEqual(nuevos[-1], "sesion_ok", nuevos)
+        self.assertFalse(link.waiting)
+        self.assertIsNone(link.lost or None)
+
+
 class TestAgenteCrudo(TA.ServerCase):
     """El agente de verdad, hablándole directo (una laptop de mentira)."""
 
@@ -448,17 +556,51 @@ class TestAgenteCrudo(TA.ServerCase):
         self.assertTrue(r.wait(lambda ms: any(m["op"] == "reanudar_ok" for m in ms)), r.msgs)
         self.assertEqual(r.first("reanudar_ok").get("sonda"), 1)
 
-    def test_sigue_que_no_llega_es_sesion_error_sonda_y_queda_libre(self):
-        with mock.patch.object(agent, "ESPERA_SIGUE_S", 0.5):
+    def test_la_laptop_que_calla_en_la_espera_es_sesion_error_sonda_y_queda_libre(self):
+        """§6.1: sin `sigue` ni ping, el silencio de siempre termina la espera: sesion_error "sonda" con un texto
+        verdadero (sin "vuelve a correr agmen run"), no preparó nada y queda libre para otra laptop."""
+        with mock.patch.object(agent, "SILENCE_TIMEOUT", 0.5):
             c = self.en_espera()
             self.assertTrue(c.wait(c.hay("sesion_error")), c.msgs)
         self.assertEqual(c.first("sesion_error")["codigo"], "sonda")
-        self.assertEqual(c.first("sesion_error")["texto"],
-                         "robot: la laptop no terminó la prueba de red en 0.5 s; vuelve a correr agmen run")
+        texto = "robot: la laptop dejó de contestar durante la prueba de red (no dijo nada en 0.5 s): no preparé nada"
+        self.assertEqual(c.first("sesion_error")["texto"], texto)
         self.assertTrue(until(lambda: self.server.session is None))
+        self.assertIn((f"rechacé la sesión de 127.0.0.1: {texto}", "error"), self.said)
         self.assertIsNone(c.first("sesion_ok"))
         c2, ok = self.sesion(msg=self.mensaje(tablas=1, desde="laptop"))   # libre para otra laptop
         self.assertEqual(ok["op"], "sesion_ok", ok)
+
+    def test_la_espera_dura_mientras_la_laptop_mande_ping_y_lo_dice_cada_tanto(self):
+        """§6.1: sin tope fijo; con ping, la espera pasa de largo el silencio, y cada AVISO_ESPERA_S una línea."""
+        with mock.patch.object(agent, "SILENCE_TIMEOUT", 0.5), mock.patch.object(agent, "AVISO_ESPERA_S", 0.3):
+            c = self.en_espera()
+            hasta = time.monotonic() + 2.0   # cuatro veces el silencio
+            while time.monotonic() < hasta:
+                c.send({"op": "ping", "t": "x"})
+                time.sleep(0.1)
+            self.assertIsNone(c.first("sesion_error"), c.msgs)
+            self.assertTrue(self.server.session is not None and self.server.session._awaiting)
+            avisos = [t for t, _ in self.said if "sigo esperando a que la laptop termine" in t]
+            self.assertGreaterEqual(len(avisos), 2, self.said)
+            self.assertEqual(self.sigue(c)["op"], "sesion_ok")
+        n = len(avisos)
+        time.sleep(0.6)
+        self.assertEqual(len([t for t, _ in self.said if "sigo esperando a que la laptop termine" in t]), n)
+
+    def test_reanudar_hacia_una_sesion_en_espera_es_un_error_verdadero(self):
+        """§6.2: la sesión en espera aún no está abierta: no se dice "los nodos están detenidos"."""
+        c = self.en_espera()
+        r = self.conectar()
+        r.send({"op": "reanudar", "sesion": "0" * 32, "logs": {}})
+        self.assertTrue(r.wait(r.hay("sesion_error")), r.msgs)
+        err = r.first("sesion_error")
+        self.assertEqual(err["codigo"], "sesion")
+        self.assertEqual(err["texto"], "robot: no hay ninguna sesión abierta que reanudar (la de la laptop 127.0.0.1 "
+                                       "aún espera la prueba de red y no corrió nada aquí). Abre una sesión nueva")
+        self.ping(c)   # la que espera no se entera
+        self.assertIsNone(c.first("sesion_error"))
+        self.assertEqual(self.sigue(c)["op"], "sesion_ok")
 
     def test_otra_orden_antes_de_sigue_es_un_error_y_la_conexion_sigue(self):
         c = self.en_espera()
@@ -543,8 +685,10 @@ class Falso:
     `sigue` (`espera=False`: sesion_ok directo con "sonda", lo que no existe en campo: §5.2). `ordenes`: lo que llegó."""
 
     def __init__(self, case, modos=(), capaz=True, barrera: threading.Barrier | None = None, espera: bool = True,
-                 sin_reanudar: bool = False):
+                 sin_reanudar: bool = False, tarda: float = 0.0, adios_en_espera: bool = False):
         self.sin_reanudar = sin_reanudar   # a `reanudar`, sesion_error "sesion" (perdió la gracia): sesión nueva
+        self.tarda = tarda                 # el sesion_ok directo sale tras tantos s (un before lento; contesta ping)
+        self.adios_en_espera = adios_en_espera   # tras sonda_espera, adios (lo cerraron allá) y nada más
         self.modos = list(modos)
         self.capaz = capaz
         self.espera = espera
@@ -566,7 +710,19 @@ class Falso:
         if first["op"] == "sesion":
             if self.capaz and self.espera and first.get("sonda") == 1:
                 ch.send({"op": "sonda_espera"})
+                if self.adios_en_espera:
+                    ch.send({"op": "adios", "motivo": "Ctrl+C"})
+                    return
             else:
+                hasta = time.monotonic() + self.tarda   # (como el de verdad: mientras corre su before, contesta ping)
+                while hasta > time.monotonic():
+                    try:
+                        msg = ch.recv(hasta - time.monotonic())
+                    except agent.ChannelTimeout:
+                        break
+                    self.ordenes.append(msg["op"])
+                    if msg["op"] == "ping":
+                        ch.send({"op": "pong", "t": msg.get("t")})
                 ch.send(ok)
         elif self.sin_reanudar:
             ch.send({"op": "sesion_error", "codigo": "sesion", "texto": "robot: esa sesión ya terminó"})
@@ -952,10 +1108,13 @@ class TestAgmenRun(TA.LinkCase):
 
 
 class TestVariosRobots(FalsoCase):
-    def conectar(self, falsos, nombres=("robot", "brazo")):
-        """cli._connect de verdad con agentes de mentira: abre, prueba y (si todas pasan) `sigue` a todas."""
+    def conectar(self, falsos, nombres=("robot", "brazo"), preparar=None):
+        """cli._connect de verdad con agentes de mentira: abre, prueba y (si todas pasan) `sigue` a todas.
+        `preparar(remotes)`: antes de conectar (p. ej. para cambiar un enlace)."""
         remotes = {n: agent.AgentLink(SimpleNamespace(name=n, host="127.0.0.1", port=f.port))
                    for f, n in zip(falsos, nombres)}
+        if preparar is not None:
+            preparar(remotes)
         for link in remotes.values():
             link.attach(None, lambda who, text, kind, droppable=False: self.notas.append(text))
             self.addCleanup(link.close)
@@ -998,9 +1157,45 @@ class TestVariosRobots(FalsoCase):
         a, b = Falso(self, capaz=False), Falso(self, ["dice_no_udp"])
         error, said, lost, remotes = self.conectar([a, b])
         self.assertIn("la prueba de red con 'brazo' no pasó", error)
-        self.assertIn("(en 'robot' sí corrió su preparación, [robot] before y su hub", error)
+        self.assertIn("(en 'robot' sí corrió su preparación, porque su agmen agent no esperó", error)
+        self.assertNotIn("[robot] before y su hub", error)   # §6.2: no se afirma lo que no se sabe
         self.assertNotIn("en 'brazo' sí corrió", error)
         self.assertEqual(b.sigues, 0)
+
+    def test_un_adios_del_agente_en_la_espera_es_una_conexion_perdida(self):
+        """§6.3: lo cerraron allá (adios) mientras esperaba la prueba: conexión perdida, sin `sigue`, y el consejo
+        de volver a correr agmen run una sola vez."""
+        falso = Falso(self, adios_en_espera=True)
+        link = self.link(falso)
+        self.assertTrue(until(lambda: bool(link.lost)), self.notas)
+        self.assertIn("robot (127.0.0.1", link.lost)
+        self.assertIn("cerraron agmen agent allá (Ctrl+C) mientras esperaba la prueba de red", link.lost)
+        self.assertIn("No arrancó nada", link.lost)
+        self.assertEqual(link.lost.lower().count("vuelve a correr agmen run"), 1, link.lost)
+        self.assertEqual(falso.sigues, 0)
+
+    def test_robot_perdido_entre_un_sigue_y_otro_no_salen_mas(self):
+        """§6.2: antes de CADA `sigue` se vuelve a mirar: si 'brazo' se pierde tras el `sigue` de 'robot', 'pinza'
+        ya no lo recibe y todos reciben adios."""
+        a, b, c = Falso(self), Falso(self), Falso(self)
+
+        def preparar(remotes):
+            orig = remotes["robot"].go_on
+
+            def go_on():
+                orig()
+                b.chans[0].sock.shutdown(socket.SHUT_RDWR)
+                until(lambda: bool(remotes["brazo"].lost))
+
+            remotes["robot"].go_on = go_on
+
+        error, said, lost, remotes = self.conectar([a, b, c], ("robot", "brazo", "pinza"), preparar)
+        self.assertEqual(error, "", said)
+        self.assertEqual(len(lost), 1, lost)
+        self.assertIn("brazo (127.0.0.1", lost[0])
+        self.assertEqual((a.sigues, b.sigues, c.sigues), (1, 0, 0))
+        self.assertTrue(until(lambda: a.ordenes[-1:] == ["adios"] and c.ordenes[-1:] == ["adios"]),
+                        (a.ordenes, c.ordenes))
 
 
     def test_dos_robots_en_paralelo(self):

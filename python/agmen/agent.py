@@ -87,7 +87,9 @@ RESUME_LOG_LINES = 2000         # para reanudar: las últimas líneas de log de 
 RESUME_LOG_BYTES = 1024 * 1024  # … y con tope en bytes
 RESUME_MAX_NODES = 1024         # reanudar: entradas de 'logs' que se aceptan
 RESUME_CONFIRM = 1.0            # §13: un reanudar al final de la gracia la prorroga hasta esto (una vez por gracia)
-ESPERA_SIGUE_S = 30.0           # 4c §5.1: tras sonda_espera, lo que el agente espera el `sigue` de la laptop
+# 4c §6.1: tras sonda_espera el agente espera el `sigue` sin tope fijo, mientras la laptop siga ahí (sus ping; el
+# silencio de siempre, SILENCE_TIMEOUT, la da por perdida). Cada tanto lo dice en su terminal.
+AVISO_ESPERA_S = 60.0
 
 WRITTEN_KEYS = ("cmd", "env", "cwd", "restart", "autostart", "profile")   # lo escrito que se compara (D7)
 CLOCKS = ("real", "sim", "replay")
@@ -1200,6 +1202,14 @@ class AgentServer:
             if stopping:
                 self._refuse_now(channel, ip, "ocupado", "el agente se está cerrando")
                 return
+            if session is not None and session._awaiting:
+                # 4c §6.2: la única sesión de aquí aún no está abierta (espera la prueba de red; no corrió nada): no hay
+                # nada que reanudar (y no se dice "los nodos están detenidos": nunca arrancaron).
+                self._refuse_now(channel, ip, "sesion",
+                                 f"{self.machine}: no hay ninguna sesión abierta que reanudar (la de la laptop "
+                                 f"{session.ip} aún espera la prueba de red y no corrió nada aquí). Abre una sesión "
+                                 f"nueva")
+                return
             # La identidad: el saludo (la clave) y el identificador de la sesión (comparado en tiempo constante).
             if session is None or not session.ready.is_set() or not _same(sid, session.id) \
                     or not session.resume(channel, ip, logs):
@@ -1503,10 +1513,12 @@ class _Session:
         self._probing: Channel | None = None
         self._probe_lock = threading.Lock()
         # 4c §5.1: con la prueba de red primero, el agente contesta sonda_espera y no corre nada (ni [robot] before,
-        # ni el hub, ni nodos) hasta el `sigue` de la laptop; con tope ESPERA_SIGUE_S (con self._end_lock).
+        # ni el hub, ni nodos) hasta el `sigue` de la laptop; sin tope fijo (§6.1): mientras la laptop no calle
+        # SILENCE_TIMEOUT. `_await_timer`: el aviso de cada AVISO_ESPERA_S (con self._end_lock).
         self._tables_known = False           # ¿ya se decidió el puente (antes de sonda_espera)?
         self._awaiting = False               # dijo sonda_espera y aún no llega `sigue`
         self._await_timer: threading.Timer | None = None
+        self._await_since = 0.0              # desde cuándo espera (monotonic)
         self.bridge = None
         self.peer = None
         self.sender = self._start_sender(channel, self.out)
@@ -1892,26 +1904,56 @@ class _Session:
                 self._setup_thread.start()
 
     def _await_probe(self) -> None:
-        """4c §5.1: contesta sonda_espera y espera el `sigue` de la laptop, como mucho ESPERA_SIGUE_S (si no llega,
-        sesion_error "sonda" y el agente queda libre). Mientras, solo sonda, ping y adios (lo lee _loop)."""
-        timer = threading.Timer(ESPERA_SIGUE_S, self._no_go)
-        timer.daemon = True
+        """4c §5.1 y §6.1: contesta sonda_espera y espera el `sigue` de la laptop, sin tope fijo: la espera acaba con
+        `sigue`, `adios`, el cierre o la pérdida de la conexión, o el silencio de siempre (_loop: SILENCE_TIMEOUT sin
+        nada; la laptop manda ping mientras tanto). Mientras, solo sonda, ping y adios; cada AVISO_ESPERA_S, una línea
+        en la terminal."""
         with self._end_lock:
             if self._ending:
                 return
-            self._awaiting, self._await_timer = True, timer
-            timer.start()
+            self._awaiting, self._await_since = True, time.monotonic()
+            self._remind_later()
         self.send({"op": "sonda_espera"})
         self.say(f"laptop {self.ip}: primero la prueba de red; no preparo nada ([robot] before, hub, nodos) hasta "
                  f"que la laptop diga que sigue", "out")
 
-    def _no_go(self) -> None:
+    def _remind_later(self) -> None:
+        """Con self._end_lock: arma el próximo aviso de la espera (§6.1)."""
+        timer = threading.Timer(AVISO_ESPERA_S, self._remind)
+        timer.daemon = True
+        self._await_timer = timer
+        timer.start()
+
+    def _remind(self) -> None:
+        """§6.1: sigue esperando el `sigue` (la laptop está ahí, p. ej. abriendo la sesión con otra computadora)."""
         with self._end_lock:
             if not self._awaiting or self._ending:
                 return
-            self._awaiting, self._await_timer = False, None
-        self._refused("sonda", f"{self.server.machine}: la laptop no terminó la prueba de red en "
-                               f"{ESPERA_SIGUE_S:g} s; vuelve a correr agmen run")
+            waited = time.monotonic() - self._await_since
+            try:
+                self._remind_later()
+            except Exception:   # (sin hilo nuevo: no hay más avisos; la espera sigue igual, la cuida _loop)
+                self._await_timer = None
+        minutes = max(1, int(waited // 60))
+        self.say(f"laptop {self.ip}: sigo esperando a que la laptop termine con las otras computadoras (la prueba de "
+                 f"red, abrir sus sesiones; llevo {minutes} min): no preparo nada hasta su 'sigue'", "out")
+
+    def _silent_wait(self, channel: Channel) -> None:
+        """§6.1: la laptop calló SILENCE_TIMEOUT durante la espera: sesion_error "sonda" (por si aún lee), sin haber
+        preparado nada, y el agente queda libre. Si ya no espera (no debería: solo este hilo lee `sigue`), _lost."""
+        with self._end_lock:
+            waiting = self._awaiting and not self._ending and channel is self.channel
+            if waiting:
+                timer, self._awaiting, self._await_timer = self._await_timer, False, None
+        if not waiting:
+            self._lost(channel, f"no dijo nada en {SILENCE_TIMEOUT:g} s",
+                       f"la laptop ({self.ip}) no dijo nada en {SILENCE_TIMEOUT:g} s: se perdió la conexión. "
+                       f"Detengo los nodos")
+            return
+        if timer is not None:
+            timer.cancel()
+        self._refused("sonda", f"{self.server.machine}: la laptop dejó de contestar durante la prueba de red (no dijo "
+                               f"nada en {SILENCE_TIMEOUT:g} s): no preparé nada")
 
     def _go_on(self) -> None:
         """Llegó `sigue` (4c §5.1): ahora sí, lo de siempre (before, nodos ajenos, hub, sesion_ok, puente)."""
@@ -2101,6 +2143,9 @@ class _Session:
             try:
                 msg = channel.recv(SILENCE_TIMEOUT)
             except ChannelTimeout:
+                if self._awaiting:   # 4c §6.1: la laptop calló durante la prueba de red (no corrió nada aquí)
+                    self._silent_wait(channel)
+                    return
                 self._lost(channel, f"no dijo nada en {SILENCE_TIMEOUT:g} s",
                            f"la laptop ({self.ip}) no dijo nada en {SILENCE_TIMEOUT:g} s: se perdió la conexión. "
                            f"Detengo los nodos")
@@ -2732,7 +2777,11 @@ class AgentLink:
         return self._waiting is not None
 
     def _wait_probe(self, channel: Channel, contact: float, retry: bool) -> _Espera:
-        """sonda_espera: un hilo lee la conexión mientras se hace la prueba y, tras `sigue`, hasta el sesion_ok."""
+        """sonda_espera: un hilo lee la conexión mientras se hace la prueba y, tras `sigue`, hasta el sesion_ok.
+        4c §6.1: el hilo de ping de esta conexión (lo arrancó open() o el reintento, antes de mandar `sesion`) sigue
+        mandando ping cada PING_EVERY toda la espera, aunque el hilo principal esté abriendo la sesión con otra
+        computadora: así el agente no da a esta laptop por perdida. Si el agente calla SILENCE_TIMEOUT, el lector de
+        la espera lo da por perdido (_wait_ok)."""
         esp = _Espera(channel, contact, retry)
         esp.thread = threading.Thread(target=self._wait_read, args=(esp,), daemon=True,
                                       name=f"agmen-espera-{self.name}")
@@ -2764,7 +2813,8 @@ class AgentLink:
         with self._lock:
             mine = self._waiting is esp and not self._closing and not self.lost
             if mine:
-                self.lost = f"{e}. No arrancó nada; vuelve a correr agmen run"
+                again = "" if "vuelve a correr agmen run" in str(e).lower() else "; vuelve a correr agmen run"
+                self.lost = f"{e}. No arrancó nada{again}"   # (§6.2: sin repetir lo que el texto ya dice)
                 self.state_since = time.monotonic()
         if mine:
             self._done.set()

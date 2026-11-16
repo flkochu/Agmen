@@ -539,7 +539,9 @@ def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list
     `net_check` (y puente), la prueba de red con todas a la vez (4c): si falla con alguna,
     es un error como "no contesta" (no arranca nada). 4c §5.1: los agentes al día esperan la
     prueba sin preparar nada (sonda_espera); solo cuando pasó con TODAS reciben `sigue` (a la
-    vez: cada uno espera como mucho 30 s) y se espera el sesion_ok de cada una."""
+    vez) y se espera el sesion_ok de cada una. §6.1: la espera de cada agente dura mientras esta
+    laptop le mande ping (lo hace el hilo de ping de su enlace, no este), aunque abrir la sesión
+    con otra tarde minutos."""
     from .agent import AgentError, save_client_key, session_message
 
     def on_lost(link, text):
@@ -590,6 +592,13 @@ def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list
         waiting = [link for link in opened if link.waiting]
         if waiting and not lost:
             for link in waiting:   # (sin prueba, o si una se perdió, ninguna recibe `sigue`: D-a)
+                if lost or stop.is_set():
+                    # 4c §6.2: antes de CADA `sigue`, otra vez: si una se perdió (o se pidió parar) entre la prueba y
+                    # aquí, no sale ningún `sigue` más y adios a todas (las que ya lo recibieron detienen lo suyo).
+                    for other in opened:
+                        other.close()
+                    return "" if lost else ("se dejó de esperar a las otras computadoras antes de arrancar: no "
+                                            "arranqué nada")
                 link.go_on()
             for link in waiting:
                 try:
@@ -687,9 +696,8 @@ def _net_checks(launcher, links: list, stop, lost: list) -> str:
         parts += [f"  {line}" for line in link.probe_lines(res)]
     for link in links:   # 4c §5.5: un agente que no esperó a la prueba (p. ej. un Agmen anterior) ya se preparó
         if not link.waiting:
-            parts.append(f"(en '{link.name}' sí corrió su preparación, [robot] before y su hub, porque su agmen agent "
-                         f"no esperó a la prueba de red: es un Agmen anterior, o no pasa topics con esta computadora. "
-                         f"Al despedirme se detiene)")
+            parts.append(f"(en '{link.name}' sí corrió su preparación, porque su agmen agent no esperó a la prueba de "
+                         f"red: es un Agmen anterior, o no pasa topics con esta computadora. Al despedirme se detiene)")
     parts.append(f"Si sabes que la red está bien, puedes saltártela: agmen run {links[0].toml_hint} --no-net-check "
                  f"(pero entonces, si un firewall bloquea los topics, Agmen no te lo va a decir)")
     return "\n".join(parts)

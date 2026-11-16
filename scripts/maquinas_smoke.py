@@ -321,7 +321,8 @@ def toml_del_robot(dest: Path, ip: str, puerto: int) -> Path:
     base = ROOT.as_posix()
     antes = dest.parent / "antes.py"
     antes.write_text(ANTES_PY, encoding="utf-8")
-    before = json.dumps(f"python {antes.as_posix()} {(dest.parent / 'marcas').as_posix()}")
+    # 4c §6.2: como lista de argumentos (una ruta con espacios no lo rompe)
+    before = json.dumps(["python", antes.as_posix(), (dest.parent / "marcas").as_posix()])
     titulo = 'name = "robot del tutorial, en dos computadoras"\n'
     for viejo, nuevo in ((titulo, f"{titulo}before = [{before}]\n"),
                          ('host = "192.168.1.20"', f'host = "{ip}:{puerto}"'),
