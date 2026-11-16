@@ -186,12 +186,16 @@ class _HubLink:
     def got_reply(self) -> None:
         self.last_reply = time.monotonic()
 
-    def close(self) -> None:
+    def close(self, bye: bool = True) -> None:
+        """Detiene el latido. Con `bye`, se despide del hub; sin él (un enlace que sobró y comparte el id
+        con otro que sigue vivo), solo se calla."""
         self._stop.set()
         with self._beat_lock:
             if self._closed:
                 return
             self._closed = True
+            if not bye:
+                return
             try:
                 self._out[0].sendto(hp.encode("bye", id=self.id), self.hub)
             except OSError:
@@ -1043,19 +1047,31 @@ class RawPublisher(_NetSend):
                 self._drain()
 
     def set_schema(self, text: str, name: str, schema_id: int) -> None:
-        # Con el candado: dos set_schema a la vez no crean dos enlaces (con un hilo de latido cada uno,
-        # y close() solo cerraría uno), y uno a la vez que close() no crea un enlace ya cerrado.
-        # El hilo de latido del enlace nuevo puede pedir este candado (_drain_locked): espera a que
-        # set_schema lo suelte; _HubLink() no espera a ese hilo, así que no hay bloqueo mutuo.
+        # El enlace se crea FUERA del candado (resuelve el hub y manda el registro por la red) y se
+        # instala CON él, solo si no hay otro y no se cerró: dos set_schema a la vez no dejan dos enlaces
+        # vivos (cada uno con su hilo de latido; close() solo cerraría uno), y uno a la vez que close() no
+        # deja un enlace después del cierre. El que sobra se cierra fuera del candado (su hilo de latido
+        # puede estar pidiéndolo en _drain_locked). Sin otro enlace vivo con el mismo id, se despide del
+        # hub; si lo hay, se calla (su `bye` daría de baja el id del que sí quedó).
         with self._lock:
             if self._closed:
                 raise RuntimeError(_RAWPUB_CERRADO)
             if self._link is not None:
                 return
-            self.schema_text = text
-            self._link = _HubLink(self._sock, dict(
-                op="pub", id=f"{self.source_id:016x}", node=node_name(), pid=os.getpid(), topic=self.topic,
-                schema=f"{schema_id:016x}", type=name, text=text), on_tick=self._drain_locked)
+        link = _HubLink(self._sock, dict(
+            op="pub", id=f"{self.source_id:016x}", node=node_name(), pid=os.getpid(), topic=self.topic,
+            schema=f"{schema_id:016x}", type=name, text=text), on_tick=self._drain_locked)
+        with self._lock:
+            closed = self._closed
+            installed = not closed and self._link is None
+            if installed:
+                self.schema_text = text
+                self._link = link
+        if installed:
+            return
+        link.close(bye=closed)
+        if closed:
+            raise RuntimeError(_RAWPUB_CERRADO)
 
     def _drain(self) -> None:
         if self._link is None:

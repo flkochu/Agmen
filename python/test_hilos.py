@@ -54,6 +54,7 @@ RONDAS = int(os.environ.get("AGMEN_HILOS_RONDAS", "8"))
 TSAN = os.environ.get("AGMEN_HILOS_TSAN") == "1"
 SOLO = os.environ.get("AGMEN_HILOS_SOLO", "")
 TOPE_HIJO = 150.0 if TSAN else 30.0   # TSan hace todo 5-15 veces más lento
+AVISO_CLOSE = "close() del Subscriber regresó sin liberar el puerto"   # el aviso del núcleo de C++
 
 
 def puerto_libre() -> int:
@@ -146,13 +147,17 @@ def espera(hs, tope, que):
         faulthandler.dump_traceback(all_threads=True)
         os._exit(3)
 
+# El tope de Subscriber.close() con otros hilos dentro de receive(): 1 s; con ThreadSanitizer, 3 s (TSan hace
+# todo 5-15 veces más lento). Solo ese tope cambia bajo TSan.
+TOPE_CLOSE = 3.0 if os.environ.get("AGMEN_HILOS_TSAN") == "1" else 1.0
+
 def mide(f, tope, que):
     """Llama f() y falla si tarda más de `tope` s (un close() colgado)."""
     t0 = time.monotonic()
     f()
     dt = time.monotonic() - t0
     if dt > tope:
-        falla("%s tardó %.1f s (tope %.0f s)" % (que, dt, tope))
+        falla("%s tardó %.2f s (tope %g s)" % (que, dt, tope))
         termina()   # no tiene sentido seguir con más rondas
 
 def par(nombre, tipo=None):
@@ -473,8 +478,8 @@ for r in range(RONDAS):
     for e in dentro:
         e.wait(10)
     time.sleep(0.02)   # que entren de verdad a receive(): solo cambia cuál camino se prueba, no el resultado
-    mide(sub.close, 1, "Subscriber.close() con receive(%s) en curso" % (T_RX,))
-    mide(sub.close, 1, "Subscriber.close() por segunda vez")
+    mide(sub.close, TOPE_CLOSE, "Subscriber.close() con receive(%s) en curso" % (T_RX,))
+    mide(sub.close, TOPE_CLOSE, "Subscriber.close() por segunda vez")
     try:
         sub.receive(0.01)
         falla("receive tras close no lanzó")
@@ -504,7 +509,7 @@ for r in range(RONDAS):
     for e in dentro:
         e.wait(10)
     time.sleep(0.05)
-    mide(sub.close, 1, "Subscriber.close() con receive() en curso")
+    mide(sub.close, TOPE_CLOSE, "Subscriber.close() con receive() en curso")
     try:
         sub2 = agmen.Subscriber(TIPO, "127.0.0.1:%d" % puerto)
     except Exception as e:   # noqa: BLE001
@@ -549,7 +554,7 @@ for r in range(RONDAS):
     fin = time.monotonic() + 0.3
     while time.monotonic() < fin and not all(e.is_set() for e in dentro):
         time.sleep(0.01)
-    mide(sub.close, 1, "Subscriber.close() con flujo y receive(60) en curso")
+    mide(sub.close, TOPE_CLOSE, "Subscriber.close() con flujo y receive(60) en curso")
     espera(hs, 5, "receptores tras close() (receive(60) debía despertar con 'ya se cerró')")
     if sorted(salieron) != [0, 1, 2]:
         falla("ronda %d: solo %d de 3 receive() terminaron con 'ya se cerró'" % (r, len(salieron)))
@@ -651,6 +656,75 @@ for r in range(RONDAS):
     espera(hs, 15, "close() x close()")
     sub.close()
     pub.close()
+termina()
+''')
+
+caso("sub_close_dos_y_aviso", modos=("dir",), tipos=("compact",))(r'''
+# Dos close() seguidos con un hilo dentro de receive(): el segundo regresa en seguida (< 0.2 s; solo espera
+# la llamada que soltó el núcleo). En el uso normal no sale el aviso de "close() regresó sin liberar el
+# puerto" (sin TSan: con TSan un hilo lento puede pasarse del tope de verdad). Con el núcleo de C++, si el
+# hilo que está dentro de receive() no puede salir (otro hilo retiene el GIL 1.5 s), close() regresa sin
+# liberar el puerto y lo avisa UNA vez por stderr; un close() después ya no avisa.
+from agmen import _backend
+AVISO = "close() del Subscriber regresó sin liberar el puerto"
+class Copia:
+    """sys.stderr que además guarda lo escrito (los avisos del núcleo van a sys.stderr)."""
+    def __init__(self, o):
+        self.o, self.partes, self.mu = o, [], threading.Lock()
+    def write(self, t):
+        with self.mu:
+            self.partes.append(t)
+        return self.o.write(t)
+    def flush(self):
+        self.o.flush()
+    def avisos(self):
+        with self.mu:
+            return "".join(self.partes).count(AVISO)
+COPIA = Copia(sys.stderr)
+sys.stderr = COPIA
+
+def un_receptor(sub, dentro):
+    def recibe():
+        dentro.set()
+        sub.receive(None)
+    return lanza(trabajo(recibe))
+
+for r in range(RONDAS):
+    sub = agmen.Subscriber(TIPO, "127.0.0.1:0")
+    dentro = threading.Event()
+    hs = un_receptor(sub, dentro)
+    dentro.wait(10)
+    time.sleep(0.05)
+    mide(sub.close, TOPE_CLOSE, "Subscriber.close() con un hilo en receive()")
+    mide(sub.close, 0.2, "el segundo close() seguido")
+    espera(hs, 5, "receptor tras close()")
+if os.environ.get("AGMEN_HILOS_TSAN") != "1" and COPIA.avisos():
+    falla("el aviso de close() salió %d vez/veces en el uso normal (el puerto sí se liberó)" % COPIA.avisos())
+
+if _backend.NATIVE:
+    antes = COPIA.avisos()
+    sub = agmen.Subscriber(TIPO, "127.0.0.1:0")
+    dentro = threading.Event()
+    hs = un_receptor(sub, dentro)
+    dentro.wait(10)
+    time.sleep(0.05)   # el receptor está dentro de su tramo de 200 ms
+    def acapara():
+        time.sleep(0.005)   # deja que el principal llame close() (que suelta el GIL para esperar)
+        fin = time.monotonic() + 1.5
+        while time.monotonic() < fin:
+            3 ** 20000   # sin soltar el GIL: el intervalo de cambio es de 30 s
+    viejo = sys.getswitchinterval()
+    sys.setswitchinterval(30.0)
+    try:
+        hog = lanza(acapara)
+        sub.close()
+        espera(hog, 10, "el hilo que retiene el GIL")
+    finally:
+        sys.setswitchinterval(viejo)
+    espera(hs, 5, "receptor tras close() (con el GIL retenido)")
+    mide(sub.close, 0.2, "close() después del que no liberó")
+    if COPIA.avisos() - antes != 1:
+        falla("close() que no liberó el puerto: se esperaba el aviso una vez, salió %d" % (COPIA.avisos() - antes))
 termina()
 ''')
 
@@ -1232,6 +1306,10 @@ class _Base(unittest.TestCase):
                 malas.append(f"corrida {i}: {len(tsan)} informe(s) de ThreadSanitizer:\n    " + "\n    ".join(tsan[:8]))
             if r.returncode == 0 and out.endswith("ok"):
                 continue
+            # Si un close() del Subscriber regresó sin liberar el puerto, el núcleo lo avisó: se muestra.
+            avisos = [x.strip() for x in err.splitlines() if AVISO_CLOSE in x]
+            if avisos:
+                malas.append(f"corrida {i}: el hijo avisó ({len(avisos)} vez/veces): {avisos[0]}")
             if r.returncode < 0:
                 try:
                     sig = signal_name(-r.returncode)

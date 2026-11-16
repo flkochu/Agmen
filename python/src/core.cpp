@@ -703,12 +703,10 @@ public:
         }
         g_subs.push_back(this);   // ya con el GIL
     }
-    ~PySubscriber() {
-        // Primero el núcleo: su borrador usa turn_mu_ y gone_cv_, que se destruyen después.
-        // Aquí nadie más tiene una copia (las copias solo viven dentro de un método).
-        core_.reset();
-        std::erase(g_subs, this);
-    }
+    // core_ se declara al final: se destruye antes que turn_mu_, gone_cv_ y core_gone_, que usa su
+    // borrador (también si el constructor falla a medias). Aquí nadie más tiene una copia (las copias
+    // solo viven dentro de un método).
+    ~PySubscriber() { std::erase(g_subs, this); }
     PySubscriber(const PySubscriber&) = delete;
     PySubscriber& operator=(const PySubscriber&) = delete;
 
@@ -780,7 +778,10 @@ public:
         //    hecha, puerto libre. Tope 750 ms (250 ms si el programa sale); pasado el tope regresa igual y
         //    el núcleo se destruye cuando salga ese hilo (o nunca, si quedó detenido al salir).
         //    Con un solo hilo el núcleo ya se destruyó en el paso 1 y no se espera ni se suelta el GIL.
-        // Dos veces, o desde dos hilos a la vez: inofensivo (el segundo también espera, con el mismo tope).
+        // 3) Si vence el tope con el núcleo vivo, lo avisa una vez por agmen::log, con el GIL y sin
+        //    candados (el aviso puede tomar el GIL). No se avisa si el programa sale.
+        // Solo espera la llamada que soltó el núcleo (la que encontró core_ no vacío): dos veces, o desde
+        // dos hilos a la vez, es inofensivo y nunca suma más de un tope (la segunda regresa en seguida).
         {
             const std::lock_guard lock(turn_mu_);
             turn_closed_ = true;
@@ -788,17 +789,25 @@ public:
         turn_cv_.notify_all();
         std::shared_ptr<agmen::SubscriberCore> old;
         old.swap(core_);
-        old.reset();   // aquí y con el GIL, si nadie más lo usa
+        if (!old) return;   // otra llamada ya lo soltó (y es la que espera, si hace falta)
+        old.reset();        // aquí y con el GIL, si nadie más lo usa
         {
             const std::lock_guard lock(turn_mu_);
             if (core_gone_) return;   // lo normal: un solo hilo
         }
         using namespace std::chrono;
         const milliseconds limit = g_closing.load() ? milliseconds(250) : milliseconds(750);
-        const NoGil nogil(Inside::Close);
-        if (!nogil.released()) return;   // el programa sale y este hilo no es el que cierra: no se espera
-        std::unique_lock lock(turn_mu_);
-        gone_cv_.wait_for(lock, limit, [this] { return core_gone_; });
+        bool freed = false;
+        {
+            const NoGil nogil(Inside::Close);
+            if (!nogil.released()) return;   // el programa sale y este hilo no es el que cierra: no se espera
+            std::unique_lock lock(turn_mu_);
+            freed = gone_cv_.wait_for(lock, limit, [this] { return core_gone_; });
+        }
+        if (freed || g_closing.load()) return;
+        agmen::log::write(
+            "agmen: close() del Subscriber regresó sin liberar el puerto: otro hilo sigue dentro de "
+            "receive(). El puerto se libera cuando ese hilo salga.");
     }
     [[nodiscard]] bool closed() const { return !core_; }
     // Las lecturas no esperan el turno de receive(): el núcleo las da con un candado chico.
@@ -887,14 +896,15 @@ private:
         if (!core_) throw std::logic_error("el Subscriber ya se cerró");
         return core_;
     }
-    std::shared_ptr<agmen::SubscriberCore> core_;   // solo se toca con el GIL
-    std::mutex turn_mu_;                              // turn_busy_, turn_waiting_, turn_closed_, core_gone_
+    std::mutex turn_mu_;                           // turn_busy_, turn_waiting_, turn_closed_, core_gone_
     std::condition_variable turn_cv_;
     std::condition_variable gone_cv_;                 // core_gone_ (close() espera la destrucción del núcleo)
     bool turn_busy_ = false;     // un hilo está en receive_raw()
     int turn_waiting_ = 0;       // hilos esperando el turno
     bool turn_closed_ = false;   // close(): los receive() en curso o por venir dan "ya se cerró"
     bool core_gone_ = false;     // el borrador ya destruyó el núcleo
+    // Al final: se destruye primero (su borrador usa lo de arriba). Solo se toca con el GIL.
+    std::shared_ptr<agmen::SubscriberCore> core_;
 };
 
 // ---------------------------------------------------------------------------
