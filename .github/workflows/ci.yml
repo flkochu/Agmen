@@ -99,7 +99,7 @@ jobs:
         run: python scripts/gen_smoke.py
 
       - name: Mensajes estándar (RFC 0013; C++ <-> Python por el hub, echo, record, play y export, con NaN)
-        run: python scripts/estandar_smoke.py
+        run: python scripts/estandar_smoke.py --required
 
       - name: Node y reloj de Agmen (sim ×2, pausa desde el panel, simulador paso a paso)
         run: python scripts/node_check.py

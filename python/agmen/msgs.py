@@ -109,8 +109,10 @@ def _from_wxyz(cls, *wxyz):
     numpy.ndarray, ej. data.qpos[3:7]). Solo cambia el orden: no normaliza."""
     values = wxyz[0] if len(wxyz) == 1 else wxyz
     text = (str, bytes, bytearray)      # float("1") y list(b"1234") "funcionan": un texto no es un cuaternión
+    # Sin orden fijo (set, dict) o bytes crudos (memoryview): no son (w, x, y, z), aunque se puedan recorrer.
+    not_ordered = (*text, set, frozenset, dict, memoryview)
     try:
-        if isinstance(values, text):
+        if isinstance(values, not_ordered):
             raise TypeError
         values = list(values)               # una vez: también si es un iterador
         if any(isinstance(v, text) for v in values):

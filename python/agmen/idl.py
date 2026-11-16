@@ -411,12 +411,13 @@ class _Parser:
         t = self.peek()
         if t.value == "[":
             self.next()
-            items = []
+            items = _List()
             while True:
                 self.skip_nl()
                 if self.peek().value == "]":
                     self.next()
                     return items
+                items.positions.append(self.peek().pos)
                 items.append(self.parse_value())
                 self.skip_nl()
                 if self.peek().value == ",":
@@ -429,7 +430,7 @@ class _Parser:
             try:
                 if v.lower().lstrip("-").startswith("0x"):
                     return int(v, 16)
-                return float(v) if any(c in v for c in ".eE") else int(v)
+                return _Float(v, t.value) if any(c in v for c in ".eE") else int(v)
             except ValueError:
                 raise self.f.error(f"número inválido '{t.value}'", t.pos) from None
         if t.kind == "signed":
@@ -566,6 +567,19 @@ class _Parser:
         self.end_of_statement()
 
 
+class _Float(float):    # un número con decimales, y cómo se escribió (para citarlo tal cual en un error)
+    def __new__(cls, value: str, text: str):
+        out = super().__new__(cls, value)
+        out.text = text
+        return out
+
+
+class _List(list):      # [1, 2, A]: los valores, y dónde está cada uno (para señalar el elemento en un error)
+    def __init__(self) -> None:
+        super().__init__()
+        self.positions: list[Pos] = []
+
+
 @dataclass
 class _Name:            # un nombre como valor (el valor de un enum)
     name: str
@@ -590,8 +604,10 @@ def _special(f: AgmenFile, value, enum: EnumDef | None) -> bool:
     del enum del campo o de una constante, que se revisan como siempre.)"""
     if not isinstance(value, _Name) or value.name.lstrip("+-").lower() not in _SPECIAL:
         return False
-    if enum is not None and value.name in dict(enum.members):
-        return False
+    if enum is not None:
+        # En un campo de enum, NAN, INF, -inf... son nombres que no son del enum: el error de siempre
+        # ("'INF' no es un M (A, B)"). Solo 'nan' tal cual (que nunca es un valor de enum) se explica aparte.
+        return value.name == "nan"
     consts = {c.name for x in (f, *f.imports) for c in x.consts}
     return value.name not in consts
 
@@ -620,6 +636,11 @@ def _check_special(f: AgmenFile, prim: str, value, pos: Pos, enum: EnumDef | Non
     return math.nan
 
 
+def _written(value) -> str:
+    """El número como lo escribió el usuario (si el lector lo guardó)."""
+    return getattr(value, "text", None) or repr(value)
+
+
 def _check_float(f: AgmenFile, prim: str, value, pos: Pos) -> float:
     """Un número para un f32 o f64: que no se vuelva infinito (ej. 1e999) ni se salga de un f32."""
     try:
@@ -631,9 +652,14 @@ def _check_float(f: AgmenFile, prim: str, value, pos: Pos) -> float:
                       f"±1.79e308; f32, a ±3.4e38)", pos)
     if prim == "f32":
         try:
-            struct.pack("<f", x)
+            as_f32 = struct.unpack("<f", struct.pack("<f", x))[0]
         except OverflowError:
-            raise f.error(f"{x:g} no cabe en f32 (llega a ±3.4e38): usa f64 o un número más chico", pos) from None
+            raise f.error(f"{_written(value)} no cabe en f32: el mayor f32 es ±3.4028234663852886e38. Usa f64 o un número "
+                          f"más chico", pos) from None
+        if x != 0 and as_f32 == 0:
+            # Además, el C++ generado (1e-50f) no compila con -Werror: "floating constant truncated to zero".
+            raise f.error(f"{_written(value)} se vuelve 0 en f32: el menor f32 que no es 0 es ±1.401298464324817e-45. "
+                          f"Usa 0, un número más grande o f64", pos)
     return x
 
 
@@ -758,6 +784,10 @@ def _resolve(f: AgmenFile) -> None:
             fd.default = check_default(fd)
         return base
 
+    def _items(v: list, pos: Pos):
+        """Cada elemento con su posición (si el lector la guardó), para que el error señale el elemento."""
+        return zip(v, getattr(v, "positions", None) or [pos] * len(v), strict=True)
+
     def check_default(fd: FieldDef):
         v, pos = fd.raw_default, fd.default_pos
         if fd.kind == "struct":
@@ -777,11 +807,11 @@ def _resolve(f: AgmenFile) -> None:
             if n is None:                      # T[]: la lista que se dé (o vacía)
                 if not isinstance(v, list):
                     raise f.error(f"'{fd.name}' es una lista: su valor por defecto va entre corchetes, [1, 2]", pos)
-                return [_check_scalar(f, fd.prim, x, pos, fd.enum, True) for x in v]
+                return [_check_scalar(f, fd.prim, x, at, fd.enum, True) for x, at in _items(v, pos)]
             if isinstance(v, list):
                 if len(v) != n:
                     raise f.error(f"'{fd.name}' tiene {n} elementos y el valor por defecto trae {len(v)}", pos)
-                return [_check_scalar(f, fd.prim, x, pos, fd.enum, True) for x in v]
+                return [_check_scalar(f, fd.prim, x, at, fd.enum, True) for x, at in _items(v, pos)]
             return [_check_scalar(f, fd.prim, v, pos, fd.enum, True)] * n
         if isinstance(v, list):
             raise f.error(f"'{fd.name}' no es un arreglo: su valor por defecto es uno solo", pos)

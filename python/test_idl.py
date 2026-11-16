@@ -343,7 +343,7 @@ class TestErrores(Tmp):
         # nan (RFC 0013): solo en f32 y f64.
         ("message A {\n    u8 x = nan\n}\n", "x.agmen:2:12:", "'nan' solo vale en campos f32 y f64; u8 es entero"),
         ("message A {\n    i32[3] x = nan\n}\n", "x.agmen:2:16:", "i32 es entero y no tiene NaN"),
-        ("message A {\n    u16[2] x = [1, nan]\n}\n", "x.agmen:2:16:", "u16 es entero y no tiene NaN"),
+        ("message A {\n    u16[2] x = [1, nan]\n}\n", "x.agmen:2:20:", "u16 es entero y no tiene NaN"),
         ("message A {\n    bool b = nan\n}\n", "x.agmen:2:14:", "un bool lleva true o false"),
         ("message A {\n    time t = nan\n}\n", "x.agmen:2:14:", "time es entero y no tiene NaN"),
         ("enum Modo { QUIETO, TROTAR }\nmessage A {\n    Modo m = nan\n}\n", "x.agmen:3:14:",
@@ -362,7 +362,24 @@ class TestErrores(Tmp):
         ("message A {\n    f32[2] x = [1, -inf]\n}\n", "x.agmen:2:20:", "'-inf' no vale como valor"),
         # Un número que se vuelve infinito (antes tronaba después, sin posición).
         ("message A {\n    f64 x = 1e999\n}\n", "x.agmen:2:13:", "no cabe en f64: se vuelve infinito"),
-        ("message A {\n    f32 x = -1e39\n}\n", "x.agmen:2:13:", "no cabe en f32"),
+        ("message A {\n    f32 x = -1e39\n}\n", "x.agmen:2:13:",
+         "-1e39 no cabe en f32: el mayor f32 es ±3.4028234663852886e38"),
+        # El número como se escribió (no redondeado a algo que parece dentro del límite).
+        ("message A {\n    f32 x = 3.4028236e38\n}\n", "x.agmen:2:13:", "3.4028236e38 no cabe en f32"),
+        # Un número que no es 0 pero se vuelve 0 en f32 (el C++ generado no compilaría con -Werror).
+        ("message A {\n    f32 x = 1e-50\n}\n", "x.agmen:2:13:",
+         "1e-50 se vuelve 0 en f32: el menor f32 que no es 0 es ±1.401298464324817e-45"),
+        # En un arreglo, el error señala el elemento, no el '['.
+        ("message A {\n    f32[2] a = [1, 1e39]\n}\n", "x.agmen:2:20:", "1e39 no cabe en f32"),
+        ("message A {\n    f32[2] a = [1e-50, 1]\n}\n", "x.agmen:2:17:", "se vuelve 0 en f32"),
+        ("message A {\n    u8[3] a = [1, 2,\n        300]\n}\n", "x.agmen:3:9:", "300 no cabe en u8"),
+        ("enum M { A, B }\nmessage X {\n    M[2] m = [A, NAN]\n}\n", "x.agmen:3:18:", "'NAN' no es un M (A, B)"),
+        # En un campo de enum, un nombre que no es del enum da el error de siempre, citando lo escrito.
+        ("enum M { A, B }\nmessage X {\n    M m = INF\n}\n", "x.agmen:3:11:", "'INF' no es un M (A, B)"),
+        ("enum M { A, B }\nmessage X {\n    M m = NAN\n}\n", "x.agmen:3:11:", "'NAN' no es un M (A, B)"),
+        ("enum M { A, B }\nmessage X {\n    M m = -inf\n}\n", "x.agmen:3:11:", "'-inf' no es un M (A, B)"),
+        ("enum Modo { QUIETO, TROTAR }\nmessage X {\n    Modo m = TROTA\n}\n", "x.agmen:3:14:",
+         "'TROTA' no es un Modo: ¿quisiste decir 'TROTAR'?"),
         ("const f64 X = 1e999\n", "x.agmen:1:15:", "se vuelve infinito"),
     ]
 
@@ -379,12 +396,23 @@ class TestErrores(Tmp):
         for name in ("NAN", "INF"):
             with self.subTest(name):
                 err = self.error(f"const f32 {name} = 1.0\nmessage A {{\n    f32 x = {name}\n}}\n")
-                self.assertIn("x.agmen:3:13:", err)
+                self.assertIn("x.agmen:3:13: se esperaba un valor de tipo f32", err)   # el de siempre
                 self.assertNotIn("minúsculas", err)
                 self.assertNotIn("valor especial", err)
         # Y un valor de enum que se llame NAN sigue siendo un valor del enum.
         msgs = agmen.load(self.write("e.agmen", "enum M { A, NAN }\nmessage B {\n    M m = NAN\n}\n"))
         self.assertIs(msgs.B().m, msgs.M.NAN)
+
+    def test_limites_de_f32_que_si_valen(self):
+        """1e-45 (el menor f32 que no es 0) y el mayor f32 siguen valiendo, y 0 también."""
+        import math
+
+        msgs = agmen.load(self.write("lim.agmen", "message L {\n    f32 a = 1e-45\n    f32 b = -1e-45\n"
+                                                  "    f32 c = 3.4028234e38\n    f32 d = 0.0\n}\n"))
+        m = msgs.L()
+        back = msgs.L.decode_payload(m.encode_payload())
+        self.assertEqual(struct.unpack("<4I", m.encode_payload()), (1, 0x80000001, 0x7F7FFFFF, 0))
+        self.assertTrue(back.a > 0 and back.b < 0 and math.isfinite(back.c) and back.d == 0)
 
     def test_choque_con_un_tipo_de_agmen_msgs(self):
         """Un .agmen de 0.14 que importaba agmen/msgs.agmen y tenía su propio Pose: el error da las dos salidas."""

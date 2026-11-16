@@ -9,16 +9,19 @@
 4. `agmen record` -> `agmen info` -> `agmen play` -> `agmen export --parquet` y `--foxglove`, y el
    .mcap leído por mcap.js + agmen.js (el lector del panel, si hay Node).
 
-    python scripts/estandar_smoke.py          # requiere haber compilado antes (build/bin/estandar_peer)
+    python scripts/estandar_smoke.py              # requiere haber compilado antes (build/bin/estandar_peer)
+    python scripts/estandar_smoke.py --required   # en el CI: sin núcleo de C++, Node o pyarrow, falla
 """
 
 import json
 import math
 import os
+import re
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -83,6 +86,7 @@ def worker() -> int:
 
 
 # --------------------------------------------------------------------------------------------
+REQUIRED = "--required" in sys.argv     # en el CI: sin núcleo de C++, estandar_peer, Node o pyarrow, falla
 failures = 0
 
 
@@ -92,22 +96,86 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     failures += 0 if ok else 1
 
 
-def start(cmd, env):
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-                            errors="replace", env=env)
+def missing(what: str) -> None:
+    """Algo opcional que no está: con --required es una falla; sin él, se dice que se saltó."""
+    global failures
+    if REQUIRED:
+        print(f"FALLA {what} (--required)", flush=True)
+        failures += 1
+    else:
+        print(f"OMITIDO {what}", flush=True)
 
 
-def wait_line(p, token, timeout=15):
-    """Lee la salida de p hasta ver `token`; devuelve lo leído."""
-    seen, end = [], time.monotonic() + timeout
+def wait_for(cond, timeout: float, every: float = 0.05) -> bool:
+    end = time.monotonic() + timeout
     while time.monotonic() < end:
-        line = p.stdout.readline()
-        if not line:
-            break
-        seen.append(line)
-        if token in line:
-            break
-    return "".join(seen)
+        if cond():
+            return True
+        time.sleep(every)
+    return bool(cond())
+
+
+class Proc:
+    """Un proceso con un hilo que va leyendo su salida (stdout y stderr juntos) mientras corre: así
+    nunca se llena el pipe (en Windows es chico) y las esperas tienen un límite de verdad."""
+
+    def __init__(self, name: str, cmd, env):
+        self.name = name
+        self.lines: list[str] = []
+        self.p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                  text=True, encoding="utf-8", errors="replace", env=env)
+        self._reader = threading.Thread(target=self._read, daemon=True)
+        self._reader.start()
+
+    def _read(self) -> None:
+        for line in self.p.stdout:
+            self.lines.append(line.rstrip("\r\n"))
+
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+    def wait_line(self, token: str, timeout: float = 20.0) -> bool:
+        """Espera una línea con `token`, con tope. Si se vence o el proceso termina antes, lo dice."""
+        wait_for(lambda: any(token in x for x in list(self.lines)) or self.p.poll() is not None, timeout)
+        if any(token in x for x in list(self.lines)):
+            return True
+        why = (f"el proceso terminó con código {self.p.returncode}" if self.p.poll() is not None
+               else f"se venció el tope de {timeout:g} s")
+        last = self.lines[-1] if self.lines else "(nada)"
+        print(f"      {self.name}: esperaba una línea con {token!r} y no llegó ({why}); "
+              f"lo último que escribió: {last}", flush=True)
+        return False
+
+    def wait(self, timeout: float) -> int | None:
+        """Espera a que termine solo; si no, lo detiene. Devuelve su código (None si hubo que matarlo)."""
+        try:
+            code = self.p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.stop()
+            code = None
+        self._reader.join(5)
+        return code
+
+    def stop(self) -> None:
+        if self.p.poll() is None:
+            self.p.terminate()
+            try:
+                self.p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.p.kill()
+                self.p.wait()
+        self._reader.join(5)
+
+
+def hub_has_sub(hub_addr: str, topic: str) -> bool:
+    """¿El hub ya tiene un suscriptor en `topic`? (Así se sabe que el receptor está listo, sin dormir.)"""
+    from agmen import hub as hubmod
+
+    try:
+        msgs = hubmod.query(hub_addr, timeout=0.5, say=None)
+    except ConnectionError:
+        return False
+    return any(op == "ep" and f.get("kind") == "sub" and f.get("topic") == topic for op, f in msgs)
 
 
 def rx_lines(out):
@@ -125,116 +193,118 @@ def strict_json(text):
     return json.loads(text, parse_constant=bad)
 
 
+def check_bytes(rows, kind, n):
+    bad = []
+    for t_data, h in rows:
+        i = (t_data - T0) // 1000
+        if t_data != T0 + 1000 * i or not 0 <= i < n:
+            bad.append(f"t_data inesperado {t_data}")
+        elif bytes.fromhex(h) != make(kind, i).encode_payload():
+            bad.append(f"bytes distintos en i={i}")
+    return bad
+
+
 def main() -> int:
-    from agmen import msgs
+    from agmen import _backend, msgs
+    from agmen.hub import ping
 
     hub_addr = f"127.0.0.1:{free_port()}"
     env0 = {**os.environ, "PYTHONPATH": str(ROOT / "python"), "PYTHONIOENCODING": "utf-8", "AGMEN_HUB": hub_addr}
     py = [sys.executable, "-u"]
     peer = str(BIN / f"estandar_peer{EXE}")
-    hub = start(py + ["-m", "agmen", "hub", "--listen", hub_addr], env0)
+    if not Path(peer).exists():
+        print(f"FALLA no existe {peer}: compila antes (cmake --build build --config Release)", flush=True)
+        return 1
+    if _backend.NATIVE:
+        backends = ("native", "pure")
+    else:
+        missing(f"el núcleo de C++ (agmen._core no está compilado: {_backend.WHY or 'sin módulo'}): solo Python puro")
+        backends = ("pure",)
+    hub = Proc("agmen hub", py + ["-m", "agmen", "hub", "--listen", hub_addr], env0)
     procs = [hub]
     tmp = tempfile.TemporaryDirectory()
     try:
-        time.sleep(1.0)
-        n = 40
-        from agmen import _backend
-
-        backends = ("native", "pure") if _backend.NATIVE else ("pure",)
-        if not _backend.NATIVE:
-            print("OMITIDO el núcleo de C++ (agmen._core no está compilado): solo Python puro")
-        if not Path(peer).exists():
-            print(f"FALLA no existe {peer}: compila antes (cmake --build build --config Release)")
+        if not wait_for(lambda: ping(hub_addr) is not None, 20, 0.1):
+            check("el hub arranca", False, hub.text())
             return 1
+        n = 40
         for backend in backends:
             env = {**env0, "AGMEN_BACKEND": backend}
             for kind in ("odometry", "imu"):
                 topic = f"/{kind}_{backend}"
                 # 1) C++ -> Python
-                sub = start(py + [str(Path(__file__)), "--py", "sub", kind, topic, str(n)], env)
+                sub = Proc("receptor de Python", py + [str(Path(__file__)), "--py", "sub", kind, topic, str(n)], env)
                 procs.append(sub)
-                head = wait_line(sub, "LISTO")
-                time.sleep(0.5)
+                ready = sub.wait_line("LISTO") and wait_for(lambda: hub_has_sub(hub_addr, topic), 15, 0.1)
                 cpp = subprocess.run([peer, "pub", kind, topic, str(n)], capture_output=True, text=True, env=env,
                                      timeout=60)
-                time.sleep(1.0)
-                sub.terminate()
-                out = head + sub.communicate(timeout=10)[0]
-                rows = rx_lines(out)
-                bad = []
-                for t_data, h in rows:
-                    i = (t_data - T0) // 1000
-                    if t_data != T0 + 1000 * i or not 0 <= i < n:
-                        bad.append(f"t_data inesperado {t_data}")
-                    elif bytes.fromhex(h) != make(kind, i).encode_payload():
-                        bad.append(f"bytes distintos en i={i}")
+                sub.wait(30)                   # termina solo al recibir n (o a los 20 s del propio receptor)
+                rows = rx_lines(sub.text())
+                bad = check_bytes(rows, kind, n)
                 check(f"C++ publica {kind} -> Python ({backend}): bytes y t_data intactos ({len(rows)}/{n} llegaron)",
-                      cpp.returncode == 0 and len(rows) >= n // 2 and not bad,
-                      f"{bad[:3]}\npeer: {cpp.stdout}{cpp.stderr}\npython: {out}")
+                      ready and cpp.returncode == 0 and len(rows) >= n // 2 and not bad,
+                      f"{bad[:3]}\npeer: {cpp.stdout}{cpp.stderr}\npython: {sub.text()}")
                 if kind == "imu" and rows:
                     # decodificado de verdad: NaN en pares, valores en impares
-                    from agmen import wire
                     t0, h0 = rows[0]
                     m = msgs.Imu.decode_payload(bytes.fromhex(h0))
                     i = (t0 - T0) // 1000
-                    nan_ok = math.isnan(m.orientation.w) == (i % 2 == 0)
-                    check(f"  la orientación sin medir llega como NaN ({backend})", nan_ok, repr(m))
+                    check(f"  la orientación sin medir llega como NaN ({backend})",
+                          math.isnan(m.orientation.w) == (i % 2 == 0), repr(m))
                 # 2) Python -> C++
                 topic2 = topic + "_rev"
-                cpp_sub = start([peer, "sub", kind, topic2, str(n)], env)
+                cpp_sub = Proc("receptor de C++", [peer, "sub", kind, topic2, str(n)], env)
                 procs.append(cpp_sub)
-                head = wait_line(cpp_sub, "LISTO")
-                time.sleep(0.5)
+                ready = cpp_sub.wait_line("LISTO") and wait_for(lambda: hub_has_sub(hub_addr, topic2), 15, 0.1)
                 pyp = subprocess.run(py + [str(Path(__file__)), "--py", "pub", kind, topic2, str(n)],
                                      capture_output=True, text=True, env=env, timeout=60)
-                time.sleep(1.0)
-                cpp_sub.terminate()
-                out = head + cpp_sub.communicate(timeout=10)[0]
-                rows = rx_lines(out)
-                bad = []
-                for t_data, h in rows:
-                    i = (t_data - T0) // 1000
-                    if t_data != T0 + 1000 * i or not 0 <= i < n:
-                        bad.append(f"t_data inesperado {t_data}")
-                    elif bytes.fromhex(h) != make(kind, i).encode_payload():
-                        bad.append(f"bytes distintos en i={i}")
+                cpp_sub.wait(20)
+                rows = rx_lines(cpp_sub.text())
+                bad = check_bytes(rows, kind, n)
                 check(f"Python ({backend}) publica {kind} -> C++: bytes y t_data intactos ({len(rows)}/{n})",
-                      pyp.returncode == 0 and len(rows) >= n // 2 and not bad,
-                      f"{bad[:3]}\npython: {pyp.stdout}{pyp.stderr}\ncpp: {out}")
+                      ready and pyp.returncode == 0 and len(rows) >= n // 2 and not bad,
+                      f"{bad[:3]}\npython: {pyp.stdout}{pyp.stderr}\ncpp: {cpp_sub.text()}")
 
         # 3) topic echo con Imu sin orientación (los pares)
-        for flag in ([], ["--json"]):
-            topic = "/imu_echo"
-            echo = start(py + ["-m", "agmen", "topic", "echo", topic, "--max-hz", "0", "--count", "6", *flag], env0)
+        for k, flag in enumerate(([], ["--json"])):
+            topic = f"/imu_echo{k}"
+            echo = Proc("agmen topic echo",
+                        py + ["-m", "agmen", "topic", "echo", topic, "--max-hz", "0", "--count", "6", *flag], env0)
             procs.append(echo)
-            time.sleep(1.5)
+            ready = wait_for(lambda: hub_has_sub(hub_addr, topic), 20, 0.1)
+            if not ready:
+                print(f"      agmen topic echo no apareció en el hub como suscriptor de {topic}: {echo.text()}")
             subprocess.run([peer, "pub", "imu", topic, "60"], capture_output=True, text=True, env=env0, timeout=60)
-            try:
-                out = echo.communicate(timeout=20)[0]
-            except subprocess.TimeoutExpired:
-                echo.kill()
-                out = echo.communicate()[0]
+            code = echo.wait(20)
+            out = echo.text()
             if flag:
                 try:
                     rows = [strict_json(x) for x in out.splitlines() if x.startswith("{")]
-                    ok = len(rows) >= 1
-                    err = ""
+                    ok, err = len(rows) >= 1, ""
                 except ValueError as e:
                     ok, err = False, str(e)
-                check("agmen topic echo --json con Imu sin orientación: JSON válido (sin NaN)", ok, f"{err}\n{out[:800]}")
+                check("agmen topic echo --json con Imu sin orientación: JSON válido (sin NaN)", ready and ok,
+                      f"{err}\n{out[:800]}")
             else:
                 check("agmen topic echo (texto) con Imu sin orientación: no falla y escribe nan",
-                      echo.returncode in (0, None) and "Traceback" not in out and "nan" in out.lower(), out[:800])
+                      ready and code == 0 and "Traceback" not in out and "nan" in out.lower(), out[:800])
 
         # 4) record -> info -> play -> export
         mcap = str(Path(tmp.name) / "imu.mcap")
         # --duration: el grabador termina solo y cierra el archivo, sin señales (igual en Windows y Linux).
-        rec = start(py + ["-m", "agmen", "record", "/imu_rec", "-o", mcap, "--quiet", "--duration", "6s"], env0)
+        # Sin --quiet: dice "⏺ grabando …" cuando ya está grabando, y "⏹ …: N mensajes" al terminar.
+        rec = Proc("agmen record", py + ["-m", "agmen", "record", "/imu_rec", "-o", mcap, "--duration", "8s"], env0)
         procs.append(rec)
-        time.sleep(1.5)
+        ready = rec.wait_line("grabando") and wait_for(lambda: hub_has_sub(hub_addr, "/imu_rec"), 15, 0.1)
         subprocess.run([peer, "pub", "imu", "/imu_rec", "40"], capture_output=True, text=True, env=env0, timeout=60)
-        rec_out = rec.communicate(timeout=60)[0]
-        check("agmen record cierra el archivo", os.path.exists(mcap) and os.path.getsize(mcap) > 0, rec_out)
+        code = rec.wait(60)
+        summary = next((x for x in rec.lines if "⏹" in x), "")
+        found = re.search(r"(\d+) mensajes", summary)
+        recorded = int(found.group(1)) if found else 0
+        check(f"agmen record graba la Imu ({recorded} mensajes)",
+              ready and code == 0 and os.path.exists(mcap) and recorded > 0,
+              f"la grabación quedó {'vacía' if found else 'sin resumen'}: el grabador "
+              f"{'no llegó a decir que estaba grabando' if not ready else 'no recibió nada'}\n{rec.text()}")
 
         def cli(*args, timeout=60):
             return subprocess.run(py + ["-m", "agmen", *args], capture_output=True, text=True, encoding="utf-8",
@@ -244,24 +314,21 @@ def main() -> int:
         check("agmen info lee la grabación con Imu", info.returncode == 0 and "/imu_rec" in info.stdout
               and "Traceback" not in info.stderr, info.stdout + info.stderr)
         # play: un receptor del topic para ver que sale NaN en lo reproducido
-        sub = start(py + [str(Path(__file__)), "--py", "sub", "imu", "/imu_rec", "5"], env0)
+        sub = Proc("receptor de Python", py + [str(Path(__file__)), "--py", "sub", "imu", "/imu_rec", "5"], env0)
         procs.append(sub)
-        head = wait_line(sub, "LISTO")
-        time.sleep(0.5)
+        ready = sub.wait_line("LISTO") and wait_for(lambda: hub_has_sub(hub_addr, "/imu_rec"), 15, 0.1)
         play = cli("play", mcap, "--quiet", "--no-clock", timeout=90)
-        time.sleep(0.5)
-        sub.terminate()
-        out = head + sub.communicate(timeout=10)[0]
+        sub.wait(20)
         check("agmen play reproduce la Imu con NaN (un receptor la recibe)",
-              play.returncode == 0 and len(rx_lines(out)) >= 1 and "Traceback" not in play.stderr,
-              f"{play.stdout}{play.stderr}\n{out}")
+              ready and play.returncode == 0 and len(rx_lines(sub.text())) >= 1 and "Traceback" not in play.stderr,
+              f"{play.stdout}{play.stderr}\n{sub.text()}")
         if _has_module("pyarrow"):
             pq = str(Path(tmp.name) / "pq")
             exp = cli("export", mcap, "--parquet", pq)
             check("agmen export --parquet con NaN", exp.returncode == 0 and "Traceback" not in exp.stderr,
                   exp.stdout + exp.stderr)
         else:
-            print("OMITIDO agmen export --parquet: falta pyarrow (pip install pyarrow)")
+            missing("agmen export --parquet: falta pyarrow (pip install pyarrow)")
         fox = str(Path(tmp.name) / "fox.mcap")
         exp2 = cli("export", mcap, "--foxglove", fox)
         check("agmen export --foxglove con NaN", exp2.returncode == 0 and os.path.exists(fox),
@@ -280,8 +347,7 @@ def main() -> int:
             check(f"el JSON de --foxglove es válido, sin NaN ({count} mensajes)", count > 0 and not bad_json,
                   str(bad_json[:2]))
         # el lector JavaScript del panel
-        node = subprocess.run(["node", "--version"], capture_output=True, text=True) if _has("node") else None
-        if node is not None:
+        if _has("node"):
             js = r"""
 const M = require(process.argv[2]), A = require(process.argv[3]), fs = require("fs");
 (async () => {
@@ -301,21 +367,18 @@ const M = require(process.argv[2]), A = require(process.argv[3]), fs = require("
             jsf.write_text(js, encoding="utf-8")
             pn = ROOT / "python" / "agmen" / "panel"
             r = subprocess.run(["node", str(jsf), str(pn / "mcap.js"), str(pn / "agmen.js"), mcap], capture_output=True,
-                               text=True, encoding="utf-8")
+                               text=True, encoding="utf-8", timeout=60)
             res = json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else {}
             check("mcap.js + agmen.js leen la grabación (NaN en las Imu pares)",
                   r.returncode == 0 and res.get("total", 0) > 0 and res.get("nan", 0) > 0, r.stdout + r.stderr)
         else:
-            print("OMITIDO mcap.js: Node no está instalado")
+            missing("mcap.js + agmen.js: Node no está instalado")
     finally:
         for p in procs:
-            if p.poll() is None:
-                p.terminate()
-                try:
-                    p.communicate(timeout=5)
-                except subprocess.TimeoutExpired:
-                    p.kill()
+            p.stop()
         tmp.cleanup()
+    if failures:
+        print(f"\n--- salida del hub ---\n{hub.text()[-3000:]}")
     print(f"\n{'TODO BIEN' if not failures else str(failures) + ' FALLAS'}")
     return 1 if failures else 0
 

@@ -269,7 +269,9 @@ class TestCuaternion(unittest.TestCase):
 
     def test_errores_claros(self):
         for bad in ((1, 2, 3), ([1, 2, 3, 4, 5],), ("a", 0, 0, 0), (None,), ("1234",), (b"1234",),
-                    (bytearray(b"1234"),), ("1", 0, 0, 0)):
+                    (bytearray(b"1234"),), ("1", 0, 0, 0), ({1.0, 2.0, 3.0, 4.0},), (frozenset({1.0, 2.0, 3.0, 4.0}),),
+                    ({"w": 1, "x": 0, "y": 0, "z": 0},), (memoryview(b"\x00\x01\x02\x03"),),
+                    (memoryview(struct.pack("<4d", 1, 0, 0, 0)).cast("d"),)):
             with self.subTest(bad):
                 with self.assertRaisesRegex(wire.WireError, r"from_wxyz: se esperaban 4 números \(w, x, y, z\)"):
                     msgs.Quaternion.from_wxyz(*bad)
