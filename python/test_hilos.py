@@ -448,30 +448,78 @@ for r in range(RONDAS):
 termina()
 ''')
 
-caso("sub_x_close", modos=("dir", "topic"))(PUBLICA + r'''
-# Receptores dentro de receive() (esperando, con un tope de 6 s) y el principal cierra: close() termina en
-# poco, y los receive() vuelven con None o con "el Subscriber ya se cerró" (nunca "Bad file descriptor").
+# Receptores dentro de receive(T) sin mensajes y el principal cierra: close() termina en menos de 1 s, y
+# CADA receive() en curso termina con "el Subscriber ya se cerró" (no con None ni "Bad file descriptor").
+# T (60 s, o None = sin límite) es mucho mayor que lo que se espera a los receptores tras close() (5 s):
+# si close() no los despierta, la prueba falla por CUELGUE; nunca pasa porque venció su timeout.
+SUB_X_CLOSE = r'''
 for r in range(RONDAS):
     pub, sub = par("sc%d" % r)
-    alto = threading.Event(); dentro = [threading.Event() for _ in range(4)]
+    dentro = [threading.Event() for _ in range(4)]
+    salieron = []
     def recibe(i):
-        while not alto.is_set():
+        while True:
             dentro[i].set()
-            sub.receive(6)
+            try:
+                s = sub.receive(T_RX)
+            except RuntimeError as e:
+                if cerrado(e):
+                    salieron.append(i)
+                raise
+            if s is None:
+                falla("receive(%s) devolvió None con el Subscriber cerrado por otro hilo (debía dar 'ya se cerró')" % (T_RX,))
+                return
     hs = lanza(*[trabajo(recibe, i) for i in range(4)])
     for e in dentro:
         e.wait(10)
     time.sleep(0.02)   # que entren de verdad a receive(): solo cambia cuál camino se prueba, no el resultado
-    mide(sub.close, 3, "Subscriber.close() con receive(6) en curso")
-    mide(sub.close, 3, "Subscriber.close() por segunda vez")
+    mide(sub.close, 1, "Subscriber.close() con receive(%s) en curso" % (T_RX,))
+    mide(sub.close, 1, "Subscriber.close() por segunda vez")
     try:
         sub.receive(0.01)
+        falla("receive tras close no lanzó")
     except RuntimeError as e:
         if not cerrado(e):
             falla("receive tras close: %s" % e)
-    alto.set()
-    espera(hs, 15, "receptores tras close() (receive(20) debía despertar)")
+    espera(hs, 5, "receptores tras close() (receive(%s) debía despertar con 'ya se cerró')" % (T_RX,))
+    if sorted(salieron) != [0, 1, 2, 3]:
+        falla("ronda %d: solo %d de 4 receive() terminaron con 'ya se cerró'" % (r, len(salieron)))
     pub.close()
+termina()
+'''
+caso("sub_x_close", modos=("dir", "topic"))(PUBLICA + "T_RX = 60\n" + SUB_X_CLOSE)
+caso("sub_x_close_sin_tope", modos=("dir", "topic"))(PUBLICA + "T_RX = None\n" + SUB_X_CLOSE)
+
+caso("sub_x_close_reabre", modos=("dir",))(r'''
+# Tras close() con hilos dentro de receive(), el puerto ya está libre: otro Subscriber se abre en seguida en
+# la misma dirección (UDP y, con arrow, TCP) y recibe. close() regresa con el núcleo ya destruido.
+for r in range(RONDAS):
+    sub = agmen.Subscriber(TIPO, "127.0.0.1:0")
+    puerto = sub.port
+    dentro = [threading.Event() for _ in range(3)]
+    def recibe(i):
+        dentro[i].set()
+        sub.receive(None if i == 0 else 60)
+    hs = lanza(*[trabajo(recibe, i) for i in range(3)])
+    for e in dentro:
+        e.wait(10)
+    time.sleep(0.05)
+    mide(sub.close, 1, "Subscriber.close() con receive() en curso")
+    try:
+        sub2 = agmen.Subscriber(TIPO, "127.0.0.1:%d" % puerto)
+    except Exception as e:   # noqa: BLE001
+        falla("ronda %d: reabrir 127.0.0.1:%d en seguida de close(): %s: %s" % (r, puerto, type(e).__name__, e))
+        termina()
+    espera(hs, 5, "receptores tras close()")
+    pub = agmen.Publisher(TIPO, "127.0.0.1:%d" % puerto, "/hilos/%d/reabre" % PID)
+    fin = time.monotonic() + 8
+    while time.monotonic() < fin:
+        pub.publish(mk(1, 1))
+        if sub2.receive(0.05) is not None:
+            break
+    else:
+        falla("ronda %d: el Subscriber reabierto no recibió en 8 s" % r)
+    pub.close(); sub2.close()
 termina()
 ''')
 
@@ -480,20 +528,33 @@ caso("sub_x_close_con_flujo", modos=("dir", "topic"))(PUBLICA + r'''
 for r in range(RONDAS):
     pub, sub = par("sf%d" % r)
     alto = threading.Event(); cuenta = [0]; ya = threading.Event(); dentro = [threading.Event() for _ in range(3)]
+    salieron = []
     def recibe(i):
-        while not alto.is_set():
-            s = sub.receive(0.1)
-            if s is not None:
-                dentro[i].set()
-    hs = lanza(trabajo(publicador, pub, 0, alto, cuenta, ya),
-               *[trabajo(recibe, i) for i in range(3)])
+        # receive(60): mucho más que los 5 s que se les espera tras close(); cada uno debe salir con
+        # "ya se cerró" (un None sería que venció su timeout: falla).
+        while True:
+            try:
+                s = sub.receive(60)
+            except RuntimeError as e:
+                if cerrado(e):
+                    salieron.append(i)
+                raise
+            if s is None:
+                falla("receive(60) devolvió None con el Subscriber cerrado por otro hilo (debía dar 'ya se cerró')")
+                return
+            dentro[i].set()
+    pubs = lanza(trabajo(publicador, pub, 0, alto, cuenta, ya))
+    hs = lanza(*[trabajo(recibe, i) for i in range(3)])
     ya.wait(10)
     fin = time.monotonic() + 0.3
     while time.monotonic() < fin and not all(e.is_set() for e in dentro):
         time.sleep(0.01)
-    mide(sub.close, 10, "Subscriber.close()")
+    mide(sub.close, 1, "Subscriber.close() con flujo y receive(60) en curso")
+    espera(hs, 5, "receptores tras close() (receive(60) debía despertar con 'ya se cerró')")
+    if sorted(salieron) != [0, 1, 2]:
+        falla("ronda %d: solo %d de 3 receive() terminaron con 'ya se cerró'" % (r, len(salieron)))
     alto.set()
-    espera(hs, 15, "receptores y publicador tras close()")
+    espera(pubs, 15, "publicador tras close()")
     pub.close()
 termina()
 ''')
@@ -877,6 +938,32 @@ for r in range(RONDAS):
 termina()
 """)
 
+caso("raw_pub_schema_x_close", modos=("topic",), tipos=("compact",))(RAW + r"""
+# RawPublisher.set_schema() desde 4 hilos a la vez, y close() desde otro en la misma salida: un solo enlace
+# con el hub (un solo hilo de latido), y ninguno se crea después del cierre. Al final no queda vivo ningún
+# hilo "agmen-latido-*" (en este proceso solo los RawPublisher de este caso tienen latido).
+def latidos():
+    return [h.name for h in threading.enumerate() if h.name.startswith("agmen-latido")]
+for r in range(RONDAS * 3):
+    rp = pubsub.RawPublisher("/hilos/%d/rs%d" % (PID, r))
+    puerta = threading.Barrier(5 if r % 2 else 4)   # rondas impares: close() compite con los set_schema
+    def pone():
+        puerta.wait(10)
+        rp.set_schema(Chico.SCHEMA_TEXT, Chico.NAME, Chico.SCHEMA_ID)
+    def cierra():
+        puerta.wait(10)
+        rp.close()
+    hs = lanza(*[trabajo(pone) for _ in range(4)], *([trabajo(cierra)] if r % 2 else []))
+    espera(hs, 15, "RawPublisher: set_schema() x set_schema() x close()")
+    mide(rp.close, 10, "RawPublisher.close()")
+fin = time.monotonic() + 5   # cada hilo de latido sale al ver su parada (a lo más un latido después)
+while latidos() and time.monotonic() < fin:
+    time.sleep(0.05)
+if latidos():
+    falla("quedan %d hilos de latido vivos tras cerrar todos los RawPublisher: %s" % (len(latidos()), latidos()[:4]))
+termina()
+""")
+
 RAWSUB = r"""
 def publica(pub, alto, cuenta):
     k = 0
@@ -1083,15 +1170,7 @@ def _resumen_tsan(err: str) -> list[str]:
         for i, x in enumerate(lineas):
             if x.startswith(("Read of", "Write of", "Previous read", "Previous write", "Atomic")):
                 acc.append(x.split(" at ")[0] + " en " + _frame_nuestro(lineas, i + 1))
-        fp = ""
-        # Dos hilos DENTRO de PySubscriber::receive/close: el turno rx_mu_ se toma con try_lock_for(), que
-        # usa pthread_mutex_clocklock, y el libtsan de GCC 13/14 y el de Clang 15 no lo interceptan: TSan
-        # no ve el candado y avisa de carreras que el candado evita. Una lectura sin candado (announced,
-        # filenos, listen...) contra receive() sí es una carrera de verdad y no se marca.
-        dentro = blk.count("PySubscriber::receive") + blk.count("PySubscriber::close")
-        if "unlocked mutex" in tipo or (dentro >= 2 and not any(k in blk for k in ("announced python/src", "filenos", "listen_address", "native_handles"))):
-            fp = " [probable falso positivo: rx_mu_ se toma con try_lock_for (pthread_mutex_clocklock) y este libtsan no lo intercepta]"
-        out.append(tipo + " | " + " || ".join(acc[:2]) + fp)
+        out.append(tipo + " | " + " || ".join(acc[:2]))
     return out
 
 
@@ -1120,7 +1199,12 @@ class _Base(unittest.TestCase):
         if TSAN:
             lib = libtsan()
             if not lib:
-                self.skipTest("no encuentro libtsan.so (gcc -print-file-name=libtsan.so)")
+                # Fallar, no saltarse: si no, el trabajo de TSan del CI quedaría en verde sin haber probado nada.
+                self.fail("AGMEN_HILOS_TSAN=1 pero no encuentro libtsan.so (gcc -print-file-name=libtsan.so): "
+                          "instala el libtsan de tu compilador o quita AGMEN_HILOS_TSAN")
+            if not any(b"__tsan_init" in c.read_bytes() for c in (ROOT / "agmen").glob("_core*")):
+                self.fail(f"AGMEN_HILOS_TSAN=1 pero no hay un agmen/_core compilado con TSan en {ROOT} "
+                          "(AGMEN_HILOS_RAIZ): compila con -DAGMEN_TSAN=ON y usa AGMEN_HILOS_RAIZ=<build>/python_tsan")
             supp = AQUI.parent / "tests" / "tsan.supp"
             env["LD_PRELOAD"] = lib
             env["TSAN_OPTIONS"] = (f"suppressions={supp} halt_on_error=0 exitcode=66 report_signal_unsafe=0 "

@@ -697,11 +697,18 @@ public:
         {
             const NoGil nogil(Inside::Create);
             if (!nogil.released()) throw closing_error("un Subscriber");
-            core_ = std::make_shared<agmen::SubscriberCore>(where, type_info(name, text, id, size, arrow));
+            // Con un borrador propio: avisa a close() cuando el núcleo ya se destruyó (ver close()).
+            core_ = std::shared_ptr<agmen::SubscriberCore>(
+                new agmen::SubscriberCore(where, type_info(name, text, id, size, arrow)), CoreDeleter{this});
         }
         g_subs.push_back(this);   // ya con el GIL
     }
-    ~PySubscriber() { std::erase(g_subs, this); }
+    ~PySubscriber() {
+        // Primero el núcleo: su borrador usa turn_mu_ y gone_cv_, que se destruyen después.
+        // Aquí nadie más tiene una copia (las copias solo viven dentro de un método).
+        core_.reset();
+        std::erase(g_subs, this);
+    }
     PySubscriber(const PySubscriber&) = delete;
     PySubscriber& operator=(const PySubscriber&) = delete;
 
@@ -712,6 +719,7 @@ public:
         for (PySubscriber* p : g_subs) {
             new (&p->turn_mu_) std::mutex();
             new (&p->turn_cv_) std::condition_variable();
+            new (&p->gone_cv_) std::condition_variable();
             p->turn_busy_ = false;
             p->turn_waiting_ = 0;
         }
@@ -763,10 +771,16 @@ public:
         if (nogil.released()) c->heartbeat();
     }
     void close() {
-        // Con el GIL, sin esperar a nadie: marca el cierre (los receive() que esperan su turno despiertan
-        // ya; el que está dentro sale al terminar su tramo, a lo más 200 ms) y suelta la referencia del
-        // objeto. El núcleo se destruye cuando sale el último hilo que lo usaba (también uno detenido para
-        // siempre al salir del programa: entonces se deja vivo). Dos veces, o desde dos hilos: inofensivo.
+        // 1) Con el GIL, sin esperar a nadie: marca el cierre (los receive() que esperan su turno
+        //    despiertan ya; el que está dentro sale al terminar su tramo, a lo más 200 ms) y suelta la
+        //    referencia del objeto. El núcleo se destruye cuando sale el último hilo que lo usaba, con el
+        //    GIL (su copia es local de receive(), heartbeat() o listen_address()).
+        // 2) Si alguien más lo tenía, espera SIN el GIL (si no, ese hilo no podría retomarlo para salir y
+        //    soltar su copia) a que el borrador avise que ya se destruyó: sockets cerrados, baja del hub
+        //    hecha, puerto libre. Tope 750 ms (250 ms si el programa sale); pasado el tope regresa igual y
+        //    el núcleo se destruye cuando salga ese hilo (o nunca, si quedó detenido al salir).
+        //    Con un solo hilo el núcleo ya se destruyó en el paso 1 y no se espera ni se suelta el GIL.
+        // Dos veces, o desde dos hilos a la vez: inofensivo (el segundo también espera, con el mismo tope).
         {
             const std::lock_guard lock(turn_mu_);
             turn_closed_ = true;
@@ -775,6 +789,16 @@ public:
         std::shared_ptr<agmen::SubscriberCore> old;
         old.swap(core_);
         old.reset();   // aquí y con el GIL, si nadie más lo usa
+        {
+            const std::lock_guard lock(turn_mu_);
+            if (core_gone_) return;   // lo normal: un solo hilo
+        }
+        using namespace std::chrono;
+        const milliseconds limit = g_closing.load() ? milliseconds(250) : milliseconds(750);
+        const NoGil nogil(Inside::Close);
+        if (!nogil.released()) return;   // el programa sale y este hilo no es el que cierra: no se espera
+        std::unique_lock lock(turn_mu_);
+        gone_cv_.wait_for(lock, limit, [this] { return core_gone_; });
     }
     [[nodiscard]] bool closed() const { return !core_; }
     // Las lecturas no esperan el turno de receive(): el núcleo las da con un candado chico.
@@ -800,6 +824,19 @@ public:
     [[nodiscard]] std::uint64_t rejected() { return live()->rejected(); }
 
 private:
+    /// Destruye el núcleo y avisa a close() (en el hilo que soltó la última copia, con el GIL).
+    struct CoreDeleter {
+        PySubscriber* p;
+        void operator()(agmen::SubscriberCore* c) const noexcept {
+            delete c;
+            {
+                const std::lock_guard lock(p->turn_mu_);
+                p->core_gone_ = true;
+            }
+            p->gone_cv_.notify_all();
+        }
+    };
+
     /// El turno de receive_raw() entre hilos (sin el GIL). Con un solo hilo, tomarlo es un candado
     /// libre y una bandera; solo quien no lo consigue espera en la condición, a lo más su tramo.
     /// std::mutex + std::condition_variable (y no un std::timed_mutex): ThreadSanitizer los ve.
@@ -851,11 +888,13 @@ private:
         return core_;
     }
     std::shared_ptr<agmen::SubscriberCore> core_;   // solo se toca con el GIL
-    std::mutex turn_mu_;                              // turn_busy_, turn_waiting_, turn_closed_
+    std::mutex turn_mu_;                              // turn_busy_, turn_waiting_, turn_closed_, core_gone_
     std::condition_variable turn_cv_;
+    std::condition_variable gone_cv_;                 // core_gone_ (close() espera la destrucción del núcleo)
     bool turn_busy_ = false;     // un hilo está en receive_raw()
     int turn_waiting_ = 0;       // hilos esperando el turno
     bool turn_closed_ = false;   // close(): los receive() en curso o por venir dan "ya se cerró"
+    bool core_gone_ = false;     // el borrador ya destruyó el núcleo
 };
 
 // ---------------------------------------------------------------------------

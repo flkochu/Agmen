@@ -7,8 +7,5 @@
 # Una entrada solo se agrega si el informe es del intérprete o de una biblioteca ajena, nunca de src/,
 # include/agmen/ o python/src/, y con un comentario que diga qué es y por qué es un falso positivo.
 #
-# Conocido y SIN suprimir: el candado rx_mu_ de python/src/core.cpp (std::timed_mutex::try_lock_for ->
-# pthread_mutex_clocklock) no lo ve el libtsan de GCC 13/14 ni el de Clang 15 (no interceptan esa
-# función). Da "unlock of an unlocked mutex" y carreras falsas entre dos receive()/close(). python/test_hilos.py
-# las marca como "probable falso positivo". Se resuelve al arreglar (p. ej. sin timed_mutex) o con un
-# Clang/GCC cuyo libtsan intercepte pthread_mutex_clocklock; no con una supresión.
+# El turno de receive() del Subscriber (python/src/core.cpp) usa std::mutex + std::condition_variable,
+# que TSan sí ve: ya no hay std::timed_mutex ni falsos positivos por pthread_mutex_clocklock.

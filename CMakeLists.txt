@@ -94,8 +94,10 @@ function(agmen_set_warnings target)
         if(AGMEN_TSAN)
             # -O1 -g: las pilas de ThreadSanitizer con archivo:línea. No se mezcla con ASan.
             target_compile_options(${target} PRIVATE -fsanitize=thread -fno-omit-frame-pointer -g -O1)
-            # GCC avisa (-Wtsan) de los atomic_thread_fence del núcleo, que TSan no modela: el aviso se
-            # queda, pero con AGMEN_WERROR no tumba el build. Lo que importe lo dirá TSan al correr.
+            # GCC avisa (-Wtsan) de los atomic_thread_fence del núcleo (la memoria compartida), que TSan no
+            # modela: el aviso se queda, pero con AGMEN_WERROR no tumba el build. Esas rutas quedan SIN
+            # cubrir por TSan (no ve el orden que dan los fence: ni avisa bien ni avisa de más ahí); las
+            # cubren las pruebas de memoria compartida y la revisión, no este build.
             # Con -O1 + -fsanitize=thread, GCC 13 da un -Wmaybe-uninitialized falso con std::optional
             # (examples/nivel0/common.hpp: SeqTracker::expected_), que con -O2/-O3 no da: también queda
             # como aviso, sin tumbar el build con AGMEN_WERROR (los builds normales siguen con -Werror).

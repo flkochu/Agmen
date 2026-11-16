@@ -555,7 +555,7 @@ class _Receiver:
         self._quiet_peers: frozenset = frozenset()   # los peers de cuando el hub calló (§10.2)
         self._quiet_warned: set = set()
         self._sock = wire.udp_socket()
-        self.announced: dict[int, tuple[str, str]] = {}   # schema_id → (topic, esquema)
+        self._announced: dict[int, tuple[str, str]] = {}   # schema_id → (topic, esquema)
         self._link = None
         # Los mensajes arrow llegan por TCP (RFC 0008): un puerto más, que se registra en el hub.
         self._tcp: _tcp.Listener | None = None
@@ -582,6 +582,12 @@ class _Receiver:
                 raise
             if tcp:   # con dirección fija, la misma IP y el mismo puerto en TCP
                 self._tcp = self._same_port_tcp(where, shm)
+
+    @property
+    def announced(self) -> dict[int, tuple[str, str]]:
+        """schema_id → (topic, esquema) de los anuncios vistos. Una copia (como el núcleo de C++):
+        el hilo que recibe puede añadir anuncios mientras otro la recorre."""
+        return dict(self._announced)
 
     def _same_port_tcp(self, where: str, shm: bool) -> _tcp.Listener:
         """El TCP en la misma IP y el mismo puerto que el UDP. Con el puerto 0, el
@@ -939,7 +945,7 @@ class _PureSubscriber(_Receiver):
             data, src, peer = got
             env, payload = wire.parse(data, shm=peer is not None and peer.hello)
             if env.encoding == wire.ENC_SCHEMA:
-                self.announced[env.schema_id] = wire.read_announcement(env, payload)
+                self._announced[env.schema_id] = wire.read_announcement(env, payload)
                 continue
             if env.flags & wire.FLAG_SHM:
                 # Un descriptor de memoria compartida (RFC 0009): la vista del bloque, sin copiar.
@@ -957,7 +963,7 @@ class _PureSubscriber(_Receiver):
 
     def _check_type(self, env) -> None:
         if env.schema_id != self.type.SCHEMA_ID:
-            known = self.announced.get(env.schema_id)
+            known = self._announced.get(env.schema_id)
             detail = f"{known[1]}, topic {known[0]}" if known else None
             raise wire.WireError(wire.type_mismatch_text(self.type, env.schema_id, detail))
 
@@ -1037,14 +1043,19 @@ class RawPublisher(_NetSend):
                 self._drain()
 
     def set_schema(self, text: str, name: str, schema_id: int) -> None:
-        if self._closed:
-            raise RuntimeError(_RAWPUB_CERRADO)
-        if self._link is not None:
-            return
-        self.schema_text = text
-        self._link = _HubLink(self._sock, dict(
-            op="pub", id=f"{self.source_id:016x}", node=node_name(), pid=os.getpid(), topic=self.topic,
-            schema=f"{schema_id:016x}", type=name, text=text), on_tick=self._drain_locked)
+        # Con el candado: dos set_schema a la vez no crean dos enlaces (con un hilo de latido cada uno,
+        # y close() solo cerraría uno), y uno a la vez que close() no crea un enlace ya cerrado.
+        # El hilo de latido del enlace nuevo puede pedir este candado (_drain_locked): espera a que
+        # set_schema lo suelte; _HubLink() no espera a ese hilo, así que no hay bloqueo mutuo.
+        with self._lock:
+            if self._closed:
+                raise RuntimeError(_RAWPUB_CERRADO)
+            if self._link is not None:
+                return
+            self.schema_text = text
+            self._link = _HubLink(self._sock, dict(
+                op="pub", id=f"{self.source_id:016x}", node=node_name(), pid=os.getpid(), topic=self.topic,
+                schema=f"{schema_id:016x}", type=name, text=text), on_tick=self._drain_locked)
 
     def _drain(self) -> None:
         if self._link is None:
@@ -1119,10 +1130,15 @@ class RawPublisher(_NetSend):
         return self._rejected
 
     def close(self) -> None:
-        if self._link is not None:
-            self._link.close()
-        with self._lock:   # un _drain() en curso (de send() o del latido) termina antes
+        # Primero se marca el cierre con el candado: un set_schema() después ya no crea enlace, y el que
+        # estaba en curso ya lo dejó en self._link. El enlace se cierra fuera del candado (su hilo de
+        # latido puede estar pidiéndolo en _drain_locked, que ya ve _closed y no hace nada).
+        with self._lock:
             self._closed = True
+            link = self._link
+        if link is not None:
+            link.close()
+        with self._lock:   # un _drain() en curso (de send() o del latido) termina antes
             self._sock.close()
             self._close_net_sock()
 
