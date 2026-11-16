@@ -7,14 +7,14 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 
 ## [Sin publicar]
 
-### Planeado (nivel 10, versión 0.14.0)
-- El mismo robot en simulación y en el mundo real, y nodos en varias
-  computadoras. Diseño aceptado el 2026-11-13 en el
-  [RFC 0011](docs/rfc/0011-sim-real-y-varias-computadoras.md) (D1–D10 = a:
-  perfiles en `robot.toml` con `agmen run --sim`, un mundo de MuJoCo de
-  ejemplo y `agmen agent` en cada computadora). Hecho: los perfiles (bloque 1,
-  abajo). Falta: el mundo de MuJoCo (`examples/sim/`, `agmen[sim]`),
-  `[[machine]]` y `agmen agent`, con el capítulo 17.
+## [0.14.0] — 2026-11-16
+
+**Simulación y real, y nodos en varias computadoras.** Implementa el
+[RFC 0011](docs/rfc/0011-sim-real-y-varias-computadoras.md) con las opciones
+recomendadas (D1–D10 = a): perfiles en `robot.toml`, un mundo de MuJoCo de
+ejemplo, `agmen agent` en cada computadora, los topics entre computadoras de la
+misma red, la prueba de red antes de arrancar, los relojes medidos (no
+corregidos) y un banco para medir la latencia y los MB/s entre dos computadoras.
 
 ### Agregado
 - **Perfiles en `robot.toml`** (RFC 0011 §3.2): `profile = "real"`, `"sim"`,
@@ -22,9 +22,9 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   `[[topic]]`. Sin `profile`, corren en todos. Un perfil puede ser una lista
   (`profile = ["real", "mesa"]`). Dos nodos pueden llamarse igual si nunca
   corren juntos (una `imu` real y una `imu` falsa).
-- **`[profile.X]`** con `clock`, `web` y `record`: cada una reemplaza la de
-  arriba, solo en ese perfil. `local` se acepta, pero todavía no hace nada
-  (llega con varias computadoras).
+- **`[profile.X]`** con `clock`, `web`, `record` y `local`: cada una reemplaza
+  la de arriba, solo en ese perfil. `local = true` hace que todo el perfil corra
+  en esta computadora y se ignora `machine` (en la terminal, lo dice).
 - **`[robot] profile`**: el perfil por defecto de `agmen run`. Por omisión,
   `real`.
 - **Banderas de `agmen run`**: `--sim` (lo mismo que `--profile sim`, con el
@@ -40,14 +40,268 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 - **`perfil` en las grabaciones**: `agmen run --record` lo guarda en
   `agmen.grabacion`, y `agmen info` lo muestra. `agmen record` suelto no lo
   escribe. Las grabaciones sin el campo se leen igual.
+- **El mundo de MuJoCo** (RFC 0011 §3.3, `examples/sim/`): el robot del
+  tutorial con física, como un nodo más con `profile = "sim"`. Publica `/imu`
+  (100 Hz) y `/camara` (`Imagen` de 320 × 240, 15 fps), y escucha `/cmd`, igual
+  que el hardware. `agmen run examples/tutorial/robot.toml --sim` lo corre; el
+  cerebro, el mux y el panel no cambian. El mundo sigue al reloj de Agmen, así
+  que la pausa, el paso y la velocidad del panel funcionan.
+  - Cuatro archivos: `mundo.py` (el nodo), `fisica.py` (la clase `Mundo`, sin
+    Agmen), `camara.py` (la cámara) y `ver.py` (la ventana de `--ver`).
+  - `--ver` abre la ventana de MuJoCo. Sin pantalla, avisa y sigue.
+  - Sin OpenGL, el mundo sigue sin cámara y lo dice en una línea.
+  - La clase `Mundo` (`fisica.py`) se puede usar sola, sin Agmen (pensada para
+    entrenar IA).
+- **`agmen[sim]`**: extra de `pip` que trae MuJoCo (`mujoco>=3.2.7`).
+- **Capítulo 17 del tutorial**: el mismo robot en simulación y en el mundo
+  real.
+- **`[[machine]]` y `machine` en `robot.toml`** (RFC 0011 §3.4, parte 3a):
+  `[[machine]]` declara una computadora del robot con `name` y `host` (IP o
+  nombre, con `:puerto` opcional; por defecto 7391). `machine = "nombre"` en un
+  `[[node]]` o un `[[mux]]` dice en cuál corre. Los nombres de `[[machine]]`
+  son únicos, y dos `[[machine]]` no pueden tener el mismo `host`. Un nodo sin
+  `machine` corre donde corres `agmen run`, como antes.
+- **Qué funciona con `machine`**: `agmen run` decide si cada `[[machine]]` es
+  esta computadora (una de sus IP, o loopback) y lo dice en la terminal
+  (`es esta computadora; sus nodos corren aquí`). Si lo es, sus nodos arrancan
+  aquí. Un nombre que no resuelve en 1.5 s se toma como otra computadora, y el
+  aviso pide poner la IP en `host`.
+- **`agmen agent`** (RFC 0011 §3.4, parte 3b): en la computadora del robot,
+  `agmen agent robot.toml` escucha en el puerto de su `[[machine]]` (7391 por
+  defecto) y arranca solo los nodos de **su** `robot.toml` que dicen `machine`
+  de esa computadora. Imprime su clave (`xxxx-xxxx-xxxx`). Opciones: `--machine
+  NOMBRE` (si el archivo tiene varias `[[machine]]` aquí), `--port N` y
+  `--new-key`.
+- **La clave**: se crea la primera vez y se guarda en la carpeta de Agmen del
+  usuario (`agent.key`, solo legible por su dueño). Nunca va en `robot.toml`.
+  Laptop y agente se prueban que tienen la misma clave sin enviarla (PBKDF2 y
+  HMAC). El protocolo `agmen-agent/1` está en
+  [`docs/PROTOCOLO.md`](docs/PROTOCOLO.md).
+- **`agmen run` se conecta con cada agente** antes de arrancar nada (ni hub, ni
+  `before`, ni nodos locales). Si una conexión falla, no arranca nada, sale con
+  código 2 y dice qué hacer. La primera vez pide la clave en la terminal, o la
+  toma de `AGMEN_AGENT_KEY`. Ctrl+C (y Ctrl+D en Linux) al pedir la clave
+  cancela sin arrancar nada, con código de salida 130. Solo guarda en
+  `keys.toml` la que escribiste a mano, y únicamente después de una conexión
+  aceptada.
+- **`agmen run --forget-key NOMBRE`**: borra la clave guardada de una
+  `[[machine]]` y sale.
+- **Logs y Ctrl+C con nodos remotos**: los logs de los nodos de otra
+  computadora llevan el prefijo `robot/motor │`. Ctrl+C en la laptop detiene
+  los nodos de todas las computadoras.
+- **Reconectar tras un corte** (RFC 0011 §3.4, parte 3c): si se corta el WiFi, el
+  agente da 10 s de gracia (sus nodos siguen) y `agmen run` reintenta solo hasta
+  Ctrl+C. Si la laptop vuelve a tiempo, nada se reinicia y los logs que se
+  perdieron llegan. Si vuelve tarde, los nodos de esa computadora ya están
+  detenidos y ninguno arranca solo; la laptop lo dice y se puede arrancarlos
+  desde el panel.
+- **Cerrar el agente a propósito**: Ctrl+C o SIGTERM en `agmen agent` detienen
+  sus nodos al momento, y la laptop lo dice (`cerraron agmen agent allá`) en vez de
+  esperar 10 s. Protocolo: `adios` del agente (ver `docs/PROTOCOLO.md`).
+- **Panel con varias computadoras**: una línea por computadora (`aquí`,
+  `conectado`, `sin conexión` con cuántos segundos de gracia quedan), los nodos
+  de otra computadora como `robot/motor`, y sus botones apagados cuando no hay
+  conexión, con el motivo en el texto del botón.
+- **`agmen agent --show-key`** imprime la clave guardada y sale. Cuando la salida
+  no es una terminal (un servicio), el agente no escribe la clave en el log: dice
+  dónde está guardada.
+- **Servicio de arranque**: `examples/tutorial/agmen-agent.service`, una unidad
+  de systemd de ejemplo (usuario normal, reintentos que no se rinden, tiempo para
+  despedirse).
+- **Protocolo `agmen-agent/1`, parte 3c**: `sesion_ok` trae `sesion` y `gracia`;
+  nuevos `reanudar` y `reanudar_ok` (con los `log` que la laptop no tenía); el
+  `adios` del agente; `sesion_error` `sesion` y `ocupado` con los segundos que
+  quedan. El agente guarda 2 000 líneas de log (1 MiB) para reanudar.
+- **Topics entre computadoras, parte 4a (RFC 0011 §3.5): la base, sin encender**.
+  El hub `agmen-hub/1` gana la operación `red` (modo red: `peers=nombre@ip`, que se
+  repite cada 2 s y caduca a los 6 s), `pong red=1`, `ok … peers=`, `sub … net=1` y
+  las entradas de otra computadora (`sub` y `pub` con `machine`; `addr` en `sub`),
+  con sus reglas de aceptación. `query` (`state`) lleva `machine` y `net`. Los dos
+  núcleos (C++ y Python) escuchan en la red solo cuando su hub se lo dice, aceptan
+  datos solo de las computadoras declaradas, y mandan a otra computadora (UDP los
+  chicos, TCP los grandes, sin memoria compartida). Contadores nuevos: `rejected`
+  (datos o control que no vienen de una computadora declarada o de su hub) y
+  `unreachable` (destinos de otra computadora que no se alcanzan).
+  `RawPublisher` (el del `[[mux]]`) ya manda a otra computadora igual que un
+  Publisher. En la 4a, un topic todavía no cruzaba entre computadoras: eso llegó con
+  la parte 4b (abajo); la vista en herramientas y panel, con la 4c. Protocolo en
+  `docs/PROTOCOLO.md` ("Topics y hub: `agmen-hub/1`").
+- **Topics entre computadoras, parte 4b (RFC 0011 §3.5, §8 y §9): el puente**.
+  `agmen run` (en la laptop, uno por cada agente conectado) y `agmen agent` (en el
+  robot) pasan las tablas de sus hubs por la conexión firmada `agmen-agent/1`, cuando
+  las dos dicen `tablas`. Mientras la conexión está confirmada, cada lado enciende el
+  modo red de su hub, manda sus endpoints locales y registra los del otro como
+  entradas de otra computadora (ids `<computadora>.<id>`, con la IP que ve el
+  receptor). Así un topic cruza de verdad entre la laptop y cada robot, sin configurar
+  nada, y sin reiniciar nodos al reconectar. `agmen-agent/1` gana `tablas` (capacidad),
+  `desde` en `sesion`, `sin_tablas` en `sesion_ok`/`reanudar_ok` cuando el agente no
+  hace el puente, y el mensaje `tablas` (partes de como mucho 100 endpoints y 48 KiB;
+  1 000 endpoints y 1 MiB por tabla). `agmen-hub/1` gana `solo=` en un `sub` de otra
+  computadora, y `state` se reparte en varios datagramas (`parte i= de= n=`, de como
+  mucho 32 KiB) cuando no cabe en uno; `query` atiende una por datagrama, con topes de
+  16 MiB en total y 4 MiB por dirección. En simulación o reproducción, en el robot
+  solo cruzan los nodos que arrancó el agente: los demás se avisan una vez. Con dos
+  robots, los topics no cruzan entre ellos: `agmen run` lo avisa una vez por topic. Si
+  un lado no dice `tablas`, no hay puente, y se dice una vez. Los dos cambios son
+  añadidos: quien no los conoce sigue como antes. Protocolo en `docs/PROTOCOLO.md`
+  ("El puente de topics"). La prueba de red y lo visible en herramientas y panel llegaron
+  con la parte 4c (abajo).
+- **La prueba de red, parte 4c (RFC 0011 §3.5 y §6, reto 2)**: antes de arrancar nada,
+  `agmen run` prueba el paso de los topics con cada robot, en los dos sentidos, por UDP
+  (mensajes chicos) y por TCP (mensajes grandes). Son cuatro comprobaciones por robot. Si
+  alguna falla al conectar, no arranca nada: ni los nodos de la laptop, ni el `[robot] before`
+  ni el hub de los robots (su agente espera la prueba antes de preparar nada). Despide a los
+  agentes y sale con código 2. El mensaje dice qué computadora no recibe de cuál, por dónde
+  (UDP, TCP o los dos) y qué hacer según su sistema (Windows, Linux o macOS). Al reconectar
+  tras un corte, la prueba solo avisa: nada se detiene. Solo se hace cuando hay puente (los
+  dos lados con `[hub]`) y los dos la saben hacer. Con varios robots, las pruebas van a la
+  vez, y ningún robot recibe la orden de arrancar hasta que pasan todas. En Windows, avisa
+  antes de la primera prueba que Windows puede preguntar por el firewall. Un límite: la
+  prueba la hace Python, así que un nodo en C++ puede seguir bloqueado en Windows aunque la
+  prueba pase; Agmen lo dice una vez.
+- **`agmen run --no-net-check`**: se salta la prueba de red, con un aviso en rojo de que se
+  saltó y de que, si un firewall bloquea los topics, Agmen no lo va a decir.
+- **De qué computadora es cada topic (parte 4c, RFC 0011 §3.5)**: `agmen topic list` gana la
+  columna `publica` (las computadoras que publican cada topic; `aquí` es esta). `agmen topic
+  info` dice `· aquí` o `· en <computadora>` en cada emisor y receptor. `agmen node list`
+  gana la columna `computadora`. Sin otras computadoras, la salida es la de antes, byte a
+  byte. `/api/state` trae `publishers_at` y `subscribers_at` en cada topic, y el panel
+  muestra una etiqueta (`robot → laptop`) cuando `robot.toml` tiene `[[machine]]`.
+- **`scripts/maquinas_smoke.py` en el CI** (RFC 0011 §6, reto 9): dos "computadoras" en los
+  tres sistemas, con `examples/tutorial/robot_dos.toml`. En Linux (x86-64 y ARM64), son
+  espacios de nombres de red y de montaje, con su propio `/dev/shm` del kernel: el mismo
+  aislamiento de un contenedor, sin imágenes. Ahí el modo `aislado` es obligatorio, y si no
+  se puede, el script falla diciendo qué faltó. Fuera del CI, el script usa dos IP de
+  loopback (`127.0.0.1` y `127.0.0.2`, con `AGMEN_SHM=0`), salvo que se pida
+  `AGMEN_SMOKE_MODO=aislado`. Comprueba la prueba de red, que los nodos corren en el robot,
+  los topics en los dos sentidos, un mensaje grande y, en el modo aislado, el firewall con
+  UDP bloqueado (si hay `iptables` o `nft`), y que Ctrl+C detiene todo.
+- **Protocolo `agmen-agent/1`, parte 4c**: la capacidad `"sonda": 1` (junto a `tablas`), y los
+  mensajes `sonda_espera`, `sigue`, `sonda`, `sonda_ok` y `sonda_fin`, más el `sesion_error`
+  `sonda`. Son añadidos: quien no los conoce sigue como en la 4b. Formato en
+  `docs/PROTOCOLO.md` ("La prueba de red").
+- **Capítulo 18 del tutorial**: la sección 10, "La prueba de red: el firewall"; la de topics
+  muestra la columna `publica`, `topic info`, `node list` y la etiqueta del panel.
+- **Lo que todavía no existe**: sincronizar los relojes entre computadoras (nivel 11; el
+  bloque 5 solo los mide y avisa). Dos robots no se pasan topics entre sí. Una laptop a
+  la vez por agente.
+- **Capítulo 5 del tutorial, sección 7**: resumen de `[[machine]]`, qué corre en
+  cada computadora y por qué el hardware va con `profile = "real"`.
+- **Capítulo 18 del tutorial, "Un robot, varias computadoras"**: el recorrido de
+  dos computadoras con `robot_dos.toml`, la clave, el agente como servicio y qué
+  pasa cuando se cae el WiFi, con salidas reales de las pruebas. Desde la parte 4b, su
+  sección 10 explica los topics entre la laptop y la Pi (sin salidas de prueba aún).
+- **Los relojes de las dos computadoras** (bloque 5, RFC 0011 §3.6): `agmen run` mide cada
+  2 s la diferencia entre el reloj de la laptop y el de cada robot, con las cuatro marcas
+  de tiempo de NTP. Solo se mide y se avisa: ningún `t_data` cambia.
+  - **Avisos**: en sesión real, `agmen run` avisa cuando la diferencia pasa de 10 ms, con
+    qué hacer (chrony en Linux o Raspberry Pi, `w32tm /resync` en Windows); dice cuando
+    vuelve a estar bien (menos de 8 ms) y recuerda cada 10 minutos mientras siga mal. En
+    simulación y reproducción no avisa, y no corrige nada.
+  - **`agmen node list`** muestra una línea por computadora (`robot: reloj +2.1 ms
+    (±0.6)`), o «sin medir» con su motivo. Sin otras computadoras, la salida es la de
+    siempre. En simulación dice `(no afecta en sim)`.
+  - **El panel** muestra el reloj de cada computadora, en rojo y con qué hacer si está
+    corrido. Las latencias de un topic que sale de otra computadora se corrigen con la
+    diferencia en sesión real; si no se pueden corregir, se marcan `(sin corregir)`.
+  - **`agmen record`** guarda en un registro de metadatos aparte, `agmen.relojes`, un
+    resumen por computadora (diferencia al empezar y al terminar, mínima, máxima,
+    incertidumbre y muestras). Se escribe al cerrar cada archivo, y solo si hubo alguna
+    medición de otra computadora; `agmen.grabacion` no cambia. `agmen info` lo muestra.
+    Formato en `docs/PROTOCOLO.md`.
+  - **Protocolo**: `agmen-agent/1` gana la capacidad `"relojes": 1` y las claves `reloj` de
+    `ping` y `pong`; `agmen-hub/1` gana `relojes=` y `modo=` en `red`, y la línea `maq` en
+    `state`. Todo es añadido: un lado anterior sigue funcionando y la medición queda «sin
+    medir». Formato en `docs/PROTOCOLO.md`.
+  - **Capítulo 18 del tutorial, sección 12**: los relojes de las dos computadoras, para
+    estudiantes.
+- **Banco de medición entre dos computadoras** (RFC 0011 §7, punto 7):
+  `bench/dos_computadoras.py` mide, entre la laptop y el robot, la ida y vuelta de
+  un mensaje (mediana y p99) y los MB/s y mensajes/s de ida, de 64 B a 6 MiB, con su
+  tabla al final. Se corre con `bench/dos_computadoras.toml`: `agmen agent` en la
+  Raspberry Pi y `agmen run` en la laptop. `--local` lo prueba en una sola máquina
+  (dos IP de loopback; sus números no son de una red), y `--rapido` mide solo 64 B,
+  el máximo de UDP y 1 MiB, con menos muestras. Capítulo 18 del tutorial, sección 13.
 
 ### Cambiado
+- **La terminal de `agmen run` conserva lo más nuevo.** Cuando las líneas llegan más
+  rápido de lo que la terminal las escribe, se descartan las más viejas de la cola y
+  entran las nuevas (antes se descartaban las que llegaban, y se perdía el final de
+  las ráfagas). Los avisos de Agmen y los errores nunca se descartan. El aviso
+  `… N líneas no cupieron en la terminal (están en el panel web)` sale antes de las
+  líneas que sí cupieron, como antes. El orden de las líneas no cambia.
+- **En Windows con Python 3.12 o anterior, el reloj de Agmen en modo real lee la hora del
+  sistema con resolución fina.** Antes, la hora de los nodos en Python puro avanzaba de
+  ~15.6 ms en ~15.6 ms. Ahora se lee `GetSystemTimePreciseAsFileTime` (100 ns), el mismo
+  reloj del sistema que ya usaban los nodos de C++ y Python 3.13. Si no se puede leer,
+  Agmen lo dice una vez y sigue con la hora de siempre.
+- **Con la prueba de red, el robot espera antes de preparar nada** (parte 4c, RFC 0011 §5):
+  cuando la laptop y el agente hacen la prueba (con puente), el agente no corre su
+  `[robot] before` ni arranca su hub hasta que la laptop diga `sigue`. Antes, esto corría al
+  conectar. Con agentes o laptops anteriores, o con `--no-net-check`, todo sigue como antes.
+- **Al perder una computadora, `agmen run` ya no se detiene**: los nodos de esa
+  computadora pasan a `sin conexión` (sin perder su último estado), las órdenes
+  sobre ellos se rechazan diciendo por qué, y los demás nodos siguen. Antes, la
+  parte 3b detenía todo y salía con error.
+- **`agmen run` con nodos en otra computadora** ya no sale con el error de la
+  parte 3a: se conecta con `agmen agent` (ver arriba). Si el agente no contesta,
+  la clave es mala o los `robot.toml` no dicen lo mismo, sale con código 2, no
+  arranca nada y dice qué hacer.
+- **El robot del tutorial usa perfiles.** `imu` y `motor` son
+  `profile = "real"`, y `mundo` es `profile = "sim"`. Por eso `agmen run
+  examples/tutorial/robot.toml` imprime `no corren: mundo (perfil sim)`, y
+  `--sim` no arranca el motor.
+- **Al salir del programa, los hilos propios ven un cierre.** Desde que el
+  programa empieza a salir, en *otros* hilos: `publish()` no manda y regresa
+  `False`; `receive()` regresa `None`, aunque no le hayas puesto límite;
+  `spin()` y `spin_for()` regresan; crear un `Publisher` o `Subscriber` lanza
+  `RuntimeError`; y las funciones de un `Node` ya no se llaman. Si tu hilo
+  hace `while True: m = sub.receive(); usar(m.algo)`, revisa `if m is None:
+  break`; si no, verás un `AttributeError` de ese hilo al terminar. Lo más
+  limpio: detén tus hilos (o `node.stop()`) antes de salir. Y pon
+  `daemon=True` al hilo que espera mensajes: Python espera a los hilos que no
+  son daemon antes de salir, así que un `receive()` sin límite en uno de ellos
+  nunca deja terminar el programa. Tutorial: capítulo 12, sección 8.
 - **`--play` ya no arranca los nodos `profile = "real"`.** Usa el perfil
   `replay`: un motor no debe moverse con los datos de una grabación. Para
   correrlos, `agmen run robot.toml --play ARCHIVO.mcap --profile real`
   (con el reloj de la grabación, y `agmen run` avisa). Los `robot.toml` sin
   perfiles no cambian: `--play` arranca los mismos nodos que en 0.13.0, y
   `--skip` funciona igual.
+
+### Corregido
+- **`cmd` con la ruta de un ejecutable** (`cmd = "../venv/bin/python nodo.py"`)
+  se corre tal cual, sin seguir los enlaces simbólicos. Antes acababa en el
+  Python del sistema y no en el del entorno virtual. `python` a secas sigue
+  siendo el Python que corre `agmen`.
+- **El botón "paso" del panel** ya no cuenta como ciclos saltados ni imprime
+  `⚠ every(…): N ciclos saltados…`. Los atrasos de verdad se siguen contando y
+  avisando. Sin cambio en los bytes de la red.
+- **El vigilante de `max_gap_ms`** ya no da la alarma falsa `'/imu' no llega`
+  al dar pasos: tras cada paso, el topic tiene 0.3 s de reloj real para
+  ponerse al día antes de avisar. Un topic que de verdad dejó de llegar se
+  avisa como mucho 0.3 s más tarde.
+- **Un programa de Python que publica ya no aborta a veces al salir** con
+  `terminate called without an active exception` (pasaba con Python 3.12 y el
+  núcleo de C++, desde 0.9.0): el hilo de latidos al hub ahora se detiene
+  antes de que el intérprete termine. Si tu programa publica o recibe desde un
+  hilo propio, al salir ese hilo ya no publica ni recibe (ver *Cambiado*).
+- **Un programa con hilos propios ya no aborta al salir** con
+  `terminate called without an active exception` (Python 3.12 y el núcleo de
+  C++, desde 0.9.0). Pasaba cuando un hilo que publicaba, recibía, giraba un
+  `Node` o avisaba estaba dentro de agmen mientras el intérprete terminaba.
+  Ahora agmen declara el cierre antes de que Python empiece a apagarse y
+  espera hasta 2 s a lo que ya estaba dentro. Si no termina, sale **una**
+  línea de aviso que dice cuánto esperó, qué quedó corriendo y qué hacer; el
+  programa sale igual, con su código de salida.
+  - Límites: en Linux (glibc), una función de un `Node` que tarda más de 2 s
+    al salir se queda detenida y el programa sale limpio. En Windows y macOS
+    puede terminar con un error de Python al salir; el aviso lo dice.
+  - Con un `spin()` girando, el primer Ctrl+C lo usa agmen para detener los
+    nodos, así que no acorta la espera de 2 s.
+  - Con Python 3.13 nunca hubo aborto; el comportamiento al salir es el mismo
+    en 3.12 y 3.13. El CI corre las pruebas del cierre también con 3.13 (job
+    `cierre-313`).
 
 ## [0.13.0] — 2026-11-06
 

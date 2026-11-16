@@ -72,13 +72,15 @@ agmen info examples/tutorial/grabaciones/agmen-2026-11-05_15-30-12.mcap
 ```
 
 ```
-examples/tutorial/grabaciones/agmen-2026-11-05_15-30-12.mcap  (192 kB, 12.0 s)
-  grabado con Agmen 0.12.0 en mi-laptop, reloj real, 2026-11-05 15:30:12
+examples/tutorial/grabaciones/agmen-2026-11-13_22-40-16.mcap  (487 kB, 27.7 s)
+  grabado con Agmen 0.13.0 en vm, reloj real, perfil real, 2026-11-13T22:40:16+00:00
   topic         tipo          mensajes  frecuencia
   ────────────  ────────────  ────────  ──────────
-  /cmd          MotorCommand  240       20.0/s
-  /cmd/cerebro  MotorCommand  240       20.0/s
-  /imu          ImuSample     1200      100.0/s
+  /cmd          MotorCommand  354       12.8/s
+  /cmd/cerebro  MotorCommand  359       13.0/s
+  /cmd/teleop   MotorCommand  21        0.8/s
+  /imu          ImuSample     2769      100.0/s
+  /mux/ruedas   MuxEstado     29        1.0/s
   sin pérdidas
   adjuntos: robot.toml
 ```
@@ -111,13 +113,20 @@ están en el tiempo de la grabación. Para eso tus nodos corren con
 `AGMEN_CLOCK=replay`… o, mucho más fácil, con `agmen run`:
 
 ```bash
-agmen run examples/tutorial/robot.toml --play vuelta1.mcap --skip imu
+agmen run examples/tutorial/robot.toml --play vuelta1.mcap
+```
+
+```
+agmen │ perfil replay · reloj de la grabación · no corren: imu, motor (perfil real), mundo (perfil sim)
 ```
 
 - `--play` pone a **todos** los nodos en el tiempo de la grabación: no hay forma
   de olvidar uno.
-- `--skip imu` no arranca el nodo `imu`: la grabación lo **sustituye**. El
-  motor, el cerebro, el mux y el panel corren de verdad, con los datos de ayer.
+- El sensor `imu` y el `motor` **no corren**: los dos son `profile = "real"`.
+  La grabación sustituye al sensor, y el motor no se mueve con datos de ayer.
+  El mux y el panel sí corren, con los datos de ayer.
+- Con `--skip imu` solo verás un aviso de que no hace falta: el perfil ya deja
+  fuera a ese nodo.
 - En el panel, la tarjeta *Reloj* dice **reproducción**, cuánto va y cuánto
   dura, con pausa, paso y velocidad.
 
@@ -211,8 +220,8 @@ df = tabla.to_pandas()
   cuándo se capturó; `t_pub`: cuándo se publicó; `log_time`: cuándo llegó al
   grabador) y los campos con su tipo de Arrow: `time` como timestamp, arreglos
   como listas, imágenes como bytes.
-- `rec.lost` dice cuántos se perdieron al grabar, y la columna `seq` muestra
-  dónde (huecos).
+- `rec.lost["total"]` dice cuántos mensajes se perdieron al grabar (`rec.lost`
+  es un diccionario), y la columna `seq` muestra dónde (huecos).
 
 O todo de una vez, una tabla Parquet por topic:
 
@@ -229,17 +238,25 @@ python examples/tutorial/dataset.py vuelta1.mcap
 ```
 
 ```
-Recording('vuelta1.mcap', 12.0 s, /cmd: MotorCommand, /cmd/cerebro: MotorCommand, /imu: ImuSample)
-/cmd: 240 mensajes de MotorCommand
-/cmd/cerebro: 240 mensajes de MotorCommand
-/imu: 1200 mensajes de ImuSample
-/imu: az promedio 9.81 m/s² en 12.0 s
-tabla /imu: 1200 filas · t_data, t_pub, log_time, source_id, seq, ax, ay, az, gx, gy, gz
+Recording('agmen-2026-11-13_22-40-16.mcap', 27.7 s, /cmd: MotorCommand, /cmd/cerebro: MotorCommand, /cmd/teleop: MotorCommand, /imu: ImuSample, /mux/ruedas: MuxEstado)
+/cmd: 354 mensajes de MotorCommand
+/cmd/cerebro: 359 mensajes de MotorCommand
+/cmd/teleop: 21 mensajes de MotorCommand
+/imu: 2769 mensajes de ImuSample
+/mux/ruedas: 29 mensajes de MuxEstado
+/imu: az promedio 9.81 m/s² en 27.7 s
+tabla /imu: 2769 filas · t_data, t_pub, log_time, source_id, seq, ax, ay, az, gx, gy, gz
 huecos en seq: 0
 escribí dataset/cmd.parquet
 escribí dataset/cmd/cerebro.parquet
+escribí dataset/cmd/teleop.parquet
 escribí dataset/imu.parquet
+escribí dataset/mux/ruedas.parquet
 ```
+
+La salida es real: es una grabación de 27.7 segundos del robot del tutorial,
+con el cerebro y el teleop encendidos. Con tu grabación, los números serán
+otros.
 
 ## 6. Cámaras: ¿alcanza el disco?
 
@@ -277,5 +294,6 @@ Si el disco no alcanza, el grabador descarta (y lo cuenta), pero la cámara
 - Con perfiles (desde 0.14.0), `--play` usa el perfil `replay`: los nodos
   `real` no arrancan, salvo que pidas `--profile real`.
 
-**Siguiente (nivel 10):** el mismo robot en la simulación y en el mundo real,
-y un `robot.toml` con nodos en varias computadoras.
+**Siguiente (nivel 10):** el mismo robot en simulación ya está (el
+[capítulo 17](17-simulacion-y-real.md)). Falta un `robot.toml` con nodos en
+varias computadoras.

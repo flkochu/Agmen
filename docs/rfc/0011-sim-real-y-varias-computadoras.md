@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Estado** | ✅ **Aceptado** (2026-11-13, D1–D10 = a), aún sin implementar; se implementa en Agmen 0.14.0, por bloques según la [sección 7](#7-plan-para-agmen-0140). Decisiones en la [sección 5](#5-decisiones) |
+| **Estado** | ✅ **Aceptado** (2026-11-13, D1–D10 = a) e **implementado en Agmen 0.14.0** (2026-11-16), por bloques según la [sección 7](#7-plan-para-agmen-0140): perfiles, el mundo de MuJoCo, la parte 3a (declarar computadoras con `[[machine]]`, §3.4), la 3b (`agmen agent` con clave) y la 3c (reconexión, panel con varias computadoras, servicio); la 4a (base de los topics entre computadoras: el hub y los dos núcleos), la 4b (el puente, §3.5) y la 4c (la prueba de red y de qué computadora es cada topic, §3.5; el CI con dos computadoras, §6 reto 9); el bloque 5 (los relojes, §3.6); y el cierre (el banco `bench/dos_computadoras.py`, punto 7 del plan). Reto 9, como se hizo: el CI de Linux usa espacios de nombres de red y de montaje del kernel (el mismo aislamiento de un contenedor, sin imágenes); fuera del CI, dos IP de loopback salvo `AGMEN_SMOKE_MODO=aislado`. Decisiones en la [sección 5](#5-decisiones) |
 | **Depende de** | RFC 0003 (`agmen run`, `robot.toml` y el panel), RFC 0004 (el hub, los topics esperados y el diseño de varias máquinas de §3.6), RFC 0006 (el reloj de simulación y `/clock`), RFC 0008 (TCP para datos grandes; un suscriptor lento no frena a nadie), RFC 0009 (la memoria compartida se prueba, no se adivina), RFC 0010 (`--play` y `--skip`) |
 | **Versión** | Agmen 0.14.0 |
 | **Requisitos** | d (misma interfaz para simulación y robot real), i (un solo comando levanta todo el robot), g (Windows y Linux, x86-64 y ARM64) |
@@ -194,6 +194,8 @@ examples/sim/
   mundo.py      el nodo: avanza la física, publica /imu (ImuSample) y /camara (Imagen), escucha /cmd (MotorCommand)
 ```
 
+> **Nota de implementación:** al implementarlo, la física, la cámara y la ventana quedaron en `fisica.py` (la clase `Mundo`), `camara.py` y `ver.py` (decisión de Adán del 2026-11-13); `mundo.py` queda como el nodo.
+
 ```bash
 pip install agmen[sim]                              # agmen + mujoco
 agmen run examples/tutorial/robot.toml --sim        # el tutorial entero, con física
@@ -335,9 +337,9 @@ de topics viajan por la conexión del agente, que ya tiene clave.
   Windows, `w32tm /resync`). Una Raspberry Pi sin internet que arrancó con la
   hora de ayer se nota al instante.
 - **No se cambia ningún `t_data`** (D10): cada computadora pone su hora, como
-  hoy. Las latencias del panel ya restan la diferencia, y `agmen record` la
-  guarda en la grabación (`agmen.grabacion`) para quien quiera corregir
-  después. Sincronizar de verdad es del nivel 11.
+  hoy. Las latencias del panel se corrigen con la diferencia, y `agmen record`
+  guarda el resumen en el registro `agmen.relojes` de la grabación (un registro
+  aparte de `agmen.grabacion`) para quien quiera corregir después. Sincronizar de verdad es del nivel 11.
 
 ## 4. Lo que NO entra en 0.14.0
 

@@ -30,8 +30,12 @@ jobs:
       - name: Versión consistente
         run: python scripts/check_version.py
 
-      - name: nanobind (para agmen._core), NumPy, pyarrow (el juez de arrow) y mcap (el juez de las grabaciones)
-        run: python -m pip install nanobind numpy pyarrow mcap
+      - name: nanobind (para agmen._core), NumPy, pyarrow (el juez de arrow), mcap (el juez de las grabaciones) y MuJoCo (el mundo)
+        run: python -m pip install nanobind numpy pyarrow mcap mujoco
+
+      - name: OpenGL por software (la cámara del mundo de MuJoCo, solo x86-64)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libosmesa6
 
       - name: include/agmen/msgs.hpp al día con python/agmen/msgs.agmen
         run: python -m agmen gen python/agmen/msgs.agmen --cpp include/agmen --check-files
@@ -82,6 +86,9 @@ jobs:
       - name: Perfiles (agmen run --sim, --profile, --play con perfil replay)
         run: python scripts/perfiles_smoke.py
 
+      - name: Mundo de MuJoCo (agmen run --sim con el robot del tutorial; la cámara es obligatoria solo en ubuntu-latest)
+        run: python scripts/sim_smoke.py --required ${{ matrix.os == 'ubuntu-latest' && '--camara-requerida' || '' }}
+
       - name: ¿Paralelo o en serie? (nodos, terminal, apagado, panel y grupos de un Node)
         run: python scripts/paralelo_check.py
 
@@ -93,6 +100,13 @@ jobs:
 
       - name: Node y reloj de Agmen (sim ×2, pausa desde el panel, simulador paso a paso)
         run: python scripts/node_check.py
+
+      - name: Herramientas de red para las dos computadoras (ip; las dos "computadoras" son espacios de nombres del kernel)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y iproute2 util-linux
+
+      - name: Dos computadoras (agmen agent + agmen run en dos redes y dos /dev/shm; en Windows, dos IP de loopback)
+        run: python scripts/maquinas_smoke.py
 
       - name: Instalar el paquete (compila agmen._core) y probarlo
         run: |
@@ -111,6 +125,33 @@ jobs:
           cmake --build build --parallel
       - name: Pruebas
         run: ctest --test-dir build --output-on-failure
+
+  # El cierre del núcleo de C++ (atexit, python/test_cierre.py) también con Python 3.13: ahí CPython
+  # no aborta al finalizar con hilos vivos, pero las pruebas deterministas del cierre deben seguir
+  # cumpliéndose. Los otros jobs corren con 3.12, donde el aborto sí muerde.
+  cierre-313:
+    name: ubuntu + Python 3.13 (cierre del núcleo)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        id: py
+        with:
+          python-version: "3.13"
+
+      - name: nanobind (para agmen._core) y NumPy
+        run: python -m pip install nanobind numpy
+
+      - name: Configurar y compilar agmen._core (advertencias = errores)
+        run: |
+          cmake -S . -B build -DAGMEN_WERROR=ON -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE="${{ steps.py.outputs.python-path }}"
+          cmake --build build --config Release --parallel
+
+      - name: Pruebas del cierre (con el núcleo de C++)
+        env:
+          AGMEN_BACKEND: native
+        run: python -m unittest discover -s python -p "test_cierre.py" -v
 
   # Fuzzing corto del decodificador (tests/fuzz/README.md): cada fuzzer parte de
   # los vectores de prueba y de las regresiones guardadas, y corre un minuto con

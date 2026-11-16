@@ -172,17 +172,17 @@ La referencia completa de `robot.toml` está en el
 
 ## 6. Perfiles: el mismo `robot.toml` para el robot y para simulación
 
-*Disponible desde Agmen 0.14.0 (aún sin publicar)*
+*Disponible desde Agmen 0.14.0*
 
 Hasta ahora, cada `[[node]]` corre siempre. Pero un robot tiene piezas que
 mueven cosas de verdad (un motor, un sensor conectado a la computadora), y
 quieres probar el resto sin el robot. Un **perfil** es un nombre que dice en
 qué modo corre cada nodo. Así no copias el archivo: tienes uno solo.
 
-Esta sección funciona hoy, sin simulador. La "IMU falsa" es el mismo
-`publisher` de antes, con otra velocidad. El simulador de física (MuJoCo)
-llega después en la versión 0.14.0, y el capítulo 17 mostrará el mismo robot
-con física.
+Esta sección funciona sin simulador: la "IMU falsa" es el mismo `publisher`
+de antes, con otra velocidad. El simulador de física (MuJoCo) también viene
+en la versión 0.14.0: el [capítulo 17](17-simulacion-y-real.md) muestra el
+mismo robot con física, con `agmen run examples/tutorial/robot.toml --sim`.
 
 ### Paso 1: el archivo
 
@@ -295,9 +295,9 @@ http = "127.0.0.1:8098"          # en simulación, el panel usa este puerto
 ```
 
 Lo que pones en `[profile.X]` reemplaza lo de arriba, pero solo en ese
-perfil. Las claves que puedes poner ahí son `clock`, `web` y `record`. La
-clave `local` ya se acepta, pero todavía no hace nada: sirve para varias
-computadoras, y llega más adelante en 0.14.0.
+perfil. Las claves que puedes poner ahí son `clock`, `web`, `record` y `local`.
+Con `local = true`, todo corre en esta computadora, aunque un nodo diga
+`machine` (lo vemos en la [sección 7](#7-decir-en-qué-computadora-corre-cada-nodo-machine)).
 
 Un perfil puede tener cualquier nombre (letras sin acento, números, `_` o
 `-`). Por ejemplo, el robot sobre la mesa, sin ruedas. Pon `profile = "mesa"`
@@ -354,11 +354,89 @@ Pero un `--skip` con un nombre que no existe sí es error, y te dice cuáles hay
 error: --skip nada: no hay un nodo con ese nombre (hay: hub, imu, motor)
 ```
 
+## 7. Decir en qué computadora corre cada nodo (`[[machine]]`)
+
+*Disponible desde Agmen 0.14.0*
+
+Un robot suele tener dos computadoras. Por ejemplo, Adán tiene una laptop con
+Windows y una Raspberry Pi en el robot, y las dos están en el WiFi de la
+escuela. El motor debe ir en la Raspberry Pi; la IA y el panel, en la laptop.
+
+Con `[[machine]]` le dices a Agmen qué computadoras tienes. Con `machine` en un
+`[[node]]` (o en un `[[mux]]`) dices en cuál corre ese nodo. Sin `machine`, el
+nodo corre donde corres `agmen run`, como hasta ahora:
+
+```toml
+[[machine]]
+name = "robot"                  # la Raspberry Pi del robot
+host = "192.168.1.20"           # su IP; puerto por defecto: 7391
+
+[[node]]
+name = "motor"
+cmd = "../../build/bin/tutorial_motor --escuchar /cmd"
+machine = "robot"               # corre en la Raspberry Pi
+profile = "real"                # toca el motor: nunca corre en simulación
+```
+
+Lo que hace `agmen run` depende de dónde lo corres:
+
+- **En la Raspberry Pi**, con `host` igual a su IP, sus nodos corren ahí y los
+  demás, en esa misma computadora.
+- **En la laptop**, se conecta primero con `agmen agent` de la Pi. Si no
+  contesta, no arranca nada (ni el hub, ni los nodos de la laptop), sale con
+  código 2 y dice qué hacer.
+- **Con `[profile.sim] local = true`**, todo el perfil corre en la laptop, y
+  `machine` se ignora (la terminal lo dice).
+
+Si se corta el WiFi, la Pi no detiene todo de inmediato: sus nodos siguen unos
+10 segundos, y la laptop reintenta sola. Si la conexión vuelve a tiempo, nada se
+reinicia. Si vuelve tarde, la Pi ya detuvo sus nodos, y ninguno arranca solo.
+
+**Todo el recorrido** está en el [capítulo 18](18-un-robot-varias-computadoras.md):
+el archivo `robot_dos.toml`, la clave del agente, el agente como servicio y las
+salidas reales de un corte de WiFi.
+
+> **Lo que todavía no hace (Agmen 0.14.0).**
+>
+> - **Los relojes se miden, pero no se sincronizan.** `agmen run` avisa si la hora
+>   de dos computadoras difiere más de 10 ms y te dice qué hacer. Corregir los
+>   relojes es del nivel 11. Ver el [capítulo 18, sección 12](18-un-robot-varias-computadoras.md#12-los-relojes-de-las-dos-computadoras).
+
+### ¿Por qué poner la IP y no el nombre?
+
+Si pones un nombre, como `robot.local`, Agmen le pregunta a la red en qué IP
+está. Si la red no lo conoce, o no contesta en 1.5 segundos, Agmen no puede
+saber si esa computadora es la tuya. Ante la duda, supone que es **otra**. Por
+eso el mensaje dice `no pude resolver 'robot.local'` y te pide la IP.
+
+Si el nombre apunta a dos direcciones, una de esta computadora y otra de fuera,
+Agmen tampoco adivina: el mensaje dice que el nombre es esas dos direcciones, que
+una es de aquí y la otra no, y pide poner la IP en `host`.
+
+¿Por qué es mejor así? Un error de más (no arranca y lo dice) se arregla en un
+minuto. Un motor que arranca en la computadora equivocada, no. Una IP no depende
+de la red de la escuela: siempre apunta a la misma computadora. Si la Raspberry
+Pi cambia de IP, cámbiala en `host`.
+
+### ¿Por qué `profile = "real"` en el hardware?
+
+Un motor o un sensor de verdad se marca con `profile = "real"`. Así la
+simulación nunca lo arranca, aunque lo olvides. Si el motor está en la Raspberry
+Pi, en el perfil `real` la laptop lo arranca a través de `agmen agent`, y solo
+si el agente de la Pi está corriendo. En simulación ese nodo no corre.
+
+Un nodo **sin** `profile` corre en todos los perfiles, incluida la simulación. Si
+es un motor, la simulación en la laptop podría intentar moverlo. Por eso el
+hardware siempre lleva `profile = "real"`.
+
 ## Lo que aprendiste
 
 - A describir tu robot en un archivo y levantarlo con **un comando**.
 - A tener un solo `robot.toml` para el robot y para simulación, con perfiles
   (`profile`, `--sim` y `--profile`), y a marcar el hardware con `profile = "real"`.
+- A decir en qué computadora corre cada nodo con `[[machine]]` y `machine`. El
+  [capítulo 18](18-un-robot-varias-computadoras.md) arma un robot con dos
+  computadoras, con su clave, su servicio y un corte de WiFi.
 - A controlar y depurar todo **desde el navegador**: nodos, logs, sensores y manejo.
 - Que Agmen te avisa claro cuando algo está mal, en el archivo o en un nodo.
 

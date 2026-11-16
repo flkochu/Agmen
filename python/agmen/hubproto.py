@@ -13,6 +13,23 @@ Nodo → hub
     sub   id node pid topic schema port [tcp]  registrar/latir un Subscriber
                                                (topic="*" = todos; schema="*" = cualquier tipo;
                                                tcp = puerto TCP donde recibe mensajes arrow, RFC 0008)
+          [net=1]                              (net=1 = "mi puerto escucha en la red", RFC 0011 §3.5)
+    sub   … machine addr [tcp]                 un Subscriber de OTRA computadora (modo red): vive en
+                                               `machine` (un nombre de `peers`) y recibe en addr=ip:puerto
+    pub   … machine                            un Publisher de OTRA computadora (modo red; sin `subs`)
+          [solo=id,id | solo=-]                (RFC 0011 §9.2, sesión de simulación) solo con machine: a qué
+                                               Publisher de aquí se da como destino un sub de fuera (- = ninguno)
+    red   peers=nombre@ip,nombre@ip            modo red (RFC 0011): las otras computadoras y la IP con
+                                               la que esta las ve; se repite cada NET_BEAT_S, caduca a
+                                               los NET_EXPIRE_S; `peers=` vacío = volver a modo local.
+                                               `red`, `machine`, `addr` y `net` solo desde 127.0.0.1
+          [relojes=nombre:dif:err:edad,…]      (bloque 5, RFC 0011 §3.6) la diferencia de reloj de cada una
+                                               (ns; positivo = adelantada), su incertidumbre (ns) y su edad
+                                               (ms); sin medir: nombre:-:motivo:edad (edad "-" si nunca).
+                                               Ver agmen.relojes. Un hub anterior ignora el campo
+          [modo=real|sim|replay]               (bloque 5, §6.1) el modo del reloj de la sesión (agmen run en
+                                               la laptop; el `reloj` de la sesión en el agente); sin él, "no
+                                               se sabe". El hub lo da en `state`. Un hub anterior lo ignora
     bye   id                                   el endpoint se va
     stat  node pid kind name ...               cuentas de un agmen.Node, cada segundo (RFC 0006):
                                                kind=timer: group period_ns runs late skipped
@@ -26,10 +43,19 @@ Hub → nodo
     subs  id topic to=ip:puerto,... [tcp=...]   a quién mandarle los datos (a un Publisher): `to` son
                                                los puertos UDP (mensajes compact) y `tcp` los puertos
                                                TCP de los que reciben mensajes arrow (RFC 0008)
-    ok    id                                    latido recibido (a un Subscriber)
+    ok    id [peers=ip,ip]                      latido recibido (a un Subscriber); en modo red, `peers`
+                                               son las IP de las que puede aceptar datos
     error id msg                                registro rechazado (ej. choque de tipos)
-    pong  version
-    state (varias líneas: topic ..., ep ..., stat ...)
+    red_ok peers=n                              modo red aceptado: cuántas computadoras
+    pong  version [red=1]                       red=1 = el hub está en modo red
+    state version hub robot [modo]             primera línea; `modo` (bloque 5, §6.1) solo en modo red y si el
+                                               puente lo dijo en `red` (caduca con el modo red)
+          (luego varias líneas: topic ..., ep ..., stat ...; en modo red, también una `maq` por computadora de
+          peers: `maq name ip reloj err [edad]` con la diferencia medida, o `maq name ip sin=<motivo> [edad]`
+          sin medir; quien lee `state` ignora las líneas y los campos que no conoce)
+          si no cabe en un datagrama (RFC 0011 §9.1): varios, de como mucho 32 KiB, cada uno con una
+          primera línea `parte i=<k> de=<m> n=<consulta>` y líneas enteras (una que sola no cabe va
+          recortada, con cortado=1)
 
 Los datos (formato v1, "AGM...") y el control ("agmen-hub/1 ...") pueden llegar
 al mismo socket; se distinguen por los primeros bytes.
@@ -123,3 +149,98 @@ def check_topic(topic: str, allow_wildcard: bool = False) -> None:
 def is_topic(target: str) -> bool:
     """'/imu' es un topic; '127.0.0.1:7500' es una dirección."""
     return target.startswith("/")
+
+
+# --- Modo red (RFC 0011 §3.5): el hub y otras computadoras ---------------------
+# Los mismos casos revisa tests/test_wire.cpp (hub_modo_red) contra hubproto.hpp.
+
+LOCALHOST = "127.0.0.1"
+NET_BEAT_S = 2.0        # quien encendió el modo red lo repite cada tanto
+NET_EXPIRE_S = 6.0      # sin otro `red` este tiempo = vuelta a modo local
+MODOS_RELOJ = ("real", "sim", "replay")   # bloque 5 (§6.1): los valores de `modo` en `red` y en `state`
+NET_LOCAL_WARN_S = 5.0  # un Subscriber local que sigue sin net=1 tras este tiempo: aviso
+MACHINE_RE = re.compile(r"^[A-Za-z0-9_-]+$")   # como [[machine]] name en robot.toml
+
+
+def split_list(text: str) -> list[str]:
+    """'a,b,,c' → ['a', 'b', 'c']."""
+    return [x for x in text.split(",") if x]
+
+
+def check_machine(name: str) -> None:
+    if not MACHINE_RE.match(name):
+        raise ProtocolError(f"'{name}' no es un nombre de computadora válido: usa letras (sin acentos), dígitos, "
+                            f"'_' o '-', como en [[machine]] name de robot.toml")
+
+
+def parse_ipv4(text: str) -> str:
+    """'192.168.1.20' → la misma, validada (4 números de 0 a 255, sin ceros a la izquierda)."""
+    parts = text.split(".")
+    ok = len(parts) == 4 and all(
+        p and len(p) <= 3 and p.isascii() and p.isdigit() and (p == "0" or p[0] != "0") and int(p) <= 255
+        for p in parts)
+    if not ok:
+        raise ProtocolError(f"'{text}' no es una IP válida: escríbela como cuatro números de 0 a 255, "
+                            f"ej. 192.168.1.20")
+    return text
+
+
+def check_peer_ip(ip: str, loopback: bool = False) -> None:
+    """La IP de OTRA computadora: válida, y que no sea esta ni una dirección de grupo. `loopback`: se aceptan
+    las 127.x (salvo 127.0.0.1), solo para pruebas con AGMEN_NET_IP (RFC 0011, precisión §9.6)."""
+    parse_ipv4(ip)
+    first = int(ip.split(".")[0])
+    if ip == LOCALHOST:
+        raise ProtocolError("127.0.0.1 es esta misma computadora, no otra: pon la IP con la que esta computadora "
+                            "ve a la otra, ej. 192.168.1.20")
+    if first == 127 and not loopback:
+        raise ProtocolError(f"{ip} es esta misma computadora (las 127.x no salen de ella), no otra: pon la IP "
+                            f"con la que esta computadora ve a la otra, ej. 192.168.1.20 (las 127.x solo valen "
+                            f"en pruebas, con AGMEN_NET_IP)")
+    if ip in ("0.0.0.0", "255.255.255.255") or 224 <= first <= 239:
+        raise ProtocolError(f"{ip} no es la IP de una computadora (es una dirección especial o de grupo): pon la "
+                            f"IP con la que esta computadora ve a la otra, ej. 192.168.1.20")
+
+
+def parse_port(text: str, what: str = "puerto") -> int:
+    if not (text.isascii() and text.isdigit()) or not 1 <= int(text) <= 65535:
+        raise ProtocolError(f"{what} '{text}' no es válido: es un número de 1 a 65535")
+    return int(text)
+
+
+def parse_hostport(text: str) -> tuple[str, int]:
+    """'192.168.1.20:7500' → ('192.168.1.20', 7500)."""
+    ip, sep, port = text.rpartition(":")
+    if not sep:
+        raise ProtocolError(f"'{text}' no es una dirección: escríbela como ip:puerto, ej. 192.168.1.20:7500")
+    return parse_ipv4(ip), parse_port(port)
+
+
+def parse_peers(text: str, loopback: bool = False) -> list[tuple[str, str]]:
+    """'robot@192.168.1.20,laptop@192.168.1.5' → [('robot', '192.168.1.20'), ...]. '' = ninguna.
+    `loopback`: acepta IP 127.x (pruebas con AGMEN_NET_IP; ver check_peer_ip)."""
+    out: list[tuple[str, str]] = []
+    names: dict[str, str] = {}     # en minúsculas → como vino
+    ips: dict[str, str] = {}       # IP → nombre
+    for item in split_list(text):
+        name, sep, ip = item.partition("@")
+        if not sep:
+            raise ProtocolError(f"'{item}' en peers no es nombre@ip, ej. robot@192.168.1.20")
+        check_machine(name)
+        check_peer_ip(ip, loopback)
+        if name.lower() in names:
+            raise ProtocolError(f"la computadora '{name}' está dos veces en peers: cada una va una sola vez")
+        if ip in ips:
+            raise ProtocolError(f"'{ips[ip]}' y '{name}' tienen la misma IP {ip} en peers: cada computadora "
+                                f"tiene la suya")
+        names[name.lower()] = name
+        ips[ip] = name
+        out.append((name, ip))
+    return out
+
+
+# (Decidido: queda así.) '@' no está entre los bytes que van sin escapar (_SAFE), así que en la red
+# `peers` va como "robot%40192.168.1.20" (se lee igual con '@' sin escapar). Añadir '@' a _SAFE
+# cambiaría los bytes de cualquier valor de hoy que lo lleve; no se tocó.
+def format_peers(peers: list[tuple[str, str]]) -> str:
+    return ",".join(f"{name}@{ip}" for name, ip in peers)

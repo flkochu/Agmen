@@ -23,7 +23,6 @@ import hmac
 import json
 import os
 import secrets
-import socket
 import threading
 import time
 import webbrowser
@@ -34,10 +33,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from .. import schema, wire
+from .. import relojes, schema, wire
 from .. import ws as wsmod
 from .._version import __version__
-from ..pubsub import RawSubscriber, _PurePublisher
+from ..machines import lan_addresses   # vive en machines: también la usa agmen run (RFC 0011 §3.4)
+from ..pubsub import RawSubscriber, _PurePublisher, is_closed_error
 from .bridge import FOXGLOVE_PROTOCOL, PROTOCOLS, Bridge
 
 HERE = Path(__file__).resolve().parent
@@ -101,24 +101,6 @@ def choose_token(lan: bool, token: str | None) -> str | None:
     if token:
         return token
     return secrets.token_urlsafe(9) if lan else None
-
-
-def lan_addresses() -> list[str]:
-    """Las IP de esta computadora en la red local (para el link del celular)."""
-    found: list[str] = []
-    try:   # la interfaz de la ruta por defecto (no manda ningún paquete)
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("10.255.255.255", 1))
-            found.append(s.getsockname()[0])
-    except OSError:
-        pass
-    try:
-        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
-            if ip not in found:
-                found.append(ip)
-    except OSError:
-        pass
-    return [ip for ip in found if not ip.startswith("127.")]
 
 
 class SensorHub:
@@ -341,7 +323,12 @@ class Teleop:
             now = time.monotonic()
             if now - self.last_sent < 0.015 and (left, right) != (0.0, 0.0):
                 return self.last_cmd  # máx. ~60 Hz: un navegador no puede saturar al robot
-            self.pub.publish(MotorCommand(left, right))
+            try:
+                self.pub.publish(MotorCommand(left, right))
+            except RuntimeError as e:
+                if not is_closed_error(e):
+                    raise
+                return self.last_cmd   # el panel se está apagando: no se mandó
             self.last_sent, self.last_cmd = now, (left, right)
         return left, right
 
@@ -367,6 +354,11 @@ class Panel:
         self._rec_reader = None
         self._rec_lock = threading.Lock()
         self.rhythm: list[dict] = []  # cuentas de los agmen.Node (del hub)
+        self.endpoints: list[dict] = []   # las líneas ep del hub (4c §2.4: de qué computadora es cada topic)
+        # Bloque 5 (RFC 0011 §3.6): la diferencia de reloj de cada otra computadora, de las líneas `maq` del hub (C2),
+        # y cuáles están «mal» ahora (con la histéresis de 10/8 ms, como los avisos de agmen run; C4).
+        self.clocks: dict[str, relojes.Estado] = {}
+        self._clock_bad: dict[str, bool] = {}
         self.listen = listen
         self.topics = topics
         self.robot_name = robot_name
@@ -439,13 +431,58 @@ class Panel:
         for c in self.commands:
             c.close()
 
+    def nodes_info(self) -> list[dict]:
+        """Los nodos, cada uno con `machine` (RFC 0011 parte 3c §4; None si corre aquí sin [[machine]])."""
+        nodes = self.launcher.nodes_info() if self.launcher else []
+        for n in nodes:
+            n.setdefault("machine", None)
+        return nodes
+
+    def machines_info(self) -> list[dict]:
+        """Las computadoras del robot y cómo está la conexión con cada una (RFC 0011 parte 3c §4).
+        Vacía sin [[machine]] (o con un Launcher que no las conoce): el panel se ve como siempre.
+        Bloque 5 (§4.2): cada computadora que no es esta gana `clock` (ver relojes.info_panel)."""
+        get = getattr(self.launcher, "machines_info", None) if self.launcher is not None else None
+        machines = get() if get is not None else []
+        if machines:
+            mode = self.session_mode()
+            for m in machines:
+                if not m.get("here"):
+                    m["clock"] = self.clock_of(m["name"], mode, lost=m.get("state") == "sin conexión")
+        return machines
+
+    def session_mode(self) -> str:
+        """El modo del reloj de esta sesión: "replay" con agmen run --play; si no, el del reloj de este proceso."""
+        if self.playing:
+            return "replay"
+        if self.clock is not None:
+            return "sim"
+        from .. import clock as ck
+        return ck.mode()
+
+    def clock_of(self, name: str, mode: str, lost: bool = False) -> dict:
+        """El `clock` de la computadora `name` (§4.2): lo último que dijo el hub; sin dato, «sin medir» (C6).
+        `lost`: agmen run perdió la conexión con ella. El hub deja de nombrarla cuando no queda ninguna otra
+        computadora conectada (vuelve a modo local), así que el motivo lo pone el panel: «sin conexión»."""
+        e = self.clocks.get(name)
+        if lost and (e is None or not e.medido):
+            e = relojes.Estado(False, motivo="sin_conexion")
+        e = e or relojes.Estado(False, motivo="sin_dato")
+        remotes = getattr(self.launcher, "remotes", None) or {}
+        so = getattr(remotes.get(name), "so_alla", "") or ""
+        so = so if isinstance(so, str) else ""
+        info, bad = relojes.info_panel(name, e, mode, self._clock_bad.get(name, False), so)
+        self._clock_bad[name] = bad
+        return info
+
     def snapshot(self) -> dict:
         return {
             "robot": self.robot_name,
             "profile": self.profile,
             "playing": self.playing,
             "version": __version__,
-            "nodes": self.launcher.nodes_info() if self.launcher else [],
+            "nodes": self.nodes_info(),
+            "machines": self.machines_info(),
             "managed": self.launcher is not None,
             "teleop": self.teleop.info() if self.teleop else None,
             "commands": [c.info() for c in self.commands],
@@ -571,12 +608,87 @@ class Panel:
             except Exception:  # noqa: BLE001 — sin hub, no hay cuentas
                 msgs = []
             self.rhythm = [f for op, f in msgs if op == "stat"]
+            self.endpoints = [f for op, f in msgs if op == "ep"]   # (incompleta: lo que llegó; no se inventa nada)
+            self.clocks = relojes.maquinas_del_hub(msgs)           # bloque 5: sin modo red, vacío
+
+    def here_name(self, machines: list[dict]) -> str:
+        """Cómo se llama esta computadora en el panel (4c §2.4): la [[machine]] local o, si esta no es una
+        [[machine]], el nombre que agmen run usa como `desde` (tables.laptop_name). "" sin [[machine]]."""
+        if not machines:
+            return ""
+        here = next((m["name"] for m in machines if m.get("here")), None)
+        if here:
+            return here
+        config, places = getattr(self.launcher, "config", None), getattr(self.launcher, "places", None)
+        if config is None or places is None:
+            return ""
+        from ..tables import laptop_name
+        return laptop_name(config, places)
+
+    @staticmethod
+    def topics_at(endpoints: list[dict], here: str) -> dict[str, tuple[list[str], list[str]]]:
+        """topic → (publishers_at, subscribers_at): las computadoras que publican y que reciben cada topic, sin repetir
+        (primero esta y luego las demás por orden alfabético). Una línea ep sin `machine` es de esta (`here`). Los
+        receptores de todos los topics ("*", como el panel mismo) no cuentan: no dicen a dónde va un topic."""
+        sets: dict[str, tuple[set, set]] = {}
+        for e in endpoints:
+            topic, kind = e.get("topic", ""), e.get("kind")
+            if topic == "*" or kind not in ("pub", "sub"):
+                continue
+            pubs, subs = sets.setdefault(topic, (set(), set()))
+            (pubs if kind == "pub" else subs).add(e.get("machine") or here)
+
+        def ordered(names: set) -> list[str]:
+            return ([here] if here in names else []) + sorted(names - {here}, key=lambda n: (n.lower(), n))
+
+        return {t: (ordered(p), ordered(s)) for t, (p, s) in sets.items()}
 
     def state(self) -> dict:
         """Lo que ven el panel y /api/state. `cpu_s`: CPU usada por este proceso
         (el puente): con dos lecturas se saca cuánto le cuesta al robot."""
-        return {**self.snapshot(), "stats": self.hub.snapshot(), "bridge": self.bridge.info(),
+        snap, stats = self.snapshot(), self.hub.snapshot()
+        # 4c §2.4: cada topic dice de qué computadoras sale y a cuáles llega (vacías sin [[machine]]).
+        here = self.here_name(snap["machines"])
+        at = self.topics_at(self.endpoints, here) if here else {}
+        for key, t in stats.get("topics", {}).items():
+            pubs, subs = at.get(t.get("topic") or key, ([], []))
+            t["publishers_at"], t["subscribers_at"] = pubs, subs
+        if here:
+            self.correct_latency(stats.get("topics", {}), snap["machines"], here)
+        return {**snap, "stats": stats, "bridge": self.bridge.info(),
                 "cpu_s": round(time.process_time(), 4), "lan": self.lan}
+
+    def correct_latency(self, topics: dict, machines: list[dict], here: str) -> None:
+        """Bloque 5 (RFC 0011 §3.6, §4.3): la latencia de un topic que sale de OTRA computadora se calcula con dos
+        relojes; en una sesión real se corrige con la diferencia medida de esa computadora (8.1: cruda + dif). Si no
+        se puede (sin medición vigente, o lo publican varias computadoras), queda como siempre pero marcada «sin
+        corregir». En sim/replay no se corrige nada (C3). Los topics que solo salen de aquí no cambian (ni ganan
+        claves)."""
+        if self.session_mode() != "real":
+            return
+        clocks = {m["name"]: m.get("clock") for m in machines if not m.get("here")}
+        for t in topics.values():
+            pubs = t.get("publishers_at") or []
+            if not any(p != here for p in pubs) or t.get("latency_ms") is None:
+                continue
+            c = clocks.get(pubs[0]) if len(pubs) == 1 else None
+            if len(pubs) > 1:
+                t["latency_fix"] = "sin_corregir"
+                t["latency_note"] = (f"sin corregir: lo publican varias computadoras ({', '.join(pubs)}) y cada una "
+                                     f"tiene su reloj")
+            elif not c or c.get("offset_ms") is None:
+                why = (c or {}).get("why") or relojes.MOTIVOS["sin_dato"]
+                t["latency_fix"] = "sin_corregir"
+                t["latency_note"] = f"sin corregir: el reloj de {pubs[0]} está sin medir ({why})"
+            else:
+                # 8.1: dif = (reloj de allá) − (reloj de aquí). El t_pub de allá vale "hora de aquí + dif", así que
+                # la cruda (recepción aquí − t_pub) = real − dif: la latencia real = cruda + dif.
+                raw = t["latency_ms"]
+                t["latency_raw_ms"] = raw
+                t["latency_ms"] = round(raw + c["offset_ms"], 3)
+                t["latency_fix"] = "corregida"
+                t["latency_note"] = (f"corregida con la diferencia de reloj de {pubs[0]} "
+                                     f"({c['offset_ms']:+.1f} ms ±{c['error_ms']:.1f}); sin corregir, {raw:.2f} ms")
 
     def _handler(self):
         panel = self
@@ -777,8 +889,10 @@ class Panel:
                                    HTTPStatus.BAD_REQUEST)
                         return
                     err = panel.launcher.action(parts[2], parts[3])
-                    self._json({"error": err} if err else {"ok": True},
-                               HTTPStatus.BAD_REQUEST if err else HTTPStatus.OK)
+                    from ..run import NoConnection
+                    status = (HTTPStatus.CONFLICT if isinstance(err, NoConnection)    # §15: sin conexión con su
+                              else HTTPStatus.BAD_REQUEST if err else HTTPStatus.OK)  # computadora: 409
+                    self._json({"error": str(err)} if err else {"ok": True}, status)
                 elif parts == ["api", "record"]:
                     err = panel.record_action(str(body.get("action", "")))
                     self._json({"error": err} if err else {"ok": True, "recording": panel.recording_info()},

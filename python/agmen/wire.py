@@ -16,6 +16,7 @@ from __future__ import annotations
 import functools
 import os
 import struct
+import sys
 import time
 from dataclasses import dataclass, fields
 
@@ -61,10 +62,51 @@ def _clock():
     return _CLOCK
 
 
+def _hora_fina_windows():
+    """En Windows con Python <= 3.12, time.time_ns() avanza de ~15.6 ms en ~15.6 ms. Esta lee EL MISMO reloj del
+    sistema con resolución de 100 ns (GetSystemTimePreciseAsFileTime, Windows 8+), como ya hacen los nodos de C++
+    y Python 3.13. None si no hace falta (otro sistema, o la hora de Python ya es fina) o si no se puede."""
+    if sys.platform != "win32":
+        return None
+    try:
+        if time.get_clock_info("time").resolution < 1e-4:
+            return None
+        import ctypes
+        f = ctypes.WinDLL("kernel32").GetSystemTimePreciseAsFileTime   # (instancia propia: no toca la compartida)
+        f.argtypes = [ctypes.POINTER(ctypes.c_uint64)]   # FILETIME: 64 bits, en pasos de 100 ns desde 1601
+        f.restype = None
+
+        def hora() -> int:
+            ft = ctypes.c_uint64()
+            f(ctypes.byref(ft))
+            return (ft.value - 116_444_736_000_000_000) * 100
+        if abs(hora() - time.time_ns()) > 1_000_000_000:   # no cuadra con la hora de Python: no se usa
+            raise OSError("la hora fina de Windows no coincide con la del sistema")
+        return hora
+    except Exception as e:   # nunca en silencio: se dice una vez y sigue la hora de siempre
+        print(f"[agmen] ⚠ no pude leer la hora fina de Windows ({type(e).__name__}: {e}): con Python 3.12 o "
+              f"anterior, la hora de los nodos en Python avanza de ~15.6 ms en ~15.6 ms. Usa Python 3.13 si "
+              f"necesitas más precisión", file=sys.stderr, flush=True)
+        return None
+
+
+_HORA_FINA = _hora_fina_windows()
+
+
 def wall_ns() -> int:
-    """La hora de la computadora en ns, aunque el robot esté en simulación
-    (para registros y medir latencia de red)."""
-    return time.time_ns()
+    """La hora de la computadora en ns, aunque el robot esté en simulación (para registros, `t_data` en modo real
+    y medir latencia de red). En Windows se lee con resolución fina (ver _hora_fina_windows)."""
+    return _HORA_FINA() if _HORA_FINA is not None else time.time_ns()
+
+
+def wall_resolution_ns() -> int:
+    """La resolución de wall_ns() en ns: 100 en Windows con la hora fina; si no, la de la hora de Python."""
+    if _HORA_FINA is not None:
+        return 100
+    try:
+        return max(0, int(round(time.get_clock_info("time").resolution * 1e9)))
+    except (ValueError, OSError):
+        return 0
 
 
 def _domain() -> int:

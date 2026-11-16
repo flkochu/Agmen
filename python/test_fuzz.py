@@ -256,9 +256,28 @@ print(f"errores={errors} imu={got['imu']} img={got['img']} invalidos={invalid}",
 """
 
 
+def _puertos_libres() -> int:
+    """Un puerto p con UDP p y TCP p+1 libres ahora mismo. (Antes era fijo, 47991: cae en el rango de
+    puertos que el sistema reparte a las conexiones salientes, y si otra conexión tenía el 47992 la prueba
+    fallaba con 'Address already in use'.)"""
+    import socket
+    for _ in range(50):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u:
+            u.bind(("127.0.0.1", 0))
+            port = u.getsockname()[1]
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as t:
+                    t.bind(("127.0.0.1", port + 1))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError("no encontré un par de puertos libres (UDP p y TCP p+1) en 127.0.0.1")
+
+
 class TestNodo(unittest.TestCase):
     def test_paquetes_malos_no_detienen_al_nodo_en_un_hilo_de_1_MB(self):
-        r = subprocess.run([sys.executable, "-c", _NODO_EN_UN_HILO, str(ROOT / "python"), "47991"], check=False,
+        r = subprocess.run([sys.executable, "-c", _NODO_EN_UN_HILO, str(ROOT / "python"), str(_puertos_libres())],
+                           check=False,
                            capture_output=True, text=True, encoding="utf-8", timeout=60,
                            env={**os.environ, "PYTHONIOENCODING": "utf-8"})
         self.assertEqual(r.returncode, 0, f"el proceso se cayó ({r.returncode}):\n{r.stderr[-2000:]}")

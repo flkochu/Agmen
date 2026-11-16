@@ -77,6 +77,19 @@ OK   Python, tipo nuevo -> agmen echo: 30/30 mensajes decodificados
 
 ✅ **Listo.** Agmen funciona en tu computadora, y C++ y Python ya se entienden.
 
+## 5. (Opcional) El simulador de MuJoCo
+
+Para el [capítulo 17](17-simulacion-y-real.md), el robot del tutorial corre
+también en simulación. Instala el extra `sim`, desde la misma carpeta:
+
+```bash
+pip install ".[sim]"          # agmen + mujoco (cuando esté publicado: pip install agmen[sim])
+```
+
+Sin este paso, todo lo anterior funciona igual. Solo el mundo simulado pide
+MuJoCo, y si falta, te lo dice. En Linux, la cámara del simulador además
+necesita `sudo apt install libegl1 libosmesa6`.
+
 ## Problemas comunes
 
 | Síntoma | Causa | Solución |

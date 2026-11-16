@@ -4,6 +4,8 @@
 """
 
 import io
+import os
+import re
 import sys
 import tempfile
 import threading
@@ -616,8 +618,44 @@ class TestPerfiles(unittest.TestCase):
             with self.subTest(rel=rel):
                 cfg = load_config(path)
                 vistos += 1
-                self.assertEqual((cfg.profile, cfg.skipped, cfg.local), ("real", [], False))
+                # El robot del tutorial tiene un nodo `mundo` (perfil sim): en `real` no corre.
+                esperado = [("mundo", ("sim",))] if rel == "examples/tutorial/robot.toml" else []
+                self.assertEqual((cfg.profile, cfg.skipped, cfg.local), ("real", esperado, False))
         self.assertGreater(vistos, 0)
+
+    # 14. el robot del tutorial por perfil (RFC 0011 §3.3, reto 1)
+    def test_tutorial_por_perfil(self):
+        path = Path(__file__).resolve().parent.parent / "examples" / "tutorial" / "robot.toml"
+        real, sim = load_config(path, "real"), load_config(path, "sim")
+
+        # real: el hardware de verdad; el mundo no corre.
+        self.assertTrue({"imu", "motor", "cerebro"} <= set(self.names(real)))
+        self.assertNotIn("mundo", self.names(real))
+        self.assertEqual(real.clock.mode, "real")
+
+        # sim: corren ruedas (el mux), mundo y cerebro; imu y motor NUNCA (no se mueve el robot de verdad).
+        self.assertEqual(sim.profile, "sim")
+        self.assertTrue({"mundo", "cerebro"} <= set(self.names(sim)))
+        self.assertNotIn("imu", self.names(sim))
+        self.assertNotIn("motor", self.names(sim))
+        self.assertEqual(sorted(n for n, _ in sim.skipped), ["imu", "motor"])
+        self.assertTrue(all(p == ("real",) for _, p in sim.skipped))
+        self.assertEqual([m.name for m in real.muxes], ["ruedas"])
+        self.assertEqual([m.name for m in sim.muxes], ["ruedas"])
+        self.assertEqual(sim.clock.mode, "sim")
+
+        # el cerebro empieza apagado en los dos perfiles
+        for cfg in (real, sim):
+            self.assertFalse(next(n for n in cfg.nodes if n.name == "cerebro").autostart)
+
+        # topics: /camara solo se espera en sim; /imu es obligatorio en los dos
+        for cfg in (real, sim):
+            imu = next(t for t in cfg.topics if t.name == "/imu")
+            self.assertTrue(imu.required)
+        self.assertNotIn("/camara", [t.name for t in real.topics])
+        camara = next(t for t in sim.topics if t.name == "/camara")
+        self.assertEqual(camara.type, "Imagen")
+        self.assertFalse(camara.required)
 
 
 class TerminalBloqueada(io.StringIO):
@@ -683,6 +721,92 @@ class TestOtroRobot(unittest.TestCase):
         self.assertEqual(other_robot(self.config(), query=no_hay), [])
 
 
+class TestResolverPrograma(unittest.TestCase):
+    """Node._resolve_program (c49bd35): la ruta de 'cmd' se usa tal cual, sin seguir enlaces simbólicos
+    (el 'python' de un entorno virtual es un enlace al del sistema: si se sigue, se pierde el venv)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+
+    def nodo(self, cmd: str, base: Path | None = None):
+        from agmen.run import Node
+
+        base = base or self.dir
+        (base / "robot.toml").write_text(f'[robot]\nname = "r"\n\n[[node]]\nname = "n"\ncmd = "{cmd}"\n',
+                                         encoding="utf-8")
+        cfg = load_config(base / "robot.toml")
+        return Node(cfg.nodes[0], cfg.base_dir, None, None), base
+
+    def enlace(self, destino: Path, objetivo: Path) -> None:
+        try:
+            destino.symlink_to(objetivo)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"aquí no se pueden crear enlaces simbólicos ({e})")
+
+    def test_ruta_relativa_con_enlace_no_se_resuelve(self):
+        (self.dir / "real").mkdir()
+        (self.dir / "real" / "programa").write_text("#!/bin/sh\n", encoding="utf-8")
+        (self.dir / "bin").mkdir()
+        self.enlace(self.dir / "bin" / "enlace", Path("..") / "real" / "programa")
+        nodo, base = self.nodo("bin/enlace --x 1")
+        args = nodo._resolve_program(base)
+        self.assertEqual(args[1:], ["--x", "1"])
+        self.assertEqual(args[0], str(Path(os.path.abspath(base)) / "bin" / "enlace"))
+        self.assertTrue(args[0].endswith("enlace"), "no debe acabar en el destino del enlace")
+        self.assertTrue(os.path.isabs(args[0]))
+
+    def test_ruta_con_punto_punto_y_enlace(self):
+        (self.dir / "venv" / "bin").mkdir(parents=True)
+        (self.dir / "robot").mkdir()
+        (self.dir / "real").mkdir()
+        (self.dir / "real" / "py").write_text("", encoding="utf-8")
+        self.enlace(self.dir / "venv" / "bin" / "python", self.dir / "real" / "py")
+        nodo, base = self.nodo("../venv/bin/python nodo.py", self.dir / "robot")
+        args = nodo._resolve_program(base)
+        self.assertEqual(os.path.basename(args[0]), "python")
+        self.assertNotIn("real", Path(args[0]).parts)
+        self.assertEqual(os.path.realpath(args[0]), os.path.realpath(self.dir / "real" / "py"))   # sí apunta ahí
+        self.assertEqual(args[1], "nodo.py")
+
+    def test_ruta_absoluta_se_respeta(self):
+        absoluta = str(self.dir / "bin" / "algo")
+        nodo, base = self.nodo(absoluta.replace("\\", "/") + " a b")
+        self.assertEqual(nodo._resolve_program(base), [absoluta.replace("\\", "/"), "a", "b"])
+
+    def test_python_a_secas_es_el_interprete_actual(self):
+        for nombre in ("python", "python3", "py"):
+            with self.subTest(nombre=nombre):
+                nodo, base = self.nodo(f"{nombre} cerebro.py --n 2")
+                self.assertEqual(nodo._resolve_program(base), [sys.executable, "cerebro.py", "--n", "2"])
+
+    def test_nombre_sin_ruta_no_se_toca(self):
+        nodo, base = self.nodo("echo hola")
+        self.assertEqual(nodo._resolve_program(base), ["echo", "hola"])
+
+    def test_de_punta_a_punta_con_un_venv_de_verdad(self):
+        import subprocess
+        import venv
+
+        (self.dir / "robot").mkdir()
+        try:
+            venv.EnvBuilder(with_pip=False, symlinks=True).create(self.dir / "venv")
+        except Exception as e:
+            self.skipTest(f"no se pudo crear un entorno virtual ({e})")
+        exe = self.dir / "venv" / ("Scripts" if os.name == "nt" else "bin") / ("python.exe" if os.name == "nt" else "python")
+        if not exe.exists():
+            self.skipTest("el entorno virtual no trae python")
+        rel = "../venv/" + ("Scripts/python" if os.name == "nt" else "bin/python")
+        nodo, base = self.nodo(f"{rel} -c 'import sys; print(sys.prefix)'", self.dir / "robot")
+        args = nodo._resolve_program(base)
+        r = subprocess.run([*args[:1], "-c", "import sys; print(sys.prefix)"], capture_output=True, text=True,
+                           timeout=60, cwd=base)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(os.path.realpath(r.stdout.strip()), os.path.realpath(self.dir / "venv"),
+                         "el nodo debe correr dentro del entorno virtual, no en el Python del sistema")
+
+
 class TestPrinter(unittest.TestCase):
     def test_una_terminal_atorada_no_frena_a_quien_escribe(self):
         term = TerminalBloqueada()
@@ -714,6 +838,252 @@ class TestPrinter(unittest.TestCase):
         term.abierta.set()
         p.close()
         self.assertIn("aviso importante", term.getvalue())
+
+    def detenido(self, max_queue):
+        """Un Printer con el escritor atorado en la terminal (escribiendo un 'tapón'): lo que llegue después se
+        queda en la cola hasta abrirla."""
+        term = TerminalBloqueada()
+        p = Printer(["a"], stream=term, max_queue=max_queue)
+        p("a", "tapón")
+        fin = time.monotonic() + 5
+        while not (p._writing and not p._live) and time.monotonic() < fin:
+            time.sleep(0.001)
+        self.assertTrue(p._writing and not p._live, "el escritor no tomó el tapón")
+        return term, p
+
+    def salida(self, term, p):
+        term.abierta.set()
+        p.close()
+        return [l.split(" │ ", 1)[1] for l in term.getvalue().splitlines()]
+
+    def test_con_la_cola_llena_se_conservan_las_mas_nuevas(self):
+        """Cierre del nivel 10 (decisión 2): una ráfaga mayor que la cola sale con sus ÚLTIMAS líneas; el aviso
+        dice cuántas faltan y va antes de ellas; las no descartables están todas y en orden."""
+        term, p = self.detenido(max_queue=10)
+        enviadas = []
+        for i in range(100):
+            if i % 25 == 0:
+                p("agmen", f"aviso {i}", "agmen")
+                enviadas.append(f"aviso {i}")
+            p("a", f"línea {i}")
+            enviadas.append(f"línea {i}")
+        self.assertLessEqual(len(p._q), 2 * p._live + 1, "la cola no crece con las descartadas")
+        out = self.salida(term, p)
+        self.assertEqual(out[0], "tapón")
+        m = re.fullmatch(r"… (\d+) líneas no cupieron en la terminal \(están en el panel web\)", out[1])
+        self.assertIsNotNone(m, out[1])
+        resto = out[2:]
+        self.assertEqual([l for l in resto if l.startswith("aviso")], [f"aviso {i}" for i in (0, 25, 50, 75)])
+        lineas = [int(l.split()[1]) for l in resto if l.startswith("línea")]
+        self.assertEqual(lineas, list(range(100 - len(lineas), 100)), "salen las últimas, seguidas")
+        self.assertEqual(int(m.group(1)) + len(lineas), 100)
+        # La cola llena son 10; los 3 avisos que llegaron con ella llena entran igual (nunca se descartan).
+        self.assertEqual((len(resto), len(lineas)), (13, 9))
+        self.assertEqual(resto, [l for l in enviadas if l in resto], "el orden no cambia")
+
+    def test_cola_llena_solo_de_no_descartables_descarta_la_que_llega(self):
+        term, p = self.detenido(max_queue=3)
+        for i in range(5):
+            p("agmen", f"aviso {i}", "agmen")
+        p("a", "nueva")
+        p("a", "otra", "error", droppable=False)
+        out = self.salida(term, p)
+        self.assertEqual(out, ["tapón", "… 1 líneas no cupieron en la terminal (están en el panel web)",
+                               *(f"aviso {i}" for i in range(5)), "otra"])
+
+    def test_rafaga_larga_sin_crecer(self):
+        """O(1) amortizado y memoria acotada: 20 000 líneas con la terminal atorada."""
+        term, p = self.detenido(max_queue=50)
+        t0 = time.perf_counter()
+        for i in range(20_000):
+            p("a", f"línea {i}")
+            self.assertLessEqual(len(p._q), 2 * 50 + 1)
+        self.assertLess(time.perf_counter() - t0, 5.0)
+        out = self.salida(term, p)
+        self.assertEqual(out[2:], [f"línea {i}" for i in range(19_950, 20_000)])
+
+
+def maquina(name, host, extra=""):
+    return f'\n[[machine]]\nname = "{name}"\nhost = "{host}"\n{extra}'
+
+
+MAQUINAS = maquina("robot", "192.168.1.20") + maquina("laptop", "laptop.local:7400")
+
+
+class TestMaquinas(unittest.TestCase):
+    """[[machine]] y machine en [[node]]/[[mux]] (RFC 0011 §3.4, parte 3a)."""
+
+    def load(self, text: str, profile=None):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "robot.toml"
+            path.write_text(text, encoding="utf-8")
+            return load_config(path, profile)
+
+    def assertConfigError(self, text: str, *must_contain: str, profile=None):
+        with self.assertRaises(ConfigError) as ctx:
+            self.load(text, profile)
+        for frag in must_contain:
+            self.assertIn(frag, str(ctx.exception))
+        return str(ctx.exception)
+
+    # --- lo que carga bien
+    def test_sin_machine_se_carga_como_antes(self):
+        cfg = self.load(MINIMO)
+        self.assertEqual(cfg.machines, [])
+        self.assertEqual(cfg.nodes[0].machine, "")
+        self.assertFalse(cfg.local)
+
+    def test_campos_y_puerto_por_defecto(self):
+        cfg = self.load(MAQUINAS + nodo("motor", extra='machine = "robot"\n') + nodo("ia"))
+        self.assertEqual([(m.name, m.host, m.port) for m in cfg.machines],
+                         [("robot", "192.168.1.20", 7391), ("laptop", "laptop.local", 7400)])
+        by = {n.name: n for n in cfg.nodes}
+        self.assertEqual(by["motor"].machine, "robot")
+        self.assertEqual(by["ia"].machine, "")
+
+    def test_machine_declarada_sin_nodos_es_valida(self):
+        cfg = self.load(MAQUINAS + nodo("a"))
+        self.assertEqual(len(cfg.machines), 2)
+
+    def test_host_con_nombre_no_se_resuelve_al_cargar(self):
+        t0 = time.monotonic()
+        cfg = self.load(maquina("x", "no-existe.invalid") + nodo("a", extra='machine = "x"\n'))
+        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertEqual(cfg.machines[0].host, "no-existe.invalid")
+
+    def test_host_ipv6_con_puerto(self):
+        cfg = self.load(maquina("x", "[fe80::1]:7400") + maquina("y", "fe80::2") + nodo("n"))
+        self.assertEqual([(m.host, m.port) for m in cfg.machines], [("fe80::1", 7400), ("fe80::2", 7391)])
+
+    def test_mux_con_machine_y_su_nodeconfig_la_hereda(self):
+        mux = ('\n[[mux]]\nname = "ruedas"\noutput = "127.0.0.1:7500"\nmachine = "robot"\n'
+               '[[mux.input]]\nname = "a"\nlisten = "127.0.0.1:7501"\npriority = 1\n')
+        cfg = self.load(MAQUINAS + mux + nodo("ia"))
+        self.assertEqual(cfg.muxes[0].machine, "robot")
+        nodo_mux = next(n for n in cfg.nodes if n.name == "ruedas")
+        self.assertEqual(nodo_mux.machine, "robot")
+        self.assertEqual(next(n for n in cfg.nodes if n.name == "ia").machine, "")
+
+    def test_mux_sin_machine_es_vacio(self):
+        mux = ('\n[[mux]]\nname = "ruedas"\noutput = "127.0.0.1:7500"\n'
+               '[[mux.input]]\nname = "a"\nlisten = "127.0.0.1:7501"\npriority = 1\n')
+        cfg = self.load(MAQUINAS + mux + nodo("ia"))
+        self.assertEqual(cfg.muxes[0].machine, "")
+        self.assertEqual(next(n for n in cfg.nodes if n.name == "ruedas").machine, "")
+
+    def test_mux_con_machine_no_declarada_es_error(self):
+        mux = ('\n[[mux]]\nname = "ruedas"\noutput = "127.0.0.1:7500"\nmachine = "robto"\n'
+               '[[mux.input]]\nname = "a"\nlisten = "127.0.0.1:7501"\npriority = 1\n')
+        self.assertConfigError(MAQUINAS + mux + nodo("ia"), "[[mux]] 'ruedas'", "robto", "¿Quisiste decir 'robot'?")
+
+    def test_raw_es_la_tabla_sin_resolver(self):
+        text = (MAQUINAS + '\n[[node]]\nname = "ia"\ncmd = "python cerebro.py"\ncwd = "sub"\n'
+                'machine = "laptop"\nenv = { A = "1" }\n')
+        n = self.load(text).nodes[0]
+        self.assertEqual(n.raw, {"name": "ia", "cmd": "python cerebro.py", "cwd": "sub",
+                                 "machine": "laptop", "env": {"A": "1"}})
+        self.assertEqual(n.cmd[0], sys.executable)        # lo resuelto sí cambió
+        self.assertEqual(n.raw["cmd"], "python cerebro.py")   # y raw no
+
+    def test_raw_es_una_copia_independiente(self):
+        n = self.load('[[node]]\nname = "a"\ncmd = "x"\nenv = { A = "1" }\n').nodes[0]
+        n.raw["env"]["A"] = "2"
+        n.raw["name"] = "otro"
+        self.assertEqual(n.env["A"], "1")
+        self.assertEqual(n.name, "a")
+        otro = self.load('[[node]]\nname = "a"\ncmd = "x"\nenv = { A = "1" }\n').nodes[0]
+        self.assertEqual(otro.raw["env"], {"A": "1"})
+
+    def test_local_conserva_el_campo_machine(self):
+        text = (MAQUINAS + nodo("motor", extra='machine = "robot"\n')
+                + '\n[profile.sim]\nlocal = true\n')
+        cfg = self.load(text, "sim")
+        self.assertTrue(cfg.local)
+        self.assertEqual(cfg.nodes[0].machine, "robot")
+        self.assertFalse(self.load(text, "real").local)
+
+    def test_los_nombres_de_nodo_siguen_unicos_entre_computadoras(self):
+        text = (MAQUINAS + nodo("motor", extra='machine = "robot"\n')
+                + nodo("motor", extra='machine = "laptop"\n'))
+        self.assertConfigError(text, "motor")
+
+    # --- errores en machine de un nodo
+    def test_machine_mal_escrita_sugiere(self):
+        e = self.assertConfigError(MAQUINAS + nodo("a", extra='machine = "robto"\n'),
+                                   "[[node]] 'a'", "robto", "¿Quisiste decir 'robot'?")
+        self.assertNotIn("Traceback", e)
+
+    def test_machine_sin_parecido_lista_las_declaradas(self):
+        self.assertConfigError(MAQUINAS + nodo("a", extra='machine = "zzz"\n'),
+                               "'zzz'", "robot, laptop")
+
+    def test_machine_sin_ninguna_machine_declarada(self):
+        self.assertConfigError(nodo("a", extra='machine = "robot"\n'),
+                               "no declara ninguna [[machine]]", "[[machine]]")
+
+    def test_machine_vacia_o_no_texto(self):
+        self.assertConfigError(MAQUINAS + nodo("a", extra='machine = ""\n'), "machine")
+        self.assertConfigError(MAQUINAS + nodo("a", extra='machine = 3\n'), "machine")
+
+    def test_machine_mal_escrita_en_un_nodo_de_otro_perfil_tambien_falla(self):
+        text = MAQUINAS + nodo("a") + nodo("mundo", '"sim"', 'machine = "robto"\n')
+        for perfil in (None, "real", "sim"):
+            self.assertConfigError(text, "robto", "¿Quisiste decir 'robot'?", profile=perfil)
+
+    # --- errores en [[machine]]
+    def test_name_repetido(self):
+        self.assertConfigError(maquina("robot", "1.2.3.4") + maquina("robot", "1.2.3.5"), "'robot'", "únicos")
+
+    def test_host_vacio(self):
+        self.assertConfigError(maquina("robot", ""), "'robot'", "vacío")
+        self.assertConfigError(maquina("robot", "   "), "'robot'")
+
+    def test_host_con_esquema_o_ruta(self):
+        self.assertConfigError(maquina("robot", "http://192.168.1.20"), "http://")
+        self.assertConfigError(maquina("robot", "192.168.1.20/x"), "robot")
+
+    def test_host_con_espacios(self):
+        self.assertConfigError(maquina("robot", "192.168.1.20 :7391"), "espacios")
+        self.assertConfigError(maquina("robot", "mi robot"), "espacios")
+
+    def test_puerto_invalido(self):
+        for host in ("1.2.3.4:0", "1.2.3.4:65536", "1.2.3.4:abc", "1.2.3.4:", "1.2.3.4:-1", "1.2.3.4:80.5"):
+            with self.subTest(host=host):
+                self.assertConfigError(maquina("robot", host), "puerto", "1 y 65535")
+
+    def test_puertos_en_los_limites(self):
+        cfg = self.load(maquina("a", "1.2.3.4:1") + maquina("b", "1.2.3.4:65535") + nodo("n"))
+        self.assertEqual([m.port for m in cfg.machines], [1, 65535])
+
+    def test_clave_port_aparte(self):
+        self.assertConfigError(maquina("robot", "1.2.3.4", "port = 7391\n"), "host", "7391")
+
+    def test_clave_mal_escrita(self):
+        self.assertConfigError('\n[[machine]]\nname = "robot"\nhots = "1.2.3.4"\n', "¿Quisiste decir 'host'?")
+        self.assertConfigError(maquina("robot", "1.2.3.4", 'nombre = "x"\n'), "desconocida")
+
+    def test_name_invalido(self):
+        for nombre in ("ro bot", "róbot", "robot!", "a/b", ""):
+            with self.subTest(nombre=nombre):
+                self.assertConfigError(maquina(nombre, "1.2.3.4"), "nombre de computadora válido")
+
+    def test_name_valido_con_guiones(self):
+        cfg = self.load(maquina("mi_robot-2", "1.2.3.4") + nodo("n"))
+        self.assertEqual(cfg.machines[0].name, "mi_robot-2")
+
+    def test_falta_name_o_host(self):
+        self.assertConfigError('\n[[machine]]\nhost = "1.2.3.4"\n', "falta 'name'")
+        self.assertConfigError('\n[[machine]]\nname = "robot"\n', "falta 'host'")
+
+    def test_host_no_es_texto(self):
+        self.assertConfigError('\n[[machine]]\nname = "robot"\nhost = 5\n', "host es un texto")
+
+    def test_machine_no_es_lista_de_tablas(self):
+        self.assertConfigError('machine = "robot"\n' + MINIMO, "[[machine]]")
+        self.assertConfigError('[machine]\nname = "robot"\nhost = "1.2.3.4"\n' + MINIMO, "[[machine]]")
+
+    def test_machine_dentro_de_robot_o_profile_es_clave_desconocida(self):
+        self.assertConfigError('[robot]\nname = "r"\nmachine = "x"\n', "machine")
 
 
 if __name__ == "__main__":

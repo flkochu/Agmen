@@ -141,6 +141,164 @@ void check_topic(std::string_view topic) {
     }
 }
 
+// --- Modo red (RFC 0011 §3.5): los mismos textos que python/agmen/hubproto.py ---
+
+std::vector<std::string> split_list(std::string_view list) {
+    std::vector<std::string> out;
+    std::size_t p = 0;
+    while (p < list.size()) {
+        auto c = list.find(',', p);
+        if (c == std::string_view::npos) c = list.size();
+        if (c > p) out.emplace_back(list.substr(p, c - p));
+        p = c + 1;
+    }
+    return out;
+}
+
+namespace {
+
+bool is_digit(char c) { return c >= '0' && c <= '9'; }
+
+bool all_digits(std::string_view s) {
+    if (s.empty()) return false;
+    for (char c : s) {
+        if (!is_digit(c)) return false;
+    }
+    return true;
+}
+
+std::string lower(std::string_view s) {
+    std::string out(s);
+    for (auto& c : out) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return out;
+}
+
+}  // namespace
+
+void check_machine(std::string_view name) {
+    bool ok = !name.empty();
+    for (char c : name) {
+        ok = ok && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || is_digit(c) || c == '_' ||
+                    c == '-');
+    }
+    if (!ok) {
+        throw std::invalid_argument("'" + std::string(name) +
+                                    "' no es un nombre de computadora válido: usa letras (sin acentos), "
+                                    "dígitos, '_' o '-', como en [[machine]] name de robot.toml");
+    }
+}
+
+std::string parse_ipv4(std::string_view text) {
+    int parts = 0;
+    bool ok = true;
+    std::size_t p = 0;
+    while (ok) {
+        auto dot = text.find('.', p);
+        if (dot == std::string_view::npos) dot = text.size();
+        const auto part = text.substr(p, dot - p);
+        ok = all_digits(part) && part.size() <= 3 && (part == "0" || part.front() != '0') &&
+             std::stoi(std::string(part)) <= 255;
+        ++parts;
+        if (dot == text.size()) break;
+        p = dot + 1;
+    }
+    if (!ok || parts != 4) {
+        throw std::invalid_argument("'" + std::string(text) +
+                                    "' no es una IP válida: escríbela como cuatro números de 0 a 255, "
+                                    "ej. 192.168.1.20");
+    }
+    return std::string(text);
+}
+
+void check_peer_ip(std::string_view ip, bool loopback) {
+    (void)parse_ipv4(ip);
+    const int first = std::stoi(std::string(ip.substr(0, ip.find('.'))));
+    if (ip == kLocalhost) {
+        throw std::invalid_argument(
+            "127.0.0.1 es esta misma computadora, no otra: pon la IP con la que esta computadora ve a "
+            "la otra, ej. 192.168.1.20");
+    }
+    if (first == 127 && !loopback) {
+        throw std::invalid_argument(
+            std::string(ip) +
+            " es esta misma computadora (las 127.x no salen de ella), no otra: pon la IP con la que esta "
+            "computadora ve a la otra, ej. 192.168.1.20 (las 127.x solo valen en pruebas, con AGMEN_NET_IP)");
+    }
+    if (ip == "0.0.0.0" || ip == "255.255.255.255" || (first >= 224 && first <= 239)) {
+        throw std::invalid_argument(
+            std::string(ip) +
+            " no es la IP de una computadora (es una dirección especial o de grupo): pon la IP con "
+            "la que esta computadora ve a la otra, ej. 192.168.1.20");
+    }
+}
+
+std::uint16_t parse_port(std::string_view text, std::string_view what) {
+    unsigned long value = 0;
+    bool ok = all_digits(text);
+    for (std::size_t i = 0; ok && i < text.size(); ++i) {
+        value = value * 10 + static_cast<unsigned long>(text[i] - '0');
+        ok = value <= 65535;
+    }
+    if (!ok || value == 0) {
+        throw std::invalid_argument(std::string(what) + " '" + std::string(text) +
+                                    "' no es válido: es un número de 1 a 65535");
+    }
+    return static_cast<std::uint16_t>(value);
+}
+
+std::pair<std::string, std::uint16_t> parse_hostport(std::string_view text) {
+    const auto colon = text.rfind(':');
+    if (colon == std::string_view::npos) {
+        throw std::invalid_argument("'" + std::string(text) +
+                                    "' no es una dirección: escríbela como ip:puerto, ej. "
+                                    "192.168.1.20:7500");
+    }
+    auto ip = parse_ipv4(text.substr(0, colon));
+    return {std::move(ip), parse_port(text.substr(colon + 1))};
+}
+
+std::vector<std::pair<std::string, std::string>> parse_peers(std::string_view text, bool loopback) {
+    std::vector<std::pair<std::string, std::string>> out;
+    std::map<std::string, std::string, std::less<>> names;  // en minúsculas → como vino
+    std::map<std::string, std::string, std::less<>> ips;    // IP → nombre
+    for (const auto& item : split_list(text)) {
+        const auto at = item.find('@');
+        if (at == std::string::npos) {
+            throw std::invalid_argument("'" + item +
+                                        "' en peers no es nombre@ip, ej. robot@192.168.1.20");
+        }
+        std::string name = item.substr(0, at);
+        std::string ip = item.substr(at + 1);
+        check_machine(name);
+        check_peer_ip(ip, loopback);
+        if (names.count(lower(name)) != 0) {
+            throw std::invalid_argument("la computadora '" + name +
+                                        "' está dos veces en peers: cada una va una sola vez");
+        }
+        if (const auto it = ips.find(ip); it != ips.end()) {
+            throw std::invalid_argument("'" + it->second + "' y '" + name + "' tienen la misma IP " +
+                                        ip + " en peers: cada computadora tiene la suya");
+        }
+        names.emplace(lower(name), name);
+        ips.emplace(ip, name);
+        out.emplace_back(std::move(name), std::move(ip));
+    }
+    return out;
+}
+
+std::string format_peers(const std::vector<std::pair<std::string, std::string>>& peers) {
+    std::string out;
+    for (const auto& [name, ip] : peers) {
+        if (!out.empty()) out += ',';
+        out += name;
+        out += '@';
+        out += ip;
+    }
+    return out;
+}
+
 std::string hub_address() { return env_or("AGMEN_HUB", kDefaultHub); }
 
 std::string process_id() {
@@ -184,9 +342,21 @@ std::string hex16(std::uint64_t v) {
 
 Link::Link(std::string id, std::string beat)
     : hub_(net::Address::resolve(hub_address())),
+      hub_from_(hub_.to_string()),
       id_(std::move(id)),
       beat_(std::move(beat)),
-      started_(std::chrono::steady_clock::now()) {}
+      started_(std::chrono::steady_clock::now()) {
+    // Un hub en 0.0.0.0 contesta desde 127.0.0.1 (igual que _hub_from en python/agmen/pubsub.py).
+    if (hub_from_.rfind("0.0.0.0:", 0) == 0) hub_from_ = "127.0.0.1" + hub_from_.substr(7);
+}
+
+void Link::warn_foreign(std::string_view topic, const std::string& from) {
+    constexpr std::size_t kMaxWarned = 256;   // remitentes distintos que se avisan (los demás solo se cuentan)
+    if (foreign_warned_.size() >= kMaxWarned || !foreign_warned_.insert(from).second) return;
+    log::write("[agmen] ⚠ '" + std::string(topic) + "': llegó un mensaje de control de " + from +
+               ", que no es el hub (" + hub_from_ +
+               "): lo descarté sin hacerle caso. Si no es tuyo, algo en la red se hace pasar por el hub.");
+}
 
 void Link::beat(net::UdpSocket& socket) {
     const wire::ByteView data(reinterpret_cast<const std::uint8_t*>(beat_.data()), beat_.size());
@@ -219,22 +389,6 @@ void Link::bye(net::UdpSocket& socket) noexcept {
     }
 }
 
-namespace {
-
-std::vector<std::string> split_list(const std::string& list) {
-    std::vector<std::string> out;
-    std::size_t p = 0;
-    while (p < list.size()) {
-        auto c = list.find(',', p);
-        if (c == std::string::npos) c = list.size();
-        if (c > p) out.push_back(list.substr(p, c - p));
-        p = c + 1;
-    }
-    return out;
-}
-
-}  // namespace
-
 bool Link::handle(wire::ByteView data, std::optional<std::vector<std::string>>& subs,
                   std::optional<std::vector<std::string>>* tcp) {
     if (!is_control(data)) return false;
@@ -252,7 +406,14 @@ bool Link::handle(wire::ByteView data, std::optional<std::vector<std::string>>& 
             if (tcp != nullptr) *tcp = split_list(l.get("tcp"));
             error_.clear();
         } else if (l.op == "ok") {
+            ++oks_;
             error_.clear();
+            const auto it = l.fields.find("peers");
+            if (it == l.fields.end()) {
+                peers_.reset();
+            } else {
+                peers_ = split_list(it->second);
+            }
         } else if (l.op == "error") {
             error_ = l.get("msg");
         }

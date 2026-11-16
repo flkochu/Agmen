@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import errno
+import os
 import select
 import socket
 import struct
@@ -42,6 +44,34 @@ CONNECT_TIMEOUT_S = 1.0
 BIG_BUFFER = 4 << 20          # SO_SNDBUF / SO_RCVBUF que se pide fuera de Linux
 READ_CHUNK = 1 << 18
 SHM_NO, SHM_PROBING, SHM_YES = 0, 1, 2
+LOCAL_IP = "127.0.0.1"
+
+
+def _error_text(err: int) -> str:
+    """El motivo de un código de error de socket (SO_ERROR, connect_ex). En Windows son códigos de Winsock
+    (10061...), que os.strerror no conoce ("Unknown error"): el texto lo da el sistema (RFC 0011 §9.9)."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            text = ctypes.FormatError(err).strip()
+            if text:
+                return text
+        except (ImportError, AttributeError, OSError, ValueError):
+            pass
+    return os.strerror(err)
+# Conectar a OTRA computadora (RFC 0011 §3) no bloquea a nadie: la conexión se termina en el hilo del
+# Fanout, y si no contesta en este tiempo se da por fallida (se reintenta cada Fanout.RETRY_S).
+# 3 s (la especificación no da el número; a 127.0.0.1 se sigue esperando 1 s, bloqueando).
+REMOTE_CONNECT_S = 3.0
+_IN_PROGRESS = {0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EAGAIN, getattr(errno, "WSAEWOULDBLOCK", 10035)}
+
+
+def unreachable_text(topic: str, addr: tuple[str, int], why: str) -> str:
+    """El aviso (una vez por destino) de un destino de otra computadora al que no se pudo mandar."""
+    return (f"[agmen] ⚠ '{topic}': no pude mandar a la computadora {addr[0]} ({addr[0]}:{addr[1]}): {why}. "
+            f"Los demás destinos siguen igual; revisa que {addr[0]} esté en la red y que su firewall deje "
+            f"pasar a Agmen. Lo que no sale se cuenta (unreachable).")
 
 
 def _tune(sock: socket.socket, option: int) -> None:
@@ -95,9 +125,9 @@ class Outgoing:
     del Fanout lo manda sin bloquear a nadie y lee los avisos del suscriptor."""
 
     __slots__ = ("addr", "sock", "cur", "pending", "control", "next", "dropped", "sent", "alive",
-                 "shm", "hello", "lent", "lent_bytes", "inbox")
+                 "shm", "hello", "lent", "lent_bytes", "inbox", "remote", "connecting", "deadline", "error")
 
-    def __init__(self, addr: tuple[str, int]) -> None:
+    def __init__(self, addr: tuple[str, int], remote: bool = False, src_ip: str | None = None) -> None:
         self.addr = addr
         self.sock: socket.socket | None = None
         self.cur: _Item | None = None             # el paquete en curso
@@ -112,7 +142,14 @@ class Outgoing:
         self.lent: dict[tuple[int, int], int] = {}   # descriptores mandados y no devueltos → bytes
         self.lent_bytes = 0
         self.inbox = bytearray()
-        self._connect()
+        self.remote = remote          # de otra computadora (RFC 0011): sin memoria compartida, sin bloquear
+        self.connecting = False       # conexión a otra computadora en curso (la termina el hilo del Fanout)
+        self.deadline = 0.0
+        self.error = ""               # por qué no se pudo conectar (para el aviso)
+        if remote:
+            self._connect_remote(src_ip)
+        else:
+            self._connect()
 
     def _connect(self) -> None:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -127,6 +164,42 @@ class Outgoing:
             return                               # el suscriptor ya no está; el hub lo quitará
         self.sock = s
         self.alive = True
+
+    def _connect_remote(self, src_ip: str | None) -> None:
+        """Sin bloquear: a otra computadora puede tardar o no contestar nunca, y publish() no espera."""
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            _tune(s, socket.SO_SNDBUF)
+            if src_ip:
+                s.bind((src_ip, 0))              # AGMEN_NET_IP: sale desde esa IP
+            s.setblocking(False)
+            err = s.connect_ex(self.addr)
+        except OSError as e:
+            s.close()
+            self.error = str(e)
+            return
+        if err not in _IN_PROGRESS:
+            s.close()
+            self.error = _error_text(err)
+            return
+        self.sock = s
+        self.alive = True
+        self.connecting = err != 0
+        self.deadline = time.monotonic() + REMOTE_CONNECT_S
+
+    def finish_connect(self) -> bool:
+        """El select dijo que la conexión en curso terminó: True si quedó lista."""
+        try:
+            err = self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+        except OSError as e:
+            self.error = str(e)
+            return False
+        if err:
+            self.error = _error_text(err)
+            return False
+        self.connecting = False
+        return True
 
     @staticmethod
     def _give_back(item: _Item | None, pool) -> None:
@@ -164,6 +237,8 @@ class Outgoing:
                 (n < _shm.MAX_UNRETURNED and self.lent_bytes + item.length <= _shm.MAX_UNRETURNED_BYTES))
 
     def wants_write(self) -> bool:
+        if self.connecting:
+            return True                          # el select avisa cuando termina de conectar
         return self.pending is not None or bool(self.control) or (self.next is not None and self.can_send(self.next))
 
     def _start(self, item: _Item) -> None:
@@ -183,7 +258,7 @@ class Outgoing:
 
     def step(self, pool=None) -> None:
         """Manda lo que acepte el sistema ahora (lo llama el hilo del Fanout)."""
-        while self.alive:
+        while self.alive and not self.connecting:
             if self.pending is None:
                 if self.control:
                     self._start(_Item(self.control.popleft()))
@@ -215,8 +290,14 @@ class Fanout:
 
     RETRY_S = 1.0
 
-    def __init__(self, topic: str = "", source_id: int = 0, topic_id: int = 0) -> None:
+    def __init__(self, topic: str = "", source_id: int = 0, topic_id: int = 0, net: bool = False,
+                 net_ip: str | None = None) -> None:
+        """`net`: los destinos que no son 127.0.0.1 son de otra computadora (modo topic, RFC 0011 §3);
+        `net_ip`: AGMEN_NET_IP, la IP desde la que salen (solo pruebas)."""
         self.topic, self.source_id, self.topic_id = topic, source_id, topic_id
+        self.net, self.net_ip = net, net_ip
+        self.unreachable = 0                     # mensajes que no salieron hacia otra computadora
+        self._unreach_warned: set = set()
         self.conns: dict[tuple[str, int], Outgoing] = {}
         self.want: list[tuple[str, int]] = []
         self.announcement = None
@@ -257,24 +338,43 @@ class Fanout:
             self._reconnect(force=True)
         self._wake()
 
-    def _reconnect(self, force: bool = False) -> None:
+    def _reconnect(self, force: bool = False, msg: bool = False) -> None:
+        """`msg`: lo llama un mensaje de datos; a otra computadora sin conexión, se cuenta como no salido."""
         now = time.monotonic()
         for a in self.want:
             c = self.conns.get(a)
             if c is not None and c.alive:
                 continue
+            remote = self.net and a[0] != LOCAL_IP and a[0] != self.net_ip   # AGMEN_NET_IP es local (§9.5)
             if not force and now - self._last_try.get(a, 0.0) < self.RETRY_S:
+                if remote and msg:
+                    self.unreachable += 1
                 continue
             self._last_try[a] = now
             self._forget(a)
-            c = Outgoing(a)
+            c = Outgoing(a, True, self.net_ip) if remote else Outgoing(a)
             if c.alive:
                 self.conns[a] = c
                 if self.announcement is not None:
                     c.offer(_Item(self.announcement), self.pool)
                     c.step(self.pool)
+            elif remote:
+                if msg:
+                    self.unreachable += 1
+                self._warn_unreachable(a, c.error)
             # si no está, se reintenta en un rato
 
+    def _warn_unreachable(self, a, why: str) -> None:
+        if a not in self._unreach_warned:
+            self._unreach_warned.add(a)
+            print(unreachable_text(self.topic, a, why or "no contestó"), file=sys.stderr, flush=True)
+
+    def _remote_failed(self, c: Outgoing, why: str) -> None:
+        """Una conexión a otra computadora que no se pudo terminar (con el lock)."""
+        if c.next is not None or c.cur is not None:
+            self.unreachable += 1                # lo que esperaba salir por ella
+        c.fail(self.pool)
+        self._warn_unreachable(c.addr, why)
     def send(self, packet) -> bool:
         """Deja un paquete ya armado (un anuncio) en cada conexión. True si hay alguien."""
         with self.lock:
@@ -297,7 +397,7 @@ class Fanout:
         (el payload se escribe una sola vez) y si no, entero por TCP."""
         n = payload.nbytes if isinstance(payload, memoryview) else len(payload)
         with self.lock:
-            self._reconnect()
+            self._reconnect(msg=True)
             # D3: el mensaje nuevo reemplaza al que esperaba. Se suelta antes de
             # escribir, así su bloque se puede reutilizar para este.
             for c in self.conns.values():
@@ -352,6 +452,8 @@ class Fanout:
             if c.hello:
                 return
             c.hello = True
+            if c.remote:
+                return    # la memoria compartida es de cada computadora: a otra ni se prueba ni se avisa
             if not _shm.enabled():
                 return
             if self.pool is None:
@@ -412,11 +514,15 @@ class Fanout:
                 if self.pool is not None and now - last_trim >= 1.0:
                     last_trim = now
                     self.pool.trim(now)
+                for c in [c for c in self.conns.values() if c.connecting and now >= c.deadline]:
+                    self._remote_failed(c, f"no contestó en {REMOTE_CONNECT_S:.0f} s")
                 alive = [c for c in self.conns.values() if c.alive]
-                rs = [c.sock for c in alive]
+                rs = [c.sock for c in alive if not c.connecting]
                 ws = [c.sock for c in alive if c.wants_write()]
+                # Windows dice que una conexión en curso falló por los "excepcionales", no por los de escribir.
+                xs = [c.sock for c in alive if c.connecting]
             try:
-                r, w, _ = select.select([self._wake_r, *rs], ws, [], 0.5 if ws else 1.0)
+                r, w, x = select.select([self._wake_r, *rs], ws, xs, 0.5 if ws else 1.0)
             except (OSError, ValueError):
                 time.sleep(0.01)
                 continue
@@ -425,10 +531,14 @@ class Fanout:
                     self._wake_r.recv(4096)
                 except OSError:
                     pass
-            if not r and not w:
+            if not r and not w and not x:
                 continue
             with self.lock:
                 for c in alive:
+                    if c.connecting and c.sock is not None and (c.sock in w or c.sock in x):
+                        if not c.finish_connect():
+                            self._remote_failed(c, c.error)
+                            continue
                     if c.sock is not None and c.sock in r:
                         self._serve_reads(c)
                     if c.alive and c.sock in w:
@@ -445,7 +555,7 @@ class Fanout:
     @property
     def connected(self) -> int:
         with self.lock:
-            return sum(1 for c in self.conns.values() if c.alive)
+            return sum(1 for c in self.conns.values() if c.alive and not c.connecting)
 
     @property
     def shm_subscribers(self) -> int:
@@ -613,36 +723,74 @@ class Listener:
     publicador que se conecta le dice que puede memoria compartida (RFC 0009)."""
 
     def __init__(self, bind: tuple[str, int], shm: bool = False) -> None:
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        except OSError:
-            pass
-        try:
-            self.sock.bind(bind)
-            self.sock.listen(16)
-        except OSError:
-            self.sock.close()
-            raise
-        self.sock.setblocking(False)
+        self.sock = self._open(bind)
         self.shm = shm
         self.conns: dict[socket.socket, _Incoming] = {}
         self.ready: list = []        # paquetes completos por entregar: (paquete, "ip:puerto", conexión)
+        # Modo red (RFC 0011 §2): los puertos de escucha anteriores (siguen aceptando hasta retire_old) y
+        # de qué IP se aceptan conexiones (None = de todas: escucha solo en 127.0.0.1, lo de siempre).
+        self.old: list[socket.socket] = []
+        self.allow: frozenset | None = None
+        self.on_reject = None
+        self.net_ip: str | None = None   # AGMEN_NET_IP: también es esta computadora (memoria compartida, §9.5)
+
+    @staticmethod
+    def _open(bind: tuple[str, int]) -> socket.socket:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        except OSError:
+            pass
+        try:
+            s.bind(bind)
+            s.listen(16)
+        except OSError:
+            s.close()
+            raise
+        s.setblocking(False)
+        return s
 
     @property
     def port(self) -> int:
         return self.sock.getsockname()[1]
 
     def filenos(self) -> list:
-        return [self.sock, *self.conns]
+        return [self.sock, *self.old, *self.conns]
+
+    def rebind(self, bind: tuple[str, int]) -> None:
+        """Un puerto de escucha nuevo en `bind`; el de antes sigue aceptando hasta retire_old(). Las
+        conexiones ya aceptadas no se tocan. Si no se puede abrir, lanza OSError y nada cambia."""
+        new = self._open(bind)
+        self.old.append(self.sock)
+        self.sock = new
+
+    def retire_old(self) -> None:
+        """Cierra los puertos de escucha anteriores (no las conexiones que ya aceptaron)."""
+        for s in self.old:
+            try:
+                s.close()
+            except OSError:
+                pass
+        self.old = []
+
+    def set_allow(self, allow: frozenset, on_reject) -> None:
+        """De qué IP se aceptan conexiones; las aceptadas de una IP que ya no está se cierran."""
+        self.allow, self.on_reject = allow, on_reject
+        for s, inc in list(self.conns.items()):
+            if inc.sender.rsplit(":", 1)[0] not in allow:
+                self._drop(s, True)
 
     def service(self, readable) -> None:
         """Atiende los sockets listos (de un select): acepta y lee."""
         for s in readable:
-            if s is self.sock:
+            if s is self.sock or s in self.old:
                 try:
-                    c, peer = self.sock.accept()
+                    c, peer = s.accept()
                 except OSError:
+                    continue
+                if self.allow is not None and peer[0] not in self.allow:
+                    c.close()                    # de una computadora que no es de [[machine]]
+                    self.on_reject(peer[0])
                     continue
                 c.setblocking(False)
                 try:
@@ -652,7 +800,8 @@ class Listener:
                 _tune(c, socket.SO_RCVBUF)
                 inc = _Incoming(c, f"{peer[0]}:{peer[1]}")
                 self.conns[c] = inc
-                if self.shm:
+                # En modo red, la memoria compartida solo con esta computadora (en local, lo de siempre).
+                if self.shm and (self.allow is None or peer[0] == LOCAL_IP or peer[0] == self.net_ip):
                     # El suscriptor habla primero (RFC 0009 §3.3): un publicador de
                     # 0.10 nunca lee esto, y uno de 0.11 sabe que puede probar.
                     inc.hello = True
@@ -677,6 +826,7 @@ class Listener:
     def close(self) -> None:
         for s in list(self.conns):
             self._drop(s, False)
+        self.retire_old()
         try:
             self.sock.close()
         except OSError:

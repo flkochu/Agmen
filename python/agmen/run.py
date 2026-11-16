@@ -13,6 +13,7 @@ Un solo comando en vez de una terminal por nodo:
 
 from __future__ import annotations
 
+import copy
 import difflib
 import os
 import re
@@ -37,6 +38,11 @@ class ConfigError(Exception):
     """Error en robot.toml, con un mensaje que dice exactamente qué corregir."""
 
 
+class NoConnection(str):
+    """El error de Launcher.action cuando el nodo es de otra computadora sin conexión (RFC 0011 parte 3c §15):
+    es texto como cualquier otro error, pero el panel lo responde con HTTP 409 (no 400: la orden era válida)."""
+
+
 # ---------------------------------------------------------------------------
 # Configuración
 # ---------------------------------------------------------------------------
@@ -58,6 +64,16 @@ class NodeConfig:
     cwd: Path | None = None
     env: dict[str, str] = field(default_factory=dict)
     profiles: tuple[str, ...] = ()   # en qué perfiles corre (RFC 0011); vacía = en todos
+    machine: str = ""                # en qué [[machine]] corre (RFC 0011 §3.4); vacío = donde corre agmen run
+    raw: dict = field(default_factory=dict)   # la tabla tal como se escribió en robot.toml (para comparar dos copias)
+
+
+@dataclass
+class MachineConfig:
+    """Una [[machine]] de robot.toml (RFC 0011 §3.4): una computadora del robot."""
+    name: str
+    host: str              # IP o nombre, sin el puerto (no se resuelve al leer el archivo)
+    port: int = 7391       # donde escucha agmen agent
 
 
 @dataclass
@@ -124,6 +140,7 @@ class MuxConfig:
     inputs: list[tuple[str, str, int]]             # (nombre, topic o dirección, prioridad)
     hold_ms: float = 300.0
     profiles: tuple[str, ...] = ()                 # en qué perfiles corre (RFC 0011); vacía = en todos
+    machine: str = ""                              # en qué [[machine]] corre (RFC 0011 §3.4)
 
 
 @dataclass
@@ -143,7 +160,8 @@ class RobotConfig:
     profile: str = "real"                                    # el perfil activo
     profiles: tuple[str, ...] = ("real", "sim", "replay")   # los perfiles conocidos
     skipped: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)   # (nodo o mux, perfiles) que no corren
-    local: bool = False                                      # [profile.X] local (RFC 0011 §3.4)
+    local: bool = False                                      # [profile.X] local (RFC 0011 §3.4): se ignora machine
+    machines: list[MachineConfig] = field(default_factory=list)   # [[machine]] (RFC 0011 §3.4)
     warnings: list[str] = field(default_factory=list)        # avisos (no errores) de robot.toml, ej. un perfil mal escrito
 
     def topics_used(self) -> set[str]:
@@ -288,6 +306,89 @@ def _claim(declared: dict, name: str, kind: str, profiles: tuple[str, ...]) -> N
     declared.setdefault(name, []).append((kind, profiles))
 
 
+def _parse_machines(data: dict) -> list[MachineConfig]:
+    """Las [[machine]] (RFC 0011 §3.4). `host` no se resuelve aquí: eso lo hace
+    agmen run al arrancar (agmen.machines), con límite de tiempo."""
+    from .machines import split_host
+
+    raw_machines = data.get("machine", [])
+    if not isinstance(raw_machines, list) or not all(isinstance(m, dict) for m in raw_machines):
+        raise ConfigError("'machine' se declara como [[machine]] (una por computadora), ej.\n\n"
+                          "  [[machine]]\n  name = \"robot\"\n  host = \"192.168.1.20\"")
+    out: list[MachineConfig] = []
+    for i, raw in enumerate(raw_machines, start=1):
+        where = f"[[machine]] #{i}"
+        if "port" in raw:
+            raise ConfigError(f"{where}: el puerto va en host, ej. host = \"192.168.1.20:7391\" "
+                              f"(sin puerto se usa 7391)")
+        _check_keys(raw, {"name", "host"}, where)
+        name = raw.get("name")
+        if name is None:
+            raise ConfigError(f"{where}: falta 'name' (cómo le dices a esa computadora), ej. name = \"robot\"")
+        if not isinstance(name, str) or not _PROFILE_NAME.fullmatch(name):
+            raise ConfigError(f"{where}: {name!r} no es un nombre de computadora válido. Usa letras (sin acentos), "
+                              f"dígitos, '_' o '-', ej. \"robot\" o \"laptop\"")
+        where = f"[[machine]] '{name}'"
+        same = next((m for m in out if m.name.lower() == name.lower()), None)
+        if same is not None:
+            if same.name == name:
+                raise ConfigError(f"hay dos [[machine]] llamadas '{name}': los nombres deben ser únicos "
+                                  f"(una [[machine]] por computadora)")
+            raise ConfigError(f"hay dos [[machine]] que solo cambian en mayúsculas ('{same.name}' y '{name}'): "
+                              f"así es fácil confundirlas. Ponles nombres distintos, o deja una")
+        host = raw.get("host")
+        if host is None:
+            raise ConfigError(f"{where}: falta 'host' (la IP o el nombre de esa computadora), "
+                              f"ej. host = \"192.168.1.20\" o host = \"robot.local\"")
+        if not isinstance(host, str):
+            raise ConfigError(f"{where}: host es un texto, ej. host = \"192.168.1.20\" o host = \"robot.local\"")
+        try:
+            address, port = split_host(host)
+        except ValueError as e:
+            raise ConfigError(f"{where}: host {e}") from None
+        twin = next((m for m in out if _same_host(m.host, address) and m.port == port), None)
+        if twin is not None:
+            raise ConfigError(f"[[machine]] '{twin.name}' y '{name}' tienen el mismo host ({host.strip()}): son la "
+                              f"misma computadora. Deja una sola [[machine]] y usa su nombre en machine")
+        out.append(MachineConfig(name, address, port))
+    return out
+
+
+def _same_host(a: str, b: str) -> bool:
+    """¿Dos host escritos distinto son la misma dirección? ("Robot.local" y "robot.local.",
+    "::1" y "0:0::1", "192.168.1.20" y "::ffff:192.168.1.20"). Sin DNS: dos nombres que
+    resuelven igual no se detectan aquí."""
+    import ipaddress
+
+    from .machines import unwrap
+
+    try:
+        return unwrap(ipaddress.ip_address(a)) == unwrap(ipaddress.ip_address(b))
+    except ValueError:
+        return a.lower().rstrip(".") == b.lower().rstrip(".")
+
+
+def _parse_machine(raw: dict, where: str, machines: list[MachineConfig]) -> str:
+    """El `machine` de un [[node]] o [[mux]]: el name de una [[machine]] declarada."""
+    if "machine" not in raw:
+        return ""
+    value = raw["machine"]
+    names = [m.name for m in machines]
+    if not isinstance(value, str) or not value:
+        raise ConfigError(f"{where}: machine es el name de una [[machine]], ej. machine = \"robot\" "
+                          f"(sin machine, corre donde corres agmen run)")
+    if value in names:
+        return value
+    if not names:
+        raise ConfigError(f"{where}: machine = '{value}', pero robot.toml no declara ninguna [[machine]]. "
+                          f"Declárala:\n\n  [[machine]]\n  name = \"{value}\"\n  host = \"192.168.1.20\"\n\n"
+                          f"o quita machine para que corra donde corres agmen run")
+    hint = difflib.get_close_matches(value, names, n=1)
+    extra = f" ¿Quisiste decir '{hint[0]}'?" if hint else f" Computadoras declaradas: {', '.join(names)}."
+    raise ConfigError(f"{where}: machine = '{value}' no es ninguna [[machine]] de robot.toml.{extra} "
+                      f"Sin machine, corre donde corres agmen run")
+
+
 def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
     """Lee robot.toml y lo resuelve para un perfil (RFC 0011): nodes, muxes y
     topics traen solo lo que corre en él. Sin `profile`, usa [robot] profile o
@@ -300,10 +401,12 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{path.name} no es TOML válido: {e}") from None
 
-    _check_keys(data, {"robot", "node", "mux", "topic", "hub", "web", "clock", "record", "profile"}, path.name)
+    _check_keys(data, {"robot", "node", "mux", "topic", "hub", "web", "clock", "record", "profile", "machine"},
+                path.name)
     robot = data.get("robot", {})
     _check_keys(robot, {"name", "before", "profile"}, "[robot]")
     base_dir = path.parent
+    machines = _parse_machines(data)
 
     nodes: list[NodeConfig] = []
     raw_nodes = data.get("node", [])
@@ -314,7 +417,7 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
     mentions: list[tuple[str, str, tuple[str, ...]]] = []   # (dónde, nombre, perfiles): para los avisos
     for i, raw in enumerate(raw_nodes, start=1):
         where = f"[[node]] #{i}"
-        _check_keys(raw, {"name", "cmd", "restart", "autostart", "cwd", "env", "profile"}, where)
+        _check_keys(raw, {"name", "cmd", "restart", "autostart", "cwd", "env", "profile", "machine"}, where)
         name = raw.get("name")
         if not isinstance(name, str) or not name.strip():
             raise ConfigError(f"{where}: falta 'name' (el nombre del nodo)")
@@ -338,6 +441,8 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
             cwd=(base_dir / raw["cwd"]).resolve() if "cwd" in raw else None,
             env={str(k): str(v) for k, v in env.items()},
             profiles=profiles,
+            machine=_parse_machine(raw, where, machines),
+            raw=copy.deepcopy(raw),
         ))
 
     hub_raw = data.get("hub", {})
@@ -352,7 +457,7 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
     mux_configs: list[MuxConfig] = []
     for i, raw in enumerate(raw_muxes, start=1):
         where = f"[[mux]] #{i}"
-        _check_keys(raw, {"name", "output", "hold_ms", "input", "profile"}, where)
+        _check_keys(raw, {"name", "output", "hold_ms", "input", "profile", "machine"}, where)
         name = raw.get("name")
         if not isinstance(name, str) or not name.strip():
             raise ConfigError(f"{where}: falta 'name', ej. name = \"ruedas\"")
@@ -360,6 +465,7 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
         profiles = _parse_profiles(raw, where)
         _claim(declared, name, "mux", profiles)
         mentions.append((where, name, profiles))
+        machine = _parse_machine(raw, where, machines)
         if "output" not in raw:
             raise ConfigError(f"{where}: falta 'output' (a dónde reenviar), ej. output = \"127.0.0.1:7500\"")
         hold_ms = raw.get("hold_ms", 300)
@@ -398,7 +504,7 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
             listens.add(inp["listen"])
             args += ["--in", f"{inp['name']}={inp['listen']}@{inp['priority']}"]
             mux_inputs.append((str(inp["name"]), str(inp["listen"]), int(inp["priority"])))
-        mux_configs.append(MuxConfig(name, str(raw["output"]), mux_inputs, float(hold_ms), profiles))
+        mux_configs.append(MuxConfig(name, str(raw["output"]), mux_inputs, float(hold_ms), profiles, machine))
         if hub_enabled:   # quién manda, en /mux/<nombre> (RFC 0012): necesita el hub, como todo topic
             from .mux import state_topic
 
@@ -410,6 +516,8 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
             env={"PYTHONPATH": os.pathsep.join(
                 [str(Path(__file__).resolve().parent.parent), *filter(None, [os.environ.get("PYTHONPATH")])])},
             profiles=profiles,
+            machine=machine,
+            raw=copy.deepcopy(raw),
         ))
     nodes = muxes + nodes   # los mux arrancan primero: ya escuchan cuando llegan comandos
 
@@ -522,7 +630,7 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
                        hub=hub_enabled, clock=clock, record=record, path=path,
                        muxes=mux_configs, profile=profile, profiles=known,
                        skipped=[(n.name, n.profiles) for n in skipped_nodes],
-                       local=bool(active.get("local", False)),
+                       local=bool(active.get("local", False)), machines=machines,
                        warnings=_typo_warnings(mentions, raw_tables))
 
 
@@ -721,8 +829,16 @@ class LogBook:
             notify()
 
     def since(self, idx: int) -> tuple[list[dict], int]:
+        """Las líneas desde la `idx` (en orden). Recorre solo las nuevas, desde el final:
+        el agente la llama por cada línea (RFC 0011 §3.4) y no debe recorrer las 5000."""
         with self.lock:
-            return [line for line in self.lines if line["i"] >= idx], self.next_idx
+            out = []
+            for line in reversed(self.lines):
+                if line["i"] < idx:
+                    break
+                out.append(line)
+            out.reverse()
+            return out, self.next_idx
 
 
 # ---------------------------------------------------------------------------
@@ -739,12 +855,25 @@ class Node:
         self.printer = printer
         self.lock = threading.RLock()
         self.proc: subprocess.Popen | None = None
+        # Quién quiere saber de cada cambio de estado (agmen agent, RFC 0011 §3.4). Se llama
+        # con el nodo, ya con su proc y exit_code nuevos, y con self.lock tomado: no debe esperar.
+        self.on_state: Callable[[Node], None] | None = None
         self.state = "detenido"          # corriendo | detenido | falló | reiniciando | terminó
         self.started_at: float | None = None
         self.restarts = 0
         self.exit_code: int | None = None
         self.wanted = False              # ¿el usuario quiere que esté corriendo?
         self._generation = 0
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @state.setter
+    def state(self, value: str) -> None:
+        self._state = value
+        if self.on_state is not None:
+            self.on_state(self)
 
     # --- estado para el panel ---
     def info(self) -> dict:
@@ -776,11 +905,13 @@ class Node:
     def _resolve_program(self, cwd: Path) -> list[str]:
         """Rutas relativas ('../../build/bin/motor') se toman respecto a robot.toml
         en TODOS los sistemas (en Windows, por defecto se resolverían desde donde
-        corres agmen) y se agrega '.exe' en Windows si hace falta."""
+        corres agmen) y se agrega '.exe' en Windows si hace falta. La ruta se usa
+        tal cual, SIN seguir enlaces simbólicos: el 'python' de un entorno
+        virtual es un enlace al del sistema, y si se sigue, se pierde el venv."""
         args = list(self.cfg.cmd)
         prog = args[0]
         if ("/" in prog or "\\" in prog) and not os.path.isabs(prog):
-            path = (cwd / prog).resolve()
+            path = Path(os.path.abspath(cwd)) / prog   # sin resolve(): seguiría los enlaces
             if os.name == "nt" and not path.suffix and path.with_suffix(".exe").exists():
                 path = path.with_suffix(".exe")
             args[0] = str(path)
@@ -803,12 +934,12 @@ class Node:
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace", bufsize=1, **kwargs)
         except OSError as e:
-            self.state, self.exit_code = "falló", None
+            self.exit_code, self.state = None, "falló"   # el estado al final: on_state ve todo lo nuevo
             self._log(f"no se pudo arrancar '{self.cfg.cmd[0]}': {e.strerror or e}. "
                       f"¿Compilaste el proyecto y la ruta es correcta (relativa a robot.toml)?", "error")
             return
         self._generation += 1
-        self.state, self.started_at, self.exit_code = "corriendo", time.time(), None
+        self.started_at, self.exit_code, self.state = time.time(), None, "corriendo"
         self._log(f"▶ iniciado (pid {self.proc.pid})", "agmen")
         threading.Thread(target=self._pump, args=(self.proc, self._generation), daemon=True).start()
 
@@ -914,7 +1045,19 @@ class Printer:
     imprime mucho haría esperar a todos los demás: el sistema dejaría de ser
     paralelo. Por eso los nodos solo encolan y un hilo propio escribe. Si la
     terminal no da abasto, se descartan líneas de la terminal (no del panel) y
-    se avisa cuántas, en vez de frenar a los nodos.
+    se avisa cuántas, en vez de frenar a los nodos: con la cola llena, la línea
+    descartable que llega saca a la descartable MÁS VIEJA de la cola (se ve lo
+    más nuevo). Las no descartables nunca se pierden; el orden no cambia.
+
+    La cola guarda las líneas (str) en orden; las descartables, además, en
+    `_droppable` (las mismas, de la más vieja a la más nueva). Sacar una es O(1):
+    su id va a `_dead` y se salta al escribir; cuando hay más muertas que vivas
+    se compacta la cola (O(1) amortizado por línea).
+
+    Marcar por `id()` es válido: una línea muerta sigue referenciada en `_q` hasta
+    la compactación (su id no se puede reusar mientras tanto), y `_format` siempre
+    crea un objeto nuevo (el f-string con " │ "), así que dos líneas de la cola
+    nunca son el mismo objeto aunque digan lo mismo: matar una no mata a la otra.
     """
 
     def __init__(self, names: list[str], stream=None, max_queue: int = 500) -> None:
@@ -926,7 +1069,10 @@ class Printer:
         if self.use_color and os.name == "nt":
             os.system("")  # activa los colores ANSI en la consola de Windows
         self.max_queue = max_queue
-        self.queue: deque[str] = deque()
+        self._q: deque[str] = deque()          # en orden; puede traer muertas (ver _dead)
+        self._droppable: deque[str] = deque()  # las descartables vivas de _q, de la más vieja a la más nueva
+        self._dead: set[int] = set()           # id() de las de _q que ya se descartaron
+        self._live = 0                         # cuántas de _q siguen vivas
         self.dropped = 0
         self.cond = threading.Condition()
         self._closed = False
@@ -943,14 +1089,34 @@ class Printer:
                 text = f"\x1b[2m{text}\x1b[0m" if kind == "agmen" else f"\x1b[31m{text}\x1b[0m"
         return f"{tag} │ {text}"
 
-    def __call__(self, node: str, text: str, kind: str = "out") -> None:
+    def __call__(self, node: str, text: str, kind: str = "out", droppable: bool | None = None) -> None:
+        """`droppable`: ¿se puede descartar si la terminal no da abasto? Por defecto, solo las
+        líneas "out": los avisos de agmen y los errores de aquí nunca. Lo que llega de otra
+        computadora (agmen agent) siempre se puede: un agente roto no llena la memoria aquí."""
         line = self._format(node, text, kind)
+        drop = kind == "out" if droppable is None else droppable
         with self.cond:
-            if len(self.queue) >= self.max_queue and kind == "out":
-                self.dropped += 1   # los avisos de agmen y los errores nunca se descartan
-                return
-            self.queue.append(line)
+            if self._live >= self.max_queue and drop:
+                self.dropped += 1
+                if not self._droppable:
+                    return               # la cola está llena solo de no descartables: se va la que llega
+                # Lo más nuevo importa más: sale la descartable más vieja y entra esta.
+                self._dead.add(id(self._droppable.popleft()))
+                self._live -= 1
+                if len(self._dead) > self._live:
+                    self._q = deque(l for l in self._q if id(l) not in self._dead)
+                    self._dead.clear()
+            self._q.append(line)
+            self._live += 1
+            if drop:
+                self._droppable.append(line)
             self.cond.notify()
+
+    @property
+    def queue(self) -> list[str]:
+        """Las líneas que esperan su turno, en orden (una copia: para pruebas y diagnóstico)."""
+        with self.cond:
+            return [l for l in self._q if id(l) not in self._dead]
 
     def _emit(self, line: str) -> None:
         try:
@@ -961,12 +1127,16 @@ class Printer:
     def _write_loop(self) -> None:
         while True:
             with self.cond:
-                while not self.queue and not self.dropped and not self._closed:
+                while not self._live and not self.dropped and not self._closed:
                     self.cond.wait()
-                if self._closed and not self.queue and not self.dropped:
+                if self._closed and not self._live and not self.dropped:
                     self.cond.notify_all()
                     return
-                lines, self.queue = list(self.queue), deque()
+                if self._dead:
+                    lines = [l for l in self._q if id(l) not in self._dead]
+                else:
+                    lines = list(self._q)
+                self._q, self._droppable, self._dead, self._live = deque(), deque(), set(), 0
                 dropped, self.dropped = self.dropped, 0
                 self._writing = True
             try:
@@ -986,7 +1156,7 @@ class Printer:
         """Espera a que la cola se vacíe (antes de que otro escriba directo)."""
         end = time.monotonic() + timeout
         with self.cond:
-            while (self.queue or self.dropped or self._writing) and time.monotonic() < end:
+            while (self._live or self.dropped or self._writing) and time.monotonic() < end:
                 self.cond.wait(0.05)
 
     def close(self, timeout: float = 3.0) -> None:
@@ -1002,13 +1172,68 @@ class Printer:
 # ---------------------------------------------------------------------------
 
 class Launcher:
-    def __init__(self, config: RobotConfig, stream=None) -> None:
+    def __init__(self, config: RobotConfig, stream=None, *, places: dict | None = None,
+                 remotes: dict | None = None) -> None:
+        """`places`: dónde corre cada [[machine]] ({nombre: machines.Place}, de
+        machines.place_machines), si quien construye el Launcher ya lo decidió; si
+        no, se decide aquí. Si ningún nodo dice machine, no se consulta nada.
+        `remotes`: {nombre de [[machine]]: agent.AgentLink} de las computadoras que
+        no son esta (RFC 0011 §3.4): sus nodos son agent.RemoteNode, nodos como los
+        demás cuyas órdenes viajan a su agmen agent. Si un nodo es de otra
+        computadora sin AgentLink, o su machine no está declarada, ConfigError antes
+        de crear nada (nunca medio robot en silencio)."""
+        remotes = remotes or {}
+        self.places = self._check_places(config, places, remotes)
         self.config = config
+        self.remotes = remotes
         self.logs = LogBook()
-        self.printer = Printer([n.name for n in config.nodes] + ["agmen"], stream=stream)
-        self.nodes = {n.name: Node(n, config.base_dir, self.logs, self.printer) for n in config.nodes}
+        shown = [f"{n.machine}/{n.name}" if n.machine in remotes else n.name for n in config.nodes]
+        self.printer = Printer(shown + list(remotes) + ["agmen"], stream=stream)
+        self.nodes: dict[str, Node] = {}
+        for n in config.nodes:
+            if n.machine in remotes:
+                from .agent import RemoteNode
+
+                node = RemoteNode(n, config.base_dir, self.logs, self.printer, remotes[n.machine])
+                remotes[n.machine].nodes[n.name] = node
+            else:
+                node = Node(n, config.base_dir, self.logs, self.printer)
+            self.nodes[n.name] = node
+        for link in remotes.values():
+            link.attach(self.logs, self.printer)
         self.stopping = threading.Event()
         self.recording = None    # el control de grabación (RFC 0010); lo pone agmen run
+        self._born = time.monotonic()
+
+    @staticmethod
+    def _check_places(config: RobotConfig, places: dict | None, remotes: dict | None = None) -> dict:
+        used = {n.machine for n in config.nodes if n.machine}
+        if not used:
+            return {}   # ningún nodo dice machine: todo corre aquí, sin consultar nada
+        declared = {m.name for m in config.machines}
+        unknown = [n for n in config.nodes if n.machine and n.machine not in declared]
+        if unknown:   # una configuración armada desde Python (load_config ya lo revisa en robot.toml)
+            n = unknown[0]
+            raise ConfigError(f"el nodo '{n.name}' dice machine = '{n.machine}', pero no hay ninguna [[machine]] "
+                              f"'{n.machine}' en la configuración"
+                              + (f" (hay: {', '.join(sorted(declared))})" if declared else "")
+                              + f". Declárala en la configuración ([[machine]] name = \"{n.machine}\" y su "
+                                f"host)")
+        from .machines import place_machines, remote_error
+
+        if places is None:
+            places = place_machines(config)
+        missing = sorted(used - set(places))
+        if missing:
+            raise ValueError(f"Launcher: places no dice dónde corre {', '.join(missing)} "
+                             f"(usa machines.place_machines(config))")
+        from .machines import Place
+
+        error = remote_error(config, {m: (Place(True, "agent") if m in (remotes or {}) else p)
+                                      for m, p in places.items()})
+        if error:
+            raise ConfigError(error)
+        return places
 
     def say(self, text: str, kind: str = "agmen") -> None:
         self.logs.add("agmen", text, kind)
@@ -1039,7 +1264,14 @@ class Launcher:
             return
         self.stopping.set()
         self.say("deteniendo todos los nodos…")
-        threads = [threading.Thread(target=n.stop) for n in self.nodes.values()]
+        # Primero las otras computadoras (detener_todo, sus estado, adios); luego lo de aquí.
+        threads = [threading.Thread(target=link.finish) for link in self.remotes.values()]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        local = [n for n in self.nodes.values() if n.cfg.machine not in self.remotes]
+        threads = [threading.Thread(target=n.stop) for n in local]
         for t in threads:
             t.start()
         for t in threads:
@@ -1050,15 +1282,51 @@ class Launcher:
         self.printer.close()
 
     def action(self, name: str, what: str) -> str | None:
-        """Acción desde el panel. Devuelve un error en texto, o None si salió bien."""
+        """Acción desde el panel. Devuelve un error en texto, o None si salió bien. Si el nodo es de otra
+        computadora sin conexión, el error es un NoConnection (el panel responde 409)."""
         node = self.nodes.get(name)
         if node is None:
             return f"no existe el nodo '{name}'"
         if what not in ("start", "stop", "restart"):
             return f"acción desconocida '{what}'"
+        refusal = getattr(node, "refusal", None)   # RFC 0011 §15: un nodo de otra computadora sin conexión
+        err = refusal(what) if refusal is not None else None
+        if err:
+            node._log(err, "error", own=True)   # también en la terminal y el log, como siempre
+            return NoConnection(err)
         self.say(f"panel web: {what} '{name}'")
         threading.Thread(target=getattr(node, what), daemon=True).start()
         return None
 
     def nodes_info(self) -> list[dict]:
-        return [n.info() for n in self.nodes.values()]
+        """Los nodos para el panel; cada uno con `machine` (RFC 0011 parte 3c §4): el nombre de su
+        [[machine]], o None si corre aquí sin [[machine]] (o con [profile.X] local = true)."""
+        out = []
+        for n in self.nodes.values():
+            info = n.info()
+            info["machine"] = None if self.config.local else (info.get("machine") or n.cfg.machine or None)
+            out.append(info)
+        return out
+
+    def machines_info(self) -> list[dict]:
+        """Las [[machine]] que usa el perfil activo, en el orden de robot.toml, para el panel (RFC 0011
+        parte 3c §4): name, host, here, state ("aquí", "conectado" o "sin conexión"), since (s en ese
+        estado), grace_left (s que le quedan seguro a la gracia del robot; None si no aplica) y detail
+        (en palabras). Vacía sin [[machine]] o con [profile.X] local = true: el panel se ve como siempre."""
+        if self.config.local:
+            return []
+        from .machines import _address
+
+        out = []
+        for m in self.config.machines:
+            if m.name not in self.places:
+                continue   # ningún nodo de este perfil corre ahí
+            link = self.remotes.get(m.name)
+            entry = {"name": m.name, "host": _address(m), "here": link is None}
+            if link is None:   # es esta computadora (el texto de `detail` lo fijó la §15)
+                entry.update(state="aquí", since=round(time.monotonic() - self._born, 1), grace_left=None,
+                             detail="aquí (esta computadora)")
+            else:
+                entry.update(link.status())
+            out.append(entry)
+        return out

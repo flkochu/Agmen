@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import schema, wire
+from ..pubsub import is_closed_error
 
 RATE_LIMIT_S = 0.015          # máx. ~60 mensajes por segundo por mando: un navegador no satura al robot
 ACTIVE_S = 0.3                # "mandando" si mandó hace menos de esto (el navegador manda cada 50 ms)
@@ -475,7 +476,12 @@ class Command:
             if now - self.last_sent < RATE_LIMIT_S:
                 self.skipped += 1
                 return False
-            self.pub.publish(self.cls(payload))
+            try:
+                self.pub.publish(self.cls(payload))
+            except RuntimeError as e:
+                if not is_closed_error(e):
+                    raise
+                return False           # el panel se está apagando: no se mandó
             self.last_sent, self.last_what = now, what
             self.sent += 1
         return True

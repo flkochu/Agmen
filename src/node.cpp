@@ -190,6 +190,19 @@ struct Timer {
     std::int64_t last_warn = std::numeric_limits<std::int64_t>::min() / 2;
 };
 
+namespace {
+
+// Cuántos de los plazos first + i·period (0 <= i < k) caen dentro del salto del
+// reloj (jump_from, jump_to]. Espejo de _in_jump (python/agmen/node.py).
+std::int64_t in_jump(std::int64_t first, std::int64_t k, std::int64_t period, std::int64_t jump_from,
+                     std::int64_t jump_to) {
+    const std::int64_t lo = jump_from < first ? 0 : (jump_from - first) / period + 1;
+    const std::int64_t hi = jump_to >= first ? std::min(k - 1, (jump_to - first) / period) : -1;
+    return std::max<std::int64_t>(0, hi - lo + 1);
+}
+
+}  // namespace
+
 struct GroupRt {
     std::string name;
     std::vector<std::unique_ptr<RawSub>> subs;
@@ -370,9 +383,16 @@ struct NodeImpl {
             // 1. Temporizadores que ya tocan (cada uno una vez por vuelta).
             for (auto& tp : g.timers) {
                 Timer& t = *tp;
-                const std::int64_t now = clock::mono_ns();
+                const clock::MonoReading r = clock::mono_reading();
+                const std::int64_t now = r.t;
                 if (now < t.next) continue;
-                const std::int64_t late = now - t.next;
+                // Tras un salto del reloj (el botón *paso* del panel), el tiempo que
+                // saltó no es atraso del nodo: al atraso se le resta lo que el salto
+                // cubre de (plazo, ahora], y los ciclos cuyo plazo cayó DENTRO del
+                // salto corren igual que siempre pero no cuentan como saltados.
+                const std::int64_t covered =
+                    std::max<std::int64_t>(0, std::min(now, r.jump_to) - std::max(t.next, r.jump_from));
+                const std::int64_t late = now - t.next - covered;
                 const std::int64_t t0 = steady_now_ns();
                 t.cb();
                 const std::int64_t run = steady_now_ns() - t0;
@@ -389,13 +409,15 @@ struct NodeImpl {
                 // tocaba, no de ahora. Si ya pasó más de un periodo completo,
                 // esos ciclos se saltan (no se recuperan de golpe).
                 t.next += t.period;
-                const std::int64_t after = clock::mono_ns();
+                const clock::MonoReading a = clock::mono_reading();
+                const std::int64_t after = a.t;
                 if (after > t.next) {
                     const std::int64_t k = (after - t.next) / t.period;
                     if (k > 0) {
+                        const std::int64_t own = k - in_jump(t.next, k, t.period, a.jump_from, a.jump_to);
                         t.next += k * t.period;
-                        t.skipped += static_cast<std::uint64_t>(k);
-                        t.win_skipped += static_cast<std::uint64_t>(k);
+                        t.skipped += static_cast<std::uint64_t>(own);
+                        t.win_skipped += static_cast<std::uint64_t>(own);
                     }
                 }
                 if (should_stop()) break;

@@ -37,7 +37,7 @@ EXE = ".exe" if sys.platform == "win32" else ""
 BIN = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "build" / "bin"
 HTTP = "127.0.0.1:8181"
 # PYTHONIOENCODING: en Windows, la salida de un proceso hijo a un pipe va en cp1252.
-ENV = {**os.environ, "PYTHONPATH": str(ROOT / "python"), "AGMEN_HUB": "127.0.0.1:7391", "PYTHONIOENCODING": "utf-8"}
+ENV = {**os.environ, "PYTHONPATH": str(ROOT / "python"), "AGMEN_HUB": "127.0.0.1:7396", "PYTHONIOENCODING": "utf-8"}
 
 CUSTOM = """
 import math, time

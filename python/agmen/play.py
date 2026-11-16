@@ -69,8 +69,8 @@ class _ReplayPublisher(_PurePublisher):
                 env, payload = wire.parse(data)
                 return self._tcp.send_message(env, payload)
         ok = False
-        for d in dests:
-            ok = self._send(data, d) or ok
+        for d in dests:   # a esta computadora y, en modo red, a los Subscriber de otra (RFC 0011 parte 4b §5)
+            ok = self._send_any(data, d) or ok
         return ok
 
 

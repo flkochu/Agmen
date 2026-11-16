@@ -1,0 +1,25 @@
+# dos_computadoras.toml — el banco de bench/dos_computadoras.py en DOS computadoras:
+# el `eco` corre en el robot (la Raspberry Pi) y el `medidor` en la laptop.
+#
+#   en la Raspberry Pi:  agmen agent bench/dos_computadoras.toml
+#   en la laptop:        agmen run bench/dos_computadoras.toml
+#
+# Cambia `host` por la IP de TU robot. Tiene que ser el mismo archivo en las dos
+# computadoras (cada una con su copia del repositorio). Las rutas de `cmd` son
+# relativas a este archivo. El medidor imprime la tabla al terminar; luego, Ctrl+C.
+
+[robot]
+name = "banco: latencia y MB/s entre dos computadoras"
+
+[[machine]]
+name = "robot"                  # la Raspberry Pi
+host = "192.168.1.20"           # puerto por defecto: 7391
+
+[[node]]
+name = "eco"                    # contesta y cuenta lo que le llega
+cmd = "python dos_computadoras.py --eco"
+machine = "robot"
+
+[[node]]
+name = "medidor"                # sin machine: corre en la laptop
+cmd = "python dos_computadoras.py --medir"

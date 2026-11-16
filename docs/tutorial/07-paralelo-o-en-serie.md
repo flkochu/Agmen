@@ -81,6 +81,8 @@ Desde 0.3.0, los nodos **nunca esperan** a la terminal:
 - Otro hilo escribe en la terminal. Si la terminal no da abasto, se salta
   líneas **solo en la terminal** (el panel las guarda) y te avisa:
   `… 1520 líneas no cupieron en la terminal (están en el panel web)`.
+  Desde 0.14.0, se saltan las **más viejas**: la terminal siempre muestra lo más
+  nuevo. Los avisos de Agmen y los errores nunca se saltan.
 - Si un nodo escribe más de 200 líneas por segundo, el excedente se resume:
   `… 9800 líneas omitidas (escribe más de 200 líneas/s)`.
 

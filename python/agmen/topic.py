@@ -17,6 +17,7 @@ import time
 
 from . import hub as hubmod
 from . import hubproto as hp
+from . import relojes
 from . import wire
 from .pubsub import RawSubscriber, hub_address
 
@@ -29,6 +30,26 @@ def _state():
     return head, topics, eps
 
 
+HERE = "aquí"   # cómo se dice "esta computadora" en las columnas de dónde corre cada cosa (4c §2)
+
+
+def _remote(eps) -> bool:
+    """¿Hay alguna entrada de otra computadora (`machine=` en su línea ep, 4a/4b)? Sin ninguna, todo se ve como antes."""
+    return any(e.get("machine") for e in eps)
+
+
+def _where(e: dict) -> str:
+    """Dónde corre un endpoint: el nombre de su computadora, o HERE si es de esta (su línea ep no dice `machine`)."""
+    return e.get("machine") or HERE
+
+
+def _places(names) -> str:
+    """Las computadoras, sin repetir: primero HERE y luego las demás por orden alfabético, separadas por coma."""
+    names = set(names)
+    rest = sorted(names - {HERE}, key=lambda n: (n.lower(), n))
+    return ", ".join(([HERE] if HERE in names else []) + rest)
+
+
 def _table(rows: list[list[str]], header: list[str]) -> list[str]:
     widths = [max(len(str(r[i])) for r in [header] + rows) for i in range(len(header))]
     fmt = lambda r: "  ".join(str(c).ljust(w) for c, w in zip(r, widths)).rstrip()  # noqa: E731
@@ -36,10 +57,11 @@ def _table(rows: list[list[str]], header: list[str]) -> list[str]:
 
 
 def cmd_list(args) -> int:
-    head, topics, _ = _state()
+    head, topics, eps = _state()
     if not topics:
         print(f"# no hay topics todavía (hub {head.get('hub', hub_address())})")
         return 0
+    remote = _remote(eps)   # 4c §2.2: la columna "publica" solo si hay alguna entrada de otra computadora
     rows = []
     for t in topics:
         flags = []
@@ -49,8 +71,12 @@ def cmd_list(args) -> int:
             flags.append("⚠ obligatorio y nadie lo publica")
         if int(t["pubs"]) > 1:
             flags.append("⚠ varios emisores")
-        rows.append([t["name"], t["type"] or "?", t["pubs"], t["subs"], "; ".join(flags)])
-    for line in _table(rows, ["topic", "tipo", "emisores", "receptores", ""]):
+        row = [t["name"], t["type"] or "?", t["pubs"], t["subs"]]
+        if remote:
+            row.append(_places(_where(e) for e in eps if e["kind"] == "pub" and e["topic"] == t["name"]))
+        rows.append(row + ["; ".join(flags)])
+    header = ["topic", "tipo", "emisores", "receptores"] + (["publica"] if remote else []) + [""]
+    for line in _table(rows, header):
         print(line)
     return 0
 
@@ -67,15 +93,18 @@ def cmd_info(args) -> int:
         return 1
     print(f"topic:   {t['name']}")
     print(f"tipo:    {t['type'] or '?'}  (schema_id {t['schema'] or '?'})")
-    print(f"esquema: {t['text'] or '(todavía no se anuncia)'}")
+    cut = " … (recortado: es muy largo para la lista del hub)" if t.get("cortado") == "1" else ""
+    print(f"esquema: {t['text'] or '(todavía no se anuncia)'}{cut}")
     if t["expected"] != "no":
         print(f"robot.toml: declarado{' y obligatorio' if t['expected'] == 'required' else ''}")
+    remote = _remote(eps)   # 4c §2.3: dónde corre cada uno, solo si hay alguna entrada de otra computadora
     for kind, title in (("pub", "emisores"), ("sub", "receptores")):
         mine = [e for e in eps if e["kind"] == kind and (e["topic"] == t["name"] or (kind == "sub" and e["topic"] == "*"))]
         print(f"{title} ({len(mine)}):")
         for e in mine:
             extra = " (escucha todos los topics)" if e["topic"] == "*" else ""
-            print(f"  {e['node']}  pid {e['pid']}  {e['addr']}  latió hace {e['age']} s{extra}")
+            where = ("  · " + (HERE if not e.get("machine") else f"en {e['machine']}")) if remote else ""
+            print(f"  {e['node']}  pid {e['pid']}  {e['addr']}  latió hace {e['age']} s{extra}{where}")
     return 0
 
 
@@ -84,19 +113,51 @@ def cmd_node_list(args) -> int:
     if not eps:
         print("# no hay nodos registrados")
         return 0
-    nodes: dict[str, dict] = {}
+    # 4c §2.3: con alguna entrada de otra computadora, un nodo es (nombre, computadora) y lleva la columna
+    # "computadora"; sin ninguna, todo como antes (la clave es solo el nombre).
+    remote = _remote(eps)
+    nodes: dict[tuple[str, str], dict] = {}
     for e in eps:
-        n = nodes.setdefault(e["node"], {"pid": e["pid"], "pub": [], "sub": [], "age": 99.0})
+        where = _where(e) if remote else ""
+        n = nodes.setdefault((e["node"], where), {"pid": e["pid"], "pub": [], "sub": [], "age": 99.0})
         n[e["kind"]].append(e["topic"] if e["topic"] != "*" else "(todos)")
         n["age"] = min(n["age"], float(e["age"]))
-    rows = [[name, n["pid"], ", ".join(sorted(n["pub"])) or "—", ", ".join(sorted(n["sub"])) or "—",
-             f"hace {n['age']:.1f} s"] for name, n in sorted(nodes.items())]
-    for line in _table(rows, ["nodo", "pid", "publica", "escucha", "último latido"]):
+    order = sorted(nodes.items(), key=lambda kv: (kv[0][0], kv[0][1] != HERE, kv[0][1].lower(), kv[0][1]))
+    rows = [[name, *([where] if remote else []), n["pid"], ", ".join(sorted(n["pub"])) or "—",
+             ", ".join(sorted(n["sub"])) or "—", f"hace {n['age']:.1f} s"] for (name, where), n in order]
+    header = ["nodo", *(["computadora"] if remote else []), "pid", "publica", "escucha", "último latido"]
+    for line in _table(rows, header):
         print(line)
-    stats = [f for op, f in hubmod.query(hub_address()) if op == "stat"]
+    msgs = hubmod.query(hub_address())
+    head = next((f for op, f in msgs if op == "state"), {})
+    for line in clock_lines(relojes.maquinas_del_hub(msgs), session_mode(head)):
+        print(line)
+    stats = [f for op, f in msgs if op == "stat"]
     for line in stats_lines(stats):
         print(line)
     return 0
+
+
+def session_mode(head: dict | None = None) -> str:
+    """El modo del reloj de la sesión, si esta herramienta lo puede saber (bloque 5, §6.2). Manda el hub: el
+    `modo` de su línea `state` (head), que le dice el puente en modo red; uno desconocido es "" (no se sabe; nunca
+    se toma por real ni por sim). 8.6: si el hub no lo dice (hub anterior, sin agmen run, caducado): "" SIEMPRE, el
+    texto condicional, aunque exista AGMEN_CLOCK (el consejo: "nunca supone real ni sim")."""
+    modos = ("real", "sim", "replay")
+    if head and "modo" in head:
+        return head["modo"] if head["modo"] in modos else ""
+    return ""
+
+
+def clock_lines(maquinas: dict, mode: str) -> list[str]:
+    """Bloque 5 (RFC 0011 §3.6, §4.1): la diferencia de reloj de cada otra computadora, debajo de la tabla. Sin
+    modo red el hub no da líneas `maq`: ninguna línea (la salida de siempre)."""
+    if not maquinas:
+        return []
+    out = ["", "# relojes de las otras computadoras (respecto al de esta)"]
+    for name in sorted(maquinas, key=lambda n: (n.lower(), n)):
+        out.append(relojes.linea_node_list(name, maquinas[name], mode))
+    return out
 
 
 def stats_lines(stats: list[dict[str, str]]) -> list[str]:

@@ -11,6 +11,8 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -37,10 +39,23 @@ def get_state():
 
 def post(path, body=None, headers=H):
     req = urllib.request.Request(URL + path, data=json.dumps(body or {}).encode(), headers=headers, method="POST")
+    t0 = time.monotonic()
     try:
         return urllib.request.urlopen(req, timeout=5).status
     except urllib.error.HTTPError as e:
         return e.code
+    except (urllib.error.URLError, OSError) as e:
+        # Sin respuesta: se anota como FALLA y la prueba sigue, para que al final salga la
+        # salida de agmen (antes el traceback la perdía). ¿El panel entero no contesta, o solo esta?
+        took = time.monotonic() - t0
+        try:
+            t1 = time.monotonic()
+            urllib.request.urlopen(URL + "/api/state", timeout=5).read()
+            alive = f"el panel sí contesta /api/state ({(time.monotonic() - t1) * 1000:.0f} ms después)"
+        except OSError as e2:
+            alive = f"el panel tampoco contesta /api/state: {e2}"
+        check(f"POST {path} contesta", False, f"{type(e).__name__}: {e} tras {took:.1f} s; {alive}")
+        return None
 
 
 def node(state, name):
@@ -59,13 +74,33 @@ def wait_for(pred, timeout=15.0):
     return False
 
 
+def donde_estaba(pilas: Path) -> str:
+    """Las últimas pilas de los hilos de agmen run (ver main), para el reporte de una falla."""
+    try:
+        cola = pilas.read_text(encoding="utf-8", errors="replace").splitlines()[-150:]
+    except OSError as e:
+        return f"\n--- sin pilas de agmen run ({e}) ---"
+    return "\n--- dónde estaba cada hilo de agmen run (cada 20 s; lo último) ---\n" + "\n".join(cola)
+
+
 def main():
     env = {**os.environ, "PYTHONPATH": str(ROOT / "python"), "PYTHONIOENCODING": "utf-8", "NO_COLOR": "1"}
     kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
-    agmen = subprocess.Popen([sys.executable, "-m", "agmen", "run", "examples/tutorial/robot.toml",
+    # Si el panel se queda sin contestar (pasó dos veces en el CI de Windows, sin causa conocida), hay que ver dónde
+    # está cada hilo de agmen run: cada 20 s deja sus pilas en un archivo, que solo se muestra si algo falla.
+    pilas = Path(tempfile.gettempdir()) / f"agmen_run_smoke_pilas_{os.getpid()}.txt"
+    con_pilas = ("import faulthandler, runpy; faulthandler.dump_traceback_later(20, repeat=True, "
+                 f"file=open({str(pilas)!r}, 'w')); runpy.run_module('agmen', run_name='__main__', alter_sys=True)")
+    agmen = subprocess.Popen([sys.executable, "-c", con_pilas, "run", "examples/tutorial/robot.toml",
                               "--no-browser", "--http", "127.0.0.1:8180"],
                              cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              text=True, encoding="utf-8", errors="replace", **kwargs)
+    # La salida de agmen se lee MIENTRAS corre. Si nadie la lee, la tubería se llena (en Windows es chica), agmen
+    # run se queda esperando al escribir una línea y el panel entero deja de contestar: así falló este script en el
+    # CI de Windows ("POST /api/teleop: timed out; el panel tampoco contesta /api/state", y luego "refused").
+    lines: list[str] = []
+    reader = threading.Thread(target=lambda: lines.extend(agmen.stdout), daemon=True)
+    reader.start()
     pids = []
     try:
         check("un comando levanta hub, imu, motor y el mux; cerebro espera (autostart = false)",
@@ -149,10 +184,14 @@ def main():
         else:
             agmen.send_signal(signal.SIGINT)
         try:
-            out, _ = agmen.communicate(timeout=20)
+            agmen.wait(timeout=20)
         except subprocess.TimeoutExpired:
             agmen.kill()
-            out, _ = agmen.communicate()
+            agmen.wait()
+        reader.join(10)
+        out = "".join(lines)
+        if sys.exc_info()[0] is not None:   # algo tronó a media prueba: que no se pierda la salida de agmen
+            print("\n--- salida de agmen ---\n" + out + donde_estaba(pilas))
 
     check("el motor recibió el manejo manual (izq=+0.80 der=+0.30)", "izq=+0.80  der=+0.30" in out)
     motor = [line.split("izq=")[1].strip() for line in out.splitlines() if "[motor] rueda izq=" in line]
@@ -181,7 +220,8 @@ def main():
                 pass
         check("no quedan procesos huérfanos", not alive, f"vivos: {alive}")
     if not all(results):
-        print("\n--- salida de agmen ---\n" + out)
+        print("\n--- salida de agmen ---\n" + out + donde_estaba(pilas))
+    pilas.unlink(missing_ok=True)
     sys.exit(0 if all(results) else 1)
 
 

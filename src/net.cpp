@@ -273,10 +273,18 @@ std::optional<Received> UdpSocket::recv_from(std::span<std::uint8_t> buffer,
         throw NetError(code, "falló la espera de datos");
     }
 
+    // Sin bloquear: entre el poll y la lectura, otro lector del mismo socket (el
+    // hijo de un fork lo comparte) puede llevarse el datagrama; esperar ahí no
+    // tendría límite. Windows no tiene fork ni MSG_DONTWAIT.
+#ifdef _WIN32
+    constexpr int kFlags = 0;
+#else
+    constexpr int kFlags = MSG_DONTWAIT;
+#endif
     sockaddr_in from{};
     socklen_t from_len = sizeof from;
     const auto n = ::recvfrom(s, reinterpret_cast<char*>(buffer.data()),
-                              static_cast<LenType>(buffer.size()), 0,
+                              static_cast<LenType>(buffer.size()), kFlags,
                               reinterpret_cast<sockaddr*>(&from), &from_len);
     if (n < 0) {
         const int code = last_error();
@@ -444,6 +452,41 @@ TcpStream TcpStream::connect(const Address& to, std::chrono::milliseconds timeou
         }
     }
     return TcpStream(static_cast<std::intptr_t>(s), to.to_string());
+}
+
+TcpStream TcpStream::connect_async(const Address& to, std::string_view from_ip, bool& pending) {
+    ensure_winsock();
+    sockaddr_in addr{};
+    std::memcpy(&addr, to.raw_.data(), sizeof addr);
+    const NativeSocket s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == kInvalid) throw NetError(last_error(), "no se pudo crear el socket TCP");
+    TcpStream out(static_cast<std::intptr_t>(s), to.to_string());   // se cierra solo si algo falla
+    tune_tcp(s, true);
+    if (!from_ip.empty()) {
+        const sockaddr_in src = resolve(std::string(from_ip) + ":0");   // AGMEN_NET_IP: sale desde esa IP
+        if (::bind(s, reinterpret_cast<const sockaddr*>(&src), sizeof src) != 0) {
+            throw NetError(last_error(), "no se pudo salir desde " + std::string(from_ip));
+        }
+    }
+    set_nonblocking(s);
+    pending = false;
+    if (::connect(s, reinterpret_cast<const sockaddr*>(&addr), sizeof addr) != 0) {
+        const int code = last_error();
+        if (!is_in_progress(code)) throw NetError(code, "no se pudo conectar a " + to.to_string());
+        pending = true;
+    }
+    return out;
+}
+
+int TcpStream::finish_connect() {
+    if (handle_ == -1) return -1;
+    int err = 0;
+    socklen_t len = sizeof err;
+    if (::getsockopt(native(handle_), SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len) != 0) {
+        err = last_error();
+    }
+    if (err != 0) close();
+    return err;
 }
 
 TcpStream::TcpStream(TcpStream&& other) noexcept : handle_(other.handle_), peer_(std::move(other.peer_)) {
