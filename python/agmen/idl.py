@@ -641,12 +641,26 @@ def _written(value) -> str:
     return getattr(value, "text", None) or repr(value)
 
 
+def _nonzero_digits(value) -> bool:
+    """¿El número, como se escribió, tiene alguna cifra distinta de 0 antes del exponente? (0.0, -0.0, 0e5: no)."""
+    text = getattr(value, "text", None)
+    if text is None:
+        return value != 0
+    mantissa = text.lower().split("e")[0]
+    return any(c in "123456789" for c in mantissa)
+
+
 def _check_float(f: AgmenFile, prim: str, value, pos: Pos) -> float:
     """Un número para un f32 o f64: que no se vuelva infinito (ej. 1e999) ni se salga de un f32."""
     try:
         x = float(value)
     except OverflowError:                      # un entero de cientos de cifras
         x = math.inf
+    if x == 0 and _nonzero_digits(value):
+        # 1e-400 (y en f64, 2e-324): Python ya lo lee como 0. Lo escrito no era 0: se dice, no se cambia en silencio.
+        least = "1.401298464324817e-45" if prim == "f32" else "4.9406564584124654e-324"
+        raise f.error(f"{_written(value)} se vuelve 0 en {prim}: el menor {prim} que no es 0 es ±{least}. "
+                      f"Usa 0, un número más grande{' o f64' if prim == 'f32' else ''}", pos)
     if not math.isfinite(x):
         raise f.error(f"el número no cabe en {prim}: se vuelve infinito. Usa uno más chico (f64 llega a "
                       f"±1.79e308; f32, a ±3.4e38)", pos)

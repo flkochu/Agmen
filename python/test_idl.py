@@ -369,6 +369,12 @@ class TestErrores(Tmp):
         # Un número que no es 0 pero se vuelve 0 en f32 (el C++ generado no compilaría con -Werror).
         ("message A {\n    f32 x = 1e-50\n}\n", "x.agmen:2:13:",
          "1e-50 se vuelve 0 en f32: el menor f32 que no es 0 es ±1.401298464324817e-45"),
+        # Tan chico que Python ya lo lee como 0: también se dice (en f32 y en f64), no se cambia en silencio.
+        ("message A {\n    f32 x = 1e-400\n}\n", "x.agmen:2:13:", "1e-400 se vuelve 0 en f32"),
+        ("message A {\n    f64 x = 1e-400\n}\n", "x.agmen:2:13:",
+         "1e-400 se vuelve 0 en f64: el menor f64 que no es 0 es ±4.9406564584124654e-324"),
+        ("message A {\n    f64 x = 2e-324\n}\n", "x.agmen:2:13:", "2e-324 se vuelve 0 en f64"),
+        ("message A {\n    f64[2] x = [0.0, -3e-400]\n}\n", "x.agmen:2:22:", "-3e-400 se vuelve 0 en f64"),
         # En un arreglo, el error señala el elemento, no el '['.
         ("message A {\n    f32[2] a = [1, 1e39]\n}\n", "x.agmen:2:20:", "1e39 no cabe en f32"),
         ("message A {\n    f32[2] a = [1e-50, 1]\n}\n", "x.agmen:2:17:", "se vuelve 0 en f32"),
@@ -413,6 +419,16 @@ class TestErrores(Tmp):
         back = msgs.L.decode_payload(m.encode_payload())
         self.assertEqual(struct.unpack("<4I", m.encode_payload()), (1, 0x80000001, 0x7F7FFFFF, 0))
         self.assertTrue(back.a > 0 and back.b < 0 and math.isfinite(back.c) and back.d == 0)
+
+    def test_los_ceros_siguen_valiendo(self):
+        """0, 0.0, -0.0, 0e5, 0x0 y 0.000e-999 son 0 escrito como 0: valen; 5e-324 (el menor f64) también."""
+        msgs = agmen.load(self.write("ceros.agmen", "message Z {\n    f32 a = 0\n    f32 b = 0.0\n    f64 c = -0.0\n"
+                                                    "    f64 d = 0e5\n    f64 e = 0x0\n    f64 f = 0.000e-999\n"
+                                                    "    f64 g = 5e-324\n}\n"))
+        z = msgs.Z()
+        self.assertEqual((z.a, z.b, z.c, z.d, z.e, z.f), (0.0,) * 6)
+        self.assertEqual(struct.unpack_from("<Q", z.encode_payload(), 8)[0], 1 << 63)    # -0.0 se queda con su signo
+        self.assertEqual(z.g, 5e-324)
 
     def test_choque_con_un_tipo_de_agmen_msgs(self):
         """Un .agmen de 0.14 que importaba agmen/msgs.agmen y tenía su propio Pose: el error da las dos salidas."""
