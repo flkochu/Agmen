@@ -2761,5 +2761,159 @@ class TestPanelCongeladoDePuntaAPunta(CortesBase):
         self.assertIsNotNone(codigo, self.diag("agmen run no salió con Ctrl+C"))
 
 
+
+# ===========================================================================
+# 5. Con el puente de la 4b (RFC 0011 §3.5): un topic cruza, y los cortes de la 3c lo cortan y lo devuelven
+# ===========================================================================
+
+class IntermediarioEntreIPs(Intermediario):
+    """El intermediario en la IP del "robot" (escucha) y conectando desde la de la "laptop": así cada lado ve al
+    otro en la IP donde escuchan sus nodos (con AGMEN_NET_IP), como en dos computadoras."""
+
+    def __init__(self, destino: int, escucha: str, origen: str) -> None:
+        self.ip_destino, self.origen = escucha, origen
+        super().__init__(destino)
+        viejo, nuevo = self._escucha, socket.socket()
+        nuevo.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        nuevo.bind((escucha, self.puerto))
+        nuevo.listen(16)
+        self._escucha = nuevo
+        self._cerrar(viejo)
+        threading.Thread(target=self._aceptar, daemon=True, name="intermediario-acepta-ip").start()
+
+    def _aceptar(self) -> None:
+        while not self._cerrado:
+            try:
+                c, _ = self._escucha.accept()
+            except OSError:
+                if self._cerrado or self._escucha.fileno() == -1:
+                    return
+                continue
+            if self.caido:
+                self._cerrar(c)
+                continue
+            try:
+                u = socket.create_connection((self.ip_destino, self.destino), timeout=3,
+                                             source_address=(self.origen, 0))
+                u.settimeout(None)
+            except OSError:
+                self._cerrar(c)
+                continue
+            with self._lock:
+                self.conexiones += 1
+                self._pares.append((c, u))
+            threading.Thread(target=self._bombear, args=(c, u, "c2a"), daemon=True).start()
+            threading.Thread(target=self._bombear, args=(u, c, "a2c"), daemon=True).start()
+
+
+def _hay_ips() -> bool:
+    import test_tablas as tt
+    return tt.hay_ips(tt.LAPTOP_IP, tt.ROBOT_IP)
+
+
+@unittest.skipUnless(_hay_ips(), "hace falta 127.0.0.2 y 127.0.0.3 (en Linux siempre están)")
+class TestPuenteConCortes(ta.E2EBase):
+    """La 4b con la 3c, de punta a punta (dos procesos y el intermediario): un topic del robot llega a la laptop; al
+    congelar la red las entradas del otro caducan y los dos hubs vuelven a modo local; al volver, reanuda y el topic
+    vuelve a llegar sin reiniciar nodos (mismos PID); y tres cortes más no acumulan hilos ni descriptores (Linux)."""
+
+    hub_real = True
+
+    def test_corte_y_vuelta_con_un_topic_cruzando(self):
+        import test_tablas as tt
+        from agmen import pubsub
+
+        (self.dir / "nodo_red.py").write_text(tt.NODO_RED_PY, encoding="utf-8")
+        nodo, marks = json.dumps(str(self.dir / "nodo_red.py")), json.dumps(str(self.marks))
+        px = IntermediarioEntreIPs(self.port, tt.ROBOT_IP, tt.LAPTOP_IP)
+        self.addCleanup(px.close)
+        texto = (f'[robot]\nname = "puente"\n\n[[machine]]\nname = "robot"\nhost = "{tt.ROBOT_IP}:{{port}}"\n\n'
+                 f'[[node]]\nname = "imu"\ncmd = ["python", {nodo}, "pub", {marks}]\nmachine = "robot"\n\n'
+                 f'[web]\nenabled = false\n')
+        toml_a, toml_r = self.dir / "agente.toml", self.dir / "run.toml"
+        toml_a.write_text(texto.format(port=self.port), encoding="utf-8")
+        toml_r.write_text(texto.format(port=px.puerto), encoding="utf-8")
+        hub_robot = f"127.0.0.1:{ta.free_udp_port()}"
+        pa, la, clave = self.agente(toml_a, hub_env=hub_robot, AGMEN_NET_IP=tt.ROBOT_IP)
+        env = self.env("run", AGMEN_REMOTE_HOSTS=tt.ROBOT_IP, AGMEN_NET_IP=tt.LAPTOP_IP, AGMEN_AGENT_KEY=clave)
+        pr, lr = self.lanzar(["run", str(toml_r), "--no-browser", "--no-web"], env)
+        diag = lambda que="": (f"{que}\n--- agmen run:\n{''.join(lr)}\n--- agmen agent:\n{''.join(la)}")   # noqa: E731
+        self.assertTrue(self.espera(lambda: any("todo arrancado" in l for l in lr) or pr.poll() is not None, 60), diag())
+        hub = env["AGMEN_HUB"]
+        (sub,) = tt.abrir_en(hub, tt.LAPTOP_IP, (pubsub._PureSubscriber, tt.Imu, "/imu"))
+        # Un hilo recibe todo el tiempo (como un nodo de verdad: así el Subscriber late a su hub aunque la prueba espere).
+        recibidos: list[float] = []
+        parar = threading.Event()
+
+        def recibir():
+            while not parar.is_set():
+                if sub.receive(0.05) is not None:
+                    recibidos.append(time.monotonic())
+
+        hilo = threading.Thread(target=recibir, daemon=True)
+        hilo.start()
+        self.addCleanup(sub.close)
+        self.addCleanup(hilo.join, 2)
+        self.addCleanup(parar.set)
+
+        def llega(desde: float | None = None) -> bool:
+            desde = time.monotonic() if desde is None else desde
+            return self.espera(lambda: any(t > desde for t in recibidos), 30)
+
+        self.assertTrue(llega(), diag("el topic no cruzó"))
+        pids0 = self.pids_de_marcas()
+        self.assertEqual(len(pids0.get("pub", [])), 1, pids0)
+        self.assertTrue(tt.hub_en_red(hub) and tt.hub_en_red(hub_robot))
+        self.assertTrue(tt.remotas_de(hub))
+        # Se congela la red del robot a la laptop (sin cerrar nada): a los 6 s sin nada la laptop la da por perdida y
+        # cierra; el agente lo ve y entra en gracia (desde lo último que recibió: los ping siguieron llegando, así la
+        # gracia de 10 s alcanza para ver todo). Sin conexión confirmada nadie late las entradas del otro (caducan en
+        # 3 s) ni repite `red` (los dos hubs vuelven a modo local en 6 s).
+        px.congelar(c2a=False, a2c=True)
+        self.assertTrue(self.espera(lambda: any("se perdió la conexión" in l for l in lr), 20), diag("no notó el corte"))
+        # (Los topes son holgados a propósito: caducan en 3 s y vuelven a modo local en 6 s; lo que se prueba es que
+        # pase, no cuánto tarda, y un CI de Windows cargado puede tardar más. Cada espera vuelve en cuanto se cumple.)
+        holgura = 15
+        self.assertTrue(self.espera(lambda: tt.remotas_de(hub) == [] and tt.remotas_de(hub_robot) == [],
+                                    3 + holgura), diag("las entradas del otro no caducaron"))
+        self.assertTrue(self.espera(lambda: tt.hub_en_red(hub) is False and tt.hub_en_red(hub_robot) is False,
+                                    6 + holgura), diag("los hubs no volvieron a modo local"))
+        quieto = time.monotonic() + 0.3                       # (lo que ya venía en camino)
+        self.assertTrue(self.espera(lambda: time.monotonic() > quieto + 0.5, 2))
+        self.assertFalse(any(t > quieto for t in recibidos), "sin conexión no cruza nada")
+        px.levantar()
+        self.assertTrue(self.espera(lambda: any("no se reinició nada" in l for l in lr), 30), diag("no reanudó"))
+        self.assertTrue(llega(), diag("el topic no volvió a llegar tras reanudar"))
+        self.assertTrue(tt.hub_en_red(hub))
+        self.assertEqual(self.pids_de_marcas(), pids0, diag("el nodo del robot se reinició"))
+
+        def recursos(p):
+            return len(os.listdir(f"/proc/{p.pid}/task")), len(os.listdir(f"/proc/{p.pid}/fd"))
+
+        base = {"agente": recursos(pa), "run": recursos(pr)} if LINUX else {}   # (con /proc: solo Linux)
+        for i in (1, 2, 3):
+            antes = sum("no se reinició nada" in l for l in lr)
+            px.cortar()
+            self.assertTrue(self.espera(lambda: sum("): se perdió la conexión (" in l for l in lr) >= i + 1, 20),
+                            diag(f"corte {i}: no lo notó"))
+            px.levantar()
+            self.assertTrue(self.espera(lambda: sum("no se reinició nada" in l for l in lr) > antes, 30),
+                            diag(f"corte {i}: no reconectó"))
+        self.assertTrue(llega(), diag("tras 3 cortes el topic no llega"))
+        self.assertEqual(self.pids_de_marcas(), pids0, diag("algún corte reinició el nodo"))
+        if not LINUX:
+            self.assertEqual(self.detener(pr), 0, diag())
+            return
+
+        def estable():
+            ahora = {"agente": recursos(pa), "run": recursos(pr)}
+            return all(ahora[q][0] <= base[q][0] and ahora[q][1] <= base[q][1] for q in base)
+
+        ok = self.espera(estable, 15)
+        self.assertTrue(ok, diag(f"tras 3 cortes (hilos, descriptores) = { {'agente': recursos(pa), 'run': recursos(pr)} }; "
+                                 f"antes: {base}"))
+        self.assertEqual(self.detener(pr), 0, diag())
+
+
 if __name__ == "__main__":
     unittest.main()

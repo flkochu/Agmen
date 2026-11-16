@@ -591,7 +591,7 @@ class TestNodoCtrlC(unittest.TestCase):
         import signal
 
         env = {**os.environ, "PYTHONPATH": str(RAIZ / "python"), "PYTHONIOENCODING": "utf-8", "NO_COLOR": "1",
-               "AGMEN_HUB": "127.0.0.1:7394"}
+               "AGMEN_HUB": "127.0.0.1:7394", "PYTHONFAULTHANDLER": "1"}   # con SIGABRT dice dónde está cada hilo
         env.pop("MUJOCO_GL", None)
         p = subprocess.Popen([sys.executable, str(MUNDO_PY)], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              text=True, encoding="utf-8", errors="replace", cwd=tempfile.gettempdir())
@@ -599,10 +599,18 @@ class TestNodoCtrlC(unittest.TestCase):
         primera = p.stdout.readline()                # ya cargó MuJoCo y se presentó
         self.assertIn("[mundo] Agmen", primera)
         p.send_signal(signal.SIGINT)
-        salida = primera + p.communicate(timeout=30)[0]
+        try:
+            salida = primera + p.communicate(timeout=30)[0]
+        except subprocess.TimeoutExpired:            # pasó una vez en el CI de ARM64 y no supimos dónde se quedó
+            p.send_signal(signal.SIGABRT)
+            self.fail("el nodo no terminó en 30 s tras Ctrl+C. Lo que dijo y dónde estaba cada hilo:\n"
+                      + primera + p.communicate(timeout=30)[0])
         self.assertNotIn("Traceback", salida)
-        self.assertIn(p.returncode, (0, 130), salida)
-        if p.returncode == 130:
+        # -SIGINT también es salir bien: si el Ctrl+C cae dentro de un exec() de texto (los de dataclasses, al cargar
+        # los mensajes), CPython lo anota como "sin atrapar" aunque el nodo lo atrape y diga su línea, y al salir se
+        # mata con SIGINT en vez de devolver 130.
+        self.assertIn(p.returncode, (0, 130, -signal.SIGINT), salida)
+        if p.returncode != 0:
             self.assertIn("[mundo] interrumpido (Ctrl+C)", salida)
 
 

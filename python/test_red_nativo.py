@@ -174,14 +174,21 @@ class TestNativoControlYContadores(Base):
             t.start()
             try:
                 tope = time.monotonic() + 3.0
+                raros = []                          # lecturas que mezclarían lo de antes con lo nuevo
                 while time.monotonic() < tope:
-                    ip, port = sub.listen.rsplit(":", 1)
+                    leido = sub.listen
+                    ip, port = leido.rsplit(":", 1)
                     if (ip == "127.0.0.1") != (int(port) == antes):
-                        malos.append(sub.listen)
+                        raros.append(leido)
                     if ip == "127.0.0.2":
                         break
                 else:
                     self.fail("no pasó a la red en 3 s")
+                # El kernel puede dar en 127.0.0.2 el mismo NÚMERO de puerto que había en 127.0.0.1 (medido: 1 de
+                # cada ~28 000 veces; así falló una vez en el CI de ARM64). Esa ronda no distingue lo de antes de
+                # lo nuevo, así que no cuenta.
+                if int(sub.listen.rsplit(":", 1)[1]) != antes:
+                    malos += raros
             finally:
                 parar.set()
                 t.join(2)

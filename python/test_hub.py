@@ -437,6 +437,58 @@ class TestModoRed(unittest.TestCase):
         self.assertNotIn("r1", self.hub.endpoints)
         self.assertTrue(any("'cam' (de la computadora 'robot') no latió" in x for x in self.logs))
 
+    def test_solo_da_la_entrada_de_fuera_solo_a_los_publisher_de_la_lista(self):
+        """RFC 0011 §9.2: un sub de otra computadora con `solo` es destino solo de los Publisher locales de su lista;
+        al cambiarla, los `subs` cambian; `solo=-`: de ninguno; `state` lo muestra."""
+        self.red()
+        self.pub("p1", src=("127.0.0.1", 40001))
+        self.pub("p2", src=("127.0.0.1", 40002))
+        remoto = dict(id="laptop.s1", node="ia", pid=7, topic="/cmd", schema="00000000000000aa", type="Cmd",
+                      machine="laptop", addr=f"{LAPTOP}:7600")
+
+        def subs_de():
+            return {a[1]: d for d, a in self.sent if " subs " in d}
+
+        self.send("sub", solo="p1", **remoto)
+        self.assertEqual(subs_de(), {40001: f"agmen-hub/1 subs id=p1 topic=/cmd to={LAPTOP}:7600 tcp=",
+                                     40002: "agmen-hub/1 subs id=p2 topic=/cmd to= tcp="})
+        self.assertEqual(self.ep("laptop.s1")["solo"], "p1")
+        # Al registrarse (o latir) un Publisher que no está en la lista, no la recibe.
+        self.pub("p3", src=("127.0.0.1", 40003))
+        self.assertEqual(subs_de(), {40003: "agmen-hub/1 subs id=p3 topic=/cmd to= tcp="})
+        self.pub("p1", src=("127.0.0.1", 40001))
+        self.assertEqual(subs_de(), {40001: f"agmen-hub/1 subs id=p1 topic=/cmd to={LAPTOP}:7600 tcp="})
+        # Cambia la lista: los `subs` se vuelven a mandar.
+        self.send("sub", solo="p2,p3", **remoto)
+        self.assertEqual(subs_de(), {40001: "agmen-hub/1 subs id=p1 topic=/cmd to= tcp=",
+                                     40002: f"agmen-hub/1 subs id=p2 topic=/cmd to={LAPTOP}:7600 tcp=",
+                                     40003: f"agmen-hub/1 subs id=p3 topic=/cmd to={LAPTOP}:7600 tcp="})
+        self.assertEqual(self.ep("laptop.s1")["solo"], "p2,p3")
+        # solo=-: de ninguno.
+        self.send("sub", solo="-", **remoto)
+        self.assertEqual(set(subs_de().values()), {f"agmen-hub/1 subs id={p} topic=/cmd to= tcp=" for p in
+                                                   ("p1", "p2", "p3")})
+        self.assertEqual(self.ep("laptop.s1")["solo"], "-")
+        # Sin `solo`: a todos (como siempre), y `state` no lo muestra.
+        self.send("sub", **remoto)
+        self.assertEqual(set(subs_de().values()), {f"agmen-hub/1 subs id={p} topic=/cmd to={LAPTOP}:7600 tcp="
+                                                   for p in ("p1", "p2", "p3")})
+        self.assertNotIn("solo", self.ep("laptop.s1"))
+
+    def test_solo_en_una_entrada_local_es_un_error(self):
+        self.red()
+        for kind, extra in (("sub", dict(port=6000)), ("sub", dict(port=6000, net=1)), ("pub", {})):
+            with self.subTest(kind=kind, extra=extra):
+                fields = dict(id="x1", node="n", pid=1, topic="/cmd", schema="00000000000000aa", type="Cmd",
+                              solo="p1", **extra)
+                ((op, f), _), = self.send(kind, **fields)
+                self.assertEqual((op, f["id"]), ("error", "x1"))
+                self.assertIn("solo va solo con machine=", f["msg"])
+        ((op, f), _), = self.send("sub", id="r1", node="n", pid=1, topic="/cmd", schema="00000000000000aa",
+                                  machine="laptop", addr=f"{LAPTOP}:7600", solo="")
+        self.assertIn("solo= vacío no vale", f["msg"])
+        self.assertNotIn("x1", self.hub.endpoints)
+
     def test_entradas_de_otra_computadora_rechazadas(self):
         base = dict(id="r1", node="cam", pid=7, topic="/cmd", schema="00000000000000aa", type="Cmd")
         ((op, f), _), = self.send("sub", machine="robot", addr=f"{ROBOT}:7600", **base)
@@ -515,6 +567,262 @@ class TestModoRed(unittest.TestCase):
         self.assertEqual(len(self.hub.endpoints), 3000)
         self.red(peers="")
         self.assertEqual(self.hub.endpoints, {})
+
+class FakeHub:
+    """Un "hub" de mentira: a cada `query` le contesta con los datagramas que le digan (en ese orden)."""
+
+    def __init__(self, datagrams):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.addr = f"127.0.0.1:{self.sock.getsockname()[1]}"
+        self.datagrams = datagrams
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self):
+        try:
+            while True:
+                data, addr = self.sock.recvfrom(65536)
+                for d in self.datagrams:
+                    self.sock.sendto(d, addr)
+        except OSError:
+            return
+
+    def close(self):
+        self.sock.close()
+        self.thread.join(1)
+
+
+def sin_age(msgs):
+    """Las líneas sin `age` (que cambia de una lectura a otra)."""
+    return [(op, {k: v for k, v in f.items() if k != "age"}) for op, f in msgs]
+
+
+class TestListaEnPartes(unittest.TestCase):
+    """RFC 0011 §9.1: la respuesta a `query` que no cabe en un datagrama sale en partes de como mucho ~32 KiB."""
+
+    def hub(self, topics=0, text_len=300, eps_per_topic=1):
+        h = H.Hub(f"127.0.0.1:{free_port()}", log=lambda t: None)
+        self.addCleanup(h.sock.close)
+        texto = ("Largo{" + ", ".join(f"f32 campo{i}" for i in range(text_len)))[:text_len - 1] + "}"
+        for i in range(topics):
+            for j in range(eps_per_topic):
+                h.handle(hp.encode("pub", id=f"p{i}_{j}", node=f"nodo{i}", pid=1234, topic=f"/largo{i}",
+                                   schema=f"{0xabc000 + i:016x}", type=f"Largo{i}", text=texto),
+                         ("127.0.0.1", 1000 + i * eps_per_topic + j), time.monotonic())
+        return h
+
+    def client(self):
+        c = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, H.QUERY_RCVBUF)
+        c.bind(("127.0.0.1", 0))
+        c.settimeout(0.5)
+        self.addCleanup(c.close)
+        return c
+
+    def ask(self, h, c):
+        """`query` al hub (sin su hilo: aquí mismo) y los datagramas que contesta."""
+        with unittest.mock.patch.object(H.time, "monotonic", return_value=100.0):
+            h.handle(hp.encode("query"), c.getsockname(), 100.0)
+            text = h.state_text()
+        while h._outbox:
+            h.flush()
+        got = []
+        while True:
+            try:
+                got.append(c.recvfrom(65536)[0])
+            except socket.timeout:
+                return text, got
+
+    def test_si_cabe_en_un_datagrama_son_los_bytes_de_siempre(self):
+        h = self.hub(topics=5)
+        text, got = self.ask(h, self.client())
+        self.assertEqual(got, [text.encode()])
+        self.assertTrue(got[0].startswith(b"agmen-hub/1 state "))
+        self.assertNotIn(b" parte ", got[0])
+
+    def test_si_no_cabe_va_en_partes_sin_partir_lineas(self):
+        h = self.hub(topics=60, text_len=1000)
+        text, got = self.ask(h, self.client())
+        self.assertGreater(len(text.encode()), H.QUERY_MAX)          # (antes: no salía nada)
+        self.assertGreater(len(got), 2)
+        lines = []
+        for k, d in enumerate(got, 1):
+            self.assertLessEqual(len(d), H.PART_BYTES)
+            (op, f), *rest = hp.parse(d)
+            self.assertEqual((op, f["i"], f["de"], f["n"]), ("parte", str(k), str(len(got)), "1"))
+            self.assertTrue(rest)
+            lines.extend(d.decode().split("\n")[1:])
+        self.assertEqual(lines, text.split("\n"))                    # todas, enteras y en orden
+        # Una segunda consulta lleva otro `n`.
+        _, otra = self.ask(h, self.client())
+        self.assertEqual(hp.parse(otra[0])[0][1]["n"], "2")
+
+    def test_query_junta_las_partes(self):
+        h = self.hub(topics=60, text_len=1000)
+        stop = threading.Event()
+        threading.Thread(target=h.serve, args=(stop,), daemon=True).start()
+        self.addCleanup(stop.set)
+        msgs = H.query(h.listen)
+        self.assertIsNone(msgs.incompleta)
+        with h.lock:
+            self.assertEqual(sin_age(msgs), sin_age(hp.parse(h.state_text().encode())))
+        self.assertIsInstance(msgs, list)                            # la misma forma de siempre
+
+    def test_mil_endpoints_con_esquemas_largos_llegan_completos_y_el_hub_sigue_atendiendo(self):
+        h = self.hub(topics=500, text_len=300, eps_per_topic=2)
+        stop = threading.Event()
+        threading.Thread(target=h.serve, args=(stop,), daemon=True).start()
+        self.addCleanup(stop.set)
+        # Quien pregunta y nunca lee: el hub no se atora mandándole partes.
+        mudo = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(mudo.close)
+        for _ in range(3):
+            mudo.sendto(hp.encode("query"), ("127.0.0.1", h.sock.getsockname()[1]))
+        self.assertIsNotNone(H.ping(h.listen, timeout=0.5))
+        t0 = time.monotonic()
+        msgs = H.query(h.listen, timeout=1.0)
+        took = time.monotonic() - t0
+        self.assertIsNone(msgs.incompleta)
+        self.assertEqual(sum(1 for op, _ in msgs if op == "ep"), 1000)
+        self.assertEqual(sum(1 for op, f in msgs if op == "topic" and len(f["text"]) == 300), 500)
+        self.assertLess(took, 1.0)
+
+    def test_una_parte_perdida_devuelve_lo_que_hay_y_lo_dice_una_vez(self):
+        text = self.hub(topics=60, text_len=1000).state_text()
+        parts = H.split_state(text, 7)
+        self.assertGreaterEqual(len(parts), 3)
+        fake = FakeHub([parts[0], parts[2]])
+        self.addCleanup(fake.close)
+        dicho = []
+        msgs = H.query(fake.addr, timeout=0.3, say=lambda hub, t: dicho.append(t))
+        self.assertEqual(msgs.incompleta, (2, len(parts)))
+        self.assertEqual(msgs, hp.parse(b"\n".join(p.split(b"\n", 1)[1] for p in (parts[0], parts[2]))))
+        self.assertEqual(len(dicho), 1)
+        self.assertIn(f"la lista del hub llegó incompleta (2 de {len(parts)} partes)", dicho[0])
+        # Lo de siempre (stderr): una vez por hub, aunque se pregunte varias veces.
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            H.query(fake.addr, timeout=0.2)
+            H.query(fake.addr, timeout=0.2)
+        self.assertEqual(err.getvalue().count("llegó incompleta"), 1, err.getvalue())
+
+    def test_partes_repetidas_desordenadas_o_de_otra_consulta(self):
+        text = self.hub(topics=60, text_len=1000).state_text()
+        viejas = H.split_state(text.replace("Largo", "Viejo"), 1)
+        nuevas = H.split_state(text, 2)
+        m = len(nuevas)
+        mezcla = [viejas[1], nuevas[-1], nuevas[0], nuevas[0], viejas[0]] + nuevas[1:-1][::-1]
+        fake = FakeHub(mezcla)
+        self.addCleanup(fake.close)
+        msgs = H.query(fake.addr, timeout=1.0, say=lambda hub, t: self.fail(t))
+        self.assertIsNone(msgs.incompleta)
+        self.assertEqual(msgs, hp.parse(text.encode()))
+        self.assertEqual(m, len(viejas))
+
+    def test_respuesta_de_un_datagrama_tras_partes_viejas_gana(self):
+        """§10.6: partes viejas (de otra consulta) y luego la respuesta de un datagrama: gana esta."""
+        text = self.hub(topics=60, text_len=1000).state_text()
+        viejas = H.split_state(text, 1)
+        chica = self.hub(topics=2).state_text().encode()
+        fake = FakeHub([viejas[0], viejas[1], chica])
+        self.addCleanup(fake.close)
+        msgs = H.query(fake.addr, timeout=5.0, say=lambda hub, t: self.fail(t))
+        self.assertIsNone(msgs.incompleta)
+        self.assertEqual(msgs, hp.parse(chica))
+
+    def test_una_parte_ilegible_marca_la_respuesta_incompleta(self):
+        """§10.6: llegan todas las partes, pero una no se puede leer: la respuesta es `incompleta` y se dice."""
+        text = self.hub(topics=60, text_len=1000).state_text()
+        parts = H.split_state(text, 3)
+        m = len(parts)
+        mala = parts[1].split(b"\n", 1)[0] + b"\nesto no es una linea del hub"
+        fake = FakeHub([parts[0], mala] + parts[2:])
+        self.addCleanup(fake.close)
+        dicho = []
+        t0 = time.monotonic()
+        msgs = H.query(fake.addr, timeout=5.0, say=lambda hub, t: dicho.append(t))
+        self.assertLess(time.monotonic() - t0, 4.0)                 # no espera al tope: ya llegaron todas
+        self.assertEqual(msgs.incompleta, (m - 1, m))
+        self.assertEqual(len(dicho), 1)
+        self.assertIn(f"llegó incompleta ({m - 1} de {m} partes)", dicho[0])
+        self.assertEqual(sum(1 for op, _ in msgs if op == "parte"), 0)
+
+    def test_un_datagrama_con_miles_de_query_se_atiende_una_vez(self):
+        """§10.3 (a): de un datagrama con miles de `query` solo se contesta una, y el hub sigue con `ping`."""
+        h = self.hub(topics=500, text_len=300, eps_per_topic=2)
+        mudo = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        mudo.bind(("127.0.0.1", 0))
+        self.addCleanup(mudo.close)
+        una = b"\n".join([hp.encode("query")] * 3000)
+        self.assertLess(len(una), 65507)
+        with unittest.mock.patch.object(h, "flush"):                 # (sin que salga nada aún)
+            h.handle(una, mudo.getsockname(), time.monotonic())
+        partes = len(H.split_state(h.state_text(), 1))
+        self.assertEqual(len(h._outbox), partes)                     # una sola respuesta en la cola
+        h._outbox.clear(), h._outbox_addr.clear()
+        h._outbox_bytes = 0
+        # Con su hilo: muchos datagramas así no lo dejan sin contestar `ping`.
+        stop = threading.Event()
+        threading.Thread(target=h.serve, args=(stop,), daemon=True).start()
+        self.addCleanup(stop.set)
+        for _ in range(20):
+            mudo.sendto(una, ("127.0.0.1", h.sock.getsockname()[1]))
+        t0 = time.monotonic()
+        self.assertIsNotNone(H.ping(h.listen, timeout=5.0))
+        self.assertLess(time.monotonic() - t0, 1.0)
+
+    def test_un_cliente_que_no_lee_no_deja_sin_lista_a_otro(self):
+        """§10.3 (b, c): tope por dirección: lo pendiente para quien no lee no pasa de OUTBOX_ADDR_MAX, y otro que
+        pregunta después sí recibe su lista entera."""
+        h = self.hub(topics=500, text_len=300, eps_per_topic=2)
+        mudo = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        mudo.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        mudo.bind(("127.0.0.1", 0))
+        self.addCleanup(mudo.close)
+        armadas = []
+        real = h.state_text
+        h.state_text = lambda: (armadas.append(1), real())[1]
+        with unittest.mock.patch.object(h, "flush"):                 # (sin que salga nada: como si fuera muy rápido)
+            for _ in range(100):
+                h.handle(hp.encode("query"), mudo.getsockname(), time.monotonic())
+        self.assertLessEqual(h._outbox_addr[mudo.getsockname()], H.OUTBOX_ADDR_MAX)
+        self.assertLess(len(armadas), 100)                            # (b) llena la cola, ya ni se arma la lista
+        self.assertLess(h._outbox_bytes, H.OUTBOX_MAX)
+        c = self.client()
+        text, got = self.ask(h, c)
+        self.assertEqual(h._outbox_addr, {})                          # todo salió (y se descontó)
+        self.assertEqual(h._outbox_bytes, 0)
+        self.assertEqual([x for d in got for x in sin_age(hp.parse(d.split(b"\n", 1)[1]))],
+                         sin_age(hp.parse(text.encode())))
+
+    def test_una_linea_que_sola_no_cabe_se_recorta_y_se_marca(self):
+        h = self.hub(topics=1, text_len=100_000)
+        h.handle(hp.encode("sub", id="s1", node="oye", pid=1, topic="/largo0", schema="*", port=6000),
+                 ("127.0.0.1", 6000), time.monotonic())
+        text, got = self.ask(h, self.client())
+        msgs = [x for d in got for x in hp.parse(d)]
+        (topic,) = [f for op, f in msgs if op == "topic"]
+        self.assertEqual(topic["cortado"], "1")
+        self.assertTrue(text.split("\n")[1].startswith("agmen-hub/1 topic name=/largo0 "))
+        self.assertGreater(len(topic["text"]), 1000)
+        full = next(f for op, f in hp.parse(text.encode()) if op == "topic")["text"]
+        self.assertTrue(full.startswith(topic["text"]))
+        self.assertLess(len(topic["text"]), len(full))
+        self.assertEqual(sorted(f["id"] for op, f in msgs if op == "ep"), ["p0_0", "s1"])   # lo demás, entero
+        self.assertTrue(all(len(d) <= H.PART_BYTES for d in got))
+
+    def test_un_cliente_anterior_ve_una_lista_parcial_bien_formada(self):
+        """Uno de antes lee un solo datagrama: ve la primera parte (la línea `parte` y luego `state` y `topic`)."""
+        h = self.hub(topics=60, text_len=1000)
+        c = self.client()
+        _, got = self.ask(h, c)
+        msgs = hp.parse(got[0])                       # lo que hacía hub.query antes
+        self.assertEqual([op for op, _ in msgs[:3]], ["parte", "state", "topic"])
+        self.assertTrue(all(op in ("parte", "state", "topic", "ep", "stat") for op, _ in msgs))
+
 
 class TestNetIp(unittest.TestCase):
     """AGMEN_NET_IP en el hub (RFC 0011, precisión §7): "desde esta computadora" es 127.0.0.1 y, solo con

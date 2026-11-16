@@ -17,6 +17,8 @@ Nodo → hub
     sub   … machine addr [tcp]                 un Subscriber de OTRA computadora (modo red): vive en
                                                `machine` (un nombre de `peers`) y recibe en addr=ip:puerto
     pub   … machine                            un Publisher de OTRA computadora (modo red; sin `subs`)
+          [solo=id,id | solo=-]                (RFC 0011 §9.2, sesión de simulación) solo con machine: a qué
+                                               Publisher de aquí se da como destino un sub de fuera (- = ninguno)
     red   peers=nombre@ip,nombre@ip            modo red (RFC 0011): las otras computadoras y la IP con
                                                la que esta las ve; se repite cada NET_BEAT_S, caduca a
                                                los NET_EXPIRE_S; `peers=` vacío = volver a modo local.
@@ -40,6 +42,9 @@ Hub → nodo
     red_ok peers=n                              modo red aceptado: cuántas computadoras
     pong  version [red=1]                       red=1 = el hub está en modo red
     state (varias líneas: topic ..., ep ..., stat ...)
+          si no cabe en un datagrama (RFC 0011 §9.1): varios, de como mucho 32 KiB, cada uno con una
+          primera línea `parte i=<k> de=<m> n=<consulta>` y líneas enteras (una que sola no cabe va
+          recortada, con cortado=1)
 
 Los datos (formato v1, "AGM...") y el control ("agmen-hub/1 ...") pueden llegar
 al mismo socket; se distinguen por los primeros bytes.

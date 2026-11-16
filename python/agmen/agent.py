@@ -463,6 +463,7 @@ class Channel:
         self._send_lock = threading.Lock()
         self._sent = 0
         self._received = 0
+        self._broken = ""      # un envío falló (quizá con la línea a medias): ya no se escribe nada más por aquí
         sock.settimeout(SEND_TIMEOUT)
 
     def send(self, obj: dict) -> None:
@@ -478,11 +479,15 @@ class Channel:
             if len(line) - 1 > MAX_LINE:
                 raise MessageTooLarge(f"el mensaje '{op}' mide {len(line) - 1} bytes y el límite es "
                                       f"{MAX_LINE}: no se mandó")
+            if self._broken:   # otra línea detrás de una a medias: el otro lado vería una firma mala (RFC 0011 4b §8.1)
+                raise ChannelClosed(f"ya no se puede usar ({self._broken})")
             try:
                 self.sock.sendall(line)
             except socket.timeout:
+                self._broken = f"la otra punta no leyó en {SEND_TIMEOUT:g} s"
                 raise ChannelError(f"la otra punta no lee hace {SEND_TIMEOUT:g} s") from None
             except OSError as e:
+                self._broken = f"la conexión se cortó ({e.strerror or e})"
                 raise ChannelClosed(f"la conexión se cortó ({e.strerror or e})") from None
             self._sent = n
 
@@ -1250,10 +1255,17 @@ class AgentServer:
                         f"o de otra versión? Detenlo (o reinicia {m}) y vuelve a correr agmen run"), True
             return "", False
         try:
-            msgs = query(address, timeout=1.0)
+            msgs = query(address, timeout=1.0, say=None)
+            if msgs.incompleta is not None:   # §10.1: nunca se da por buena una lista incompleta: otra vez
+                msgs = query(address, timeout=1.0, say=None)
         except (ConnectionError, OSError):
             return (f"{m}: el agmen hub de {address} contesta pero no dice qué nodos tiene: detenlo y vuelve a "
                     f"correr agmen run"), True
+        if msgs.incompleta is not None:   # falla cerrada: sin la lista entera no se sabe si hay nodos ajenos
+            k, total = msgs.incompleta
+            return (f"{m}: la lista de nodos del agmen hub de {address} no llegó completa ({k} de {total} partes, dos "
+                    f"veces), así que no puedo comprobar que no corran nodos que este agente no lanzó. Vuelve a correr "
+                    f"agmen run; si se repite, hay demasiados topics en {m} o está saturada"), True
         names = sorted({_clean(f.get("node", "?"), 40) for op, f in msgs if op in ("ep", "stat")})
         if names:
             return (f"{m}: ya corren nodos que este agente no lanzó ({', '.join(names)}), con su agmen hub en "
@@ -1339,9 +1351,13 @@ class _Outbox:
 
     def __init__(self) -> None:
         self.cond = threading.Condition()
-        self.items: deque[tuple[str, str, int, bool]] = deque()   # (op, json, bytes, ¿es un log?)
+        # (op, json, bytes, ¿es un log?, n de la tabla o None). Las partes de una tabla del puente (4b §8.7) no
+        # cuentan en bytes ni en replies (no hacen descartar log ni dejar de leer a la laptop) y una tabla
+        # pendiente se sustituye por la más nueva: como mucho hay una (PART_BYTES × partes).
+        self.items: deque[tuple[str, str, int, bool, int | None]] = deque()
         self.bytes = 0
-        self.replies = 0        # lo que no es log, pendiente
+        self.replies = 0        # lo que no es log ni tabla, pendiente
+        self.tables = 0         # partes de tabla pendientes
         self.dropped = 0
         self.closed = False
         self.sending = False    # el hilo que manda tiene uno en la mano (ya salió de la cola)
@@ -1349,18 +1365,38 @@ class _Outbox:
     def put(self, obj: dict, droppable: bool = False) -> bool:
         body = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
         size = len(body.encode("utf-8"))
+        table = obj["n"] if obj["op"] == "tablas" and type(obj.get("n")) is int else None
         with self.cond:
             if self.closed:
                 return False
-            if droppable and (len(self.items) >= OUT_MAX_MSGS or self.bytes + size > OUT_MAX_BYTES):
+            if table is not None:
+                self._drop_tables(keep=table)
+                self.items.append((obj["op"], body, size, False, table))
+                self.tables += 1
+                self.cond.notify_all()
+                return True
+            counted = len(self.items) - self.tables
+            if droppable and (counted >= OUT_MAX_MSGS or self.bytes + size > OUT_MAX_BYTES):
                 self.dropped += 1
                 return False
-            self.items.append((obj["op"], body, size, droppable))
+            self.items.append((obj["op"], body, size, droppable, None))
             self.bytes += size
             if not droppable:
                 self.replies += 1
             self.cond.notify_all()
             return True
+
+    def _drop_tables(self, keep: int | None = None) -> None:
+        """Con self.cond: quita las partes pendientes de toda tabla que no sea `keep` (la más nueva)."""
+        if any(item[4] is not None and item[4] != keep for item in self.items):
+            self.items = deque(item for item in self.items if item[4] is None or item[4] == keep)
+            self.tables = sum(1 for item in self.items if item[4] is not None)
+
+    def drop_tables(self) -> None:
+        """Al cerrar: lo importante (detener, adios) no espera detrás de una tabla."""
+        with self.cond:
+            self._drop_tables()
+            self.cond.notify_all()
 
     def get(self) -> tuple[str, str] | None:
         """El siguiente (espera); None si se cerró."""
@@ -1369,10 +1405,13 @@ class _Outbox:
                 self.cond.wait()
             if self.closed:
                 return None
-            op, body, size, droppable = self.items.popleft()
-            self.bytes -= size
-            if not droppable:
-                self.replies -= 1
+            op, body, size, droppable, table = self.items.popleft()
+            if table is None:
+                self.bytes -= size
+                if not droppable:
+                    self.replies -= 1
+            else:
+                self.tables -= 1
             self.sending = True
             self.cond.notify_all()
             return op, body
@@ -1400,7 +1439,7 @@ class _Outbox:
         with self.cond:
             self.closed = True
             self.items.clear()   # la memoria se libera al cerrar la sesión
-            self.bytes = self.replies = 0
+            self.bytes = self.replies = self.tables = 0
             self.cond.notify_all()
 
 
@@ -1452,6 +1491,13 @@ class _Session:
         self._orders: queue.Queue = queue.Queue()
         self._setup_thread: threading.Thread | None = None
         self._unread = threading.Event()     # el lector de la conexión actual ya salió (para el adios de end)
+        # El puente (RFC 0011 parte 4b): si la laptop y este agente dijeron "tablas", el puente con el hub de aquí
+        # y el Peer de la laptop (None: sin puente; todo como en el bloque 3).
+        self._first: dict = {}
+        self._tables = False
+        self._no_tables = ""                 # la laptop pidió puente y este agente no lo hace: por qué (4b §8.6)
+        self.bridge = None
+        self.peer = None
         self.sender = self._start_sender(channel, self.out)
         self.worker = threading.Thread(target=self._work_loop, daemon=True, name="agmen-agent-orders")
         self.worker.start()
@@ -1651,6 +1697,10 @@ class _Session:
                     except Exception as e:
                         failed = e
                     out = self.out
+            if grace and self.peer is not None:
+                # 4b: sin conexión no se late nada de la laptop ni se repite `red`. Con el candado (§10.2): un lose()
+                # de esta conexión (vieja) nunca llega después del confirm() de la nueva (que también lo toma).
+                self.peer.lose()
         if not grace:
             self.end(early, "error")
             return
@@ -1713,12 +1763,18 @@ class _Session:
                     if lost:
                         reply["perdidos"] = lost
                     reply["gracia"] = _grace_number()
+                    if self._tables:
+                        reply["tablas"] = 1
+                    elif self._no_tables:
+                        reply["sin_tablas"] = self._no_tables
                     out.put(reply)
                     for item in logs:
                         out.put(item, droppable=True)
                     self.channel, self.out, self.unconfirmed = channel, out, channel
                     self._unread.clear()   # el lector de la nueva es este hilo (en _guarded, abajo)
                     old_ip, self.ip = self.ip, ip
+            if self.peer is not None:
+                self.peer.lose()   # 4b: hasta que la laptop confirme por la conexión nueva, sin puente (con el candado)
         if failed is not None:
             channel.close()   # §14: el canal nuevo no se queda abierto (end() cierra el de antes, el actual)
             self.end(f"la laptop volvió a conectarse desde {ip} y no pude esperar a que confirme "
@@ -1745,6 +1801,7 @@ class _Session:
         §15: devuelve si la confirmación tuvo efecto (o ya no hacía falta). False si la sesión está terminando (la
         gracia venció justo ahora) o la conexión ya no es la actual: entonces el mensaje no se atiende ni se contesta,
         para que la laptop no reciba un pong que diga "reconectado" con los nodos ya detenidos."""
+        ip = _show_ip(self.ip)
         with self._end_lock:
             if self._ending or channel is not self.channel:
                 return False
@@ -1754,6 +1811,11 @@ class _Session:
             self.unconfirmed, self.lost_at, self._grace_timer = None, None, None
             self._grace_token += 1   # si el temporizador ya disparó y espera el candado, ya no hace nada
             self._extended = False
+            if self.peer is not None:
+                # 4b: el puente vuelve, con la IP desde la que llegó la laptop. Con el candado (§8.2, §10.2): una
+                # pérdida (_lost, que hace peer.lose() con este mismo candado) llega antes, y entonces aquí ya no es la
+                # conexión actual, o después, y su peer.lose() gana; la de una conexión vieja ya no es la actual.
+                self.peer.confirm(ip)
         if timer is not None:
             timer.cancel()
         with self.server.lock:
@@ -1785,6 +1847,7 @@ class _Session:
                                      f"({_clean(e, 200)}). Mira la terminal de agmen agent en {self.server.machine}")
             return
         self.plan, self.launcher = plan, launcher
+        self._first = first
         launcher.logs.listeners.append(self._on_log)
         for node in launcher.nodes.values():
             node.on_state = self._on_state
@@ -1829,11 +1892,19 @@ class _Session:
                 return
             if own:
                 launcher.nodes["hub"].start()   # el hub de esta computadora, como en agmen run
-            self.send({"op": "sesion_ok", "maquina": m, "agmen": __version__, "nodos": list(plan.names),
-                       "sesion": self.id, "gracia": _grace_number()})
+            self._tables = self._wants_tables()
+            ok = {"op": "sesion_ok", "maquina": m, "agmen": __version__, "nodos": list(plan.names),
+                  "sesion": self.id, "gracia": _grace_number()}
+            if self._tables:
+                ok["tablas"] = 1
+            elif self._no_tables:
+                ok["sin_tablas"] = self._no_tables   # §8.6: la laptop pidió puente y aquí no se hace: por qué
+            self.send(ok)
             self.ready.set()
             with self.server.lock:   # la IP de la última sesión ACEPTADA conserva su lugar aunque otros fallen
                 self.server.trusted = _ip_key(self.ip)
+            if self._tables:
+                self._start_bridge()
             for name in plan.names:
                 node = launcher.nodes[name]
                 with node.lock:
@@ -1857,6 +1928,72 @@ class _Session:
             else:
                 self._refused("interno", f"{m}: error inesperado al preparar la sesión ({_clean(e, 200)}). Mira la "
                                          f"terminal de agmen agent en {m}")
+
+    def _wants_tables(self) -> bool:
+        """¿Hay puente (4b §1, §3)? Si la laptop dijo "tablas" y dice cómo se llama (`desde`), este agente tiene hub
+        y ve a la laptop en una IPv4. Si la laptop lo dijo y algo de aquí no deja, se dice por qué."""
+        first = self._first
+        if not _says_tables(first):
+            return False
+        from .tables import check_name
+
+        why = ""
+        try:
+            check_name(first.get("desde"))
+        except Exception as e:
+            why = f"la laptop no dice bien cómo se llama ('desde': {_clean(e, 200)})"
+        if not why and not self.plan.config.hub:
+            why = f"en {self.server.machine} [hub] enabled = false"
+        if not why:
+            try:
+                from . import hubproto
+
+                hubproto.parse_ipv4(_show_ip(self.ip))
+            except Exception:
+                why = f"la laptop llegó desde {_show_ip(self.ip)}, que no es una IPv4 (en esta versión, solo IPv4)"
+        if why:
+            self.launcher.say(f"⚠ los topics no cruzan entre {self.server.machine} y la laptop: {why}", "error")
+            self._no_tables = _cut(why, 200)
+            return False
+        return True
+
+    def _start_bridge(self) -> None:
+        """El puente con el hub de aquí (4b): la laptop es el único Peer; su IP, la que ve este agente."""
+        from .pubsub import hub_address
+        from .tables import Bridge
+
+        # §9.2: si la laptop pidió una sesión de simulación o reproducción, solo cruzan los nodos que arrancó este
+        # agente (y sus descendientes); en una sesión `real`, todo (como siempre).
+        owned = self._node_pids if self._first.get("reloj") in ("sim", "replay") else None
+        try:
+            bridge = Bridge(hub_address(), self.launcher.say, owned=owned,
+                            session="reproducción" if self._first.get("reloj") == "replay" else "simulación")
+            peer = bridge.add_peer(self._first["desde"], lambda part: self.send(part))
+            bridge.start()
+        except Exception as e:   # nunca en silencio; la sesión sigue sin puente
+            self.launcher.say(f"⚠ no pude arrancar el puente de topics con la laptop ({_clean(repr(e), 200)}): los "
+                              f"topics no cruzan entre computadoras", "error")
+            return
+        ip = _show_ip(self.ip)
+        with self._end_lock:
+            ending = self._ending
+            if not ending:
+                self.bridge, self.peer = bridge, peer
+                if self.lost_at is None and self.unconfirmed is None:
+                    peer.confirm(ip)   # con el candado (§8.2): una pérdida después hace peer.lose(); antes, no se llega
+        if ending:
+            bridge.close()
+
+    def _node_pids(self) -> list[int]:
+        """Los pids de los nodos de esta sesión que están corriendo ahora (el puente los mira en cada tabla: un nodo
+        que se reinicia sigue contando)."""
+        out = []
+        for name in self.plan.names:
+            node = self.launcher.nodes.get(name)
+            proc = getattr(node, "proc", None)
+            if proc is not None and proc.returncode is None:   # (sin poll(): eso es del Launcher)
+                out.append(proc.pid)
+        return out
 
     def _run_before(self, cmd: list[str]) -> int | None:
         """Un comando de [robot] before, con su salida como log de "agmen" (RFC 0011 §3.3)."""
@@ -1951,6 +2088,9 @@ class _Session:
                 what = {"arrancar": "start", "detener": "stop", "reiniciar": "restart"}[op]
                 self.launcher.say(f"la laptop pidió {op} '{name}'")
                 self._work(getattr(self.launcher.nodes[name], what))
+        elif op == "tablas":   # la tabla del hub de la laptop (4b): solo si hay puente
+            if self.peer is not None:
+                self.peer.receive(msg)
         elif op in ("sesion", "reanudar"):
             self._error("esta conexión ya tiene su sesión abierta")
         else:
@@ -2019,6 +2159,9 @@ class _Session:
             timer.cancel()
         me = threading.current_thread()
         try:
+            if self.bridge is not None:
+                self.bridge.close()   # 4b: sin `red` ni latidos; su hilo y el del Peer terminan
+                self.out.drop_tables()   # §8.7: los estado finales y el adios no esperan detrás de una tabla
             if reason and not quiet and grace_token is None:
                 self.say(reason, kind)
             self.cancel.set()
@@ -2160,13 +2303,24 @@ def get_key(name: str, address: str, *, interactive: bool | None = None,
     raise AssertionError("inalcanzable")
 
 
-def session_message(config, machine: str, clock: str) -> dict:
+def session_message(config, machine: str, clock: str, desde: str | None = None) -> dict:
     """El `sesion` para el agente de `machine`. no_arrancar = todos sus nodos: agmen run
     los arranca después, cuando TODAS las computadoras aceptaron (y en el orden del
-    archivo; los de --skip o autostart = false, nunca solos)."""
+    archivo; los de --skip o autostart = false, nunca solos). Con `desde` (agmen run con
+    hub, RFC 0011 parte 4b §3): "tablas": 1 y cómo se llama esta computadora allá."""
     nodes = written_nodes(config, machine)
-    return {"op": "sesion", "perfil": config.profile, "reloj": clock, "agmen": __version__, "maquina": machine,
-            "nodos": nodes, "no_arrancar": list(nodes)}
+    msg = {"op": "sesion", "perfil": config.profile, "reloj": clock, "agmen": __version__, "maquina": machine,
+           "nodos": nodes, "no_arrancar": list(nodes)}
+    if desde is not None:
+        msg["tablas"] = 1
+        msg["desde"] = desde
+    return msg
+
+
+def _says_tables(msg: dict | None) -> bool:
+    """¿El otro lado dijo que sabe pasar las tablas de su hub (RFC 0011 parte 4b §3)?"""
+    value = (msg or {}).get("tablas")
+    return type(value) is int and value == 1
 
 
 def _kind(text: str) -> str:
@@ -2242,6 +2396,13 @@ class AgentLink:
         self._resuming: threading.Event | None = None
         self._resume_bye = False
         self._pace: float = RETRY_EVERY     # el ritmo de los reintentos de ahora (1 s, o 5 s tras un rechazo)
+        # El puente (RFC 0011 parte 4b): el Peer de esta conexión en el puente de agmen run (None: sin puente) y si el
+        # agente dijo "tablas" en su último sesion_ok/reanudar_ok.
+        self._peer = None
+        self._tables = False
+        self._no_tables = ""                # por qué el agente no hace puente, si lo dijo ("sin_tablas", §8.6)
+        self._told_tables = False
+        self._stopping = False              # finish()/close(): ya no sale ninguna tabla (§8.7)
 
     @property
     def on_lost(self) -> Callable[[AgentLink, str], None] | None:
@@ -2304,6 +2465,7 @@ class AgentLink:
             self.channel = None
             raise
         self._took(ok, contact)
+        self._set_tables(ok)
         self.version = _clean(channel.peer_version, 40)
         self.state_since = time.monotonic()
         self._reader = threading.Thread(target=self._read_loop, args=(channel, self._gen), daemon=True,
@@ -2311,11 +2473,19 @@ class AgentLink:
         self._reader.start()
 
     def _dial(self, key: str, connect_timeout: float) -> Channel:
-        """Conecta y saluda. LinkError si no se puede."""
+        """Conecta y saluda. LinkError si no se puede. Con AGMEN_NET_IP (pruebas), la conexión sale desde esa IP:
+        así el agente ve a esta computadora en la IP donde escuchan sus nodos (RFC 0011 parte 4b §5)."""
+        from .hub import net_ip_from_env
+
         where = f"{self.name} ({self.shown})"
         host = self.machine.host
         try:
-            sock = socket.create_connection((host, self.machine.port), timeout=connect_timeout)
+            net_ip = net_ip_from_env()
+        except (OSError, ValueError) as e:
+            raise LinkError("sin_ruta", f"no llego a {where}: {e}") from None
+        try:
+            sock = socket.create_connection((host, self.machine.port), timeout=connect_timeout,
+                                            source_address=(net_ip, 0) if net_ip else None)
         except ConnectionRefusedError:
             raise LinkError("rechazada", f"{where} no contesta: ¿está corriendo agmen agent ahí? En {self.name}: "
                                          f"agmen agent {self.toml_hint}") from None
@@ -2556,7 +2726,70 @@ class AgentLink:
         elif op == "pong":   # el último contacto confirmado (§9): el t es el monotonic de un ping de aquí
             if self.down_since is None:
                 self.last_ok = self._confirmed(msg, self.last_ok)
+        elif op == "tablas":   # la tabla del hub del robot (4b): solo si los dos lo dijeron
+            peer = self._peer
+            if peer is not None and self._tables:
+                peer.receive(msg)
         # lo que no conozca (un agente más nuevo): nada
+
+    # --- el puente (RFC 0011 parte 4b) ---
+    def bridge(self, peer) -> None:
+        """agmen run, justo antes de arrancar los nodos: el Peer de esta computadora en su puente. Si la conexión
+        ya está y el agente dijo "tablas", el puente empieza ya."""
+        self._peer = peer
+        channel = self.channel
+        if channel is not None and self.down_since is None:
+            self._bridge_up(channel)
+
+    def _set_tables(self, ok: dict | None) -> None:
+        """Lo que dijo el agente del puente en sesion_ok/reanudar_ok: "tablas" (lo hace) o "sin_tablas" (por qué no)."""
+        self._tables = _says_tables(ok)
+        why = (ok or {}).get("sin_tablas")
+        self._no_tables = _clean(why, 200) if isinstance(why, str) and why.strip() else ""
+
+    def _bridge_up(self, channel: Channel) -> None:
+        """La conexión `channel` quedó confirmada: con "tablas" de los dos lados, hay puente (con la IP a la que se
+        conectó agmen run); si el agente no lo hace, se dice una vez por qué (o, si no dice nada, qué hacer)."""
+        peer = self._peer
+        if peer is None:
+            return
+        if not self._tables:
+            peer.lose()
+            if not self._told_tables:
+                self._told_tables = True
+                if self._no_tables:   # §8.6: el agente dijo por qué
+                    self._notice(f"⚠ {self.name} no pasa topics entre computadoras ({self._no_tables}): sus nodos "
+                                 f"corren, pero sus topics no llegan aquí ni los de aquí allá", "error")
+                else:
+                    self._notice(f"⚠ {self.name} no pasa topics entre computadoras (su agmen agent no dice 'tablas': "
+                                 f"es un Agmen anterior): sus nodos corren, pero sus topics no llegan aquí ni los de "
+                                 f"aquí allá. Actualiza Agmen en {self.name} (pip install -U agmen)", "error")
+            return
+        try:
+            ip = _show_ip(channel.sock.getpeername()[0])
+        except OSError:
+            return   # ya se cerró: su lector lo ve
+        with self._lock:
+            # §8.2: con el candado de _lose: si la conexión ya se perdió (o ya no es la actual) no se confirma; si se
+            # pierde después, su peer.lose() llega detrás de este confirm.
+            if self.channel is channel and self.down_since is None and not self._closing and not self.lost:
+                peer.confirm(ip)
+
+    def send_table(self, part: dict) -> None:
+        """Una parte de la tabla de aquí, por la conexión actual (desde el hilo del Peer). §8.1: si falla por algo
+        que no sea "no cabe" (p. ej. se agotó el tiempo con la línea a medias), esa conexión ya no se usa y se trata
+        como cualquier pérdida (gracia y reintentos de la 3c)."""
+        with self._lock:
+            channel, gen = self.channel, self._gen
+            if channel is None or self.down_since is not None or self._closing or self._stopping:
+                return
+        try:
+            channel.send(part)
+        except MessageTooLarge:
+            raise
+        except AgentError as e:
+            self._lose(f"no pude mandarle la tabla de topics: {e}", gen)
+            raise
 
     def _note_once(self, what: str, text: str) -> None:
         """Un aviso propio de agmen run sobre lo que manda el agente: una vez por conexión."""
@@ -2592,6 +2825,8 @@ class AgentLink:
                              f"todo. Revisa {self.name} (¿se apagó, se cayó la red o se cerró agmen agent?) y vuelve "
                              f"a correr agmen run")
         self._done.set()
+        if self._peer is not None:
+            self._peer.lose()   # 4b: sin conexión no se late nada del robot ni se repite `red`
         if not resilient:
             for node in self.nodes.values():
                 if farewell:
@@ -2934,6 +3169,9 @@ class AgentLink:
                                       name=f"agmen-agent-{self.name}")
             reader.start()
             self._reader = reader
+            # 4b: confirmada (tras sesion_ok, o tras el pong de confirmación de un reanudar): vuelve el puente.
+            self._set_tables(resumed if resumed is not None else ok)
+            self._bridge_up(channel)
         except BaseException as e:
             with self._lock:   # ¿sigue siendo la actual? (si su lector ya la perdió, otro hilo reintenta)
                 mine = self._gen == gen and self.down_since is None and not self._closing
@@ -2980,6 +3218,9 @@ class AgentLink:
         """Al terminar (Ctrl+C): detener_todo, espera los estado (hasta `timeout`), adios.
         Sin conexión (reintentando): deja de intentar y dice que el agente no se enteró (salvo
         que se haya despedido: sus nodos ya estaban detenidos)."""
+        self._stopping = True   # §8.7: detener_todo y adios no esperan detrás de una tabla
+        if self._peer is not None:
+            self._peer.lose()
         channel = self.channel
         if channel is None:
             if self.down_since is not None and not self._closing:
@@ -3007,6 +3248,7 @@ class AgentLink:
     def close(self) -> None:
         """adios y cierra (sin esperar a los nodos; lo que tarde el agente en cerrar, hasta BYE_TIMEOUT).
         También deja de reintentar."""
+        self._stopping = True
         with self._lock:
             if not self._closing:
                 self.state_since = time.monotonic()
@@ -3014,6 +3256,8 @@ class AgentLink:
             channel, self.channel = self.channel, None
         self._retry_stop.set()
         self._done.set()
+        if self._peer is not None:
+            self._peer.lose()
         if channel is None:
             return
         if not self.lost:

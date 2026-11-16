@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Estado** | ✅ **Aceptado** (2026-11-13, D1–D10 = a); en curso en Agmen 0.14.0, por bloques según la [sección 7](#7-plan-para-agmen-0140): perfiles, el mundo de MuJoCo, la parte 3a (declarar computadoras con `[[machine]]`, §3.4) y la 3b (`agmen agent` con clave) y la 3c (reconexión, panel con varias computadoras, servicio) hechos; la 4a (base de los topics entre computadoras: el hub y los dos núcleos, sin encender) hecha; faltan el puente (4b), lo visible (4c) y relojes (bloque 5). Decisiones en la [sección 5](#5-decisiones) |
+| **Estado** | ✅ **Aceptado** (2026-11-13, D1–D10 = a); en curso en Agmen 0.14.0, por bloques según la [sección 7](#7-plan-para-agmen-0140): perfiles, el mundo de MuJoCo, la parte 3a (declarar computadoras con `[[machine]]`, §3.4) y la 3b (`agmen agent` con clave) y la 3c (reconexión, panel con varias computadoras, servicio) hechos; la 4a (base de los topics entre computadoras: el hub y los dos núcleos) y la 4b (el puente, §3.5) hechas; falta la 4c (lo visible y la prueba del firewall) y relojes (bloque 5). Decisiones en la [sección 5](#5-decisiones) |
 | **Depende de** | RFC 0003 (`agmen run`, `robot.toml` y el panel), RFC 0004 (el hub, los topics esperados y el diseño de varias máquinas de §3.6), RFC 0006 (el reloj de simulación y `/clock`), RFC 0008 (TCP para datos grandes; un suscriptor lento no frena a nadie), RFC 0009 (la memoria compartida se prueba, no se adivina), RFC 0010 (`--play` y `--skip`) |
 | **Versión** | Agmen 0.14.0 |
 | **Requisitos** | d (misma interfaz para simulación y robot real), i (un solo comando levanta todo el robot), g (Windows y Linux, x86-64 y ARM64) |
