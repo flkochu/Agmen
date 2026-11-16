@@ -126,6 +126,40 @@ jobs:
       - name: Pruebas
         run: ctest --test-dir build --output-on-failure
 
+  # Carreras entre hilos (PR "hilos"): el núcleo y agmen._core con ThreadSanitizer. ctest corre las
+  # pruebas de C++ (tests/test_hilos.cpp entre ellas) y python/test_hilos.py corre su batería contra el
+  # _core con TSan (<build>/python_tsan); un solo informe de TSan hace fallar el caso. tests/tsan.supp no
+  # suprime nada de Agmen.
+  tsan:
+    name: ubuntu + ThreadSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        id: py
+        with:
+          python-version: "3.12"
+
+      - name: nanobind (para agmen._core) y NumPy
+        run: python -m pip install nanobind numpy
+
+      - name: Compilar con ThreadSanitizer
+        run: |
+          cmake -S . -B build-tsan -DAGMEN_TSAN=ON -DAGMEN_WERROR=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo -DPython_EXECUTABLE="${{ steps.py.outputs.python-path }}"
+          cmake --build build-tsan --parallel
+
+      - name: Pruebas de C++
+        env:
+          TSAN_OPTIONS: suppressions=${{ github.workspace }}/tests/tsan.supp halt_on_error=0 exitcode=66
+        run: ctest --test-dir build-tsan --output-on-failure
+
+      - name: Batería de hilos de Python contra agmen._core con ThreadSanitizer
+        env:
+          AGMEN_HILOS_TSAN: "1"
+          AGMEN_HILOS_RAIZ: ${{ github.workspace }}/build-tsan/python_tsan
+        run: python -m unittest discover -s python -p "test_hilos.py" -v
+
   # El cierre del núcleo de C++ (atexit, python/test_cierre.py) también con Python 3.13: ahí CPython
   # no aborta al finalizar con hilos vivos, pero las pruebas deterministas del cierre deben seguir
   # cumpliéndose. Los otros jobs corren con 3.12, donde el aborto sí muerde.
