@@ -870,9 +870,13 @@ Prueba mensajes de 64 bytes a 6 MiB (un tamaño tras otro: 64 B, 1 KiB, 16 KiB, 
 - **El ritmo de ida.** La laptop manda sin parar unos 2 segundos, y la Pi cuenta lo que
   le llega: MB/s, mensajes por segundo, y cuántos llegaron de los enviados.
 
-El camino depende del tamaño: los mensajes de tamaño fijo viajan por UDP hasta 65 440
-bytes (lo que cabe en un datagrama), y los de más viajan por TCP. La tabla dice por
-dónde le llegó cada uno.
+El camino depende del tipo del mensaje: los de tamaño fijo viajan por UDP hasta 65 440
+bytes (lo que cabe en un datagrama), y los de más viajan por TCP. La tabla dice qué
+camino le toca a cada tamaño.
+
+El banco también mide, sin red, cuánto tarda tu computadora en **codificar y
+decodificar** cada mensaje. Así no confundes lo que tarda Python en armar el mensaje con
+lo que tarda la red en llevarlo.
 
 ### Cómo se corre
 
@@ -905,14 +909,22 @@ el máximo de UDP y 1 MiB. Para probar el banco sin dos computadoras, usa
 Esta tabla es de `--local --rapido` en una sola computadora. Son dos IP de loopback, **no
 son números de una red**: sirve para ver cómo se lee, y tus números van a ser otros.
 
-| Tamaño | Bytes | Camino | Ida y vuelta (mediana / p99) | Sin respuesta | MB/s de ida | Mensajes/s | Recibidos / enviados | Descartados (TCP, D3) | Perdidos |
-|---|---:|---|---|---:|---:|---:|---:|---:|---:|
-| 64 B | 64 | UDP | 0.32 / 0.41 ms | 0 de 30 | 9.9 | 155393 | 155470 / 174322 | 0 | 18852 |
-| máx. UDP | 65 440 | UDP | 3.00 / 3.44 ms | 0 de 30 | 44.7 | 684 | 684 / 684 | 0 | 0 |
-| 1 MiB | 1 048 576 | TCP | 3.17 / 3.85 ms | 0 de 30 | 722.2 | 689 | 688 / 688 | 0 | 0 |
+| Tamaño | Bytes | Camino | Codificar+decodificar | Ida y vuelta (mediana / p99) | Sin respuesta | MB/s de ida | Mensajes/s | Recibidos / enviados | Descartados (TCP, D3) | Perdidos |
+|---|---:|---|---:|---|---:|---:|---:|---:|---:|---:|
+| 64 B | 64 | UDP | 0.005 ms | 0.26 / 1.97 ms | 0 de 30 | 10.7 | 166502 | 166621 / 189174 | 0 | 22553 |
+| máx. UDP | 65 440 | UDP | 2.205 ms | 2.98 / 4.46 ms | 0 de 30 | 47.3 ¹ | 723 ¹ | 723 / 723 | 0 | 0 |
+| 1 MiB | 1 048 576 | TCP | 0.840 ms | 2.74 / 7.80 ms | 0 de 30 | 666.4 ¹ | 636 ¹ | 635 / 635 | 0 | 0 |
+
+¹ el eco recibió todo lo enviado: ese ritmo lo limitó quien publica (codificar y publish() en la laptop; ver «Codificar+decodificar»), no la red.
 
 Qué quiere decir cada columna:
 
+- **Codificar+decodificar**: lo que tarda esta computadora, sin red, en armar y leer un
+  mensaje de ese tamaño. Compáralo con la ida y vuelta: en la fila "máx. UDP" del
+  ejemplo, 2.2 de los 3.0 ms son eso, no la red. En Python puro es mucho más (un arreglo
+  fijo grande se codifica byte por byte).
+- **La marca ¹**: si llegó todo lo que se mandó, la red no fue el límite: lo fue quien
+  publica. No leas esa fila como "UDP es más lento que TCP".
 - **Ida y vuelta (mediana / p99)**: el tiempo típico y el tiempo de las peores 1 de
   cada 100 respuestas. Si la mediana es buena pero el p99 se dispara, la red tiene
   pausas de vez en cuando.
@@ -931,6 +943,9 @@ y por dónde contestó la Pi. Si las dos versiones de Agmen no son iguales, el b
 actualiza la Pi (`git pull`) antes de comparar números.
 
 ### Si algo falla
+
+Si la Pi deja de contestar a media medición, el banco corta ese tamaño (como mucho a los
+30 segundos) y lo dice.
 
 El banco no adivina. Si el eco de la Pi no contesta, dice tres cosas que revisar: que el
 `agmen agent` esté corriendo en la Pi y que `agmen run` diga que arrancó el nodo `eco`;
