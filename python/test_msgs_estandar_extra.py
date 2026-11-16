@@ -139,7 +139,6 @@ class TestNanCasos(unittest.TestCase):
         self.assertEqual(back.encode_payload(), raw)
 
 
-@unittest.skipUnless(shutil.which("g++") or shutil.which("clang++"), "no hay compilador de C++")
 class TestNanCppCompila(unittest.TestCase):
     """El C++ generado para los casos raros de `nan` compila (C++20, -Werror) y da los mismos bits que Python."""
 
@@ -158,6 +157,19 @@ message M {
 """
 
     def test_compila_y_mismos_bits(self):
+        # Solo en Linux, con la biblioteca estática que dejó CMake: en Windows compila MSVC (la
+        # biblioteca es agmen_core.lib) y MinGW, aunque esté en el PATH, no enlaza con ella.
+        if not sys.platform.startswith("linux"):
+            self.skipTest(f"solo corre en Linux (aquí: {sys.platform}): el mismo C++ generado ya lo compilan "
+                          "MSVC y CMake en test_msgs, valores_nan_msgs y test_estandar_usuario")
+        lib = BIN.parent / "libagmen_core.a"
+        if not lib.exists():
+            self.skipTest(f"falta {lib} (compila antes: cmake --build build)")
+        if not (BIN.parent / "generated" / "agmen" / "version.hpp").exists():
+            self.skipTest(f"falta {BIN.parent / 'generated' / 'agmen' / 'version.hpp'} (compila antes: cmake --build build)")
+        compilers = [c for c in (shutil.which("g++"), shutil.which("clang++")) if c]
+        if not compilers:
+            self.skipTest("no hay g++ ni clang++ en el PATH")
         with tempfile.TemporaryDirectory() as d:
             _write(d, "raro.agmen", self.SRC)
             subprocess.run([sys.executable, "-m", "agmen", "gen", str(Path(d) / "raro.agmen"), "--cpp", d, "--quiet"],
@@ -175,15 +187,16 @@ int main() {
 """)
             mod = gen.load(Path(d) / "raro.agmen")
             esperado = mod.M(estructuras=[mod.S(), mod.S(), mod.S()]).encode_payload().hex()
-            for cxx in filter(None, [shutil.which("g++"), shutil.which("clang++")]):
+            for cxx in compilers:
                 with self.subTest(cxx=Path(cxx).name):
                     exe = Path(d) / ("raro_" + Path(cxx).name)
                     r = subprocess.run([cxx, "-std=c++20", "-Wall", "-Wextra", "-Wpedantic", "-Wshadow", "-Wconversion",
                                         "-Wsign-conversion", "-Werror", f"-I{ROOT / 'include'}", f"-I{BIN.parent / 'generated'}", f"-I{d}",
-                                        str(Path(d) / "main.cpp"), str(BIN.parent / "libagmen_core.a"), "-lpthread",
-                                        "-lrt", "-o", str(exe)], capture_output=True, text=True)
+                                        str(Path(d) / "main.cpp"), str(lib), "-lpthread",
+                                        "-lrt", "-o", str(exe)], capture_output=True, text=True,
+                                       encoding="utf-8", errors="replace")
                     self.assertEqual(r.returncode, 0, r.stderr)
-                    out = subprocess.run([str(exe)], capture_output=True, text=True).stdout.strip()
+                    out = subprocess.run([str(exe)], capture_output=True, text=True, encoding="utf-8").stdout.strip()
                     self.assertEqual(out, esperado)
 
 
@@ -219,10 +232,12 @@ message Dron {
         v.calib = [1.0, math.nan, 3.0]
         v.id = 9
         lleno = v.encode_payload().hex()
-        exe = BIN / "test_estandar_usuario"
+        exe = BIN / ("test_estandar_usuario.exe" if sys.platform == "win32" else "test_estandar_usuario")
         if not exe.exists():
-            self.skipTest(f"falta compilar {exe} (cmake --build build)")
-        out = subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout.split("\n")
+            self.skipTest(f"falta compilar {exe} (cmake --build build --config Release); "
+                          "la comparación de bytes con C++ no se hizo")
+        out = subprocess.run([str(exe)], capture_output=True, text=True, check=True,
+                             encoding="utf-8").stdout.splitlines()
         self.assertEqual(out[0], f"vacio {vacio}")
         self.assertEqual(out[1], f"lleno {lleno}")
         self.assertEqual(out[2], "malos 0")
@@ -408,7 +423,7 @@ class TestNoCambiaLoQueExistia(unittest.TestCase):
         ref = HERE.parent / "tests" / "vectors" / "schema_ids_89f99ef.json"
         if not ref.exists():
             self.skipTest("sin tests/vectors/schema_ids_89f99ef.json")
-        esperado = json.loads(ref.read_text())
+        esperado = json.loads(ref.read_text(encoding="utf-8"))
         for nombre, sid in esperado.items():
             if nombre == "MotorCommand":      # el del tutorial (examples/tutorial/motor_command.agmen)
                 cls = gen.load(ROOT / "examples" / "tutorial" / "motor_command.agmen").MotorCommand
