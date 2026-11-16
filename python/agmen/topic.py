@@ -17,6 +17,7 @@ import time
 
 from . import hub as hubmod
 from . import hubproto as hp
+from . import relojes
 from . import wire
 from .pubsub import RawSubscriber, hub_address
 
@@ -127,10 +128,36 @@ def cmd_node_list(args) -> int:
     header = ["nodo", *(["computadora"] if remote else []), "pid", "publica", "escucha", "último latido"]
     for line in _table(rows, header):
         print(line)
-    stats = [f for op, f in hubmod.query(hub_address()) if op == "stat"]
+    msgs = hubmod.query(hub_address())
+    head = next((f for op, f in msgs if op == "state"), {})
+    for line in clock_lines(relojes.maquinas_del_hub(msgs), session_mode(head)):
+        print(line)
+    stats = [f for op, f in msgs if op == "stat"]
     for line in stats_lines(stats):
         print(line)
     return 0
+
+
+def session_mode(head: dict | None = None) -> str:
+    """El modo del reloj de la sesión, si esta herramienta lo puede saber (bloque 5, §6.2). Manda el hub: el
+    `modo` de su línea `state` (head), que le dice el puente en modo red; uno desconocido es "" (no se sabe; nunca
+    se toma por real ni por sim). 8.6: si el hub no lo dice (hub anterior, sin agmen run, caducado): "" SIEMPRE, el
+    texto condicional, aunque exista AGMEN_CLOCK (el consejo: "nunca supone real ni sim")."""
+    modos = ("real", "sim", "replay")
+    if head and "modo" in head:
+        return head["modo"] if head["modo"] in modos else ""
+    return ""
+
+
+def clock_lines(maquinas: dict, mode: str) -> list[str]:
+    """Bloque 5 (RFC 0011 §3.6, §4.1): la diferencia de reloj de cada otra computadora, debajo de la tabla. Sin
+    modo red el hub no da líneas `maq`: ninguna línea (la salida de siempre)."""
+    if not maquinas:
+        return []
+    out = ["", "# relojes de las otras computadoras (respecto al de esta)"]
+    for name in sorted(maquinas, key=lambda n: (n.lower(), n)):
+        out.append(relojes.linea_node_list(name, maquinas[name], mode))
+    return out
 
 
 def stats_lines(stats: list[dict[str, str]]) -> list[str]:

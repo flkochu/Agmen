@@ -23,6 +23,13 @@ Nodo → hub
                                                la que esta las ve; se repite cada NET_BEAT_S, caduca a
                                                los NET_EXPIRE_S; `peers=` vacío = volver a modo local.
                                                `red`, `machine`, `addr` y `net` solo desde 127.0.0.1
+          [relojes=nombre:dif:err:edad,…]      (bloque 5, RFC 0011 §3.6) la diferencia de reloj de cada una
+                                               (ns; positivo = adelantada), su incertidumbre (ns) y su edad
+                                               (ms); sin medir: nombre:-:motivo:edad (edad "-" si nunca).
+                                               Ver agmen.relojes. Un hub anterior ignora el campo
+          [modo=real|sim|replay]               (bloque 5, §6.1) el modo del reloj de la sesión (agmen run en
+                                               la laptop; el `reloj` de la sesión en el agente); sin él, "no
+                                               se sabe". El hub lo da en `state`. Un hub anterior lo ignora
     bye   id                                   el endpoint se va
     stat  node pid kind name ...               cuentas de un agmen.Node, cada segundo (RFC 0006):
                                                kind=timer: group period_ns runs late skipped
@@ -41,7 +48,11 @@ Hub → nodo
     error id msg                                registro rechazado (ej. choque de tipos)
     red_ok peers=n                              modo red aceptado: cuántas computadoras
     pong  version [red=1]                       red=1 = el hub está en modo red
-    state (varias líneas: topic ..., ep ..., stat ...)
+    state version hub robot [modo]             primera línea; `modo` (bloque 5, §6.1) solo en modo red y si el
+                                               puente lo dijo en `red` (caduca con el modo red)
+          (luego varias líneas: topic ..., ep ..., stat ...; en modo red, también una `maq` por computadora de
+          peers: `maq name ip reloj err [edad]` con la diferencia medida, o `maq name ip sin=<motivo> [edad]`
+          sin medir; quien lee `state` ignora las líneas y los campos que no conoce)
           si no cabe en un datagrama (RFC 0011 §9.1): varios, de como mucho 32 KiB, cada uno con una
           primera línea `parte i=<k> de=<m> n=<consulta>` y líneas enteras (una que sola no cabe va
           recortada, con cortado=1)
@@ -146,6 +157,7 @@ def is_topic(target: str) -> bool:
 LOCALHOST = "127.0.0.1"
 NET_BEAT_S = 2.0        # quien encendió el modo red lo repite cada tanto
 NET_EXPIRE_S = 6.0      # sin otro `red` este tiempo = vuelta a modo local
+MODOS_RELOJ = ("real", "sim", "replay")   # bloque 5 (§6.1): los valores de `modo` en `red` y en `state`
 NET_LOCAL_WARN_S = 5.0  # un Subscriber local que sigue sin net=1 tras este tiempo: aviso
 MACHINE_RE = re.compile(r"^[A-Za-z0-9_-]+$")   # como [[machine]] name en robot.toml
 

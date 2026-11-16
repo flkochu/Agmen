@@ -64,6 +64,10 @@
   .machine .mdetail { color: var(--muted); }
   .machine.off .mdetail, .node.off .meta { color: var(--warn); }
   .node .name .mach { color: var(--muted); font-weight: 400; }
+  /* el reloj de cada computadora (bloque 5, RFC 0011 §3.6): rojo mientras esté corrido, gris sin medir */
+  .machine .mclock { color: var(--muted); }
+  .machine .mclock.mal, .mwhy { color: var(--bad); }
+  .mwhy { font: 12px/1.4 var(--mono); padding: 0 0 4px 18px; }
   .tag { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
 
   /* manejar */
@@ -355,6 +359,21 @@ function renderMachines(box, list) {
     line.querySelector(".mhost").textContent = `(${m.host})`;
     line.querySelector(".mdetail").textContent = m.detail || m.state;
     wrap.appendChild(line);
+    if (m.clock) {                                   // bloque 5: la diferencia de su reloj con el de aquí (como texto)
+      const c = m.clock, span = document.createElement("span");
+      span.className = "mclock" + (c.state === "mal" ? " mal" : "");
+      span.textContent = (c.state === "mal" ? "⚠ " : "") + "· " + (c.text || "reloj sin medir") +
+        (c.state === "sin_medir" ? ` (${c.why})` : c.why && c.state !== "mal" ? ` (${c.why})` : "");
+      span.title = c.why || "";
+      line.lastElementChild.appendChild(document.createTextNode(" "));
+      line.lastElementChild.appendChild(span);
+      if (c.state === "mal") {                       // C4: fijo y en rojo, con el qué hacer, mientras siga mal
+        const why = document.createElement("div");
+        why.className = "mwhy";
+        why.textContent = `el reloj de ${m.name} ${c.why}`;
+        wrap.appendChild(why);
+      }
+    }
   }
   box.appendChild(wrap);
 }
@@ -860,7 +879,8 @@ function onState(m) {
   document.querySelector(".logs").style.display = m.managed ? "" : "none";  // agmen web: no hay nodos que mostrar
   const key = JSON.stringify([m.nodes.map((n) => [n.name, n.state, n.restarts, n.pid, Math.floor((n.uptime || 0)),
                                                   n.machine, n.known_state]),
-                              state.machines.map((x) => [x.name, x.state, x.detail])]);
+                              state.machines.map((x) => [x.name, x.state, x.detail,
+                                                         x.clock ? [x.clock.text, x.clock.state, x.clock.why] : null])]);
   if (key !== onState.nodesKey) {
     const names = JSON.stringify(m.nodes.map((n) => n.name));
     const namesChanged = names !== onState.names;
@@ -899,7 +919,9 @@ function updateStats(g) {
   renderTopics(topics);
   const s = topics[focus] || g;    // las tarjetas muestran el topic con el foco
   $("rate").textContent = (s.rate_hz ? s.rate_hz.toFixed(0) + " Hz" : "0 Hz") + (s.bytes_s >= 100000 ? ` · ${(s.bytes_s / 1e6).toFixed(1)} MB/s` : "");
-  $("lat").textContent = s.latency_ms == null ? "—" : s.latency_ms.toFixed(2) + " ms";
+  $("lat").textContent = s.latency_ms == null ? "—" : s.latency_ms.toFixed(2) + " ms" +
+    (s.latency_fix === "sin_corregir" ? " (sin corregir)" : "");   // bloque 5: de otra computadora (§4.3)
+  $("lat").title = s.latency_note || "";
   $("lost").textContent = s.lost; $("errors").textContent = g.errors;
   $("source").textContent = s.type ? `${s.topic || "(sin topic)"} · ${s.type} · ${s.source}` : `esperando en ${g.listening}`;
   $("schema").textContent = s.schema || "";

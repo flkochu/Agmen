@@ -432,7 +432,7 @@ def _run(args) -> int:
             stop.set()
     bridge = None
     if remotes and config.hub and not stop.is_set():   # 4b: el puente con los robots (antes de arrancar los nodos)
-        bridge = _bridge_for(launcher, remotes)
+        bridge = _bridge_for(launcher, remotes, "replay" if args.play else config.clock.mode)
     if not stop.is_set():   # una computadora se perdió (o Ctrl+C) mientras se preparaba lo de aquí: no se arranca
         launcher.start_all()
         if not ctrl_c.pressed:
@@ -514,21 +514,22 @@ def _key_hint(name: str, source: str, code: str) -> str:
                        f"en la terminal de {name}"}[source]
 
 
-def _bridge_for(launcher, remotes: dict):
+def _bridge_for(launcher, remotes: dict, modo: str = ""):
     """El puente de agmen run (RFC 0011 parte 4b): un hilo con el hub de aquí y un Peer por cada robot. Si no
-    se puede arrancar, se dice y todo sigue sin topics entre computadoras."""
+    se puede arrancar, se dice y todo sigue sin topics entre computadoras. `modo`: el del reloj de la sesión (el
+    mismo que va a los agentes), que el puente le dice al hub en `red` (bloque 5, §6.1)."""
     from .pubsub import hub_address
     from .tables import Bridge
 
     try:
-        bridge = Bridge(hub_address(), launcher.say, robots=len(remotes) > 1)
+        bridge = Bridge(hub_address(), launcher.say, robots=len(remotes) > 1, modo=modo)
         bridge.start()
     except Exception as e:
         launcher.say(f"⚠ no pude arrancar el puente de topics con las otras computadoras ({e!r}): los topics no "
                      f"cruzan entre computadoras", "error")
         return None
     for name, link in remotes.items():
-        link.bridge(bridge.add_peer(name, link.send_table))
+        link.bridge(bridge.add_peer(name, link.send_table, reloj=link.clock_state))   # (bloque 5: y su reloj)
     return bridge
 
 
@@ -564,6 +565,7 @@ def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list
 
             launcher.say(f"conectando con {name} ({link.shown})…")
             link.on_lost = on_lost   # ANTES de open(): una pérdida justo después de abrir no se olvida
+            link.watch_clock(clock)  # bloque 5: los avisos del reloj (solo en una sesión real)
             try:
                 link.open(key, session_message(config, name, clock, desde, sonda=net_check), on_key_ok=keep,
                           stop=stop)

@@ -194,6 +194,23 @@ abre, lo recorta y lo junta; para entender los mensajes basta este documento.
   JavaScript (`python/agmen/panel/mcap.js`, el del panel) y la biblioteca
   oficial de MCAP. Los tres leen igual el vector
   [`tests/vectors/grabacion.mcap`](../tests/vectors/grabacion.mcap).
+- **La diferencia de relojes** (desde 0.14.0, bloque 5, RFC 0011 §3.6). Si hubo otra
+  computadora con medición, `agmen record` (y `agmen run --record`) guarda en
+  `agmen.grabacion` la clave opcional `relojes`, con un objeto JSON en texto:
+  `{"<computadora>": {"inicio_ns", "fin_ns", "min_ns", "max_ns", "error_ns",
+  "muestras"}}`. Cada valor es la diferencia respecto a la computadora que graba
+  (positivo = la otra va adelantada), tomada al empezar, cada ~10 s y al terminar.
+  `inicio_ns` y `fin_ns` son la primera y la última medida; `min_ns` y `max_ns`, la
+  mínima y la máxima; `error_ns` es la mayor incertidumbre, y `muestras` cuántas
+  medidas se usaron. Sin otras computadoras, o sin ninguna medición, la clave no
+  aparece: la grabación es igual a la de antes. `agmen info` la muestra.
+- Al cerrar, si hubo `relojes`, el grabador escribe un **segundo** registro
+  `agmen.grabacion`, igual al primero más esa clave. Los lectores de Python
+  (`agmen info`, `agmen.Recording`) usan el último. El visor del panel usa el
+  primero, que no la trae. Si el grabador muere antes de cerrar, queda solo el primero.
+  - Pendiente de decisión del autor: pasarlo a un registro aparte `agmen.relojes`.
+- Riesgo aceptado: un salto brusco del reloj a media grabación no se reconstruye
+  (se consulta cada ~10 s); la mínima y la máxima solo lo delatan.
 
 ## Topics de Agmen
 
@@ -411,6 +428,60 @@ agmen-hub/1 ep id=a1 kind=sub node=imu pid=4321 topic=/imu …
 - **Un cliente anterior** lee solo el primer datagrama: ve una lista **parcial**. Antes
   de la 4b no veía nada, así que es una mejora, no un cambio de formato.
 
+#### Relojes y modo en `red` y `state` (desde 0.14.0, bloque 5)
+
+El puente (el de la laptop o el del agente) manda dos campos opcionales en la misma
+línea `red` que cada 2 s. Un hub anterior los ignora, y sin modo red no cambia nada:
+
+```
+agmen-hub/1 red peers=robot%40192.168.1.20 relojes=robot:35000000:600000:412 modo=real
+```
+
+- `relojes=<entrada>,…`: una entrada por computadora. Medida:
+  `<nombre>:<dif_ns>:<err_ns>:<edad_ms>`, con `dif` con signo respecto a quien manda
+  la línea (positivo = esa computadora va adelantada). Sin medir:
+  `<nombre>:-:<motivo>:<edad_ms>`, con la edad en `-` si nunca hubo medición. Los
+  motivos son los de [La diferencia de relojes](#la-diferencia-de-relojes-relojes-desde-0140).
+- `modo=real|sim|replay`: el modo del reloj de la sesión. La laptop lo sabe por
+  `agmen run`; el agente, por el `reloj` de su `sesion`. Sin `modo`, el hub dice que
+  no se sabe.
+
+El hub guarda cada entrada con la hora a la que llegó, y `state` da dos cosas nuevas:
+
+- En la **cabecera**, `modo=…`. Solo en modo red, y solo si el puente lo dijo:
+
+```
+agmen-hub/1 state version=0.14.0 hub=127.0.0.1:7390 robot=… modo=real
+```
+
+- Al **final** de `state`, una línea `maq` por cada computadora de `peers`, y otra por
+  cada computadora que el puente nombró sin conexión (esas no llevan `ip`):
+
+```
+agmen-hub/1 maq name=robot ip=192.168.1.20 reloj=35000000 err=600000 edad=0.4
+agmen-hub/1 maq name=robot ip=192.168.1.20 sin=vieja edad=12.3
+agmen-hub/1 maq name=otra sin=sin_conexion
+```
+
+Campos de `maq`: `name`; `ip` (solo las de `peers`); `reloj` y `err` (ns, si hay
+medición vigente); `sin` (el motivo, si no la hay); `edad` (segundos con un decimal:
+hace cuánto es la última medición que el hub sabe).
+
+**Caducidades.** La edad de una medición es la `edad` que trae la entrada más el tiempo
+que lleva en el hub. Pasados 10 s, la medición ya no cuenta y sale `sin=vieja`, aunque
+la línea `red` siga llegando cada 2 s. `modo` y `relojes`
+se borran cuando el hub vuelve a modo local (un `red` sin `peers`, o 6 s sin `red`),
+así que `modo=` solo aparece mientras el modo red está encendido.
+
+**Compatibilidad.**
+
+- Sin `relojes` ni `modo` en `red` (puente anterior, o sin medición), el hub no da
+  `maq` ni `modo=`.
+- Sin modo red, `state` sale **byte a byte igual** que antes: no hay `maq` ni `modo=`.
+- Un hub anterior ignora `relojes=` y `modo=` del `red`, y no da `maq`.
+- Quien no conoce `maq` o `modo=` los ignora. `agmen node list` toma solo las líneas
+  `maq` de la respuesta.
+
 ### Qué hacen los nodos (desde 0.14.0)
 
 Los nodos cambian solo cuando su hub está en modo red. Con el modo local, sus bytes y
@@ -601,6 +672,10 @@ JSON sea un objeto con `"op"`. Si algo falla, cierra la conexión.
   - `sonda`: `1` si la laptop va a hacer la prueba de red con este agente (solo va con
     `tablas`; con `--no-net-check` no va). Desde la 4c; ver
     [La prueba de red](#la-prueba-de-red-sonda-desde-0140).
+  - `relojes`: `1` si la laptop mide la diferencia de relojes con este agente (desde
+    el bloque 5, la laptop siempre lo dice; ver
+    [La diferencia de relojes](#la-diferencia-de-relojes-relojes-desde-0140)). No es lo
+    mismo que `reloj` (arriba): ese es el modo del reloj (`real`, `sim` o `replay`).
   - `nodos`: objeto de nombre → lo escrito de ese nodo, con las claves `cmd`,
     `env`, `cwd`, `restart`, `autostart` y `profile`. Una clave que no está
     escrita no aparece.
@@ -613,11 +688,17 @@ JSON sea un objeto con `"op"`. Si algo falla, cierra la conexión.
 - `ping`: `t` (un número). El agente lo repite en `pong`. El primer `ping` de una
   conexión reanudada se manda en seguida, sin esperar los 2 s: es el que confirma
   la reanudación.
+  - Desde el bloque 5, si el agente dijo `relojes`: además `reloj`, con la mejor
+    medición vigente de la laptop (`{"dif", "err", "edad"}`) o `{}` si no hay
+    ninguna. Sin `relojes` del agente, el `ping` no lleva `reloj`. Ver
+    [La diferencia de relojes](#la-diferencia-de-relojes-relojes-desde-0140).
 - `reanudar`: `sesion` (el identificador que dio `sesion_ok`) y `logs`
   (`{nodo: k}`, el último `n` de `log` que la laptop recibió de ese nodo; `"agmen"`
   también cuenta; un nodo que no aparece vale 0). Solo como primer mensaje de una
   conexión nueva, para volver a una sesión que sigue en gracia (ver
   [La gracia y reanudar](#la-gracia-y-reanudar)).
+  - Desde el bloque 5, `relojes: 1` igual que en `sesion`, si la laptop mide la
+    diferencia de relojes.
 
 Ejemplo de un `reanudar` (la firma va al final, aquí se omite):
 
@@ -645,6 +726,10 @@ Ejemplo de un `sesion` (la firma va al final de la línea, aquí se omite):
     red con esta laptop (ver [La prueba de red](#la-prueba-de-red-sonda-desde-0140)).
     Con `sonda` y sin haber contestado antes `sonda_espera`, la laptop no cuenta
     ninguna prueba (es un agente que no esperó a la prueba).
+  - Desde el bloque 5, además: `relojes: 1` si el agente mide la diferencia de
+    relojes. Solo lo dice si la laptop lo dijo en `sesion`. Si no lo dice, es un
+    agente anterior: sus `ping` y `pong` son los de antes, y la laptop dice «sin
+    medir» (ver [La diferencia de relojes](#la-diferencia-de-relojes-relojes-desde-0140)).
 - `sesion_error`: `codigo` y `texto`. El agente cierra después de mandarlo.
   - `ocupado`: ya hay otra laptop conectada (el texto dice desde qué IP). Si esa
     laptop se cortó y el agente la tiene en gracia, el texto dice cuántos segundos
@@ -678,7 +763,10 @@ Ejemplo de un `sesion` (la firma va al final de la línea, aquí se omite):
   64 órdenes pendientes. Desde la 4c, también cualquier orden que no sea `ping`,
   `adios`, `sonda` o `sigue` mientras el agente espera la prueba de red.
 - `pong`: `t`. Repite el `t` del `ping` si es un número o un texto de hasta 64
-  caracteres; si no, `null`.
+  caracteres; si no, `null`. Desde el bloque 5, si la laptop mandó `reloj` en ese
+  `ping` y los dos dijeron `relojes`, además `reloj`: `{"rx", "tx", "res"}` (ver
+  [La diferencia de relojes](#la-diferencia-de-relojes-relojes-desde-0140)). El `pong`
+  sale antes que los `log` y las tablas que el agente tenga en cola.
 
 - `reanudar_ok`: `nodos` (como en `sesion_ok`, con el estado actual de cada nodo),
   `gracia`, y `perdidos` solo si hay alguno: `{nodo: cuántas}`, las líneas de `log`
@@ -687,6 +775,7 @@ Ejemplo de un `sesion` (la firma va al final de la línea, aquí se omite):
   Desde la 4b, `tablas` y `sin_tablas` van igual que en `sesion_ok`. Desde la 4c,
   `sonda: 1` va junto a `tablas`, si el agente hace la prueba de red (ver
   [La prueba de red](#la-prueba-de-red-sonda-desde-0140)).
+  Desde el bloque 5, `relojes: 1` igual que en `sesion_ok`.
 - `adios`: `motivo` (texto corto, por ejemplo `Ctrl+C` o `SIGTERM`). Ver
   [Despedida del agente](#despedida-del-agente).
 
@@ -1110,6 +1199,92 @@ topics no cambian por esto: la firma de `agmen-agent/1` protege la conexión de 
 - Los mensajes nuevos (`reanudar`, `reanudar_ok`, `adios`) van firmados igual que los
   de antes, con el mismo `n` y la misma forma de la línea. El formato de la red no
   cambió.
+
+### La diferencia de relojes (`relojes`, desde 0.14.0)
+
+> Bloque 5 del RFC 0011 (§3.6). Se mide y se avisa: **ningún `t_data` cambia**.
+> Sincronizar los relojes es del nivel 11.
+
+Cada 2 s, la laptop mide la diferencia entre su reloj y el del agente con cuatro
+marcas de tiempo, como NTP. El reloj que se mide es la hora «de pared» de cada
+computadora, la misma que Agmen pone en `t_data` en modo `real`.
+
+**Capacidad.** Cada lado dice `"relojes": 1` en su mensaje de inicio: la laptop en
+`sesion` y en `reanudar`, y el agente en `sesion_ok` y en `reanudar_ok`. Solo si los
+dos lo dijeron, el `ping` lleva `reloj` y el `pong` lo contesta. (La clave `reloj` de
+`sesion` ya existía y es el modo del reloj; `relojes` es la capacidad nueva.)
+
+**Las marcas.** Cada una es un entero en nanosegundos desde 1970:
+
+| Marca | Quién la anota | Cuándo |
+|---|---|---|
+| `t1` | laptop | Justo antes de mandar el `ping` |
+| `rx` | agente | Al recibir la línea del `ping` |
+| `tx` | agente | Justo antes de escribir el `pong` en la conexión (lo escribe el hilo que manda) |
+| `t4` | laptop | Al recibir el `pong` |
+
+**Lo que viaja.**
+
+```
+laptop → agente   {"op":"ping","t":1.5,"reloj":{"dif":35000000,"err":600000,"edad":412}} <firma>
+agente → laptop   {"op":"pong","t":1.5,"reloj":{"rx":…,"tx":…,"res":100}} <firma>
+```
+
+- `ping` → `reloj`: la mejor medición vigente de la laptop, o `{}` si no tiene
+  ninguna. Sus campos son `dif` (ns, con el signo de la laptop), `err` (la
+  incertidumbre, ns) y `edad` (ms: hace cuánto se hizo esa medición). El agente la
+  da por tomada hace `edad` ms, no «ahora», y la caduca a los 10 s. Un `{}` borra la
+  que tenía: pasa a «sin medir».
+- `pong` → `reloj`: `rx` y `tx` (ns, del agente). `res` (ns, opcional) es la
+  resolución del reloj de pared del agente; solo va si no es cero. Las marcas que no
+  sean enteros, que queden fuera de rango, o con `tx` menor que `rx`, son «mal
+  formadas»: se ignoran y se dice una vez. Nada tumba la sesión.
+
+**La fórmula (la hace la laptop).** La diferencia es del reloj del agente respecto al
+de la laptop:
+
+```
+dif         = ((rx − t1) + (tx − t4)) / 2        (división entera, en ns)
+ida y vuelta = (t4 − t1) − (tx − rx)
+err          = ida y vuelta / 2 + res_laptop + res_agente
+```
+
+- **Signo:** `dif` positivo significa que el reloj del agente va **adelantado**
+  respecto al de la laptop. Por eso `dif = +35000000` quiere decir +35 ms.
+- Una ida y vuelta mayor de 2 s (2 000 000 000 ns), o negativa más allá de la suma
+  de las dos resoluciones, es absurda: la medición se descarta y se dice una vez.
+  Una ida y vuelta negativa dentro de esa resolución cuenta como 0.
+- Se guardan las últimas **8** mediciones y se usa la de **menor ida y vuelta** entre
+  las que tienen menos de 10 s. Si hay empate, gana la más nueva.
+
+**Estados.** Una medición vigente es la que tiene menos de 10 s (`RELOJ_VIGENTE_S`).
+Sin ella, la computadora está «sin medir», con su motivo. Nunca se muestra un 0 ni
+un valor viejo como si fuera actual:
+
+| Motivo | Texto |
+|---|---|
+| `esperando` | aún no hay medición |
+| `anterior` | el otro lado tiene un Agmen anterior, que no mide el reloj |
+| `vieja` | no hay una medición de los últimos 10 s |
+| `sin_conexion` | sin conexión con esa computadora |
+| `sin_dato` | el hub no recibió la medición |
+| `descartadas` | las mediciones salen absurdas: ¿la red tarda más de 2 s? |
+
+El agente guarda la medición de la laptop con el signo cambiado (la diferencia de la
+laptop respecto al agente) y la pasa a su propio hub en `red`, con el nombre de la
+laptop. Así `agmen node list` en el robot también la muestra.
+
+**Compatibilidad.** Nada de esto cambia los bytes de lo que ya existía:
+
+- **Agente anterior** (no dice `relojes`): la laptop no pone `reloj` en ningún
+  `ping`. Los `ping` y `pong` son exactamente los de antes, desde el primero. La
+  laptop dice una vez que el agente es anterior, y su estado es «sin medir» con el
+  motivo `anterior`.
+- **Laptop anterior** (no dice `relojes` en `sesion`): el agente no recibe `reloj` y
+  no contesta con `reloj`. Su terminal dice una vez que la laptop tiene un Agmen
+  anterior, y su estado es «sin medir» con el motivo `anterior`.
+- **Una sesión que se pierde** (sin conexión): la medición deja de contar y el estado
+  es «sin medir» con el motivo `sin_conexion`.
 
 ### Vectores de `agmen-agent/1`
 

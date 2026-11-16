@@ -17,8 +17,8 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   panel con varias computadoras, el servicio de arranque y el capítulo 18 (parte
   3c, abajo), la base de los topics entre computadoras (parte 4a, abajo) y el puente
   que pasa las tablas de topics (parte 4b, abajo), y la prueba de red y lo visible en
-  herramientas y panel (parte 4c, abajo). Falta: los relojes (bloque 5 del plan del RFC)
-  y el cierre del nivel.
+  herramientas y panel (parte 4c, abajo), y los relojes de las dos computadoras (bloque
+  5, abajo: se miden, se avisan y se guardan en las grabaciones). Falta: el cierre del nivel.
 
 ### Agregado
 - **Perfiles en `robot.toml`** (RFC 0011 §3.2): `profile = "real"`, `"sim"`,
@@ -186,16 +186,46 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   `docs/PROTOCOLO.md` ("La prueba de red").
 - **Capítulo 18 del tutorial**: la sección 10, "La prueba de red: el firewall"; la de topics
   muestra la columna `publica`, `topic info`, `node list` y la etiqueta del panel.
-- **Lo que todavía no existe**: medir la diferencia de reloj entre computadoras (bloque 5).
-  Dos robots no se pasan topics entre sí. Una laptop a la vez por agente.
+- **Lo que todavía no existe**: sincronizar los relojes entre computadoras (nivel 11; el
+  bloque 5 solo los mide y avisa). Dos robots no se pasan topics entre sí. Una laptop a
+  la vez por agente.
 - **Capítulo 5 del tutorial, sección 7**: resumen de `[[machine]]`, qué corre en
   cada computadora y por qué el hardware va con `profile = "real"`.
 - **Capítulo 18 del tutorial, "Un robot, varias computadoras"**: el recorrido de
   dos computadoras con `robot_dos.toml`, la clave, el agente como servicio y qué
   pasa cuando se cae el WiFi, con salidas reales de las pruebas. Desde la parte 4b, su
   sección 10 explica los topics entre la laptop y la Pi (sin salidas de prueba aún).
+- **Los relojes de las dos computadoras** (bloque 5, RFC 0011 §3.6): `agmen run` mide cada
+  2 s la diferencia entre el reloj de la laptop y el de cada robot, con las cuatro marcas
+  de tiempo de NTP. Solo se mide y se avisa: ningún `t_data` cambia.
+  - **Avisos**: en sesión real, `agmen run` avisa cuando la diferencia pasa de 10 ms, con
+    qué hacer (chrony en Linux o Raspberry Pi, `w32tm /resync` en Windows); dice cuando
+    vuelve a estar bien (menos de 8 ms) y recuerda cada 10 minutos mientras siga mal. En
+    simulación y reproducción no avisa, y no corrige nada.
+  - **`agmen node list`** muestra una línea por computadora (`robot: reloj +2.1 ms
+    (±0.6)`), o «sin medir» con su motivo. Sin otras computadoras, la salida es la de
+    siempre. En simulación dice `(no afecta en sim)`.
+  - **El panel** muestra el reloj de cada computadora, en rojo y con qué hacer si está
+    corrido. Las latencias de un topic que sale de otra computadora se corrigen con la
+    diferencia en sesión real; si no se pueden corregir, se marcan `(sin corregir)`.
+  - **`agmen record`** guarda en `agmen.grabacion` la clave `relojes`, con un resumen por
+    computadora (diferencia al empezar y al terminar, mínima, máxima, incertidumbre y
+    muestras). Al cerrar se escribe un segundo registro `agmen.grabacion` con esa clave;
+    `agmen info` la muestra. Lo que queda pendiente de decisión del autor está en
+    `docs/PROTOCOLO.md`.
+  - **Protocolo**: `agmen-agent/1` gana la capacidad `"relojes": 1` y las claves `reloj` de
+    `ping` y `pong`; `agmen-hub/1` gana `relojes=` y `modo=` en `red`, y la línea `maq` en
+    `state`. Todo es añadido: un lado anterior sigue funcionando y la medición queda «sin
+    medir». Formato en `docs/PROTOCOLO.md`.
+  - **Capítulo 18 del tutorial, sección 12**: los relojes de las dos computadoras, para
+    estudiantes.
 
 ### Cambiado
+- **En Windows con Python 3.12 o anterior, el reloj de Agmen en modo real lee la hora del
+  sistema con resolución fina.** Antes, la hora de los nodos en Python puro avanzaba de
+  ~15.6 ms en ~15.6 ms. Ahora se lee `GetSystemTimePreciseAsFileTime` (100 ns), el mismo
+  reloj del sistema que ya usaban los nodos de C++ y Python 3.13. Si no se puede leer,
+  Agmen lo dice una vez y sigue con la hora de siempre.
 - **Con la prueba de red, el robot espera antes de preparar nada** (parte 4c, RFC 0011 §5):
   cuando la laptop y el agente hacen la prueba (con puente), el agente no corre su
   `[robot] before` ni arranca su hub hasta que la laptop diga `sigue`. Antes, esto corría al

@@ -299,11 +299,14 @@ class Peer:
     """La otra computadora de UNA conexión del agente: su nombre, la IP con la que este lado la ve (la pone
     el que recibe), si la conexión está confirmada, la última tabla completa que mandó y lo que de ella
     está registrado en el hub. `send(obj)` manda un mensaje por la conexión (desde el hilo de este Peer:
-    si la otra punta no lee, no frena al puente)."""
+    si la otra punta no lee, no frena al puente). `reloj()` (bloque 5; None: no se sabe): la diferencia de reloj
+    de esa computadora (un relojes.Estado), que el puente pasa al hub en `red`."""
 
-    def __init__(self, bridge: Bridge, name: str, send: Callable[[dict], None]) -> None:
+    def __init__(self, bridge: Bridge, name: str, send: Callable[[dict], None],
+                 reloj: Callable[[], object] | None = None) -> None:
         self.bridge = bridge
         self.name = name
+        self.reloj = reloj
         self.ip: str | None = None
         self.confirmed = False
         self.table: tuple[list[dict], list[dict]] | None = None   # (pubs, subs) del otro, validados
@@ -510,7 +513,7 @@ class Bridge:
 
     def __init__(self, hub: str, say: Callable[[str, str], None], *, robots: bool = False,
                  beat: float = hp.BEAT_S, owned: Callable[[], list[int]] | None = None,
-                 session: str = "simulación") -> None:
+                 session: str = "simulación", modo: str = "") -> None:
         self.hub = hub
         self.session = session   # cómo se llama la sesión en el aviso de §9.2: "simulación" o "reproducción"
         # §9.2: en una sesión de simulación o reproducción (del lado del robot), los pids de los nodos que arrancó el
@@ -537,6 +540,14 @@ class Bridge:
         self._stop = threading.Event()
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
+        # Bloque 5 (§6.1): el modo del reloj de la sesión (real, sim o replay), que va en `modo` de cada `red` para
+        # que las herramientas sueltas (agmen node list) lo sepan por el hub. "" = no se sabe: `red` sin `modo`.
+        # Uno desconocido no tumba el puente (los topics cruzan igual): se dice y el hub queda sin saberlo.
+        self.modo = modo if modo in hp.MODOS_RELOJ else ""
+        if modo and not self.modo:
+            self.say_once(("modo",), f"⚠ el puente de topics recibió un modo de reloj desconocido ({modo[:40]!r}; "
+                                     f"conozco real, sim y replay): no se lo digo al hub y agmen node list no "
+                                     f"sabrá si la sesión usa el reloj real", "error")
 
     def say_once(self, key, text: str, kind: str = "agmen") -> None:
         with self._said_lock:
@@ -555,8 +566,8 @@ class Bridge:
         except Exception:
             pass
 
-    def add_peer(self, name: str, send: Callable[[dict], None]) -> Peer:
-        peer = Peer(self, name, send)
+    def add_peer(self, name: str, send: Callable[[dict], None], reloj: Callable[[], object] | None = None) -> Peer:
+        peer = Peer(self, name, send, reloj)
         with self.lock:
             self.peers.append(peer)
         return peer
@@ -604,6 +615,7 @@ class Bridge:
         now = time.monotonic()
         with self.lock:
             peers = [p for p in self.peers if p.confirmed and p.ip]
+            perdidos = [p for p in self.peers if not (p.confirmed and p.ip)]   # 8.6: sin conexión ahora
         local = self._read_hub(now, [p.name for p in peers])
         if local is not None and peers:
             parts = self._parts(*local)
@@ -613,7 +625,9 @@ class Bridge:
         active = sorted((p.name, p.ip) for p in peers)
         if active:
             if active != self._red or now - self._red_at >= hp.NET_BEAT_S:
-                lines.append(hp.encode("red", peers=hp.format_peers(active)))
+                modo = {"modo": self.modo} if self.modo else {}
+                lines.append(hp.encode("red", peers=hp.format_peers(active), **self._relojes(peers, perdidos),
+                                       **modo))
                 self._red, self._red_at = active, now
         else:
             self._red = None   # deja de repetir `red`: el hub vuelve a modo local en NET_EXPIRE_S
@@ -631,6 +645,29 @@ class Bridge:
         self._drain()
         if self.robots:
             self._robots(peers)
+
+    def _relojes(self, peers: list[Peer], perdidos: list[Peer] = ()) -> dict[str, str]:
+        """Bloque 5: el campo `relojes` de `red` (vacío si ningún Peer sabe su reloj: el `red` de siempre). 8.6: una
+        computadora declarada con la que se perdió la conexión (`perdidos`, fuera de `peers`) va solo como «sin medir
+        (sin conexión)», para que node list y el panel no la pierdan de vista."""
+        from . import relojes
+
+        known = []
+        activos = {p.name for p in peers}
+        todos = [(p, True) for p in peers] + [(p, False) for p in perdidos if p.name not in activos]
+        for p, activo in sorted(todos, key=lambda x: x[0].name):
+            if p.reloj is None:
+                continue
+            try:
+                e = p.reloj()
+            except Exception as err:   # nunca en silencio; el `red` sale igual (esa computadora, sin medir)
+                self.say_once(("reloj", p.name), f"⚠ no pude leer la diferencia de reloj de {p.name} "
+                                                 f"({repr(err)[:200]}): queda «sin medir»", "error")
+                continue
+            if not activo:
+                e = relojes.Estado(False, edad_s=e.edad_s, motivo="sin_conexion")
+            known.append((p.name, e))
+        return {"relojes": relojes.formato_red(known)} if known else {}
 
     def _send(self, data: bytes) -> None:
         if len(data) > HUB_LINE_MAX:   # (no debería pasar: hub_lines no las arma) nunca en silencio
