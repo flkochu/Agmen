@@ -25,6 +25,7 @@ Requiere haber compilado antes (usa build/bin/publisher). Solo librería estánd
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -503,6 +504,21 @@ def main():
         check("agmen topic list dice de qué computadora sale cada topic (publica: robot / aquí)",
               "publica" in lista and "robot" in filas.get("/imu", "") and "robot" in filas.get("/grande", "")
               and "aquí" in filas.get("/ping", "") and "robot" not in filas.get("/ping", ""), lista)
+
+        # --- 4b. la diferencia de relojes (bloque 5, RFC 0011 §3.6): agmen node list la muestra. Las dos
+        # "computadoras" comparten el reloj del kernel (en los dos modos): la diferencia medida tiene que ser chica.
+        nodos, dif = "", None
+        patron = re.compile(r"^robot: reloj ([+-][0-9.]+) ms \(±([0-9.]+)\)", re.M)
+        fin = time.monotonic() + 30
+        while time.monotonic() < fin:   # la primera medición tarda un ping (cada 2 s) y un `red` del puente
+            nodos = cli("laptop", ["node", "list"]).stdout
+            m = patron.search(nodos)
+            if m:
+                dif = float(m.group(1))
+                break
+            time.sleep(0.5)
+        check("agmen node list muestra el reloj del robot (robot: reloj ±X ms) y, con el mismo reloj del kernel, "
+              "la diferencia es chica (|dif| < 5 ms)", dif is not None and abs(dif) < 5.0, nodos)
 
         # --- 5. el mensaje grande (TCP) y sin memoria compartida
         ok_grande = wait_for(lambda: (mar / "grande_ok").exists(), 30)

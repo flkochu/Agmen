@@ -406,18 +406,24 @@ class TestHub(unittest.TestCase):
 
 
 class TestHerramientasIgnoranMaq(unittest.TestCase):
-    """§2.2: agmen topic list/info y node list de hoy ignoran la línea `maq`: su salida no cambia."""
+    """§2.2: agmen topic list/info ignoran la línea `maq`: su salida no cambia. (agmen node list sí la usa desde la
+    parte B, §4.1: ver test_relojes_ver.py; aquí se comprueba que la tabla y las cuentas no cambian.)"""
 
     def test_salida_igual(self):
         extra = hp.parse("\n".join([hp.line("maq", name="robot", ip="192.168.1.20", reloj=-35000000, err=600000,
                                             edad="1.5"),
                                     hp.line("maq", name="pi", ip="192.168.1.30", sin="anterior")]).encode())
-        for fn, kw in (("cmd_list", {}), ("cmd_info", {"topic": "/imu"}), ("cmd_node_list", {})):
+        for fn, kw in (("cmd_list", {}), ("cmd_info", {"topic": "/imu"})):
             with self.subTest(fn=fn):
                 self.assertEqual(TM.corre(fn, TM.lineas() + extra, **kw), TM.corre(fn, TM.lineas(), **kw))
-        for fn, kw in (("cmd_list", {}), ("cmd_node_list", {})):
-            with self.subTest(fn=fn, machine=True):
-                self.assertEqual(TM.corre(fn, TM.lineas("robot") + extra, **kw), TM.corre(fn, TM.lineas("robot"), **kw))
+        with self.subTest(fn="cmd_list", machine=True):
+            self.assertEqual(TM.corre("cmd_list", TM.lineas("robot") + extra), TM.corre("cmd_list", TM.lineas("robot")))
+        for machine in (None, "robot"):
+            with self.subTest(fn="cmd_node_list", machine=machine):
+                con = TM.corre("cmd_node_list", TM.lineas(machine) + extra).split("\n")
+                sin = TM.corre("cmd_node_list", TM.lineas(machine)).split("\n")
+                i = con.index("# relojes de las otras computadoras (respecto al de esta)")
+                self.assertEqual(con[:i - 1] + con[i + 3:], sin)   # (la línea en blanco, el título y las dos)
         # el puente (tablas.local_table) tampoco se fija en ella
         self.assertEqual(T.local_table(TM.lineas() + extra), T.local_table(TM.lineas()))
 

@@ -36,7 +36,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from . import _mcap, _shm, clock, wire
+from . import _mcap, _shm, clock, relojes, wire
 from . import hub as hubmod
 from ._version import __version__
 from .pubsub import _Receiver, hub_address
@@ -45,6 +45,7 @@ PROFILE = "agmen"
 ENCODING = "agmen"
 STATUS_EVERY_S = 2.0
 WARN_EVERY_S = 5.0
+CLOCKS_EVERY_S = 10.0         # bloque 5: cada cuánto se anota la diferencia de relojes de las otras computadoras
 UNKNOWN_WAIT_S = 3.0          # un mensaje de un topic que aún no se conoce espera a su anuncio
 
 
@@ -216,6 +217,13 @@ class Recorder:
         self._last_status = 0.0
         self._last_warn: dict[str, float] = {}
         self._clock_warned = False
+        # Bloque 5 (RFC 0011 §3.6, §4.4): la diferencia de reloj de las otras computadoras, de las líneas `maq` del
+        # hub (al empezar, cada ~10 s y al terminar), por archivo. Sin modo red: nada (la grabación de siempre).
+        self._clocks = relojes.Resumen()
+        self._clocks_now = threading.Event()
+        self._clocks_seen = False   # ¿el hub dio alguna vez líneas `maq`? (si no, al terminar no se le pregunta)
+        self._clk: threading.Thread | None = None
+        self._meta: dict[str, str] = {}
         self._rate_in: collections.deque = collections.deque()    # (monotonic, bytes) de los últimos 2 s
         self._rate_out: collections.deque = collections.deque()
         self.error: BaseException | None = None
@@ -227,13 +235,21 @@ class Recorder:
         self._t0 = self._last_status = time.monotonic()
         self._rx = threading.Thread(target=self._rx_loop, name="agmen-record-rx", daemon=True)
         self._wx = threading.Thread(target=self._wx_loop, name="agmen-record-wx", daemon=True)
+        self._clk = threading.Thread(target=self._clock_loop, name="agmen-record-relojes", daemon=True)
         self._rx.start()
         self._wx.start()
+        self._clocks_now.clear()   # (el primer archivo ya se abrió: el hilo anota al arrancar)
+        self._clk.start()
         return self
 
     def stop(self) -> Summary:
         """Deja de recibir, escribe lo que quedó en la cola y cierra el archivo."""
+        if self._writer is not None and not self._stop.is_set() and self._clocks_seen:
+            self._sample_clocks()   # bloque 5: la diferencia de relojes al terminar (solo si hay otras computadoras)
         self._stop.set()
+        self._clocks_now.set()
+        if self._clk is not None:
+            self._clk.join()
         if self._rx is not None:
             self._rx.join()
         for item in self._pending:                # su topic nunca se supo
@@ -350,6 +366,27 @@ class Recorder:
         except (ConnectionError, OSError, ValueError):
             pass
 
+    # --- la diferencia de relojes (bloque 5, otro hilo: una consulta al hub no frena la recepción) ---
+    def _clock_loop(self) -> None:
+        while True:
+            self._sample_clocks()
+            self._clocks_now.wait(CLOCKS_EVERY_S)   # cada ~10 s, o ya mismo al empezar otro archivo (split)
+            self._clocks_now.clear()
+            if self._stop.is_set():
+                return
+
+    def _sample_clocks(self) -> None:
+        """Una consulta al hub por las líneas `maq`: la diferencia vigente de cada otra computadora."""
+        try:
+            msgs = hubmod.query(hub_address(), timeout=0.2)
+        except (ConnectionError, OSError, ValueError):
+            return
+        maquinas = relojes.maquinas_del_hub(msgs)
+        if maquinas:
+            self._clocks_seen = True
+            with self._lock:
+                self._clocks.poner(maquinas)
+
     def _resolve_pending(self) -> None:
         if not self._pending:
             return
@@ -459,6 +496,8 @@ class Recorder:
                 "topics": " ".join(self.topics), "archivo": str(self._file_index)}
         meta.update({k: str(v) for k, v in self.info.items()})
         self._writer.add_metadata("agmen.grabacion", meta)
+        self._meta = meta
+        self._clocks_now.set()   # bloque 5: el archivo nuevo (split) anota los relojes ya
         for name, media, data in self.attachments:
             self._writer.add_attachment(name, media, data, log_time=max(0, clock.now_ns()))
         self.summary.files.append(path)
@@ -469,7 +508,13 @@ class Recorder:
         with self._lock:
             lost = {k: str(v) for k, v in sorted(self._file_lost.items())}
             self._file_lost = {}
+            clocks, self._clocks = self._clocks.texto(), relojes.Resumen()
         lost["total"] = str(sum(int(v) for v in lost.values()))
+        if clocks:
+            # Bloque 5 (§4.4): la diferencia de relojes solo se sabe completa al cerrar. Se repite agmen.grabacion
+            # con la clave `relojes` añadida (lo demás, igual al del principio: si el grabador muere antes, queda
+            # el del principio). Quien lee se queda con el último (describe, agmen.recording).
+            self._writer.add_metadata("agmen.grabacion", {**self._meta, "relojes": clocks})
         self._writer.add_metadata("agmen.perdidos", lost)
         self._writer.close()
         self._writer = None
@@ -619,6 +664,11 @@ class RecordingControl:
 # agmen info
 # ---------------------------------------------------------------------------
 
+def _last_meta(metadata, name: str) -> dict:
+    """El último registro `name` de los metadatos (agmen.grabacion puede ir dos veces: al cerrar, con `relojes`)."""
+    return next((v for n, v in reversed(metadata) if n == name), {})
+
+
 def describe(path: str) -> dict:
     """Lo que dice `agmen info`: un dict con la grabación resumida."""
     with _mcap.Reader(path) as r:
@@ -642,7 +692,7 @@ def describe(path: str) -> dict:
         return {"path": path, "size": os.path.getsize(path), "profile": r.profile, "library": r.library,
                 "complete": r.complete, "truncated": r.truncated, "start": t0, "end": t1,
                 "seconds": (t1 - t0) / 1e9 if t0 is not None else 0.0, "topics": topics,
-                "recording": meta.get("agmen.grabacion", {}), "lost": meta.get("agmen.perdidos", {}),
+                "recording": _last_meta(r.metadata, "agmen.grabacion"), "lost": meta.get("agmen.perdidos", {}),
                 "attachments": [a.name for a in r.attachments]}
 
 
@@ -675,6 +725,9 @@ def cmd_info(args) -> int:
         print(f"  grabado con Agmen {rec.get('version', '?')} en {rec.get('computadora', '?')}, "
               f"reloj {rec.get('reloj', '?')}" + (f", perfil {rec['perfil']}" if rec.get("perfil") else "")
               + (f", {rec['inicio']}" if rec.get("inicio") else ""))
+        if rec.get("relojes"):   # bloque 5 (RFC 0011 §3.6): respecto al reloj de la computadora que grabó
+            for line in relojes.lineas_grabacion(rec["relojes"]):
+                print("  " + line)
     rows = []
     for t in d["topics"]:
         rate = t["messages"] / d["seconds"] if d["seconds"] > 0 else 0.0

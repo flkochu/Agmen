@@ -17,6 +17,7 @@ import time
 
 from . import hub as hubmod
 from . import hubproto as hp
+from . import relojes
 from . import wire
 from .pubsub import RawSubscriber, hub_address
 
@@ -127,10 +128,31 @@ def cmd_node_list(args) -> int:
     header = ["nodo", *(["computadora"] if remote else []), "pid", "publica", "escucha", "último latido"]
     for line in _table(rows, header):
         print(line)
-    stats = [f for op, f in hubmod.query(hub_address()) if op == "stat"]
+    msgs = hubmod.query(hub_address())
+    for line in clock_lines(relojes.maquinas_del_hub(msgs), session_mode()):
+        print(line)
+    stats = [f for op, f in msgs if op == "stat"]
     for line in stats_lines(stats):
         print(line)
     return 0
+
+
+def session_mode() -> str:
+    """El modo del reloj de la sesión, si esta herramienta lo puede saber: solo por AGMEN_CLOCK (agmen run se lo
+    pasa a sus nodos). Desde una terminal cualquiera no se sabe: "" (el hub no lo dice)."""
+    m = os.environ.get("AGMEN_CLOCK", "")
+    return m if m in ("real", "sim", "replay") else ""
+
+
+def clock_lines(maquinas: dict, mode: str) -> list[str]:
+    """Bloque 5 (RFC 0011 §3.6, §4.1): la diferencia de reloj de cada otra computadora, debajo de la tabla. Sin
+    modo red el hub no da líneas `maq`: ninguna línea (la salida de siempre)."""
+    if not maquinas:
+        return []
+    out = ["", "# relojes de las otras computadoras (respecto al de esta)"]
+    for name in sorted(maquinas, key=lambda n: (n.lower(), n)):
+        out.append(relojes.linea_node_list(name, maquinas[name], mode))
+    return out
 
 
 def stats_lines(stats: list[dict[str, str]]) -> list[str]:

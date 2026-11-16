@@ -20,6 +20,7 @@ Signo: la diferencia de una computadora X es (reloj de X) − (reloj de aquí); 
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 import time
@@ -417,3 +418,153 @@ def leer_red(texto: str) -> dict[str, Estado]:
                              f"{RELOJ_IDA_VUELTA_MAX_NS}) y la edad, ms")
         out[nombre] = Estado(True, int(dif), int(err), edad_s)
     return out
+
+
+# --- lo que se ve (parte B, §4): agmen node list, el panel y agmen record ------------------------------------------
+
+def leer_maq(f: dict) -> Estado:
+    """Una línea `maq` del `state` del hub (ya en campos) → su Estado. Lo que no se entiende queda «sin medir»
+    (`sin_dato`): nunca se inventa un 0 (C6)."""
+    edad = None
+    try:
+        if "edad" in f:
+            edad = max(0.0, float(f["edad"]))
+    except ValueError:
+        edad = None
+    reloj, err = f.get("reloj"), f.get("err")
+    if reloj is not None and err is not None:
+        if _ENTERO.match(reloj) and _ENTERO.match(err) and abs(int(reloj)) < MARCA_MAX \
+                and 0 <= int(err) <= RELOJ_IDA_VUELTA_MAX_NS:
+            return Estado(True, int(reloj), int(err), edad)
+        return Estado(False, edad_s=edad, motivo="sin_dato")
+    sin = f.get("sin", "")
+    return Estado(False, edad_s=edad, motivo=sin if _MOTIVO.match(sin) else "sin_dato")
+
+
+def maquinas_del_hub(msgs) -> dict[str, Estado]:
+    """Las líneas `maq` de una respuesta del hub (hubmod.query) → {computadora: Estado}. Vacío sin modo red."""
+    return {f["name"]: leer_maq(f) for op, f in msgs if op == "maq" and f.get("name")}
+
+
+def lenta(e: Estado) -> bool:
+    """¿La incertidumbre es tan grande que no se puede afirmar nada (> 10 ms, §3.3)?"""
+    return e.medido and e.err_ns > RELOJ_UMBRAL_NS
+
+
+def pasa_umbral(e: Estado) -> bool:
+    """¿Va corrido (|dif| > 10 ms) con una medición confiable? (sin la histéresis: una sola mirada)"""
+    return e.medido and not lenta(e) and abs(e.dif_ns) > RELOJ_UMBRAL_NS
+
+
+def que_hacer_corto(so: str = "") -> str:
+    """Qué hacer con un reloj corrido, en una línea (el del sistema `so` primero)."""
+    linux, windows, mac = "Linux/Raspberry Pi: chrony", "Windows: w32tm /resync", "macOS: sntp"
+    orden = {"windows": [windows, linux], "darwin": [mac, linux, windows]}.get(so, [linux, windows])
+    return "revisa la hora de las dos (" + "; ".join(orden) + ")"
+
+
+NOTA_MODO = {"sim": "no afecta en sim", "replay": "no afecta en reproducción"}
+
+
+def linea_node_list(nombre: str, e: Estado, modo: str) -> str:
+    """La línea de `agmen node list` (§4.1). `modo`: "real", "sim", "replay" o "" (no se sabe: la herramienta
+    suelta no conoce el modo de la sesión). Solo en "real" se marca con ⚠; sin saberlo, se dice el dato y que,
+    si la sesión es real, hay que revisar (sin ⚠ ni nota de sim)."""
+    base = linea_corta(nombre, e)
+    if not e.medido:
+        return base
+    if modo in NOTA_MODO:
+        return f"{base} ({NOTA_MODO[modo]})"
+    if lenta(e):
+        return f"{base} — la red está demasiado lenta para afirmar si va corrido"
+    if not pasa_umbral(e):
+        return base
+    umbral = f"más de {RELOJ_UMBRAL_NS / 1e6:g} ms"
+    if modo == "real":
+        return f"⚠ {base} — {umbral}: {que_hacer_corto()}"
+    return f"{base} — {umbral}: si la sesión usa el reloj real, {que_hacer_corto()}"
+
+
+def info_panel(nombre: str, e: Estado, modo: str, mal_antes: bool, so: str = "") -> tuple[dict, bool]:
+    """El `clock` de una computadora en `machines` de /api/state (§4.2) y si sigue «mal» (con la histéresis de
+    10/8 ms de los avisos de agmen run, C4; solo en sesión real, C3). `mal_antes`: lo de la vez anterior."""
+    mal = mal_antes
+    if modo == "real" and e.medido and not lenta(e):
+        if not mal and abs(e.dif_ns) > RELOJ_UMBRAL_NS:
+            mal = True
+        elif mal and abs(e.dif_ns) < RELOJ_BIEN_NS:
+            mal = False
+    if modo != "real":
+        mal = False
+    edad = None if e.edad_s is None else round(e.edad_s, 1)
+    if not e.medido:
+        return ({"offset_ms": None, "error_ms": None, "state": "sin_medir",
+                 "why": MOTIVOS.get(e.motivo, e.motivo or "sin dato"), "age_s": edad,
+                 "text": "reloj sin medir"}, mal)
+    texto = linea_corta(nombre, e).split(": ", 1)[1]
+    if modo in NOTA_MODO:
+        why = NOTA_MODO[modo]
+    elif mal:
+        why = (f"va {fmt_ms(e.dif_ns)} {_hacia(e.dif_ns)} respecto a esta computadora: las latencias y las "
+               f"grabaciones salen corridas. No se sabe cuál de los dos relojes está mal: "
+               f"{que_hacer_corto(so)}")
+    elif lenta(e):
+        why = "la red está demasiado lenta para afirmar si va corrido"
+    else:
+        why = ""
+    return ({"offset_ms": round(e.dif_ns / 1e6, 3), "error_ms": round(e.err_ns / 1e6, 3),
+             "state": "mal" if mal else "ok", "why": why, "age_s": edad, "text": texto}, mal)
+
+
+class Resumen:
+    """Lo que `agmen record` guarda de cada computadora en `relojes` de agmen.grabacion (§4.4, C5): la diferencia
+    al empezar y al terminar, la mínima, la máxima, la mayor incertidumbre y cuántas muestras. Solo cuentan las
+    mediciones vigentes ("sin medir" no es una muestra).
+
+    Riesgo aceptado: un salto brusco de un reloj a media grabación no se reconstruye (se consulta cada ~10 s); la
+    mínima y la máxima solo lo delatan."""
+
+    def __init__(self) -> None:
+        self.por: dict[str, dict[str, int]] = {}
+
+    def poner(self, estados: dict[str, Estado]) -> None:
+        for nombre, e in estados.items():
+            if not e.medido:
+                continue
+            r = self.por.get(nombre)
+            if r is None:
+                self.por[nombre] = {"inicio_ns": e.dif_ns, "fin_ns": e.dif_ns, "min_ns": e.dif_ns,
+                                    "max_ns": e.dif_ns, "error_ns": e.err_ns, "muestras": 1}
+                continue
+            r["fin_ns"] = e.dif_ns
+            r["min_ns"], r["max_ns"] = min(r["min_ns"], e.dif_ns), max(r["max_ns"], e.dif_ns)
+            r["error_ns"] = max(r["error_ns"], e.err_ns)
+            r["muestras"] += 1
+
+    def texto(self) -> str:
+        """El valor de la clave `relojes` (los metadatos MCAP son texto: JSON compacto). "" = no hay nada."""
+        if not self.por:
+            return ""
+        return json.dumps(self.por, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def lineas_grabacion(texto: str) -> list[str]:
+    """Cómo dice `agmen record info` la clave `relojes` (vacía: ninguna línea). Una mal escrita se dice, no truena."""
+    try:
+        d = json.loads(texto)
+        if not isinstance(d, dict):
+            raise ValueError("no es un objeto")
+        out = []
+        for nombre in sorted(d):
+            r = d[nombre]
+            ini, fin, lo, hi = (int(r[k]) for k in ("inicio_ns", "fin_ns", "min_ns", "max_ns"))
+            err, n = int(r["error_ns"]), int(r["muestras"])
+            linea = (f"reloj de {nombre}: {fmt_dif(ini)} al empezar, {fmt_dif(fin)} al terminar (mín {fmt_dif(lo)}, "
+                     f"máx {fmt_dif(hi)}, ±{fmt_ms(err)}, {n} muestra{'s' if n != 1 else ''})")
+            out.append(linea)
+            if hi - lo > RELOJ_UMBRAL_NS:
+                out.append(f"  ⚠ cambió {fmt_ms(hi - lo)} durante la grabación (¿alguien ajustó un reloj?): las "
+                           f"latencias de ese rato no se pueden corregir con un solo número")
+        return out
+    except (ValueError, TypeError, KeyError, AttributeError) as e:
+        return [f"⚠ la diferencia de relojes guardada no se puede leer ({e}); lo demás de la grabación sí"]

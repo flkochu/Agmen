@@ -33,7 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from .. import schema, wire
+from .. import relojes, schema, wire
 from .. import ws as wsmod
 from .._version import __version__
 from ..machines import lan_addresses   # vive en machines: también la usa agmen run (RFC 0011 §3.4)
@@ -355,6 +355,10 @@ class Panel:
         self._rec_lock = threading.Lock()
         self.rhythm: list[dict] = []  # cuentas de los agmen.Node (del hub)
         self.endpoints: list[dict] = []   # las líneas ep del hub (4c §2.4: de qué computadora es cada topic)
+        # Bloque 5 (RFC 0011 §3.6): la diferencia de reloj de cada otra computadora, de las líneas `maq` del hub (C2),
+        # y cuáles están «mal» ahora (con la histéresis de 10/8 ms, como los avisos de agmen run; C4).
+        self.clocks: dict[str, relojes.Estado] = {}
+        self._clock_bad: dict[str, bool] = {}
         self.listen = listen
         self.topics = topics
         self.robot_name = robot_name
@@ -436,9 +440,35 @@ class Panel:
 
     def machines_info(self) -> list[dict]:
         """Las computadoras del robot y cómo está la conexión con cada una (RFC 0011 parte 3c §4).
-        Vacía sin [[machine]] (o con un Launcher que no las conoce): el panel se ve como siempre."""
+        Vacía sin [[machine]] (o con un Launcher que no las conoce): el panel se ve como siempre.
+        Bloque 5 (§4.2): cada computadora que no es esta gana `clock` (ver relojes.info_panel)."""
         get = getattr(self.launcher, "machines_info", None) if self.launcher is not None else None
-        return get() if get is not None else []
+        machines = get() if get is not None else []
+        if machines:
+            mode = self.session_mode()
+            for m in machines:
+                if not m.get("here"):
+                    m["clock"] = self.clock_of(m["name"], mode)
+        return machines
+
+    def session_mode(self) -> str:
+        """El modo del reloj de esta sesión: "replay" con agmen run --play; si no, el del reloj de este proceso."""
+        if self.playing:
+            return "replay"
+        if self.clock is not None:
+            return "sim"
+        from .. import clock as ck
+        return ck.mode()
+
+    def clock_of(self, name: str, mode: str) -> dict:
+        """El `clock` de la computadora `name` (§4.2): lo último que dijo el hub; sin dato, «sin medir» (C6)."""
+        e = self.clocks.get(name) or relojes.Estado(False, motivo="sin_dato")
+        remotes = getattr(self.launcher, "remotes", None) or {}
+        so = getattr(remotes.get(name), "so_alla", "") or ""
+        so = so if isinstance(so, str) else ""
+        info, bad = relojes.info_panel(name, e, mode, self._clock_bad.get(name, False), so)
+        self._clock_bad[name] = bad
+        return info
 
     def snapshot(self) -> dict:
         return {
@@ -574,6 +604,7 @@ class Panel:
                 msgs = []
             self.rhythm = [f for op, f in msgs if op == "stat"]
             self.endpoints = [f for op, f in msgs if op == "ep"]   # (incompleta: lo que llegó; no se inventa nada)
+            self.clocks = relojes.maquinas_del_hub(msgs)           # bloque 5: sin modo red, vacío
 
     def here_name(self, machines: list[dict]) -> str:
         """Cómo se llama esta computadora en el panel (4c §2.4): la [[machine]] local o, si esta no es una
@@ -617,8 +648,39 @@ class Panel:
         for key, t in stats.get("topics", {}).items():
             pubs, subs = at.get(t.get("topic") or key, ([], []))
             t["publishers_at"], t["subscribers_at"] = pubs, subs
+        if here:
+            self.correct_latency(stats.get("topics", {}), snap["machines"], here)
         return {**snap, "stats": stats, "bridge": self.bridge.info(),
                 "cpu_s": round(time.process_time(), 4), "lan": self.lan}
+
+    def correct_latency(self, topics: dict, machines: list[dict], here: str) -> None:
+        """Bloque 5 (RFC 0011 §3.6, §4.3): la latencia de un topic que sale de OTRA computadora se calcula con dos
+        relojes; en una sesión real se le resta la diferencia medida de esa computadora. Si no se puede (sin
+        medición vigente, o lo publican varias computadoras), queda como siempre pero marcada «sin corregir». En
+        sim/replay no se resta nada (C3). Los topics que solo salen de aquí no cambian (ni ganan claves)."""
+        if self.session_mode() != "real":
+            return
+        clocks = {m["name"]: m.get("clock") for m in machines if not m.get("here")}
+        for t in topics.values():
+            pubs = t.get("publishers_at") or []
+            if not any(p != here for p in pubs) or t.get("latency_ms") is None:
+                continue
+            c = clocks.get(pubs[0]) if len(pubs) == 1 else None
+            if len(pubs) > 1:
+                t["latency_fix"] = "sin_corregir"
+                t["latency_note"] = (f"sin corregir: lo publican varias computadoras ({', '.join(pubs)}) y cada una "
+                                     f"tiene su reloj")
+            elif not c or c.get("offset_ms") is None:
+                why = (c or {}).get("why") or relojes.MOTIVOS["sin_dato"]
+                t["latency_fix"] = "sin_corregir"
+                t["latency_note"] = f"sin corregir: el reloj de {pubs[0]} está sin medir ({why})"
+            else:
+                raw = t["latency_ms"]
+                t["latency_raw_ms"] = raw
+                t["latency_ms"] = round(raw - c["offset_ms"], 3)
+                t["latency_fix"] = "corregida"
+                t["latency_note"] = (f"corregida: se restó la diferencia del reloj de {pubs[0]} "
+                                     f"({c['offset_ms']:+.1f} ms ±{c['error_ms']:.1f}); sin restar, {raw:.2f} ms")
 
     def _handler(self):
         panel = self
