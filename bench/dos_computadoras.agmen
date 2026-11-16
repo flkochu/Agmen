@@ -1,0 +1,61 @@
+# Mensajes de bench/dos_computadoras.py: latencia y MB/s entre dos computadoras.
+#
+# Cada tamaño tiene su tipo y su topic (/bench/ida/<tamaño>). Los chicos son
+# compact (tamaño fijo): viajan por UDP, como un IMU o un mando. Los grandes
+# llevan `bytes`: viajan en arrow, por TCP (RFC 0008), como una imagen.
+# En todos, `n` es el número de serie y `fase` dice qué hace el eco con él:
+#   0 = calentar (contesta), 1 = ida y vuelta (contesta),
+#   2 = ritmo (solo cuenta), 3 = fin del ritmo (contesta con lo que contó).
+package bench
+
+# 64 bytes de payload (UDP)
+message Carga64 {
+    u32 n
+    u32 fase
+    u8[56] d
+}
+
+# 1 KiB (UDP)
+message Carga1k {
+    u32 n
+    u32 fase
+    u8[1016] d
+}
+
+# 16 KiB (UDP)
+message Carga16k {
+    u32 n
+    u32 fase
+    u8[16376] d
+}
+
+# El más grande que cabe en un datagrama: 65 440 bytes (UDP; 64 KiB = 65 536 ya no cabe)
+message CargaMaxUdp {
+    u32 n
+    u32 fase
+    u8[65432] d
+}
+
+# Tamaño variable: 64 KiB por TCP, 256 KiB, 1 MiB y 6 MiB
+message CargaGrande {
+    u32 n
+    u32 fase
+    bytes d
+}
+
+# La respuesta del eco: chica (compact, UDP), para que la vuelta casi no cuente.
+message Eco {
+    u32 n          # el número de serie al que contesta
+    u32 que        # 0 = respuesta (calentar o ida y vuelta), 1 = informe del ritmo
+    u32 recibidos  # informe: cuántos mensajes de la fase de ritmo recibió el eco
+    u32 camino     # por dónde le llegó: 1 = UDP, 2 = TCP, 3 = memoria compartida
+    i64 dt_ns      # informe: del primero al último de la fase de ritmo, con el reloj del eco
+}
+
+# Quién es el eco (se manda al calentar, una vez por segundo como mucho).
+message Saludo {
+    string version  # versión de Agmen
+    string sistema  # sistema operativo y procesador
+    string nucleo   # "núcleo C++" o "Python puro"
+    string desde    # de qué IP le llegan los mensajes del medidor
+}
