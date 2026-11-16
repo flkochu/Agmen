@@ -448,7 +448,7 @@ class Panel:
             mode = self.session_mode()
             for m in machines:
                 if not m.get("here"):
-                    m["clock"] = self.clock_of(m["name"], mode)
+                    m["clock"] = self.clock_of(m["name"], mode, lost=m.get("state") == "sin conexión")
         return machines
 
     def session_mode(self) -> str:
@@ -460,9 +460,14 @@ class Panel:
         from .. import clock as ck
         return ck.mode()
 
-    def clock_of(self, name: str, mode: str) -> dict:
-        """El `clock` de la computadora `name` (§4.2): lo último que dijo el hub; sin dato, «sin medir» (C6)."""
-        e = self.clocks.get(name) or relojes.Estado(False, motivo="sin_dato")
+    def clock_of(self, name: str, mode: str, lost: bool = False) -> dict:
+        """El `clock` de la computadora `name` (§4.2): lo último que dijo el hub; sin dato, «sin medir» (C6).
+        `lost`: agmen run perdió la conexión con ella. El hub deja de nombrarla cuando no queda ninguna otra
+        computadora conectada (vuelve a modo local), así que el motivo lo pone el panel: «sin conexión»."""
+        e = self.clocks.get(name)
+        if lost and (e is None or not e.medido):
+            e = relojes.Estado(False, motivo="sin_conexion")
+        e = e or relojes.Estado(False, motivo="sin_dato")
         remotes = getattr(self.launcher, "remotes", None) or {}
         so = getattr(remotes.get(name), "so_alla", "") or ""
         so = so if isinstance(so, str) else ""

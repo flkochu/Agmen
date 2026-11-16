@@ -14,7 +14,6 @@ import io
 import json
 import os
 import socket
-import time
 import unittest
 import urllib.request
 from pathlib import Path
@@ -227,6 +226,13 @@ class TestPanel(unittest.TestCase):
         self.assertIsNone(m["pi"]["clock"]["offset_ms"])        # nunca 0 ms (C6)
         self.assertEqual(m["pi"]["clock"]["why"], R.MOTIVOS["anterior"])
         self.assertEqual(m["robot"]["state"], "conectado")       # lo de antes sigue
+
+    def test_un_robot_sin_conexion_dice_sin_conexion_aunque_el_hub_ya_no_lo_nombre(self):
+        # Con un solo robot, al perderlo el hub vuelve a modo local y deja de nombrarlo: el motivo lo pone el panel.
+        perdido = [{"name": "laptop", "here": True, "state": "aquí"},
+                   {"name": "robot", "here": False, "state": "sin conexión"}]
+        c = self.state(self.panel(machines=perdido))["machines"][1]["clock"]
+        self.assertEqual((c["state"], c["why"], c["offset_ms"]), ("sin_medir", R.MOTIVOS["sin_conexion"], None))
 
     def test_sin_dato_del_hub_es_sin_medir(self):
         m = {x["name"]: x for x in self.state(self.panel())["machines"]}

@@ -790,18 +790,35 @@ class TestPongSinCola(unittest.TestCase):
 
 
 class TestHoraDePared(unittest.TestCase):
-    def test_la_hora_es_la_del_sistema_y_no_avanza_a_saltos(self):
-        # En Windows con Python <= 3.12, time.time_ns() avanza de ~15.6 ms en ~15.6 ms; la medición usa la hora fina.
-        self.assertLess(abs(R.hora_ns() - time.time_ns()), 100_000_000)   # el mismo reloj (a 0.1 s)
+    """La hora de pared que usan la medición y el reloj de Agmen en modo real (wire.wall_ns). En Windows con
+    Python <= 3.12 se lee con la función fina del sistema: aquí se comprueba, en el CI de Windows, que es el
+    mismo reloj y que no avanza a saltos."""
+
+    def test_es_la_hora_del_sistema(self):
+        from agmen import wire
+        cerca = min(abs(wire.wall_ns() - time.time_ns()) for _ in range(200))
+        self.assertLess(cerca, 20_000_000, "wall_ns() no es la hora del sistema (época o unidades mal)")
+        self.assertEqual(R.hora_ns.__doc__ is not None and abs(R.hora_ns() - wire.wall_ns()) < 1_000_000_000, True)
+
+    def test_no_avanza_a_saltos(self):
+        from agmen import wire
         fin, vistas = time.monotonic() + 0.2, set()
         while time.monotonic() < fin:
-            vistas.add(R.hora_ns())
-        self.assertGreater(len(vistas), 100, "la hora de pared avanza a saltos: la medición no serviría")
+            vistas.add(wire.wall_ns())
+        self.assertGreater(len(vistas), 100, "la hora de pared avanza a saltos: los t_data y la medición saldrían gruesos")
         self.assertLessEqual(R.resolucion_ns(), 1_000_000)
 
-    def test_sin_hora_fina_se_usa_la_de_siempre_con_su_resolucion(self):
-        with mock.patch.object(R, "_HORA_FINA", None):
-            self.assertLess(abs(R.hora_ns() - time.time_ns()), 100_000_000)
+    def test_el_reloj_de_agmen_en_modo_real_es_esa_hora(self):
+        from agmen import clock, wire
+        if clock.mode() != clock.REAL:
+            self.skipTest("estas pruebas corren con otro reloj")
+        cerca = min(abs(clock.now_ns() - wire.wall_ns()) for _ in range(200))
+        self.assertLess(cerca, 5_000_000)
+
+    def test_sin_hora_fina_se_usa_la_de_python(self):
+        from agmen import wire
+        with mock.patch.object(wire, "_HORA_FINA", None):
+            self.assertLess(min(abs(wire.wall_ns() - time.time_ns()) for _ in range(50)), 20_000_000)
             self.assertGreaterEqual(R.resolucion_ns(), 0)
 
 

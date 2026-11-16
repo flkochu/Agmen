@@ -142,7 +142,7 @@ def mode_name() -> str:
 def now_ns() -> int:
     """La hora de Agmen, en ns. Real: desde la época Unix. Sim: el tiempo de la simulación."""
     if mode() == REAL:
-        return time.time_ns()
+        return wire.wall_ns()   # la hora del sistema (en Windows, leída con resolución fina)
     with _g.lock:
         return _sim_now_locked()
 

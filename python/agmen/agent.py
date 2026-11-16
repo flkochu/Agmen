@@ -32,6 +32,7 @@ import select
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 from collections import OrderedDict, deque
@@ -1361,6 +1362,8 @@ class _Outbox:
     laptop, y si se acumulan demasiados (replies_full) la sesión deja de leerla hasta que
     drene; los estado dependen de los nodos, que cambian poco (el reinicio espera ≥ 1 s)."""
 
+    _fill_said = False   # ya se dijo que no se pudo poner la hora de envío en un pong (una vez por proceso)
+
     def __init__(self) -> None:
         self.cond = threading.Condition()
         # (op, json, bytes, ¿es un log?, n de la tabla o None, cómo escribirlo al mandarlo o None). Las partes de una
@@ -1448,8 +1451,11 @@ class _Outbox:
         if fill is not None:   # 8.3: en el hilo que manda, justo antes de escribir en la conexión (fuera del candado)
             try:
                 body = fill()
-            except Exception:   # noqa: BLE001 — nunca debería; entonces sale como estaba (con la marca de antes)
-                pass
+            except Exception as e:   # noqa: BLE001 — nunca debería; sale como estaba (medición válida, más error)
+                if not _Outbox._fill_said:   # una vez (regla 1)
+                    _Outbox._fill_said = True
+                    print(f"[agmen agent] ⚠ no pude poner la hora de envío en un pong ({type(e).__name__}: {e}): "
+                          f"la medición del reloj sale con más error", file=sys.stderr, flush=True)
         return op, body
 
     def sent(self) -> None:
