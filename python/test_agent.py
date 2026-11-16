@@ -1526,6 +1526,56 @@ class TestAddressError(unittest.TestCase):
 # 4. La cola de salida del agente
 # ===========================================================================
 
+class TestNodosAjenosConListaIncompleta(unittest.TestCase):
+    """§10.1: la comprobación de nodos ajenos falla cerrada: una lista incompleta del hub se reintenta una vez y, si
+    sigue incompleta, la sesión se rechaza diciendo qué pasó y qué hacer."""
+
+    def server(self):
+        s = agent.AgentServer.__new__(agent.AgentServer)
+        s.machine = "robot"
+        return s
+
+    def respuesta(self, lines, incompleta=None):
+        from agmen import hub as H
+        from agmen import hubproto as hp
+
+        r = H.Respuesta(hp.parse("\n".join(lines).encode()))
+        r.incompleta = incompleta
+        return r
+
+    def foreign(self, *respuestas):
+        from agmen import hub as H
+
+        q = mock.Mock(side_effect=list(respuestas))
+        with mock.patch.object(H, "ping", return_value="9.9"), mock.patch.object(H, "query", q):
+            out = self.server().foreign("127.0.0.1:7")
+        return out, q.call_count
+
+    def test_incompleta_dos_veces_rechaza(self):
+        st = "agmen-hub/1 state version=x"
+        (why, hub), veces = self.foreign(self.respuesta([st], (1, 3)), self.respuesta([st], (2, 3)))
+        self.assertEqual(veces, 2)
+        self.assertTrue(hub)
+        self.assertIn("no llegó completa (2 de 3 partes, dos veces)", why)
+        self.assertIn("Vuelve a correr agmen run; si se repite, hay demasiados topics", why)
+
+    def test_incompleta_una_vez_reintenta(self):
+        st = "agmen-hub/1 state version=x"
+        out, veces = self.foreign(self.respuesta([st], (1, 3)), self.respuesta([st]))
+        self.assertEqual((out, veces), (("", True), 2))
+        ep = "agmen-hub/1 ep id=p1 node=imu kind=pub topic=/x"
+        (why, _), veces = self.foreign(self.respuesta([st], (1, 3)), self.respuesta([st, ep]))
+        self.assertIn("ya corren nodos que este agente no lanzó (imu)", why)
+
+    def test_completa_como_antes(self):
+        st = "agmen-hub/1 state version=x"
+        self.assertEqual(self.foreign(self.respuesta([st])), (("", True), 1))
+        ep = "agmen-hub/1 ep id=p1 node=imu kind=pub topic=/x"
+        (why, hub), veces = self.foreign(self.respuesta([st, ep]))
+        self.assertEqual(veces, 1)
+        self.assertIn("ya corren nodos que este agente no lanzó (imu)", why)
+
+
 class TestColaDeSalida(unittest.TestCase):
     def test_orden_y_log_descartable(self):
         ob = agent._Outbox()

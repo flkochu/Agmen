@@ -2871,10 +2871,13 @@ class TestPuenteConCortes(ta.E2EBase):
         # 3 s) ni repite `red` (los dos hubs vuelven a modo local en 6 s).
         px.congelar(c2a=False, a2c=True)
         self.assertTrue(self.espera(lambda: any("se perdió la conexión" in l for l in lr), 20), diag("no notó el corte"))
-        self.assertTrue(self.espera(lambda: tt.remotas_de(hub) == [] and tt.remotas_de(hub_robot) == [], 3 + 1),
-                        diag("las entradas del otro no caducaron"))
-        self.assertTrue(self.espera(lambda: tt.hub_en_red(hub) is False and tt.hub_en_red(hub_robot) is False, 6 + 1),
-                        diag("los hubs no volvieron a modo local"))
+        # (Los topes son holgados a propósito: caducan en 3 s y vuelven a modo local en 6 s; lo que se prueba es que
+        # pase, no cuánto tarda, y un CI de Windows cargado puede tardar más. Cada espera vuelve en cuanto se cumple.)
+        holgura = 15
+        self.assertTrue(self.espera(lambda: tt.remotas_de(hub) == [] and tt.remotas_de(hub_robot) == [],
+                                    3 + holgura), diag("las entradas del otro no caducaron"))
+        self.assertTrue(self.espera(lambda: tt.hub_en_red(hub) is False and tt.hub_en_red(hub_robot) is False,
+                                    6 + holgura), diag("los hubs no volvieron a modo local"))
         quieto = time.monotonic() + 0.3                       # (lo que ya venía en camino)
         self.assertTrue(self.espera(lambda: time.monotonic() > quieto + 0.5, 2))
         self.assertFalse(any(t > quieto for t in recibidos), "sin conexión no cruza nada")

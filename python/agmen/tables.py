@@ -38,7 +38,13 @@ HUB_LINE_MAX = 65507        # una línea para el hub, como mucho: lo que cabe en
 HUB_QUIET_S = 3.0           # el hub sin contestar este tiempo: se dice (una vez)
 HUB_BURST_BYTES = 64 * 1024  # al hub, de golpe como mucho esto; luego una pausa de HUB_BURST_S
 HUB_BURST_S = 0.002
-QUERY_TIMEOUT = 0.3         # lo que se espera la respuesta de `query` (el hub está en esta computadora)
+# Lo que se espera la respuesta de `query` (§10.5): vuelve en cuanto llegan todas las partes, así que el tope solo
+# cuesta cuando algo se pierde. Peor latido del puente: BEAT_S + QUERY_TIMEOUT + PING_TIMEOUT (2,3 s), menos que
+# hp.EXPIRE_S (lo importado caduca en el hub) y que hp.NET_EXPIRE_S (`red`): ver test_tablas, TestTiempos.
+QUERY_TIMEOUT = 1.0
+PING_TIMEOUT = 0.3          # si `query` no contesta nada: ¿está vivo el hub? (el hub está en esta computadora)
+INCOMPLETE_KEEP = 3         # §10.4: consultas incompletas seguidas en las que se sigue mandando la última tabla buena
+TOO_BIG_SAY_S = 30.0        # §10.4: los avisos "no cabe" / "ya cabe", como mucho uno cada esto
 SAID_MAX = 1000             # avisos distintos que se recuerdan (para decir cada uno una vez)
 _WORST_NAME = "x" * 64      # para medir, al mandar, la línea más larga que el otro lado puede armar
 _WORST_IP = "255.255.255.255"
@@ -157,9 +163,8 @@ class Lineage:
         self.roots = {r for r in roots if r > 0}
         self._groups: set[int] = set()
         self._parents: dict[int, tuple[int, int]] | None = None   # Windows: pid → (padre, creado)
-        if os.name == "nt":
-            self._parents = _win_parents()
-        else:
+        self._photo = False   # Windows (§10.7): la foto de los procesos se toma solo si hace falta, una vez
+        if os.name != "nt":
             for r in self.roots:
                 try:
                     self._groups.add(os.getpgid(r))
@@ -176,6 +181,9 @@ class Lineage:
                 return os.getpgid(pid) in self._groups
             except OSError:
                 return None   # (ya no está, o no se puede ver)
+        if not self._photo:
+            self._photo = True
+            self._parents = _win_parents()
         if self._parents is None or pid not in self._parents:
             return None
         seen = set()
@@ -522,6 +530,10 @@ class Bridge:
         self._quiet_since: float | None = None
         self._quiet_told = False
         self._too_big = False       # el hub contesta `ping` pero su lista no llega entera (faltan partes, §9.1)
+        self._incomplete = 0        # §10.4: consultas seguidas con la lista incompleta (o sin respuesta, con ping)
+        self._last_good: tuple | None = None   # §10.4: (tabla, solo) de la última consulta completa (con peers)
+        self._big_told = False      # el estado de "no cabe" que se dijo por última vez (§10.4)
+        self._big_said_at: float | None = None
         self._stop = threading.Event()
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
@@ -636,43 +648,69 @@ class Bridge:
         msgs = None
         try:
             msgs = query(self.hub, timeout=QUERY_TIMEOUT, say=None)   # (lo incompleto lo dice el puente, abajo)
-            if getattr(msgs, "incompleta", None) is not None:   # §9.1: llegó en partes y faltan partes
-                raise ConnectionError("incompleta")
         except (ConnectionError, OSError, hp.ProtocolError, ValueError):
-            # §8.3: si `ping` sí contesta, el hub está vivo y lo que no cabe es su respuesta a `query` (un datagrama):
-            # no se dice "no contesta"; al otro lado se le manda una tabla vacía (no se queda con una vieja).
-            if ping(self.hub, timeout=QUERY_TIMEOUT) is not None:
-                self._quiet_since, self._quiet_told = None, False
-                if names and not self._too_big:
-                    self._too_big = True
-                    who = "', '".join(sorted(names))
-                    got = getattr(msgs, "incompleta", None)
-                    parts = f"llegaron {got[0]} de {got[1]} partes: " if got else ""
-                    self.say(f"⚠ la tabla de mi hub no cabe en una respuesta ({parts}demasiados topics o esquemas muy "
-                             f"largos): no puedo pasarle mis topics a '{who}'", "error")
-                if self.owned is not None:
-                    self.solo = {}   # §9.2: sin la lista no se sabe qué es de los nodos del agente: a ninguno
-                return [], []
-            if self._quiet_since is None:
-                self._quiet_since = now
-            if not self._quiet_told and now - self._quiet_since >= HUB_QUIET_S:
-                self._quiet_told = True
-                self.say(f"⚠ el puente de topics no puede hablar con el agmen hub de esta computadora ({self.hub}): no "
-                         f"contesta. Sin él los topics no cruzan entre computadoras; sigo intentando", "error")
-            return None
+            # §8.3: si `ping` sí contesta, el hub está vivo y lo que falla es su respuesta a `query`: no se dice "no
+            # contesta"; se trata como una lista incompleta (abajo).
+            if ping(self.hub, timeout=PING_TIMEOUT) is None:
+                if self._quiet_since is None:
+                    self._quiet_since = now
+                if not self._quiet_told and now - self._quiet_since >= HUB_QUIET_S:
+                    self._quiet_told = True
+                    self.say(f"⚠ el puente de topics no puede hablar con el agmen hub de esta computadora ({self.hub}): "
+                             f"no contesta. Sin él los topics no cruzan entre computadoras; sigo intentando", "error")
+                return None
+            msgs = None
         if self._quiet_told:
             self.say(f"el puente de topics ya habla con el agmen hub de esta computadora ({self.hub})")
-        if self._too_big:
-            self.say("la tabla de mi hub ya cabe en una respuesta: vuelvo a pasar mis topics")
-        self._quiet_since, self._quiet_told, self._too_big = None, False, False
+        self._quiet_since, self._quiet_told = None, False
+        got = getattr(msgs, "incompleta", None) if msgs is not None else None
+        if msgs is None or got is not None:   # §9.1: llegó en partes y faltan partes (o no llegó, con el hub vivo)
+            self._incomplete += 1
+            if self._incomplete <= INCOMPLETE_KEEP and not self._too_big:
+                # §10.4: una pérdida suelta no vacía la tabla: se sigue mandando la última buena (si la hay).
+                if self._last_good is None:
+                    return None
+                table, self.solo = self._last_good
+                return table
+            self._too_big = True
+            self._last_good = None
+            if self.owned is not None:
+                self.solo = {}   # §9.2: sin la lista no se sabe qué es de los nodos del agente: a ninguno
+            self._tell_too_big(now, names, got)
+            return [], []   # al otro lado, una tabla vacía (no se queda con una vieja)
+        self._incomplete, self._too_big = 0, False
+        self._tell_too_big(now, names, None)
         cut: list[str] = []
         table = local_table(msgs, cut)
         if cut:
             self.say_once(("local-cortado",), f"⚠ no paso a las otras computadoras {len(cut)} Publisher(s) cuyo esquema "
                                               f"es tan largo que mi hub lo manda recortado (p. ej. {cut[0]})", "error")
         if self.owned is not None:
+            if not names:
+                # §10.7: sin nadie confirmado no se calcula qué pids son del agente (en Windows es una foto de todos
+                # los procesos): no hay a quién mandarle nada.
+                self.solo = {}
+                self._last_good = None
+                return [], []
             table = self._ours(msgs, table, names)
+        self._last_good = (table, self.solo) if names else None
         return table
+
+    def _tell_too_big(self, now: float, names, got) -> None:
+        """§10.4: "no cabe" / "ya cabe", una vez por cambio de estado y como mucho uno cada TOO_BIG_SAY_S (si el
+        estado va y viene más rápido, se dice el que quede al pasar ese tiempo)."""
+        if self._too_big == self._big_told or (self._too_big and not names):
+            return
+        if self._big_said_at is not None and now - self._big_said_at < TOO_BIG_SAY_S:
+            return
+        self._big_told, self._big_said_at = self._too_big, now
+        if self._too_big:
+            who = "', '".join(sorted(names))
+            parts = f"llegaron {got[0]} de {got[1]} partes: " if got else ""
+            self.say(f"⚠ la tabla de mi hub no cabe en una respuesta ({parts}demasiados topics o esquemas muy "
+                     f"largos): no puedo pasarle mis topics a '{who}'", "error")
+        else:
+            self.say("la tabla de mi hub ya cabe en una respuesta: vuelvo a pasar mis topics")
 
     def _ours(self, msgs, table: tuple[list[dict], list[dict]], names) -> tuple[list[dict], list[dict]]:
         """§9.2: de lo local, solo lo de los nodos que arrancó el agente (o de un descendiente suyo); de lo demás se

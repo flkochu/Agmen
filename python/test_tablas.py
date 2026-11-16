@@ -45,7 +45,7 @@ def hay_ips(*ips) -> bool:
 class Lado:
     """Una computadora: un hub de verdad (con AGMEN_NET_IP) y su puente, con lo que dice y lo que le manda al hub."""
 
-    def __init__(self, case, name: str, ip: str, robots: bool = False, owned=None):
+    def __init__(self, case, name: str, ip: str, robots: bool = False, owned=None, session: str = "simulación"):
         self.name, self.ip = name, ip
         self.hub = TR.Hub(ip)
         case.addCleanup(self.hub.close)
@@ -53,7 +53,7 @@ class Lado:
         self.sent: list[bytes] = []          # lo que el puente le manda al hub
         self.ticks = 0
         self.bridge = T.Bridge(self.hub.addr, lambda text, kind="agmen": self.said.append(text), robots=robots,
-                               beat=0.1, owned=owned)
+                               beat=0.1, owned=owned, session=session)
         real_send, real_read = self.bridge._send, self.bridge._read_hub
 
         def send(data):
@@ -275,6 +275,7 @@ class TestDosComputadoras(Base):
                 out.incompleta = (2, 3)
             return out
 
+        self.enterContext(mock.patch.object(T, "TOO_BIG_SAY_S", 0.0))   # ("ya cabe" sin esperar 30 s)
         with mock.patch.object(H, "query", query), mock.patch.object(T, "HUB_QUIET_S", 0.0):
             ok = until(lambda: any("no cabe en una respuesta" in t for t in self.la.said))
             self.assertTrue(ok, self.la.said)
@@ -696,6 +697,35 @@ class TestConfirmarYPerderNoSeCruzan(Base):
             s._confirm(ch)
         self.assertFalse(s.peer.confirmed)
 
+    def test_un_lose_atrasado_de_la_conexion_vieja_no_apaga_el_puente_de_la_nueva(self):
+        """§10.2: _lost hace peer.lose() con _end_lock (el mismo candado que _confirm): mientras corre, ninguna
+        conexión nueva puede confirmarse; y un _lost de la vieja que llega después de confirmar la nueva no hace
+        nada. Sin carreras: se mira el candado desde dentro de lose()."""
+        s, vieja = self.sesion(unconfirmed=False)
+        s.peer = bridge_sin_hub(self).add_peer("laptop", lambda part: None)
+        s.peer.confirm("127.0.0.3")
+        visto = []
+        real_lose = s.peer.lose
+
+        def lose():
+            visto.append((s._end_lock.locked(), s.channel is vieja))
+            real_lose()
+
+        s.peer.lose = lose
+        s._lost(vieja, "dejó de contestar", "x")
+        self.assertEqual(visto, [(True, True)])                       # con el candado, y aún con la vieja
+        self.assertFalse(s.peer.confirmed)
+        # Llega la nueva (como resume) y confirma.
+        nueva = mock.Mock()
+        with s._end_lock:
+            s.channel, s.unconfirmed = nueva, nueva
+        self.assertTrue(s._confirm(nueva))
+        self.assertTrue(s.peer.confirmed)
+        # La pérdida atrasada de la vieja: no apaga el puente.
+        s._lost(vieja, "dejó de contestar", "x")
+        self.assertEqual(len(visto), 1)
+        self.assertTrue(s.peer.confirmed)
+
     def test_agente_al_arrancar_el_puente(self):
         s, ch = self.sesion(unconfirmed=False)
         real = A._show_ip
@@ -893,12 +923,12 @@ class TestSimulacion(Base):
     """§9.2: en una sesión de simulación (o reproducción), del lado del robot solo cruzan los nodos que arrancó el
     agente (o un descendiente suyo); lo importado de la laptop lleva `solo`. En una sesión `real`, nada cambia."""
 
-    def armar(self, sim: bool):
+    def armar(self, sim: bool, session: str = "simulación"):
         self.nodo, self.hijo, self.detener_nodo = proceso(self, hijo=True)
         self.ajeno, _, _ = proceso(self)
         self.roots = [self.nodo]
         self.la = Lado(self, "laptop", LAPTOP_IP)
-        self.lb = Lado(self, "robot", ROBOT_IP, owned=(lambda: list(self.roots)) if sim else None)
+        self.lb = Lado(self, "robot", ROBOT_IP, owned=(lambda: list(self.roots)) if sim else None, session=session)
         self.canal = Canal(self.la, self.lb)
         self.canal.confirmar()
         sch = f"{TR.Chico.SCHEMA_ID:016x}"
@@ -970,6 +1000,58 @@ class TestSimulacion(Base):
         self.assertTrue(T.Lineage([self.nodo]).owns(self.hijo))
         self.assertIsNone(T.Lineage([self.nodo]).owns(0))
 
+    def test_con_datos_un_publisher_ajeno_del_robot_no_le_manda_a_la_laptop(self):
+        """§9.2 con datos de verdad: un Publisher del robot que no es de un nodo del agente (aquí, el de esta prueba)
+        no recibe como destino al Subscriber de la laptop, ni le llega nada. Al contar como del agente, sí."""
+        self.armar(sim=True)
+        sub = self.la.open(self, pubsub._PureSubscriber, TR.Chico, "/r")
+        pub = self.lb.open(self, pubsub._PurePublisher, TR.Chico, "/r")   # pid: el de esta prueba (no es del agente)
+        importado = lambda: [e for e in self.lb.remotas("laptop").values() if e.topic == "/r"]   # noqa: E731
+        got = []
+
+        def paso():   # (el Subscriber atiende a su hub al recibir: así se entera del modo red y se anota net=1)
+            pub.publish(TR.Chico(1, 2))
+            got.extend(TR.receive_all(sub, 0.02))
+
+        self.assertTrue(until(lambda: importado() and importado()[0].solo is not None, every=paso), self.lb.said)
+        self.assertEqual(importado()[0].solo, set())                  # ningún Publisher de /r es del agente
+        start = self.lb.ticks
+        self.assertTrue(until(lambda: self.lb.ticks >= start + 5, every=paso))   # varias tablas, publicando
+        self.assertFalse([d for d in pub.dests if d[0] == LAPTOP_IP], pub.dests)  # sus `subs` no traen a la laptop
+        self.assertEqual(got, [])
+        self.assertTrue(any(t.startswith("'") and f"(pid {os.getpid()})" in t and "no lo arranqué yo" in t
+                            for t in self.lb.said), self.lb.said)
+        # El control: si el agente lo hubiera arrancado, el mismo Publisher sí le manda a la laptop.
+        self.roots.append(os.getpid())
+        self.assertTrue(until(lambda: got, every=paso), (pub.dests, self.lb.said))
+        self.assertEqual(got[0].message, TR.Chico(1, 2))
+        self.assertTrue([d for d in pub.dests if d[0] == LAPTOP_IP])
+
+    def test_en_una_reproduccion_la_misma_regla_y_el_aviso_dice_reproduccion(self):
+        self.armar(sim=True, session="reproducción")
+        self.assertTrue(until(lambda: set(self.la.remotas("robot")) == {"robot.pn", "robot.ph", "robot.sn"}),
+                        (set(self.la.remotas("robot")), self.lb.said))
+        self.assertTrue(until(lambda: self.solo("laptop.la") is not None))
+        self.assertEqual(self.solo("laptop.la"), {"pn"})
+        texto = (f"'ajeno' (pid {self.ajeno}) no lo arranqué yo y esta es una sesión de reproducción: no lo conecto "
+                 f"con laptop (ni recibe ni manda). Si es parte del robot, ponlo en robot.toml")
+        self.assertEqual(ajeno_dicho(self.lb.said, "ajeno"), [texto])
+
+    def test_el_agente_aplica_la_regla_en_sim_y_replay_y_no_en_real(self):
+        """§9.2: el agente arma el puente con `owned` si la laptop pidió reloj sim o replay (con su nombre en el
+        aviso), y sin restricción en real."""
+        for reloj, owned, nombre in (("sim", True, "simulación"), ("replay", True, "reproducción"),
+                                     ("real", False, None)):
+            with self.subTest(reloj=reloj):
+                s, _ = TestConfirmarYPerderNoSeCruzan.sesion(self, unconfirmed=False)
+                s._first = {"desde": "laptop", "reloj": reloj}
+                with mock.patch("agmen.pubsub.hub_address", return_value="127.0.0.1:9"):
+                    s._start_bridge()
+                self.addCleanup(s.bridge.close)
+                self.assertEqual(s.bridge.owned is not None, owned)
+                if owned:
+                    self.assertEqual(s.bridge.session, nombre)
+
     def test_en_una_sesion_real_cruza_todo_y_no_hay_solo(self):
         self.armar(sim=False)
         todos = {"robot.pn", "robot.ph", "robot.pa", "robot.sa", "robot.sn"}
@@ -994,6 +1076,95 @@ class TestHubQueNoContesta(Base):
                 b.tick()
         self.assertEqual(sum("no contesta" in t for t in said), 1, said)
         self.assertFalse(any("no cabe" in t for t in said))
+
+
+class TestListaIncompleta(Base):
+    """§10.4: una lista incompleta no vacía la tabla (hasta 3 seguidas); a la cuarta, vacía y se avisa una vez. Los
+    avisos "no cabe"/"ya cabe", una vez por cambio de estado y como mucho uno cada TOO_BIG_SAY_S."""
+
+    def setUp(self):
+        super().setUp()
+        from agmen import hub as H
+
+        self.H = H
+        port = TA.free_udp_port()
+        h = H.Hub(f"127.0.0.1:{port}", log=lambda t: None)
+        self.addCleanup(h.sock.close)
+        h.handle(hp.encode("pub", id="p1", node="imu", pid=1, topic="/x", schema="00000000000000aa", type="X",
+                           text="X{u32 a}"), ("127.0.0.1", 5000), time.monotonic())
+        self.buena = H.Respuesta(hp.parse(h.state_text().encode()))
+        self.mala = H.Respuesta(self.buena[:1])
+        self.mala.incompleta = (1, 2)
+        self.said: list[str] = []
+        self.b = bridge_sin_hub(self, self.said)
+
+    def leer(self, now, resp):
+        with mock.patch.object(self.H, "query", return_value=resp), \
+                mock.patch.object(self.H, "ping", side_effect=AssertionError("no hace falta ping")):
+            return self.b._read_hub(now, ["robot"])
+
+    def avisos(self):
+        return [t for t in self.said if "no cabe" in t or "ya cabe" in t]
+
+    def test_tres_incompletas_conservan_la_tabla_y_la_cuarta_la_vacia(self):
+        tabla = self.leer(0.0, self.buena)
+        self.assertEqual([d["id"] for d in tabla[0]], ["p1"])
+        for i in (1, 2, 3):
+            self.assertEqual(self.leer(float(i), self.mala), tabla, i)   # la última buena
+        self.assertEqual(self.avisos(), [])
+        self.assertEqual(self.leer(4.0, self.mala), ([], []))           # la cuarta: vacía, y se avisa
+        self.assertEqual(self.avisos(), ["⚠ la tabla de mi hub no cabe en una respuesta (llegaron 1 de 2 partes: "
+                                         "demasiados topics o esquemas muy largos): no puedo pasarle mis topics a "
+                                         "'robot'"])
+        self.assertEqual(self.leer(5.0, self.mala), ([], []))           # sigue vacía, sin repetir el aviso
+        self.assertEqual(len(self.avisos()), 1)
+        # Vuelve a llegar entera: se pasa ya, pero "ya cabe" espera a que pasen TOO_BIG_SAY_S desde el último aviso.
+        self.assertEqual(self.leer(6.0, self.buena), tabla)
+        self.assertEqual(len(self.avisos()), 1)
+        self.assertEqual(self.leer(4.0 + T.TOO_BIG_SAY_S, self.buena), tabla)
+        self.assertEqual(self.avisos()[1:], ["la tabla de mi hub ya cabe en una respuesta: vuelvo a pasar mis topics"])
+        # Un vaivén rápido (4 incompletas y vuelve) dentro de los 30 s: ni "no cabe" ni "ya cabe" otra vez.
+        t = 5.0 + T.TOO_BIG_SAY_S
+        for i in range(4):
+            self.leer(t + i, self.mala)
+        self.assertEqual(self.leer(t + 4, self.buena), tabla)
+        self.assertEqual(len(self.avisos()), 2)
+
+    def test_una_incompleta_suelta_no_cuenta_para_las_siguientes(self):
+        tabla = self.leer(0.0, self.buena)
+        for i in range(10):
+            self.assertEqual(self.leer(1.0 + 2 * i, self.mala), tabla)
+            self.assertEqual(self.leer(2.0 + 2 * i, self.buena), tabla)
+        self.assertEqual(self.avisos(), [])
+
+    def test_sin_tabla_buena_aun_no_manda_nada_hasta_la_cuarta(self):
+        for i in (1, 2, 3):
+            self.assertIsNone(self.leer(float(i), self.mala))
+        self.assertEqual(self.leer(4.0, self.mala), ([], []))
+
+    def test_sin_nadie_confirmado_no_se_mira_de_quien_es_cada_pid(self):
+        """§10.7: en sim/replay, sin peers confirmados no se arma Lineage (en Windows, una foto de los procesos)."""
+        self.b.owned = lambda: [1]
+        with mock.patch.object(T, "Lineage", side_effect=AssertionError("no hacía falta")), \
+                mock.patch.object(self.H, "query", return_value=self.buena):
+            self.assertEqual(self.b._read_hub(0.0, []), ([], []))
+        with mock.patch.object(self.H, "query", return_value=self.buena):
+            self.assertEqual([d["id"] for d in self.b._read_hub(1.0, ["robot"])[0]], ["p1"])   # pid 1: del agente
+
+    def test_en_posix_lineage_no_toma_la_foto_de_windows(self):
+        with mock.patch.object(T, "_win_parents", side_effect=AssertionError("solo si hace falta")):
+            lin = T.Lineage([os.getpid()])
+            self.assertTrue(lin.owns(os.getpid()))                    # (uno de los suyos: sin foto)
+
+
+class TestTiempos(unittest.TestCase):
+    def test_el_latido_del_puente_aguanta_la_consulta_mas_lenta(self):
+        """§10.5: el peor latido del puente (BEAT_S + QUERY_TIMEOUT + PING_TIMEOUT) no deja caducar lo importado
+        (EXPIRE_S) ni el modo red (`red` cada NET_BEAT_S, caduca a NET_EXPIRE_S)."""
+        self.assertEqual(T.QUERY_TIMEOUT, 1.0)
+        peor = hp.BEAT_S + T.QUERY_TIMEOUT + T.PING_TIMEOUT
+        self.assertLess(peor, hp.EXPIRE_S)
+        self.assertLess(hp.NET_BEAT_S + peor, hp.NET_EXPIRE_S)
 
 
 # ---------------------------------------------------------------------------

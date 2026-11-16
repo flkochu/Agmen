@@ -722,6 +722,82 @@ class TestListaEnPartes(unittest.TestCase):
         self.assertEqual(msgs, hp.parse(text.encode()))
         self.assertEqual(m, len(viejas))
 
+    def test_respuesta_de_un_datagrama_tras_partes_viejas_gana(self):
+        """§10.6: partes viejas (de otra consulta) y luego la respuesta de un datagrama: gana esta."""
+        text = self.hub(topics=60, text_len=1000).state_text()
+        viejas = H.split_state(text, 1)
+        chica = self.hub(topics=2).state_text().encode()
+        fake = FakeHub([viejas[0], viejas[1], chica])
+        self.addCleanup(fake.close)
+        msgs = H.query(fake.addr, timeout=5.0, say=lambda hub, t: self.fail(t))
+        self.assertIsNone(msgs.incompleta)
+        self.assertEqual(msgs, hp.parse(chica))
+
+    def test_una_parte_ilegible_marca_la_respuesta_incompleta(self):
+        """§10.6: llegan todas las partes, pero una no se puede leer: la respuesta es `incompleta` y se dice."""
+        text = self.hub(topics=60, text_len=1000).state_text()
+        parts = H.split_state(text, 3)
+        m = len(parts)
+        mala = parts[1].split(b"\n", 1)[0] + b"\nesto no es una linea del hub"
+        fake = FakeHub([parts[0], mala] + parts[2:])
+        self.addCleanup(fake.close)
+        dicho = []
+        t0 = time.monotonic()
+        msgs = H.query(fake.addr, timeout=5.0, say=lambda hub, t: dicho.append(t))
+        self.assertLess(time.monotonic() - t0, 4.0)                 # no espera al tope: ya llegaron todas
+        self.assertEqual(msgs.incompleta, (m - 1, m))
+        self.assertEqual(len(dicho), 1)
+        self.assertIn(f"llegó incompleta ({m - 1} de {m} partes)", dicho[0])
+        self.assertEqual(sum(1 for op, _ in msgs if op == "parte"), 0)
+
+    def test_un_datagrama_con_miles_de_query_se_atiende_una_vez(self):
+        """§10.3 (a): de un datagrama con miles de `query` solo se contesta una, y el hub sigue con `ping`."""
+        h = self.hub(topics=500, text_len=300, eps_per_topic=2)
+        mudo = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        mudo.bind(("127.0.0.1", 0))
+        self.addCleanup(mudo.close)
+        una = b"\n".join([hp.encode("query")] * 3000)
+        self.assertLess(len(una), 65507)
+        with unittest.mock.patch.object(h, "flush"):                 # (sin que salga nada aún)
+            h.handle(una, mudo.getsockname(), time.monotonic())
+        partes = len(H.split_state(h.state_text(), 1))
+        self.assertEqual(len(h._outbox), partes)                     # una sola respuesta en la cola
+        h._outbox.clear(), h._outbox_addr.clear()
+        h._outbox_bytes = 0
+        # Con su hilo: muchos datagramas así no lo dejan sin contestar `ping`.
+        stop = threading.Event()
+        threading.Thread(target=h.serve, args=(stop,), daemon=True).start()
+        self.addCleanup(stop.set)
+        for _ in range(20):
+            mudo.sendto(una, ("127.0.0.1", h.sock.getsockname()[1]))
+        t0 = time.monotonic()
+        self.assertIsNotNone(H.ping(h.listen, timeout=5.0))
+        self.assertLess(time.monotonic() - t0, 1.0)
+
+    def test_un_cliente_que_no_lee_no_deja_sin_lista_a_otro(self):
+        """§10.3 (b, c): tope por dirección: lo pendiente para quien no lee no pasa de OUTBOX_ADDR_MAX, y otro que
+        pregunta después sí recibe su lista entera."""
+        h = self.hub(topics=500, text_len=300, eps_per_topic=2)
+        mudo = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        mudo.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        mudo.bind(("127.0.0.1", 0))
+        self.addCleanup(mudo.close)
+        armadas = []
+        real = h.state_text
+        h.state_text = lambda: (armadas.append(1), real())[1]
+        with unittest.mock.patch.object(h, "flush"):                 # (sin que salga nada: como si fuera muy rápido)
+            for _ in range(100):
+                h.handle(hp.encode("query"), mudo.getsockname(), time.monotonic())
+        self.assertLessEqual(h._outbox_addr[mudo.getsockname()], H.OUTBOX_ADDR_MAX)
+        self.assertLess(len(armadas), 100)                            # (b) llena la cola, ya ni se arma la lista
+        self.assertLess(h._outbox_bytes, H.OUTBOX_MAX)
+        c = self.client()
+        text, got = self.ask(h, c)
+        self.assertEqual(h._outbox_addr, {})                          # todo salió (y se descontó)
+        self.assertEqual(h._outbox_bytes, 0)
+        self.assertEqual([x for d in got for x in sin_age(hp.parse(d.split(b"\n", 1)[1]))],
+                         sin_age(hp.parse(text.encode())))
+
     def test_una_linea_que_sola_no_cabe_se_recorta_y_se_marca(self):
         h = self.hub(topics=1, text_len=100_000)
         h.handle(hp.encode("sub", id="s1", node="oye", pid=1, topic="/largo0", schema="*", port=6000),

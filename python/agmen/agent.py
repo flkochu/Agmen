@@ -1255,10 +1255,17 @@ class AgentServer:
                         f"o de otra versión? Detenlo (o reinicia {m}) y vuelve a correr agmen run"), True
             return "", False
         try:
-            msgs = query(address, timeout=1.0)
+            msgs = query(address, timeout=1.0, say=None)
+            if msgs.incompleta is not None:   # §10.1: nunca se da por buena una lista incompleta: otra vez
+                msgs = query(address, timeout=1.0, say=None)
         except (ConnectionError, OSError):
             return (f"{m}: el agmen hub de {address} contesta pero no dice qué nodos tiene: detenlo y vuelve a "
                     f"correr agmen run"), True
+        if msgs.incompleta is not None:   # falla cerrada: sin la lista entera no se sabe si hay nodos ajenos
+            k, total = msgs.incompleta
+            return (f"{m}: la lista de nodos del agmen hub de {address} no llegó completa ({k} de {total} partes, dos "
+                    f"veces), así que no puedo comprobar que no corran nodos que este agente no lanzó. Vuelve a correr "
+                    f"agmen run; si se repite, hay demasiados topics en {m} o está saturada"), True
         names = sorted({_clean(f.get("node", "?"), 40) for op, f in msgs if op in ("ep", "stat")})
         if names:
             return (f"{m}: ya corren nodos que este agente no lanzó ({', '.join(names)}), con su agmen hub en "
@@ -1690,11 +1697,13 @@ class _Session:
                     except Exception as e:
                         failed = e
                     out = self.out
+            if grace and self.peer is not None:
+                # 4b: sin conexión no se late nada de la laptop ni se repite `red`. Con el candado (§10.2): un lose()
+                # de esta conexión (vieja) nunca llega después del confirm() de la nueva (que también lo toma).
+                self.peer.lose()
         if not grace:
             self.end(early, "error")
             return
-        if self.peer is not None:
-            self.peer.lose()   # 4b: sin conexión no se late nada de la laptop ni se repite `red`
         if failed is not None:
             self.end(f"la laptop ({self.ip}) {cause}, y no pude esperar a que vuelva ({_clean(repr(failed), 200)}): "
                      f"detengo los nodos", "error")
@@ -1764,8 +1773,8 @@ class _Session:
                     self.channel, self.out, self.unconfirmed = channel, out, channel
                     self._unread.clear()   # el lector de la nueva es este hilo (en _guarded, abajo)
                     old_ip, self.ip = self.ip, ip
-        if self.peer is not None:
-            self.peer.lose()   # 4b: hasta que la laptop confirme por la conexión nueva, sin puente
+            if self.peer is not None:
+                self.peer.lose()   # 4b: hasta que la laptop confirme por la conexión nueva, sin puente (con el candado)
         if failed is not None:
             channel.close()   # §14: el canal nuevo no se queda abierto (end() cierra el de antes, el actual)
             self.end(f"la laptop volvió a conectarse desde {ip} y no pude esperar a que confirme "
@@ -1803,8 +1812,9 @@ class _Session:
             self._grace_token += 1   # si el temporizador ya disparó y espera el candado, ya no hace nada
             self._extended = False
             if self.peer is not None:
-                # 4b: el puente vuelve, con la IP desde la que llegó la laptop. Con el candado (§8.2): una pérdida
-                # (_lost) llega antes, y entonces aquí ya no es la conexión actual, o después, y su peer.lose() gana.
+                # 4b: el puente vuelve, con la IP desde la que llegó la laptop. Con el candado (§8.2, §10.2): una
+                # pérdida (_lost, que hace peer.lose() con este mismo candado) llega antes, y entonces aquí ya no es la
+                # conexión actual, o después, y su peer.lose() gana; la de una conexión vieja ya no es la actual.
                 self.peer.confirm(ip)
         if timer is not None:
             timer.cancel()
