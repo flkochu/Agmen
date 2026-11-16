@@ -268,6 +268,16 @@ if(AGMEN_BUILD_TESTS)
     agmen_set_warnings(test_gen)
     add_test(NAME gen COMMAND test_gen)
 
+    # Los mensajes estándar chicos de <agmen/msgs.hpp> (RFC 0013) contra sus
+    # vectores, los mismos que revisan Python y JavaScript; y `= nan` en .agmen.
+    agmen_add_messages(valores_nan_msgs tests/valores_nan.agmen)
+    add_executable(test_msgs tests/test_msgs.cpp)
+    target_link_libraries(test_msgs PRIVATE valores_nan_msgs)
+    target_compile_definitions(test_msgs PRIVATE
+        AGMEN_ESTANDAR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/tests/vectors/estandar.txt")
+    agmen_set_warnings(test_msgs)
+    add_test(NAME msgs COMMAND test_msgs)
+
     # Fuzzers (tests/fuzz). Las entradas que alguna vez rompieron el
     # decodificador (tests/fuzz/regresiones/) se vuelven a correr con cualquier
     # compilador; con AGMEN_FUZZ=ON (Clang) además salen los fuzzers de libFuzzer.

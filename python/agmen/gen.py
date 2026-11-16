@@ -10,6 +10,7 @@ exactamente el código que escribe `gen --python`.
 
 from __future__ import annotations
 
+import math
 import sys
 import types
 from pathlib import Path
@@ -50,10 +51,22 @@ def _cpp_name(owner: AgmenFile, d: EnumDef | StructDef) -> str:
     return f"{_ns(d.file)}::{d.name}" if d.file.package else d.name
 
 
+# `nan` (RFC 0013): un NaN quieto con bits fijos, iguales a los de Python
+# (struct.pack de float("nan")), en GCC, clang y MSVC: std::bit_cast no deja
+# que cada compilador elija signo ni carga, como podría quiet_NaN().
+_CPP_NAN = {"f32": "std::bit_cast<float>(0x7FC00000U)", "f64": "std::bit_cast<double>(0x7FF8000000000000ULL)"}
+
+
+def _is_nan(v) -> bool:
+    return isinstance(v, float) and math.isnan(v)
+
+
 def _cpp_literal(prim: str, v) -> str:
     if prim == "bool":
         return "true" if v else "false"
     if prim in ("f32", "f64"):
+        if _is_nan(v):
+            return _CPP_NAN[prim]
         r = repr(float(v))
         if r in ("inf", "-inf", "nan"):
             raise idl.AgmenFileError(f"valor {r} no permitido")
@@ -396,8 +409,11 @@ class _Cpp:
 
     def render(self) -> str:
         f = self.f
+        uses_nan = any(_is_nan(fd.default) or (isinstance(fd.default, list) and any(map(_is_nan, fd.default)))
+                       for s in f.structs for fd in s.fields)
         lines = ["// " + f.path.name, *_header(f, "//"), "#pragma once", "",
-                 "#include <agmen/agmen.hpp>", "", "#include <array>", "#include <cstddef>", "#include <cstdint>",
+                 "#include <agmen/agmen.hpp>", "", "#include <array>", *(["#include <bit>"] if uses_nan else []),
+                 "#include <cstddef>", "#include <cstdint>",
                  "#include <span>", "#include <string>", "#include <string_view>", "#include <utility>",
                  "#include <vector>", ""]
         if f.imports:
@@ -468,7 +484,7 @@ class _Py:
         if fd.prim == "bool":
             return "True" if v else "False"
         if fd.prim in ("f32", "f64"):
-            return repr(float(v))
+            return 'float("nan")' if _is_nan(v) else repr(float(v))   # nan (RFC 0013): un NaN quieto
         return str(int(v))
 
     def zero(self, fd: FieldDef) -> str:

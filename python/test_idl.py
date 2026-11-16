@@ -12,6 +12,7 @@
 import ast
 import importlib
 import io
+import struct
 import sys
 import tempfile
 import textwrap
@@ -339,6 +340,17 @@ class TestErrores(Tmp):
         ("message A { }\n", "x.agmen:1:9:", "no tiene campos"),
         ("const u8 patas = 4\n", "x.agmen:1:10:", "MAYÚSCULAS"),
         ("message A {\n    u8 _x\n}\n", "x.agmen:2:8:", "no puede empezar con '_'"),
+        # nan (RFC 0013): solo en f32 y f64.
+        ("message A {\n    u8 x = nan\n}\n", "x.agmen:2:12:", "'nan' solo vale en campos f32 y f64; u8 es entero"),
+        ("message A {\n    i32[3] x = nan\n}\n", "x.agmen:2:16:", "i32 es entero y no tiene NaN"),
+        ("message A {\n    u16[2] x = [1, nan]\n}\n", "x.agmen:2:16:", "u16 es entero y no tiene NaN"),
+        ("message A {\n    bool b = nan\n}\n", "x.agmen:2:14:", "un bool lleva true o false"),
+        ("message A {\n    time t = nan\n}\n", "x.agmen:2:14:", "time es entero y no tiene NaN"),
+        ("enum Modo { QUIETO, TROTAR }\nmessage A {\n    Modo m = nan\n}\n", "x.agmen:3:14:",
+         "un Modo lleva uno de sus nombres (QUIETO, TROTAR)"),
+        ("const f32 X = nan\n", "x.agmen:1:15:", "no en una constante"),
+        ("message A {\n    f32 x = NaN\n}\n", "x.agmen:2:13:", "se escribe 'nan', en minúsculas"),
+        ("message A {\n    string s = nan\n}\n", "x.agmen:2:16:", "va entre comillas"),
     ]
 
     def test_errores_con_linea_y_columna(self):
@@ -355,6 +367,80 @@ class TestErrores(Tmp):
         with self.assertRaises(idl.AgmenFileError) as e:
             idl.parse_file(self.dir / "a.agmen")
         self.assertIn("import circular", str(e.exception))
+
+
+class TestNan(Tmp):
+    """`nan` como valor por defecto (RFC 0013): f32 y f64, sueltos y en arreglos.
+    No viaja: ni el texto canónico ni el schema_id cambian. C++ (tests/test_msgs.cpp)
+    revisa los mismos bytes con tests/valores_nan.agmen."""
+
+    VALORES_NAN = ROOT / "tests" / "valores_nan.agmen"
+    # Los bytes de ConNan() (los mismos que revisa tests/test_msgs.cpp).
+    BYTES = bytes.fromhex("0000c07f00000000000000000000f87f0000c07f0000c07f0000c07f00000000000000000000f87f00000000"
+                          "0000f87f0000c07f0000c03f0000c07f0000000000000000000004400700000000000000")
+
+    def test_valores(self):
+        import math
+
+        msgs = agmen.load(self.VALORES_NAN)
+        c = msgs.ConNan()
+        self.assertTrue(math.isnan(c.a) and math.isnan(c.b))
+        self.assertTrue(all(math.isnan(x) for x in [*c.v, *c.w]))
+        self.assertEqual(len(c.v), 3)
+        self.assertTrue(math.isnan(c.m[0]) and c.m[1] == 1.5 and math.isnan(c.m[2]))
+        self.assertEqual((c.c, c.k), (2.5, 7))
+        self.assertIsNot(msgs.ConNan().v, c.v, "cada instancia con su propia lista")
+        self.assertEqual(c.encode_payload(), self.BYTES)
+        # Un NaN quieto: f32 0x7FC00000 y f64 0x7FF8000000000000, como en C++.
+        self.assertEqual(struct.unpack_from("<I", self.BYTES, 0)[0], 0x7FC00000)
+        self.assertEqual(struct.unpack_from("<Q", self.BYTES, 8)[0], 0x7FF8000000000000)
+
+    def test_no_viaja(self):
+        """El texto canónico y el schema_id son los mismos con o sin `= nan`."""
+        con = idl.parse_file(self.write("con.agmen", "message A {\n    f32 x = nan\n    f64[2] v = nan\n}\n"))
+        sin = idl.parse_file(self.write("sin.agmen", "message A {\n    f32 x\n    f64[2] v\n}\n"))
+        self.assertEqual(con.structs[0].text, "agmen/1 A{f32 x;f64[2] v}")
+        self.assertEqual((con.structs[0].text, con.structs[0].schema_id), (sin.structs[0].text, sin.structs[0].schema_id))
+        self.assertEqual(con.structs[0].schema_id, schema.schema_id("A{f32 x;f64[2] v}"))
+
+    def test_codigo_generado(self):
+        f = idl.parse_file(self.VALORES_NAN)
+        cpp = gen.cpp(f)
+        self.assertIn("#include <bit>", cpp)
+        self.assertIn("float a = std::bit_cast<float>(0x7FC00000U);", cpp)
+        self.assertIn("double b = std::bit_cast<double>(0x7FF8000000000000ULL);", cpp)
+        self.assertIn("agmen::wire::filled<float, 3>(std::bit_cast<float>(0x7FC00000U))", cpp)
+        self.assertNotIn("#include <bit>", gen.cpp(idl.parse_file(VECTORS / "v1.agmen")), "solo si hace falta")
+        py = gen.python(f)
+        self.assertIn('a: float = float("nan")', py)
+        # El .py que escribe agmen gen se importa y da los mismos bytes.
+        out = self.dir / "py"
+        out.mkdir()
+        (out / "valores_nan.py").write_text(py, encoding="utf-8")
+        sys.path.insert(0, str(out))
+        try:
+            mod = importlib.import_module("valores_nan")
+            self.assertEqual(mod.ConNan().encode_payload(), self.BYTES)
+        finally:
+            sys.path.remove(str(out))
+            sys.modules.pop("valores_nan", None)
+
+    def test_struct_y_message_con_nan(self):
+        import math
+
+        p = self.write("q.agmen", """
+            struct Q { f32 x = nan; f32 w = nan }
+            message M {
+                Q q
+                f64 t = nan
+            }
+            """)
+        msgs = agmen.load(p)
+        m = msgs.M()
+        self.assertTrue(math.isnan(m.q.x) and math.isnan(m.t))
+        back = msgs.M.decode_payload(m.encode_payload())
+        self.assertTrue(math.isnan(back.q.w) and math.isnan(back.t))
+        self.assertEqual(back.encode_payload(), m.encode_payload())
 
 
 class TestGen(Tmp):

@@ -44,3 +44,103 @@ message MuxEstado {
     u64    fuente                 # source_id del publicador que manda (0 si nadie manda)
     u32    cambios                # cuántas veces cambió el mando desde que arrancó el mux
 }
+
+# ---------------------------------------------------------------------------
+# Mensajes estándar chicos (RFC 0013 §3.2 y §3.3): compact, tamaño fijo, sin texto.
+#
+# Convenciones, para todos:
+#   - Unidades SI: metros, radianes, segundos, m/s, rad/s, m/s². Nunca grados.
+#   - Ejes de mano derecha. En el cuerpo de un robot: x al frente, y a la
+#     izquierda, z arriba (REP-103).
+#   - Rotaciones: cuaterniones con campos con nombre x, y, z, w (el orden de
+#     ROS, Foxglove e Isaac Lab 3.0). w = 1 es "sin rotación". Para MuJoCo, que
+#     pone w primero, usa wxyz() y from_wxyz(): el orden nunca se adivina.
+#   - Lo que no se mide o no se manda va en NaN: nunca se inventa un valor.
+#   - No llevan timestamp ni frame_id: el instante es el t_data del sobre y el
+#     marco es el del topic.
+#   - f64 en la geometría (como Foxglove y ROS); f32 en lo que sale de un
+#     microcontrolador y entra a una política (la IMU).
+# ---------------------------------------------------------------------------
+
+# Un vector en el plano (los campos de foxglove.Vector2). Las unidades son las
+# del campo que lo usa.
+struct Vector2 {
+    f64 x
+    f64 y
+}
+
+# Un vector en el espacio (los campos de foxglove.Vector3). Las unidades son
+# las del campo que lo usa (m, m/s, rad/s...).
+struct Vector3 {
+    f64 x
+    f64 y
+    f64 z
+}
+
+# Una rotación (los campos de foxglove.Quaternion): x, y, z, w, con w al final.
+# Empieza en "sin rotación" (w = 1) porque se calcula. En Python, wxyz() y
+# from_wxyz(); en C++, agmen::msgs::wxyz() y from_wxyz() (<agmen/geometry.hpp>).
+struct Quaternion {
+    f64 x
+    f64 y
+    f64 z
+    f64 w = 1                     # w = 1, x = y = z = 0: sin rotación
+}
+
+# Una pose (los campos de foxglove.Pose): dónde está y cómo está girado algo,
+# en el marco del topic.
+message Pose {
+    Vector3    position           # m
+    Quaternion orientation
+}
+
+# Una transformación entre dos marcos (los campos de foxglove.FrameTransform,
+# sin los nombres): los marcos padre e hijo los dice robot.toml.
+message Transform {
+    Vector3    translation        # dónde está el origen del hijo, visto desde el padre (m)
+    Quaternion rotation           # cómo está girado el hijo, visto desde el padre
+}
+
+# Una velocidad (los campos de geometry_msgs/Twist): para mover un robot, en
+# el marco de su base (base_link).
+message Twist {
+    Vector3 linear                # m/s, en el marco del topic (para mover un robot: su base_link)
+    Vector3 angular               # rad/s, en el mismo marco
+}
+
+# Odometría (los campos de foxglove.Odometry, sin texto ni covarianzas): el
+# hijo (ej. base_link) visto desde el padre (ej. odom); los dos marcos los dice
+# el [[frame]] de robot.toml cuyo topic es este.
+message Odometry {
+    Pose    pose                  # el hijo visto desde el padre (ej. base_link en odom)
+    Vector3 linear_velocity       # m/s, medida en el hijo (como body_frame_id en Foxglove)
+    Vector3 angular_velocity      # rad/s, medida en el hijo
+}
+
+# Un vector en el espacio en f32, para lo que sale de un microcontrolador (la
+# IMU). Las unidades son las del campo que lo usa.
+struct Vector3f {
+    f32 x
+    f32 y
+    f32 z
+}
+
+# Una rotación en f32: x, y, z, w, con w al final. Empieza en NaN porque se
+# mide: vacía hasta que la llenes (lo que no se mide no se inventa). En Python,
+# wxyz() y from_wxyz(); en C++, agmen::msgs::wxyz() y from_wxyz().
+struct Quaternionf {
+    f32 x = nan
+    f32 y = nan
+    f32 z = nan
+    f32 w = nan
+}
+
+# Una IMU (los campos de sensor_msgs/Imu, sin covarianzas, en f32). La
+# orientación es respecto a un marco quieto con z hacia arriba (alineado con la
+# gravedad); hacia dónde apunta x es arbitrario (donde quedó al encender),
+# salvo que tenga magnetómetro. ImuSample, la del tutorial, no cambia.
+message Imu {
+    Quaternionf orientation           # la IMU vista desde un marco quieto con z arriba; NaN si no la estima
+    Vector3f    angular_velocity      # rad/s, en el marco de la IMU
+    Vector3f    linear_acceleration   # m/s², en el marco de la IMU (quieta y con z arriba marca +9.81 en z)
+}

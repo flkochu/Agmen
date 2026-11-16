@@ -25,6 +25,10 @@ el mismo texto canónico de siempre (RFC 0001), así que los bytes no cambian.
 - Un enum viaja como su entero (`u8`).
 - Las constantes, los valores por defecto y el `package` no viajan: viven
   solo en el código generado.
+- Desde Agmen 0.15 (RFC 0013), un campo f32 o f64 puede empezar en `nan`
+  ("no se mide o no se manda"): `f32 x = nan`, `f32[3] v = nan`. Es un NaN
+  quieto con los mismos bits en C++ y en Python (f32 0x7FC00000,
+  f64 0x7FF8000000000000). En cualquier otro tipo, `nan` es un error.
 - Desde Agmen 0.10 (RFC 0008) hay campos de tamaño variable: `string`,
   `bytes`, `T[]` y `tensor<T,N>`. Un message con alguno viaja en la
   codificación arrow (por TCP) en vez de compact; su código generado sabe
@@ -38,6 +42,7 @@ from __future__ import annotations
 
 import difflib
 import keyword
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -572,7 +577,29 @@ def _alias_hint(name: str) -> str:
     return f": usa '{alias}'" if alias else ""
 
 
-def _check_scalar(f: AgmenFile, prim: str, value, pos: Pos, enum: EnumDef | None):
+def _check_nan(f: AgmenFile, prim: str, value, pos: Pos, enum: EnumDef | None, allow_nan: bool):
+    """`nan` (RFC 0013): "no se mide o no se manda". Solo vale como valor por
+    defecto de un campo f32 o f64; en lo demás, un error que dice qué hacer."""
+    if value.name != "nan":
+        raise f.error(f"se escribe 'nan', en minúsculas (no '{value.name}')", value.pos)
+    if not allow_nan:
+        raise f.error("'nan' solo vale como valor por defecto de un campo f32 o f64, no en una constante: "
+                      "usa un número", pos)
+    if enum is not None:
+        names = ", ".join(m for m, _ in enum.members)
+        raise f.error(f"'nan' solo vale en campos f32 y f64; un {enum.name} lleva uno de sus nombres ({names})", pos)
+    if prim not in FLOATS:
+        what = "un bool lleva true o false" if prim == "bool" else (
+            f"{prim} es entero y no tiene NaN: usa un número que signifique 'no hay' (ej. 0 o -1)")
+        raise f.error(f"'nan' solo vale en campos f32 y f64; {what}", pos)
+    return math.nan
+
+
+def _check_scalar(f: AgmenFile, prim: str, value, pos: Pos, enum: EnumDef | None, allow_nan: bool = False):
+    # 'nan' en minúsculas no puede ser el nombre de un valor de enum (van en MAYÚSCULAS);
+    # 'NaN' o 'NAN' en un campo de número es casi seguro un nan mal escrito.
+    if isinstance(value, _Name) and (value.name == "nan" or (enum is None and value.name.lower() == "nan")):
+        return _check_nan(f, prim, value, pos, enum, allow_nan)
     if enum is not None:
         names = [m for m, _ in enum.members]
         if not isinstance(value, _Name):
@@ -705,15 +732,15 @@ def _resolve(f: AgmenFile) -> None:
             if n is None:                      # T[]: la lista que se dé (o vacía)
                 if not isinstance(v, list):
                     raise f.error(f"'{fd.name}' es una lista: su valor por defecto va entre corchetes, [1, 2]", pos)
-                return [_check_scalar(f, fd.prim, x, pos, fd.enum) for x in v]
+                return [_check_scalar(f, fd.prim, x, pos, fd.enum, True) for x in v]
             if isinstance(v, list):
                 if len(v) != n:
                     raise f.error(f"'{fd.name}' tiene {n} elementos y el valor por defecto trae {len(v)}", pos)
-                return [_check_scalar(f, fd.prim, x, pos, fd.enum) for x in v]
-            return [_check_scalar(f, fd.prim, v, pos, fd.enum)] * n
+                return [_check_scalar(f, fd.prim, x, pos, fd.enum, True) for x in v]
+            return [_check_scalar(f, fd.prim, v, pos, fd.enum, True)] * n
         if isinstance(v, list):
             raise f.error(f"'{fd.name}' no es un arreglo: su valor por defecto es uno solo", pos)
-        return _check_scalar(f, fd.prim, v, pos, fd.enum)
+        return _check_scalar(f, fd.prim, v, pos, fd.enum, True)
 
     for s in f.structs:
         build(s, [])
