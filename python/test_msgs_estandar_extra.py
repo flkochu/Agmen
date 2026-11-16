@@ -346,6 +346,60 @@ class TestCuaternionExtra(unittest.TestCase):
             msgs.Quaternion.from_wxyz(np.zeros((2, 2)).reshape(2, 2)[0])
 
 
+class TestGrabacionResuelveEstandar(unittest.TestCase):
+    """agmen.Recording da las clases de agmen.msgs aunque en el proceso ya existan otras con el mismo esquema."""
+
+    def _grabar(self, d):
+        from agmen import _mcap
+
+        path = os.path.join(d, "std.mcap")
+        w = _mcap.Writer(path)
+        t0 = 1_700_000_000_000_000_000
+        tipos = {"/imu": msgs.Imu(), "/odom": msgs.Odometry(), "/pose": msgs.Pose(), "/tw": msgs.Twist(),
+                 "/tf": msgs.Transform(), "/v2": msgs.Vector2(), "/qf": None}
+        for i, (topic, m) in enumerate(tipos.items()):
+            if m is None or not hasattr(m, "encode_payload"):
+                continue
+            lay = type(m).LAYOUT
+            cid = w.add_channel(topic, "agmen", w.add_schema(lay.name, "agmen", lay.text.encode()))
+            w.add_message(cid, t0, t0, i, wire.encode(m, i, t_data=t0, t_pub=t0, topic=topic))
+        w.close()
+        return path
+
+    def _revisa(self, path):
+        with agmen.Recording(path) as rec:
+            self.assertIs(rec.topics["/imu"], msgs.Imu)
+            self.assertIs(rec.topics["/odom"], msgs.Odometry)
+            self.assertIs(rec.topics["/pose"], msgs.Pose)
+            self.assertIs(rec.topics["/tw"], msgs.Twist)
+            self.assertIs(rec.topics["/tf"], msgs.Transform)
+            got = {s.topic: s.message for s in rec.messages()}
+            self.assertTrue(math.isnan(got["/imu"].orientation.x))
+            self.assertEqual(got["/odom"].pose.orientation.w, 1.0)
+
+    def test_basico(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._revisa(self._grabar(d))
+
+    def test_con_clases_del_mismo_esquema_ya_cargadas(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._grabar(d)
+            otra = msgs.types(numpy=True)                                  # otras clases con el mismo esquema
+            self.assertIsNot(otra.Imu, msgs.Imu)
+            usuario = gen.load(_write(d, "imu_propia.agmen", msgs_agmen_copia()))
+            self.assertIsNot(usuario.Imu, msgs.Imu)
+            self._revisa(path)
+
+
+def msgs_agmen_copia():
+    """El mismo texto de Imu/Vector3f/Quaternionf escrito por un usuario (mismo schema_id)."""
+    return """
+struct Vector3f { f32 x\n f32 y\n f32 z }
+struct Quaternionf { f32 x = nan\n f32 y = nan\n f32 z = nan\n f32 w = nan }
+message Imu { Quaternionf orientation\n Vector3f angular_velocity\n Vector3f linear_acceleration }
+""".replace("\\n", "\n")
+
+
 class TestNoCambiaLoQueExistia(unittest.TestCase):
     """schema_id de los tipos de siempre, fijos (calculados en 89f99ef, tests/vectors/schema_ids_89f99ef.json)."""
 
