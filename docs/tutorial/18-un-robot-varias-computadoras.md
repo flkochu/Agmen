@@ -1,6 +1,6 @@
 # Capítulo 18 — Un robot, varias computadoras
 
-*Disponible desde Agmen 0.14.0 (aún sin publicar) · ⏱ 60 minutos*
+*Disponible desde Agmen 0.14.0 · ⏱ 60 minutos*
 
 En el [capítulo 5, sección 7](05-un-solo-comando.md#7-decir-en-qué-computadora-corre-cada-nodo-machine)
 viste la idea: un robot puede tener dos computadoras. Aquí lo armas de verdad.
@@ -121,16 +121,13 @@ agmen agent examples/tutorial/robot_dos.toml
 Déjala corriendo. La terminal dice esto (la versión que ves es la de tu instalación):
 
 ```
-agmen agent │ Agmen 0.13.0 · robot 'robot del tutorial, en dos computadoras' · esta computadora es 'robot' (192.168.1.20) · nodos de aquí (perfil real): imu
+agmen agent │ Agmen 0.14.0 · robot 'robot del tutorial, en dos computadoras' · esta computadora es 'robot' (192.168.1.20) · nodos de aquí (perfil real): imu
 agmen agent │ esperando a agmen run en 192.168.1.20:7391 · clave: vwcw-wbqt-csnx
 ```
 
 La última línea es la clave que vas a escribir en la laptop. Si la terminal no
 es una terminal (por ejemplo, un servicio, que lo veremos en la sección 7), la
 clave **no** aparece: dice dónde está guardada.
-
-> ⚠ La primera línea dice 0.13.0 porque en este repositorio la versión 0.14.0
-> todavía no está publicada. Cuando se publique, dirá 0.14.0.
 
 Si la IP de la Pi no es la de `host`, el agente no encuentra su `[[machine]]` y
 termina con un error que dice que ninguna `[[machine]]` es esa computadora. Revisa la IP.
@@ -156,17 +153,17 @@ tu usuario (agmen run --forget-key robot la borra)`) y sigue. Así se ve la
 terminal de la laptop. Quitamos algunas líneas, marcadas con `…`:
 
 ```
-agmen     │ Agmen 0.13.0 · robot 'robot del tutorial, en dos computadoras' · 3 nodos · agmen hub en 127.0.0.1:7390
+agmen     │ Agmen 0.14.0 · robot 'robot del tutorial, en dos computadoras' · 3 nodos · agmen hub en 127.0.0.1:7390
 agmen     │ sin machine, corren en esta computadora: hub, cerebro
 agmen     │ conectando con robot (192.168.1.20:7391)…
 robot     │ sesión de 192.168.1.7: agmen hub en 127.0.0.1:7390
-agmen     │ robot (192.168.1.20:7391): conectado · Agmen 0.13.0
+agmen     │ robot (192.168.1.20:7391): conectado · Agmen 0.14.0
 …
 agmen     │ 'cerebro' no arranca solo (autostart = false); inícialo desde el panel
 agmen     │ todo arrancado. Ctrl+C para detener todo.
 robot     │ la laptop pidió arrancar 'imu'
 robot/imu │ ▶ iniciado (pid 2150)
-robot/imu │ [publisher] Agmen 0.13.0 · agmen/1 ImuSample{f32 ax;f32 ay;f32 az;f32 gx;f32 gy;f32 gz} (schema_id 0x83b0e57da34a724d) → /imu a 100 Hz
+robot/imu │ [publisher] Agmen 0.14.0 · agmen/1 ImuSample{f32 ax;f32 ay;f32 az;f32 gx;f32 gy;f32 gz} (schema_id 0x83b0e57da34a724d) → /imu a 100 Hz
 …
 robot/imu │ [publisher] enviados=101 retrasos=0
 robot/imu │ [publisher] enviados=202 retrasos=0
@@ -398,7 +395,7 @@ hub   │ ■ detenido
 agmen agent │ la laptop (192.168.1.7) no volvió en 10 s: detuve los nodos
 agmen agent │ esperando a agmen run en 192.168.1.20:7391 (otra vez)
 agmen agent │ rechacé la sesión de 192.168.1.7: robot: esa sesión ya terminó; los nodos están detenidos. Abre una sesión nueva
-agmen agent │ laptop 192.168.1.7 conectada · Agmen 0.13.0 · perfil real · nodos de aquí: imu
+agmen agent │ laptop 192.168.1.7 conectada · Agmen 0.14.0 · perfil real · nodos de aquí: imu
 ```
 
 Lo que pasó, paso a paso:
@@ -479,7 +476,7 @@ decir, si las dos computadoras tienen `[hub]` encendido.
 
 ```
 agmen     │ conectando con robot (192.168.1.20:7391)…
-agmen     │ robot (192.168.1.20:7391): conectado · Agmen 0.13.0
+agmen     │ robot (192.168.1.20:7391): conectado · Agmen 0.14.0
 agmen     │ ✔ red con 'robot': los topics pasan en los dos sentidos (UDP y TCP)
 ```
 
@@ -492,7 +489,7 @@ En este ejemplo, el firewall de la Pi (`ufw`) no deja entrar los mensajes chicos
 
 ```
 agmen     │ conectando con robot (192.168.1.20:7391)…
-agmen     │ robot (192.168.1.20:7391): conectado · Agmen 0.13.0
+agmen     │ robot (192.168.1.20:7391): conectado · Agmen 0.14.0
 error: la prueba de red con 'robot' no pasó, así que no arranqué nada:
   robot no recibe de esta computadora por UDP (mensajes chicos): ¿un firewall (ufw) bloquea la entrada? En robot: sudo ufw allow from 192.168.1.7
 Si sabes que la red está bien, puedes saltártela: agmen run examples/tutorial/robot_dos.toml --no-net-check (pero entonces, si un firewall bloquea los topics, Agmen no te lo va a decir)
@@ -823,16 +820,21 @@ otras dos cosas:
   1075 ms. La cruda da 40 ms (1075 − 1035), y la real, 75 ms (40 + 35). Si no se puede
   corregir (no hay medición, o dos computadoras publican el mismo topic), la latencia
   sale marcada como `(sin corregir)`. En simulación y reproducción no se corrige nada.
-- **Guarda un resumen en las grabaciones.** `agmen record` escribe, por cada
-  computadora, la diferencia al empezar y al terminar, la mínima, la máxima, la
-  incertidumbre y cuántas medidas hubo. `agmen info` lo muestra así (ejemplo):
+- **Guarda un resumen en las grabaciones.** Al cerrar cada archivo, `agmen record`
+  escribe en la grabación un registro aparte, `agmen.relojes`, con una línea por
+  computadora: la diferencia al empezar y al terminar, la mínima, la máxima, la
+  incertidumbre y cuántas medidas hubo. Si no hubo medidas de otra computadora, no
+  escribe nada. El registro `agmen.grabacion` (quién grabó, cuándo, qué topics) no
+  cambia. `agmen info` lee `agmen.relojes` y muestra cada línea así (ejemplo):
 
 ```
   reloj de robot: +35.0 ms al empezar, +35.0 ms al terminar (mín +35.0 ms, máx +35.0 ms, ±0.6 ms, 12 muestras)
 ```
 
-Si la mínima y la máxima se separan más de 10 ms, `agmen info` lo marca con `⚠`: el
-reloj cambió durante la grabación (alguien lo ajustó).
+Si la mínima y la máxima se separan más de 10 ms, `agmen info` añade una línea con
+`⚠`: `cambió 35.0 ms durante la grabación (¿alguien ajustó un reloj?): las latencias de
+ese rato no se pueden corregir con un solo número`. Una grabación sin `agmen.relojes`
+se muestra como siempre, sin líneas de reloj.
 
 ### Los límites
 
@@ -849,14 +851,118 @@ reloj cambió durante la grabación (alguien lo ajustó).
 | Mediciones absurdas (ida y vuelta de más de 2 s) | Se descartan. Si no queda ninguna buena, sale «sin medir» con su motivo |
 | Sincronizar los relojes | No se hace aquí: es del nivel 11 |
 
-## 13. Lo que todavía no hace
+## 13. Medir tu red
+
+Los números de las secciones anteriores dicen si los relojes coinciden. Pero, ¿cuánto
+tarda un mensaje de tu laptop a la Pi, y cuántos datos caben por segundo? Eso lo mide
+el banco `bench/dos_computadoras.py`, con tu propia red.
+
+### Qué mide
+
+Prueba mensajes de 64 bytes a 6 MiB (un tamaño tras otro: 64 B, 1 KiB, 16 KiB, 65 440 B,
+64 KiB, 256 KiB, 1 MiB y 6 MiB). Para cada tamaño, mide dos cosas:
+
+- **La ida y vuelta.** La laptop manda un mensaje con un número de serie, y la Pi
+  contesta con uno chico que repite ese número. La laptop mide cuánto tardó la
+  respuesta con **su propio reloj**: por eso no depende de la diferencia de relojes de
+  la sección 12. Muestra la mediana y el p99 (el tiempo que tarda el 99 % de las veces
+  o menos).
+- **El ritmo de ida.** La laptop manda sin parar unos 2 segundos, y la Pi cuenta lo que
+  le llega: MB/s, mensajes por segundo, y cuántos llegaron de los enviados.
+
+El camino depende del tipo del mensaje: los de tamaño fijo viajan por UDP hasta 65 440
+bytes (lo que cabe en un datagrama), y los de más viajan por TCP. La tabla dice qué
+camino le toca a cada tamaño.
+
+El banco también mide, sin red, cuánto tarda tu computadora en **codificar y
+decodificar** cada mensaje. Así no confundes lo que tarda Python en armar el mensaje con
+lo que tarda la red en llevarlo.
+
+### Cómo se corre
+
+Las dos computadoras necesitan la misma versión de Agmen y su copia del repositorio,
+con el mismo `bench/dos_computadoras.toml`. En ese archivo, pon en `host` la IP de tu
+Pi. Desde la raíz del repositorio:
+
+En la **Raspberry Pi** (el robot):
+
+```bash
+agmen agent bench/dos_computadoras.toml
+```
+
+En tu **laptop**:
+
+```bash
+agmen run bench/dos_computadoras.toml
+```
+
+La primera vez, `agmen run` te pide la clave del agente, como en la sección 3. Cuando el
+medidor termina, `agmen run` imprime la tabla. Luego, Ctrl+C en la laptop.
+
+Si quieres una prueba más corta, agrega `--rapido` al `cmd` del nodo `medidor` en el
+`.toml` de la laptop (`cmd = "python dos_computadoras.py --medir --rapido"`): mide solo 64 B,
+el máximo de UDP y 1 MiB. Para probar el banco sin dos computadoras, usa
+`python bench/dos_computadoras.py --local` desde la raíz del repositorio (ver abajo).
+
+### Cómo leer la tabla
+
+Esta tabla es de `--local --rapido` en una sola computadora. Son dos IP de loopback, **no
+son números de una red**: sirve para ver cómo se lee, y tus números van a ser otros.
+
+| Tamaño | Bytes | Camino | Codificar+decodificar | Ida y vuelta (mediana / p99) | Sin respuesta | MB/s de ida | Mensajes/s | Recibidos / enviados | Descartados (TCP, D3) | Perdidos |
+|---|---:|---|---:|---|---:|---:|---:|---:|---:|---:|
+| 64 B | 64 | UDP | 0.005 ms | 0.26 / 1.97 ms | 0 de 30 | 10.7 | 166502 | 166621 / 189174 | 0 | 22553 |
+| máx. UDP | 65 440 | UDP | 2.205 ms | 2.98 / 4.46 ms | 0 de 30 | 47.3 ¹ | 723 ¹ | 723 / 723 | 0 | 0 |
+| 1 MiB | 1 048 576 | TCP | 0.840 ms | 2.74 / 7.80 ms | 0 de 30 | 666.4 ¹ | 636 ¹ | 635 / 635 | 0 | 0 |
+
+¹ el eco recibió todo lo enviado: ese ritmo lo limitó quien publica (codificar y publish() en la laptop; ver «Codificar+decodificar»), no la red.
+
+Qué quiere decir cada columna:
+
+- **Codificar+decodificar**: lo que tarda esta computadora, sin red, en armar y leer un
+  mensaje de ese tamaño. Compáralo con la ida y vuelta: en la fila "máx. UDP" del
+  ejemplo, 2.2 de los 3.0 ms son eso, no la red. En Python puro es mucho más (un arreglo
+  fijo grande se codifica byte por byte).
+- **La marca ¹**: si llegó todo lo que se mandó, la red no fue el límite: lo fue quien
+  publica. No leas esa fila como "UDP es más lento que TCP".
+- **Ida y vuelta (mediana / p99)**: el tiempo típico y el tiempo de las peores 1 de
+  cada 100 respuestas. Si la mediana es buena pero el p99 se dispara, la red tiene
+  pausas de vez en cuando.
+- **Sin respuesta**: cuántas pruebas de ida y vuelta no tuvieron respuesta a tiempo, de
+  las que hizo. Si hay alguna, revisa el firewall (sección 10).
+- **MB/s de ida** y **Mensajes/s**: lo que aguantó el camino en el ritmo de ida.
+- **Recibidos / enviados**: cuántos llegaron de los que la laptop mandó.
+- **Descartados (TCP, D3)**: en TCP, la laptop descarta a propósito los mensajes que la Pi
+  no alcanza a leer, y se queda con el más nuevo. No son pérdidas.
+- **Perdidos**: los que no llegaron (enviados, menos recibidos, menos descartados). En UDP
+  no hay reenvío: un mensaje que se pierde, se pierde. En el ejemplo de 64 B se perdió
+  más de una décima parte de lo enviado: ese número cuenta, y no lo escondas.
+
+La última línea dice qué versión y qué núcleo (C++ o Python puro) corrió en cada lado,
+y por dónde contestó la Pi. Si las dos versiones de Agmen no son iguales, el banco avisa:
+actualiza la Pi (`git pull`) antes de comparar números.
+
+### Si algo falla
+
+Si la Pi deja de contestar a media medición, el banco corta ese tamaño (como mucho a los
+30 segundos) y lo dice.
+
+El banco no adivina. Si el eco de la Pi no contesta, dice tres cosas que revisar: que el
+`agmen agent` esté corriendo en la Pi y que `agmen run` diga que arrancó el nodo `eco`;
+que el firewall de las dos computadoras deje entrar UDP y TCP de la otra (sección 10);
+y que `agmen run` haya dicho que la prueba de red pasó.
+
+## 14. Lo que todavía no hace
 
 Esto es honesto: el capítulo 18 cubre el robot con dos computadoras, pero no todo.
 
 - **No sincronizamos la hora.** Agmen mide la diferencia entre los relojes y te
   avisa (ver la sección 12), pero no corrige ninguno. Sincronizarlos de verdad es del
   nivel 11.
-- **Una laptop a la vez** con cada agente.
+- **Una laptop a la vez** con cada agente. Dos robots no se pasan topics entre sí.
+- **Solo dentro de una red.** Dos computadoras en redes distintas (con NAT, o por
+  internet), o en un WiFi que aísla a sus clientes, no se ven entre sí. Eso necesita un
+  relay, que llega con la nube en el nivel 11.
 - **Usa la misma versión de Agmen en las dos computadoras.** Con una Pi en una
   versión anterior, que no aguanta cortes, la laptop no puede reanudar: la Pi
   detiene sus nodos en cuanto la pierde, y al volver hay que arrancarlos otra vez.
@@ -886,5 +992,10 @@ del motor deja de recibir órdenes, se detiene solo, como viste en el
   y cada nodo.
 - `agmen node list` y el panel muestran la diferencia de reloj con el robot, y
   `agmen run` te avisa si pasa de 10 ms y te dice qué hacer.
+- `agmen record` guarda la diferencia de reloj en `agmen.relojes`, y `agmen info` la
+  muestra con la grabación.
+- `bench/dos_computadoras.py` mide la ida y vuelta y los MB/s entre tus dos computadoras,
+  con tu red de verdad. Lo que sale con `--local` no es de una red.
 
-**Siguiente (nivel 10):** cerrar el nivel. Todavía no hay capítulo para eso.
+**Siguiente (nivel 11):** sincronizar los relojes, y la red entre redes distintas con un
+relay (la nube). Mientras tanto, mide tu red con la sección 13.

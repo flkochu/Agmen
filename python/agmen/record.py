@@ -223,7 +223,6 @@ class Recorder:
         self._clocks_now = threading.Event()
         self._clocks_seen = False   # ¿el hub dio alguna vez líneas `maq`? (si no, al terminar no se le pregunta)
         self._clk: threading.Thread | None = None
-        self._meta: dict[str, str] = {}
         self._rate_in: collections.deque = collections.deque()    # (monotonic, bytes) de los últimos 2 s
         self._rate_out: collections.deque = collections.deque()
         self.error: BaseException | None = None
@@ -496,7 +495,6 @@ class Recorder:
                 "topics": " ".join(self.topics), "archivo": str(self._file_index)}
         meta.update({k: str(v) for k, v in self.info.items()})
         self._writer.add_metadata("agmen.grabacion", meta)
-        self._meta = meta
         self._clocks_now.set()   # bloque 5: el archivo nuevo (split) anota los relojes ya
         for name, media, data in self.attachments:
             self._writer.add_attachment(name, media, data, log_time=max(0, clock.now_ns()))
@@ -508,13 +506,14 @@ class Recorder:
         with self._lock:
             lost = {k: str(v) for k, v in sorted(self._file_lost.items())}
             self._file_lost = {}
-            clocks, self._clocks = self._clocks.texto(), relojes.Resumen()
+            clocks, self._clocks = self._clocks.metadatos(), relojes.Resumen()
         lost["total"] = str(sum(int(v) for v in lost.values()))
         if clocks:
-            # Bloque 5 (§4.4): la diferencia de relojes solo se sabe completa al cerrar. Se repite agmen.grabacion
-            # con la clave `relojes` añadida (lo demás, igual al del principio: si el grabador muere antes, queda
-            # el del principio). Quien lee se queda con el último (describe, agmen.recording).
-            self._writer.add_metadata("agmen.grabacion", {**self._meta, "relojes": clocks})
+            # Bloque 5 (§4.4): la diferencia de relojes solo se sabe completa al cerrar: va en un registro aparte,
+            # `agmen.relojes` ({computadora: su resumen en JSON}), y solo si hubo alguna medición de otra
+            # computadora. agmen.grabacion queda como siempre (una vez, al empezar); sin otras computadoras el
+            # archivo no cambia. Si el grabador muere antes de cerrar, no hay agmen.relojes (como agmen.perdidos).
+            self._writer.add_metadata("agmen.relojes", clocks)
         self._writer.add_metadata("agmen.perdidos", lost)
         self._writer.close()
         self._writer = None
@@ -666,11 +665,6 @@ class RecordingControl:
 # agmen info
 # ---------------------------------------------------------------------------
 
-def _last_meta(metadata, name: str) -> dict:
-    """El último registro `name` de los metadatos (agmen.grabacion puede ir dos veces: al cerrar, con `relojes`)."""
-    return next((v for n, v in reversed(metadata) if n == name), {})
-
-
 def describe(path: str) -> dict:
     """Lo que dice `agmen info`: un dict con la grabación resumida."""
     with _mcap.Reader(path) as r:
@@ -694,7 +688,8 @@ def describe(path: str) -> dict:
         return {"path": path, "size": os.path.getsize(path), "profile": r.profile, "library": r.library,
                 "complete": r.complete, "truncated": r.truncated, "start": t0, "end": t1,
                 "seconds": (t1 - t0) / 1e9 if t0 is not None else 0.0, "topics": topics,
-                "recording": _last_meta(r.metadata, "agmen.grabacion"), "lost": meta.get("agmen.perdidos", {}),
+                "recording": meta.get("agmen.grabacion", {}), "lost": meta.get("agmen.perdidos", {}),
+                "clocks": meta.get("agmen.relojes", {}),
                 "attachments": [a.name for a in r.attachments]}
 
 
@@ -727,9 +722,10 @@ def cmd_info(args) -> int:
         print(f"  grabado con Agmen {rec.get('version', '?')} en {rec.get('computadora', '?')}, "
               f"reloj {rec.get('reloj', '?')}" + (f", perfil {rec['perfil']}" if rec.get("perfil") else "")
               + (f", {rec['inicio']}" if rec.get("inicio") else ""))
-        if rec.get("relojes"):   # bloque 5 (RFC 0011 §3.6): respecto al reloj de la computadora que grabó
-            for line in relojes.lineas_grabacion(rec["relojes"]):
-                print("  " + line)
+    # Bloque 5 (RFC 0011 §3.6, agmen.relojes): respecto al reloj de la computadora que grabó. Fuera del `if rec`:
+    # salen aunque el archivo no traiga agmen.grabacion; una computadora mal escrita se dice en su línea.
+    for line in relojes.lineas_grabacion(d["clocks"]):
+        print("  " + line)
     rows = []
     for t in d["topics"]:
         rate = t["messages"] / d["seconds"] if d["seconds"] > 0 else 0.0

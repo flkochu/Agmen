@@ -7,18 +7,14 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 
 ## [Sin publicar]
 
-### Planeado (nivel 10, versión 0.14.0)
-- Nodos en varias computadoras. Diseño aceptado el 2026-11-13 en el
-  [RFC 0011](docs/rfc/0011-sim-real-y-varias-computadoras.md) (D1–D10 = a:
-  perfiles en `robot.toml`, un mundo de MuJoCo de ejemplo y `agmen agent` en
-  cada computadora). Hechos: los perfiles (bloque 1, abajo), el mundo de
-  MuJoCo (bloque 2, abajo), `[[machine]]` (bloque 3, parte 3a, abajo) y
-  `agmen agent` con clave (parte 3b, abajo), y la reconexión tras un corte, el
-  panel con varias computadoras, el servicio de arranque y el capítulo 18 (parte
-  3c, abajo), la base de los topics entre computadoras (parte 4a, abajo) y el puente
-  que pasa las tablas de topics (parte 4b, abajo), y la prueba de red y lo visible en
-  herramientas y panel (parte 4c, abajo), y los relojes de las dos computadoras (bloque
-  5, abajo: se miden, se avisan y se guardan en las grabaciones). Falta: el cierre del nivel.
+## [0.14.0] — 2026-11-16
+
+**Simulación y real, y nodos en varias computadoras.** Implementa el
+[RFC 0011](docs/rfc/0011-sim-real-y-varias-computadoras.md) con las opciones
+recomendadas (D1–D10 = a): perfiles en `robot.toml`, un mundo de MuJoCo de
+ejemplo, `agmen agent` en cada computadora, los topics entre computadoras de la
+misma red, la prueba de red antes de arrancar, los relojes medidos (no
+corregidos) y un banco para medir la latencia y los MB/s entre dos computadoras.
 
 ### Agregado
 - **Perfiles en `robot.toml`** (RFC 0011 §3.2): `profile = "real"`, `"sim"`,
@@ -208,19 +204,32 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   - **El panel** muestra el reloj de cada computadora, en rojo y con qué hacer si está
     corrido. Las latencias de un topic que sale de otra computadora se corrigen con la
     diferencia en sesión real; si no se pueden corregir, se marcan `(sin corregir)`.
-  - **`agmen record`** guarda en `agmen.grabacion` la clave `relojes`, con un resumen por
-    computadora (diferencia al empezar y al terminar, mínima, máxima, incertidumbre y
-    muestras). Al cerrar se escribe un segundo registro `agmen.grabacion` con esa clave;
-    `agmen info` la muestra. Lo que queda pendiente de decisión del autor está en
-    `docs/PROTOCOLO.md`.
+  - **`agmen record`** guarda en un registro de metadatos aparte, `agmen.relojes`, un
+    resumen por computadora (diferencia al empezar y al terminar, mínima, máxima,
+    incertidumbre y muestras). Se escribe al cerrar cada archivo, y solo si hubo alguna
+    medición de otra computadora; `agmen.grabacion` no cambia. `agmen info` lo muestra.
+    Formato en `docs/PROTOCOLO.md`.
   - **Protocolo**: `agmen-agent/1` gana la capacidad `"relojes": 1` y las claves `reloj` de
     `ping` y `pong`; `agmen-hub/1` gana `relojes=` y `modo=` en `red`, y la línea `maq` en
     `state`. Todo es añadido: un lado anterior sigue funcionando y la medición queda «sin
     medir». Formato en `docs/PROTOCOLO.md`.
   - **Capítulo 18 del tutorial, sección 12**: los relojes de las dos computadoras, para
     estudiantes.
+- **Banco de medición entre dos computadoras** (RFC 0011 §7, punto 7):
+  `bench/dos_computadoras.py` mide, entre la laptop y el robot, la ida y vuelta de
+  un mensaje (mediana y p99) y los MB/s y mensajes/s de ida, de 64 B a 6 MiB, con su
+  tabla al final. Se corre con `bench/dos_computadoras.toml`: `agmen agent` en la
+  Raspberry Pi y `agmen run` en la laptop. `--local` lo prueba en una sola máquina
+  (dos IP de loopback; sus números no son de una red), y `--rapido` mide solo 64 B,
+  el máximo de UDP y 1 MiB, con menos muestras. Capítulo 18 del tutorial, sección 13.
 
 ### Cambiado
+- **La terminal de `agmen run` conserva lo más nuevo.** Cuando las líneas llegan más
+  rápido de lo que la terminal las escribe, se descartan las más viejas de la cola y
+  entran las nuevas (antes se descartaban las que llegaban, y se perdía el final de
+  las ráfagas). Los avisos de Agmen y los errores nunca se descartan. El aviso
+  `… N líneas no cupieron en la terminal (están en el panel web)` sale antes de las
+  líneas que sí cupieron, como antes. El orden de las líneas no cambia.
 - **En Windows con Python 3.12 o anterior, el reloj de Agmen en modo real lee la hora del
   sistema con resolución fina.** Antes, la hora de los nodos en Python puro avanzaba de
   ~15.6 ms en ~15.6 ms. Ahora se lee `GetSystemTimePreciseAsFileTime` (100 ns), el mismo

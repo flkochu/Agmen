@@ -172,7 +172,7 @@ La referencia completa de `robot.toml` está en el
 
 ## 6. Perfiles: el mismo `robot.toml` para el robot y para simulación
 
-*Disponible desde Agmen 0.14.0 (aún sin publicar)*
+*Disponible desde Agmen 0.14.0*
 
 Hasta ahora, cada `[[node]]` corre siempre. Pero un robot tiene piezas que
 mueven cosas de verdad (un motor, un sensor conectado a la computadora), y
@@ -356,7 +356,7 @@ error: --skip nada: no hay un nodo con ese nombre (hay: hub, imu, motor)
 
 ## 7. Decir en qué computadora corre cada nodo (`[[machine]]`)
 
-*Disponible desde Agmen 0.14.0 (aún sin publicar)*
+*Disponible desde Agmen 0.14.0*
 
 Un robot suele tener dos computadoras. Por ejemplo, Adán tiene una laptop con
 Windows y una Raspberry Pi en el robot, y las dos están en el WiFi de la

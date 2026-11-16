@@ -215,6 +215,12 @@ entra al roadmap de §7 cuando le toque.
 - ✅ El panel manda **cualquier tipo `compact`** (`[[web.command]]`): botones con un mensaje fijo y deslizadores y casillas armados con el esquema, con hombre muerto (manda solo mientras se mantiene presionado; al soltar se calla). El servidor arma el mensaje y revisa tipos y rangos: nunca reenvía bytes del navegador. Arca9 ya no necesita un nodo que traduzca `MotorCommand`.
 - ✅ El mux publica **quién manda** en `/mux/<nombre>` (`agmen.msgs.MuxEstado`), y el panel lo muestra y avisa cuando la entrada que mandaba se calla. `[[topic]] max_gap_ms` avisa cuando un topic deja de llegar.
 
+### Cambió en 0.14.0 (RFC 0011, nivel 10)
+- ✅ Simulación y real con los mismos nodos: perfiles en `robot.toml` (`profile = "real"`, `"sim"`, `"replay"` o propios), el mundo de MuJoCo (`--sim`) y `[profile.X]`. El cerebro, el mux y el panel no cambian entre perfiles.
+- ✅ Varias computadoras: `[[machine]]` declara cada computadora del robot, `agmen agent` corre sus nodos con clave, la conexión se reanuda sola tras un corte de unos 10 s, y los topics cruzan entre computadoras de la misma red. Antes de arrancar, `agmen run` prueba el firewall.
+- ✅ Los relojes se miden (cada ~2 s, como NTP), se avisan cuando pasan de 10 ms y se guardan en las grabaciones (`agmen.relojes`). No se cambia ningún `t_data`: sincronizar los relojes es del nivel 11.
+- ✅ `bench/dos_computadoras.py` mide la ida y vuelta y los MB/s entre dos computadoras, para medir con una Raspberry Pi de verdad.
+
 ### Falta (siguientes niveles)
 - El formato LeRobot (Parquet + MP4, por episodios), encima de esto (nivel 13).
 - Que la cámara escriba directo en la memoria compartida (préstamo para escribir, RFC 0009 §4): quitaría la copia que queda en el publicador.
@@ -272,7 +278,7 @@ iceoryx2).
 | **7 ✅** (0.10.0) | **Datos grandes (RFC 0008): codificación `arrow` (`string`, `bytes`, `T[]`, `tensor<T,N>`) por TCP con descarte por suscriptor lento; `agmen.msgs.Imagen`; cámara en el panel y en Foxglove. El puente del panel se quedó en Python: medido, cumple** | a, b, h |
 | **8 ✅** (0.11.0) | **Memoria compartida (RFC 0009): imágenes y tensores sin copiar entre procesos de la misma computadora, en C++ y Python, Linux y Windows (y macOS hasta 0.11.0); se prueba si se puede y si no, TCP; préstamos que se devuelven solos y con tope; `bench/shm_vs_tcp.py`** | a, b, g |
 | **9 ✅** (0.12.0) | **Grabar y reproducir (RFC 0010): `agmen record` en MCAP sin frenar a nadie, `agmen play` con el reloj `replay` y sustitución de nodos, el `.mcap` en el panel con barra de tiempo y en Foxglove, `agmen.Recording` y `agmen export --parquet`; `bench/grabar.py`** | c |
-| 10 (en curso, 0.14.0) | Abstracción sim/real; `robot.toml` con nodos en varias máquinas (el lanzador básico ya existe desde 0.2.0). Hechos: perfiles, MuJoCo, `[[machine]]`, `agmen agent` con clave, reconexión con gracia de 10 s, panel con varias computadoras y servicio (partes 3a, 3b y 3c); partes 4a, 4b y 4c hechas (base de los topics entre computadoras, el puente: los topics cruzan entre la laptop y cada robot, y la prueba de red con de qué computadora es cada topic); bloque 5 hecho (los relojes se miden, se avisan, se ven en `node list` y el panel, y se guardan en las grabaciones; §3.6); falta el cierre: las pruebas de dos computadoras ya están en el CI, `bench/dos_computadoras.py` y la versión 0.14.0 ([RFC 0011](rfc/0011-sim-real-y-varias-computadoras.md), aceptado el 2026-11-13) | d, i |
+| **10 ✅** (0.14.0) | **Simulación y real, y nodos en varias computadoras (RFC 0011): perfiles en `robot.toml`, el mundo de MuJoCo (`--sim`), `[[machine]]` y `agmen agent` con clave, reconexión con gracia de 10 s, topics entre computadoras de la misma red con su prueba de red, los relojes medidos y avisados (`agmen.relojes` en las grabaciones; sin corregir: eso es del nivel 11), y el banco `bench/dos_computadoras.py`; pruebas de dos computadoras en el CI** | d, i |
 | 11 | Red multi-máquina, sincronización de relojes y **`agmen-web` en la nube** (relay con autenticación) | c, h |
 | 12 | Puentes (`agmen-iot` MQTT, ROS 2) y `agmen-micro` | f |
 | 13 | Paquetes de IA: `agmen-vision`, `agmen-learn` (meta de aprendizaje por refuerzo: ver §4, 2026-11-13) | — |
@@ -299,7 +305,7 @@ iceoryx2).
 | Préstamo para escribir directo en la memoria compartida (la cámara llena el bloque) | Cuando se mida que la copia del publicador estorba (RFC 0009 §4) |
 | ~~¿Seguir probando y publicando para macOS?~~ | ✅ No, desde 0.11.1 (2026-11-05, §4): Windows y Linux, x86-64 y ARM64; en macOS, Python puro |
 | ~~Formato de grabación: MCAP o propio sobre Arrow IPC~~ | ✅ [RFC 0010](rfc/0010-grabar-y-reproducir.md) aceptado el 2026-11-05 (D1–D9 = a): MCAP con los mensajes de Agmen adentro, sin cambiar un byte |
-| ~~Simulación y real; nodos y topics en varias computadoras~~ | ✅ [RFC 0011](rfc/0011-sim-real-y-varias-computadoras.md) aceptado el 2026-11-13 (D1–D10 = a): perfiles en `robot.toml`, un mundo de MuJoCo y `agmen agent` en cada computadora; en curso en 0.14.0: perfiles, el mundo de MuJoCo, `[[machine]]` (parte 3a), `agmen agent` con clave (3b), y la reconexión, el panel con varias computadoras y el servicio (3c) hechos; la base de los topics entre computadoras (4a), el puente (4b) y la prueba de red con de qué computadora es cada topic (4c) hechos; faltan relojes (bloque 5) y el cierre |
+| ~~Simulación y real; nodos y topics en varias computadoras~~ | ✅ [RFC 0011](rfc/0011-sim-real-y-varias-computadoras.md) aceptado el 2026-11-13 (D1–D10 = a): perfiles en `robot.toml`, un mundo de MuJoCo y `agmen agent` en cada computadora; implementado en 0.14.0 (2026-11-16): perfiles, el mundo de MuJoCo, `[[machine]]`, `agmen agent` con clave, la reconexión, el panel con varias computadoras y el servicio, los topics entre computadoras, la prueba de red, los relojes medidos y avisados, y el banco `bench/dos_computadoras.py` |
 | ~~Mandos del panel de cualquier tipo; quién manda en el mux; `max_gap_ms`~~ | ✅ [RFC 0012](rfc/0012-mandos-del-panel-y-quien-manda.md) aceptado el 2026-11-13 (D1–D6 = a), implementado en 0.13.0 a pedido de Arca9 |
 
 ## Fuentes

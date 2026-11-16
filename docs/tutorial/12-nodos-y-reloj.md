@@ -317,7 +317,7 @@ evitarlo:
 - Con Python 3.12 y el núcleo de C++ (el que se usa por defecto), un programa
   así podía abortar al salir con `terminate called without an active
   exception`. Con Python 3.13 nunca abortó. Esta corrección llega en la versión
-  0.14.0, que aún no se publica; desde ella, el comportamiento al salir es el
+  0.14.0; desde ella, el comportamiento al salir es el
   mismo en los dos.
 
 ## Lo que aprendiste

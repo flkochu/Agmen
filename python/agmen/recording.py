@@ -34,7 +34,7 @@ import re
 import sys
 from dataclasses import dataclass
 
-from . import _mcap, schema, wire
+from . import _mcap, relojes, schema, wire
 from ._version import __version__
 from .pubsub import Sample
 
@@ -284,6 +284,20 @@ class Recording:
     def info(self) -> dict[str, str]:
         """Lo que anotó el grabador (agmen.grabacion): versión, computadora, reloj, inicio, comando…"""
         return dict(dict(self._r.metadata).get("agmen.grabacion", {}))
+
+    @property
+    def clocks(self) -> dict[str, dict[str, int]]:
+        """La diferencia de reloj de cada otra computadora durante la grabación, respecto al de la que grabó
+        (agmen.relojes, RFC 0011 §3.6): {"robot": {"inicio_ns", "fin_ns", "min_ns", "max_ns", "error_ns",
+        "muestras"}}. {} si no hubo otras computadoras (o el grabador no llegó a cerrar el archivo). Un resumen mal
+        escrito (también JSON hostil) da ValueError con la computadora y el motivo; nunca otra excepción."""
+        out = {}
+        for nombre, texto in dict(self._r.metadata).get("agmen.relojes", {}).items():
+            try:
+                out[nombre] = relojes.leer_resumen(texto)
+            except ValueError as e:
+                raise ValueError(f"{self.path}: agmen.relojes, computadora {relojes.imprimible(nombre)}: {e}") from None
+        return out
 
     @property
     def lost(self) -> dict[str, int]:
