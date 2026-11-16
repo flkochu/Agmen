@@ -1053,6 +1053,11 @@ class Printer:
     `_droppable` (las mismas, de la más vieja a la más nueva). Sacar una es O(1):
     su id va a `_dead` y se salta al escribir; cuando hay más muertas que vivas
     se compacta la cola (O(1) amortizado por línea).
+
+    Marcar por `id()` es válido: una línea muerta sigue referenciada en `_q` hasta
+    la compactación (su id no se puede reusar mientras tanto), y `_format` siempre
+    crea un objeto nuevo (el f-string con " │ "), así que dos líneas de la cola
+    nunca son el mismo objeto aunque digan lo mismo: matar una no mata a la otra.
     """
 
     def __init__(self, names: list[str], stream=None, max_queue: int = 500) -> None:

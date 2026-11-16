@@ -290,13 +290,13 @@ class Recording:
         """La diferencia de reloj de cada otra computadora durante la grabación, respecto al de la que grabó
         (agmen.relojes, RFC 0011 §3.6): {"robot": {"inicio_ns", "fin_ns", "min_ns", "max_ns", "error_ns",
         "muestras"}}. {} si no hubo otras computadoras (o el grabador no llegó a cerrar el archivo). Un resumen mal
-        escrito da ValueError con la computadora y el motivo."""
+        escrito (también JSON hostil) da ValueError con la computadora y el motivo; nunca otra excepción."""
         out = {}
         for nombre, texto in dict(self._r.metadata).get("agmen.relojes", {}).items():
             try:
                 out[nombre] = relojes.leer_resumen(texto)
             except ValueError as e:
-                raise ValueError(f"{self.path}: agmen.relojes, computadora {nombre}: {e}") from None
+                raise ValueError(f"{self.path}: agmen.relojes, computadora {relojes.imprimible(nombre)}: {e}") from None
         return out
 
     @property

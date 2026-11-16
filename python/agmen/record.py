@@ -722,8 +722,10 @@ def cmd_info(args) -> int:
         print(f"  grabado con Agmen {rec.get('version', '?')} en {rec.get('computadora', '?')}, "
               f"reloj {rec.get('reloj', '?')}" + (f", perfil {rec['perfil']}" if rec.get("perfil") else "")
               + (f", {rec['inicio']}" if rec.get("inicio") else ""))
-        for line in relojes.lineas_grabacion(d["clocks"]):   # bloque 5 (RFC 0011 §3.6, agmen.relojes): respecto
-            print("  " + line)                                 # al reloj de la computadora que grabó
+    # Bloque 5 (RFC 0011 §3.6, agmen.relojes): respecto al reloj de la computadora que grabó. Fuera del `if rec`:
+    # salen aunque el archivo no traiga agmen.grabacion; una computadora mal escrita se dice en su línea.
+    for line in relojes.lineas_grabacion(d["clocks"]):
+        print("  " + line)
     rows = []
     for t in d["topics"]:
         rate = t["messages"] / d["seconds"] if d["seconds"] > 0 else 0.0

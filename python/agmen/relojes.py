@@ -601,26 +601,58 @@ class Resumen:
                 for nombre, r in sorted(self.por.items())}
 
 
+def imprimible(texto: str, limite: int = 80) -> str:
+    """Un texto que viene de un archivo o de otra computadora, para la terminal: sin NINGÚN carácter de
+    control (ni escapes ANSI ni saltos de línea, como `_clean` de agent.py) y corto."""
+    texto = "".join(c if c.isprintable() else "\ufffd" for c in str(texto))
+    return texto if len(texto) <= limite else texto[:limite] + "…"
+
+
+_CAMPOS_RESUMEN = ("inicio_ns", "fin_ns", "min_ns", "max_ns", "error_ns", "muestras")
+
+
+def _sin_constantes(nombre: str):
+    raise ValueError(f"{nombre} no es un número entero")
+
+
 def leer_resumen(texto: str) -> dict[str, int]:
-    """El resumen de UNA computadora, tal como va en `agmen.relojes` (JSON). Mal escrito: ValueError que lo dice."""
+    """El resumen de UNA computadora, tal como va en `agmen.relojes` (JSON). Cada campo debe ser un entero de
+    verdad (ni bool, ni float, ni texto) acotado como las marcas del reloj (|v| < MARCA_MAX), y `muestras` y
+    `error_ns` no negativos. Mal escrito (también JSON hostil: Infinity, enteros enormes, anidado sin fin):
+    ValueError que dice por qué; nunca otra excepción."""
     try:
-        r = json.loads(texto)
-        if not isinstance(r, dict):
-            raise ValueError("no es un objeto")
-        return {k: int(r[k]) for k in ("inicio_ns", "fin_ns", "min_ns", "max_ns", "error_ns", "muestras")}
-    except (ValueError, TypeError, KeyError) as e:
-        raise ValueError(f"resumen de reloj mal escrito ({type(e).__name__}: {e})") from None
+        r = json.loads(texto, parse_constant=_sin_constantes)
+    except (ValueError, TypeError, OverflowError, RecursionError) as e:
+        raise ValueError(f"resumen de reloj mal escrito ({type(e).__name__}: {str(e)[:80]})") from None
+    if not isinstance(r, dict):
+        raise ValueError("resumen de reloj mal escrito (no es un objeto JSON)")
+    out = {}
+    for k in _CAMPOS_RESUMEN:
+        if k not in r:
+            raise ValueError(f"resumen de reloj mal escrito (falta {k})")
+        v = r[k]
+        if type(v) is not int:
+            raise ValueError(f"resumen de reloj mal escrito ({k} no es un entero: {type(v).__name__})")
+        if abs(v) >= MARCA_MAX:
+            raise ValueError(f"resumen de reloj mal escrito ({k} fuera de rango: |{k}| debe ser < 2**63)")
+        if k in ("error_ns", "muestras") and v < 0:
+            raise ValueError(f"resumen de reloj mal escrito ({k} negativo: {v})")
+        out[k] = v
+    return out
 
 
 def lineas_grabacion(meta: dict[str, str]) -> list[str]:
     """Cómo dice `agmen info` el registro `agmen.relojes` (vacío: ninguna línea). Una computadora mal escrita se
-    dice en su línea, no truena: las demás y lo demás de la grabación se leen igual."""
+    dice en su línea, no truena: las demás y lo demás de la grabación se leen igual. Los nombres vienen del
+    archivo: se muestran sin caracteres de control (no pueden fingir una línea ni mover la terminal)."""
     out = []
-    for nombre in sorted(meta):
+    for crudo in sorted(meta):
+        nombre = imprimible(crudo)
         try:
-            r = leer_resumen(meta[nombre])
+            r = leer_resumen(meta[crudo])
         except ValueError as e:
-            out.append(f"⚠ la diferencia de relojes de {nombre} no se puede leer ({e}); lo demás de la grabación sí")
+            out.append(f"⚠ la diferencia de relojes de {nombre} no se puede leer ({imprimible(str(e), 200)}); "
+                       f"lo demás de la grabación sí")
             continue
         ini, fin, lo, hi, err, n = (r[k] for k in ("inicio_ns", "fin_ns", "min_ns", "max_ns", "error_ns",
                                                    "muestras"))

@@ -6,40 +6,47 @@
 # En todos, `n` es el número de serie y `fase` dice qué hace el eco con él:
 #   0 = calentar (contesta), 1 = ida y vuelta (contesta),
 #   2 = ritmo (solo cuenta), 3 = fin del ritmo (contesta con lo que contó).
+# `ronda` identifica cada fase de ritmo: el eco solo cuenta los de la ronda en
+# curso, así un mensaje de ida y vuelta que llega tarde no borra la cuenta.
 package bench
 
 # 64 bytes de payload (UDP)
 message Carga64 {
     u32 n
     u32 fase
-    u8[56] d
+    u32 ronda
+    u8[52] d
 }
 
 # 1 KiB (UDP)
 message Carga1k {
     u32 n
     u32 fase
-    u8[1016] d
+    u32 ronda
+    u8[1012] d
 }
 
 # 16 KiB (UDP)
 message Carga16k {
     u32 n
     u32 fase
-    u8[16376] d
+    u32 ronda
+    u8[16372] d
 }
 
 # El más grande que cabe en un datagrama: 65 440 bytes (UDP; 64 KiB = 65 536 ya no cabe)
 message CargaMaxUdp {
     u32 n
     u32 fase
-    u8[65432] d
+    u32 ronda
+    u8[65428] d
 }
 
 # Tamaño variable: 64 KiB por TCP, 256 KiB, 1 MiB y 6 MiB
 message CargaGrande {
     u32 n
     u32 fase
+    u32 ronda
     bytes d
 }
 

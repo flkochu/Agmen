@@ -24,23 +24,34 @@ no tiene cable, ni Wi-Fi, ni una Raspberry Pi lenta.
 El banco es un solo script con dos papeles: `--eco` (en el robot) y `--medir`
 (en la laptop). Para cada tamaño de mensaje mide:
 
+- **codificar+decodificar**: cuánto tarda, en la laptop y sin red, convertir ese
+  mensaje a bytes y de vuelta (encode_payload/decode_payload, lo mismo que hacen
+  publish() y receive()); mediana de unas repeticiones. Sirve para separar el
+  costo del codificador del de la red en las otras columnas.
 - **ida y vuelta**: la laptop publica un mensaje de ese tamaño con un número de
   serie; el eco contesta con un mensaje chico que repite el número. Se mide en la
-  laptop, de publish() a que llega la respuesta (con time.perf_counter_ns: no
-  depende de los relojes de las dos computadoras), a ritmo fijo (50 por segundo,
-  o al paso de la respuesta si tarda más). Mediana y percentil 99.
+  laptop, de publish() a que llega la respuesta, a ritmo fijo (50 por segundo, o
+  al paso de la respuesta si tarda más). Mediana y percentil 99. Tiene un tope de
+  ~30 s por tamaño: si el eco deja de contestar a media medición, se corta y se dice.
 - **ritmo de ida**: la laptop publica sin parar ~2 s (1 s con --rapido) y el eco
   cuenta lo que le llega: MB/s y mensajes/s según el eco, cuántos recibió de los
   enviados y cuántos se perdieron. Por TCP, el publicador descarta a propósito
   los que un suscriptor lento no alcanza a leer (RFC 0008 D3: recibe el más
-  nuevo); esos salen aparte, como "descartados", y no son pérdidas.
+  nuevo); esos salen aparte, como "descartados", y no son pérdidas. Si el eco
+  recibió TODOS los enviados, la fila se marca: ese ritmo lo limitó quien publica
+  (codificar y publish() en la laptop), no la red.
 
-Cada tamaño tiene su tipo (bench/dos_computadoras.agmen): los de tamaño fijo son
-compact y viajan por UDP (hasta 65 440 bytes, lo que cabe en un datagrama); los
-que llevan `bytes` viajan en arrow, por TCP. La tabla dice por dónde le llegó
-cada uno al eco. Los números incluyen codificar y decodificar el mensaje, como
-en cualquier nodo de Python; la última línea dice qué núcleo (C++ o Python puro)
-corrió en cada lado.
+Los tiempos se miden con time.perf_counter_ns y NO con el reloj de Agmen, a
+propósito: aquí se mide tiempo real de esta computadora (que no depende de los
+relojes de las dos ni de un reloj simulado), no el tiempo del robot.
+
+Cada tamaño tiene su tipo (bench/dos_computadoras.agmen) y el TIPO decide el
+camino (no se mide ni se elige al vuelo): los de tamaño fijo son compact y viajan
+por UDP (hasta 65 440 bytes, lo que cabe en un datagrama); los que llevan `bytes`
+viajan en arrow, por TCP. La tabla dice por dónde le llegó cada uno al eco. Las
+columnas de red incluyen codificar y decodificar el mensaje, como en cualquier
+nodo de Python (por eso va aparte esa columna); la última línea dice qué núcleo
+(C++ o Python puro) corrió en cada lado.
 
     tamaños: 64 B, 1 KiB, 16 KiB, 65 440 B (el máximo de UDP), 64 KiB (por TCP),
              256 KiB, 1 MiB, 6 MiB
@@ -53,6 +64,8 @@ import json
 import math
 import os
 import platform
+import random
+import shutil
 import signal
 import socket
 import statistics
@@ -61,6 +74,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -86,6 +100,8 @@ TAMANOS = [
 RAPIDO = ("64 B", "máx. UDP", "1 MiB")
 CAMINOS = {1: "UDP", 2: "TCP", 3: "memoria compartida"}
 CALENTAR, VUELTA, RITMO, FIN = 0, 1, 2, 3
+CABECERA = 12                      # n, fase y ronda (u32 cada uno) antes de `d`
+VUELTA_TOPE_NS = 30_000_000_000    # la ida y vuelta de un tamaño no dura más que esto en total
 NT = os.name == "nt"
 
 
@@ -94,10 +110,23 @@ def topic_de(etiqueta: str) -> str:
                             "64 KiB": "64k", "256 KiB": "256k", "1 MiB": "1m", "6 MiB": "6m"}[etiqueta]
 
 
-def mensaje(tipo, tam: int, n: int, fase: int, datos: bytes):
+def mensaje(tipo, tam: int, n: int, fase: int, datos: bytes, ronda: int = 0):
     if tipo is M.CargaGrande:
-        return tipo(n=n, fase=fase, d=datos)
-    return tipo(n=n, fase=fase, d=datos[:tam - 8])
+        return tipo(n=n, fase=fase, ronda=ronda, d=datos)
+    return tipo(n=n, fase=fase, ronda=ronda, d=datos[:tam - CABECERA])
+
+
+def codifica_ms(tipo, tam: int, datos: bytes) -> float:
+    """Mediana, en ms, de codificar y decodificar UN mensaje de este tamaño aquí, sin red (encode_payload y
+    decode_payload: lo que hacen publish() y receive()). Unas repeticiones, ~0.2 s como mucho por tamaño."""
+    msg = mensaje(tipo, tam, 1, VUELTA, datos)
+    tiempos: list[float] = []
+    fin = time.perf_counter_ns() + 200_000_000
+    while len(tiempos) < 3 or (len(tiempos) < 50 and time.perf_counter_ns() < fin):
+        t0 = time.perf_counter_ns()
+        tipo.decode_payload(msg.encode_payload())
+        tiempos.append((time.perf_counter_ns() - t0) / 1e6)
+    return statistics.median(tiempos)
 
 
 def datos_de(tam: int) -> bytes:
@@ -127,7 +156,10 @@ def eco() -> int:
 
     def escucha(etiqueta: str, tipo) -> None:
         sub = agmen.Subscriber(tipo, topic_de(etiqueta))
-        recibidos, primero, ultimo = 0, 0, 0
+        # La cuenta es de UNA ronda de ritmo (el campo `ronda`): un mensaje de ida y vuelta que llega tarde ya no
+        # la borra, y uno de ritmo de una ronda ya cerrada (llegó después de su FIN) no ensucia la siguiente.
+        ronda, recibidos, primero, ultimo = None, 0, 0, 0
+        cerradas: list[int] = []
         try:
             while not alto.is_set():
                 s = sub.receive(0.5)
@@ -137,23 +169,30 @@ def eco() -> int:
                 m = s.message
                 camino = 3 if s.envelope.flags & wire.FLAG_SHM else (2 if sub.tcp_port else 1)
                 if m.fase == RITMO:
-                    if recibidos == 0:
-                        primero = ahora
+                    if m.ronda in cerradas:
+                        continue
+                    if m.ronda != ronda:
+                        ronda, recibidos, primero = m.ronda, 0, ahora
                     recibidos += 1
                     ultimo = ahora
                     continue
                 if m.fase == FIN:
+                    if m.ronda not in cerradas:
+                        cerradas.append(m.ronda)
+                        del cerradas[:-64]
+                    cuenta = recibidos if m.ronda == ronda else 0
                     with candado:
-                        vuelta.publish(M.Eco(n=m.n, que=1, recibidos=recibidos, camino=camino,
-                                             dt_ns=ultimo - primero))
+                        vuelta.publish(M.Eco(n=m.n, que=1, recibidos=cuenta, camino=camino,
+                                             dt_ns=ultimo - primero if cuenta else 0))
                     continue
-                recibidos = 0          # calentar o ida y vuelta: empieza otra ronda
                 with candado:
                     vuelta.publish(M.Eco(n=m.n, que=0, recibidos=0, camino=camino, dt_ns=0))
                     if m.fase == CALENTAR and time.monotonic() - ultimo_saludo[0] > 1.0:
                         ultimo_saludo[0] = time.monotonic()
                         saludo.publish(M.Saludo(version=agmen.__version__, sistema=soy(), nucleo=_backend.NAME,
                                                 desde=s.sender.rsplit(":", 1)[0]))
+        except Exception:   # se dice aquí, con su tamaño; el hilo principal avisa que ese tamaño ya no contesta
+            print(f"[eco] ✖ error en el hilo de {etiqueta}:\n{traceback.format_exc()}", flush=True)
         finally:
             sub.close()
 
@@ -164,9 +203,15 @@ def eco() -> int:
         hilos.append(h)
     print(f"[eco] listo (Agmen {agmen.__version__}, {soy()}, {_backend.NAME}): espero al medidor", flush=True)
     try:
-        while any(h.is_alive() for h in hilos):
+        muertos: set[str] = set()
+        while len(muertos) < len(hilos):
+            for h in hilos:
+                if not h.is_alive() and h.name not in muertos:
+                    muertos.add(h.name)
+                    print(f"[eco] ✖ el hilo de {h.name} terminó por un error (arriba dice cuál): ese tamaño ya "
+                          f"no contesta" + ("; los demás siguen" if len(muertos) < len(hilos) else ""), flush=True)
             time.sleep(0.5)
-        print("[eco] ✖ un hilo terminó por un error (arriba dice cuál)", flush=True)
+        print("[eco] ✖ todos los hilos terminaron por un error (arriba dice cuáles)", flush=True)
         return 1
     except KeyboardInterrupt:
         alto.set()
@@ -203,6 +248,7 @@ class Medidor:
         self.vuelta = agmen.Subscriber(M.Eco, "/bench/vuelta")
         self.saludo = agmen.Subscriber(M.Saludo, "/bench/saludo")
         self.n = 0
+        self.ronda = random.randrange(1, 2 ** 31)   # distinta en cada corrida: no se confunde con una anterior
         self.eco_ip = ""
         self.info_eco: dict = {}
 
@@ -253,53 +299,70 @@ class Medidor:
 
     def mide(self, etiqueta: str, tipo, tam: int, tope_eco_s: float) -> dict:
         datos = datos_de(tam)
+        cod_ms = codifica_ms(tipo, tam, datos)   # aquí, sin red: para no confundir al codificador con la red
         pub = agmen.Publisher(tipo, topic_de(etiqueta))
         try:
             self.calienta(pub, tipo, tam, datos, etiqueta, tope_eco_s)
-            # --- ida y vuelta, a ritmo fijo
-            muestras, sin_respuesta, camino = [], 0, 0
+            # --- ida y vuelta, a ritmo fijo, con tope total (VUELTA_TOPE_NS)
+            muestras, sin_respuesta, seguidas, camino = [], 0, 0, 0
             cuantas = 30 if self.rapido else 100
-            presupuesto = time.perf_counter_ns() + int((2 if self.rapido else 4) * 1e9)
+            inicio = time.perf_counter_ns()
+            presupuesto = inicio + int((2 if self.rapido else 4) * 1e9)
+            tope = inicio + VUELTA_TOPE_NS
             periodo = 20_000_000                       # 50 por segundo
             espera_max = 5_000_000_000 if tam > 65_536 else 1_000_000_000
             proximo = time.perf_counter_ns()
             while len(muestras) + sin_respuesta < cuantas and (time.perf_counter_ns() < presupuesto
                                                                or len(muestras) < 5):
+                if time.perf_counter_ns() >= tope:
+                    if len(muestras) < 5:
+                        raise SinEco(f"la ida y vuelta de {etiqueta} no juntó ni 5 respuestas en "
+                                     f"{VUELTA_TOPE_NS / 1e9:.0f} s ({len(muestras)} respuestas, {sin_respuesta} "
+                                     f"sin respuesta): la corto. {QUE_HACER}")
+                    print(f"  ⚠ la ida y vuelta de {etiqueta} llegó al tope de {VUELTA_TOPE_NS / 1e9:.0f} s: la "
+                          f"corto con {len(muestras)} respuestas", flush=True)
+                    break
                 n = self.siguiente()
                 msg = mensaje(tipo, tam, n, VUELTA, datos)
                 t0 = time.perf_counter_ns()
                 pub.publish(msg)
-                r = self.espera(n, 0, t0 + espera_max)
+                r = self.espera(n, 0, min(t0 + espera_max, tope))
                 if r is None:
                     sin_respuesta += 1
-                    if sin_respuesta >= 5 and not muestras:
-                        raise SinEco(f"el eco dejó de contestar a {etiqueta}. {QUE_HACER}")
+                    seguidas += 1
+                    if seguidas >= 5:
+                        raise SinEco(f"el eco dejó de contestar a {etiqueta} a media medición (5 seguidas sin "
+                                     f"respuesta, después de {len(muestras)} respuestas): la corto. {QUE_HACER}")
                 else:
+                    seguidas = 0
                     muestras.append((time.perf_counter_ns() - t0) / 1e6)
                     camino = r.camino
                 proximo = max(proximo + periodo, time.perf_counter_ns())
                 time.sleep(max(0.0, (proximo - time.perf_counter_ns()) / 1e9))
-            # --- ritmo de ida: sin parar
+            # --- ritmo de ida: sin parar (su propia ronda: lo que llegue tarde de antes no cuenta)
+            self.ronda = self.ronda % (2 ** 32 - 1) + 1
+            ronda = self.ronda
             time.sleep(0.2)
             descartados0 = pub.dropped
             enviados = 0
             fin = time.perf_counter_ns() + int((1 if self.rapido else 2) * 1e9)
             while time.perf_counter_ns() < fin:
-                pub.publish(mensaje(tipo, tam, self.siguiente(), RITMO, datos))
+                pub.publish(mensaje(tipo, tam, self.siguiente(), RITMO, datos, ronda))
                 enviados += 1
             informe = None
             hasta = time.perf_counter_ns() + 30_000_000_000   # 6 MiB atrasados en un Wi-Fi lento tardan
             time.sleep(0.2)
             while informe is None and time.perf_counter_ns() < hasta:
                 n = self.siguiente()
-                pub.publish(mensaje(tipo, tam, n, FIN, datos))
+                pub.publish(mensaje(tipo, tam, n, FIN, datos, ronda))
                 informe = self.espera(n, 1, min(hasta, time.perf_counter_ns() + 1_000_000_000))
             if informe is None:
                 raise SinEco(f"el eco no mandó el informe del ritmo de {etiqueta} en 30 s. {QUE_HACER}")
             descartados = pub.dropped - descartados0
             rec, dt = informe.recibidos, informe.dt_ns / 1e9
             return dict(
-                etiqueta=etiqueta, bytes=tam, camino=CAMINOS.get(camino or informe.camino, "?"),
+                etiqueta=etiqueta, bytes=tam, camino=CAMINOS.get(camino or informe.camino, "?"), cod_ms=cod_ms,
+                limita_publicador=enviados > 0 and rec == enviados and descartados == 0,
                 lat_med=statistics.median(muestras), lat_p99=p99(muestras), muestras=len(muestras),
                 sin_respuesta=sin_respuesta, enviados=enviados, recibidos=rec, descartados=descartados,
                 perdidos=max(0, enviados - rec - descartados),
@@ -314,16 +377,22 @@ class Medidor:
 
 
 def tabla(res: dict) -> str:
-    filas = ["| Tamaño | Bytes | Camino | Ida y vuelta (mediana / p99) | Sin respuesta | MB/s de ida "
-             "| Mensajes/s | Recibidos / enviados | Descartados (TCP, D3) | Perdidos |",
-             "|---|---:|---|---|---:|---:|---:|---:|---:|---:|"]
+    filas = ["| Tamaño | Bytes | Camino | Codificar+decodificar | Ida y vuelta (mediana / p99) | Sin respuesta "
+             "| MB/s de ida | Mensajes/s | Recibidos / enviados | Descartados (TCP, D3) | Perdidos |",
+             "|---|---:|---|---:|---|---:|---:|---:|---:|---:|---:|"]
     for r in res["filas"]:
         bytes_ = f"{r['bytes']:,}".replace(",", " ")
-        filas.append(f"| {r['etiqueta']} | {bytes_} | {r['camino']} | {r['lat_med']:.2f} / {r['lat_p99']:.2f} ms "
-                     f"| {r['sin_respuesta']} de {r['muestras'] + r['sin_respuesta']} | {r['mbs']:.1f} "
-                     f"| {r['msgs']:.0f} | {r['recibidos']} / {r['enviados']} | {r['descartados']} | {r['perdidos']} |")
+        marca = " ¹" if r.get("limita_publicador") else ""
+        filas.append(f"| {r['etiqueta']} | {bytes_} | {r['camino']} | {r['cod_ms']:.3f} ms "
+                     f"| {r['lat_med']:.2f} / {r['lat_p99']:.2f} ms "
+                     f"| {r['sin_respuesta']} de {r['muestras'] + r['sin_respuesta']} | {r['mbs']:.1f}{marca} "
+                     f"| {r['msgs']:.0f}{marca} | {r['recibidos']} / {r['enviados']} | {r['descartados']} "
+                     f"| {r['perdidos']} |")
     lap, eco_ = res["laptop"], res["eco"]
     filas.append("")
+    if any(r.get("limita_publicador") for r in res["filas"]):
+        filas.append("¹ el eco recibió todo lo enviado: ese ritmo lo limitó quien publica (codificar y publish() en "
+                     "la laptop; ver «Codificar+decodificar»), no la red.")
     filas.append(f"laptop: Agmen {lap['agmen']} · {lap['sistema']} · {lap['nucleo']} · Python {lap['python']}  —  "
                  f"robot (eco): Agmen {eco_.get('agmen', '?')} · {eco_.get('sistema', '?')} · {eco_.get('nucleo', '?')}  "
                  f"—  conexión: el eco contesta desde {res['eco_ip'] or '?'} y ve al medidor en "
@@ -348,9 +417,10 @@ def medir(args) -> int:
         for i, (etiqueta, tipo, tam) in enumerate(sizes):
             r = med.mide(etiqueta, tipo, tam, 90 if i == 0 else 20)   # el primero: el eco puede estar arrancando
             res["filas"].append(r)
-            print(f"  {etiqueta:>8} ({r['camino']}): ida y vuelta {r['lat_med']:.2f} ms (p99 {r['lat_p99']:.2f}) "
-                  f"· {r['mbs']:.1f} MB/s · {r['msgs']:.0f} msg/s · recibió {r['recibidos']} de {r['enviados']}",
-                  flush=True)
+            print(f"  {etiqueta:>8} ({r['camino']}): codificar+decodificar {r['cod_ms']:.3f} ms · ida y vuelta "
+                  f"{r['lat_med']:.2f} ms (p99 {r['lat_p99']:.2f}) · {r['mbs']:.1f} MB/s · {r['msgs']:.0f} msg/s "
+                  f"· recibió {r['recibidos']} de {r['enviados']}"
+                  + (" (el ritmo lo limitó quien publica)" if r["limita_publicador"] else ""), flush=True)
     except SinEco as e:
         res["error"] = str(e)
         print(f"[medidor] ✖ {e}", flush=True)
@@ -468,21 +538,22 @@ def local(args) -> int:
     t0 = time.monotonic()
     base_tmp = os.environ.get("TMPDIR") or None
     tmp = Path(tempfile.mkdtemp(prefix="agmen_dos_", dir=base_tmp))
-    resultado = tmp / "resultado.json"
-    puerto = puerto_libre()
-    toml = tmp / "dos_computadoras.toml"
-    toml_local(toml, ip_robot, puerto, resultado, args.rapido)
-    base = {**os.environ, "PYTHONPATH": str(ROOT / "python"), "PYTHONIOENCODING": "utf-8", "NO_COLOR": "1",
-            "PYTHONDONTWRITEBYTECODE": "1", "AGMEN_REMOTE_HOSTS": "", "AGMEN_AGENT_KEY": ""}
-    for v in ("AGMEN_HUB", "AGMEN_NET_IP", "AGMEN_SHM", "AGMEN_NODE"):
-        base.pop(v, None)
-    envs = {nombre: {**base, "AGMEN_NET_IP": ip, "AGMEN_SHM": "0", "AGMEN_HUB": f"127.0.0.1:{puerto_libre(True)}",
-                     "AGMEN_CONFIG_DIR": str(tmp / f"cfg-{nombre}"), "HOME": str(tmp / f"home-{nombre}")}
-            for nombre, ip in (("laptop", ip_laptop), ("robot", ip_robot))}
-    envs["laptop"]["AGMEN_REMOTE_HOSTS"] = ip_robot   # una 127.x como otra computadora (solo pruebas)
     procs: list[Proc] = []
     codigo = 1
-    try:
+    try:   # desde mkdtemp: el directorio temporal se borra siempre (también si falla algo de la preparación)
+        resultado = tmp / "resultado.json"
+        puerto = puerto_libre()
+        toml = tmp / "dos_computadoras.toml"
+        toml_local(toml, ip_robot, puerto, resultado, args.rapido)
+        base = {**os.environ, "PYTHONPATH": str(ROOT / "python"), "PYTHONIOENCODING": "utf-8", "NO_COLOR": "1",
+                "PYTHONDONTWRITEBYTECODE": "1", "AGMEN_REMOTE_HOSTS": "", "AGMEN_AGENT_KEY": ""}
+        for v in ("AGMEN_HUB", "AGMEN_NET_IP", "AGMEN_SHM", "AGMEN_NODE"):
+            base.pop(v, None)
+        envs = {nombre: {**base, "AGMEN_NET_IP": ip, "AGMEN_SHM": "0",
+                         "AGMEN_HUB": f"127.0.0.1:{puerto_libre(True)}",
+                         "AGMEN_CONFIG_DIR": str(tmp / f"cfg-{nombre}"), "HOME": str(tmp / f"home-{nombre}")}
+                for nombre, ip in (("laptop", ip_laptop), ("robot", ip_robot))}
+        envs["laptop"]["AGMEN_REMOTE_HOSTS"] = ip_robot   # una 127.x como otra computadora (solo pruebas)
         agente = Proc(["agent", str(toml), "--machine", "robot", "--port", str(puerto)], envs["robot"], tmp)
         procs.append(agente)
         if not espera(lambda: "esperando a agmen run" in agente.salida or agente.p.poll() is not None, 40) \
@@ -519,7 +590,6 @@ def local(args) -> int:
     finally:
         for p in reversed(procs):   # primero agmen run (detiene al medidor y al eco), luego el agente
             p.detener()
-        import shutil
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"({time.monotonic() - t0:.0f} s)")
     return codigo

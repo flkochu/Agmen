@@ -42,6 +42,7 @@ class BancoDosComputadoras(unittest.TestCase):
                 self.fail(f"el banco no terminó en 150 s:\n{e.stdout}\n{e.stderr}")
             texto = r.stdout + r.stderr
             self.assertEqual(r.returncode, 0, texto)
+            self.assertIn("| Codificar+decodificar |", r.stdout, texto)
             for etiqueta in ("| 64 B |", "| máx. UDP |", "| 1 MiB |"):
                 self.assertIn(etiqueta, r.stdout, texto)
             self.assertIn("NO son números de una red", r.stdout, texto)
@@ -62,13 +63,58 @@ class BancoDosComputadoras(unittest.TestCase):
                     self.assertGreater(f["mbs"], 0, texto)
                     self.assertGreater(f["msgs"], 0, texto)
                     self.assertGreater(f["recibidos"], 1, texto)
-                    # Sin pérdidas absurdas: en UDP, el que publica sin parar puede llenar el búfer del que recibe,
-                    # pero no perder casi todo; en TCP no se pierde nada (lo que no alcanza es "descartado", D3).
-                    self.assertLessEqual(f["perdidos"], f["enviados"] // 2, texto)
-                    if f["camino"] == "TCP":
-                        self.assertEqual(f["perdidos"], 0, texto)
+                    # Las cuentas cuadran. Sin umbral de pérdida: en UDP, el que publica sin parar puede llenar el
+                    # búfer del que recibe y cuánto se pierde depende de la máquina. Tampoco "perdidos == 0" en TCP:
+                    # no es una garantía ni en loopback (un mensaje que iba en una conexión que se cierra o se
+                    # rehace se pierde sin contar como descartado D3); el banco lo reporta, la prueba no lo exige.
+                    self.assertEqual(f["recibidos"] + f["perdidos"] + f["descartados"], f["enviados"], texto)
+                    self.assertGreater(f["cod_ms"], 0, texto)   # codificar+decodificar, medido aparte y sin red
+                    self.assertEqual(f["limita_publicador"], f["recibidos"] == f["enviados"], texto)
             self.assertEqual(res["eco_ip"], "127.0.0.3", texto)   # el eco corrió en el "robot"
             self.assertEqual(res["eco"].get("desde"), "127.0.0.2", texto)
+
+
+
+def _banco():
+    """El módulo del banco, importado (sin correrlo)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("banco_dos_computadoras", BANCO)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TablaDelBanco(unittest.TestCase):
+    def fila(self, **cambio):
+        f = dict(etiqueta="64 B", bytes=64, camino="UDP", cod_ms=0.012, lat_med=0.5, lat_p99=1.0, muestras=30,
+                 sin_respuesta=0, enviados=100, recibidos=100, descartados=0, perdidos=0, mbs=1.0, msgs=100.0,
+                 limita_publicador=True)
+        return {**f, **cambio}
+
+    def res(self, filas):
+        lap = dict(agmen="0", sistema="x", nucleo="Python puro", python="3")
+        return dict(filas=filas, laptop=lap, eco={}, eco_ip="", local=True, error="")
+
+    def test_marca_cuando_llego_todo(self):
+        t = _banco().tabla(self.res([self.fila()]))
+        self.assertIn("| 0.012 ms |", t)
+        self.assertIn("| 1.0 ¹ | 100 ¹ |", t)
+        self.assertIn("¹ el eco recibió todo lo enviado: ese ritmo lo limitó quien publica", t)
+
+    def test_sin_marca_si_se_perdio_algo(self):
+        t = _banco().tabla(self.res([self.fila(recibidos=90, perdidos=10, limita_publicador=False)]))
+        self.assertNotIn("¹", t)
+
+    def test_codifica_ms_y_mensaje_del_tamano_justo(self):
+        b = _banco()
+        for etiqueta, tipo, tam in b.TAMANOS[:4] + b.TAMANOS[-2:-1]:
+            with self.subTest(etiqueta):
+                msg = b.mensaje(tipo, tam, 7, b.RITMO, b.datos_de(tam), ronda=3)
+                if tipo is not b.M.CargaGrande:
+                    self.assertEqual(len(msg.encode_payload()), tam)   # el tamaño de la tabla es el de verdad
+                m = tipo.decode_payload(msg.encode_payload())
+                self.assertEqual((m.n, m.fase, m.ronda), (7, b.RITMO, 3))
+                self.assertGreater(b.codifica_ms(tipo, tam, b.datos_de(tam)), 0)
 
 
 if __name__ == "__main__":

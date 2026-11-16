@@ -367,7 +367,8 @@ class TestGrabacion(TREC.HubCase):
         self.assertNotIn("relojes", meta[0][1])
         self.assertNotIn("reloj de", TREC.TestPerfilEnLaGrabacion.info(self, path))
         from agmen.recording import Recording
-        self.assertEqual(Recording(path).clocks, {})
+        with Recording(path) as g:
+            self.assertEqual(g.clocks, {})
         self.assertEqual(record.describe(path)["clocks"], {})
 
     def test_con_relojes(self):
@@ -390,8 +391,9 @@ class TestGrabacion(TREC.HubCase):
                       "±0.6 ms, ", info)
         from agmen.recording import Recording
         self.assertEqual(record.describe(path)["recording"], grabacion)
-        self.assertEqual(Recording(path).info, grabacion)
-        self.assertEqual(Recording(path).clocks, {"robot": r})
+        with Recording(path) as g:
+            self.assertEqual(g.info, grabacion)
+            self.assertEqual(g.clocks, {"robot": r})
 
     def test_split_consulta_el_hub_al_cerrar_cada_archivo(self):
         """8.6: en un corte (split) se consulta el hub al cerrar ese archivo: su `fin_ns` es el de ese momento."""
@@ -429,11 +431,90 @@ class TestGrabacion(TREC.HubCase):
         w.close()
         self.assertIn("⚠ la diferencia de relojes de robot no se puede leer", TREC.TestPerfilEnLaGrabacion.info(self, path))
         from agmen.recording import Recording
-        with self.assertRaisesRegex(ValueError, "agmen.relojes, computadora robot"):
-            Recording(path).clocks
+        with Recording(path) as g, self.assertRaisesRegex(ValueError, "agmen.relojes, computadora robot"):
+            g.clocks
+
+    def test_relojes_hostiles_no_tumban_info(self):
+        """C.1: un agmen.relojes hostil (Infinity, números enormes, 100 000 corchetes, nombres con escapes) se dice
+        en su línea, sin tapar a las demás computadoras y sin tumbar `agmen info`; aunque falte agmen.grabacion.
+        Recording.clocks da solo ValueError."""
+        path = os.path.join(self.dir, "hostil.mcap")
+        w = _mcap.Writer(path, profile=record.PROFILE, library="agmen")
+        w.add_metadata("agmen.relojes", {**HOSTILES, "pi": BIEN, "\x1b[2J\x1b[31mrobot\r\nfalso": BIEN})
+        w.close()
+        info = TREC.TestPerfilEnLaGrabacion.info(self, path)
+        self.assertIn("reloj de pi: +0.0 ms al empezar", info)
+        for k in HOSTILES:
+            self.assertIn(f"⚠ la diferencia de relojes de {k} no se puede leer", info)
+        self.assertNotIn("\x1b", info)
+        self.assertIn("reloj de \ufffd[2J\ufffd[31mrobot\ufffd\ufffdfalso: ", info)
+        from agmen.recording import Recording
+        with Recording(path) as g, self.assertRaisesRegex(ValueError, "agmen.relojes, computadora "):
+            g.clocks
+
+
+BIEN = '{"error_ns":0,"fin_ns":0,"inicio_ns":0,"max_ns":0,"min_ns":0,"muestras":1}'
+
+
+def _con(**cambio) -> str:
+    """Un resumen bueno con algunos campos cambiados por texto JSON crudo."""
+    campos = {"inicio_ns": "0", "fin_ns": "0", "min_ns": "0", "max_ns": "0", "error_ns": "0", "muestras": "1",
+              **cambio}
+    return "{" + ",".join(f'"{k}":{v}' for k, v in campos.items()) + "}"
+
+
+# Los casos de la revisión ciega del cierre (C.1): los primeros tumbaban `agmen info`; los otros se aceptaban callados.
+HOSTILES = {
+    "inf": _con(inicio_ns="Infinity"),
+    "nan": _con(inicio_ns="NaN"),
+    "menos_inf": _con(fin_ns="-Infinity"),
+    "enorme_float": _con(min_ns="-1e308", max_ns="1e308"),
+    "entero_400": _con(inicio_ns="9" * 400),
+    "entero_5000": _con(inicio_ns="9" * 5000),
+    "tope": _con(max_ns=str(2 ** 63)),
+    "hondo": "[" * 100000 + "]" * 100000,
+    "hondo_obj": '{"a":' * 100000 + "1" + "}" * 100000,
+    "float": _con(inicio_ns="1.9"),
+    "bool": _con(muestras="true"),
+    "texto": _con(inicio_ns='"12"'),
+    "muestras_neg": _con(muestras="-1"),
+    "error_neg": _con(error_ns="-5"),
+    "objeto": _con(inicio_ns="{}"),
+    "nulo": _con(inicio_ns="null"),
+    "lista": "[1]",
+    "vacio": "",
+}
 
 
 class TestTextosGrabacion(unittest.TestCase):
+    def test_hostiles(self):
+        for k, texto in HOSTILES.items():
+            with self.subTest(k):
+                with self.assertRaises(ValueError) as cm:
+                    R.leer_resumen(texto)
+                self.assertIn("resumen de reloj mal escrito", str(cm.exception))
+                (linea,) = R.lineas_grabacion({k: texto})
+                self.assertTrue(linea.startswith(f"⚠ la diferencia de relojes de {k} no se puede leer"), linea)
+        # Juntas: cada una en su línea y la buena se lee.
+        lineas = R.lineas_grabacion({**HOSTILES, "pi": BIEN})
+        self.assertEqual(len(lineas), len(HOSTILES) + 1)
+        self.assertIn("reloj de pi: +0.0 ms al empezar, +0.0 ms al terminar (mín +0.0 ms, máx +0.0 ms, ±0.0 ms, "
+                      "1 muestra)", lineas)
+
+    def test_bordes_validos(self):
+        tope = 2 ** 63 - 1
+        r = R.leer_resumen(_con(inicio_ns=str(-tope), fin_ns=str(tope), min_ns=str(-tope), max_ns=str(tope),
+                                error_ns="0", muestras="0"))
+        self.assertEqual((r["inicio_ns"], r["max_ns"], r["muestras"]), (-tope, tope, 0))
+        self.assertEqual(len(R.lineas_grabacion({"robot": _con(min_ns=str(-tope), max_ns=str(tope))})), 2)
+
+    def test_nombres_sin_caracteres_de_control(self):
+        (linea,) = R.lineas_grabacion({"\x1b[2J\x1b[31mrobot\r\nfalso": BIEN})
+        self.assertTrue(linea.startswith("reloj de \ufffd[2J\ufffd[31mrobot\ufffd\ufffdfalso: "), linea)
+        (linea,) = R.lineas_grabacion({"\x1b]0;x\x07": "{mal"})
+        self.assertNotIn("\x1b", linea)
+        self.assertNotIn("\x07", linea)
+
     def test_salto_se_delata(self):
         r = R.Resumen()
         for dif in (1 * MS, 30 * MS, 2 * MS):
