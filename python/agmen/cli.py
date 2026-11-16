@@ -634,18 +634,18 @@ def _net_checks(launcher, links: list, stop, lost: list) -> str:
             t.join(1.0)
     if lost or stop.is_set():   # una computadora se perdió mientras tanto: lo cuenta cmd_run (sale con 1)
         return ""
-    failures, ran = [], False
+    failures, ran, windows = [], False, sonda.sistema() == "windows"
     for link in links:
         res = results.get(link.name)
         if res is None:   # sin prueba con este robot (su agente no la sabe hacer: ya se dijo)
             continue
-        ran = True
+        ran, windows = True, windows or res.so_alla == "windows"
         link.took_probe(res.ok)
         if res.ok:
             launcher.say(PASA.format(robot=link.name))
         else:
             failures.append((link, res))
-    if ran:
+    if ran and windows:   # §1.6: el límite (C++ en Windows) solo si alguna de las computadoras de la prueba es Windows
         launcher.say(LIMITE)
     if not failures:
         return ""

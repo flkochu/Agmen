@@ -2505,6 +2505,7 @@ class AgentLink:
         # ese agente no la hace. before_probe(): se llama antes de cada prueba (agmen run: el aviso de Windows, una vez).
         self._probe_cap = False
         self._probing: queue.Queue | None = None
+        self._probe_error: str | None = None   # el "error" con que el agente contestó la prueba en curso (4c §1.6)
         self._net_ok: bool | None = None
         self._told_probe = False
         self.before_probe: Callable[[], None] | None = None
@@ -2827,7 +2828,11 @@ class AgentLink:
             node.remote_state(state, pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
                               code if isinstance(code, int) and not isinstance(code, bool) else None)
         elif op == "error":
-            self._say(msg.get("texto", ""), "error")
+            texto = msg.get("texto", "")
+            if self._probing is not None and isinstance(texto, str) and "prueba de red" in texto:
+                self._probe_error = texto   # 4c §1.6: la prueba falla ya con ese motivo (y lo dice ella, una vez)
+            else:
+                self._say(texto, "error")
         elif op == "pong":   # el último contacto confirmado (§9): el t es el monotonic de un ping de aquí
             if self.down_since is None:
                 self.last_ok = self._confirmed(msg, self.last_ok)
@@ -2956,7 +2961,7 @@ class AgentLink:
         box: queue.Queue = queue.Queue()
 
         def next_msg(until: float) -> dict | None:
-            while not gone():
+            while not gone() and self._probe_error is None:
                 left = until - time.monotonic()
                 if left <= 0:
                     return None
@@ -2966,7 +2971,16 @@ class AgentLink:
                     continue
             return None
 
+        def failed_there() -> bool:
+            """§1.6: si el agente contestó `error` a la prueba, falla en ese momento con ese motivo (sin esperar)."""
+            texto = self._probe_error
+            if texto is None:
+                return False
+            res.error = (f"{where} no pudo hacer la prueba de red: {_clean(texto, 300)}")
+            return True
+
         with lado:
+            self._probe_error = None
             self._probing = box
             try:
                 start = time.monotonic()
@@ -2979,6 +2993,8 @@ class AgentLink:
                 ok = next_msg(deadline)
                 if gone():
                     return None
+                if failed_there():
+                    return res
                 if ok is None or ok["op"] != "sonda_ok":
                     why = "no llegó su sonda_ok" if ok is None else "mandó sonda_fin antes de sonda_ok"
                     res.error = (f"{where} no contestó la prueba de red ({why} en {sonda.SONDA_S + sonda.MARGEN_S:g} "
@@ -2993,13 +3009,18 @@ class AgentLink:
                 so = ok.get("so")
                 res.so_alla = so if so in sonda.SISTEMAS else ""   # uno que no conozco: el consejo general
                 lado.send(robot_ip, udp, tcp, dato)
-                lado.wait(min(deadline, time.monotonic() + sonda.SONDA_S), gone)
+                lado.wait(min(deadline, time.monotonic() + sonda.SONDA_S),
+                          lambda: gone() or self._probe_error is not None)
                 if gone():
                     return None
+                if failed_there():
+                    return res
                 res.aqui_udp, res.aqui_tcp = lado.got_udp.is_set(), lado.got_tcp.is_set()
                 end = next_msg(deadline)
                 if gone():
                     return None
+                if failed_there():
+                    return res
                 if end is None or end["op"] != "sonda_fin":
                     why = "no llegó su sonda_fin" if end is None else "mandó otro sonda_ok"
                     res.error = (f"{where} no contestó la prueba de red ({why} en {sonda.SONDA_S + sonda.MARGEN_S:g} "

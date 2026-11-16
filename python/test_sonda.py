@@ -243,6 +243,25 @@ class TestConElAgente(SondaCase):
         if sonda.sistema() == "linux":
             self.assertIn("En esta computadora: sudo ufw allow from 127.0.0.1", lines[0])
 
+    def test_si_el_agente_no_puede_abrir_sus_sockets_falla_ya_con_ese_motivo(self):
+        """§1.6 con el agente de verdad: contesta `error` y la laptop no espera los SONDA_S + MARGEN_S."""
+        orig = sonda.Lado.__init__
+
+        def init(self_, *a, **kw):
+            if threading.current_thread().name == "agmen-agent-sonda":
+                raise OSError("no pude abrir los sockets de la prueba de red en 0.0.0.0 (prueba)")
+            orig(self_, *a, **kw)
+
+        link = self.abrir()
+        t0 = time.monotonic()
+        with mock.patch.object(sonda.Lado, "__init__", init):
+            res = link.net_check()
+        self.assertLess(time.monotonic() - t0, 1.5)
+        self.assertFalse(res.ok)
+        self.assertIn("no pudo hacer la prueba de red: robot: no pude abrir los sockets de la prueba de red", res.error)
+        self.assertIn("la prueba de red no se pudo hacer", res.error)
+        self.assertIsNotNone(link.channel)
+
     def test_sin_sonda_de_la_laptop_no_hay_prueba_y_el_agente_no_la_dice(self):
         link = self.abrir(sonda_tambien=False)
         self.assertTrue(link._tables)
@@ -341,15 +360,24 @@ class Falso:
 
     def _sonda(self, ch, msg, ip, modo):
         udp, tcp, dato = sonda.oferta(msg)
+        if modo == "error":   # (como el agente de verdad cuando no puede: §1.6)
+            ch.send({"op": "error", "texto": "robot: no pude abrir los sockets de la prueba de red en 0.0.0.0 "
+                                             "(prueba): la prueba de red no se pudo hacer"})
+            return
+        if modo == "otro_error":   # un error que no es de la prueba: se dice como siempre y la prueba sigue
+            ch.send({"op": "error", "texto": "robot: no conozco el nodo 'x'"})
         with sonda.Lado() as lado:
             lado.listen(ip)
             lado.send(ip, udp, tcp, sonda.nuevo_dato() if modo == "dato_malo" else dato)
             if modo == "no_ok":
                 return
-            ok = {"op": "sonda_ok", **lado.offer(), "so": "linux"}
+            ok = {"op": "sonda_ok", **lado.offer(), "so": "windows" if modo == "windows" else "linux"}
             if modo == "ok_malo":
                 ok["tcp"] = 70000
             ch.send(ok)
+            if modo == "error_tras_ok":
+                ch.send({"op": "error", "texto": "robot: error inesperado en la prueba de red (prueba)"})
+                return
             if self.barrera is not None:
                 self.barrera.wait(TOPE_S)   # las dos sondas a la vez: si fueran una tras otra, no pasa
             lado.wait(time.monotonic() + sonda.SONDA_S)
@@ -432,6 +460,38 @@ class TestConAgenteDeMentira(FalsoCase):
         self.assertEqual(len(lines), 1)
         self.assertIn("por UDP (mensajes chicos)", lines[0])
 
+    def test_si_el_agente_contesta_error_falla_ya_con_ese_motivo(self):
+        """§1.6: sin esperar los SONDA_S + MARGEN_S; el motivo va en el error de la prueba (no se dice dos veces)."""
+        lados = Lados(self)
+        link = self.link(Falso(self, ["error"]))
+        t0 = time.monotonic()
+        res = link.net_check()   # SONDA_S de verdad (2 s): si esperara, tardaría 4
+        self.assertLess(time.monotonic() - t0, 1.5)
+        self.assertFalse(res.ok)
+        self.assertIn("robot (127.0.0.1", res.error)
+        self.assertIn("no pudo hacer la prueba de red: robot: no pude abrir los sockets de la prueba de red", res.error)
+        self.assertEqual(link.probe_lines(res)[0], res.error)
+        self.assertFalse(any("no pude abrir los sockets" in n for n in self.notas), self.notas)
+        self.assertTrue(until(lados.cerrados))
+        self.assertIsNotNone(link.channel)
+        self.assertTrue(link.net_check().ok)   # la siguiente no arrastra el error de antes
+
+    def test_un_error_tras_sonda_ok_tambien_corta_la_espera(self):
+        lados = Lados(self)
+        link = self.link(Falso(self, ["error_tras_ok"]))
+        t0 = time.monotonic()
+        with mock.patch.object(sonda, "SONDA_S", 5.0):
+            res = link.net_check()
+        self.assertLess(time.monotonic() - t0, 3.0)
+        self.assertIn("no pudo hacer la prueba de red: robot: error inesperado en la prueba de red", res.error)
+        self.assertTrue(until(lados.cerrados))
+
+    def test_un_error_que_no_es_de_la_prueba_se_dice_y_la_prueba_sigue(self):
+        link = self.link(Falso(self, ["otro_error"]))
+        res = link.net_check()
+        self.assertTrue(res.ok, res)
+        self.assertIn("robot: no conozco el nodo 'x'", self.notas)
+
     def test_sonda_ok_que_no_se_espera_se_ignora(self):
         falso = Falso(self)
         link = self.link(falso)
@@ -499,7 +559,8 @@ class TestAgmenRun(TA.LinkCase):
         self.assertIn("la prueba de red con 'robot' no pasó, así que no arranqué nada:", salida)
         self.assertIn("robot no recibe de esta computadora por UDP (mensajes chicos)", salida)
         self.assertIn("--no-net-check", salida)
-        self.assertIn(sonda.LIMITE, salida)
+        if sonda.sistema() != "windows":   # §1.6: el límite de C++ solo si alguna computadora es Windows
+            self.assertNotIn(sonda.LIMITE, salida)
         self.sin_arrancar_nada()   # ni los del robot ni el de aquí
         self.assertTrue(until(lados.cerrados))
         # El mismo código que cuando el agente no contesta.
@@ -551,7 +612,7 @@ class TestVariosRobots(FalsoCase):
         self.assertEqual(error, "", said)
         self.assertIn(sonda.PASA.format(robot="robot"), said)
         self.assertIn(sonda.PASA.format(robot="brazo"), said)
-        self.assertEqual(said.count(sonda.LIMITE), 1)
+        self.assertEqual(said.count(sonda.LIMITE), 0)   # §1.6: ninguna es Windows
         self.assertTrue(all(l._net_ok for l in links))
 
     def test_si_uno_falla_el_error_lo_nombra_y_el_aviso_de_windows_sale_una_vez(self):
@@ -566,8 +627,32 @@ class TestVariosRobots(FalsoCase):
         self.assertIn("la prueba de red con 'brazo' no pasó, así que no arranqué nada:", error)
         self.assertIn("brazo no recibe de esta computadora por UDP (mensajes chicos)", error)
         self.assertNotIn("'robot' no pasó", error)
+        self.assertEqual(said.count(sonda.LIMITE), 1)   # esta es Windows: el límite, una vez
         self.assertTrue(error.endswith("(pero entonces, si un firewall bloquea los topics, Agmen no te lo va a "
                                        "decir)"), error)
+
+    def net_checks(self, falsos, sistema="linux"):
+        links = [self.link(f, n) for f, n in zip(falsos, ("robot", "brazo"))]
+        said: list[str] = []
+        launcher = SimpleNamespace(say=lambda t, k="agmen": said.append(t))
+        with mock.patch.object(sonda, "SONDA_S", 0.5), mock.patch.object(sonda, "sistema", lambda: sistema):
+            error = cli._net_checks(launcher, links, threading.Event(), [])
+        return error, said
+
+    def test_el_limite_de_cpp_sale_si_el_robot_es_windows(self):
+        error, said = self.net_checks([Falso(self), Falso(self, ["windows"])])
+        self.assertEqual(error, "", said)
+        self.assertEqual(said.count(sonda.LIMITE), 1, said)
+
+    def test_el_limite_de_cpp_no_sale_si_ninguna_es_windows(self):
+        error, said = self.net_checks([Falso(self), Falso(self)])
+        self.assertEqual(error, "", said)
+        self.assertNotIn(sonda.LIMITE, said)
+
+    def test_el_limite_de_cpp_no_sale_si_no_hubo_prueba(self):
+        error, said = self.net_checks([Falso(self, capaz=False)], sistema="windows")
+        self.assertEqual(error, "")
+        self.assertNotIn(sonda.LIMITE, said)
 
     def test_si_se_deja_de_esperar_cierra_todo(self):
         lados = Lados(self)
