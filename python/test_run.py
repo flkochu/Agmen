@@ -5,6 +5,7 @@
 
 import io
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -837,6 +838,69 @@ class TestPrinter(unittest.TestCase):
         term.abierta.set()
         p.close()
         self.assertIn("aviso importante", term.getvalue())
+
+    def detenido(self, max_queue):
+        """Un Printer con el escritor atorado en la terminal (escribiendo un 'tapón'): lo que llegue después se
+        queda en la cola hasta abrirla."""
+        term = TerminalBloqueada()
+        p = Printer(["a"], stream=term, max_queue=max_queue)
+        p("a", "tapón")
+        fin = time.monotonic() + 5
+        while not (p._writing and not p._live) and time.monotonic() < fin:
+            time.sleep(0.001)
+        self.assertTrue(p._writing and not p._live, "el escritor no tomó el tapón")
+        return term, p
+
+    def salida(self, term, p):
+        term.abierta.set()
+        p.close()
+        return [l.split(" │ ", 1)[1] for l in term.getvalue().splitlines()]
+
+    def test_con_la_cola_llena_se_conservan_las_mas_nuevas(self):
+        """Cierre del nivel 10 (decisión 2): una ráfaga mayor que la cola sale con sus ÚLTIMAS líneas; el aviso
+        dice cuántas faltan y va antes de ellas; las no descartables están todas y en orden."""
+        term, p = self.detenido(max_queue=10)
+        enviadas = []
+        for i in range(100):
+            if i % 25 == 0:
+                p("agmen", f"aviso {i}", "agmen")
+                enviadas.append(f"aviso {i}")
+            p("a", f"línea {i}")
+            enviadas.append(f"línea {i}")
+        self.assertLessEqual(len(p._q), 2 * p._live + 1, "la cola no crece con las descartadas")
+        out = self.salida(term, p)
+        self.assertEqual(out[0], "tapón")
+        m = re.fullmatch(r"… (\d+) líneas no cupieron en la terminal \(están en el panel web\)", out[1])
+        self.assertIsNotNone(m, out[1])
+        resto = out[2:]
+        self.assertEqual([l for l in resto if l.startswith("aviso")], [f"aviso {i}" for i in (0, 25, 50, 75)])
+        lineas = [int(l.split()[1]) for l in resto if l.startswith("línea")]
+        self.assertEqual(lineas, list(range(100 - len(lineas), 100)), "salen las últimas, seguidas")
+        self.assertEqual(int(m.group(1)) + len(lineas), 100)
+        # La cola llena son 10; los 3 avisos que llegaron con ella llena entran igual (nunca se descartan).
+        self.assertEqual((len(resto), len(lineas)), (13, 9))
+        self.assertEqual(resto, [l for l in enviadas if l in resto], "el orden no cambia")
+
+    def test_cola_llena_solo_de_no_descartables_descarta_la_que_llega(self):
+        term, p = self.detenido(max_queue=3)
+        for i in range(5):
+            p("agmen", f"aviso {i}", "agmen")
+        p("a", "nueva")
+        p("a", "otra", "error", droppable=False)
+        out = self.salida(term, p)
+        self.assertEqual(out, ["tapón", "… 1 líneas no cupieron en la terminal (están en el panel web)",
+                               *(f"aviso {i}" for i in range(5)), "otra"])
+
+    def test_rafaga_larga_sin_crecer(self):
+        """O(1) amortizado y memoria acotada: 20 000 líneas con la terminal atorada."""
+        term, p = self.detenido(max_queue=50)
+        t0 = time.perf_counter()
+        for i in range(20_000):
+            p("a", f"línea {i}")
+            self.assertLessEqual(len(p._q), 2 * 50 + 1)
+        self.assertLess(time.perf_counter() - t0, 5.0)
+        out = self.salida(term, p)
+        self.assertEqual(out[2:], [f"línea {i}" for i in range(19_950, 20_000)])
 
 
 def maquina(name, host, extra=""):

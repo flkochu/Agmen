@@ -1045,7 +1045,14 @@ class Printer:
     imprime mucho haría esperar a todos los demás: el sistema dejaría de ser
     paralelo. Por eso los nodos solo encolan y un hilo propio escribe. Si la
     terminal no da abasto, se descartan líneas de la terminal (no del panel) y
-    se avisa cuántas, en vez de frenar a los nodos.
+    se avisa cuántas, en vez de frenar a los nodos: con la cola llena, la línea
+    descartable que llega saca a la descartable MÁS VIEJA de la cola (se ve lo
+    más nuevo). Las no descartables nunca se pierden; el orden no cambia.
+
+    La cola guarda las líneas (str) en orden; las descartables, además, en
+    `_droppable` (las mismas, de la más vieja a la más nueva). Sacar una es O(1):
+    su id va a `_dead` y se salta al escribir; cuando hay más muertas que vivas
+    se compacta la cola (O(1) amortizado por línea).
     """
 
     def __init__(self, names: list[str], stream=None, max_queue: int = 500) -> None:
@@ -1057,7 +1064,10 @@ class Printer:
         if self.use_color and os.name == "nt":
             os.system("")  # activa los colores ANSI en la consola de Windows
         self.max_queue = max_queue
-        self.queue: deque[str] = deque()
+        self._q: deque[str] = deque()          # en orden; puede traer muertas (ver _dead)
+        self._droppable: deque[str] = deque()  # las descartables vivas de _q, de la más vieja a la más nueva
+        self._dead: set[int] = set()           # id() de las de _q que ya se descartaron
+        self._live = 0                         # cuántas de _q siguen vivas
         self.dropped = 0
         self.cond = threading.Condition()
         self._closed = False
@@ -1079,12 +1089,29 @@ class Printer:
         líneas "out": los avisos de agmen y los errores de aquí nunca. Lo que llega de otra
         computadora (agmen agent) siempre se puede: un agente roto no llena la memoria aquí."""
         line = self._format(node, text, kind)
+        drop = kind == "out" if droppable is None else droppable
         with self.cond:
-            if len(self.queue) >= self.max_queue and (kind == "out" if droppable is None else droppable):
+            if self._live >= self.max_queue and drop:
                 self.dropped += 1
-                return
-            self.queue.append(line)
+                if not self._droppable:
+                    return               # la cola está llena solo de no descartables: se va la que llega
+                # Lo más nuevo importa más: sale la descartable más vieja y entra esta.
+                self._dead.add(id(self._droppable.popleft()))
+                self._live -= 1
+                if len(self._dead) > self._live:
+                    self._q = deque(l for l in self._q if id(l) not in self._dead)
+                    self._dead.clear()
+            self._q.append(line)
+            self._live += 1
+            if drop:
+                self._droppable.append(line)
             self.cond.notify()
+
+    @property
+    def queue(self) -> list[str]:
+        """Las líneas que esperan su turno, en orden (una copia: para pruebas y diagnóstico)."""
+        with self.cond:
+            return [l for l in self._q if id(l) not in self._dead]
 
     def _emit(self, line: str) -> None:
         try:
@@ -1095,12 +1122,16 @@ class Printer:
     def _write_loop(self) -> None:
         while True:
             with self.cond:
-                while not self.queue and not self.dropped and not self._closed:
+                while not self._live and not self.dropped and not self._closed:
                     self.cond.wait()
-                if self._closed and not self.queue and not self.dropped:
+                if self._closed and not self._live and not self.dropped:
                     self.cond.notify_all()
                     return
-                lines, self.queue = list(self.queue), deque()
+                if self._dead:
+                    lines = [l for l in self._q if id(l) not in self._dead]
+                else:
+                    lines = list(self._q)
+                self._q, self._droppable, self._dead, self._live = deque(), deque(), set(), 0
                 dropped, self.dropped = self.dropped, 0
                 self._writing = True
             try:
@@ -1120,7 +1151,7 @@ class Printer:
         """Espera a que la cola se vacíe (antes de que otro escriba directo)."""
         end = time.monotonic() + timeout
         with self.cond:
-            while (self.queue or self.dropped or self._writing) and time.monotonic() < end:
+            while (self._live or self.dropped or self._writing) and time.monotonic() < end:
                 self.cond.wait(0.05)
 
     def close(self, timeout: float = 3.0) -> None:
