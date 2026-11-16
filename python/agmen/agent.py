@@ -1952,8 +1952,11 @@ class _Session:
         from .pubsub import hub_address
         from .tables import Bridge
 
+        # §9.2: si la laptop pidió una sesión de simulación o reproducción, solo cruzan los nodos que arrancó este
+        # agente (y sus descendientes); en una sesión `real`, todo (como siempre).
+        owned = self._node_pids if self._first.get("reloj") in ("sim", "replay") else None
         try:
-            bridge = Bridge(hub_address(), self.launcher.say)
+            bridge = Bridge(hub_address(), self.launcher.say, owned=owned)
             peer = bridge.add_peer(self._first["desde"], lambda part: self.send(part))
             bridge.start()
         except Exception as e:   # nunca en silencio; la sesión sigue sin puente
@@ -1969,6 +1972,17 @@ class _Session:
                     peer.confirm(ip)   # con el candado (§8.2): una pérdida después hace peer.lose(); antes, no se llega
         if ending:
             bridge.close()
+
+    def _node_pids(self) -> list[int]:
+        """Los pids de los nodos de esta sesión que están corriendo ahora (el puente los mira en cada tabla: un nodo
+        que se reinicia sigue contando)."""
+        out = []
+        for name in self.plan.names:
+            node = self.launcher.nodes.get(name)
+            proc = getattr(node, "proc", None)
+            if proc is not None and proc.returncode is None:   # (sin poll(): eso es del Launcher)
+                out.append(proc.pid)
+        return out
 
     def _run_before(self, cmd: list[str]) -> int | None:
         """Un comando de [robot] before, con su salida como log de "agmen" (RFC 0011 §3.3)."""

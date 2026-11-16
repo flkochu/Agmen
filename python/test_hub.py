@@ -437,6 +437,58 @@ class TestModoRed(unittest.TestCase):
         self.assertNotIn("r1", self.hub.endpoints)
         self.assertTrue(any("'cam' (de la computadora 'robot') no latió" in x for x in self.logs))
 
+    def test_solo_da_la_entrada_de_fuera_solo_a_los_publisher_de_la_lista(self):
+        """RFC 0011 §9.2: un sub de otra computadora con `solo` es destino solo de los Publisher locales de su lista;
+        al cambiarla, los `subs` cambian; `solo=-`: de ninguno; `state` lo muestra."""
+        self.red()
+        self.pub("p1", src=("127.0.0.1", 40001))
+        self.pub("p2", src=("127.0.0.1", 40002))
+        remoto = dict(id="laptop.s1", node="ia", pid=7, topic="/cmd", schema="00000000000000aa", type="Cmd",
+                      machine="laptop", addr=f"{LAPTOP}:7600")
+
+        def subs_de():
+            return {a[1]: d for d, a in self.sent if " subs " in d}
+
+        self.send("sub", solo="p1", **remoto)
+        self.assertEqual(subs_de(), {40001: f"agmen-hub/1 subs id=p1 topic=/cmd to={LAPTOP}:7600 tcp=",
+                                     40002: "agmen-hub/1 subs id=p2 topic=/cmd to= tcp="})
+        self.assertEqual(self.ep("laptop.s1")["solo"], "p1")
+        # Al registrarse (o latir) un Publisher que no está en la lista, no la recibe.
+        self.pub("p3", src=("127.0.0.1", 40003))
+        self.assertEqual(subs_de(), {40003: "agmen-hub/1 subs id=p3 topic=/cmd to= tcp="})
+        self.pub("p1", src=("127.0.0.1", 40001))
+        self.assertEqual(subs_de(), {40001: f"agmen-hub/1 subs id=p1 topic=/cmd to={LAPTOP}:7600 tcp="})
+        # Cambia la lista: los `subs` se vuelven a mandar.
+        self.send("sub", solo="p2,p3", **remoto)
+        self.assertEqual(subs_de(), {40001: "agmen-hub/1 subs id=p1 topic=/cmd to= tcp=",
+                                     40002: f"agmen-hub/1 subs id=p2 topic=/cmd to={LAPTOP}:7600 tcp=",
+                                     40003: f"agmen-hub/1 subs id=p3 topic=/cmd to={LAPTOP}:7600 tcp="})
+        self.assertEqual(self.ep("laptop.s1")["solo"], "p2,p3")
+        # solo=-: de ninguno.
+        self.send("sub", solo="-", **remoto)
+        self.assertEqual(set(subs_de().values()), {f"agmen-hub/1 subs id={p} topic=/cmd to= tcp=" for p in
+                                                   ("p1", "p2", "p3")})
+        self.assertEqual(self.ep("laptop.s1")["solo"], "-")
+        # Sin `solo`: a todos (como siempre), y `state` no lo muestra.
+        self.send("sub", **remoto)
+        self.assertEqual(set(subs_de().values()), {f"agmen-hub/1 subs id={p} topic=/cmd to={LAPTOP}:7600 tcp="
+                                                   for p in ("p1", "p2", "p3")})
+        self.assertNotIn("solo", self.ep("laptop.s1"))
+
+    def test_solo_en_una_entrada_local_es_un_error(self):
+        self.red()
+        for kind, extra in (("sub", dict(port=6000)), ("sub", dict(port=6000, net=1)), ("pub", {})):
+            with self.subTest(kind=kind, extra=extra):
+                fields = dict(id="x1", node="n", pid=1, topic="/cmd", schema="00000000000000aa", type="Cmd",
+                              solo="p1", **extra)
+                ((op, f), _), = self.send(kind, **fields)
+                self.assertEqual((op, f["id"]), ("error", "x1"))
+                self.assertIn("solo va solo con machine=", f["msg"])
+        ((op, f), _), = self.send("sub", id="r1", node="n", pid=1, topic="/cmd", schema="00000000000000aa",
+                                  machine="laptop", addr=f"{LAPTOP}:7600", solo="")
+        self.assertIn("solo= vacío no vale", f["msg"])
+        self.assertNotIn("x1", self.hub.endpoints)
+
     def test_entradas_de_otra_computadora_rechazadas(self):
         base = dict(id="r1", node="cam", pid=7, topic="/cmd", schema="00000000000000aa", type="Cmd")
         ((op, f), _), = self.send("sub", machine="robot", addr=f"{ROBOT}:7600", **base)

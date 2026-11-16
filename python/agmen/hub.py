@@ -63,6 +63,7 @@ class Endpoint:
     net: bool = False         # sub local: su puerto escucha en la red (net=1)
     src: tuple[str, int] = ("", 0)   # de dónde late (para un sub de fuera: el proceso que lo registra)
     local_since: float | None = None  # sub local sin net=1 en modo red: desde cuándo
+    solo: frozenset[str] | None = None  # sub de fuera: solo se le da a estos Publisher locales (None: a todos; §9.2)
 
 
 def net_ip_from_env() -> str | None:
@@ -233,7 +234,8 @@ class Hub:
         return [e for e in self.endpoints.values() if e.kind == "sub" and e.topic in (topic, "*")]
 
     def _push_subs(self, pub: Endpoint) -> None:
-        subs = self.subscribers_of(pub.topic)
+        # RFC 0011 §9.2: un Subscriber de otra computadora con `solo` es destino solo de los Publisher de su lista.
+        subs = [s for s in self.subscribers_of(pub.topic) if s.solo is None or pub.id in s.solo]
         to = ",".join(f"{s.addr[0]}:{s.addr[1]}" for s in subs)
         tcp = ",".join(f"{s.addr[0]}:{s.tcp}" for s in subs if s.tcp)
         self._send(hp.encode("subs", id=pub.id, topic=pub.topic, to=to, tcp=tcp), pub.addr)
@@ -348,6 +350,7 @@ class Hub:
         if kind == "pub" and schema == "*":
             raise hp.ProtocolError("un Publisher debe decir su schema_id")
         machine = self._check_machine_fields(kind, f, addr)
+        solo = self._solo(f)
         node = f.get("node", "?")
         if schema != "*" and topic != "*":
             have = self._typed_endpoint(topic, exclude=eid)
@@ -376,7 +379,8 @@ class Hub:
             tcp = 0 if tcp_text == "0" else hp.parse_port(tcp_text, "el puerto tcp")
         net = self._flag(f, "net")
         e = self.endpoints.get(eid)
-        is_new = e is None or e.addr != addr or e.topic != topic or e.tcp != tcp or e.machine != machine
+        is_new = e is None or e.addr != addr or e.topic != topic or e.tcp != tcp or e.machine != machine \
+            or e.solo != solo
         if e is None:
             e = Endpoint(eid, kind, node, f.get("pid", ""), topic, schema, addr,
                          f.get("type", ""), tcp, f.get("text", ""))
@@ -393,6 +397,7 @@ class Hub:
         e.last_seen = now
         e.src = src
         e.net = net
+        e.solo = solo
         if kind == "sub" and not machine and self.net_mode and not net:
             if e.local_since is None:
                 e.local_since = now
@@ -418,16 +423,32 @@ class Hub:
             raise hp.ProtocolError(f"{key}={value} no vale: usa {key}=1 (o no lo pongas)")
         return value == "1"
 
+    @staticmethod
+    def _solo(f: dict[str, str]) -> frozenset[str] | None:
+        """`solo=<id>,<id>…` (RFC 0011 §9.2): los Publisher de esta computadora a los que se da como destino una
+        entrada de otra computadora; `solo=-`: a ninguno. Sin el campo: None (a todos, como siempre)."""
+        if "solo" not in f:
+            return None
+        if f["solo"] == "-":
+            return frozenset()
+        ids = hp.split_list(f["solo"])
+        if not ids:
+            raise hp.ProtocolError("solo= vacío no vale: pon los ids de los Publisher (solo=a,b) o solo=- si ninguno")
+        return frozenset(ids)
+
     def _check_machine_fields(self, kind: str, f: dict[str, str], addr: tuple[str, int]) -> str:
-        """Los campos nuevos (machine, addr, net) de un pub/sub; devuelve la computadora ("" = esta)."""
+        """Los campos nuevos (machine, addr, net, solo) de un pub/sub; devuelve la computadora ("" = esta)."""
         machine = f.get("machine", "")
-        new = [k for k in ("machine", "addr", "net") if f.get(k)]
+        new = [k for k in ("machine", "addr", "net", "solo") if f.get(k)]
         if new:
             self._check_local_origin(f"el campo {new[0]}", addr)
         if not machine:
             if f.get("addr"):
                 raise hp.ProtocolError("addr va solo con machine=<computadora>: un Subscriber de esta computadora "
                                        "dice su puerto con port")
+            if "solo" in f:
+                raise hp.ProtocolError("solo va solo con machine=<computadora> (una entrada de otra computadora, la "
+                                       "registra el puente): un endpoint de esta computadora no lo lleva")
             return ""
         node = f.get("node", "?")
         if f.get("net"):
@@ -483,6 +504,8 @@ class Hub:
     def _ep_extra(e: Endpoint) -> dict[str, str]:
         """Campos de modo red de una línea `ep` (sin modo red no hay ninguno: los bytes de siempre)."""
         if e.machine:
+            if e.solo is not None:   # (§9.2, para depurar: a qué Publisher de aquí se da)
+                return {"machine": e.machine, "solo": ",".join(sorted(e.solo)) or "-"}
             return {"machine": e.machine}
         return {"net": "1"} if e.net else {}
 

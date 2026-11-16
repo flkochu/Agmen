@@ -12,7 +12,10 @@ import contextlib
 import io
 import json
 import os
+import signal
 import socket
+import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -42,7 +45,7 @@ def hay_ips(*ips) -> bool:
 class Lado:
     """Una computadora: un hub de verdad (con AGMEN_NET_IP) y su puente, con lo que dice y lo que le manda al hub."""
 
-    def __init__(self, case, name: str, ip: str, robots: bool = False):
+    def __init__(self, case, name: str, ip: str, robots: bool = False, owned=None):
         self.name, self.ip = name, ip
         self.hub = TR.Hub(ip)
         case.addCleanup(self.hub.close)
@@ -50,7 +53,7 @@ class Lado:
         self.sent: list[bytes] = []          # lo que el puente le manda al hub
         self.ticks = 0
         self.bridge = T.Bridge(self.hub.addr, lambda text, kind="agmen": self.said.append(text), robots=robots,
-                               beat=0.1)
+                               beat=0.1, owned=owned)
         real_send, real_read = self.bridge._send, self.bridge._read_hub
 
         def send(data):
@@ -857,6 +860,127 @@ class TestTablasNoEstorban(Base):
         self.assertLess(time.monotonic() - t0, 1.8)
 
 
+def proceso(case, hijo: bool = False):
+    """Un proceso de verdad en su propio grupo (como lanza agmen run sus nodos); con `hijo`, que a su vez arranca
+    otro. Devuelve (pid, pid del hijo o None, detener). Se detienen al terminar la prueba (o antes, con detener)."""
+    code = ("import subprocess, sys, time\n"
+            + ("c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\nprint(c.pid, flush=True)\n"
+               if hijo else "print(0, flush=True)\n")
+            + "time.sleep(60)\n")
+    kwargs: dict = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+                    else {"start_new_session": True})
+    p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True, **kwargs)
+    child = int(p.stdout.readline())
+
+    def fin():
+        if child:
+            with contextlib.suppress(OSError):
+                os.kill(child, signal.SIGTERM)
+        p.kill()
+        p.wait()
+        p.stdout.close()
+
+    case.addCleanup(fin)
+    return p.pid, (child or None), fin
+
+
+def ajeno_dicho(said, node):
+    return [t for t in said if t.startswith(f"'{node}' (pid ") and "no lo arranqué yo" in t]
+
+
+@unittest.skipUnless(hay_ips(LAPTOP_IP, ROBOT_IP), "hace falta 127.0.0.2 y 127.0.0.3 (en Linux siempre están)")
+class TestSimulacion(Base):
+    """§9.2: en una sesión de simulación (o reproducción), del lado del robot solo cruzan los nodos que arrancó el
+    agente (o un descendiente suyo); lo importado de la laptop lleva `solo`. En una sesión `real`, nada cambia."""
+
+    def armar(self, sim: bool):
+        self.nodo, self.hijo, self.detener_nodo = proceso(self, hijo=True)
+        self.ajeno, _, _ = proceso(self)
+        self.roots = [self.nodo]
+        self.la = Lado(self, "laptop", LAPTOP_IP)
+        self.lb = Lado(self, "robot", ROBOT_IP, owned=(lambda: list(self.roots)) if sim else None)
+        self.canal = Canal(self.la, self.lb)
+        self.canal.confirmar()
+        sch = f"{TR.Chico.SCHEMA_ID:016x}"
+        pub = dict(schema=sch, type=TR.Chico.NAME, text=TR.Chico.SCHEMA_TEXT)
+        sub = dict(schema=sch, type=TR.Chico.NAME, net=1)
+        for line in (hp.encode("pub", id="pn", node="nodo", pid=self.nodo, topic="/a", **pub),
+                     hp.encode("pub", id="ph", node="hijo", pid=self.hijo, topic="/b", **pub),
+                     hp.encode("pub", id="pa", node="ajeno", pid=self.ajeno, topic="/a", **pub),
+                     hp.encode("sub", id="sa", node="oyente", pid=self.ajeno, topic="/d", port=7001, **sub),
+                     hp.encode("sub", id="sn", node="nodo", pid=self.nodo, topic="/d", port=7002, **sub)):
+            self.lb.hub.keep(line)
+        for line in (hp.encode("sub", id="la", node="ia", pid=1, topic="/a", port=7101, **sub),
+                     hp.encode("sub", id="lb", node="ia", pid=1, topic="/b", port=7102, **sub),
+                     hp.encode("sub", id="lw", node="rec", pid=1, topic="*", schema="*", type="", port=7103, net=1),
+                     hp.encode("pub", id="lp", node="mando", pid=1, topic="/d", **pub)):
+            self.la.hub.keep(line)
+
+    def solo(self, eid):
+        with self.lb.hub.hub.lock:
+            e = self.lb.hub.hub.endpoints.get(eid)
+            return None if e is None else e.solo
+
+    def test_solo_cruzan_el_nodo_del_agente_y_sus_hijos(self):
+        self.armar(sim=True)
+        self.assertTrue(until(lambda: set(self.la.remotas("robot")) == {"robot.pn", "robot.ph", "robot.sn"}),
+                        (set(self.la.remotas("robot")), self.lb.said))
+        self.assertTrue(self.lb.esperar_ticks(5))
+        self.assertEqual(set(self.la.remotas("robot")), {"robot.pn", "robot.ph", "robot.sn"})   # nunca los ajenos
+        # Lo importado de la laptop: los Subscriber, solo para los Publisher de los nodos del agente.
+        self.assertTrue(until(lambda: self.solo("laptop.la") is not None and self.solo("laptop.lw") is not None))
+        self.assertEqual(self.solo("laptop.la"), {"pn"})              # 'pa' (ajeno) publica /a y no le llega
+        self.assertEqual(self.solo("laptop.lb"), {"ph"})
+        self.assertEqual(self.solo("laptop.lw"), {"pn", "ph"})        # el comodín: todos los del agente
+        self.assertIsNone(self.solo("laptop.lp"))                     # (un Publisher de fuera no lleva solo)
+        ep = next(f for op, f in TR.H.query(self.lb.hub.addr) if op == "ep" and f["id"] == "laptop.la")
+        self.assertEqual(ep["solo"], "pn")                            # `state` lo muestra
+        # El aviso: una vez por nodo ajeno.
+        texto = (f"'ajeno' (pid {self.ajeno}) no lo arranqué yo y esta es una sesión de simulación: no lo conecto "
+                 f"con laptop (ni recibe ni manda). Si es parte del robot, ponlo en robot.toml")
+        self.assertEqual(ajeno_dicho(self.lb.said, "ajeno"), [texto])
+        self.assertEqual(len(ajeno_dicho(self.lb.said, "oyente")), 1)
+        self.assertEqual(ajeno_dicho(self.lb.said, "nodo") + ajeno_dicho(self.lb.said, "hijo"), [])
+
+    def test_un_nodo_que_se_reinicia_sigue_contando(self):
+        self.armar(sim=True)
+        self.assertTrue(until(lambda: "robot.pn" in self.la.remotas("robot")))
+        # El agente lo reinicia: el proceso de antes (y su hijo) se va; el nuevo tiene otro pid y otro id.
+        self.detener_nodo()
+        nuevo, _, _ = proceso(self)
+        self.roots = [nuevo]
+        with self.lb.hub.lock:
+            self.lb.hub.lines = [ln for ln in self.lb.hub.lines if b" id=pn " not in ln and b" id=ph " not in ln
+                                 and b" id=sn " not in ln]
+        self.lb.hub.keep(hp.encode("pub", id="pn2", node="nodo", pid=nuevo, topic="/a",
+                                   schema=f"{TR.Chico.SCHEMA_ID:016x}", type=TR.Chico.NAME, text=TR.Chico.SCHEMA_TEXT))
+        self.assertTrue(until(lambda: set(self.la.remotas("robot")) == {"robot.pn2"}, hp.EXPIRE_S + 5),
+                        set(self.la.remotas("robot")))
+        self.assertTrue(until(lambda: self.solo("laptop.la") == {"pn2"}))
+        self.assertFalse(ajeno_dicho(self.lb.said, "nodo"), self.lb.said)
+
+    def test_si_no_se_sabe_de_quien_es_no_se_exporta(self):
+        self.armar(sim=True)
+        self.lb.hub.keep(hp.encode("pub", id="px", node="raro", pid="", topic="/x", schema="00000000000000aa",
+                                   type="X", text="X{u32 a}"))
+        self.assertTrue(until(lambda: "robot.pn" in self.la.remotas("robot")))
+        self.assertTrue(until(lambda: ajeno_dicho(self.lb.said, "raro")))
+        self.assertNotIn("robot.px", self.la.remotas("robot"))
+        self.assertFalse(T.Lineage([self.nodo]).owns(self.ajeno))
+        self.assertTrue(T.Lineage([self.nodo]).owns(self.hijo))
+        self.assertIsNone(T.Lineage([self.nodo]).owns(0))
+
+    def test_en_una_sesion_real_cruza_todo_y_no_hay_solo(self):
+        self.armar(sim=False)
+        todos = {"robot.pn", "robot.ph", "robot.pa", "robot.sa", "robot.sn"}
+        self.assertTrue(until(lambda: set(self.la.remotas("robot")) == todos), set(self.la.remotas("robot")))
+        self.assertTrue(until(lambda: "laptop.la" in self.lb.remotas("laptop")))
+        self.assertTrue(self.lb.esperar_ticks(3))
+        self.assertTrue(all(e.solo is None for e in self.lb.remotas("laptop").values()))
+        self.assertFalse(any(b" solo=" in ln for ln in self.lb.sent))
+        self.assertFalse(any("no lo arranqué yo" in t for t in self.lb.said))
+
+
 class TestHubQueNoContesta(Base):
     """(e) y §8.3: "no contesta" solo cuando de verdad no contesta."""
 
@@ -1038,6 +1162,52 @@ class TestPuntaAPunta(TA.E2EBase):
             with open(out, "w", encoding="utf-8") as f:
                 f.write(f"--- agmen run ---\n{''.join(rlines)}\n--- agmen agent ---\n{''.join(alines)}")
 
+
+    def test_en_simulacion_solo_cruza_el_nodo_del_agente(self):
+        """§9.2 de punta a punta: `agmen run --sim`. En el "robot", un Subscriber arrancado a mano (este proceso, con
+        el hub del agente) no recibe lo que publica la laptop; el nodo del agente sí; el aviso sale en las dos
+        terminales."""
+        script = self.dir / "nodo_red.py"
+        script.write_text(NODO_RED_PY, encoding="utf-8")
+        s, marks = json.dumps(str(script)), json.dumps(str(self.marks))
+        toml = self.dir / "sim.toml"
+        toml.write_text(
+            f'[robot]\nname = "puente-sim"\n\n[[machine]]\nname = "robot"\nhost = "{ROBOT_IP}:{self.port}"\n\n'
+            f'[[node]]\nname = "motor"\ncmd = ["python", {s}, "sub", {marks}]\nmachine = "robot"\n\n'
+            f'[web]\nenabled = false\n', encoding="utf-8")
+        hub_robot = f"127.0.0.1:{TA.free_udp_port()}"
+        ap, alines, clave = self.agente(toml, hub_env=hub_robot, AGMEN_NET_IP=ROBOT_IP)
+        env = self.env("run", AGMEN_REMOTE_HOSTS=ROBOT_IP, AGMEN_NET_IP=LAPTOP_IP, AGMEN_AGENT_KEY=clave)
+        rp, rlines = self.lanzar(["run", str(toml), "--sim", "--no-browser", "--no-web"], env)
+        self.assertTrue(self.espera(lambda: any("todo arrancado" in ln for ln in rlines) or rp.poll() is not None),
+                        "".join(rlines))
+        (ajeno,) = abrir_en(hub_robot, ROBOT_IP, (pubsub._PureSubscriber, Cmd, "/cmd"))   # a mano, en el robot
+        (pub,) = abrir_en(env["AGMEN_HUB"], LAPTOP_IP, (pubsub._PurePublisher, Cmd, "/cmd"))
+        for o in (ajeno, pub):
+            self.addCleanup(o.close)
+        recibido = self.marks / "cmd_recibido"
+        robados = []
+
+        def paso():
+            pub.publish(Cmd(42))
+            robados.extend(TR.receive_all(ajeno, 0.05))
+
+        aviso = f"(pid {os.getpid()}) no lo arranqué yo y esta es una sesión de simulación: no lo conecto con "
+        ok = until(lambda: recibido.exists() and any(aviso in ln for ln in rlines) and any(aviso in ln for ln in alines),
+                   60, every=paso)
+        salida = f"--- agmen run ---\n{''.join(rlines)}\n--- agmen agent ---\n{''.join(alines)}"
+        self.assertTrue(ok, salida)
+        v, sender = recibido.read_text(encoding="utf-8").split(" ")
+        self.assertEqual((v, sender.split(":")[0]), ("42", LAPTOP_IP))   # el nodo del agente sí recibe
+        fin = time.monotonic() + 2.0                                       # y el de a mano, nunca
+        while time.monotonic() < fin:
+            paso()
+        self.assertEqual(robados, [], salida)
+        self.assertIn("(ni recibe ni manda). Si es parte del robot, ponlo en robot.toml",
+                      next(ln for ln in alines if aviso in ln))
+        self.assertEqual(sum(aviso in ln for ln in alines), 1, salida)    # una vez
+        self.assertEqual(self.detener(rp), 0, salida)
+        self.assertIsNotNone(self.detener(ap), salida)
 
     def lanzar_par(self, toml):
         ap, alines, clave = self.agente(toml, AGMEN_NET_IP=ROBOT_IP)

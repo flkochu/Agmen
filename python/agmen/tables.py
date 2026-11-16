@@ -21,6 +21,7 @@ vuelve a modo local en 6 s. Todo corre en hilos propios; los errores se atrapan 
 from __future__ import annotations
 
 import json
+import os
 import re
 import socket
 import threading
@@ -128,9 +129,10 @@ def check_endpoint(kind: str, d) -> dict:
     return out
 
 
-def hub_line(name: str, ip: str, kind: str, d: dict) -> bytes:
+def hub_line(name: str, ip: str, kind: str, d: dict, solo: list[str] | None = None) -> bytes:
     """La línea con la que se registra en el hub el endpoint `d` (ya validado) de la computadora `name`, que este
-    lado ve en `ip` (kind "pubs" o "subs")."""
+    lado ve en `ip` (kind "pubs" o "subs"). `solo` (§9.2, solo para "subs"): los ids de los Publisher de aquí a los
+    que el hub lo da como destino ([] = a ninguno); None: sin el campo (a todos, como siempre)."""
     hid = f"{name}.{d['id']}"
     if kind == "pubs":
         return hp.encode("pub", id=hid, node=d["node"], pid=d["pid"], topic=d["topic"], schema=d["schema"],
@@ -139,7 +141,104 @@ def hub_line(name: str, ip: str, kind: str, d: dict) -> bytes:
                   machine=name, addr=f"{ip}:{d['port']}")
     if d["tcp"]:
         fields["tcp"] = d["tcp"]
+    if solo is not None:
+        fields["solo"] = ",".join(solo) or "-"
     return hp.encode("sub", **fields)
+
+
+# --- §9.2: en simulación o reproducción, solo cruzan los nodos que arrancó el agente ---------------------------------
+
+class Lineage:
+    """¿Es un proceso uno de `roots` (los nodos que arrancó el agente) o un descendiente suyo? Se arma una vez por
+    tabla (1 Hz). POSIX: mismo grupo de procesos que el nodo (cada nodo corre en el suyo). Windows: la cadena de
+    procesos padre. `owns(pid)`: True, False, o None si no se puede saber (y entonces no se exporta)."""
+
+    def __init__(self, roots: list[int]) -> None:
+        self.roots = {r for r in roots if r > 0}
+        self._groups: set[int] = set()
+        self._parents: dict[int, tuple[int, int]] | None = None   # Windows: pid → (padre, creado)
+        if os.name == "nt":
+            self._parents = _win_parents()
+        else:
+            for r in self.roots:
+                try:
+                    self._groups.add(os.getpgid(r))
+                except OSError:
+                    pass   # el nodo ya no está: lo suyo no cuenta
+
+    def owns(self, pid: int) -> bool | None:
+        if pid <= 0:
+            return None
+        if pid in self.roots:
+            return True
+        if os.name != "nt":
+            try:
+                return os.getpgid(pid) in self._groups
+            except OSError:
+                return None   # (ya no está, o no se puede ver)
+        if self._parents is None or pid not in self._parents:
+            return None
+        seen = set()
+        while pid in self._parents and pid not in seen and len(seen) < 64:
+            seen.add(pid)
+            parent, born = self._parents[pid]
+            if parent in self.roots:
+                return True
+            # Un padre que nació después que el hijo es otro proceso con el pid reusado: la cadena se corta.
+            if parent not in self._parents or self._parents[parent][1] > born:
+                return False
+            pid = parent
+        return False
+
+
+def _win_parents() -> dict[int, tuple[int, int]] | None:
+    """Windows: pid → (pid del padre, cuándo nació) de todos los procesos (una foto con CreateToolhelp32Snapshot).
+    None si no se puede (y entonces nada se exporta)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", wintypes.WCHAR * 260)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    snap = k32.CreateToolhelp32Snapshot(0x2, 0)   # TH32CS_SNAPPROCESS
+    if not snap or snap == wintypes.HANDLE(-1).value:
+        return None
+    pairs: list[tuple[int, int]] = []
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = k32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            pairs.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID)))
+            ok = k32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snap)
+    out: dict[int, tuple[int, int]] = {}
+    times = [wintypes.FILETIME() for _ in range(4)]
+    for pid, parent in pairs:
+        born = 0
+        h = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if h:
+            try:
+                if k32.GetProcessTimes(h, *(ctypes.byref(t) for t in times)):
+                    born = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+            finally:
+                k32.CloseHandle(h)
+        out[pid] = (parent, born)
+    return out
 
 
 class _Problems:
@@ -378,9 +477,14 @@ class Peer:
         if not self.confirmed or self.table is None or self.ip is None:
             return []
         lines, now = [], set()
+        ours = self.bridge.solo   # §9.2 (sesión de simulación): topic → ids de los Publisher de los nodos del agente
         for kind, eps in zip(("pubs", "subs"), self.table):
             for d in eps:
-                line = hub_line(self.name, self.ip, kind, d)
+                solo = None
+                if ours is not None and kind == "subs":
+                    solo = sorted({i for ids in ours.values() for i in ids}) if d["topic"] == "*" \
+                        else ours.get(d["topic"], [])
+                line = hub_line(self.name, self.ip, kind, d, solo)
                 if len(line) > HUB_LINE_MAX:   # (ya se dijo al recibirla; solo si la IP cambió y ya no cabe)
                     continue
                 now.add(f"{self.name}.{d['id']}")
@@ -397,8 +501,12 @@ class Bridge:
     de un topic que se publica en un robot y se escucha en otro (laptop con varios robots, §4)."""
 
     def __init__(self, hub: str, say: Callable[[str, str], None], *, robots: bool = False,
-                 beat: float = hp.BEAT_S) -> None:
+                 beat: float = hp.BEAT_S, owned: Callable[[], list[int]] | None = None) -> None:
         self.hub = hub
+        # §9.2: en una sesión de simulación o reproducción (del lado del robot), los pids de los nodos que arrancó el
+        # agente: solo lo suyo se exporta, y lo importado lleva `solo` (None: sin restricción, como siempre).
+        self.owned = owned
+        self.solo: dict[str, list[str]] | None = None if owned is None else {}
         self.say = say
         self.robots = robots
         self.beat = beat
@@ -540,6 +648,8 @@ class Bridge:
                     parts = f"llegaron {got[0]} de {got[1]} partes: " if got else ""
                     self.say(f"⚠ la tabla de mi hub no cabe en una respuesta ({parts}demasiados topics o esquemas muy "
                              f"largos): no puedo pasarle mis topics a '{who}'", "error")
+                if self.owned is not None:
+                    self.solo = {}   # §9.2: sin la lista no se sabe qué es de los nodos del agente: a ninguno
                 return [], []
             if self._quiet_since is None:
                 self._quiet_since = now
@@ -558,7 +668,45 @@ class Bridge:
         if cut:
             self.say_once(("local-cortado",), f"⚠ no paso a las otras computadoras {len(cut)} Publisher(s) cuyo esquema "
                                               f"es tan largo que mi hub lo manda recortado (p. ej. {cut[0]})", "error")
+        if self.owned is not None:
+            table = self._ours(msgs, table, names)
         return table
+
+    def _ours(self, msgs, table: tuple[list[dict], list[dict]], names) -> tuple[list[dict], list[dict]]:
+        """§9.2: de lo local, solo lo de los nodos que arrancó el agente (o de un descendiente suyo); de lo demás se
+        avisa una vez por nodo. Deja en `self.solo` los ids de los Publisher que sí son suyos, por topic."""
+        try:
+            roots = [int(p) for p in self.owned()]
+        except Exception:   # nunca en silencio, y del lado seguro: nada es suyo
+            roots = []
+        lineage = Lineage(roots)
+        verdict: dict[str, bool | None] = {}   # pid (texto) → ¿de un nodo del agente? (una vez por tabla)
+
+        def owns(pid: str) -> bool | None:
+            if pid not in verdict:
+                verdict[pid] = lineage.owns(int(pid)) if pid.isascii() and pid.isdigit() else False
+            return verdict[pid]
+
+        def ours(pid: str) -> bool:
+            return owns(pid) is True
+
+        solo: dict[str, list[str]] = {}
+        who = ", ".join(sorted(names))
+        for op, f in msgs:
+            if op != "ep" or f.get("machine"):
+                continue
+            mine = owns(f.get("pid", ""))
+            if mine:
+                if f.get("kind") == "pub":
+                    solo.setdefault(f.get("topic", ""), []).append(f.get("id", ""))
+            elif mine is False and who:   # (None: el proceso ya no está; su entrada caduca sola en el hub, sin aviso)
+                node = f.get("node", "?")
+                self.say_once(("ajeno", node), f"'{node}' (pid {f.get('pid') or '?'}) no lo arranqué yo y esta es una "
+                                               f"sesión de simulación: no lo conecto con {who} (ni recibe ni manda). "
+                                               f"Si es parte del robot, ponlo en robot.toml", "error")
+        self.solo = solo
+        pubs, subs = table
+        return [d for d in pubs if ours(d["pid"])], [d for d in subs if ours(d["pid"])]
 
     def _parts(self, pubs: list[dict], subs: list[dict]) -> list[dict]:
         """La tabla de aquí en partes de como mucho PART_MAX endpoints (y PART_BYTES en JSON)."""
