@@ -97,6 +97,17 @@ def mal_manda(case, lado: str, que: str):
 class TestLado(unittest.TestCase):
     """El módulo que comparten los dos lados: abrir, mandar, esperar, validar, explicar."""
 
+    def test_wait_sent_espera_a_saber_por_que_no_salio(self):
+        # En Windows un puerto cerrado tarda ~2 s en rechazar: el motivo llega después de mandar (falló en el CI).
+        def lento(*a, **k):
+            time.sleep(0.3)
+            raise ConnectionRefusedError(111, "Connection refused")
+        with sonda.Lado() as a, mock.patch.object(sonda.socket, "create_connection", lento):
+            a.send("127.0.0.1", a.udp.getsockname()[1], 9, "0" * 32)
+            self.assertNotIn("TCP", a.send_errors)
+            a.wait_sent(time.monotonic() + 5)
+            self.assertEqual(a.send_errors.get("TCP"), "Connection refused")
+
     def test_pasa_entre_dos_lados(self):
         with sonda.Lado() as a, sonda.Lado() as b:
             a.listen("127.0.0.1")
@@ -1204,7 +1215,8 @@ class TestVariosRobots(FalsoCase):
         links = [self.link(a, "robot"), self.link(b, "brazo")]
         said: list[str] = []
         launcher = SimpleNamespace(say=lambda t, k="agmen": said.append(t))
-        error = cli._net_checks(launcher, links, threading.Event(), [])
+        with mock.patch.object(sonda, "sistema", lambda: "linux"):   # (también cuando la prueba corre en Windows)
+            error = cli._net_checks(launcher, links, threading.Event(), [])
         self.assertEqual(error, "", said)
         self.assertIn(sonda.PASA.format(robot="robot"), said)
         self.assertIn(sonda.PASA.format(robot="brazo"), said)

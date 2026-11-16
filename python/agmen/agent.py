@@ -3366,6 +3366,8 @@ class AgentLink:
                 except ValueError as e:
                     res.error = (f"{where} contestó mal la prueba de red ({e}): ¿las dos computadoras tienen la misma "
                                  f"versión de Agmen?")
+                if not (res.alla_udp and res.alla_tcp):
+                    lado.wait_sent(deadline)   # por qué no salió (en Windows el rechazo tarda ~2 s en llegar)
                 res.envio = dict(lado.send_errors)   # §4.5: lo que no pude mandar sale en la línea de ese sentido
                 return res
             finally:

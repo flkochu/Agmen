@@ -245,6 +245,13 @@ class Lado:
         """Manda `dato` a los puertos `udp` y `tcp` de `peer` (cada uno en su hilo, con tope de tiempo)."""
         self._start(self._send_udp, peer, udp, linea(dato))
         self._start(self._send_tcp, peer, tcp, linea(dato))
+        self._senders = self._threads[-2:]
+
+    def wait_sent(self, until: float) -> None:
+        """Espera (hasta `until`, en time.monotonic()) a que termine de mandar: `send_errors` ya dice por qué no
+        salió. En Linux un puerto cerrado rechaza al instante; en Windows tarda ~2 s, y sin esperar no se sabía."""
+        for t in getattr(self, "_senders", ()):
+            t.join(max(0.0, until - time.monotonic()))
 
     def _send_udp(self, peer: str, port: int, data: bytes) -> None:
         for i in range(UDP_VECES):
