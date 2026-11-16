@@ -236,29 +236,54 @@ class TestDosComputadoras(Base):
         (got,) = self.cruza([pub], [sub])
         self.assertEqual(got[0].message, TR.Chico(5, 6))
 
-    def test_si_la_tabla_del_hub_no_cabe_se_dice_eso_y_no_que_no_contesta(self):
-        """§8.3: un hub vivo con 60 topics de esquemas de ~1000 caracteres: su respuesta a `query` no cabe en un
-        datagrama. El puente lo dice (no "no contesta"), al otro le manda una tabla vacía, y el hub lo dice en su log."""
+    def test_un_hub_con_mas_de_200_endpoints_y_esquemas_largos_se_exporta_entero(self):
+        """§9.1: 250 topics de esquemas de ~1000 caracteres: la lista del hub no cabe en un datagrama, llega en partes
+        y el puente la pasa entera (antes decía "no cabe" y le mandaba al otro una tabla vacía)."""
+        sub = self.lb.open(self, pubsub._PureSubscriber, TR.Chico, "/x")
+        pub = self.la.open(self, pubsub._PurePublisher, TR.Chico, "/x")
+        self.cruza([pub], [sub])
+        texto = "Largo{" + ", ".join(f"f32 campo{i}" for i in range(80)) + "}"
+        for i in range(250):
+            self.la.hub.keep(hp.encode("pub", id=f"largo{i}", node="largo", pid=1, topic=f"/largo{i}",
+                                       schema=f"{0xabc000 + i:016x}", type=f"Largo{i}", text=texto))
+        self.assertTrue(until(lambda: len(self.lb.remotas("laptop")) == 251), (len(self.lb.remotas("laptop")),
+                                                                               self.la.said))
+        with self.lb.hub.hub.lock:
+            textos = {e.text for e in self.lb.hub.hub.endpoints.values() if e.topic.startswith("/largo")}
+        self.assertEqual(textos, {texto})
+        self.assertFalse(any("no cabe" in t or "no contesta" in t for t in self.la.said), self.la.said)
+        (got,) = self.cruza([pub], [sub])                       # y lo de antes sigue cruzando
+        self.assertEqual(got[0].message, TR.Chico(5, 6))
+
+    def test_si_faltan_partes_de_la_lista_del_hub_se_dice_y_no_que_no_contesta(self):
+        """§8.3 y §9.1: el hub está vivo pero de su lista llegan 2 de 3 partes: el puente lo dice una vez (no "no
+        contesta") y al otro le manda una tabla vacía (no se queda con una vieja)."""
+        from agmen import hub as H
+
         sub = self.lb.open(self, pubsub._PureSubscriber, TR.Chico, "/x")
         pub = self.la.open(self, pubsub._PurePublisher, TR.Chico, "/x")
         self.cruza([pub], [sub])
         self.assertTrue(self.canal.pb.table[0])                 # el robot tiene la tabla de la laptop
-        texto = "Largo{" + ", ".join(f"f32 campo{i}" for i in range(80)) + "}"
-        for i in range(60):
-            self.la.hub.keep(hp.encode("pub", id=f"largo{i}", node="largo", pid=1, topic=f"/largo{i}",
-                                       schema=f"{0xabc000 + i:016x}", type=f"Largo{i}", text=texto))
-        with mock.patch.object(T, "HUB_QUIET_S", 0.0):
+        real = H.query
+
+        def query(hub, timeout=1.0, say=H._say_incomplete):
+            out = real(hub, timeout, say)
+            if hub == self.la.hub.addr:
+                out.incompleta = (2, 3)
+            return out
+
+        with mock.patch.object(H, "query", query), mock.patch.object(T, "HUB_QUIET_S", 0.0):
             ok = until(lambda: any("no cabe en una respuesta" in t for t in self.la.said))
-        self.assertTrue(ok, self.la.said)
-        self.assertIn("⚠ la tabla de mi hub no cabe en una respuesta (demasiados topics o esquemas muy largos): no "
-                      "puedo pasarle mis topics a 'robot'", self.la.said)
+            self.assertTrue(ok, self.la.said)
+            self.assertTrue(until(lambda: self.canal.pb.table == ([], [])))   # sin dejarle al robot una tabla vieja
+            self.assertTrue(until(lambda: not self.lb.remotas("laptop")))
+        self.assertIn("⚠ la tabla de mi hub no cabe en una respuesta (llegaron 2 de 3 partes: demasiados topics o "
+                      "esquemas muy largos): no puedo pasarle mis topics a 'robot'", self.la.said)
         self.assertFalse(any("no contesta" in t for t in self.la.said), self.la.said)
-        self.assertTrue(until(lambda: self.canal.pb.table == ([], [])))   # sin dejarle al robot una tabla vieja
-        self.assertTrue(until(lambda: not self.lb.remotas("laptop")))
-        avisos = [t for t in self.la.hub.logs if "la respuesta a 'query' no cabe en un datagrama" in t]
-        self.assertEqual(len(avisos), 1, self.la.hub.logs[-5:])
-        self.assertRegex(avisos[0], r"\(\d+ bytes, máximo 65507; \d+ endpoints\)")
         self.assertEqual(sum("no cabe en una respuesta" in t for t in self.la.said), 1)
+        # Cuando vuelve a llegar entera, se dice y se vuelve a pasar.
+        self.assertTrue(until(lambda: any("ya cabe" in t for t in self.la.said)), self.la.said)
+        self.assertTrue(until(lambda: self.lb.remotas("laptop")))
 
     def test_el_reproductor_manda_a_otra_computadora(self):
         sub = self.lb.open(self, pubsub._PureSubscriber, TR.Chico, "/r")
@@ -453,6 +478,21 @@ class TestTabla(Base):
             {"id": "s1", "node": "ia", "pid": "8", "topic": "/x", "schema": "00000000000000aa", "type": "X",
              "port": 6000, "tcp": 6001},
             {"id": "w", "node": "rec", "pid": "9", "topic": "*", "schema": "*", "type": "", "port": 6003, "tcp": 0}])
+
+    def test_un_publisher_con_el_esquema_recortado_no_se_pasa_y_se_dice(self):
+        """§9.1: un topic cuyo esquema el hub mandó recortado (`cortado=1`): su Publisher no se pasa (el otro lado
+        leería mal sus mensajes); sus Subscriber sí (no llevan esquema)."""
+        msgs = hp.parse("\n".join([
+            hp.line("topic", name="/x", type="X", schema="00000000000000aa", text="X{u32", pubs=1, subs=1,
+                    expected="no", cortado=1),
+            hp.line("ep", id="p1", kind="pub", node="cam", pid=7, topic="/x", type="X", addr="127.0.0.1:5", tcp="",
+                    age="0.1"),
+            hp.line("ep", id="s1", kind="sub", node="ia", pid=8, topic="/x", type="X", addr="127.0.0.2:6000",
+                    tcp="", age="0.1", net=1),
+        ]).encode())
+        cut: list[str] = []
+        pubs, subs = T.local_table(msgs, cut)
+        self.assertEqual((pubs, [d["id"] for d in subs], cut), ([], ["s1"], ["'cam' en /x"]))
 
 
 class TestCapacidad(Base):

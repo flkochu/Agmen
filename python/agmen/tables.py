@@ -35,6 +35,8 @@ PART_BYTES = 48 * 1024      # una parte en JSON, como mucho (la línea del agent
 TABLE_MAX_BYTES = 1024 * 1024   # una tabla recibida, como mucho, en bytes de sus líneas para el hub (ya escapadas)
 HUB_LINE_MAX = 65507        # una línea para el hub, como mucho: lo que cabe en un datagrama UDP (IPv4)
 HUB_QUIET_S = 3.0           # el hub sin contestar este tiempo: se dice (una vez)
+HUB_BURST_BYTES = 64 * 1024  # al hub, de golpe como mucho esto; luego una pausa de HUB_BURST_S
+HUB_BURST_S = 0.002
 QUERY_TIMEOUT = 0.3         # lo que se espera la respuesta de `query` (el hub está en esta computadora)
 SAID_MAX = 1000             # avisos distintos que se recuerdan (para decir cada uno una vez)
 _WORST_NAME = "x" * 64      # para medir, al mandar, la línea más larga que el otro lado puede armar
@@ -155,10 +157,11 @@ class _Problems:
             self.add(kind, example, n)
 
 
-def local_table(msgs: list[tuple[str, dict[str, str]]]) -> tuple[list[dict], list[dict]]:
+def local_table(msgs: list[tuple[str, dict[str, str]]], cut: list[str] | None = None) -> tuple[list[dict], list[dict]]:
     """Lo LOCAL de la respuesta a `query` (§2.2): todos los Publisher y los Subscriber con net=1, sin
     nada que haya venido de otra computadora (no hay bucles). `ep` no trae schema ni text: son los de su
-    topic (un topic, un tipo)."""
+    topic (un topic, un tipo). Un Publisher de un topic cuyo esquema llegó recortado (`cortado=1`, §9.1) no se
+    pasa (el otro lado leería mal sus mensajes): va a `cut` ("'nodo' en /topic") para decirlo."""
     topics = {f.get("name", ""): f for op, f in msgs if op == "topic"}
     pubs, subs = [], []
     for op, f in msgs:
@@ -169,6 +172,10 @@ def local_table(msgs: list[tuple[str, dict[str, str]]]) -> tuple[list[dict], lis
         base = {"id": f.get("id", ""), "node": f.get("node", ""), "pid": f.get("pid", ""), "topic": topic}
         if f.get("kind") == "pub":
             if not t.get("schema"):
+                continue
+            if t.get("cortado") == "1":
+                if cut is not None:
+                    cut.append(f"'{f.get('node', '?')}' en {topic}")
                 continue
             pubs.append({**base, "schema": t["schema"], "type": f.get("type", ""), "text": t.get("text", "")})
         elif f.get("kind") == "sub" and f.get("net") == "1":
@@ -404,7 +411,7 @@ class Bridge:
         self._red_at = 0.0
         self._quiet_since: float | None = None
         self._quiet_told = False
-        self._too_big = False       # el hub contesta `ping` pero no `query` (su tabla no cabe en un datagrama)
+        self._too_big = False       # el hub contesta `ping` pero su lista no llega entera (faltan partes, §9.1)
         self._stop = threading.Event()
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
@@ -491,8 +498,14 @@ class Bridge:
         with self.lock:
             for p in peers:
                 lines.extend(p.hub_lines())
+        sent = 0
         for line in lines:
             self._send(line)
+            sent += len(line)
+            if sent >= HUB_BURST_BYTES:   # §9.1: con cientos de endpoints, en tandas (que no se desborde el búfer del hub)
+                sent = 0
+                self._drain()
+                time.sleep(HUB_BURST_S)
         self._drain()
         if self.robots:
             self._robots(peers)
@@ -510,8 +523,11 @@ class Bridge:
     def _read_hub(self, now: float, names: list[str] = ()):
         from .hub import ping, query
 
+        msgs = None
         try:
-            msgs = query(self.hub, timeout=QUERY_TIMEOUT)
+            msgs = query(self.hub, timeout=QUERY_TIMEOUT, say=None)   # (lo incompleto lo dice el puente, abajo)
+            if getattr(msgs, "incompleta", None) is not None:   # §9.1: llegó en partes y faltan partes
+                raise ConnectionError("incompleta")
         except (ConnectionError, OSError, hp.ProtocolError, ValueError):
             # §8.3: si `ping` sí contesta, el hub está vivo y lo que no cabe es su respuesta a `query` (un datagrama):
             # no se dice "no contesta"; al otro lado se le manda una tabla vacía (no se queda con una vieja).
@@ -520,7 +536,9 @@ class Bridge:
                 if names and not self._too_big:
                     self._too_big = True
                     who = "', '".join(sorted(names))
-                    self.say(f"⚠ la tabla de mi hub no cabe en una respuesta (demasiados topics o esquemas muy "
+                    got = getattr(msgs, "incompleta", None)
+                    parts = f"llegaron {got[0]} de {got[1]} partes: " if got else ""
+                    self.say(f"⚠ la tabla de mi hub no cabe en una respuesta ({parts}demasiados topics o esquemas muy "
                              f"largos): no puedo pasarle mis topics a '{who}'", "error")
                 return [], []
             if self._quiet_since is None:
@@ -535,7 +553,12 @@ class Bridge:
         if self._too_big:
             self.say("la tabla de mi hub ya cabe en una respuesta: vuelvo a pasar mis topics")
         self._quiet_since, self._quiet_told, self._too_big = None, False, False
-        return local_table(msgs)
+        cut: list[str] = []
+        table = local_table(msgs, cut)
+        if cut:
+            self.say_once(("local-cortado",), f"⚠ no paso a las otras computadoras {len(cut)} Publisher(s) cuyo esquema "
+                                              f"es tan largo que mi hub lo manda recortado (p. ej. {cut[0]})", "error")
+        return table
 
     def _parts(self, pubs: list[dict], subs: list[dict]) -> list[dict]:
         """La tabla de aquí en partes de como mucho PART_MAX endpoints (y PART_BYTES en JSON)."""

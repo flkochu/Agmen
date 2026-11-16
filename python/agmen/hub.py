@@ -21,6 +21,7 @@ import socket
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 from . import hubproto as hp
@@ -28,7 +29,12 @@ from ._version import __version__
 
 
 # Topics que pone Agmen mismo: no hace falta declararlos en robot.toml.
-QUERY_MAX = 65507                       # la respuesta a `query` va en UN datagrama UDP (IPv4)
+QUERY_MAX = 65507                       # lo que cabe en UN datagrama UDP (IPv4): así va `state` si cabe
+PART_BYTES = 32 * 1024                  # si no cabe: partes de como mucho esto (RFC 0011 §9.1)
+QUERY_RCVBUF = 4 * 1024 * 1024          # el búfer que pide quien pregunta (para que no se pierdan partes)
+BURST_BYTES = 96 * 1024                 # de las partes, lo que sale de golpe; lo demás, tras BURST_S (sin bloquear
+BURST_S = 0.002                         # al hub: entre tanda y tanda atiende lo que llegue)
+OUTBOX_MAX = 16 * 1024 * 1024           # partes pendientes de salir, como mucho (lo demás no sale y se dice)
 BUILTIN_TOPICS = {"/clock": "Clock"}   # el tiempo de la simulación (RFC 0006)
 BUILTIN_PREFIXES = {"/mux/": "MuxEstado"}   # quién manda en cada [[mux]] (RFC 0012)
 
@@ -102,6 +108,10 @@ class Hub:
         except OSError as e:
             raise OSError(f"no se pudo abrir el hub en {listen}: {e}. ¿Ya hay un agmen hub corriendo? "
                           f"(compruébalo con 'agmen topic list')") from None
+        try:   # con cientos de endpoints de otra computadora, el puente le late muchas líneas de golpe (§9.1)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, QUERY_RCVBUF)
+        except OSError:
+            pass   # (lo que el sistema dé)
         self.sock.settimeout(0.25)
         self.log = log
         self.endpoints: dict[str, Endpoint] = {}
@@ -117,6 +127,9 @@ class Hub:
         self._peer_ips: dict[str, str] = {}   # nombre → IP (los mismos peers, para buscar rápido)
         self._ok_peers = b""                   # b" peers=ip,ip": lo que se añade a cada `ok` en modo red
         self.net_seen = 0.0       # cuándo llegó el último `red`
+        self._query_n = 0         # cuántas respuestas a `query` salieron en partes (`n` de cada una)
+        self._outbox: deque[tuple[bytes, tuple[str, int]]] = deque()   # partes por salir (en tandas, ver flush)
+        self._outbox_bytes = 0
 
     # --- modo red ---
     @property
@@ -188,6 +201,21 @@ class Hub:
         if key not in self._warned:
             self._warned.add(key)
             self.log(f"⚠ {text}")
+
+    def flush(self) -> None:
+        """Manda una tanda (BURST_BYTES) de las partes pendientes de `query`. Si una no sale, las demás para esa misma
+        dirección tampoco (quien preguntó ya no está; dirá que su lista llegó incompleta)."""
+        sent = 0
+        while self._outbox and sent < BURST_BYTES:
+            data, addr = self._outbox.popleft()
+            self._outbox_bytes -= len(data)
+            try:
+                self.sock.sendto(data, addr)
+                sent += len(data)
+            except OSError:
+                dead = [x for x in self._outbox if x[1] == addr]
+                self._outbox = deque(x for x in self._outbox if x[1] != addr)
+                self._outbox_bytes -= sum(len(d) for d, _ in dead)
 
     # --- consultas ---
     def topic_schema(self, topic: str, exclude: str = "") -> tuple[str, str] | None:
@@ -285,15 +313,20 @@ class Hub:
             self._send(hp.encode("red_ok", peers=len(peers)), addr)
         elif op == "query":
             data = self.state_text().encode()
-            try:
-                self.sock.sendto(data, addr)
-            except OSError:   # nunca en silencio: con muchos endpoints la respuesta no cabe en un datagrama
-                if len(data) > QUERY_MAX:
-                    self._warn_once("query-no-cabe",
-                                    f"la respuesta a 'query' no cabe en un datagrama ({len(data)} bytes, máximo "
-                                    f"{QUERY_MAX}; {len(self.endpoints)} endpoints): agmen topic, el panel y el puente "
-                                    f"entre computadoras no pueden leer este hub. Menos nodos o esquemas más cortos")
-                # (lo demás, como en _send: quien preguntó ya no está)
+            if len(data) <= QUERY_MAX:     # cabe en un datagrama: los bytes de siempre
+                self._send(data, addr)
+                return
+            self._query_n += 1
+            parts = split_state(data.decode(), self._query_n)
+            size = sum(len(p) for p in parts)
+            if self._outbox_bytes + size > OUTBOX_MAX:   # muchas consultas a la vez: esta no sale (quien preguntó lo dice)
+                self._warn_once("query-cola", f"me piden la lista más rápido de lo que puedo mandarla ({len(parts)} partes, "
+                                              f"{size} bytes; ya hay {self._outbox_bytes} bytes por salir): no contesto "
+                                              f"esta consulta. Pregunta menos seguido")
+                return
+            self._outbox.extend((p, addr) for p in parts)
+            self._outbox_bytes += size
+            self.flush()
         elif op == "bye":
             e = self.endpoints.pop(f["id"], None)
             if e is not None:
@@ -456,8 +489,12 @@ class Hub:
     def state_text(self) -> str:
         lines = [hp.line("state", version=__version__, hub=self.listen, robot=self.robot)]
         topics = sorted({e.topic for e in self.endpoints.values() if e.topic != "*"} | set(self.expected))
+        by_topic: dict[str, list[Endpoint]] = {}   # (una pasada: con 1000 endpoints no se recorren 1000 veces)
+        for e in self.endpoints.values():
+            by_topic.setdefault(e.topic, []).append(e)
+        wildcard = sum(1 for e in by_topic.get("*", ()) if e.kind == "sub")
         for t in topics:
-            eps = [e for e in self.endpoints.values() if e.topic == t]
+            eps = by_topic.get(t, [])
             typed = next((e for e in eps if e.schema != "*" and e.text), None) or \
                 next((e for e in eps if e.schema != "*"), None)
             exp = self.expected.get(t)
@@ -466,7 +503,7 @@ class Hub:
                                  schema=typed.schema if typed else "",
                                  text=typed.text if typed else "",
                                  pubs=sum(1 for e in eps if e.kind == "pub"),
-                                 subs=len(self.subscribers_of(t)),
+                                 subs=sum(1 for e in eps if e.kind == "sub") + wildcard,
                                  expected=("required" if exp.required else "yes") if exp else "no"))
         now = time.monotonic()
         for e in self.endpoints.values():
@@ -481,6 +518,7 @@ class Hub:
     def serve(self, stop: threading.Event) -> None:
         last_check = 0.0
         while not stop.is_set():
+            self.sock.settimeout(BURST_S if self._outbox else 0.25)
             try:
                 data, addr = self.sock.recvfrom(65536)
             except (socket.timeout, ConnectionResetError):
@@ -489,6 +527,9 @@ class Hub:
             if data is not None:
                 with self.lock:
                     self.handle(data, addr, now)
+            if self._outbox:
+                with self.lock:
+                    self.flush()
             if now - last_check >= 0.5:
                 with self.lock:
                     self.expire(now)
@@ -515,19 +556,133 @@ def ping(hub: str = hp.DEFAULT_HUB, timeout: float = 0.3) -> str | None:
     return None
 
 
-def query(hub: str = hp.DEFAULT_HUB, timeout: float = 1.0) -> list[tuple[str, dict[str, str]]]:
+def _cut_line(text: str, limit: int) -> str:
+    """Una línea de `state` que no cabe en `limit` bytes: se recorta su texto de esquema (`text`; si no lo trae o no
+    basta, el valor más largo) y se marca `cortado=1`. Nunca se omite (RFC 0011 §9.1)."""
+    op, fields = hp.parse_line(text)
+    fields["cortado"] = "1"
+    while len(hp.line(op, **fields).encode()) > limit:
+        key = "text" if fields.get("text") else max((k for k in fields if k != "cortado"),
+                                                    key=lambda k: len(hp.quote(fields[k])), default=None)
+        if key is None or not fields[key]:
+            break   # (no pasa: sin valores, una línea mide unos pocos bytes)
+        value = fields[key]
+        low, high = 0, len(value)            # cuántos caracteres de `value` caben (búsqueda binaria)
+        while low < high:
+            mid = (low + high + 1) // 2
+            fields[key] = value[:mid]
+            if len(hp.line(op, **fields).encode()) <= limit:
+                low = mid
+            else:
+                high = mid - 1
+        fields[key] = value[:low]
+    return hp.line(op, **fields)
+
+
+def split_state(text: str, n: int, part_bytes: int = PART_BYTES) -> list[bytes]:
+    """La respuesta a `query` que no cabe en un datagrama, en partes de como mucho `part_bytes` sin partir ninguna
+    línea (RFC 0011 §9.1). Cada parte empieza con `agmen-hub/1 parte i=<k> de=<m> n=<n>`."""
+    head_max = len(hp.line("parte", i=10 ** 6, de=10 ** 6, n=n)) + 1   # la primera línea, con números de sobra
+    room = part_bytes - head_max
+    chunks: list[list[str]] = [[]]
+    size = 0
+    for ln in text.split("\n"):
+        if len(ln.encode()) + 1 > room:
+            ln = _cut_line(ln, room - 1)
+        cost = len(ln.encode()) + 1
+        if chunks[-1] and size + cost > room:
+            chunks.append([])
+            size = 0
+        chunks[-1].append(ln)
+        size += cost
+    m = len(chunks)
+    return ["\n".join([hp.line("parte", i=k, de=m, n=n)] + lines).encode() for k, lines in enumerate(chunks, 1)]
+
+
+class Respuesta(list):
+    """La lista del hub (como siempre: [(op, campos), …]). `incompleta`: None, o (k, m) si de una respuesta en
+    partes solo llegaron k de m."""
+    incompleta: tuple[int, int] | None = None
+
+
+_PART_B = (hp.PREFIX + " parte ").encode()
+
+
+def _join(group: dict[int, bytes]) -> Respuesta:
+    """Las partes que llegaron, en orden, ya leídas (una inválida no tumba a las demás)."""
+    out = Respuesta()
+    for k in sorted(group):
+        try:
+            out.extend(hp.parse(group[k]))
+        except hp.ProtocolError:
+            pass   # (no pasa con un hub de Agmen; si pasa, la lista se ve con menos líneas)
+    return out
+
+
+_told_incomplete: set[str] = set()   # hubs de los que ya se dijo que su lista llegó incompleta (hasta que llegue entera)
+
+
+def _say_incomplete(hub: str, text: str) -> None:
+    if hub not in _told_incomplete:
+        _told_incomplete.add(hub)
+        print(f"⚠ {text}", file=sys.stderr, flush=True)
+
+
+def query(hub: str = hp.DEFAULT_HUB, timeout: float = 1.0, say=_say_incomplete) -> Respuesta:
+    """La lista del hub en `hub`. Si viene en partes (RFC 0011 §9.1) las junta, con `timeout` como tope total; si al
+    vencer faltan partes, devuelve lo que llegó (`incompleta` = (k, m)) y lo dice con `say(hub, texto)` (por omisión,
+    una vez por hub en stderr; `say=None`: no lo dice, lo trata quien llama). ConnectionError si no contesta."""
     host, port = hub.rsplit(":", 1)
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(timeout)
     try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, QUERY_RCVBUF)
+    except OSError:
+        pass   # (lo que el sistema dé: con uno chico se pueden perder partes, y se dice)
+    end = time.monotonic() + timeout
+    got: dict[tuple[int, int], dict[int, bytes]] = {}   # (n, m) → {k: las líneas de la parte k, sin leer}
+    try:
+        s.settimeout(timeout)
         s.sendto(hp.encode("query"), (host, int(port)))
-        data, _ = s.recvfrom(65536)
-        return hp.parse(data)
-    except (socket.timeout, ConnectionResetError):
-        raise ConnectionError(f"no hay un agmen hub en {hub}: corre tu robot con 'agmen run' o abre "
-                              f"'agmen hub' en otra terminal") from None
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                break
+            s.settimeout(left)
+            try:
+                data, _ = s.recvfrom(65536)
+            except (socket.timeout, ConnectionResetError):
+                break
+            if not data.startswith(_PART_B):
+                if not got:
+                    _told_incomplete.discard(hub)
+                    return Respuesta(hp.parse(data))   # cabe en un datagrama: como siempre (inválido: ProtocolError)
+                continue
+            # Solo la primera línea ahora (para leer rápido y que no se llene el búfer); el resto, al final.
+            head, _, body = data.partition(b"\n")
+            try:
+                f = hp.parse(head)[0][1]
+                k, m, n = int(f["i"]), int(f["de"]), int(f["n"])
+            except (hp.ProtocolError, IndexError, KeyError, ValueError):
+                continue
+            if not 1 <= k <= m:
+                continue
+            group = got.setdefault((n, m), {})
+            group.setdefault(k, body)   # una parte repetida no cuenta dos veces
+            if len(group) == m:
+                _told_incomplete.discard(hub)
+                return _join(group)
     finally:
         s.close()
+    if not got:
+        raise ConnectionError(f"no hay un agmen hub en {hub}: corre tu robot con 'agmen run' o abre "
+                              f"'agmen hub' en otra terminal")
+    (_n, m), group = max(got.items(), key=lambda kv: len(kv[1]))
+    out = _join(group)
+    out.incompleta = (len(group), m)
+    if say is not None:
+        say(hub, f"la lista del hub llegó incompleta ({len(group)} de {m} partes): muestro lo que llegó. Vuelve a "
+                 f"intentarlo; si se repite, se están perdiendo datagramas en esta computadora")
+    return out
 
 
 def parse_expected(expect: list[str], require: list[str]) -> list[Expected]:

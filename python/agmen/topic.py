@@ -67,7 +67,8 @@ def cmd_info(args) -> int:
         return 1
     print(f"topic:   {t['name']}")
     print(f"tipo:    {t['type'] or '?'}  (schema_id {t['schema'] or '?'})")
-    print(f"esquema: {t['text'] or '(todavía no se anuncia)'}")
+    cut = " … (recortado: es muy largo para la lista del hub)" if t.get("cortado") == "1" else ""
+    print(f"esquema: {t['text'] or '(todavía no se anuncia)'}{cut}")
     if t["expected"] != "no":
         print(f"robot.toml: declarado{' y obligatorio' if t['expected'] == 'required' else ''}")
     for kind, title in (("pub", "emisores"), ("sub", "receptores")):
