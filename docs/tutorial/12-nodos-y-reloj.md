@@ -413,6 +413,10 @@ Puedes llamar a `close()` desde otro hilo, aunque haya hilos dentro de
 
 - Cuando regresa `close()` de un `Subscriber`, su puerto ya está libre. Puedes
   abrir otro `Subscriber` en ese mismo puerto.
+- Si un hilo se quedó atorado dentro de `receive()` y no sale a tiempo,
+  `close()` no espera para siempre: regresa y avisa una vez por stderr
+  ("`close()` del Subscriber regresó sin liberar el puerto…"). El puerto se
+  libera cuando ese hilo salga.
 - Cerrar dos veces, o desde dos hilos a la vez, no hace daño.
 
 💡 Esto es distinto de salir del programa (sección 8). Al salir, `receive()`

@@ -20,7 +20,8 @@ Los objetos de Agmen en Python se pueden usar desde varios hilos a la vez
   mensaje lo recibe un solo hilo.
 - **`close()` desde otro hilo**: regresa en menos de 1 s aunque haya hilos
   dentro de `receive()` o `publish()`. Esos hilos reciben `RuntimeError` con
-  "ya se cerró". Al regresar, el puerto de un `Subscriber` ya está libre.
+  "ya se cerró". Al regresar, el puerto de un `Subscriber` ya está libre; si
+  un hilo atorado no lo deja libre a tiempo, `close()` lo avisa por stderr.
 - **Pruebas**: `python/test_hilos.py` (batería de estrés por objeto, con los
   dos núcleos) y `tests/test_hilos.cpp` (ctest `hilos`).
 - **ThreadSanitizer**: opción de CMake `AGMEN_TSAN` y un trabajo nuevo en el
