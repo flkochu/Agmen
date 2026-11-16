@@ -39,6 +39,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
+from . import relojes
 from ._version import __version__
 from .run import Node
 
@@ -1473,6 +1474,9 @@ class _Session:
         self.say = server.say
         self.launcher = None
         self.plan: _Plan | None = None
+        # Bloque 5 (RFC 0011 §3.6): la diferencia de reloj de la laptop que ella misma pasa en cada ping.
+        self._reloj = relojes.Remoto()
+        self._hora: Callable[[], int] = relojes.hora_ns   # (las pruebas la cambian)
         self.id = secrets.token_hex(16)      # para reanudar: va en sesion_ok
         self.last_rx = time.monotonic()      # lo último que llegó de la laptop (la gracia cuenta desde aquí)
         self.lost_at: float | None = None    # en gracia desde (None: con conexión)
@@ -1696,6 +1700,7 @@ class _Session:
 
         Invariante (§9): el temporizador que vence la gracia se arma y arranca ANTES de avisar o
         cerrar nada; si no se puede arrancar, la sesión termina (ante la duda, nodos detenidos)."""
+        self._reloj.perdida()   # bloque 5: sin conexión, el reloj de la laptop queda «sin medir»
         failed: BaseException | None = None
         again = False
         with self._end_lock:
@@ -2078,7 +2083,7 @@ class _Session:
         try:
             bridge = Bridge(hub_address(), self.launcher.say, owned=owned,
                             session="reproducción" if self._first.get("reloj") == "replay" else "simulación")
-            peer = bridge.add_peer(self._first["desde"], lambda part: self.send(part))
+            peer = bridge.add_peer(self._first["desde"], lambda part: self.send(part), reloj=self._reloj.estado)
             bridge.start()
         except Exception as e:   # nunca en silencio; la sesión sigue sin puente
             self.launcher.say(f"⚠ no pude arrancar el puente de topics con la laptop ({_clean(repr(e), 200)}): los "
@@ -2169,6 +2174,18 @@ class _Session:
             if self._order(msg):
                 return
 
+    def _clock_ping(self, msg: dict) -> None:
+        """Bloque 5: la medición que trae el ping de la laptop (para el hub de aquí) y las líneas de la terminal."""
+        eventos = self._reloj.ping(msg.get("reloj"), "reloj" in msg)
+        if not eventos:
+            return
+        desde = self._first.get("desde")
+        laptop = f"la laptop ({_clean(desde, 40)})" if isinstance(desde, str) and desde else f"la laptop ({self.ip})"
+        modo = self._first.get("reloj")
+        for text, kind in relojes.textos_agente(eventos, laptop, self._reloj.estado(),
+                                                modo if isinstance(modo, str) else "real"):
+            self.say(text, kind)
+
     def _order(self, msg: dict) -> bool:
         """Atiende una orden. Devuelve True si la sesión terminó."""
         op = msg["op"]
@@ -2177,9 +2194,14 @@ class _Session:
                         f"nada: '{_clean(op, 40)}' no se hizo")
             return False
         if op == "ping":
+            rx = self._hora()
             t = msg.get("t")
             ok = (isinstance(t, (int, float)) and not isinstance(t, bool)) or (isinstance(t, str) and len(t) <= PONG_T_MAX)
-            self.send({"op": "pong", "t": t if ok else None})
+            pong = {"op": "pong", "t": t if ok else None}
+            if "reloj" in msg:   # bloque 5: solo si la laptop lo sabe (una anterior recibe el pong de siempre)
+                pong["reloj"] = {"rx": rx, "tx": self._hora()}
+            self.send(pong)
+            self._clock_ping(msg)
         elif op == "adios":
             if self._awaiting:   # 4c §5.5
                 self.end(f"la laptop ({self.ip}) se despidió tras la prueba de red: no preparé nada")
@@ -2695,6 +2717,11 @@ class AgentLink:
         self._probe_n = 0                   # §5.4: el `id` de la última prueba (cada una, el siguiente)
         # §5.1: la sesión que el agente dejó esperando la prueba de red (sonda_espera), hasta proceed(); None: ninguna.
         self._waiting: _Espera | None = None
+        # Bloque 5 (RFC 0011 §3.6): la diferencia entre el reloj del robot y el de aquí (las cuatro marcas viajan en
+        # ping/pong); el vigía de los avisos (watch_clock, agmen run) y el sistema del robot (de la prueba de red).
+        self._reloj = relojes.Medidor()
+        self._vigia: relojes.Vigia | None = None
+        self.so_alla = ""
 
     @property
     def on_lost(self) -> Callable[[AgentLink, str], None] | None:
@@ -2947,6 +2974,7 @@ class AgentLink:
                     return msg, contact
                 silent_until = time.monotonic() + SILENCE_TIMEOUT
                 if op == "pong":
+                    self._clock_pong(msg, channel)
                     contact = self._confirmed(msg, contact)
                 elif op != "estado":   # antes de sesion_ok no debería llegar ninguno: se ignora
                     self._dispatch(msg, channel)   # (sonda_ok/sonda_fin: a la prueba de ESTA conexión, si hay)
@@ -3012,12 +3040,44 @@ class AgentLink:
             now = False
             counts = channel is self.channel   # §14: se decide ANTES de mandarlo (el robot pudo oírlo igual)
             try:
-                channel.send({"op": "ping", "t": time.monotonic()})
+                channel.send(self._ping_msg(channel, time.monotonic()))
             except AgentError:
                 return   # el lector se entera
             finally:
                 if counts:
                     self.last_tx = time.monotonic()
+
+    # --- los relojes (bloque 5) ---
+    def _ping_msg(self, channel: Channel, t: float) -> dict:
+        """El ping de siempre; con "reloj" (la mejor medición vigente, o {} sin ninguna) salvo que el agente de esta
+        conexión ya mostró que es anterior (entonces, los bytes de siempre). Anota t1 justo antes de mandarlo."""
+        msg: dict = {"op": "ping", "t": t}
+        reloj = self._reloj.ping(channel, t)
+        if reloj is not None:
+            msg["reloj"] = reloj
+        return msg
+
+    def _clock_pong(self, msg: dict, channel: Channel) -> None:
+        """Un pong: mide (t4 = ahora) y, en agmen run, revisa si hay que avisar. Nunca tumba la conexión."""
+        for ev in self._reloj.pong(channel, msg):
+            if ev == "anterior":
+                self._notice(relojes.aviso_anterior(self.name))
+            else:
+                self._notice(relojes.aviso_mal_formado(self.name), "error")
+        vigia = self._vigia
+        if vigia is not None:
+            for text in vigia.revisar(self.clock_state()):
+                self._notice(text, "error" if text.startswith("⚠") else "agmen")
+
+    def watch_clock(self, mode: str) -> None:
+        """agmen run: los avisos del reloj de esta computadora (solo hablan en una sesión `real`; C3)."""
+        self._vigia = relojes.Vigia(self.name, mode, so=lambda: self.so_alla)
+
+    def clock_state(self) -> relojes.Estado:
+        """La diferencia entre el reloj de esta computadora y el de aquí; «sin medir» mientras no hay conexión."""
+        with self._lock:
+            up = self.channel is not None and self.down_since is None and not self.lost and not self._closing
+        return self._reloj.estado(conectado=up)
 
     def safe_end(self) -> float:
         """Cuándo el robot ya habrá detenido sus nodos si no volvió a oír a la laptop (§13.2, §14): lo último
@@ -3126,6 +3186,8 @@ class AgentLink:
         elif op == "error":
             self._say(msg.get("texto", ""), "error")   # (no toca a la prueba de red: su error va en sonda_fin)
         elif op == "pong":   # el último contacto confirmado (§9): el t es el monotonic de un ping de aquí
+            if channel is not None:
+                self._clock_pong(msg, channel)
             if self.down_since is None:
                 self.last_ok = self._confirmed(msg, self.last_ok)
         elif op == "tablas":   # la tabla del hub del robot (4b): solo si los dos lo dijeron
@@ -3343,6 +3405,7 @@ class AgentLink:
                     return res
                 so = ok.get("so")
                 res.so_alla = so if so in sonda.SISTEMAS else ""   # uno que no conozco: el consejo general
+                self.so_alla = res.so_alla   # bloque 5: el consejo del reloj, el de su sistema primero
                 lado.send(robot_ip, udp, tcp, dato)
                 lado.wait(min(deadline, time.monotonic() + sonda.SONDA_S),
                           lambda: lost_why() is not None or prueba.error is not None)
@@ -3721,6 +3784,7 @@ class AgentLink:
             if msg["op"] in ("reanudar_ok", "sesion_error"):
                 return msg, contact
             if msg["op"] == "pong":
+                self._clock_pong(msg, channel)
                 contact = self._confirmed(msg, contact)
             until = time.monotonic() + SILENCE_TIMEOUT   # (pong de nada: no debería haber otra cosa)
         return None, contact
@@ -3733,7 +3797,7 @@ class AgentLink:
         t = time.monotonic()
         self.last_tx = t
         try:
-            channel.send({"op": "ping", "t": t})
+            channel.send(self._ping_msg(channel, t))
         finally:
             self.last_tx = time.monotonic()
         early: list[dict] = []
@@ -3746,6 +3810,8 @@ class AgentLink:
                 msg = channel.recv(min(STOP_POLL, left))
             except ChannelTimeout:
                 continue
+            if msg["op"] == "pong":
+                self._clock_pong(msg, channel)
             if msg["op"] == "pong" and msg.get("t") == t:
                 return early, t
             if msg["op"] == "adios":   # §15: lo cerraron allá a media reanudación: vale la §10

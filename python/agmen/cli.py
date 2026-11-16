@@ -528,7 +528,7 @@ def _bridge_for(launcher, remotes: dict):
                      f"cruzan entre computadoras", "error")
         return None
     for name, link in remotes.items():
-        link.bridge(bridge.add_peer(name, link.send_table))
+        link.bridge(bridge.add_peer(name, link.send_table, reloj=link.clock_state))   # (bloque 5: y su reloj)
     return bridge
 
 
@@ -564,6 +564,7 @@ def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list
 
             launcher.say(f"conectando con {name} ({link.shown})…")
             link.on_lost = on_lost   # ANTES de open(): una pérdida justo después de abrir no se olvida
+            link.watch_clock(clock)  # bloque 5: los avisos del reloj (solo en una sesión real)
             try:
                 link.open(key, session_message(config, name, clock, desde, sonda=net_check), on_key_ok=keep,
                           stop=stop)

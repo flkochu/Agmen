@@ -27,6 +27,7 @@ import test_agent as TA     # (como módulo: sus clases de prueba no se vuelven 
 import test_red as TR
 from agmen import agent as A
 from agmen import hubproto as hp
+from agmen import relojes
 from agmen import play, pubsub, wire
 from agmen import tables as T
 
@@ -679,7 +680,8 @@ class TestConfirmarYPerderNoSeCruzan(Base):
                           deadline=now + 10, out=mock.Mock(), ip="::ffff:127.0.0.3", _replaced=None,
                           say=lambda *a, **k: None, server=SimpleNamespace(lock=threading.Lock(), trusted=None),
                           ready=threading.Event(), last_rx=now, peer=None, bridge=None,
-                          _first={"desde": "laptop"}, launcher=SimpleNamespace(say=lambda *a, **k: None))
+                          _first={"desde": "laptop"}, launcher=SimpleNamespace(say=lambda *a, **k: None),
+                          _reloj=relojes.Remoto())
         s.ready.set()
         s._arm = lambda deadline: None                          # (sin temporizador de verdad)
         return s, ch

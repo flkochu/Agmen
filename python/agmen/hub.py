@@ -25,6 +25,7 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from . import hubproto as hp
+from . import relojes
 from ._version import __version__
 
 
@@ -129,6 +130,9 @@ class Hub:
         self._peer_ips: dict[str, str] = {}   # nombre → IP (los mismos peers, para buscar rápido)
         self._ok_peers = b""                   # b" peers=ip,ip": lo que se añade a cada `ok` en modo red
         self.net_seen = 0.0       # cuándo llegó el último `red`
+        # Bloque 5 (RFC 0011 §3.6): la diferencia de reloj de cada computadora de peers, como la pasó el puente en
+        # `relojes` del último `red`: nombre → (relojes.Estado, cuándo llegó). Caduca a los RELOJ_VIGENTE_S.
+        self.relojes: dict[str, tuple[relojes.Estado, float]] = {}
         self._query_n = 0         # cuántas respuestas a `query` salieron en partes (`n` de cada una)
         self._outbox: deque[tuple[bytes, tuple[str, int]]] = deque()   # partes por salir (en tandas, ver flush)
         self._outbox_bytes = 0
@@ -180,8 +184,35 @@ class Hub:
                                       or (e.kind == "sub" and e.addr[0] != self._peer_ip(e.machine)))]
             self._drop(gone, "ya no está en peers")
 
+    def _set_relojes(self, texto: str | None, now: float) -> None:
+        """El campo `relojes` de `red` (bloque 5): lo que trae reemplaza lo anterior (un `red` sin él: el puente no
+        lo sabe, "sin dato"). Uno mal escrito no tumba el `red` (los peers ya se aceptaron): se ignora y se dice."""
+        if not self.peers or texto is None:
+            self.relojes = {}
+            return
+        try:
+            leidos = relojes.leer_red(texto)
+        except ValueError as e:
+            self.relojes = {}
+            self._warn_once(("relojes", str(e)[:80]), f"el puente mandó la diferencia de relojes mal escrita ({e}): "
+                                                       f"la ignoro (queda «sin medir»). ¿Otra versión de Agmen?")
+            return
+        self.relojes = {n: (e, now) for n, e in leidos.items() if n in self._peer_ips}
+
+    def _reloj_de(self, name: str, now: float) -> relojes.Estado:
+        """La diferencia de `name` ahora: la que pasó el puente, con su edad al día; vieja (C6) si ya caducó."""
+        got = self.relojes.get(name)
+        if got is None:
+            return relojes.Estado(False, motivo="sin_dato")
+        e, at = got
+        edad = None if e.edad_s is None else e.edad_s + max(0.0, now - at)
+        if e.medido and edad is not None and edad > relojes.RELOJ_VIGENTE_S:
+            return relojes.Estado(False, edad_s=edad, motivo="vieja")
+        return relojes.Estado(e.medido, e.dif_ns, e.err_ns, edad, e.motivo)
+
     def _leave_net(self, why: str) -> None:
         self.peers, self._peer_ips, self._ok_peers = [], {}, b""
+        self.relojes = {}
         self.log(f"■ modo red apagado ({why}): vuelvo a modo local; nada de otra computadora entra ni sale")
         for e in self.endpoints.values():
             e.local_since = None
@@ -337,6 +368,7 @@ class Hub:
             # Una 127.x como otra computadora solo en pruebas, con AGMEN_NET_IP (RFC 0011 §9.6).
             peers = hp.parse_peers(f["peers"], loopback=self.net_ip is not None)
             self._set_red(peers, now)
+            self._set_relojes(f.get("relojes"), now)
             self._send(hp.encode("red_ok", peers=len(peers)), addr)
         elif op == "query":
             # §10.3: los topes se miran ANTES de armar la lista (armarla cuesta), con lo que midió la anterior, y
@@ -566,6 +598,12 @@ class Hub:
                                  age=f"{now - e.last_seen:.1f}", **self._ep_extra(e)))
         for _key, (f, _seen) in sorted(self.stats.items()):
             lines.append(hp.line("stat", **f))
+        for name, ip in self.peers:   # bloque 5: sin modo red no hay ninguna (los bytes de siempre)
+            r = self._reloj_de(name, now)
+            extra = {"reloj": r.dif_ns, "err": r.err_ns} if r.medido else {"sin": r.motivo}
+            if r.edad_s is not None:
+                extra["edad"] = f"{r.edad_s:.1f}"
+            lines.append(hp.line("maq", name=name, ip=ip, **extra))
         return "\n".join(lines)
 
     # --- ciclo ---

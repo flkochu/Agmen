@@ -299,11 +299,14 @@ class Peer:
     """La otra computadora de UNA conexión del agente: su nombre, la IP con la que este lado la ve (la pone
     el que recibe), si la conexión está confirmada, la última tabla completa que mandó y lo que de ella
     está registrado en el hub. `send(obj)` manda un mensaje por la conexión (desde el hilo de este Peer:
-    si la otra punta no lee, no frena al puente)."""
+    si la otra punta no lee, no frena al puente). `reloj()` (bloque 5; None: no se sabe): la diferencia de reloj
+    de esa computadora (un relojes.Estado), que el puente pasa al hub en `red`."""
 
-    def __init__(self, bridge: Bridge, name: str, send: Callable[[dict], None]) -> None:
+    def __init__(self, bridge: Bridge, name: str, send: Callable[[dict], None],
+                 reloj: Callable[[], object] | None = None) -> None:
         self.bridge = bridge
         self.name = name
+        self.reloj = reloj
         self.ip: str | None = None
         self.confirmed = False
         self.table: tuple[list[dict], list[dict]] | None = None   # (pubs, subs) del otro, validados
@@ -555,8 +558,8 @@ class Bridge:
         except Exception:
             pass
 
-    def add_peer(self, name: str, send: Callable[[dict], None]) -> Peer:
-        peer = Peer(self, name, send)
+    def add_peer(self, name: str, send: Callable[[dict], None], reloj: Callable[[], object] | None = None) -> Peer:
+        peer = Peer(self, name, send, reloj)
         with self.lock:
             self.peers.append(peer)
         return peer
@@ -613,7 +616,7 @@ class Bridge:
         active = sorted((p.name, p.ip) for p in peers)
         if active:
             if active != self._red or now - self._red_at >= hp.NET_BEAT_S:
-                lines.append(hp.encode("red", peers=hp.format_peers(active)))
+                lines.append(hp.encode("red", peers=hp.format_peers(active), **self._relojes(peers)))
                 self._red, self._red_at = active, now
         else:
             self._red = None   # deja de repetir `red`: el hub vuelve a modo local en NET_EXPIRE_S
@@ -631,6 +634,21 @@ class Bridge:
         self._drain()
         if self.robots:
             self._robots(peers)
+
+    def _relojes(self, peers: list[Peer]) -> dict[str, str]:
+        """Bloque 5: el campo `relojes` de `red` (vacío si ningún Peer sabe su reloj: el `red` de siempre)."""
+        from . import relojes
+
+        known = []
+        for p in sorted(peers, key=lambda p: p.name):
+            if p.reloj is None:
+                continue
+            try:
+                known.append((p.name, p.reloj()))
+            except Exception as e:   # nunca en silencio; el `red` sale igual (esa computadora, sin medir)
+                self.say_once(("reloj", p.name), f"⚠ no pude leer la diferencia de reloj de {p.name} "
+                                                 f"({repr(e)[:200]}): queda «sin medir»", "error")
+        return {"relojes": relojes.formato_red(known)} if known else {}
 
     def _send(self, data: bytes) -> None:
         if len(data) > HUB_LINE_MAX:   # (no debería pasar: hub_lines no las arma) nunca en silencio
