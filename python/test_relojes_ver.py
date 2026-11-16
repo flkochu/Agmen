@@ -4,7 +4,7 @@
     python -m unittest discover -s python -p "test_relojes_ver.py"
 
 Sin otras computadoras todo sale igual que antes (node list byte a byte, /api/state sin claves nuevas, grabaciones
-sin `relojes`). Nada depende de la hora real de la máquina: las diferencias vienen de líneas `maq` fijas o de un
+sin `agmen.relojes`). Nada depende de la hora real de la máquina: las diferencias vienen de líneas `maq` fijas o de un
 `red` mandado a mano a un hub de verdad. Esperas con tope."""
 
 from __future__ import annotations
@@ -366,29 +366,32 @@ class TestGrabacion(TREC.HubCase):
         self.assertEqual([n for n, _ in meta], ["agmen.grabacion", "agmen.perdidos"])   # como siempre
         self.assertNotIn("relojes", meta[0][1])
         self.assertNotIn("reloj de", TREC.TestPerfilEnLaGrabacion.info(self, path))
+        from agmen.recording import Recording
+        self.assertEqual(Recording(path).clocks, {})
+        self.assertEqual(record.describe(path)["clocks"], {})
 
     def test_con_relojes(self):
         self.red("robot:2100000:600000:500,pi:-:anterior:-")
         path = self.grabar("b.mcap", entre=lambda: self.red("robot:3500000:400000:500,pi:-:anterior:-"))
         meta = self.metadatos(path)
-        self.assertEqual([n for n, _ in meta], ["agmen.grabacion", "agmen.grabacion", "agmen.perdidos"])
-        primero, ultimo = meta[0][1], meta[1][1]
-        self.assertNotIn("relojes", primero)
-        self.assertEqual({k: v for k, v in ultimo.items() if k != "relojes"}, primero)   # lo demás, igual
-        d = json.loads(ultimo["relojes"])
-        self.assertEqual(set(d), {"robot"})                     # "pi" sin medir no es una muestra
-        r = d["robot"]
+        # agmen.grabacion, una vez y sin `relojes` (como antes del bloque 5); el resumen va en agmen.relojes.
+        self.assertEqual([n for n, _ in meta], ["agmen.grabacion", "agmen.relojes", "agmen.perdidos"])
+        grabacion, rel = meta[0][1], meta[1][1]
+        self.assertNotIn("relojes", grabacion)
+        self.assertEqual(set(rel), {"robot"})                   # una clave por computadora; "pi" sin medir no cuenta
+        r = json.loads(rel["robot"])
+        self.assertEqual(set(r), {"inicio_ns", "fin_ns", "min_ns", "max_ns", "error_ns", "muestras"})
         self.assertEqual((r["inicio_ns"], r["fin_ns"], r["min_ns"], r["max_ns"], r["error_ns"]),
                          (2_100_000, 3_500_000, 2_100_000, 3_500_000, 600_000))
         self.assertGreaterEqual(r["muestras"], 2)
-        self.assertEqual(json.loads(record.describe(path)["recording"]["relojes"]), d)
+        self.assertEqual(record.describe(path)["clocks"], rel)
         info = TREC.TestPerfilEnLaGrabacion.info(self, path)
         self.assertIn("  reloj de robot: +2.1 ms al empezar, +3.5 ms al terminar (mín +2.1 ms, máx +3.5 ms, "
                       "±0.6 ms, ", info)
-        # 8.6: qué registro agmen.grabacion lee cada lector de Python: el ÚLTIMO (el que trae `relojes`).
         from agmen.recording import Recording
-        self.assertEqual(record.describe(path)["recording"], ultimo)
-        self.assertEqual(Recording(path).info, ultimo)
+        self.assertEqual(record.describe(path)["recording"], grabacion)
+        self.assertEqual(Recording(path).info, grabacion)
+        self.assertEqual(Recording(path).clocks, {"robot": r})
 
     def test_split_consulta_el_hub_al_cerrar_cada_archivo(self):
         """8.6: en un corte (split) se consulta el hub al cerrar ese archivo: su `fin_ns` es el de ese momento."""
@@ -404,7 +407,7 @@ class TestGrabacion(TREC.HubCase):
         rec.split_seconds = 3600
         rec.stop()
         primero = rec.summary.files[0]
-        rel = json.loads(record.describe(primero)["recording"]["relojes"])["robot"]
+        rel = json.loads(record.describe(primero)["clocks"]["robot"])
         self.assertEqual(rel["fin_ns"], 4_200_000)
 
     def test_grabacion_de_antes_se_lee_igual(self):
@@ -416,6 +419,18 @@ class TestGrabacion(TREC.HubCase):
         self.assertEqual(record.describe(path)["recording"], {"version": "0.15.0", "computadora": "pc",
                                                              "reloj": "real"})
         self.assertNotIn("reloj de", TREC.TestPerfilEnLaGrabacion.info(self, path))
+        self.assertEqual(record.describe(path)["clocks"], {})
+
+    def test_relojes_mal_escritos_se_dicen(self):
+        path = os.path.join(self.dir, "mala.mcap")
+        w = _mcap.Writer(path, profile=record.PROFILE, library="agmen")
+        w.add_metadata("agmen.grabacion", {"version": "0", "computadora": "pc", "reloj": "real"})
+        w.add_metadata("agmen.relojes", {"robot": "{no es json"})
+        w.close()
+        self.assertIn("⚠ la diferencia de relojes de robot no se puede leer", TREC.TestPerfilEnLaGrabacion.info(self, path))
+        from agmen.recording import Recording
+        with self.assertRaisesRegex(ValueError, "agmen.relojes, computadora robot"):
+            Recording(path).clocks
 
 
 class TestTextosGrabacion(unittest.TestCase):
@@ -423,18 +438,26 @@ class TestTextosGrabacion(unittest.TestCase):
         r = R.Resumen()
         for dif in (1 * MS, 30 * MS, 2 * MS):
             r.poner({"robot": R.Estado(True, dif, 500_000, 0.1)})
-        lineas = R.lineas_grabacion(r.texto())
+        lineas = R.lineas_grabacion(r.metadatos())
         self.assertEqual(lineas[0], "reloj de robot: +1.0 ms al empezar, +2.0 ms al terminar (mín +1.0 ms, "
                                     "máx +30.0 ms, ±0.5 ms, 3 muestras)")
         self.assertIn("⚠ cambió 29.0 ms durante la grabación", lineas[1])
 
     def test_vacio_y_mal_escrito(self):
-        self.assertEqual(R.Resumen().texto(), "")
+        self.assertEqual(R.Resumen().metadatos(), {})
         self.assertEqual(R.Resumen().por, {})
-        (linea,) = R.lineas_grabacion("{no es json")
+        self.assertEqual(R.lineas_grabacion({}), [])
+        (linea,) = R.lineas_grabacion({"robot": "{no es json"})
+        self.assertIn("de robot no se puede leer", linea)
+        (linea,) = R.lineas_grabacion({"robot": '{"inicio_ns": 1}'})
         self.assertIn("no se puede leer", linea)
-        (linea,) = R.lineas_grabacion('{"robot": {"inicio_ns": 1}}')
-        self.assertIn("no se puede leer", linea)
+        # Una mal escrita no tapa a las demás.
+        bien = R.Resumen()
+        bien.poner({"pi": R.Estado(True, 1 * MS, 500_000, 0.1)})
+        lineas = R.lineas_grabacion({**bien.metadatos(), "robot": "[]"})
+        self.assertEqual(len(lineas), 2)
+        self.assertTrue(lineas[0].startswith("reloj de pi: +1.0 ms"))
+        self.assertIn("de robot no se puede leer", lineas[1])
 
 
 if __name__ == "__main__":

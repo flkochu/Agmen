@@ -570,9 +570,9 @@ def info_panel(nombre: str, e: Estado, modo: str, mal_antes: bool, so: str = "")
 
 
 class Resumen:
-    """Lo que `agmen record` guarda de cada computadora en `relojes` de agmen.grabacion (§4.4, C5): la diferencia
-    al empezar y al terminar, la mínima, la máxima, la mayor incertidumbre y cuántas muestras. Solo cuentan las
-    mediciones vigentes ("sin medir" no es una muestra).
+    """Lo que `agmen record` guarda de cada computadora en el registro de metadatos `agmen.relojes` (§4.4, C5): la
+    diferencia al empezar y al terminar, la mínima, la máxima, la mayor incertidumbre y cuántas muestras. Solo
+    cuentan las mediciones vigentes ("sin medir" no es una muestra).
 
     Riesgo aceptado: un salto brusco de un reloj a media grabación no se reconstruye (se consulta cada ~10 s); la
     mínima y la máxima solo lo delatan."""
@@ -594,30 +594,39 @@ class Resumen:
             r["error_ns"] = max(r["error_ns"], e.err_ns)
             r["muestras"] += 1
 
-    def texto(self) -> str:
-        """El valor de la clave `relojes` (los metadatos MCAP son texto: JSON compacto). "" = no hay nada."""
-        if not self.por:
-            return ""
-        return json.dumps(self.por, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    def metadatos(self) -> dict[str, str]:
+        """El contenido del registro `agmen.relojes` (los metadatos MCAP son texto→texto): una clave por
+        computadora y, de valor, su resumen en JSON compacto. {} = no hubo ninguna medición (no se escribe)."""
+        return {nombre: json.dumps(r, sort_keys=True, separators=(",", ":"))
+                for nombre, r in sorted(self.por.items())}
 
 
-def lineas_grabacion(texto: str) -> list[str]:
-    """Cómo dice `agmen record info` la clave `relojes` (vacía: ninguna línea). Una mal escrita se dice, no truena."""
+def leer_resumen(texto: str) -> dict[str, int]:
+    """El resumen de UNA computadora, tal como va en `agmen.relojes` (JSON). Mal escrito: ValueError que lo dice."""
     try:
-        d = json.loads(texto)
-        if not isinstance(d, dict):
+        r = json.loads(texto)
+        if not isinstance(r, dict):
             raise ValueError("no es un objeto")
-        out = []
-        for nombre in sorted(d):
-            r = d[nombre]
-            ini, fin, lo, hi = (int(r[k]) for k in ("inicio_ns", "fin_ns", "min_ns", "max_ns"))
-            err, n = int(r["error_ns"]), int(r["muestras"])
-            linea = (f"reloj de {nombre}: {fmt_dif(ini)} al empezar, {fmt_dif(fin)} al terminar (mín {fmt_dif(lo)}, "
-                     f"máx {fmt_dif(hi)}, ±{fmt_ms(err)}, {n} muestra{'s' if n != 1 else ''})")
-            out.append(linea)
-            if hi - lo > RELOJ_UMBRAL_NS:
-                out.append(f"  ⚠ cambió {fmt_ms(hi - lo)} durante la grabación (¿alguien ajustó un reloj?): las "
-                           f"latencias de ese rato no se pueden corregir con un solo número")
-        return out
-    except (ValueError, TypeError, KeyError, AttributeError) as e:
-        return [f"⚠ la diferencia de relojes guardada no se puede leer ({e}); lo demás de la grabación sí"]
+        return {k: int(r[k]) for k in ("inicio_ns", "fin_ns", "min_ns", "max_ns", "error_ns", "muestras")}
+    except (ValueError, TypeError, KeyError) as e:
+        raise ValueError(f"resumen de reloj mal escrito ({type(e).__name__}: {e})") from None
+
+
+def lineas_grabacion(meta: dict[str, str]) -> list[str]:
+    """Cómo dice `agmen info` el registro `agmen.relojes` (vacío: ninguna línea). Una computadora mal escrita se
+    dice en su línea, no truena: las demás y lo demás de la grabación se leen igual."""
+    out = []
+    for nombre in sorted(meta):
+        try:
+            r = leer_resumen(meta[nombre])
+        except ValueError as e:
+            out.append(f"⚠ la diferencia de relojes de {nombre} no se puede leer ({e}); lo demás de la grabación sí")
+            continue
+        ini, fin, lo, hi, err, n = (r[k] for k in ("inicio_ns", "fin_ns", "min_ns", "max_ns", "error_ns",
+                                                   "muestras"))
+        out.append(f"reloj de {nombre}: {fmt_dif(ini)} al empezar, {fmt_dif(fin)} al terminar (mín {fmt_dif(lo)}, "
+                   f"máx {fmt_dif(hi)}, ±{fmt_ms(err)}, {n} muestra{'s' if n != 1 else ''})")
+        if hi - lo > RELOJ_UMBRAL_NS:
+            out.append(f"  ⚠ cambió {fmt_ms(hi - lo)} durante la grabación (¿alguien ajustó un reloj?): las "
+                       f"latencias de ese rato no se pueden corregir con un solo número")
+    return out
