@@ -458,14 +458,105 @@ Si vuelves a correr `agmen agent`, la laptop reconecta y lo dice:
 `reconectado tras 6 s sin conexión, pero ya había detenido sus nodos. Arráncalos desde el panel (o reinicia agmen run)`.
 (Esa línea es de otra corrida de prueba; el texto es el que escribe el programa.)
 
-## 10. Lo que todavía no hace
+## 10. Los topics cruzan entre la laptop y la Pi
+
+Hasta aquí, cada computadora tenía su propio hub, y un topic se quedaba en la
+computadora donde se publicó. Ya no: **un topic cruza entre la laptop y cada robot**,
+y no tienes que configurar nada. Con el mismo `robot_dos.toml` de este capítulo, el
+`/imu` de la Pi llega a tu laptop.
+
+Esto necesita que las dos computadoras tengan esta versión de Agmen (ver la sección 11,
+sobre la misma versión), y que `[hub]` no esté apagado en ninguna.
+
+### Qué se ve
+
+Con `agmen run` en la laptop y `agmen agent` en la Pi corriendo (pasos 1 y 2), abre
+otra terminal en tu laptop y escribe:
+
+```
+agmen topic hz /imu
+```
+
+Verás algo así (los números cambian; lo que importa es que salgan líneas `promedio`):
+
+```
+# agmen topic hz /imu · cada 1 s · Ctrl+C para salir
+promedio   100.00 Hz   entre mensajes: min   9.90 ms  max  10.10 ms  desv  0.05 ms   (100 mensajes)   …
+```
+
+- `topic hz` corre **en tu laptop**. El `/imu` lo publica el nodo `imu`, que corre en la
+  Pi (en el panel, `robot/imu`).
+- Si ves `sin mensajes`, el topic no está llegando. Mira las secciones 8 y 9.
+- También va al revés: lo que publica un nodo de tu laptop llega a los nodos de la Pi
+  que lo escuchan.
+
+No hizo falta reiniciar ningún nodo. El cruce se arma solo, en un par de segundos
+después de que la laptop y la Pi se ven.
+
+### Cómo funciona, en corto
+
+Cada computadora le manda a la otra la lista de sus topics: los que publica, y los que
+escucha desde la red. La otra los anota en su hub como "de la otra computadora". Esto se
+repite cada segundo. Por eso, si un nodo nuevo arranca, aparece en la otra computadora
+en unos segundos, sin reiniciar nada.
+
+### Si se corta el WiFi
+
+- El `/imu` deja de llegar a la laptop en unos segundos. Las entradas de la Pi caducan
+  en 3 s, y `topic hz` dirá `sin mensajes`.
+- Si el WiFi vuelve **a tiempo** (antes de los 10 s de la sección 9), el `imu` nunca paró:
+  el topic vuelve solo, sin reiniciar nada.
+- Si vuelve **tarde**, el `imu` ya está detenido (ningún nodo arranca solo). Arráncalo
+  desde el panel, y el topic vuelve cuando arranca.
+- Lo que protege al robot, en esos segundos, sigue siendo el freno del motor.
+
+### La regla de la simulación
+
+Si la sesión es de **simulación** (`agmen run --sim`), o de **reproducción** (`agmen run
+--play`), la regla cambia del lado del robot: **en la Pi solo cruzan los nodos que
+arrancó el agente** (el `imu`, en `robot_dos.toml`).
+
+Un nodo que tú arrancas a mano en la Pi **no recibe ni manda** nada hacia tu laptop, y
+Agmen lo avisa, una vez por nodo, en la terminal de la Pi:
+
+```
+'<nodo>' (pid N) no lo arranqué yo y esta es una sesión de simulación: no lo conecto con <laptop> (ni recibe ni manda). Si es parte del robot, ponlo en robot.toml
+```
+
+¿Por qué? Así una simulación nunca mueve el robot de verdad. Si el nodo es parte del
+robot, decláralo en `robot.toml` con `machine = "robot"`, y entonces sí cruza. En una
+sesión **real** (sin `--sim`), cruza todo.
+
+### Con más de dos computadoras
+
+Este capítulo tiene una laptop y un robot. Con dos robots, por ahora **los topics
+cruzan solo entre la laptop y cada robot**: dos robots no se pasan topics entre sí. Si
+un topic se publica en un robot y se escucha en otro, `agmen run` lo avisa una vez:
+
+```
+'/imu' se publica en 'robot' y se escucha en 'otro': en esta versión dos robots no se pasan topics entre sí (solo cada uno con esta computadora). Pon uno de los dos nodos aquí
+```
+
+Pon el nodo en tu laptop, o en uno de los dos robots, para que el topic llegue.
+
+### Límites de los topics entre computadoras
+
+| Qué | Valor |
+|---|---|
+| Endpoints que cruzan desde una computadora | Hasta 1 000. Lo que sobre no pasa, y `agmen run` lo dice |
+| Nodo dentro de un contenedor, en simulación | Cuenta como ajeno: no cruza. Declara el número de proceso de dentro del contenedor |
+| Nodo cuyo proceso padre murió (huérfano), en simulación | Pasa a ser ajeno: no cruza |
+| Dos robots | No se pasan topics entre sí (ver arriba) |
+| Direcciones | Solo IPv4 en esta versión. Si no se ven por IPv4, no hay puente y el agente lo dice |
+| Firewall | **Todavía no lo comprobamos.** Si el firewall de la laptop o de la Pi bloquea el paso, los topics no llegan y Agmen todavía no lo dice. La comprobación llega en la parte 4c del RFC 0011 |
+
+## 11. Lo que todavía no hace
 
 Esto es honesto: el capítulo 18 cubre el robot con dos computadoras, pero no todo.
 
-- **Los topics no cruzan entre computadoras.** El `cerebro` de tu laptop **no
-  recibe** todavía el `/imu` de la Pi. Cada computadora tiene su propio hub. El
-  `robot_dos.toml` te enseña a arrancar y detener nodos en otra computadora; no
-  a que sus datos viajen. Eso es el bloque 4 del [RFC 0011](../rfc/0011-sim-real-y-varias-computadoras.md).
+- **No se ve en qué computadora está cada topic.** `agmen topic list` y el panel
+  todavía no muestran desde qué computadora publica cada uno. Llega en la parte 4c del
+  [RFC 0011](../rfc/0011-sim-real-y-varias-computadoras.md).
 - **No medimos la hora.** Si el reloj de la Pi está atrasado (no tiene pila),
   las dos computadoras no coinciden. Medir eso y avisarte llega en el bloque 5.
 - **Una laptop a la vez** con cada agente.
@@ -489,6 +580,10 @@ del motor deja de recibir órdenes, se detiene solo, como viste en el
 - Cuando el WiFi se cae, **la Pi no se reinicia de inmediato**: espera 10 s. La laptop
   reintenta sola, y si vuelve a tiempo, sigue igual. Si vuelve tarde, **ningún nodo arranca solo**.
 - Ctrl+C en la laptop, o en la Pi, dice la verdad sobre lo que pasó con los nodos.
+- Un topic **cruza** entre la laptop y la Pi sin configurar nada. `agmen topic hz /imu`,
+  en tu laptop, muestra el `/imu` de la Pi. En simulación (`--sim`), solo cruzan los
+  nodos que arrancó el agente.
 
-**Siguiente (nivel 10):** los topics entre computadoras (bloque 4 del RFC 0011) y
-medir la diferencia de reloj (bloque 5). Todavía no hay capítulo para eso.
+**Siguiente (nivel 10):** que se vea en qué computadora está cada topic, la comprobación
+del firewall (parte 4c del RFC 0011) y medir la diferencia de reloj (bloque 5). Todavía
+no hay capítulo para eso.

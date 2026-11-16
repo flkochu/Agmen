@@ -232,11 +232,12 @@ Los bytes exactos de este y otros ejemplos están en los vectores de prueba.
 
 > **Estado:** el modo local (lo de siempre) está implementado desde Agmen 0.5.0
 > ([RFC 0004](rfc/0004-topics-y-descubrimiento.md), §4.2). Lo marcado
-> **(desde 0.14.0)** es la base de los topics entre computadoras
-> ([RFC 0011](rfc/0011-sim-real-y-varias-computadoras.md), §3.5, parte 4a): el hub
-> y los dos núcleos (C++ y Python) ya lo entienden. **Todavía nadie enciende el
-> modo red.** `agmen run` y `agmen agent` aún no pasan las tablas de sus hubs (eso
-> es la parte 4b). Hasta entonces, un topic no cruza entre computadoras.
+> **(desde 0.14.0)** es el soporte de los topics entre computadoras
+> ([RFC 0011](rfc/0011-sim-real-y-varias-computadoras.md), §3.5, partes 4a y 4b): el
+> hub y los dos núcleos (C++ y Python) ya lo entienden, y `agmen run` y `agmen agent`
+> encienden el modo red y pasan las tablas de sus hubs por la conexión del agente
+> (ver [El puente de topics](#el-puente-de-topics-tablas-desde-0140)). Lo que falta
+> (la prueba del firewall y lo que se ve en herramientas y panel) es la parte 4c.
 
 Es el protocolo de control entre los nodos y su **hub** (`agmen hub`, o el que
 arranca `agmen run`). Los datos no pasan por aquí: el hub solo dice a quién
@@ -342,6 +343,12 @@ agmen-hub/1 pub id=r2 node=mando pid=8 topic=/cmd schema=00000000000000aa type=C
 - `pub … machine=<nombre>`: un Publisher de `<nombre>`. No lleva dirección, y el hub
   **no** le manda `subs`: eso lo hace el hub de su computadora. El hub contesta
   `ok` al proceso que lo registró.
+- `solo=<id>,<id>…` o `solo=-` (desde 0.14.0): solo en un `sub` de otra computadora
+  (con `machine`). Sin `solo`, el Subscriber de fuera recibe de **todos** los Publisher
+  locales de su topic, como siempre. Con `solo`, solo de los Publisher cuyo `id` está
+  en la lista; `solo=-` no le da ninguno. Lo usa el puente en una sesión de simulación
+  o reproducción (ver [El puente de topics](#el-puente-de-topics-tablas-desde-0140)).
+  Sin `machine` es un error.
 
 Reglas (si no se cumplen, `error` con el porqué):
 
@@ -376,6 +383,31 @@ cada Subscriber local que escucha en la red lleva `net=1`:
 ```
 agmen-hub/1 ep id=r1 kind=sub node=cam pid=7 topic=/cmd type=Cmd addr=192.168.1.20:7600 tcp=7700 age=0.4 machine=robot
 ```
+
+#### `state` en varios datagramas (desde 0.14.0)
+
+Si la respuesta a `query` cabe en un datagrama (hasta 65 507 bytes), sale **igual que
+siempre, byte a byte**. Si no cabe, el hub la reparte en varios datagramas de como
+mucho 32 KiB cada uno. Cada datagrama empieza con una línea `parte` y sigue con sus
+líneas enteras, sin partir ninguna:
+
+```
+agmen-hub/1 parte i=1 de=2 n=7
+agmen-hub/1 state version=0.14.0 hub=127.0.0.1:7390 robot=…
+agmen-hub/1 topic name=/imu schema=00000000000000aa type=Imu …
+agmen-hub/1 parte i=2 de=2 n=7
+agmen-hub/1 ep id=a1 kind=sub node=imu pid=4321 topic=/imu …
+```
+
+- `i` va desde 1 y `de` es el total de partes. `n` distingue una respuesta de otra
+  (el hub cuenta sus respuestas en partes).
+- Una línea sola que no cabe en 32 KiB (un esquema enorme) va recortada y con
+  `cortado=1`. Nunca se omite en silencio.
+- Quien pregunta junta las partes con el mismo `n` hasta tener las `de`. Si al vencer
+  el tiempo faltan partes, usa lo que llegó y lo dice: `la lista del hub llegó
+  incompleta (k de m partes)`.
+- **Un cliente anterior** lee solo el primer datagrama: ve una lista **parcial**. Antes
+  de la 4b no veía nada, así que es una mejora, no un cambio de formato.
 
 ### Qué hacen los nodos (desde 0.14.0)
 
@@ -424,6 +456,16 @@ sus puertos (`127.0.0.1`) son los de siempre.
    frenar a los demás. A `127.0.0.1` son 1 s, como siempre.
 6. Un receptor lento de otra computadora no frena a nadie y se cuenta.
 
+### Topes de `query` (desde 0.14.0)
+
+- **Una `query` por datagrama.** Si un mismo datagrama trae varias, el hub atiende la
+  primera y las demás las ignora. Quien pregunta ya recibe una respuesta.
+- **Partes pendientes de salir**: 16 MiB en total y 4 MiB por dirección. Si la respuesta
+  nueva no cabe en esos topes, el hub no la arma ni la manda: no contesta a esa
+  `query` (quien pregunta se queda sin respuesta y lo dice, y el hub lo escribe en su
+  log). Es para que un cliente que no lee no deje sin lista a los demás.
+- Una respuesta que cabe en un datagrama sale directamente, sin pasar por esa cola.
+
 ### Compatibilidad (desde 0.14.0)
 
 - Los campos y las operaciones nuevos solo se **añaden**. Un nodo o un hub anterior
@@ -432,6 +474,11 @@ sus puertos (`127.0.0.1`) son los de siempre.
   queda en local.
 - La **memoria compartida** sigue siendo de cada computadora. Entre computadoras, un
   mensaje grande va por TCP, como cualquier mensaje a otra computadora.
+- **Una herramienta anterior** que lee `state` lee solo el primer datagrama de una
+  respuesta en partes: ve una lista parcial, y no un error. Un hub anterior no reparte
+  la lista: si no cabe en un datagrama, no contesta nada (como antes de la 4b).
+- Sin `solo`, un `sub` de otra computadora recibe de todos los Publisher locales de su
+  topic, como antes de la 4b. Por eso, quien no manda `solo` se comporta igual.
 
 ### Variable para pruebas: `AGMEN_NET_IP`
 
@@ -460,8 +507,10 @@ entorno. Para pruebas y CI hay una variable, `AGMEN_REMOTE_HOSTS` (lista separad
 por comas), que trata direcciones de esta computadora como si fueran otra; no
 existe para uso normal (ver `python/agmen/machines.py`).
 
-Hoy cada computadora tiene su propio hub: los topics todavía no cruzan entre
-computadoras (bloque 4 del RFC 0011).
+Desde la parte 4b del RFC 0011, las dos computadoras pasan las tablas de sus hubs por
+esta conexión (`tablas`, ver [El puente de topics](#el-puente-de-topics-tablas-desde-0140))
+cuando las dos dicen que lo saben hacer. Lo que no cambia: la clave, la firma, los
+números `n` y el formato de la línea.
 
 ### Texto y líneas
 
@@ -543,6 +592,10 @@ JSON sea un objeto con `"op"`. Si algo falla, cierra la conexión.
   - `reloj`: `real`, `sim` o `replay`.
   - `agmen`: la versión de Agmen de la laptop.
   - `maquina`: el nombre de su `[[machine]]`.
+  - `tablas`: `1` si la laptop tiene hub y pide el puente de topics. Solo va si la
+    laptop tiene hub (`[hub] enabled = false` no lo manda). Desde la 4b.
+  - `desde`: cómo se llama la laptop para las herramientas del robot (texto; solo va
+    con `tablas`). Reglas en [El puente de topics](#el-puente-de-topics-tablas-desde-0140).
   - `nodos`: objeto de nombre → lo escrito de ese nodo, con las claves `cmd`,
     `env`, `cwd`, `restart`, `autostart` y `profile`. Una clave que no está
     escrita no aparece.
@@ -579,6 +632,10 @@ Ejemplo de un `sesion` (la firma va al final de la línea, aquí se omite):
   nombres, en el orden del archivo), `sesion` (32 caracteres hexadecimales al
   azar, para reanudar) y `gracia` (los segundos de gracia del agente: 10). Después
   de esto, el agente arranca sus nodos con `autostart`.
+  - Desde la 4b, además: `tablas: 1` si el agente va a hacer el puente de topics, o
+    `sin_tablas: "<motivo corto>"` si la laptop lo pidió y aquí no se puede (por
+    ejemplo, sin hub, con IPv6 o con un `desde` inválido). Si no dice nada, es un
+    agente anterior.
 - `sesion_error`: `codigo` y `texto`. El agente cierra después de mandarlo.
   - `ocupado`: ya hay otra laptop conectada (el texto dice desde qué IP). Si esa
     laptop se cortó y el agente la tiene en gracia, el texto dice cuántos segundos
@@ -615,6 +672,7 @@ Ejemplo de un `sesion` (la firma va al final de la línea, aquí se omite):
   `gracia`, y `perdidos` solo si hay alguno: `{nodo: cuántas}`, las líneas de `log`
   que el agente ya no tenía. Después van los `log` guardados con `n` mayor que el
   `k` de la laptop, en orden; luego todo sigue como en una sesión normal.
+  Desde la 4b, `tablas` y `sin_tablas` van igual que en `sesion_ok`.
 - `adios`: `motivo` (texto corto, por ejemplo `Ctrl+C` o `SIGTERM`). Ver
   [Despedida del agente](#despedida-del-agente).
 
@@ -632,6 +690,7 @@ Ejemplo de un `sesion` (la firma va al final de la línea, aquí se omite):
 | Orden desconocida (`op` que no existe) | Contesta `error` |
 | `arrancar`, `detener` o `reiniciar` de un nodo que no existe | Contesta `error` |
 | Una segunda `sesion` en la misma conexión, o más de 64 órdenes pendientes | Contesta `error` |
+| Un envío de `tablas` que falla de otra forma que "mensaje demasiado grande" (p. ej. se agota el tiempo con la línea a medias) | Se trata como una pérdida normal: gracia y reintentos. Nunca se escribe otra línea detrás de una a medias |
 
 La laptop manda `ping` cada 2 s desde que manda `sesion`, así que 6 s de silencio
 sí quiere decir que se perdió la conexión.
@@ -711,7 +770,163 @@ cortesía: si no llega, la laptop lo trata como una pérdida normal, con gracia.
   con nodos vivos por error, la sesión termina en el acto y no se queda en gracia.
 - Con los nodos ya detenidos, la laptop no dice "sus nodos siguen N s": dice que
   cerraron el agente y que sus nodos están detenidos, y reintenta por si vuelve a
-  arrancar. Al volver, abre sesión nueva y ningún nodo arranca solo.### Límites
+  arrancar. Al volver, abre sesión nueva y ningún nodo arranca solo.
+
+### El puente de topics (`tablas`, desde 0.14.0)
+
+> **Estado:** implementado en la parte 4b del RFC 0011: `python/agmen/tables.py` (el
+> puente), con sus enganches en `python/agmen/agent.py` (`agmen agent`) y en `agmen run`.
+> Las pruebas están en `python/test_tablas.py`. Diseño y razones en el
+> [RFC 0011](rfc/0011-sim-real-y-varias-computadoras.md), §3.5, §8 y §9.
+
+Con esto, un topic cruza de verdad entre la laptop y cada robot. El puente pasa las
+tablas de los dos hubs **por esta misma conexión**, firmada igual que el resto. Nada
+nuevo escucha en la red: cada lado habla con su propio hub por `127.0.0.1`, como
+cualquier herramienta.
+
+#### Cuándo hay puente
+
+Las dos computadoras tienen que decirlo:
+
+- La **laptop** (`agmen run`) lo dice en `sesion` con `tablas: 1` y `desde`, solo si
+  tiene hub. Con `[hub] enabled = false`, no lo dice.
+- El **agente** (`agmen agent`) lo dice en `sesion_ok` o `reanudar_ok` con `tablas: 1`,
+  solo si va a hacer el puente: tiene hub, `desde` es válido y la laptop llega por IPv4.
+  Si la laptop lo pidió y aquí no se puede, dice `sin_tablas` con el motivo.
+
+Mientras la conexión está **confirmada** (ver [La gracia y reanudar](#la-gracia-y-reanudar)),
+cada lado hace tres cosas, una vez por segundo o cada 2 s:
+
+1. **Enciende el modo red de su hub**: `red peers=<nombre>@<ip>` cada 2 s. En la laptop,
+   el nombre es el de su `[[machine]]`. En el robot, es el `desde` de la laptop. La IP
+   es la que **este** lado ve del otro.
+2. **Exporta lo suyo**: lee su hub (`query`) y manda al otro sus endpoints **locales**:
+   todos los Publisher y los Subscriber con `net=1`. Nunca reexporta lo que vino de
+   otra computadora (no hay bucles).
+3. **Importa lo del otro**: registra cada endpoint del otro en su hub como entrada de
+   otra computadora (`sub`/`pub` con `machine=`), con id `<computadora>.<id>`, la IP que
+   ve este lado y los latidos de siempre. Lo que ya no viene en la tabla nueva se quita.
+
+Si se pierde la conexión, el puente deja de latir lo del otro. Esas entradas caducan en
+3 s y el hub vuelve a modo local en 6 s. La tabla importada se descarta. Al reconectar
+(también al reanudar), todo vuelve solo, sin reiniciar ningún nodo.
+
+#### El mensaje `tablas`
+
+```
+1 {"op":"tablas","n":3,"parte":1,"de":2,"pubs":[{…}],"subs":[{…}]} <firma>
+```
+
+(El primer número de la línea es el de la conexión, como en todos los mensajes. El `n`
+del mensaje es el de la tabla.)
+
+- `n`: número de la tabla. Sube con cada tabla nueva.
+- `parte` y `de`: la parte que es (desde 1) y cuántas son. Una tabla vacía va con `de`
+  igual a 1 y las listas vacías.
+- Cada parte trae **como mucho 100 endpoints** y **48 KiB** en JSON. La línea firmada
+  tiene su tope de 64 KiB, así que las tablas grandes van en varias partes.
+- Una tabla **vale cuando llegaron todas sus partes**. Mientras tanto, sigue valiendo la
+  anterior. Una tabla nueva **sustituye** a la anterior, nunca se suman.
+- Campos de un endpoint de `pubs`: `id`, `node`, `pid`, `topic`, `schema` (16
+  dígitos hexadecimales), `type` y `text`. De `subs`: `id`, `node`, `pid`, `topic` (puede
+  ser `*`), `schema` (16 hexadecimales o `*`), `type`, `port` (1 a 65535) y `tcp` (0 a
+  65535). Los puertos son enteros. Los `id` van de 1 a 64 letras, dígitos, `_` o `-`
+  (sin punto: el punto lo pone quien recibe, en `<computadora>.<id>`).
+
+**Quien recibe** valida cada endpoint como lo haría el hub. Lo inválido se descarta, y
+si un `id` se repite en la tabla, se queda el primero. La **IP** la pone quien recibe:
+la del otro lado tal como la ve su conexión. Nunca usa una dirección que venga en el
+mensaje.
+
+**Quien manda** sigue estas reglas:
+
+- Una tabla pendiente de salir se **sustituye** por la más nueva; no se acumulan.
+- Las partes de tabla no cuentan para descartar `log` en la cola de salida del agente.
+- Al cerrar (Ctrl+C), `detener_todo` y `adios` no esperan detrás de una tabla. Una
+  parte que ya salió puede retener esas órdenes hasta 6 s, el tiempo de silencio.
+- Un envío de tabla que falla de otra forma que "mensaje demasiado grande" cierra la
+  conexión para todos. Se trata como una pérdida normal (gracia y reintentos). Nunca se
+  escribe otra línea detrás de una a medias.
+
+#### Límites de las tablas
+
+| Qué | Valor |
+|---|---|
+| Endpoints por parte | 100 (`PART_MAX`) |
+| Tamaño de una parte, en JSON | 48 KiB (`PART_BYTES`) |
+| Endpoints por tabla | 1 000 (`MAX_ENDPOINTS`). Lo que sobra no pasa, y se dice |
+| Bytes por tabla, ya escapados como van al hub | 1 MiB (`TABLE_MAX_BYTES`). Lo que pasa se descarta y se dice |
+| Una línea de endpoint para el hub | 65 507 bytes (`HUB_LINE_MAX`). Un endpoint más grande se descarta y se dice |
+
+
+#### Avisos y casos de borde
+
+- **Un aviso por tipo de problema**, no uno por endpoint: cuántos y un ejemplo. Si hay
+  cientos de endpoints rechazados, se dice una vez.
+- **El hub no contesta a la consulta** del puente: se dice una vez, y el puente sigue
+  intentando.
+- **Lista de su hub incompleta** (faltan partes de `state`): el puente lo dice una vez
+  por cambio de estado, como mucho uno cada 30 s, con `la tabla de mi hub no cabe en
+  una respuesta…`. No vacía la tabla: sigue mandando la última buena hasta 3 consultas
+  incompletas seguidas. A la cuarta, manda la tabla vacía y avisa. Cuando la lista
+  vuelve completa, lo dice con `ya cabe`.
+- **Dos robots**: la laptop no pasa a un robot lo que es de otro. Si un topic (no
+  comodín) se publica en un robot y se escucha en otro, `agmen run` lo avisa **una vez
+  por topic**: `'<topic>' se publica en '<A>' y se escucha en '<B>': en esta versión dos
+  robots no se pasan topics entre sí`. Pon uno de los dos nodos en la laptop.
+- **Una IP que no es IPv4** no sirve en esta versión: se avisa y no hay puente.
+- **Tabla que llega sin puente** (de un lado que no lo espera): se ignora.
+
+#### Simulación y reproducción
+
+Si la laptop pidió una sesión con `reloj` = `sim` o `replay` (`agmen run --sim` o
+`--play`), en el **robot** solo cruzan los nodos que arrancó el agente. Esto evita que
+una simulación mueva el robot de verdad (RFC 0011, §6, reto 1). En `real` no cambia nada.
+
+1. **Exporta solo lo suyo**: un endpoint cuyo `pid` es el de uno de sus nodos o el de
+   un descendiente suyo. Si no se puede saber, no se exporta (lado seguro).
+2. **Lo que importa de la laptop lo ven solo sus nodos**: las entradas de la laptop
+   llevan `solo=<ids>` (ver [Entradas de otra computadora](#entradas-de-otra-computadora-desde-0140)).
+   Un Publisher arrancado a mano en el robot no le manda nada a la laptop.
+3. **Lo avisa**, una vez por nodo ajeno, en la terminal del robot (y la laptop lo recibe
+   como línea del robot): `'<nodo>' (pid N) no lo arranqué yo y esta es una sesión de
+   simulación: no lo conecto con <laptop> (ni recibe ni manda). Si es parte del robot,
+   ponlo en robot.toml`. En reproducción, dice "reproducción".
+
+Del lado de la laptop no hay restricción: sus herramientas y scripts siguen viendo todo.
+Un nodo que se reinicia (pid nuevo) sigue contando: se mira en cada tabla.
+
+Anotado, sin cambio de código:
+
+- Un nodo dentro de un contenedor declara el `pid` de dentro del contenedor. En
+  simulación cuenta como ajeno.
+- Un descendiente huérfano (su padre ya murió) pasa a ser ajeno.
+
+#### Si no hay puente: qué se dice
+
+- La laptop dice `tablas` y el agente no: `sesion_ok` trae `sin_tablas`, y `agmen run`
+  avisa `no pasa topics entre computadoras (<motivo>)`. Los motivos cortos son, por
+  ejemplo: sin hub en el robot (`[hub] enabled = false`), IPv6, o un `desde` inválido.
+- El agente no dice nada (es anterior a la 4b): `agmen run` avisa `su agmen agent no dice
+  'tablas': es un Agmen anterior`, y pide `pip install -U agmen` en esa computadora.
+- En los dos casos, los nodos siguen corriendo como en la 3c. Solo no cruzan los topics.
+
+#### En pruebas: `AGMEN_NET_IP`
+
+Con `AGMEN_NET_IP`, la conexión de `agmen run` con el agente sale desde esa IP, para
+que el agente vea a la laptop en la IP donde escuchan sus nodos. Es una variable para
+pruebas (ver [Variable para pruebas](#variable-para-pruebas-agmen_net_ip)). Sin ella,
+la conexión sale como siempre.
+
+### Compatibilidad del puente (desde 0.14.0)
+
+- **Un lado sin `tablas`** (versión anterior a la 4b): no hay puente y no se rompe nada.
+  Los nodos corren, la conexión funciona y los topics no cruzan. Se dice una vez, con
+  qué hacer. Actualicen las dos computadoras a la misma versión.
+- **Un `tablas` que llega sin puente** se ignora sin decir nada.
+- **Una laptop sin hub** no dice `tablas`: el agente no hace puente, y no dice nada.
+
+### Límites
 
 | Qué | Valor |
 |---|---|

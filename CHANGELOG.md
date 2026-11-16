@@ -15,10 +15,9 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   MuJoCo (bloque 2, abajo), `[[machine]]` (bloque 3, parte 3a, abajo) y
   `agmen agent` con clave (parte 3b, abajo), y la reconexión tras un corte, el
   panel con varias computadoras, el servicio de arranque y el capítulo 18 (parte
-  3c, abajo), y la base de los topics entre computadoras (parte 4a, abajo). Falta:
-  el puente que pasa las tablas de topics (parte 4b), lo visible en herramientas y
-  panel (parte 4c) y los relojes (bloque 5 del plan
-  del RFC).
+  3c, abajo), la base de los topics entre computadoras (parte 4a, abajo) y el puente
+  que pasa las tablas de topics (parte 4b, abajo). Falta: lo visible en herramientas y
+  panel (parte 4c) y los relojes (bloque 5 del plan del RFC).
 
 ### Agregado
 - **Perfiles en `robot.toml`** (RFC 0011 §3.2): `profile = "real"`, `"sim"`,
@@ -127,18 +126,39 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   (datos o control que no vienen de una computadora declarada o de su hub) y
   `unreachable` (destinos de otra computadora que no se alcanzan).
   `RawPublisher` (el del `[[mux]]`) ya manda a otra computadora igual que un
-  Publisher. **Un topic todavía no cruza entre computadoras**: `agmen run` y
-  `agmen agent` aún no pasan las tablas a su hub. Eso es la parte 4b (el puente);
-  la vista en herramientas y panel, la 4c. Protocolo en `docs/PROTOCOLO.md`
-  ("Topics y hub: `agmen-hub/1`").
-- **Lo que todavía no existe**: topics entre computadoras (bloque 4: cada
-  computadora tiene su propio hub) y medir la diferencia de reloj entre
-  computadoras (bloque 5). Una laptop a la vez por agente.
+  Publisher. En la 4a, un topic todavía no cruzaba entre computadoras: eso llegó con
+  la parte 4b (abajo); la vista en herramientas y panel, con la 4c. Protocolo en
+  `docs/PROTOCOLO.md` ("Topics y hub: `agmen-hub/1`").
+- **Topics entre computadoras, parte 4b (RFC 0011 §3.5, §8 y §9): el puente**.
+  `agmen run` (en la laptop, uno por cada agente conectado) y `agmen agent` (en el
+  robot) pasan las tablas de sus hubs por la conexión firmada `agmen-agent/1`, cuando
+  las dos dicen `tablas`. Mientras la conexión está confirmada, cada lado enciende el
+  modo red de su hub, manda sus endpoints locales y registra los del otro como
+  entradas de otra computadora (ids `<computadora>.<id>`, con la IP que ve el
+  receptor). Así un topic cruza de verdad entre la laptop y cada robot, sin configurar
+  nada, y sin reiniciar nodos al reconectar. `agmen-agent/1` gana `tablas` (capacidad),
+  `desde` en `sesion`, `sin_tablas` en `sesion_ok`/`reanudar_ok` cuando el agente no
+  hace el puente, y el mensaje `tablas` (partes de como mucho 100 endpoints y 48 KiB;
+  1 000 endpoints y 1 MiB por tabla). `agmen-hub/1` gana `solo=` en un `sub` de otra
+  computadora, y `state` se reparte en varios datagramas (`parte i= de= n=`, de como
+  mucho 32 KiB) cuando no cabe en uno; `query` atiende una por datagrama, con topes de
+  16 MiB en total y 4 MiB por dirección. En simulación o reproducción, en el robot
+  solo cruzan los nodos que arrancó el agente: los demás se avisan una vez. Con dos
+  robots, los topics no cruzan entre ellos: `agmen run` lo avisa una vez por topic. Si
+  un lado no dice `tablas`, no hay puente, y se dice una vez. Los dos cambios son
+  añadidos: quien no los conoce sigue como antes. Protocolo en `docs/PROTOCOLO.md`
+  ("El puente de topics"). Falta: la prueba del firewall y lo visible en herramientas
+  y panel (parte 4c).
+- **Lo que todavía no existe**: la prueba del firewall y lo visible de los topics
+  entre computadoras en herramientas y panel (parte 4c, bloque 4), y medir la
+  diferencia de reloj entre computadoras (bloque 5). Dos robots no se pasan topics
+  entre sí. Una laptop a la vez por agente.
 - **Capítulo 5 del tutorial, sección 7**: resumen de `[[machine]]`, qué corre en
   cada computadora y por qué el hardware va con `profile = "real"`.
 - **Capítulo 18 del tutorial, "Un robot, varias computadoras"**: el recorrido de
   dos computadoras con `robot_dos.toml`, la clave, el agente como servicio y qué
-  pasa cuando se cae el WiFi, con salidas reales de las pruebas.
+  pasa cuando se cae el WiFi, con salidas reales de las pruebas. Desde la parte 4b, su
+  sección 10 explica los topics entre la laptop y la Pi (sin salidas de prueba aún).
 
 ### Cambiado
 - **Al perder una computadora, `agmen run` ya no se detiene**: los nodos de esa
