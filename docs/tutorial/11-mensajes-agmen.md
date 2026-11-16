@@ -59,6 +59,7 @@ message Articulaciones {
 | `message` | Un tipo que se puede **publicar** |
 | `f32[12] q` | Un campo: tipo y nombre, uno por línea (los tipos de siempre: `f32`, `u8`, `bool`, `time`...) |
 | `= 1.0` | Valor por defecto: con lo que empieza el campo en tu código. Tampoco viaja |
+| `= nan` | Solo en `f32` y `f64`: "no se mide". Tampoco viaja (desde 0.15.0, [sección 7](#7-un-valor-que-no-se-mide-nan)) |
 | `# ...` | Comentario. Si va al final de un campo, aparece en el código generado como su documentación |
 
 💡 Para usar un tipo de otro archivo: `import "comunes.agmen"` al principio.
@@ -186,6 +187,32 @@ iguales, son el mismo tipo (aunque estén en otro `package`). Por eso
 [`motor_command.agmen`](../../examples/tutorial/motor_command.agmen) sin
 cambiar nada más.
 
+## 7. Un valor que no se mide: `nan`
+
+Desde 0.15.0, un campo `f32` o `f64` puede empezar en `nan` (*not a number*).
+Sirve para lo que todavía no existe: un sensor que no midió, o un dato que
+nadie mandó.
+
+```
+package robot
+
+message Lectura {
+    f32    distancia = nan       # m; NaN = el sensor no midió
+    f64[3] posicion = nan        # NaN en los tres: todavía no hay posición
+    u8     intentos = 0          # un entero no tiene NaN: 0 quiere decir "ninguno"
+}
+```
+
+Ojo con tres cosas:
+
+- `nan` solo vale en `f32` y `f64`. En un `u8` da error, y `inf` o `-inf` no
+  valen en ningún campo.
+- Un NaN no es igual a otro: `Lectura() == Lectura()` da falso. Para saber si
+  algo no se midió, usa `math.isnan(l.distancia)` en Python o
+  `std::isnan(l.distancia)` en C++.
+- El valor por defecto no viaja ni cambia el esquema: el `schema_id` es el mismo
+  con `= nan` que sin él.
+
 ## Lo que todavía no se puede
 
 - Textos y arreglos de tamaño variable (`string`, `f32[]`): llegan con la
@@ -200,6 +227,7 @@ cambiar nada más.
   (`agmen_add_messages`) y de Python (`agmen.load`).
 - `enum` y `const` le ponen nombre a los números; los valores por defecto,
   con qué empieza cada campo.
+- `= nan` marca lo que no se mide. No viaja, y no cambia el esquema.
 - Los bytes no cambian: lo generado habla con lo escrito a mano, con el panel
   y con Foxglove.
 

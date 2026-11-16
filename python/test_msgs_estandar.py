@@ -386,10 +386,11 @@ class TestNanEnJson(unittest.TestCase):
         row = layout.unpack(_imu_sin_orientacion().encode_payload())
         texto = json.dumps(foxglove_row(layout, row), separators=(",", ":"))
         self.assertEqual(_estricto(texto), SIN_ORIENTACION)
-        # El RFC 0013 §7 pone "el puente de Foxglove" en el bloque 1; el orquestador lo pasó al bloque 3
-        # porque completar foxglove.PoseInFrame / foxglove.Odometry necesita los marcos de robot.toml.
-        # Mientras, Imu se anuncia con su propio nombre. CAMBIA ESTA PRUEBA cuando entre ese mapeo.
-        self.assertEqual(foxglove_name(layout), "Imu", "¿ya entró el mapeo a esquemas de Foxglove (bloque 3)? "
+        # El RFC 0013 §7 pone "el puente de Foxglove" en el bloque 1, y en este bloque NO se hizo: completar
+        # foxglove.PoseInFrame / foxglove.Odometry necesita los marcos de robot.toml (bloque 3). Pasarlo al
+        # bloque 3 está propuesto y pendiente de que Adán lo confirme. Mientras, Imu se anuncia con su propio
+        # nombre. CAMBIA ESTA PRUEBA cuando entre ese mapeo.
+        self.assertEqual(foxglove_name(layout), "Imu", "¿ya entró el mapeo a esquemas de Foxglove? "
                                                         "Actualiza esta prueba")
         json.dumps(foxglove_schema(layout), allow_nan=False)
 
