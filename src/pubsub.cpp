@@ -4,10 +4,13 @@
 #include <atomic>
 #include <cstring>
 #include <deque>
+#include <functional>
+#include <set>
 #include <thread>
 
 #include "agmen/clock.hpp"
 #include "agmen/log.hpp"
+#include "agmen/platform.hpp"
 #include "agmen/shm.hpp"
 
 namespace agmen {
@@ -36,6 +39,58 @@ using Packet = std::shared_ptr<const wire::Bytes>;
 std::string host_of(const std::string& address) {
     const auto colon = address.rfind(':');
     return colon == std::string::npos ? address : address.substr(0, colon);
+}
+
+// ---------------------------------------------------------------------------
+// Modo red (RFC 0011 §2 y §3): lo mismo que python/agmen/pubsub.py y _tcp.py
+// ---------------------------------------------------------------------------
+
+/// Conectar por TCP a otra computadora espera hasta esto, sin frenar a nadie (a 127.0.0.1, kConnectTimeout).
+// 3 s, como REMOTE_CONNECT_S en Python (la especificación no da el número).
+constexpr std::chrono::milliseconds kRemoteConnect{3000};
+/// Tras la confirmación del hub, los sockets de antes se siguen leyendo esto (NET_OLD_S en Python).
+constexpr std::chrono::milliseconds kNetOld{1000};
+/// IP distintas que se avisan como rechazadas (las demás solo se cuentan).
+constexpr std::size_t kMaxRejectedWarned = 256;
+
+/// AGMEN_NET_IP (variable para pruebas, RFC 0011 §2): la IP de "esta computadora" para tener dos en una
+/// (127.0.0.1 y 127.0.0.2). "" si no está. Inválida o que no es de esta computadora: error claro al abrir.
+std::string net_ip_from_env() {
+    std::string text = platform::env("AGMEN_NET_IP");
+    const auto first = text.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return {};
+    text = text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1);
+    try {
+        (void)hub::parse_ipv4(text);
+    } catch (const std::invalid_argument& e) {
+        throw std::invalid_argument("AGMEN_NET_IP=" + text + ": " + e.what() +
+                                    ". Es una variable para pruebas: quítala si no la pusiste tú");
+    }
+    try {
+        (void)net::UdpSocket::bind(text + ":0");
+    } catch (const net::NetError& e) {
+        throw net::NetError(0, "AGMEN_NET_IP=" + text + " no es una IP de esta computadora (" + e.code().message() +
+                                   "): pon una que tenga (para pruebas, una de 127.0.0.x) o quita la variable");
+    }
+    return text;
+}
+
+/// El aviso (una vez por destino) de un destino de otra computadora al que no se pudo mandar.
+std::string unreachable_text(const std::string& topic, const std::string& addr, const std::string& why) {
+    const auto ip = host_of(addr);
+    return "[agmen] ⚠ '" + topic + "': no pude mandar a la computadora " + ip + " (" + addr + "): " + why +
+           ". Los demás destinos siguen igual; revisa que " + ip +
+           " esté en la red y que su firewall deje pasar a Agmen. Lo que no sale se cuenta (unreachable).";
+}
+
+/// ¿La IP de `from` ("ip:puerto" o "ip") está en `allowed`?
+bool ip_in(std::string_view from, const std::vector<std::string>& allowed) {
+    const auto colon = from.rfind(':');
+    const auto ip = colon == std::string_view::npos ? from : from.substr(0, colon);
+    for (const auto& a : allowed) {
+        if (a == ip) return true;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -71,6 +126,11 @@ struct Outgoing {
     std::map<std::pair<std::uint32_t, std::uint64_t>, std::size_t> lent;   // mandados y no devueltos → bytes
     std::size_t lent_bytes = 0;
     wire::Bytes inbox;            // avisos a medio llegar
+    // Modo red (RFC 0011 §3): de otra computadora, sin memoria compartida y sin bloquear al conectar.
+    std::string addr;             // "ip:puerto" del suscriptor
+    bool remote = false;
+    bool connecting = false;      // conexión en curso (la termina el hilo del Fanout)
+    std::chrono::steady_clock::time_point deadline{};
 
     [[nodiscard]] bool alive() const { return stream.valid(); }
     [[nodiscard]] bool busy() const { return current || next || !control.empty(); }
@@ -80,7 +140,10 @@ struct Outgoing {
         return it.slot < 0 || lent.size() < 2 ||
                (lent.size() < shm::kMaxUnreturned && lent_bytes + it.length <= shm::kMaxUnreturnedBytes);
     }
-    [[nodiscard]] bool wants_write() const { return current || !control.empty() || (next && can_send(next)); }
+    [[nodiscard]] bool wants_write() const {
+        if (connecting) return true;   // la espera avisa cuando termina de conectar
+        return current || !control.empty() || (next && can_send(next));
+    }
 
     static void give_back(Item& it, shm::Pool* pool) {
         if (it.slot >= 0 && pool != nullptr) pool->release(static_cast<std::uint32_t>(it.slot));
@@ -103,7 +166,7 @@ struct Outgoing {
 
     /// Manda lo que acepte el sistema ahora.
     void step(shm::Pool* pool) {
-        while (stream.valid()) {
+        while (stream.valid() && !connecting) {
             if (!current) {
                 if (!control.empty()) {
                     current = Item{control.front()};
@@ -154,10 +217,15 @@ struct Outgoing {
 /// compartida y el hilo que las atiende.
 class Fanout {
 public:
-    Fanout(std::string topic, std::uint64_t source_id, std::uint64_t topic_id)
+    /// `net`: los destinos que no son 127.0.0.1 son de otra computadora (modo topic, RFC 0011 §3);
+    /// `net_ip`: AGMEN_NET_IP, la IP desde la que salen (solo pruebas).
+    Fanout(std::string topic, std::uint64_t source_id, std::uint64_t topic_id, bool net = false,
+           std::string net_ip = {})
         : topic_(std::move(topic)),
           source_id_(source_id),
           topic_id_(topic_id),
+          net_(net),
+          net_ip_(std::move(net_ip)),
           wake_(net::UdpSocket::bind("127.0.0.1:0")) {
         wake_.connect("127.0.0.1:" + std::to_string(wake_.local_port()));
         thread_ = std::thread([this] { loop(); });
@@ -191,7 +259,7 @@ public:
                     ++it;
                 }
             }
-            reconnect(true);
+            reconnect(true, false);
         }
         wake();
     }
@@ -202,7 +270,7 @@ public:
         bool wake_up = false;
         {
             std::lock_guard lock(mu_);
-            reconnect(false);
+            reconnect(false, false);
             for (auto it = conns_.begin(); it != conns_.end();) {
                 if (!it->second.alive()) {
                     it = forget(it);
@@ -226,7 +294,7 @@ public:
         bool wake_up = false;
         {
             std::lock_guard lock(mu_);
-            reconnect(false);
+            reconnect(false, true);
             // D3: el mensaje nuevo reemplaza al que esperaba. Se suelta antes de
             // escribir, así su bloque se puede reutilizar para este.
             for (auto& [_, c] : conns_) {
@@ -298,10 +366,20 @@ public:
         return pool_ ? pool_->bytes() : 0;
     }
 
+    /// Mensajes que no salieron hacia un destino de otra computadora (RFC 0011 §3).
+    [[nodiscard]] std::uint64_t unreachable() const {
+        std::lock_guard lock(mu_);
+        return unreachable_;
+    }
+
 private:
     std::string topic_;
     std::uint64_t source_id_;
     std::uint64_t topic_id_;
+    bool net_ = false;
+    std::string net_ip_;
+    std::uint64_t unreachable_ = 0;            // mensajes que no salieron hacia otra computadora
+    std::set<std::string> unreach_warned_;
     mutable std::mutex mu_;
     std::map<std::string, Outgoing> conns_;
     std::vector<std::string> want_;
@@ -367,6 +445,7 @@ private:
             case shm::Op::Hello: {
                 if (c.hello) return;
                 c.hello = true;
+                if (c.remote) return;   // la memoria compartida es de cada computadora: a otra ni se prueba ni se avisa
                 if (!shm::enabled()) return;
                 if (!pool_) pool_ = std::make_unique<shm::Pool>(source_id_);
                 std::string why;
@@ -434,27 +513,61 @@ private:
         c.step(pool_.get());
     }
 
-    void reconnect(bool force) {
+    /// `msg`: lo llama un mensaje de datos; a otra computadora sin conexión, se cuenta como no salido.
+    void reconnect(bool force, bool msg) {
         const auto now = std::chrono::steady_clock::now();
         for (const auto& a : want_) {
             if (const auto it = conns_.find(a); it != conns_.end() && it->second.alive()) continue;
+            const auto host = host_of(a);   // AGMEN_NET_IP también es esta computadora (RFC 0011 §9.5)
+            const bool remote = net_ && host != hub::kLocalhost && host != net_ip_;
             if (!force) {
-                if (const auto t = last_try_.find(a); t != last_try_.end() && now - t->second < kRetryEvery) continue;
+                if (const auto t = last_try_.find(a); t != last_try_.end() && now - t->second < kRetryEvery) {
+                    if (remote && msg) ++unreachable_;
+                    continue;
+                }
             }
             last_try_[a] = now;
             if (const auto it = conns_.find(a); it != conns_.end()) forget(it);
-            try {
-                Outgoing c;
-                c.stream = net::TcpStream::connect(net::Address::resolve(a), kConnectTimeout);
-                if (announcement_) {
-                    c.offer(Item{announcement_}, pool_.get());
-                    c.step(pool_.get());
+            Outgoing c;
+            c.addr = a;
+            if (remote) {
+                // A otra computadora puede tardar o no contestar nunca: sin esperar (lo termina el hilo).
+                c.remote = true;
+                try {
+                    bool pending = false;
+                    c.stream = net::TcpStream::connect_async(net::Address::resolve(a), net_ip_, pending);
+                    c.connecting = pending;
+                    c.deadline = now + kRemoteConnect;
+                } catch (const net::NetError& e) {
+                    if (msg) ++unreachable_;
+                    warn_unreachable(a, e.code().value() != 0 ? e.code().message() : std::string(e.what()));
+                    continue;
                 }
-                conns_.emplace(a, std::move(c));
-            } catch (const net::NetError&) {
-                // el suscriptor no está; se reintenta en un rato (o el hub lo quita)
+            } else {
+                try {
+                    c.stream = net::TcpStream::connect(net::Address::resolve(a), kConnectTimeout);
+                } catch (const net::NetError&) {
+                    continue;   // el suscriptor no está; se reintenta en un rato (o el hub lo quita)
+                }
             }
+            if (announcement_) {
+                c.offer(Item{announcement_}, pool_.get());
+                c.step(pool_.get());
+            }
+            conns_.emplace(a, std::move(c));
         }
+    }
+
+    void warn_unreachable(const std::string& a, const std::string& why) {
+        if (unreach_warned_.insert(a).second) log::write(unreachable_text(topic_, a, why.empty() ? "no contestó" : why));
+    }
+
+    /// Una conexión a otra computadora que no se pudo terminar (con el candado).
+    void remote_failed(Outgoing& c, const std::string& why) {
+        if (c.next || c.current) ++unreachable_;   // lo que esperaba salir por ella
+        c.fail(pool_.get());
+        c.connecting = false;
+        warn_unreachable(c.addr, why);
     }
 
     Outgoing* find(std::intptr_t handle) {
@@ -476,9 +589,15 @@ private:
             {
                 std::lock_guard lock(mu_);
                 // D6 a′: una vez por segundo, los bloques sin usar 5 s se liberan.
-                if (const auto now = std::chrono::steady_clock::now(); pool_ && now - last_trim >= std::chrono::seconds(1)) {
+                const auto now = std::chrono::steady_clock::now();
+                if (pool_ && now - last_trim >= std::chrono::seconds(1)) {
                     last_trim = now;
                     (void)pool_->trim(now);
+                }
+                for (auto& [_, c] : conns_) {
+                    if (c.alive() && c.connecting && now >= c.deadline) {
+                        remote_failed(c, "no contestó en " + std::to_string(kRemoteConnect.count() / 1000) + " s");
+                    }
                 }
                 for (const auto& [_, c] : conns_) {
                     if (!c.alive()) continue;
@@ -509,6 +628,16 @@ private:
                 if (!readable[i] && !writable[i]) continue;
                 Outgoing* c = find(handles[i]);
                 if (c == nullptr) continue;
+                if (c->connecting) {
+                    // Windows dice que una conexión en curso falló como "legible" (POLLERR/POLLHUP).
+                    if (const int err = c->stream.finish_connect(); err != 0) {
+                        remote_failed(*c, err == -1 ? std::string("se cerró") : std::system_category().message(err));
+                        continue;
+                    }
+                    c->connecting = false;
+                    c->step(pool_.get());
+                    continue;
+                }
                 if (readable[i]) serve_reads(*c);
                 if (writable[i] && c->alive()) c->step(pool_.get());
             }
@@ -713,34 +842,85 @@ struct Listener {
     bool shm = false;   // ¿decirle a cada publicador que podemos memoria compartida?
     std::vector<std::unique_ptr<Incoming>> conns;
     std::deque<Arrived> ready;
+    // Modo red (RFC 0011 §2): los puertos de escucha anteriores (siguen aceptando hasta retire_old()) y
+    // de qué IP se aceptan conexiones (sin valor = de todas: escucha solo en 127.0.0.1, lo de siempre).
+    std::vector<net::TcpListener> old;
+    std::optional<std::vector<std::string>> allow;
+    std::function<void(const std::string&)> on_reject;
+    std::string net_ip;   // AGMEN_NET_IP: también es esta computadora (memoria compartida, RFC 0011 §9.5)
 
     Listener(std::string_view bind, bool can_shm) : listener(net::TcpListener::bind(bind)), shm(can_shm) {}
 
     void handles(std::vector<std::intptr_t>& out) const {
         out.push_back(listener.native_handle());
+        for (const auto& o : old) out.push_back(o.native_handle());
         for (const auto& c : conns) {
             if (const auto h = c->handle(); h != -1) out.push_back(h);   // una que ya se cerró, no
         }
     }
 
-    /// Atiende los sockets listos: acepta y lee.
-    void service(const std::vector<std::intptr_t>& handles, const bool* is_ready, std::size_t from) {
-        if (is_ready[from]) {
-            while (auto s = listener.accept()) {
-                auto c = std::make_unique<Incoming>();
-                c->from = s->peer();
-                c->peer->stream = std::move(*s);
-                if (shm) {
-                    // El suscriptor habla primero (RFC 0009 §3.3): un publicador de
-                    // 0.10 nunca lee esto, y uno de 0.11 sabe que puede probar.
-                    c->peer->hello = true;
-                    c->peer->say(shm::Record{shm::Op::Hello, 0, 0});
-                }
-                conns.push_back(std::move(c));
+    /// Un puerto de escucha nuevo en `bind`; el de antes sigue aceptando hasta retire_old(). Las
+    /// conexiones ya aceptadas no se tocan. Si no se puede abrir, lanza NetError y nada cambia.
+    void rebind(std::string_view bind) {
+        auto fresh = net::TcpListener::bind(bind);
+        old.push_back(std::move(listener));
+        listener = std::move(fresh);
+    }
+
+    /// Cierra los puertos de escucha anteriores (no las conexiones que ya aceptaron).
+    void retire_old() { old.clear(); }
+
+    /// De qué IP se aceptan conexiones; las aceptadas de una IP que ya no está se cierran.
+    void set_allow(std::vector<std::string> ips, std::function<void(const std::string&)> reject) {
+        allow = std::move(ips);
+        on_reject = std::move(reject);
+        for (auto it = conns.begin(); it != conns.end();) {
+            if (ip_in((*it)->from, *allow)) {
+                ++it;
+                continue;
             }
+            (*it)->peer->mark_closed();
+            (*it)->peer->blocks.clear();
+            it = conns.erase(it);
         }
-        for (std::size_t i = from + 1; i < handles.size(); ++i) {
+    }
+
+    void accept_from(net::TcpListener& l) {
+        while (auto s = l.accept()) {
+            const auto ip = host_of(s->peer());
+            if (allow && !ip_in(ip, *allow)) {
+                s->close();   // de una computadora que no es de [[machine]]
+                if (on_reject) on_reject(ip);
+                continue;
+            }
+            auto c = std::make_unique<Incoming>();
+            c->from = s->peer();
+            c->peer->stream = std::move(*s);
+            // En modo red, la memoria compartida solo con esta computadora (en local, lo de siempre).
+            if (shm && (!allow || ip == hub::kLocalhost || (!net_ip.empty() && ip == net_ip))) {
+                // El suscriptor habla primero (RFC 0009 §3.3): un publicador de
+                // 0.10 nunca lee esto, y uno de 0.11 sabe que puede probar.
+                c->peer->hello = true;
+                c->peer->say(shm::Record{shm::Op::Hello, 0, 0});
+            }
+            conns.push_back(std::move(c));
+        }
+    }
+
+    /// Atiende los sockets listos (handles[from..], como los dio handles()): acepta y lee.
+    void service(const std::vector<std::intptr_t>& handles, const bool* is_ready, std::size_t from) {
+        for (std::size_t i = from; i < handles.size(); ++i) {
             if (!is_ready[i]) continue;
+            if (handles[i] == listener.native_handle()) {
+                accept_from(listener);
+                continue;
+            }
+            if (const auto o = std::find_if(old.begin(), old.end(),
+                                            [&](const auto& l) { return l.native_handle() == handles[i]; });
+                o != old.end()) {
+                accept_from(*o);
+                continue;
+            }
             const auto it = std::find_if(conns.begin(), conns.end(),
                                          [&](const auto& c) { return c->handle() == handles[i]; });
             if (it == conns.end()) continue;
@@ -794,6 +974,7 @@ struct Listener {
 struct PublisherCore::State {
     TypeInfo type;
     std::mutex mu;   // se puede publicar desde varios grupos de un Node (hilos)
+    std::string net_ip;   // AGMEN_NET_IP (solo pruebas, RFC 0011 §3); "" = no está. Antes que el socket
     net::UdpSocket socket;
     std::string topic;
     std::uint64_t topic_id = 0;
@@ -806,15 +987,23 @@ struct PublisherCore::State {
     std::uint64_t seq = 0;
     bool announced = false;
     std::chrono::steady_clock::time_point last_announce{};
+    // Modo red (RFC 0011 §3): los destinos que no son 127.0.0.1 salen por otro socket (net_socket).
+    std::optional<net::UdpSocket> net_socket;   // se abre la primera vez que hay un destino de fuera
+    std::vector<char> remote;                   // remote[i]: dests[i] es de otra computadora
+    bool any_remote = false;                    // false = todos locales: lo de siempre, sin trabajo de más
+    std::atomic<std::uint64_t> unreachable{0};
+    std::set<std::string> unreach_warned;
+    std::atomic<std::uint64_t> rejected{0};   // control que no vino del hub (RFC 0011 §9.1)
 
     State(const std::string& to, TypeInfo t, std::string label)
         // Por topic todo es local (nivel 2): 127.0.0.1, así Windows no pregunta por el firewall.
         : type(std::move(t)),
+          net_ip(hub::is_topic(to) ? net_ip_from_env() : std::string()),   // antes de abrir nada
           socket(net::UdpSocket::bind(hub::is_topic(to) ? "127.0.0.1:0" : "0.0.0.0:0")),
           topic(hub::is_topic(to) ? to : (label.empty() ? "/" + type.name : std::move(label))),
           source_id(wire::random_source_id()) {
         topic_id = wire::topic_id(topic);
-        if (type.arrow) fanout = std::make_unique<Fanout>(topic, source_id, topic_id);
+        if (type.arrow) fanout = std::make_unique<Fanout>(topic, source_id, topic_id, hub::is_topic(to), net_ip);
         if (hub::is_topic(to)) {
             check_topic_or_throw(to);
             const auto id = hub::hex16(source_id);
@@ -858,7 +1047,7 @@ struct PublisherCore::State {
         if (fanout) {
             fanout->send_packet(std::make_shared<const wire::Bytes>(ann));
         } else {
-            for (const auto& d : dests) (void)socket.send_to(ann, d);
+            for (std::size_t i = 0; i < dests.size(); ++i) (void)send_any(ann, i);
         }
         announced = true;
         last_announce = std::chrono::steady_clock::now();
@@ -867,26 +1056,86 @@ struct PublisherCore::State {
     /// Lee las respuestas del hub (a quién mandarle los datos).
     void drain(std::chrono::milliseconds wait) {
         while (const auto rx = socket.recv_from(buf, wait)) {
+            wait = std::chrono::milliseconds(0);
+            const wire::ByteView data(buf.data(), rx->size);
+            if (hub::is_control(data) && !link->from_hub(rx->from)) {   // RFC 0011 §9.1: solo el hub
+                rejected.fetch_add(1);
+                link->warn_foreign(topic, rx->from);
+                continue;
+            }
             std::optional<std::vector<std::string>> subs;
             std::optional<std::vector<std::string>> tcp;
-            link->handle(wire::ByteView(buf.data(), rx->size), subs, &tcp);
+            link->handle(data, subs, &tcp);
             if (subs && fanout) {
                 tcp_dests = tcp ? *tcp : std::vector<std::string>{};
                 fanout->update(tcp_dests, std::make_shared<const wire::Bytes>(announcement()));
             } else if (subs) {
                 std::vector<net::Address> fresh;
+                std::vector<char> fresh_remote;
                 fresh.reserve(subs->size());
-                const auto ann = announcement();
+                fresh_remote.reserve(subs->size());
                 for (const auto& a : *subs) {
                     fresh.push_back(net::Address::resolve(a));
-                    bool known = false;
-                    for (const auto& d : dests) known = known || d == fresh.back();
-                    if (!known) (void)socket.send_to(ann, fresh.back());  // recién llegado
+                    // AGMEN_NET_IP también es esta computadora (RFC 0011 §9.5).
+                    const auto host = host_of(a);
+                    fresh_remote.push_back(static_cast<char>(host != hub::kLocalhost && host != net_ip ? 1 : 0));
+                }
+                const bool fresh_any =
+                    std::find(fresh_remote.begin(), fresh_remote.end(), char{1}) != fresh_remote.end();
+                if (fresh_any) {
+                    open_net_socket();
+                } else {
+                    net_socket.reset();   // sin destinos de otra computadora: ningún puerto abierto a la red (§9.3)
+                }
+                const auto ann = announcement();
+                std::vector<char> known(fresh.size(), 0);
+                for (std::size_t i = 0; i < fresh.size(); ++i) {
+                    for (const auto& d : dests) known[i] = static_cast<char>(known[i] || d == fresh[i]);
                 }
                 dests = std::move(fresh);
+                remote = std::move(fresh_remote);
+                any_remote = fresh_any;
+                for (std::size_t i = 0; i < dests.size(); ++i) {
+                    if (!known[i]) (void)send_any(ann, i);   // recién llegado: por el mismo camino que sus datos
+                }
             }
-            wait = std::chrono::milliseconds(0);
         }
+    }
+
+    /// La primera vez que hay un destino de otra computadora (con `mu`).
+    void open_net_socket() {
+        if (net_socket) return;
+        const std::string bind = (net_ip.empty() ? std::string("0.0.0.0") : net_ip) + ":0";
+        try {
+            net_socket.emplace(net::UdpSocket::bind(bind));   // AGMEN_NET_IP: los envíos salen desde esa IP
+        } catch (const net::NetError& e) {
+            log::write("[agmen] ⚠ '" + topic + "': no pude abrir el socket para mandar a otra computadora: " +
+                       e.what() + ". Lo que vaya a otra computadora no sale (se cuenta en unreachable).");
+        }
+    }
+
+    /// A un destino de otra computadora: por el socket que no está atado a 127.0.0.1. Si no sale, no
+    /// frena a los demás: se cuenta y se avisa una vez por destino.
+    bool send_net(wire::ByteView data, const net::Address& to) {
+        std::string why;
+        if (net_socket) {
+            try {
+                return net_socket->send_to(data, to) == net::SendStatus::Ok;
+            } catch (const net::NetError& e) {
+                why = e.code().value() != 0 ? e.code().message() : std::string(e.what());
+            }
+        } else {
+            why = "no pude abrir el socket para mandar a otra computadora";
+        }
+        ++unreachable;
+        const auto addr = to.to_string();
+        if (unreach_warned.insert(addr).second) log::write(unreachable_text(topic, addr, why));
+        return false;
+    }
+
+    bool send_any(wire::ByteView data, std::size_t i) {
+        if (any_remote && remote[i] != 0) return send_net(data, dests[i]);
+        return socket.send_to(data, dests[i]) == net::SendStatus::Ok;
     }
 };
 
@@ -932,8 +1181,14 @@ net::SendStatus PublisherCore::publish_payload(wire::ByteView payload, std::int6
     env.write_to(packet);
     packet.insert(packet.end(), payload.begin(), payload.end());
     auto status = net::SendStatus::NoListener;
-    for (const auto& d : s.dests) {
-        if (s.socket.send_to(packet, d) == net::SendStatus::Ok) status = net::SendStatus::Ok;
+    if (!s.any_remote) {   // todos en esta computadora: lo de siempre, sin trabajo de más
+        for (const auto& d : s.dests) {
+            if (s.socket.send_to(packet, d) == net::SendStatus::Ok) status = net::SendStatus::Ok;
+        }
+    } else {
+        for (std::size_t i = 0; i < s.dests.size(); ++i) {
+            if (s.send_any(packet, i)) status = net::SendStatus::Ok;
+        }
     }
     return status;
 }
@@ -960,6 +1215,11 @@ std::uint64_t PublisherCore::dropped() const { return s_->fanout ? s_->fanout->d
 std::size_t PublisherCore::shm_subscribers() const { return s_->fanout ? s_->fanout->shm_subscribers() : 0; }
 std::uint64_t PublisherCore::shm_fallbacks() const { return s_->fanout ? s_->fanout->shm_fallbacks() : 0; }
 std::size_t PublisherCore::shm_bytes() const { return s_->fanout ? s_->fanout->shm_bytes() : 0; }
+std::uint64_t PublisherCore::unreachable() const {
+    return s_->unreachable.load() + (s_->fanout ? s_->fanout->unreachable() : 0);
+}
+std::uint64_t PublisherCore::rejected() const { return s_->rejected.load(); }
+std::uint16_t PublisherCore::net_port() const { return s_->net_socket ? s_->net_socket->local_port() : 0; }
 
 // ---------------------------------------------------------------------------
 // SubscriberCore
@@ -968,6 +1228,7 @@ std::size_t PublisherCore::shm_bytes() const { return s_->fanout ? s_->fanout->s
 struct SubscriberCore::State {
     TypeInfo type;
     std::string where;
+    std::string net_ip;   // AGMEN_NET_IP (solo pruebas, RFC 0011 §2); "" = no está. Antes que el socket
     net::UdpSocket socket;
     std::unique_ptr<Listener> tcp;   // solo tipos arrow
     std::vector<std::uint8_t> buf = std::vector<std::uint8_t>(65536);
@@ -982,6 +1243,21 @@ struct SubscriberCore::State {
     bool tcp_warned = false;
     bool lent_warned = false;
     std::chrono::steady_clock::time_point last_forget = std::chrono::steady_clock::now();
+    // Modo red (RFC 0011 §2): solo por topic, y solo cuando el hub lo dice (un `ok` con peers).
+    std::vector<std::pair<std::string, std::string>> fields;   // los del latido (para cambiar el puerto)
+    std::string listen_ip;
+    bool net = false;                                   // ya escucha en la red
+    bool net_failed = false;
+    std::optional<std::vector<std::string>> allowed;    // de qué IP acepta; sin valor = sin filtro (local)
+    std::optional<net::UdpSocket> old_udp;              // el socket de antes, mientras se cambia
+    std::optional<std::chrono::steady_clock::time_point> old_until;   // hasta cuándo se lee (kNetOld tras confirmar)
+    std::uint64_t moves = 0;                            // cuántas veces cambiaron los sockets
+    std::atomic<std::uint64_t> rejected{0};
+    std::set<std::string> rejected_ips;
+    std::chrono::steady_clock::time_point last_ok{};   // el último `ok` del hub (modo red, RFC 0011 §9.2)
+    bool expired = false;                              // ya volvió a solo lo local por falta de `ok` (avisado)
+    std::vector<std::string> quiet_peers;              // los peers de cuando el hub calló (RFC 0011 §10.2)
+    std::set<std::string> quiet_warned;
 
     void forget_idle_blocks(bool now_please) {
         const auto now = std::chrono::steady_clock::now();
@@ -991,26 +1267,137 @@ struct SubscriberCore::State {
     }
 
     State(const std::string& w, TypeInfo t)
-        : type(std::move(t)), where(w), socket(net::UdpSocket::bind(hub::is_topic(w) ? "127.0.0.1:0" : w)) {
+        : type(std::move(t)),
+          where(w),
+          net_ip(hub::is_topic(w) ? net_ip_from_env() : std::string()),   // antes de abrir nada: error claro
+          socket(net::UdpSocket::bind(hub::is_topic(w) ? "127.0.0.1:0" : w)),
+          listen_ip(hub::is_topic(w) ? std::string(hub::kLocalhost) : host_of(w)) {
         if (type.arrow) {
             // Los mensajes arrow llegan por TCP: con dirección fija, la misma IP y el mismo puerto.
             tcp = hub::is_topic(w) ? std::make_unique<Listener>("127.0.0.1:0", shm::enabled()) : same_port_listener(w);
+            tcp->net_ip = net_ip;
         }
         if (hub::is_topic(w)) {
             check_topic_or_throw(w);
             topic = w;
             const auto id = hub::hex16(wire::random_source_id());
-            std::vector<std::pair<std::string, std::string>> fields{{"id", id},
+            std::vector<std::pair<std::string, std::string>> beat{{"id", id},
                                                                     {"node", hub::node_name()},
                                                                     {"pid", hub::process_id()},
                                                                     {"topic", w},
                                                                     {"schema", hub::hex16(type.schema_id)},
                                                                     {"type", type.name},
                                                                     {"port", std::to_string(socket.local_port())}};
-            if (tcp) fields.emplace_back("tcp", std::to_string(tcp->listener.local_port()));
-            link.emplace(id, hub::line("sub", fields));
+            if (tcp) beat.emplace_back("tcp", std::to_string(tcp->listener.local_port()));
+            link.emplace(id, hub::line("sub", beat));
             link->beat(socket);
+            fields = std::move(beat);
         }
+    }
+
+    // --- modo red (RFC 0011 §2): lo mismo que _on_ok, _go_net, _set_allowed, _reject y _retire_old
+    // de python/agmen/pubsub.py ---
+
+    /// Un `ok` del hub (con `link_mu`): con `peers`, el hub está en modo red. `via`: el socket por
+    /// donde llegó.
+    void on_ok(std::intptr_t via) {
+        const auto peers = link->peers();
+        last_ok = std::chrono::steady_clock::now();
+        quiet_peers.clear();   // el hub contesta: lo de §10.2 ya no aplica
+        quiet_warned.clear();
+        if (peers && !peers->empty()) expired = false;
+        if (peers && !net) go_net();
+        if (!net) return;
+        if (via == socket.native_handle() && old_udp && !old_until) {
+            old_until = std::chrono::steady_clock::now() + kNetOld;   // el hub confirmó el registro nuevo
+        }
+        // Sin peers (el hub volvió a modo local): los mismos sockets, pero solo lo local.
+        set_allowed(peers ? *peers : std::vector<std::string>{});
+    }
+
+    /// Sockets nuevos en todas las interfaces (o en AGMEN_NET_IP); se registra con ellos y net=1.
+    /// Los de antes se siguen leyendo hasta kNetOld después de que el hub confirme.
+    void go_net() {
+        const std::string ip = net_ip.empty() ? std::string("0.0.0.0") : net_ip;
+        try {
+            auto udp = net::UdpSocket::bind(ip + ":0");
+            if (tcp) tcp->rebind(ip + ":0");   // si falla, el Listener queda como estaba
+            old_udp.emplace(std::move(socket));
+            socket = std::move(udp);
+        } catch (const net::NetError& e) {
+            if (!net_failed) {
+                net_failed = true;
+                log::write("[agmen] ⚠ '" + topic + "': el hub está en modo red pero no pude escuchar en " + ip +
+                           ": " + e.what() +
+                           ". Sigo solo en esta computadora (127.0.0.1); lo vuelvo a intentar con cada latido.");
+            }
+            return;
+        }
+        net = true;
+        ++moves;
+        listen_ip = ip;
+        bool has_net = false;
+        for (auto& [k, v] : fields) {
+            if (k == "port") v = std::to_string(socket.local_port());
+            if (k == "tcp" && tcp) v = std::to_string(tcp->listener.local_port());
+            has_net = has_net || k == "net";
+        }
+        if (!has_net) fields.emplace_back("net", "1");
+        link->set_beat(hub::line("sub", fields));
+        link->beat(socket);
+    }
+
+    void set_allowed(const std::vector<std::string>& ips) {
+        std::vector<std::string> fresh{std::string(hub::kLocalhost)};
+        if (!net_ip.empty()) fresh.push_back(net_ip);
+        fresh.insert(fresh.end(), ips.begin(), ips.end());
+        if (allowed && *allowed == fresh) return;
+        allowed = fresh;
+        if (tcp) tcp->set_allow(std::move(fresh), [this](const std::string& ip) { reject(ip); });
+    }
+
+    /// Ningún `ok` del hub en kNetExpire: como un `ok` sin peers, solo lo local (RFC 0011 §9.2). Solo se
+    /// llama con la lista de IP ya armada (en modo red).
+    void expire_check() {
+        if (std::chrono::steady_clock::now() - last_ok <= hub::kNetExpire) return;
+        const std::size_t n_local = net_ip.empty() ? 1 : 2;
+        if (allowed && allowed->size() == n_local) return;   // ya solo lo local
+        if (allowed) {   // sus datos se descartan con otro texto (§10.2)
+            quiet_peers.assign(allowed->begin() + static_cast<std::ptrdiff_t>(n_local), allowed->end());
+        }
+        set_allowed({});
+        if (!expired) {
+            expired = true;
+            log::write("[agmen] ⚠ '" + topic + "': el hub no contesta hace más de " +
+                       std::to_string(hub::kNetExpire.count() / 1000) +
+                       " s; dejo de aceptar datos de otras computadoras hasta que vuelva (¿se cerró 'agmen hub' o "
+                       "'agmen run'?)");
+        }
+    }
+
+    void reject(const std::string& ip) {
+        rejected.fetch_add(1);
+        if (std::find(quiet_peers.begin(), quiet_peers.end(), ip) != quiet_peers.end()) {
+            // SÍ es de [[machine]], pero el hub calló (RFC 0011 §10.2): el mismo texto que Python.
+            if (quiet_warned.size() < kMaxRejectedWarned && quiet_warned.insert(ip).second) {
+                log::write("[agmen] '" + topic + "': llegó un dato de " + ip +
+                           " (una computadora de [[machine]]), pero mi hub no contesta hace " +
+                           std::to_string(hub::kNetExpire.count() / 1000) + " s: no lo acepto hasta que vuelva");
+            }
+            return;
+        }
+        // Una vez por IP; con un tope, para que una avalancha de IP distintas no llene la salida.
+        if (rejected_ips.size() < kMaxRejectedWarned && rejected_ips.insert(ip).second) {
+            log::write("[agmen] '" + topic + "': llegó un dato de " + ip +
+                       ", que no es una computadora de [[machine]]: lo descarté (¿otra red, otro robot?)");
+        }
+    }
+
+    /// Cierra los sockets de antes (las conexiones TCP ya aceptadas siguen).
+    void retire_old() {
+        old_udp.reset();
+        old_until.reset();
+        if (tcp) tcp->retire_old();
     }
 
     ~State() {
@@ -1179,12 +1566,27 @@ struct SubscriberCore::State {
         return RawSample{env, Payload(view, std::move(lease)), std::move(from)};
     }
 
-    /// Un datagrama UDP: control del hub, o datos.
-    std::optional<RawSample> handle_datagram(wire::ByteView data, std::string from) {
+    /// Un datagrama UDP: control del hub, o datos. `via`: el socket por donde llegó.
+    std::optional<RawSample> handle_datagram(wire::ByteView data, std::string from, std::intptr_t via) {
+        if (allowed) {   // sin valor hasta que escucha en la red: sin trabajo de más
+            expire_check();
+            if (!ip_in(from, *allowed)) {
+                reject(host_of(from));
+                return std::nullopt;
+            }
+        }
+        if (link && hub::is_control(data) && !link->from_hub(from)) {   // RFC 0011 §9.1: solo si es del hub
+            rejected.fetch_add(1);
+            std::lock_guard lock(link_mu);
+            link->warn_foreign(topic, from);
+            return std::nullopt;
+        }
         if (link) {
             std::optional<std::vector<std::string>> unused;
             std::unique_lock lock(link_mu);
+            const auto oks = link->oks();
             if (link->handle(data, unused)) {
+                if (link->oks() != oks) on_ok(via);
                 if (!link->error().empty()) {
                     throw wire::WireError(wire::WireError::Kind::HubRejected,
                                           "el hub rechazó escuchar '" + topic + "': " + link->error());
@@ -1212,32 +1614,68 @@ std::optional<RawSample> SubscriberCore::receive_raw(std::chrono::milliseconds t
             s.link->maybe_beat(s.socket);
         }
         s.forget_idle_blocks(false);
-        const auto left = duration_cast<milliseconds>(deadline - steady_clock::now());
-        const auto wait = left.count() > 0 ? left : milliseconds(0);
-        if (!s.tcp) {
+        auto now = steady_clock::now();
+        const auto left = duration_cast<milliseconds>(deadline - now);
+        auto wait = left.count() > 0 ? left : milliseconds(0);
+        if (!s.tcp && !s.old_udp) {   // un solo socket UDP: lo de siempre
             const auto rx = s.socket.recv_from(s.buf, wait);
             if (!rx) return std::nullopt;
-            if (auto out = s.handle_datagram(wire::ByteView(s.buf.data(), rx->size), rx->from)) return out;
+            if (auto out = s.handle_datagram(wire::ByteView(s.buf.data(), rx->size), rx->from,
+                                             s.socket.native_handle())) {
+                return out;
+            }
             continue;   // control o anuncio: si ya pasó el tiempo, la siguiente lectura no espera
         }
-        // Tipo arrow: UDP (control y anuncios) y TCP (los datos) a la vez.
-        if (!s.tcp->ready.empty()) {
+        // Tipo arrow (UDP para control y anuncios, TCP para los datos), o el socket de antes mientras
+        // se pasa a la red (RFC 0011 §2): todos a la vez.
+        // La caducidad, antes de entregar lo ya leído de TCP y de aceptar conexiones (RFC 0011 §9.2, §10.3).
+        if (s.allowed) s.expire_check();
+        if (s.tcp && !s.tcp->ready.empty()) {
             auto got = std::move(s.tcp->ready.front());
             s.tcp->ready.pop_front();
+            if (s.allowed && !ip_in(got.from, *s.allowed)) {
+                s.reject(host_of(got.from));   // leído antes de que su IP dejara de valer
+                continue;
+            }
             if (auto out = s.handle_packet(got.packet, std::move(got.from), got.peer)) return out;
             continue;
         }
-        std::vector<std::intptr_t> handles{s.socket.native_handle()};
-        s.tcp->handles(handles);
-        std::unique_ptr<bool[]> ready(new bool[handles.size()]());
-        const int n = net::wait_readable(handles, wait, std::span<bool>(ready.get(), handles.size()));
-        if (n <= 0) return std::nullopt;
-        if (ready[0]) {
-            if (const auto rx = s.socket.recv_from(s.buf, milliseconds(0))) {
-                if (auto out = s.handle_datagram(wire::ByteView(s.buf.data(), rx->size), rx->from)) return out;
+        bool hasta_el_final = true;   // ¿esta espera llega hasta `deadline`? (o hasta cerrar los sockets de antes)
+        if (s.old_until) {
+            if (now >= *s.old_until) {
+                s.retire_old();
+                continue;
+            }
+            if (const auto until_old = duration_cast<milliseconds>(*s.old_until - now) + milliseconds(1);
+                until_old < wait) {
+                wait = until_old;
+                hasta_el_final = false;
             }
         }
-        s.tcp->service(handles, ready.get(), 1);
+        std::vector<std::intptr_t> handles{s.socket.native_handle()};
+        if (s.old_udp) handles.push_back(s.old_udp->native_handle());
+        const std::size_t n_udp = handles.size();
+        if (s.tcp) s.tcp->handles(handles);
+        std::unique_ptr<bool[]> ready(new bool[handles.size()]());
+        const int n = net::wait_readable(handles, wait, std::span<bool>(ready.get(), handles.size()));
+        if (n <= 0) {
+            if (hasta_el_final) return std::nullopt;
+            continue;
+        }
+        const auto moves = s.moves;
+        bool again = false;
+        for (std::size_t i = 0; i < n_udp && !again; ++i) {
+            if (!ready[i]) continue;
+            net::UdpSocket& udp = i == 0 ? s.socket : *s.old_udp;
+            if (const auto rx = udp.recv_from(s.buf, milliseconds(0))) {
+                if (auto out = s.handle_datagram(wire::ByteView(s.buf.data(), rx->size), rx->from, handles[i])) {
+                    return out;
+                }
+            }
+            again = s.moves != moves;   // recién se cambiaron los sockets: se vuelve a empezar
+        }
+        if (again) continue;
+        if (s.tcp) s.tcp->service(handles, ready.get(), n_udp);
     }
 }
 
@@ -1253,11 +1691,24 @@ std::size_t SubscriberCore::shm_mapped() const { return s_->tcp ? s_->tcp->mappe
 
 std::uint16_t SubscriberCore::local_port() const { return s_->socket.local_port(); }
 std::uint16_t SubscriberCore::tcp_port() const { return s_->tcp ? s_->tcp->listener.local_port() : 0; }
+std::string SubscriberCore::listen_ip() const {
+    std::lock_guard lock(s_->link_mu);   // go_net() la cambia con link_mu (RFC 0011 §10.4)
+    return s_->listen_ip;
+}
+ListenAddress SubscriberCore::listen_address() const {
+    // go_net() cambia la IP y los dos sockets con link_mu tomado: aquí, los tres de una vez (§10.4).
+    // link_mu nunca se tiene durante la espera de receive_raw(), solo mientras se atiende un datagrama.
+    std::lock_guard lock(s_->link_mu);
+    const std::uint16_t puerto_tcp = s_->tcp ? s_->tcp->listener.local_port() : std::uint16_t{0};
+    return ListenAddress{s_->listen_ip, s_->socket.local_port(), puerto_tcp};
+}
+std::uint64_t SubscriberCore::rejected() const { return s_->rejected.load(); }
 
 const std::string& SubscriberCore::last_from() const { return s_->last_from; }
 std::intptr_t SubscriberCore::native_handle() const { return s_->socket.native_handle(); }
 std::vector<std::intptr_t> SubscriberCore::native_handles() const {
     std::vector<std::intptr_t> out{s_->socket.native_handle()};
+    if (s_->old_udp) out.push_back(s_->old_udp->native_handle());
     if (s_->tcp) s_->tcp->handles(out);
     return out;
 }

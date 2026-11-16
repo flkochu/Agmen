@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 import unittest
+import unittest.mock
 from dataclasses import dataclass
 
 import agmen
@@ -267,6 +268,315 @@ class TestTopicsEsperados(unittest.TestCase):
             p2.close()
         finally:
             h.close()
+
+
+# --- Modo red (RFC 0011 §3.5, parte 4a): el hub sin hilos, con `now` a mano ---------
+
+ROBOT, LAPTOP = "192.168.1.20", "192.168.1.5"
+LOCAL = ("127.0.0.1", 50000)          # de dónde manda el proceso local (en la 4b, el puente)
+
+
+class TestModoRedProtocolo(unittest.TestCase):
+    """Los mismos casos revisa tests/test_wire.cpp (hub_modo_red)."""
+
+    def test_peers(self):
+        self.assertEqual(hp.parse_peers("robot@192.168.1.20,laptop-2@10.0.0.5"),
+                         [("robot", "192.168.1.20"), ("laptop-2", "10.0.0.5")])
+        self.assertEqual(hp.parse_peers(""), [])
+        self.assertEqual(hp.format_peers([("robot", "192.168.1.20"), ("b", "10.0.0.5")]),
+                         "robot@192.168.1.20,b@10.0.0.5")
+        # '@' no está entre los bytes que van sin escapar: en la red va como %40 (y se lee de las dos formas).
+        self.assertEqual(hp.line("red", peers="robot@192.168.1.20"), "agmen-hub/1 red peers=robot%40192.168.1.20")
+        self.assertEqual(hp.parse(b"agmen-hub/1 red peers=robot@192.168.1.20"),
+                         [("red", {"peers": "robot@192.168.1.20"})])
+        self.assertEqual(hp.line("red_ok", peers=1), "agmen-hub/1 red_ok peers=1")
+        for bad, why in [("robot", "nombre@ip"), ("robot@", "IP válida"), ("@1.2.3.4", "nombre de computadora"),
+                         ("ro bot@1.2.3.4", "nombre de computadora"), ("robót@1.2.3.4", "nombre de computadora"),
+                         ("robot@127.0.0.1", "esta misma computadora"), ("robot@0.0.0.0", "dirección especial"),
+                         ("robot@127.0.0.4", "con AGMEN_NET_IP"),
+                         ("robot@224.0.0.1", "dirección especial"), ("robot@255.255.255.255", "dirección especial"),
+                         ("robot@1.2.3.4,ROBOT@1.2.3.5", "dos veces"), ("a@1.2.3.4,b@1.2.3.4", "misma IP"),
+                         ("robot@1.2.3", "IP válida"), ("robot@1.2.3.256", "IP válida"),
+                         ("robot@01.2.3.4", "IP válida"), ("robot@1.2.3.4.5", "IP válida"),
+                         ("robot@a.b.c.d", "IP válida"), ("robot@1.2.3.4:80", "IP válida")]:
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(hp.ProtocolError, why):
+                    hp.parse_peers(bad)
+
+    def test_direcciones_y_puertos(self):
+        self.assertEqual(hp.parse_hostport("192.168.1.20:7500"), ("192.168.1.20", 7500))
+        self.assertEqual(hp.parse_port("65535"), 65535)
+        for bad in ["192.168.1.20", "192.168.1.20:0", "192.168.1.20:65536", "192.168.1.20:-1",
+                    "192.168.1.20:x", "x:80", ":80", "192.168.1.20:"]:
+            with self.subTest(bad=bad):
+                with self.assertRaises(hp.ProtocolError):
+                    hp.parse_hostport(bad)
+        self.assertEqual(hp.split_list("a,,b,"), ["a", "b"])
+        self.assertEqual((hp.NET_BEAT_S, hp.NET_EXPIRE_S), (2.0, 6.0))
+
+
+class TestModoRed(unittest.TestCase):
+    def setUp(self):
+        self.logs: list[str] = []
+        self.hub = H.Hub(f"127.0.0.1:{free_port()}", log=self.logs.append, grace_s=0.0)
+        self.sent: list[tuple[str, tuple[str, int]]] = []
+        self.hub._send = lambda data, addr: self.sent.append((data.decode(), addr))
+
+    def tearDown(self):
+        self.hub.sock.close()
+
+    def send(self, op, src=LOCAL, now=0.0, **fields):
+        self.sent.clear()
+        self.hub.handle(hp.encode(op, **fields), src, now)
+        return [(hp.parse(d.encode())[0], a) for d, a in self.sent]
+
+    def red(self, peers=f"robot@{ROBOT},laptop@{LAPTOP}", now=0.0, src=LOCAL):
+        return self.send("red", src=src, now=now, peers=peers)
+
+    def sub(self, eid="s1", topic="/cmd", now=0.0, src=LOCAL, **extra):
+        fields = dict(id=eid, node="n_" + eid, pid=1, topic=topic, schema="00000000000000aa", type="Cmd")
+        if "machine" not in extra:
+            fields["port"] = 6000
+        fields.update(extra)
+        return self.send("sub", src=src, now=now, **fields)
+
+    def pub(self, eid="p1", topic="/cmd", now=0.0, src=("127.0.0.1", 40000), schema="00000000000000aa", **extra):
+        return self.send("pub", src=src, now=now, id=eid, node="n_" + eid, pid=1, topic=topic,
+                         schema=schema, type="Cmd", text="Cmd{f32 a}", **extra)
+
+    def raw(self):
+        return [d for d, _ in self.sent]
+
+    def ep(self, eid):
+        state = hp.parse(self.hub.state_text().encode())
+        return next(f for op, f in state if op == "ep" and f["id"] == eid)
+
+    def test_modo_local_son_los_bytes_de_siempre_y_red_los_cambia(self):
+        self.send("ping")
+        self.assertEqual(self.raw(), [f"agmen-hub/1 pong version={agmen.__version__}"])
+        self.sub()
+        self.assertEqual(self.raw()[0], "agmen-hub/1 ok id=s1")
+        self.assertEqual(set(self.ep("s1")), {"id", "kind", "node", "pid", "topic", "type", "addr", "tcp", "age"})
+        self.red()
+        self.assertEqual(self.raw(), ["agmen-hub/1 red_ok peers=2"])
+        self.assertTrue(any("modo red" in x and "robot (192.168.1.20)" in x for x in self.logs))
+        self.send("ping")
+        self.assertEqual(self.raw(), [f"agmen-hub/1 pong version={agmen.__version__} red=1"])
+        self.sub()
+        self.assertEqual(self.raw()[0], f"agmen-hub/1 ok id=s1 peers={ROBOT},{LAPTOP}")
+        self.assertEqual(self.sent[0][1], ("127.0.0.1", 6000))
+        self.sub(net=1)
+        self.assertEqual(self.ep("s1")["net"], "1")
+
+    def test_red_se_repite_y_caduca(self):
+        self.red(now=0.0)
+        self.red(now=4.0)                         # quien lo encendió lo repite
+        self.hub.expire(9.0)
+        self.assertTrue(self.hub.net_mode)
+        self.pub(now=9.0)
+        self.send("sub", now=9.0, id="r1", node="cam", pid=7, topic="/cmd", schema="00000000000000aa",
+                  type="Cmd", machine="robot", addr=f"{ROBOT}:7600")
+        self.sent.clear()
+        self.hub.expire(10.5)                     # 6.5 s sin otro `red`
+        self.assertFalse(self.hub.net_mode)
+        self.assertTrue(any("modo red apagado" in x and "6 s" in x for x in self.logs))
+        self.assertNotIn("r1", self.hub.endpoints)
+        subs = [d for d in self.raw() if " subs " in d]
+        self.assertEqual(subs, ["agmen-hub/1 subs id=p1 topic=/cmd to= tcp="])   # se avisa al Publisher
+        self.send("ping")
+        self.assertEqual(self.raw(), [f"agmen-hub/1 pong version={agmen.__version__}"])
+
+    def test_red_vacio_vuelve_a_modo_local(self):
+        self.red()
+        self.assertEqual(self.red(peers=""), [(("red_ok", {"peers": "0"}), LOCAL)])
+        self.assertFalse(self.hub.net_mode)
+        self.assertTrue(any("modo red apagado" in x for x in self.logs))
+        self.sub()
+        self.assertEqual(self.raw()[0], "agmen-hub/1 ok id=s1")
+
+    def test_red_rechazado(self):
+        self.red(peers=f"robot@{ROBOT}")
+        for peers, why in [(f"robot@{ROBOT},robot@{LAPTOP}", "dos veces"), (f"a@{ROBOT},b@{ROBOT}", "misma IP"),
+                           ("robot@127.0.0.1", "esta misma computadora"), ("robot@999.1.1.1", "IP válida"),
+                           ("basura", "nombre@ip"), ("ro%20bot@1.2.3.4", "nombre de computadora")]:
+            with self.subTest(peers=peers):
+                ((op, f), _), = self.red(peers=peers)
+                self.assertEqual(op, "error")
+                self.assertNotIn("id", f)
+                self.assertIn(why, f["msg"])
+        self.assertEqual(self.hub.peers, [("robot", ROBOT)])   # lo malo no cambia nada
+        ((op, f), _), = self.send("red")
+        self.assertIn("sin peers", f["msg"])
+        ((op, f), _), = self.red(src=("192.168.1.99", 7390))
+        self.assertEqual(op, "error")
+        self.assertIn("solo se acepta desde esta computadora (127.0.0.1) y llegó de 192.168.1.99", f["msg"])
+
+    def test_entradas_de_otra_computadora(self):
+        self.pub()
+        self.red()
+        got = self.send("sub", id="r1", node="cam", pid=7, topic="/cmd", schema="00000000000000aa",
+                        type="Cmd", machine="robot", addr=f"{ROBOT}:7600", tcp=7700)
+        self.assertIn((("ok", {"id": "r1", "peers": f"{ROBOT},{LAPTOP}"}), LOCAL), got)   # al que la registró
+        subs = [d for d in self.raw() if " subs " in d]
+        self.assertEqual(subs, [f"agmen-hub/1 subs id=p1 topic=/cmd to={ROBOT}:7600 tcp={ROBOT}:7700"])
+        self.assertTrue(any("'cam' (de la computadora 'robot') escucha /cmd" in x for x in self.logs))
+        # Un Publisher de otra computadora: cuenta, pero no recibe `subs`.
+        got = self.send("pub", id="r2", node="lidar", pid=8, topic="/scan", schema="00000000000000bb",
+                        type="Scan", text="Scan{f32 a}", machine="laptop")
+        self.assertEqual([op for (op, _), _ in got], ["ok"])
+        state = hp.parse(self.hub.state_text().encode())
+        topic = next(f for op, f in state if op == "topic" and f["name"] == "/cmd")
+        self.assertEqual(topic["subs"], "1")
+        self.assertEqual(self.ep("r1")["machine"], "robot")
+        self.assertEqual(self.ep("r1")["addr"], f"{ROBOT}:7600")
+        self.assertEqual(self.ep("r2")["machine"], "laptop")
+        self.assertNotIn("machine", self.ep("p1"))
+        # Caducan como cualquiera (3 s sin latir); el modo red sigue vivo.
+        self.red(now=3.0)
+        self.hub.expire(3.5)
+        self.assertNotIn("r1", self.hub.endpoints)
+        self.assertTrue(any("'cam' (de la computadora 'robot') no latió" in x for x in self.logs))
+
+    def test_entradas_de_otra_computadora_rechazadas(self):
+        base = dict(id="r1", node="cam", pid=7, topic="/cmd", schema="00000000000000aa", type="Cmd")
+        ((op, f), _), = self.send("sub", machine="robot", addr=f"{ROBOT}:7600", **base)
+        self.assertEqual((op, f["id"]), ("error", "r1"))
+        self.assertIn("modo local", f["msg"])
+        self.red()
+        for extra, why in [(dict(machine="tablet", addr=f"{ROBOT}:7600"), "no está en peers (robot, laptop)"),
+                           (dict(machine="robot", addr=f"{LAPTOP}:7600"), "pero 'robot' es 192.168.1.20"),
+                           (dict(machine="robot"), "falta addr"),
+                           (dict(machine="robot", addr=f"{ROBOT}:70000"), "1 a 65535"),
+                           (dict(machine="robot", addr=f"{ROBOT}:7600", tcp="x"), "puerto tcp"),
+                           (dict(machine="robot", addr="robot:7600"), "IP válida"),
+                           (dict(machine="robot", addr=f"{ROBOT}:7600", net=1), "net=1 es de un Subscriber"),
+                           (dict(addr=f"{ROBOT}:7600", port=6000), "addr va solo con machine")]:
+            with self.subTest(extra=extra):
+                ((op, f), _), = self.send("sub", **base, **extra)
+                self.assertEqual(op, "error")
+                self.assertIn(why, f["msg"])
+        ((op, f), _), = self.send("pub", id="r2", node="x", pid=1, topic="/a", schema="00000000000000aa",
+                                  machine="robot", addr=f"{ROBOT}:1")
+        self.assertIn("no lleva addr", f["msg"])
+        for fields in (dict(machine="robot", addr=f"{ROBOT}:7600"), dict(port=6000, net=1)):
+            ((op, f), _), = self.send("sub", src=("192.168.1.99", 5000), **base, **fields)
+            self.assertIn("solo se acepta desde esta computadora", f["msg"])
+        self.assertEqual(self.hub.endpoints, {})
+
+    def test_un_topic_un_tipo_entre_computadoras(self):
+        self.red()
+        self.pub(schema="00000000000000aa")
+        ((op, f), _), = self.send("sub", id="r1", node="cam", pid=7, topic="/cmd", schema="00000000000000bb",
+                                  type="Imu", machine="robot", addr=f"{ROBOT}:7600")
+        self.assertEqual(op, "error")
+        self.assertIn("de 'n_p1' en esta computadora", f["msg"])
+        self.assertIn("'cam' (en la computadora 'robot') quiere usarlo con Imu", f["msg"])
+
+    def test_topics_esperados_y_obligatorios(self):
+        self.hub.expected = {e.topic: e for e in H.parse_expected(["/cmd=Cmd"], ["/cmd"])}
+        self.red()
+        self.send("sub", id="r1", node="cam", pid=7, topic="/cmdd", schema="00000000000000aa", type="Cmd",
+                  machine="robot", addr=f"{ROBOT}:7600")
+        self.assertTrue(any("'cam' (de la computadora 'robot') escucha '/cmdd', que no está declarado" in x
+                            for x in self.logs))
+        self.send("pub", id="r2", node="mando", pid=8, topic="/cmd", schema="00000000000000aa", type="Cmd",
+                  machine="laptop")
+        self.hub.check_required(1.0)
+        self.assertFalse(any("nadie publica '/cmd'" in x for x in self.logs))   # el de fuera cuenta
+
+    def test_aviso_del_subscriber_que_no_pasa_a_la_red(self):
+        self.sub("viejo", topic="/cmd")
+        self.sub("nuevo", topic="/imu", net=1)
+        self.red(now=10.0)                        # desde aquí cuentan los 5 s
+        for t in (11.0, 13.0, 14.5):
+            self.sub("viejo", topic="/cmd", now=t)
+            self.sub("nuevo", topic="/imu", now=t, net=1)
+        self.red(now=12.0)
+        self.hub.expire(14.9)
+        self.assertFalse(any("solo en esta computadora" in x for x in self.logs))
+        self.hub.expire(15.0)
+        self.hub.expire(15.5)                     # una sola vez
+        warned = [x for x in self.logs if "solo en esta computadora" in x]
+        self.assertEqual(warned, ["⚠ 'n_viejo' escucha /cmd solo en esta computadora: no recibirá de robot, "
+                                  "laptop. ¿Corre con un Agmen anterior? Actualízalo"])
+
+    def test_entradas_mal_formadas_no_tumban_al_hub(self):
+        ((op, f), _), = self.sub(port="abc")
+        self.assertEqual(op, "error")
+        ((op, f), _), = self.sub(port=70000)
+        self.assertIn("1 a 65535", f["msg"])
+        ((op, f), _), = self.red(peers=",".join(f"m{i}@10.0.{i // 250}.{i % 250 + 1}" for i in range(2000)))
+        self.assertEqual((op, f), ("red_ok", {"peers": "2000"}))
+        ((op, f), _), = self.red(peers=",".join(f"m{i}@10.1.{i // 250}.{i % 250 + 1}" for i in range(2000)) + ",m7@9.9.9.9")
+        self.assertIn("dos veces", f["msg"])
+        for i in range(3000):
+            self.hub.handle(hp.encode("sub", id=f"r{i}", node="cam", pid=7, topic="/cmd", schema="00000000000000aa",
+                                      type="Cmd", machine="m0", addr=f"10.0.0.1:{1000 + i}"), LOCAL, 0.0)
+        self.assertEqual(len(self.hub.endpoints), 3000)
+        self.red(peers="")
+        self.assertEqual(self.hub.endpoints, {})
+
+class TestNetIp(unittest.TestCase):
+    """AGMEN_NET_IP en el hub (RFC 0011, precisión §7): "desde esta computadora" es 127.0.0.1 y, solo con
+    la variable, también esa IP (un Subscriber en modo red late desde su socket atado a ella)."""
+
+    def hub(self, net_ip):
+        env = {"AGMEN_NET_IP": net_ip} if net_ip else {}
+        with unittest.mock.patch.dict(os.environ, env):
+            if not net_ip:
+                os.environ.pop("AGMEN_NET_IP", None)
+            h = H.Hub(f"127.0.0.1:{free_port()}", log=lambda t: None, grace_s=0.0)
+        self.addCleanup(h.sock.close)
+        sent = []
+        h._send = lambda data, addr: sent.append((hp.parse(data)[0], addr))
+        return h, sent
+
+    def sub(self, h, sent, src):
+        sent.clear()
+        h.handle(hp.encode("sub", id="s1", node="n", pid=1, topic="/cmd", schema="00000000000000aa", type="Cmd",
+                           port=6000, net=1), src, 0.0)
+        return sent
+
+    def test_con_agmen_net_ip_esa_ip_tambien_es_esta_computadora(self):
+        h, sent = self.hub("127.0.0.2")
+        h.handle(hp.encode("red", peers=f"robot@{ROBOT}"), ("127.0.0.2", 5000), 0.0)
+        self.assertEqual(sent[-1][0], ("red_ok", {"peers": "1"}))
+        got = self.sub(h, sent, ("127.0.0.2", 5000))
+        self.assertEqual(got, [(("ok", {"id": "s1", "peers": ROBOT}), ("127.0.0.2", 6000))])
+        self.assertTrue(h.endpoints["s1"].net)
+        ((op, f), _), = self.sub(h, sent, ("127.0.0.3", 5000))     # otra IP: no
+        self.assertEqual(op, "error")
+        self.assertIn("(127.0.0.1 o 127.0.0.2) y llegó de 127.0.0.3", f["msg"])
+
+    def test_una_127_como_peer_solo_con_agmen_net_ip(self):
+        """§9.6: sin AGMEN_NET_IP, una 127.x como otra computadora es un error claro; con ella (pruebas), vale."""
+        self.assertEqual(hp.parse_peers("a@127.0.0.4", loopback=True), [("a", "127.0.0.4")])
+        with self.assertRaisesRegex(hp.ProtocolError, "esta misma computadora"):
+            hp.parse_peers("a@127.0.0.1", loopback=True)            # 127.0.0.1, nunca
+        h, sent = self.hub("")
+        h.handle(hp.encode("red", peers="a@127.0.0.4"), LOCAL, 0.0)
+        ((op, f), _), = sent
+        self.assertEqual(op, "error")
+        self.assertIn("127.0.0.4 es esta misma computadora", f["msg"])
+        self.assertIn("solo valen en pruebas, con AGMEN_NET_IP", f["msg"])
+        self.assertFalse(h.net_mode)
+        h, sent = self.hub("127.0.0.2")
+        h.handle(hp.encode("red", peers="a@127.0.0.4"), LOCAL, 0.0)
+        self.assertEqual(sent, [(("red_ok", {"peers": "1"}), LOCAL)])
+        self.assertTrue(h.net_mode)
+
+    def test_sin_agmen_net_ip_solo_127_0_0_1(self):
+        h, sent = self.hub("")
+        h.handle(hp.encode("red", peers=f"robot@{ROBOT}"), LOCAL, 0.0)
+        ((op, f), _), = self.sub(h, sent, ("127.0.0.2", 5000))
+        self.assertEqual(op, "error")
+        self.assertIn("(127.0.0.1) y llegó de 127.0.0.2", f["msg"])
+
+    def test_agmen_net_ip_que_no_sirve(self):
+        with self.assertRaisesRegex(hp.ProtocolError, "AGMEN_NET_IP=300.1.1.1"):
+            self.hub("300.1.1.1")
+        with self.assertRaisesRegex(OSError, "AGMEN_NET_IP=192.0.2.77 no es una IP de esta computadora"):
+            self.hub("192.0.2.77")
 
 
 if __name__ == "__main__":

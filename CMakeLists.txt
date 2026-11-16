@@ -241,6 +241,12 @@ if(AGMEN_BUILD_TESTS)
     agmen_set_warnings(test_tcp)
     add_test(NAME tcp COMMAND test_tcp)
 
+    # Los nodos en modo red: escuchan en la red cuando su hub lo dice (RFC 0011 §2 y §3).
+    add_executable(test_red tests/test_red.cpp)
+    target_link_libraries(test_red PRIVATE agmen::core)
+    agmen_set_warnings(test_red)
+    add_test(NAME red COMMAND test_red)
+
     # Memoria compartida para los mensajes grandes (RFC 0009).
     add_executable(test_shm tests/test_shm.cpp)
     target_link_libraries(test_shm PRIVATE agmen::core)

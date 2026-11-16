@@ -10,13 +10,16 @@
 #include <agmen/layout.hpp>
 #include <agmen/wire.hpp>
 
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <functional>
 #include <map>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #ifndef AGMEN_VECTORS_FILE
@@ -481,6 +484,76 @@ void hub_protocolo() {
     CHECK(hub::is_topic("/imu") && !hub::is_topic("127.0.0.1:7500"));
 }
 
+// --- Modo red (RFC 0011 §3.5): los mismos casos que python/test_hub.py (TestModoRedProtocolo) ---
+
+void espera_rechazo(const std::function<void()>& fn, std::string_view why, const char* what) {
+    try {
+        fn();
+    } catch (const std::invalid_argument& e) {
+        if (std::string_view(e.what()).find(why) == std::string_view::npos) {
+            std::fprintf(stderr, "  FALLA: '%s': el error no dice '%.*s': %s\n", what,
+                         static_cast<int>(why.size()), why.data(), e.what());
+            ++g_failures;
+        }
+        return;
+    }
+    std::fprintf(stderr, "  FALLA: '%s' debería rechazarse\n", what);
+    ++g_failures;
+}
+
+void hub_modo_red() {
+    using namespace agmen;
+    using Peers = std::vector<std::pair<std::string, std::string>>;
+    CHECK(hub::parse_peers("robot@192.168.1.20,laptop-2@10.0.0.5") ==
+          Peers({{"robot", "192.168.1.20"}, {"laptop-2", "10.0.0.5"}}));
+    CHECK(hub::parse_peers("").empty());
+    CHECK(hub::format_peers({{"robot", "192.168.1.20"}, {"b", "10.0.0.5"}}) ==
+          "robot@192.168.1.20,b@10.0.0.5");
+    // '@' no va sin escapar: en la red es %40 (igual que Python), y se lee de las dos formas.
+    CHECK(hub::line("red", {{"peers", "robot@192.168.1.20"}}) ==
+          "agmen-hub/1 red peers=robot%40192.168.1.20");
+    CHECK(hub::line("red_ok", {{"peers", "1"}}) == "agmen-hub/1 red_ok peers=1");
+    const std::string raw = "agmen-hub/1 red peers=robot@192.168.1.20";
+    const auto red = hub::parse(ByteView(reinterpret_cast<const std::uint8_t*>(raw.data()), raw.size()));
+    CHECK(red.size() == 1 && red[0].op == "red" && red[0].get("peers") == "robot@192.168.1.20");
+    const std::pair<const char*, const char*> malos[] = {
+        {"robot", "nombre@ip"},
+        {"robot@", "IP válida"},
+        {"@1.2.3.4", "nombre de computadora"},
+        {"ro bot@1.2.3.4", "nombre de computadora"},
+        {"robót@1.2.3.4", "nombre de computadora"},
+        {"robot@127.0.0.1", "esta misma computadora"},
+        {"robot@127.0.0.4", "con AGMEN_NET_IP"},   // RFC 0011 §9.6: una 127.x solo en pruebas
+        {"robot@0.0.0.0", "dirección especial"},
+        {"robot@224.0.0.1", "dirección especial"},
+        {"robot@255.255.255.255", "dirección especial"},
+        {"robot@1.2.3.4,ROBOT@1.2.3.5", "dos veces"},
+        {"a@1.2.3.4,b@1.2.3.4", "misma IP"},
+        {"robot@1.2.3", "IP válida"},
+        {"robot@1.2.3.256", "IP válida"},
+        {"robot@01.2.3.4", "IP válida"},
+        {"robot@1.2.3.4.5", "IP válida"},
+        {"robot@a.b.c.d", "IP válida"},
+        {"robot@1.2.3.4:80", "IP válida"},
+    };
+    for (const auto& [bad, why] : malos) {
+        espera_rechazo([texto = bad] { (void)hub::parse_peers(texto); }, why, bad);
+    }
+    // Con AGMEN_NET_IP (pruebas), una 127.x vale como otra computadora; 127.0.0.1, nunca.
+    CHECK(hub::parse_peers("a@127.0.0.4", true) ==
+          (std::vector<std::pair<std::string, std::string>>{{"a", "127.0.0.4"}}));
+    espera_rechazo([] { (void)hub::parse_peers("a@127.0.0.1", true); }, "esta misma computadora", "127.0.0.1");
+    CHECK(hub::parse_hostport("192.168.1.20:7500") ==
+          std::make_pair(std::string("192.168.1.20"), std::uint16_t{7500}));
+    CHECK(hub::parse_port("65535") == 65535);
+    for (const char* bad : {"192.168.1.20", "192.168.1.20:0", "192.168.1.20:65536", "192.168.1.20:-1",
+                            "192.168.1.20:x", "x:80", ":80", "192.168.1.20:"}) {
+        espera_rechazo([bad] { (void)hub::parse_hostport(bad); }, "", bad);
+    }
+    CHECK(hub::split_list("a,,b,") == std::vector<std::string>({"a", "b"}));
+    CHECK(hub::kNetBeat.count() == 2000 && hub::kNetExpire.count() == 6000);
+}
+
 void source_id_aleatorio() {
     CHECK(random_source_id() != 0);
     CHECK(random_source_id() != random_source_id());
@@ -503,6 +576,7 @@ int main() {
         {"limites_iguales_en_check_y_layout", limites_iguales_en_check_y_layout},
         {"source_id_aleatorio", source_id_aleatorio},
         {"hub_protocolo", hub_protocolo},
+        {"hub_modo_red", hub_modo_red},
     };
     for (const auto& [name, fn] : tests) {
         const int before = g_failures;

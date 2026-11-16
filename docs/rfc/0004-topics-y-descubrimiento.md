@@ -240,6 +240,10 @@ las dos pasan los mismos casos de prueba.
 - Un Publisher que recibe un receptor nuevo en `subs` le manda **directo** su
   anuncio de esquema antes del siguiente dato.
 
+> Desde Agmen 0.14.0 (RFC 0011 §3.5) el protocolo tiene operaciones y campos nuevos para el modo red y las
+> entradas de otra computadora. Están descritos en [`docs/PROTOCOLO.md`](../PROTOCOLO.md#topics-y-hub-agmen-hub1).
+> La tabla de arriba sigue siendo lo de siempre, en modo local.
+
 ### 4.3 Lo que se implementó en 0.5.0
 
 | Parte | Dónde |

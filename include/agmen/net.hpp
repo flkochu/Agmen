@@ -122,6 +122,16 @@ public:
     /// Se conecta a "ip:puerto" esperando hasta `timeout`. Lanza NetError si no se pudo.
     [[nodiscard]] static TcpStream connect(const Address& to, std::chrono::milliseconds timeout);
 
+    /// Empieza a conectarse a `to` sin esperar (a otra computadora, RFC 0011 §3: puede tardar o no
+    /// contestar nunca). `from_ip` (si no está vacía): la IP desde la que sale (AGMEN_NET_IP).
+    /// `pending` queda en true si la conexión sigue en curso: quien espera escritura en el socket
+    /// la termina con finish_connect(). Lanza NetError si falla en el acto.
+    [[nodiscard]] static TcpStream connect_async(const Address& to, std::string_view from_ip, bool& pending);
+
+    /// Una conexión de connect_async() que el sistema dio por terminada: 0 si quedó lista; si no,
+    /// el código del error del sistema (y la cierra).
+    int finish_connect();
+
     TcpStream() = default;
     TcpStream(TcpStream&& other) noexcept;
     TcpStream& operator=(TcpStream&& other) noexcept;
