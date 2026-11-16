@@ -663,6 +663,7 @@ struct Peer {
     bool closed = false;
     // Solo los usa el hilo que recibe: los bloques que ya abrió, para no
     // abrirlos con cada mensaje, y cuándo los nombró el último descriptor.
+    // Se cambian con Listener::mu (shm_mapped() los cuenta desde otro hilo).
     struct Cached {
         std::shared_ptr<const shm::Segment> segment;
         std::chrono::steady_clock::time_point used{};
@@ -838,6 +839,11 @@ struct Incoming {
 };
 
 struct Listener {
+    // Solo el hilo que recibe CAMBIA listener, old, conns y los `blocks` de cada conexión, y siempre con
+    // `mu`; las propiedades (handles(), mapped(), port()) los leen desde otros hilos con `mu`. El hilo que
+    // recibe los lee sin `mu` (nadie más escribe). Con `mu` nunca se emite un aviso (log::write puede
+    // necesitar el GIL, y quien lee una propiedad desde Python lo tiene).
+    mutable std::mutex mu;
     net::TcpListener listener;
     bool shm = false;   // ¿decirle a cada publicador que podemos memoria compartida?
     std::vector<std::unique_ptr<Incoming>> conns;
@@ -852,6 +858,7 @@ struct Listener {
     Listener(std::string_view bind, bool can_shm) : listener(net::TcpListener::bind(bind)), shm(can_shm) {}
 
     void handles(std::vector<std::intptr_t>& out) const {
+        std::lock_guard lock(mu);
         out.push_back(listener.native_handle());
         for (const auto& o : old) out.push_back(o.native_handle());
         for (const auto& c : conns) {
@@ -863,17 +870,28 @@ struct Listener {
     /// conexiones ya aceptadas no se tocan. Si no se puede abrir, lanza NetError y nada cambia.
     void rebind(std::string_view bind) {
         auto fresh = net::TcpListener::bind(bind);
+        std::lock_guard lock(mu);
         old.push_back(std::move(listener));
         listener = std::move(fresh);
     }
 
     /// Cierra los puertos de escucha anteriores (no las conexiones que ya aceptaron).
-    void retire_old() { old.clear(); }
+    void retire_old() {
+        std::lock_guard lock(mu);
+        old.clear();
+    }
+
+    /// El puerto TCP donde escucha (desde cualquier hilo).
+    [[nodiscard]] std::uint16_t port() const {
+        std::lock_guard lock(mu);
+        return listener.local_port();
+    }
 
     /// De qué IP se aceptan conexiones; las aceptadas de una IP que ya no está se cierran.
     void set_allow(std::vector<std::string> ips, std::function<void(const std::string&)> reject) {
         allow = std::move(ips);
         on_reject = std::move(reject);
+        std::lock_guard lock(mu);
         for (auto it = conns.begin(); it != conns.end();) {
             if (ip_in((*it)->from, *allow)) {
                 ++it;
@@ -903,6 +921,7 @@ struct Listener {
                 c->peer->hello = true;
                 c->peer->say(shm::Record{shm::Op::Hello, 0, 0});
             }
+            std::lock_guard lock(mu);
             conns.push_back(std::move(c));
         }
     }
@@ -938,6 +957,7 @@ struct Listener {
             }
         }
         // Una conexión que se cerró al devolver un bloque (el publicador se fue).
+        std::lock_guard lock(mu);
         conns.erase(std::remove_if(conns.begin(), conns.end(),
                                    [](const auto& c) {
                                        if (c->handle() != -1) return false;
@@ -949,16 +969,19 @@ struct Listener {
     }
 
     void drop(std::vector<std::unique_ptr<Incoming>>::iterator it) {
+        std::lock_guard lock(mu);
         (*it)->peer->mark_closed();
         (*it)->peer->blocks.clear();
         conns.erase(it);
     }
 
     void forget_idle(std::chrono::steady_clock::time_point now) {
+        std::lock_guard lock(mu);
         for (auto& c : conns) c->peer->forget_idle(now);
     }
 
     [[nodiscard]] std::size_t mapped() const {
+        std::lock_guard lock(mu);
         std::size_t n = 0;
         for (const auto& c : conns) n += c->peer->blocks.size();
         return n;
@@ -984,7 +1007,12 @@ struct PublisherCore::State {
     std::vector<std::string> tcp_dests;
     std::unique_ptr<Fanout> fanout;   // solo tipos arrow
     std::optional<hub::Link> link;
-    std::uint64_t seq = 0;
+    // Lo que las propiedades leen desde otros hilos mientras uno publica (seq(), subscribers(),
+    // net_port()): atómicos, sin candado. Se escriben solo con `mu`; leerlos no espera a nadie (un hilo
+    // con el GIL nunca espera a uno que, con `mu`, puede necesitar el GIL para un aviso).
+    std::atomic<std::uint64_t> seq{0};
+    std::atomic<std::size_t> n_subs{0};          // dests.size() o tcp_dests.size()
+    std::atomic<std::uint16_t> net_port_now{0};  // el puerto de net_socket; 0 si no está abierto
     bool announced = false;
     std::chrono::steady_clock::time_point last_announce{};
     // Modo red (RFC 0011 §3): los destinos que no son 127.0.0.1 salen por otro socket (net_socket).
@@ -1023,9 +1051,11 @@ struct PublisherCore::State {
             }
         } else if (fanout) {
             tcp_dests.push_back(to);
+            n_subs.store(tcp_dests.size(), std::memory_order_relaxed);
             fanout->update(tcp_dests, std::make_shared<const wire::Bytes>(announcement()));
         } else {
             dests.push_back(net::Address::resolve(to));
+            n_subs.store(dests.size(), std::memory_order_relaxed);
         }
     }
 
@@ -1037,7 +1067,7 @@ struct PublisherCore::State {
     wire::Bytes announcement() const {
         return wire::encode_announcement(type.schema_text, topic,
                                          wire::Envelope{.source_id = source_id,
-                                                        .seq = seq,
+                                                        .seq = seq.load(std::memory_order_relaxed),
                                                         .t_pub = wire::now_ns(),
                                                         .clock = clock::domain()});
     }
@@ -1068,6 +1098,7 @@ struct PublisherCore::State {
             link->handle(data, subs, &tcp);
             if (subs && fanout) {
                 tcp_dests = tcp ? *tcp : std::vector<std::string>{};
+                n_subs.store(tcp_dests.size(), std::memory_order_relaxed);
                 fanout->update(tcp_dests, std::make_shared<const wire::Bytes>(announcement()));
             } else if (subs) {
                 std::vector<net::Address> fresh;
@@ -1086,6 +1117,7 @@ struct PublisherCore::State {
                     open_net_socket();
                 } else {
                     net_socket.reset();   // sin destinos de otra computadora: ningún puerto abierto a la red (§9.3)
+                    net_port_now.store(0, std::memory_order_relaxed);
                 }
                 const auto ann = announcement();
                 std::vector<char> known(fresh.size(), 0);
@@ -1093,6 +1125,7 @@ struct PublisherCore::State {
                     for (const auto& d : dests) known[i] = static_cast<char>(known[i] || d == fresh[i]);
                 }
                 dests = std::move(fresh);
+                n_subs.store(dests.size(), std::memory_order_relaxed);
                 remote = std::move(fresh_remote);
                 any_remote = fresh_any;
                 for (std::size_t i = 0; i < dests.size(); ++i) {
@@ -1108,6 +1141,7 @@ struct PublisherCore::State {
         const std::string bind = (net_ip.empty() ? std::string("0.0.0.0") : net_ip) + ":0";
         try {
             net_socket.emplace(net::UdpSocket::bind(bind));   // AGMEN_NET_IP: los envíos salen desde esa IP
+            net_port_now.store(net_socket->local_port(), std::memory_order_relaxed);
         } catch (const net::NetError& e) {
             log::write("[agmen] ⚠ '" + topic + "': no pude abrir el socket para mandar a otra computadora: " +
                        e.what() + ". Lo que vaya a otra computadora no sale (se cuenta en unreachable).");
@@ -1169,12 +1203,12 @@ net::SendStatus PublisherCore::publish_payload(wire::ByteView payload, std::int6
                              .schema_id = s.type.schema_id,
                              .topic_id = s.topic_id,
                              .source_id = s.source_id,
-                             .seq = s.seq,
+                             .seq = s.seq.load(std::memory_order_relaxed),
                              .t_data = t_data,
                              .t_pub = wire::now_ns(),
                              .payload_len = static_cast<std::uint32_t>(payload.size()),
                              .clock = clock::domain()};
-    ++s.seq;
+    s.seq.store(env.seq + 1, std::memory_order_relaxed);   // solo se escribe con `mu`
     if (s.fanout) return s.fanout->send(env, payload) ? net::SendStatus::Ok : net::SendStatus::NoListener;
     wire::Bytes packet;
     packet.reserve(wire::kEnvelopeLen + payload.size());
@@ -1206,10 +1240,10 @@ void PublisherCore::heartbeat() {
     s_->drain(std::chrono::milliseconds(0));
 }
 
-std::uint64_t PublisherCore::seq() const { return s_->seq; }
+std::uint64_t PublisherCore::seq() const { return s_->seq.load(std::memory_order_relaxed); }
 std::uint64_t PublisherCore::source_id() const { return s_->source_id; }
 const std::string& PublisherCore::topic() const { return s_->topic; }
-std::size_t PublisherCore::subscribers() const { return s_->fanout ? s_->tcp_dests.size() : s_->dests.size(); }
+std::size_t PublisherCore::subscribers() const { return s_->n_subs.load(std::memory_order_relaxed); }
 const TypeInfo& PublisherCore::type() const { return s_->type; }
 std::uint64_t PublisherCore::dropped() const { return s_->fanout ? s_->fanout->dropped() : 0; }
 std::size_t PublisherCore::shm_subscribers() const { return s_->fanout ? s_->fanout->shm_subscribers() : 0; }
@@ -1219,7 +1253,7 @@ std::uint64_t PublisherCore::unreachable() const {
     return s_->unreachable.load() + (s_->fanout ? s_->fanout->unreachable() : 0);
 }
 std::uint64_t PublisherCore::rejected() const { return s_->rejected.load(); }
-std::uint16_t PublisherCore::net_port() const { return s_->net_socket ? s_->net_socket->local_port() : 0; }
+std::uint16_t PublisherCore::net_port() const { return s_->net_port_now.load(std::memory_order_relaxed); }
 
 // ---------------------------------------------------------------------------
 // SubscriberCore
@@ -1234,8 +1268,13 @@ struct SubscriberCore::State {
     std::vector<std::uint8_t> buf = std::vector<std::uint8_t>(65536);
     std::optional<hub::Link> link;
     std::string topic;
+    // Lo que el hilo que recibe cambia y las propiedades leen desde otros hilos: `announced`, `socket`
+    // y `old_udp` (los cambia el paso a la red). Solo el hilo que recibe los escribe, siempre con
+    // prop_mu; él los lee sin candado. Con prop_mu nunca se emite un aviso ni se espera nada: quien lee
+    // una propiedad desde Python tiene el GIL. Orden de los candados: link_mu, prop_mu, Listener::mu.
+    mutable std::mutex prop_mu;
     std::map<std::uint64_t, wire::Announcement> announced;
-    std::string last_from;
+    std::string last_from;   // solo desde el hilo que recibe
     bool clock_warned = false;
     std::mutex link_mu;   // el enlace con el hub (heartbeat() puede venir de otro hilo)
     // Memoria compartida (RFC 0009)
@@ -1322,6 +1361,7 @@ struct SubscriberCore::State {
         try {
             auto udp = net::UdpSocket::bind(ip + ":0");
             if (tcp) tcp->rebind(ip + ":0");   // si falla, el Listener queda como estaba
+            std::lock_guard lock(prop_mu);
             old_udp.emplace(std::move(socket));
             socket = std::move(udp);
         } catch (const net::NetError& e) {
@@ -1395,7 +1435,10 @@ struct SubscriberCore::State {
 
     /// Cierra los sockets de antes (las conexiones TCP ya aceptadas siguen).
     void retire_old() {
-        old_udp.reset();
+        {
+            std::lock_guard lock(prop_mu);
+            old_udp.reset();
+        }
         old_until.reset();
         if (tcp) tcp->retire_old();
     }
@@ -1488,7 +1531,9 @@ struct SubscriberCore::State {
         last_from = from;
         const auto [env, payload] = wire::Envelope::read_from(data, peer != nullptr && peer->hello);
         if (env.encoding == wire::Encoding::Announcement) {
-            announced[env.schema_id] = wire::read_announcement(env, payload);
+            auto ann = wire::read_announcement(env, payload);
+            std::lock_guard lock(prop_mu);
+            announced[env.schema_id] = std::move(ann);
             return std::nullopt;
         }
         if ((env.flags & wire::kFlagShm) != 0) return from_shared(env, payload, std::move(from), peer);
@@ -1529,19 +1574,26 @@ struct SubscriberCore::State {
         }
         std::shared_ptr<const shm::Segment> seg;
         try {
-            auto& cached = peer->blocks[d.slot];
-            if (!cached.segment || cached.segment->name() != d.name || cached.segment->size() != d.size) {
-                cached.segment = std::make_shared<const shm::Segment>(shm::Segment::open(d.name, d.size));
+            {
+                // Con Listener::mu: shm_mapped() cuenta los bloques desde otro hilo.
+                std::lock_guard lock(tcp->mu);
+                auto& cached = peer->blocks[d.slot];
+                if (!cached.segment || cached.segment->name() != d.name || cached.segment->size() != d.size) {
+                    cached.segment = std::make_shared<const shm::Segment>(shm::Segment::open(d.name, d.size));
+                }
+                cached.used = std::chrono::steady_clock::now();
+                seg = cached.segment;
             }
-            cached.used = std::chrono::steady_clock::now();
-            seg = cached.segment;
             std::atomic_thread_fence(std::memory_order_acquire);
             const auto h = shm::BlockHeader::read(seg->data());
             if (h.owner != env.source_id || h.generation != d.generation || h.length != d.length) {
                 throw shm::ShmError("el bloque " + d.name + " no guarda el mensaje que dice el descriptor");
             }
         } catch (const shm::ShmError& e) {
-            peer->blocks.erase(d.slot);
+            {
+                std::lock_guard lock(tcp->mu);
+                peer->blocks.erase(d.slot);
+            }
             peer->say(shm::Record{shm::Op::Release, d.slot, d.generation});
             peer->say(shm::Record{shm::Op::ProbeFailed, d.slot, d.generation});   // lo que siga, por TCP
             warn_tcp(e.what());
@@ -1689,8 +1741,11 @@ void SubscriberCore::forget_idle_blocks() { s_->forget_idle_blocks(true); }
 
 std::size_t SubscriberCore::shm_mapped() const { return s_->tcp ? s_->tcp->mapped() : 0; }
 
-std::uint16_t SubscriberCore::local_port() const { return s_->socket.local_port(); }
-std::uint16_t SubscriberCore::tcp_port() const { return s_->tcp ? s_->tcp->listener.local_port() : 0; }
+std::uint16_t SubscriberCore::local_port() const {
+    std::lock_guard lock(s_->prop_mu);   // el paso a la red cambia el socket (desde el hilo que recibe)
+    return s_->socket.local_port();
+}
+std::uint16_t SubscriberCore::tcp_port() const { return s_->tcp ? s_->tcp->port() : 0; }
 std::string SubscriberCore::listen_ip() const {
     std::lock_guard lock(s_->link_mu);   // go_net() la cambia con link_mu (RFC 0011 §10.4)
     return s_->listen_ip;
@@ -1699,21 +1754,30 @@ ListenAddress SubscriberCore::listen_address() const {
     // go_net() cambia la IP y los dos sockets con link_mu tomado: aquí, los tres de una vez (§10.4).
     // link_mu nunca se tiene durante la espera de receive_raw(), solo mientras se atiende un datagrama.
     std::lock_guard lock(s_->link_mu);
-    const std::uint16_t puerto_tcp = s_->tcp ? s_->tcp->listener.local_port() : std::uint16_t{0};
+    const std::uint16_t puerto_tcp = s_->tcp ? s_->tcp->port() : std::uint16_t{0};
+    std::lock_guard props(s_->prop_mu);
     return ListenAddress{s_->listen_ip, s_->socket.local_port(), puerto_tcp};
 }
 std::uint64_t SubscriberCore::rejected() const { return s_->rejected.load(); }
 
 const std::string& SubscriberCore::last_from() const { return s_->last_from; }
-std::intptr_t SubscriberCore::native_handle() const { return s_->socket.native_handle(); }
+std::intptr_t SubscriberCore::native_handle() const {
+    std::lock_guard lock(s_->prop_mu);
+    return s_->socket.native_handle();
+}
 std::vector<std::intptr_t> SubscriberCore::native_handles() const {
-    std::vector<std::intptr_t> out{s_->socket.native_handle()};
+    std::vector<std::intptr_t> out;
+    std::lock_guard lock(s_->prop_mu);   // y, dentro de handles(), Listener::mu
+    out.push_back(s_->socket.native_handle());
     if (s_->old_udp) out.push_back(s_->old_udp->native_handle());
     if (s_->tcp) s_->tcp->handles(out);
     return out;
 }
 const std::string& SubscriberCore::where() const { return s_->where; }
 const TypeInfo& SubscriberCore::type() const { return s_->type; }
-const std::map<std::uint64_t, wire::Announcement>& SubscriberCore::announced() const { return s_->announced; }
+std::map<std::uint64_t, wire::Announcement> SubscriberCore::announced() const {
+    std::lock_guard lock(s_->prop_mu);   // una copia: el hilo que recibe anota anuncios mientras tanto
+    return s_->announced;
+}
 
 }  // namespace agmen

@@ -96,8 +96,11 @@ function(agmen_set_warnings target)
             target_compile_options(${target} PRIVATE -fsanitize=thread -fno-omit-frame-pointer -g -O1)
             # GCC avisa (-Wtsan) de los atomic_thread_fence del núcleo, que TSan no modela: el aviso se
             # queda, pero con AGMEN_WERROR no tumba el build. Lo que importe lo dirá TSan al correr.
+            # Con -O1 + -fsanitize=thread, GCC 13 da un -Wmaybe-uninitialized falso con std::optional
+            # (examples/nivel0/common.hpp: SeqTracker::expected_), que con -O2/-O3 no da: también queda
+            # como aviso, sin tumbar el build con AGMEN_WERROR (los builds normales siguen con -Werror).
             if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-                target_compile_options(${target} PRIVATE -Wno-error=tsan)
+                target_compile_options(${target} PRIVATE -Wno-error=tsan -Wno-error=maybe-uninitialized)
             endif()
             target_link_options(${target} PRIVATE -fsanitize=thread)
         endif()
