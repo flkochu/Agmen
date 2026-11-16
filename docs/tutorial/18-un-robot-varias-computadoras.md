@@ -502,8 +502,8 @@ en unos segundos, sin reiniciar nada.
 
 ### Si se corta el WiFi
 
-- El `/imu` deja de llegar a la laptop en unos segundos. Las entradas de la Pi caducan
-  en 3 s, y `topic hz` dirá `sin mensajes`.
+- El `/imu` deja de llegar a la laptop en cuanto se corta, y `topic hz` dirá `sin mensajes`.
+  Cuando la laptop nota el corte, lo que tenía anotado de la Pi caduca en unos segundos.
 - Si el WiFi vuelve **a tiempo** (antes de los 10 s de la sección 9), el `imu` nunca paró:
   el topic vuelve solo, sin reiniciar nada.
 - Si vuelve **tarde**, el `imu` ya está detenido (ningún nodo arranca solo). Arráncalo
@@ -517,7 +517,7 @@ Si la sesión es de **simulación** (`agmen run --sim`), o de **reproducción** 
 arrancó el agente** (el `imu`, en `robot_dos.toml`).
 
 Un nodo que tú arrancas a mano en la Pi **no recibe ni manda** nada hacia tu laptop, y
-Agmen lo avisa, una vez por nodo, en la terminal de la Pi:
+Agmen lo avisa, una vez por nodo, en la terminal de la Pi y en tu `agmen run`:
 
 ```
 '<nodo>' (pid N) no lo arranqué yo y esta es una sesión de simulación: no lo conecto con <laptop> (ni recibe ni manda). Si es parte del robot, ponlo en robot.toml
@@ -544,7 +544,7 @@ Pon el nodo en tu laptop, o en uno de los dos robots, para que el topic llegue.
 | Qué | Valor |
 |---|---|
 | Endpoints que cruzan desde una computadora | Hasta 1 000. Lo que sobre no pasa, y `agmen run` lo dice |
-| Nodo dentro de un contenedor, en simulación | Cuenta como ajeno: no cruza. Declara el número de proceso de dentro del contenedor |
+| Nodo dentro de un contenedor, en simulación | Cuenta como ajeno: no cruza (el nodo dice su número de proceso de dentro del contenedor, y el agente no lo reconoce) |
 | Nodo cuyo proceso padre murió (huérfano), en simulación | Pasa a ser ajeno: no cruza |
 | Dos robots | No se pasan topics entre sí (ver arriba) |
 | Direcciones | Solo IPv4 en esta versión. Si no se ven por IPv4, no hay puente y el agente lo dice |
