@@ -7,6 +7,59 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 
 ## [Sin publicar]
 
+Los objetos de Agmen en Python se pueden usar desde varios hilos a la vez
+(`Publisher`, `Subscriber`, `RawPublisher`, `RawSubscriber`, `Node` y
+`agmen.clock`). Tutorial, capítulo 12, sección 9.
+
+### Agregado
+- **Varios hilos sobre el mismo objeto** (Python, con el núcleo de C++ y con
+  Python puro): cualquier método o propiedad pública de los objetos de arriba
+  se puede llamar desde varios hilos a la vez sin que el programa se caiga,
+  se corrompa o se cuelgue. Varios `publish()` a la vez: cada mensaje sale
+  entero, una vez, con su `seq`. Varios `receive()` a la vez: se turnan y cada
+  mensaje lo recibe un solo hilo.
+- **`close()` desde otro hilo**: regresa en menos de 1 s aunque haya hilos
+  dentro de `receive()` o `publish()`. Esos hilos reciben `RuntimeError` con
+  "ya se cerró". Al regresar, el puerto de un `Subscriber` ya está libre.
+- **Pruebas**: `python/test_hilos.py` (batería de estrés por objeto, con los
+  dos núcleos) y `tests/test_hilos.cpp` (ctest `hilos`).
+- **ThreadSanitizer**: opción de CMake `AGMEN_TSAN` y un trabajo nuevo en el
+  CI que corre la batería con TSan.
+
+### Cambiado
+- **Con un solo hilo, tras `close()`**: los errores son los de siempre,
+  `RuntimeError` con "ya se cerró", en vez de errores del sistema.
+  - `Subscriber.port` y `Subscriber.tcp_port` del núcleo puro: `OSError` pasa
+    a `RuntimeError`.
+  - `RawSubscriber.receive_raw()`: antes daba `None` o `ValueError`; ahora da
+    `RuntimeError`.
+  - `RawPublisher.send()`: antes daba `False` o `OSError`; ahora da
+    `RuntimeError`.
+  - `RawPublisher.set_schema()`: da `RuntimeError`.
+- **`RawSubscriber` se turna entre hilos** igual que `Subscriber`.
+- **`Subscriber.announced` del núcleo puro** devuelve una copia, como ya hacía
+  el nativo.
+- **C++**: `announced()` de `SubscriberCore` y de `Subscriber<M>` devuelve una
+  copia (`std::map` por valor) en vez de una referencia `const&`. Quien guardaba
+  la referencia debe guardar la copia.
+
+### Corregido
+- **Núcleo nativo, `Publisher`**: `publish()` mientras otro hilo cerraba el
+  `Publisher` tumbaba el programa (SIGSEGV, SIGABRT, `bad_alloc`, destinos
+  corruptos).
+- **Núcleo nativo, `Subscriber.close()`**: con otro hilo dentro de `receive()`,
+  `close()` tardaba lo que el timeout del `receive` o no volvía nunca.
+- **Núcleo nativo, `Subscriber.announced`**: leerlo mientras otro hilo recibía
+  daba texto a medias (a veces `UnicodeDecodeError`).
+- **Núcleo nativo, carreras de datos**: al leer `seq`, `subscribers`,
+  `shm_mapped` y `filenos()` mientras otro hilo publicaba, recibía o cerraba.
+- **Ambos núcleos, `RawPublisher` y `RawSubscriber`**: tras `close()`, o
+  durante él, daban `OSError: [Errno 9] Bad file descriptor`.
+- **Ambos núcleos, `RawPublisher.set_schema()`** desde varios hilos a la vez
+  dejaba hilos de latido (`agmen-latido-*`) vivos para siempre.
+- **Python puro, `Subscriber.port`, `tcp_port` y `listen`** tras o durante
+  `close()`: daban `Bad file descriptor` en vez de "ya se cerró".
+
 ## [0.14.0] — 2026-11-16
 
 **Simulación y real, y nodos en varias computadoras.** Implementa el

@@ -320,10 +320,140 @@ evitarlo:
   0.14.0; desde ella, el comportamiento al salir es el
   mismo en los dos.
 
+## 9. Varios hilos, el mismo objeto
+
+Un `Publisher` o un `Subscriber` se pueden usar desde **varios hilos a la
+vez**. No necesitas candados para llamar a sus métodos.
+
+### Qué puedes hacer
+
+Desde varios hilos, a la vez, puedes llamar a cualquier método o propiedad de
+`Publisher`, `Subscriber`, `RawPublisher`, `RawSubscriber`, `Node` y
+`agmen.clock`, sobre el **mismo** objeto. El programa no se cae, no se
+corrompe nada y no se cuelga.
+
+- **`publish()` desde varios hilos:** cada mensaje sale entero, una sola vez,
+  con su propio `seq`. El orden entre hilos no se garantiza. Dentro de un mismo
+  hilo, sí.
+- **`receive()` desde varios hilos:** se turnan. Cada mensaje lo recibe **un
+  solo hilo**.
+
+Guarda este ejemplo como `hilos_varios.py`, en `examples/tutorial/`, junto a
+`motor_command.agmen`:
+
+```python
+"""Varios hilos publican y reciben con el mismo Publisher y Subscriber."""
+import threading
+from pathlib import Path
+
+import agmen
+
+MotorCommand = agmen.load(Path(__file__).with_name("motor_command.agmen")).MotorCommand
+sub = agmen.Subscriber(MotorCommand, "127.0.0.1:7520")
+pub = agmen.Publisher(MotorCommand, "127.0.0.1:7520", topic="/cmd")
+
+recibidos = []                 # los seq que llegaron
+candado = threading.Lock()     # la lista la usan varios hilos: protégela tú
+
+
+def escuchar():
+    while True:
+        s = sub.receive(timeout=2.0)   # None: pasaron 2 s sin mensajes
+        if s is None:
+            break
+        with candado:
+            recibidos.append(s.envelope.seq)
+
+
+def publicar(n):
+    for _ in range(n):
+        pub.publish(MotorCommand(left=0.5, right=0.5))
+
+
+recs = [threading.Thread(target=escuchar) for _ in range(2)]
+pubs = [threading.Thread(target=publicar, args=(50,)) for _ in range(3)]
+for t in recs + pubs:
+    t.start()
+for t in pubs + recs:
+    t.join()
+
+print(f"publicados: 150 · recibidos: {len(recibidos)} · seq distintos: {len(set(recibidos))}")
+```
+
+```bash
+python3 examples/tutorial/hilos_varios.py
+```
+
+```
+publicados: 150 · recibidos: 150 · seq distintos: 150
+```
+
+Agmen cuida sus propias variables. **Tu** lista `recibidos` la comparten dos
+hilos, así que la proteges con un `threading.Lock`.
+
+⚠ Por UDP, un mensaje se puede perder si la red se satura. El ejemplo cuenta
+lo que llegó; no supone que llegue todo.
+
+⚠ Este ejemplo usa el puerto 7520. Si otro programa lo usa, cámbialo.
+
+### Cerrar desde otro hilo
+
+Puedes llamar a `close()` desde otro hilo, aunque haya hilos dentro de
+`receive()` o de `publish()`:
+
+- `close()` regresa en **menos de 1 segundo**.
+- Los hilos que estaban dentro reciben un `RuntimeError` con "ya se cerró":
+
+| Objeto | Mensaje |
+|---|---|
+| `Publisher` | `el Publisher ya se cerró` |
+| `Subscriber` | `el Subscriber ya se cerró` |
+| `RawPublisher` | `el RawPublisher ya se cerró` |
+| `RawSubscriber` | `el RawSubscriber ya se cerró` |
+
+- Cuando regresa `close()` de un `Subscriber`, su puerto ya está libre. Puedes
+  abrir otro `Subscriber` en ese mismo puerto.
+- Cerrar dos veces, o desde dos hilos a la vez, no hace daño.
+
+💡 Esto es distinto de salir del programa (sección 8). Al salir, `receive()`
+regresa `None`. Al cerrar un objeto desde otro hilo, el hilo que esperaba
+recibe `RuntimeError`. Un `receive()` sin límite de tiempo también lo recibe.
+
+Las propiedades de solo lectura, como `subscribers` o `seq`, también se pueden
+leer mientras otro hilo publica o recibe.
+
+### Lo que no se garantiza
+
+- El orden entre mensajes que publican hilos distintos.
+- Usar estos objetos después de un `fork()` con hilos vivos.
+- En C++, un `Subscriber` sigue siendo de un solo receptor a la vez. Lo de esta
+  sección es la garantía de los objetos de **Python**.
+
+### Ojo con `RawSubscriber`
+
+`receive_raw()` entrega **todos** los paquetes, también los anuncios de
+esquema. El publicador repite el anuncio cada segundo y lo manda también a cada
+receptor nuevo. Un anuncio tiene `encoding` igual a 3 (`wire.ENC_SCHEMA`) y no
+es un mensaje. Si cuentas mensajes por `seq`, sáltatelos:
+
+```python
+from agmen import wire
+from agmen.pubsub import RawSubscriber
+
+raw = RawSubscriber("127.0.0.1:7521")
+paquete = raw.receive_raw(timeout=1.0)     # (bytes, "ip:puerto") o None
+if paquete is not None:
+    env, _ = wire.parse(paquete[0])
+    if env.encoding != wire.ENC_SCHEMA:    # 3 = anuncio de esquema: no es un mensaje
+        print("mensaje con seq", env.seq)
+```
+
 ## Lo que aprendiste
 
 - `every` para cada ritmo, `subscribe`/`on` para cada mensaje, `spin()` para
   correrlo todo.
+- Varios hilos pueden usar el mismo `Publisher` o `Subscriber`. Cada mensaje
+  lo recibe un solo hilo, y `close()` despierta a los que esperan.
 - Lo lento va en otro grupo (`node.group`): su propio hilo, y el control no
   pierde ciclos. En Python puro, lo pesado va en otro nodo.
 - `queue = 1` te da siempre el dato más reciente.
