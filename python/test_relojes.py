@@ -8,6 +8,7 @@ Nada depende de la hora real de esta máquina: las horas se inyectan (relojes de
 
 from __future__ import annotations
 
+import json
 import socket
 import time
 import unittest
@@ -85,7 +86,7 @@ class Laptop:
 
     def __init__(self, offset_ns: int = 0) -> None:
         self.r = Reloj()
-        self.med = R.Medidor(hora=self.r.hora, mono=self.r.mono)
+        self.med = R.Medidor(hora=self.r.hora, mono=self.r.mono, res=0)
         self.offset = offset_ns
         self.canal = object()
         self.t = 0.0
@@ -137,8 +138,9 @@ class TestVentana(unittest.TestCase):
         lap = Laptop(offset_ns=35 * MS)
         self.assertEqual(lap.ronda(), {})
         lleva = lap.ronda()
-        self.assertEqual(set(lleva), {"dif", "err"})
+        self.assertEqual(set(lleva), {"dif", "err", "edad"})
         self.assertEqual(lleva["dif"], 35 * MS)
+        self.assertEqual(lleva["edad"], 2000 - 2)        # (8.2: tomada hace 2 s menos la ida y vuelta, en ms)
 
     def test_sin_medir_tras_10_s_y_sin_conexion(self):
         lap = Laptop(offset_ns=5 * MS)
@@ -194,23 +196,49 @@ class Canal:
 
 
 class TestAgenteAnterior(unittest.TestCase):
-    def test_tras_su_primer_pong_los_ping_son_los_de_siempre(self):
+    def test_sin_relojes_en_sesion_ok_los_ping_son_los_de_siempre_desde_el_primero(self):
+        """8.5: el agente no dijo "relojes": ni el primer ping lleva "reloj"; «sin medir (Agmen anterior)», una vez."""
         link = enlace()
         dicho = []
         link._notice = lambda text, kind="agmen": dicho.append(text)
         canal = Canal()
-        primero = link._ping_msg(canal, 10.5)
-        self.assertEqual(primero, {"op": "ping", "t": 10.5, "reloj": {}})
-        link._clock_pong({"op": "pong", "t": 10.5}, canal)   # el pong de un agente anterior: sin "reloj"
+        for t in (10.5, 12.5):
+            self.assertEqual(link._ping_msg(canal, t), {"op": "ping", "t": t})   # los bytes de siempre
+        link._clock_cap(canal, {"op": "sesion_ok", "sesion": "x"})
+        self.assertEqual(dicho, [])                                             # (se dice con su primer pong)
+        for t in (14.5, 16.5):
+            self.assertEqual(link._ping_msg(canal, t), {"op": "ping", "t": t})
+            link._clock_pong({"op": "pong", "t": t}, canal)
         self.assertEqual(dicho, [R.aviso_anterior("robot")])
         e = link._reloj.estado()
         self.assertEqual((e.medido, e.motivo), (False, "anterior"))
-        for t in (12.5, 14.5):
-            self.assertEqual(link._ping_msg(canal, t), {"op": "ping", "t": t})   # los bytes de siempre
-            link._clock_pong({"op": "pong", "t": t}, canal)
+        link._clock_cap(canal, {"op": "reanudar_ok"})
+        link._ping_msg(canal, 17.5)
+        link._clock_pong({"op": "pong", "t": 17.5}, canal)
         self.assertEqual(len(dicho), 1)                                         # se dijo una vez
-        # una conexión nueva (quizá ya actualizaron Agmen allá): se vuelve a ofrecer
-        self.assertEqual(link._ping_msg(Canal(), 16.5), {"op": "ping", "t": 16.5, "reloj": {}})
+        # una conexión nueva cuyo agente sí lo dice (quizá ya actualizaron Agmen allá): se mide
+        otro = Canal()
+        link._clock_cap(otro, {"op": "sesion_ok", "relojes": 1})
+        self.assertEqual(link._ping_msg(otro, 18.5), {"op": "ping", "t": 18.5, "reloj": {}})
+        self.assertEqual(link._ping_msg(canal, 20.5), {"op": "ping", "t": 20.5})   # (la vieja ya no)
+        self.assertEqual(link._reloj.estado().motivo, "esperando")
+
+    def test_con_relojes_un_pong_sin_reloj_es_mal_formado(self):
+        link = enlace()
+        dicho = []
+        link._notice = lambda text, kind="agmen": dicho.append(text)
+        canal = Canal()
+        link._clock_cap(canal, {"op": "sesion_ok", "relojes": 1})
+        link._ping_msg(canal, 1.5)
+        link._clock_pong({"op": "pong", "t": 1.5}, canal)
+        self.assertEqual(dicho, [R.aviso_mal_formado("robot")])
+
+    def test_la_sesion_dice_relojes(self):
+        cfg = SimpleNamespace(profile="real", nodes=[])
+        with mock.patch.object(A, "written_nodes", lambda config, machine: {}):
+            msg = A.session_message(cfg, "robot", "real")
+        self.assertEqual(msg["relojes"], 1)
+        self.assertEqual(msg["reloj"], "real")                                  # (la de siempre: el modo)
 
     def test_el_lector_viejo_de_la_laptop_no_se_fija_en_reloj(self):
         """Un pong con "reloj" sigue sirviendo para lo de siempre (el último contacto confirmado)."""
@@ -218,17 +246,43 @@ class TestAgenteAnterior(unittest.TestCase):
         self.assertEqual(A.AgentLink._confirmed({"op": "pong", "t": t, "reloj": {"rx": 1, "tx": 2}}, 0.0), t)
 
 
+class Salida:
+    """La cola de salida de mentira: el pong sale ya (con su `fill`, como el hilo que manda)."""
+
+    def __init__(self, enviados: list) -> None:
+        self.enviados = enviados
+
+    def put_pong(self, obj: dict, fill=None) -> bool:
+        if fill is not None:
+            obj = json.loads(fill())
+        self.enviados.append(obj)
+        return True
+
+
 def sesion_agente(primero: dict | None = None):
     s = A._Session.__new__(A._Session)
     enviados, dicho = [], []
     r = Reloj(pared=BASE + 35 * MS)
     s.__dict__.update(_awaiting=False, send=lambda obj, droppable=False: enviados.append(obj) or True,
-                      _reloj=R.Remoto(mono=r.mono), _hora=r.hora, _first=primero or {"desde": "laptop", "reloj": "real"},
+                      out=Salida(enviados), _res=0, _relojes_cap=None,
+                      _reloj=R.Remoto(mono=r.mono), _hora=r.hora,
+                      _first=primero or {"desde": "laptop", "reloj": "real", "relojes": 1},
                       ip="192.168.1.5", say=lambda text, kind="agmen": dicho.append((text, kind)))
     return s, enviados, dicho, r
 
 
 class TestLaptopAnterior(unittest.TestCase):
+    def test_el_pong_es_el_de_siempre_si_la_laptop_no_dijo_relojes(self):
+        """8.5: una laptop anterior (su sesion sin "relojes"): el pong de siempre, aunque el ping trajera "reloj"."""
+        s, enviados, dicho, _ = sesion_agente({"desde": "laptop", "reloj": "real"})
+        for t in (7, 1.5, "x"):
+            for ping in ({"op": "ping", "t": t}, {"op": "ping", "t": t, "reloj": {}}):
+                s._order(ping)
+                self.assertEqual(enviados[-1], {"op": "pong", "t": t})
+        self.assertEqual(len([d for d in dicho if "Agmen anterior" in d[0]]), 1)   # una vez
+        e = s._reloj.estado()
+        self.assertEqual((e.medido, e.motivo), (False, "anterior"))
+
     def test_el_pong_es_el_de_siempre_si_el_ping_no_trae_reloj(self):
         s, enviados, dicho, _ = sesion_agente()
         for t in (7, 1.5, "x"):
@@ -242,18 +296,22 @@ class TestLaptopAnterior(unittest.TestCase):
         s, enviados, dicho, r = sesion_agente()
         s._order({"op": "ping", "t": 3.0, "reloj": {}})
         self.assertEqual(enviados[-1], {"op": "pong", "t": 3.0, "reloj": {"rx": r.pared, "tx": r.pared}})
+        s._res = 15_625_000                                    # 8.4: la resolución del reloj de aquí, en el pong
+        s._order({"op": "ping", "t": 4.0, "reloj": {}}, rx=r.pared - 5)
+        self.assertEqual(enviados[-1], {"op": "pong", "t": 4.0, "reloj": {"rx": r.pared - 5, "tx": r.pared,
+                                                                          "res": 15_625_000}})
         self.assertEqual(dicho, [])
         self.assertEqual(s._reloj.estado().motivo, "esperando")
-        s._order({"op": "ping", "t": 5.0, "reloj": {"dif": 35 * MS, "err": 1 * MS}})
+        s._order({"op": "ping", "t": 5.0, "reloj": {"dif": 35 * MS, "err": 1 * MS, "edad": 0}})
         e = s._reloj.estado()
         self.assertEqual((e.medido, e.dif_ns, e.err_ns), (True, -35 * MS, 1 * MS))   # con el signo cambiado
         textos = [t for t, _ in dicho]
         self.assertTrue(textos[0].startswith("reloj de la laptop (laptop): -35.0 ms (±1.0 ms)"), textos)
         self.assertIn("va 35.0 ms atrasado", textos[1])
-        s._order({"op": "ping", "t": 7.0, "reloj": {"dif": 2 * MS, "err": 1 * MS}})
+        s._order({"op": "ping", "t": 7.0, "reloj": {"dif": 2 * MS, "err": 1 * MS, "edad": 0}})
         self.assertTrue(dicho[-1][0].startswith("✓ el reloj de la laptop (laptop) ya coincide"), dicho)
         n = len(dicho)
-        s._order({"op": "ping", "t": 9.0, "reloj": {"dif": 3 * MS, "err": 1 * MS}})
+        s._order({"op": "ping", "t": 9.0, "reloj": {"dif": 3 * MS, "err": 1 * MS, "edad": 0}})
         self.assertEqual(len(dicho), n)
         s._reloj.perdida()
         self.assertEqual(s._reloj.estado().motivo, "sin_conexion")
@@ -262,14 +320,16 @@ class TestLaptopAnterior(unittest.TestCase):
         self.assertEqual(s._reloj.estado().motivo, "vieja")
 
     def test_en_sim_el_agente_no_avisa_del_umbral(self):
-        s, _, dicho, _ = sesion_agente({"desde": "laptop", "reloj": "sim"})
-        s._order({"op": "ping", "t": 5.0, "reloj": {"dif": 35 * MS, "err": 1 * MS}})
+        s, _, dicho, _ = sesion_agente({"desde": "laptop", "reloj": "sim", "relojes": 1})
+        s._order({"op": "ping", "t": 5.0, "reloj": {"dif": 35 * MS, "err": 1 * MS, "edad": 0}})
         self.assertEqual(len(dicho), 1)
         self.assertIn("(no afecta en simulación)", dicho[0][0])
 
     def test_medicion_mal_formada_se_ignora(self):
         s, enviados, dicho, _ = sesion_agente()
-        for malo in ({"dif": "1", "err": 1}, {"dif": 1, "err": -1}, {"dif": 1.0, "err": 1}, "x", [1]):
+        for malo in ({"dif": "1", "err": 1, "edad": 0}, {"dif": 1, "err": -1, "edad": 0},
+                     {"dif": 1.0, "err": 1, "edad": 0}, {"dif": 1, "err": 1}, {"dif": 1, "err": 1, "edad": -1},
+                     {"dif": 1, "err": 1, "edad": 1.5}, "x", [1]):
             s._order({"op": "ping", "t": 1, "reloj": malo})
             self.assertIn("reloj", enviados[-1])
         self.assertFalse(s._reloj.estado().medido)
@@ -599,9 +659,10 @@ class TestAvisos(unittest.TestCase):
     def test_incertidumbre_grande_no_afirma_nada(self):
         v = self.vigia()
         [lenta] = v.revisar(medido(50, err_ms=25))
-        self.assertEqual(lenta, "⚠ la red con robot está demasiado lenta para medir su reloj con precisión (±25.0 ms): "
-                                "no puedo decir si va bien o corrido. Lo sigo midiendo; si la red mejora, aviso solo "
-                                "si está corrido")
+        self.assertEqual(lenta, "⚠ la red con robot está demasiado lenta para medir su reloj con precisión (±25.0 ms), "
+                                "o el reloj de alguna de las dos avanza a saltos (Windows con Python 3.12 o anterior: "
+                                "de 15.6 ms en 15.6 ms): no puedo decir si va bien o corrido. Lo sigo midiendo; si "
+                                "mejora, aviso solo si está corrido")
         self.assertEqual(v.revisar(medido(50, err_ms=25)), [])   # una vez
         self.assertFalse(v.mal)
         self.assertEqual(len(v.revisar(medido(50, err_ms=2))), 1)
@@ -622,12 +683,13 @@ class TestAvisos(unittest.TestCase):
             with self.subTest(modo=modo):
                 link = enlace()
                 r = Reloj()
-                link._reloj = R.Medidor(hora=r.hora, mono=r.mono)
+                link._reloj = R.Medidor(hora=r.hora, mono=r.mono, res=0)
                 link.watch_clock(modo)
                 link._vigia.mono = r.mono
                 link.channel = canal = Canal()
                 dicho = []
                 link._notice = lambda text, kind="agmen", d=dicho: d.append((text, kind))
+                link._clock_cap(canal, {"op": "sesion_ok", "relojes": 1})
                 link._ping_msg(canal, 1.0)
                 r.pared += 2 * MS
                 link._clock_pong({"op": "pong", "t": 1.0, "reloj": {"rx": BASE + 40 * MS, "tx": BASE + 40 * MS}},
@@ -641,6 +703,268 @@ class TestAvisos(unittest.TestCase):
         self.assertEqual(R.linea_corta("robot", medido(2.1)), "robot: reloj +2.1 ms (±0.6)")
         self.assertEqual(R.fmt_dif(-3_400_000_000), "-3.40 s")
         self.assertEqual(R.fmt_dif(86_400 * 10 ** 9), "+24.0 h")
+
+
+# 6. Arreglos de la revisión ciega (§8)
+# ===========================================================================
+
+class TestCadenaLaptopAgente(unittest.TestCase):
+    """8.2: la medición que la laptop le pasa al agente lleva su edad; el agente la caduca a los 10 s de verdad."""
+
+    def test_un_valor_viejo_no_rejuvenece_en_el_agente(self):
+        lap = Laptop(offset_ns=35 * MS)
+        lap.ronda()                                              # la medición, tomada ahora
+        lap.r.avanza(7.0)                                        # 7 s sin más pongs (la laptop la sigue teniendo)
+        lap.t += 1.0
+        lleva = lap.med.ping(lap.canal, lap.t)
+        self.assertGreaterEqual(lleva["edad"], 7000)
+        r2 = Reloj(mono=50.0)                                    # el agente: otro monotonic, sin relación
+        rem = R.Remoto(mono=r2.mono)
+        rem.ping(lleva, True)
+        e = rem.estado()
+        self.assertTrue(e.medido)
+        self.assertEqual(e.dif_ns, -35 * MS)
+        self.assertGreaterEqual(e.edad_s, 7.0)                   # tomada hace 7 s, no "ahora"
+        r2.avanza(3.5)                                           # 10.5 s de verdad: ya no cuenta
+        e = rem.estado()
+        self.assertEqual((e.medido, e.motivo), (False, "vieja"))
+        self.assertGreater(e.edad_s, R.RELOJ_VIGENTE_S)
+
+    def test_una_edad_de_mas_de_10_s_nunca_es_medido(self):
+        rem = R.Remoto(mono=Reloj().mono)
+        self.assertEqual(rem.ping({"dif": 1, "err": 1, "edad": 10_001}, True), [])
+        self.assertFalse(rem.estado().medido)
+
+    def test_vacio_borra_la_que_tenia(self):
+        r2 = Reloj()
+        rem = R.Remoto(mono=r2.mono)
+        rem.ping({"dif": 5 * MS, "err": MS, "edad": 0}, True)
+        self.assertTrue(rem.estado().medido)
+        rem.ping({}, True)                                       # la laptop ya no tiene una vigente
+        e = rem.estado()
+        self.assertEqual((e.medido, e.motivo), (False, "vieja"))
+        rem.ping({"dif": 6 * MS, "err": MS, "edad": 100}, True)  # y vuelve
+        self.assertEqual(rem.estado().dif_ns, -6 * MS)
+
+    def test_el_ping_de_la_laptop_tras_10_s_va_vacio(self):
+        lap = Laptop(offset_ns=35 * MS)
+        lap.ronda()
+        lap.r.avanza(R.RELOJ_VIGENTE_S + 0.1)
+        self.assertEqual(lap.med.ping(lap.canal, 99.0), {})
+
+
+class TestPongSinCola(unittest.TestCase):
+    """8.3: el pong sale antes que los log y las tablas pendientes (nunca antes que otra respuesta), y su `tx` se
+    escribe en el hilo que manda, al sacarlo de la cola."""
+
+    def test_orden(self):
+        ob = A._Outbox()
+        ob.put({"op": "estado", "nodo": "a"})
+        ob.put({"op": "log", "nodo": "a", "n": 1, "linea": "x"}, droppable=True)
+        ob.put({"op": "error", "texto": "e"})
+        ob.put({"op": "log", "nodo": "a", "n": 2, "linea": "x"}, droppable=True)
+        ob.put({"op": "tablas", "n": 1, "parte": 0, "de": 1})
+        ob.put({"op": "log", "nodo": "a", "n": 3, "linea": "x"}, droppable=True)
+        ob.put_pong({"op": "pong", "t": 1.0})
+        ob.put_pong({"op": "pong", "t": 2.0})
+        ops = [json.loads(ob.get()[1]) for _ in range(len(ob.items))]
+        self.assertEqual([(o["op"], o.get("n", o.get("t"))) for o in ops],
+                         [("estado", None), ("log", 1), ("error", None), ("pong", 1.0), ("pong", 2.0), ("log", 2),
+                          ("tablas", 1), ("log", 3)])
+        self.assertEqual((ob.bytes, ob.replies, ob.tables), (0, 0, 0))   # las cuentas, como antes
+
+    def test_cuenta_como_respuesta(self):
+        ob = A._Outbox()
+        for i in range(A.OUT_MAX_REPLIES):
+            ob.put_pong({"op": "pong", "t": i})
+        self.assertTrue(ob.replies_full())                                # (la laptop que no lee, igual que antes)
+
+    def test_tx_al_mandar(self):
+        s, _, _, r = sesion_agente()
+        s.out = ob = A._Outbox()
+        rx = r.pared
+        s._order({"op": "ping", "t": 3.0, "reloj": {}}, rx=rx)
+        r.pared += 7 * MS                                                  # lo que tardó en salir
+        op, body = ob.get()
+        self.assertEqual(json.loads(body), {"op": "pong", "t": 3.0, "reloj": {"rx": rx, "tx": rx + 7 * MS}})
+
+
+class TestResolucion(unittest.TestCase):
+    """8.4: la resolución de los relojes de pared cuenta en la incertidumbre."""
+
+    def test_ida_y_vuelta_ligeramente_negativa(self):
+        t1, rx, tx, t4 = BASE, BASE + 15 * MS, BASE + 15 * MS, BASE      # t4 = t1: el reloj no avanzó
+        rx = rx - 16 * MS                                                  # (y el del robot, un salto atrás)
+        self.assertIsNone(R.medir(t1, rx, tx + MS, t4))                    # sin resolución: negativa, se descarta
+        m = R.medir(t1, rx, tx + MS, t4, res_ns=2 * 15_625_000)
+        self.assertEqual((m.ida_vuelta_ns, m.err_ns), (0, 2 * 15_625_000))
+        self.assertIsNone(R.medir(t1, rx, tx + 40 * MS, t4, res_ns=2 * 15_625_000))   # fuera de la suma: no
+
+    def test_gruesa_en_una_red_de_1_ms_entre_relojes_iguales_no_alarma(self):
+        """Dos relojes iguales que avanzan de 15.625 ms en 15.625 ms; la red tarda 1 ms en cada sentido."""
+        Q = 15_625_000
+        T = [BASE + 3 * MS]                                    # la hora verdadera (igual en las dos)
+
+        def gruesa() -> int:
+            return T[0] // Q * Q
+
+        mono = [1000.0]
+        med = R.Medidor(hora=gruesa, mono=lambda: mono[0], res=Q)
+        med.capacidad(True)
+        v = R.Vigia("robot", "real", mono=lambda: mono[0])
+        avisos, t = [], 0.0
+        for i in range(200):
+            t += 1.0
+            med.ping("c", t)
+            T[0] += MS
+            rx = tx = gruesa()
+            T[0] += MS
+            self.assertEqual(med.pong("c", {"op": "pong", "t": t, "reloj": {"rx": rx, "tx": tx, "res": Q}}), [])
+            T[0] += 2_000_000_000 - 2 * MS + (i * 7_919_000) % Q   # (cada ronda en otra fase del salto)
+            mono[0] += 2.0
+            e = med.estado()
+            self.assertTrue(e.medido)                                      # nunca se descarta
+            self.assertLessEqual(abs(e.dif_ns), e.err_ns)                  # el 0 de verdad, dentro de ±err
+            avisos += v.revisar(e)
+        self.assertFalse(v.mal)
+        self.assertFalse([a for a in avisos if "adelantado" in a or "atrasado" in a], avisos)
+
+    def test_el_agente_la_manda_y_la_laptop_la_suma(self):
+        lap = Laptop()
+        lap.med.res = 1000
+        lap.ronda(reloj=None)                                  # (el pong de mentira, abajo)
+        lap.t += 1.0
+        lap.med.ping(lap.canal, lap.t)
+        t1 = lap.r.pared
+        lap.r.pared += 2 * MS
+        lap.med.pong(lap.canal, {"op": "pong", "t": lap.t, "reloj": {"rx": t1 + MS, "tx": t1 + MS, "res": 500}})
+        self.assertEqual(lap.med.estado().err_ns, MS + 1500)
+        self.assertEqual(lap.med.pong(lap.canal, {"op": "pong", "t": 77.0}), [])
+        lap.t += 1.0
+        lap.med.ping(lap.canal, lap.t)
+        self.assertEqual(lap.med.pong(lap.canal, {"op": "pong", "t": lap.t, "reloj": {"rx": 1, "tx": 1,
+                                                                                    "res": -1}}), [])   # (dicho ya)
+        self.assertGreater(R.resolucion_ns(), 0)
+
+
+class TestMenores(unittest.TestCase):
+    """8.6."""
+
+    def test_empate_gana_la_mas_nueva(self):
+        lap = Laptop(offset_ns=10 * MS)
+        lap.cada = 1.0
+        lap.ronda(MS, MS)
+        lap.offset = 12 * MS
+        lap.ronda(MS, MS)                                      # misma ida y vuelta: gana esta
+        self.assertEqual(lap.med.estado().dif_ns, 12 * MS)
+
+    def test_todas_descartadas_lo_dice(self):
+        lap = Laptop()
+        lap.ronda(1500 * MS, 1500 * MS)
+        self.assertEqual(lap.dicho, ["descartadas"])
+        e = lap.med.estado()
+        self.assertEqual((e.medido, e.motivo), (False, "descartadas"))
+        self.assertEqual(R.linea_corta("robot", e), "robot: reloj sin medir (las mediciones salen absurdas: ¿la red "
+                                                    "tarda más de 2 s?)")
+        lap.ronda(1500 * MS, 1500 * MS)
+        self.assertEqual(lap.dicho, [])                         # una vez
+        lap.ronda()
+        self.assertTrue(lap.med.estado().medido)
+        lap.ronda(1500 * MS, 1500 * MS)                         # una absurda entre buenas: nada que decir
+        self.assertEqual(lap.dicho, [])
+        self.assertTrue(lap.med.estado().medido)
+
+    def test_aviso_de_descartadas_por_la_terminal(self):
+        link = enlace()
+        dicho = []
+        link._notice = lambda text, kind="agmen": dicho.append((text, kind))
+        link._clock_events(["descartadas"])
+        self.assertEqual(dicho, [(R.aviso_descartadas("robot"), "error")])
+
+    def test_salto_de_1_s_a_media_ventana_se_ve_en_12_s_o_menos(self):
+        lap = Laptop(offset_ns=0)
+        for _ in range(R.RELOJ_VENTANA):
+            lap.ronda(MS, MS)                                  # las mejores (ida y vuelta 2 ms)
+        lap.offset = 1_000_000_000                              # el reloj del robot salta 1 s
+        segundos = 0.0
+        while abs(lap.med.estado().dif_ns - 1_000_000_000) > 5 * MS:
+            lap.ronda(2 * MS, 2 * MS)                          # peores: no ganan por ida y vuelta
+            segundos += lap.cada
+            self.assertLess(segundos, 30)
+        self.assertLessEqual(segundos, 12)
+
+    def test_la_maq_con_edad_infinita_no_rompe_el_json(self):
+        for edad in ("inf", "nan", "-1", "1e400"):
+            with self.subTest(edad=edad):
+                e = R.leer_maq({"name": "robot", "reloj": "5", "err": "1", "edad": edad})
+                self.assertIsNone(e.edad_s)
+                info, _ = R.info_panel("robot", e, "real", False)
+                json.dumps(info, allow_nan=False)                # ni Infinity ni NaN
+
+    def test_robot_sin_conexion_no_desaparece(self):
+        """El puente nombra en `relojes` a una computadora declarada que ya no está en `peers` (sin medir); el hub da
+        su `maq` sin ip; node list dice «sin conexión con esa computadora»."""
+        hub = hub_de_prueba()
+        self.addCleanup(hub.sock.close)
+        b = T.Bridge(hub.listen, lambda *a, **k: None)
+        b._sock = mock.Mock()
+        sent = []
+        b._sock.sendto = lambda data, addr: sent.append(data)
+        b._sock.recvfrom = mock.Mock(side_effect=BlockingIOError)
+        b._read_hub = lambda now, names=(): None
+        p = b.add_peer("robot", lambda part: None, reloj=lambda: R.Estado(True, 2 * MS, 600_000, 0.25))
+        q = b.add_peer("pi", lambda part: None, reloj=lambda: R.Estado(True, 9 * MS, 600_000, 0.25))
+        self.addCleanup(p.close, False)
+        self.addCleanup(q.close, False)
+        p.confirmed, p.ip = True, "192.168.1.20"               # pi: declarada, sin conexión
+        b.tick()
+        [red] = [d for d in sent if d.startswith(b"agmen-hub/1 red ")]
+        self.assertEqual(red, b"agmen-hub/1 red peers=robot%40192.168.1.20 relojes=pi:-:sin_conexion:250,"
+                              b"robot:2000000:600000:250")
+        hub.handle(red, LOCAL, time.monotonic())
+        lineas = maq(hub)
+        self.assertEqual([f["name"] for f in lineas], ["robot", "pi"])
+        self.assertEqual(lineas[1]["sin"], "sin_conexion")
+        self.assertNotIn("ip", lineas[1])
+        self.assertEqual(lineas[0]["ip"], "192.168.1.20")
+        e = R.maquinas_del_hub(hp.parse(hub.state_text().encode()))["pi"]
+        self.assertEqual(R.linea_node_list("pi", e, "real"), "pi: reloj sin medir (sin conexión con esa computadora)")
+        # una medida que no está en peers no se acepta (solo «sin medir»)
+        hub.handle(hp.encode("red", peers="robot@192.168.1.20", relojes="pi:5:1:1"), LOCAL, time.monotonic())
+        self.assertEqual([f["name"] for f in maq(hub)], ["robot"])
+        # sin modo red: nada (los bytes de siempre)
+        hub._leave_net("prueba")
+        self.assertEqual(maq(hub), [])
+        self.assertEqual(hub.relojes, {})
+
+
+class TestNegociadoDeVerdad(TA.ServerCase):
+    """8.5 con un agente y un AgentLink de verdad."""
+
+    def setUp(self):
+        super().setUp()
+        warnings.simplefilter("ignore", ResourceWarning)
+
+    def test_laptop_anterior_recibe_el_sesion_ok_y_los_pong_de_siempre(self):
+        self.start_server()
+        msg = self.mensaje()
+        del msg["relojes"]                                     # una laptop anterior
+        cli, ok = self.sesion(msg=msg)
+        self.assertEqual(ok["op"], "sesion_ok")
+        self.assertNotIn("relojes", ok)
+        cli.send({"op": "ping", "t": 1.5, "reloj": {}})        # (aunque mandara "reloj": no lo dijo)
+        self.assertTrue(cli.wait(lambda ms: any(m["op"] == "pong" for m in ms)))
+        self.assertEqual([m for m in cli.msgs if m["op"] == "pong"], [{"op": "pong", "t": 1.5}])
+
+    def test_laptop_nueva_recibe_relojes(self):
+        self.start_server()
+        cli, ok = self.sesion(msg=self.mensaje())
+        self.assertEqual(ok.get("relojes"), 1)
+        cli.send({"op": "ping", "t": 2.5, "reloj": {}})
+        self.assertTrue(cli.wait(lambda ms: any(m["op"] == "pong" for m in ms)))
+        [pong] = [m for m in cli.msgs if m["op"] == "pong"]
+        self.assertEqual(set(pong["reloj"]) - {"res"}, {"rx", "tx"})
+        self.assertGreaterEqual(pong["reloj"]["tx"], pong["reloj"]["rx"])
 
 
 if __name__ == "__main__":

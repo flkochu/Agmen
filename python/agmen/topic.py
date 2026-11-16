@@ -141,13 +141,12 @@ def cmd_node_list(args) -> int:
 def session_mode(head: dict | None = None) -> str:
     """El modo del reloj de la sesión, si esta herramienta lo puede saber (bloque 5, §6.2). Manda el hub: el
     `modo` de su línea `state` (head), que le dice el puente en modo red; uno desconocido es "" (no se sabe; nunca
-    se toma por real ni por sim). Si el hub no lo dice (hub anterior, sin agmen run, caducado): AGMEN_CLOCK, como
-    antes (agmen run se lo pasa a sus nodos). Desde una terminal cualquiera, sin nada de eso: ""."""
+    se toma por real ni por sim). 8.6: si el hub no lo dice (hub anterior, sin agmen run, caducado): "" SIEMPRE, el
+    texto condicional, aunque exista AGMEN_CLOCK (el consejo: "nunca supone real ni sim")."""
     modos = ("real", "sim", "replay")
     if head and "modo" in head:
         return head["modo"] if head["modo"] in modos else ""
-    m = os.environ.get("AGMEN_CLOCK", "")
-    return m if m in modos else ""
+    return ""
 
 
 def clock_lines(maquinas: dict, mode: str) -> list[str]:

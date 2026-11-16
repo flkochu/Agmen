@@ -200,7 +200,8 @@ class Hub:
             self._warn_once(("relojes", str(e)[:80]), f"el puente mandó la diferencia de relojes mal escrita ({e}): "
                                                        f"la ignoro (queda «sin medir»). ¿Otra versión de Agmen?")
             return
-        self.relojes = {n: (e, now) for n, e in leidos.items() if n in self._peer_ips}
+        # 8.6: una computadora que no está en `peers` (el puente perdió la conexión con ella) solo vale «sin medir».
+        self.relojes = {n: (e, now) for n, e in leidos.items() if n in self._peer_ips or not e.medido}
 
     def _set_modo(self, modo: str | None) -> None:
         """El campo `modo` de `red` (§6.1): lo que trae reemplaza lo anterior (un `red` sin él, de un puente anterior:
@@ -617,12 +618,17 @@ class Hub:
                                  age=f"{now - e.last_seen:.1f}", **self._ep_extra(e)))
         for _key, (f, _seen) in sorted(self.stats.items()):
             lines.append(hp.line("stat", **f))
-        for name, ip in self.peers:   # bloque 5: sin modo red no hay ninguna (los bytes de siempre)
+        # Bloque 5: sin modo red no hay ninguna (los bytes de siempre). 8.6: tras las de `peers`, las que el puente
+        # nombró sin conexión (sin `ip`: no está en peers).
+        fuera = sorted(n for n in self.relojes if n not in self._peer_ips) if self.peers else []
+        for name, ip in [*self.peers, *((n, None) for n in fuera)]:
             r = self._reloj_de(name, now)
             extra = {"reloj": r.dif_ns, "err": r.err_ns} if r.medido else {"sin": r.motivo}
             if r.edad_s is not None:
                 extra["edad"] = f"{r.edad_s:.1f}"
-            lines.append(hp.line("maq", name=name, ip=ip, **extra))
+            if ip is not None:
+                extra = {"ip": ip, **extra}
+            lines.append(hp.line("maq", name=name, **extra))
         return "\n".join(lines)
 
     # --- ciclo ---

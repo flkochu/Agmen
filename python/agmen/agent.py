@@ -1213,7 +1213,7 @@ class AgentServer:
                 return
             # La identidad: el saludo (la clave) y el identificador de la sesión (comparado en tiempo constante).
             if session is None or not session.ready.is_set() or not _same(sid, session.id) \
-                    or not session.resume(channel, ip, logs):
+                    or not session.resume(channel, ip, logs, relojes=_says_clocks(first)):
                 self._refuse_now(channel, ip, "sesion",
                                  f"{self.machine}: esa sesión ya terminó; los nodos están detenidos. Abre una sesión "
                                  f"nueva")
@@ -1363,10 +1363,11 @@ class _Outbox:
 
     def __init__(self) -> None:
         self.cond = threading.Condition()
-        # (op, json, bytes, ¿es un log?, n de la tabla o None). Las partes de una tabla del puente (4b §8.7) no
-        # cuentan en bytes ni en replies (no hacen descartar log ni dejar de leer a la laptop) y una tabla
-        # pendiente se sustituye por la más nueva: como mucho hay una (PART_BYTES × partes).
-        self.items: deque[tuple[str, str, int, bool, int | None]] = deque()
+        # (op, json, bytes, ¿es un log?, n de la tabla o None, cómo escribirlo al mandarlo o None). Las partes de una
+        # tabla del puente (4b §8.7) no cuentan en bytes ni en replies (no hacen descartar log ni dejar de leer a la
+        # laptop) y una tabla pendiente se sustituye por la más nueva: como mucho hay una (PART_BYTES × partes).
+        # El último campo es del pong con las marcas del reloj (bloque 5, 8.3): su `tx` se escribe al mandarlo.
+        self.items: deque[tuple[str, str, int, bool, int | None, Callable[[], str] | None]] = deque()
         self.bytes = 0
         self.replies = 0        # lo que no es log ni tabla, pendiente
         self.tables = 0         # partes de tabla pendientes
@@ -1383,7 +1384,7 @@ class _Outbox:
                 return False
             if table is not None:
                 self._drop_tables(keep=table)
-                self.items.append((obj["op"], body, size, False, table))
+                self.items.append((obj["op"], body, size, False, table, None))
                 self.tables += 1
                 self.cond.notify_all()
                 return True
@@ -1391,10 +1392,28 @@ class _Outbox:
             if droppable and (counted >= OUT_MAX_MSGS or self.bytes + size > OUT_MAX_BYTES):
                 self.dropped += 1
                 return False
-            self.items.append((obj["op"], body, size, droppable, None))
+            self.items.append((obj["op"], body, size, droppable, None, None))
             self.bytes += size
             if not droppable:
                 self.replies += 1
+            self.cond.notify_all()
+            return True
+
+    def put_pong(self, obj: dict, fill: Callable[[], str] | None = None) -> bool:
+        """Un pong (bloque 5, 8.3): sale antes que los log y las partes de tabla pendientes, nunca antes que otra
+        respuesta (estado, error, sesion_*, otro pong), así que el orden de lo demás no cambia. Cuenta como
+        respuesta, igual que antes (replies_full). `fill`: escribe el JSON justo al mandarlo (el `tx` del reloj)."""
+        body = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+        size = len(body.encode("utf-8"))
+        with self.cond:
+            if self.closed:
+                return False
+            i = len(self.items)
+            while i > 0 and (self.items[i - 1][3] or self.items[i - 1][4] is not None):
+                i -= 1   # (los log y las tablas del final de la cola: el pong va delante de ellos)
+            self.items.insert(i, (obj["op"], body, size, False, None, fill))
+            self.bytes += size
+            self.replies += 1
             self.cond.notify_all()
             return True
 
@@ -1417,7 +1436,7 @@ class _Outbox:
                 self.cond.wait()
             if self.closed:
                 return None
-            op, body, size, droppable, table = self.items.popleft()
+            op, body, size, droppable, table, fill = self.items.popleft()
             if table is None:
                 self.bytes -= size
                 if not droppable:
@@ -1426,7 +1445,12 @@ class _Outbox:
                 self.tables -= 1
             self.sending = True
             self.cond.notify_all()
-            return op, body
+        if fill is not None:   # 8.3: en el hilo que manda, justo antes de escribir en la conexión (fuera del candado)
+            try:
+                body = fill()
+            except Exception:   # noqa: BLE001 — nunca debería; entonces sale como estaba (con la marca de antes)
+                pass
+        return op, body
 
     def sent(self) -> None:
         """El hilo que manda terminó con el que tenía en la mano."""
@@ -1477,6 +1501,9 @@ class _Session:
         # Bloque 5 (RFC 0011 §3.6): la diferencia de reloj de la laptop que ella misma pasa en cada ping.
         self._reloj = relojes.Remoto()
         self._hora: Callable[[], int] = relojes.hora_ns   # (las pruebas la cambian)
+        self._res: int = relojes.resolucion_ns()           # 8.4: la resolución de ese reloj, va en el pong
+        # 8.5: ¿la laptop dijo "relojes" (en su sesion, o en el último reanudar)? None: lo que diga su sesion.
+        self._relojes_cap: bool | None = None
         self.id = secrets.token_hex(16)      # para reanudar: va en sesion_ok
         self.last_rx = time.monotonic()      # lo último que llegó de la laptop (la gracia cuenta desde aquí)
         self.lost_at: float | None = None    # en gracia desde (None: con conexión)
@@ -1753,7 +1780,7 @@ class _Session:
     def _expire(self, token: int) -> None:
         self.end(f"la laptop ({self.ip}) no volvió en {GRACE:g} s: detuve los nodos", "error", grace_token=token)
 
-    def resume(self, channel: Channel, ip: str, have: dict) -> bool:
+    def resume(self, channel: Channel, ip: str, have: dict, relojes: bool = False) -> bool:
         """'reanudar' con el identificador bueno: esta conexión sustituye a la anterior (perdida, sin confirmar,
         o que aún no se daba por perdida). Manda reanudar_ok y los log que la laptop no tiene, y lee esta
         conexión hasta que termine. False si la sesión ya estaba terminando (no se retomó).
@@ -1799,6 +1826,9 @@ class _Session:
                             reply["sonda"] = 1
                     elif self._no_tables:
                         reply["sin_tablas"] = self._no_tables
+                    if relojes:   # bloque 5 (8.5): solo si el reanudar lo dijo (a una laptop anterior, lo de antes)
+                        reply["relojes"] = 1
+                    self._relojes_cap = relojes
                     out.put(reply)
                     for item in logs:
                         out.put(item, droppable=True)
@@ -2014,6 +2044,8 @@ class _Session:
                     ok["sonda"] = 1
             elif self._no_tables:
                 ok["sin_tablas"] = self._no_tables   # §8.6: la laptop pidió puente y aquí no se hace: por qué
+            if _says_clocks(self._first):   # bloque 5 (8.5): solo si la laptop lo dijo (a una anterior, lo de antes)
+                ok["relojes"] = 1
             self.send(ok)
             self.ready.set()
             with self.server.lock:   # la IP de la última sesión ACEPTADA conserva su lugar aunque otros fallen
@@ -2148,6 +2180,7 @@ class _Session:
                 return
             try:
                 msg = channel.recv(SILENCE_TIMEOUT)
+                rx = self._hora()   # bloque 5 (8.3): `rx` lo antes posible tras recibir la línea
             except ChannelTimeout:
                 if self._awaiting:   # 4c §6.1: la laptop calló durante la prueba de red (no corrió nada aquí)
                     self._silent_wait(channel)
@@ -2172,12 +2205,45 @@ class _Session:
                 # §13.1: la laptop oye por esta conexión y la gracia se cancela; §15: si no tuvo efecto (la gracia
                 # venció entre la revisión de arriba y el candado), no se atiende ni se contesta nada.
                 return
-            if self._order(msg):
+            if self._order(msg, rx):
                 return
 
+    def _says_clocks_now(self) -> bool:
+        """8.5: ¿la laptop dijo "relojes" (en su sesion o en el último reanudar)?"""
+        cap = getattr(self, "_relojes_cap", None)
+        return cap if cap is not None else _says_clocks(getattr(self, "_first", None))
+
+    def _pong(self, msg: dict, rx: int | None) -> None:
+        """El pong de un ping (bloque 5, 8.3): sale antes que los log y las tablas pendientes; si los dos lados dijeron
+        "relojes", con las marcas del reloj: `rx` (al recibir la línea) y `tx`, que escribe el hilo que manda justo
+        antes de escribir en la conexión. Si no, el pong de siempre (los mismos bytes que antes)."""
+        t = msg.get("t")
+        ok = (isinstance(t, (int, float)) and not isinstance(t, bool)) or (isinstance(t, str) and len(t) <= PONG_T_MAX)
+        pong: dict = {"op": "pong", "t": t if ok else None}
+        if not (self._says_clocks_now() and "reloj" in msg):
+            self.out.put_pong(pong)
+            return
+        rx = self._hora() if rx is None else rx
+        reloj = {"rx": rx, "tx": rx}   # (tx = rx hasta que salga: así el pong pendiente ya es válido)
+        res = getattr(self, "_res", 0)
+        if res:
+            reloj["res"] = res
+        pong["reloj"] = reloj
+        hora = self._hora
+
+        def fill() -> str:
+            reloj["tx"] = max(rx, hora())   # (un reloj de pared que retrocede no da tx < rx)
+            return json.dumps(pong, separators=(",", ":"), ensure_ascii=False)
+
+        self.out.put_pong(pong, fill)
+
     def _clock_ping(self, msg: dict) -> None:
-        """Bloque 5: la medición que trae el ping de la laptop (para el hub de aquí) y las líneas de la terminal."""
-        eventos = self._reloj.ping(msg.get("reloj"), "reloj" in msg)
+        """Bloque 5: la medición que trae el ping de la laptop (para el hub de aquí) y las líneas de la terminal.
+        Si la laptop no dijo "relojes" (8.5), es un Agmen anterior: «sin medir», y se dice una vez."""
+        if self._says_clocks_now():
+            eventos = self._reloj.ping(msg.get("reloj"), "reloj" in msg)
+        else:
+            eventos = self._reloj.ping(None, False)
         if not eventos:
             return
         desde = self._first.get("desde")
@@ -2187,21 +2253,15 @@ class _Session:
                                                 modo if isinstance(modo, str) else "real"):
             self.say(text, kind)
 
-    def _order(self, msg: dict) -> bool:
-        """Atiende una orden. Devuelve True si la sesión terminó."""
+    def _order(self, msg: dict, rx: int | None = None) -> bool:
+        """Atiende una orden. Devuelve True si la sesión terminó. `rx`: la hora de pared al recibirla (bloque 5)."""
         op = msg["op"]
         if self._awaiting and op not in ("ping", "adios", "sonda", "sigue"):   # 4c §5.1: aún no corre nada aquí
             self._error(f"{self.server.machine} espera la prueba de red y el 'sigue' de la laptop antes de preparar "
                         f"nada: '{_clean(op, 40)}' no se hizo")
             return False
         if op == "ping":
-            rx = self._hora()
-            t = msg.get("t")
-            ok = (isinstance(t, (int, float)) and not isinstance(t, bool)) or (isinstance(t, str) and len(t) <= PONG_T_MAX)
-            pong = {"op": "pong", "t": t if ok else None}
-            if "reloj" in msg:   # bloque 5: solo si la laptop lo sabe (una anterior recibe el pong de siempre)
-                pong["reloj"] = {"rx": rx, "tx": self._hora()}
-            self.send(pong)
+            self._pong(msg, rx)
             self._clock_ping(msg)
         elif op == "adios":
             if self._awaiting:   # 4c §5.5
@@ -2560,7 +2620,15 @@ def session_message(config, machine: str, clock: str, desde: str | None = None, 
         msg["desde"] = desde
         if sonda:
             msg["sonda"] = 1
+    msg["relojes"] = 1   # bloque 5 (8.5): mide la diferencia de relojes en ping/pong (con o sin puente)
     return msg
+
+
+def _says_clocks(msg: dict | None) -> bool:
+    """¿El otro lado dijo que mide la diferencia de relojes (bloque 5, 8.5: "relojes": 1, como "tablas")? (La clave
+    "reloj" de `sesion`, que ya existía, es otra cosa: el modo del reloj.)"""
+    value = (msg or {}).get("relojes")
+    return type(value) is int and value == 1
 
 
 def _says_tables(msg: dict | None) -> bool:
@@ -2721,6 +2789,7 @@ class AgentLink:
         # Bloque 5 (RFC 0011 §3.6): la diferencia entre el reloj del robot y el de aquí (las cuatro marcas viajan en
         # ping/pong); el vigía de los avisos (watch_clock, agmen run) y el sistema del robot (de la prueba de red).
         self._reloj = relojes.Medidor()
+        self._relojes_en: Channel | None = None   # 8.5: la conexión cuyo agente dijo "relojes" (None: ninguna)
         self._vigia: relojes.Vigia | None = None
         self.so_alla = ""
 
@@ -2792,6 +2861,7 @@ class AgentLink:
     def _opened(self, channel: Channel, ok: dict, contact: float, waited: bool) -> None:
         """Llegó sesion_ok (al abrir, o tras `sigue`): la sesión queda abierta y su lector arranca."""
         self._took(ok, contact)
+        self._clock_cap(channel, ok)
         self._set_tables(ok, probe_ok=waited)
         self.version = _clean(channel.peer_version, 40)
         self.state_since = time.monotonic()
@@ -3049,22 +3119,34 @@ class AgentLink:
                     self.last_tx = time.monotonic()
 
     # --- los relojes (bloque 5) ---
+    def _clock_cap(self, channel: Channel, ok: dict | None) -> None:
+        """8.5: lo que dijo el agente en sesion_ok/reanudar_ok por `channel`: con "relojes", los ping de esa conexión
+        llevan "reloj"; sin él (un Agmen anterior), los de siempre desde el primero y «sin medir (Agmen anterior)»."""
+        sabe = _says_clocks(ok)
+        self._relojes_en = channel if sabe else None
+        self._clock_events(self._reloj.capacidad(sabe))
+
     def _ping_msg(self, channel: Channel, t: float) -> dict:
-        """El ping de siempre; con "reloj" (la mejor medición vigente, o {} sin ninguna) salvo que el agente de esta
-        conexión ya mostró que es anterior (entonces, los bytes de siempre). Anota t1 justo antes de mandarlo."""
+        """El ping de siempre; con "reloj" (la mejor medición vigente con su edad, o {} sin ninguna) solo si el agente
+        de esta conexión dijo "relojes" (8.5; si no, los bytes de siempre). Anota t1 justo antes de mandarlo."""
         msg: dict = {"op": "ping", "t": t}
-        reloj = self._reloj.ping(channel, t)
+        reloj = self._reloj.ping(channel, t, sabe=channel is getattr(self, "_relojes_en", None))
         if reloj is not None:
             msg["reloj"] = reloj
         return msg
 
-    def _clock_pong(self, msg: dict, channel: Channel) -> None:
-        """Un pong: mide (t4 = ahora) y, en agmen run, revisa si hay que avisar. Nunca tumba la conexión."""
-        for ev in self._reloj.pong(channel, msg):
+    def _clock_events(self, eventos: list[str]) -> None:
+        for ev in eventos:
             if ev == "anterior":
                 self._notice(relojes.aviso_anterior(self.name))
+            elif ev == "descartadas":
+                self._notice(relojes.aviso_descartadas(self.name), "error")
             else:
                 self._notice(relojes.aviso_mal_formado(self.name), "error")
+
+    def _clock_pong(self, msg: dict, channel: Channel) -> None:
+        """Un pong: mide (t4 = ahora) y, en agmen run, revisa si hay que avisar. Nunca tumba la conexión."""
+        self._clock_events(self._reloj.pong(channel, msg))
         vigia = self._vigia
         if vigia is not None:
             for text in vigia.revisar(self.clock_state()):
@@ -3673,12 +3755,13 @@ class AgentLink:
             if self.session_id:
                 # §14: un reanudar contestado ya no renueva la gracia del robot: no sube el último contacto
                 # confirmado (eso lo hace solo el pong del ping de confirmación, abajo).
-                channel.send({"op": "reanudar", "sesion": self.session_id, "logs": dict(self._log_n)})
+                channel.send({"op": "reanudar", "sesion": self.session_id, "logs": dict(self._log_n), "relojes": 1})
                 msg, _ = self._first_reply(channel, self.last_ok)
                 if msg is None:   # stop
                     _bye(channel)
                     return None
                 if msg["op"] == "reanudar_ok":
+                    self._clock_cap(channel, msg)   # 8.5: antes del ping de confirmación
                     ended, self._resume_bye = threading.Event(), False
                     self._resuming = ended
                     try:
@@ -3899,6 +3982,7 @@ class AgentLink:
                     self._dispatch(msg)
             else:
                 self._took(ok or {}, contact if contact is not None else now)
+                self._clock_cap(channel, ok)
                 for node in self.nodes.values():
                     node.remote_state("detenido", None, None)
                 self._notice(f"{where}: reconectado tras {away} s sin conexión, pero ya había detenido sus nodos. "

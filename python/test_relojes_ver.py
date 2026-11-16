@@ -71,7 +71,7 @@ class TestNodeList(unittest.TestCase):
         self.assertTrue(out.endswith("ia    principal  ciclo  50 veces  a tiempo\n"))
 
     def test_mal_en_sesion_real(self):
-        (linea,) = bloque_relojes(node_list(con_maq(MAL), "real"))
+        (linea,) = bloque_relojes(node_list(con_modo(con_maq(MAL), "real")))
         esperado = "⚠ robot: reloj -35.0 ms (±0.6) — más de 10 ms: revisa la hora de las dos"
         self.assertTrue(linea.startswith(esperado), linea)
         self.assertIn("chrony", linea)
@@ -86,12 +86,12 @@ class TestNodeList(unittest.TestCase):
     def test_sim_y_replay(self):
         for modo, nota in (("sim", "(no afecta en sim)"), ("replay", "(no afecta en reproducción)")):
             with self.subTest(modo=modo):
-                (linea,) = bloque_relojes(node_list(con_maq(MAL), modo))
+                (linea,) = bloque_relojes(node_list(con_modo(con_maq(MAL), modo)))
                 self.assertEqual(linea, f"robot: reloj -35.0 ms (±0.6) {nota}")
 
     def test_red_lenta_no_afirma(self):
         lenta = dict(MAL, err=15 * MS)
-        (linea,) = bloque_relojes(node_list(con_maq(lenta), "real"))
+        (linea,) = bloque_relojes(node_list(con_modo(con_maq(lenta), "real")))
         self.assertFalse(linea.startswith("⚠"), linea)
         self.assertIn("demasiado lenta", linea)
 
@@ -155,9 +155,14 @@ class TestNodeListConElModoDelHub(unittest.TestCase):
                 self.assertIn("si la sesión usa el reloj real", linea)
                 self.assertNotIn("no afecta", linea)
 
-    def test_sin_modo_del_hub_se_usa_agmen_clock(self):
-        (linea,) = bloque_relojes(node_list(con_maq(MAL), "real"))
-        self.assertTrue(linea.startswith("⚠"), linea)
+    def test_sin_modo_del_hub_agmen_clock_no_decide(self):
+        """8.6: si el hub no dice el modo, el texto condicional SIEMPRE, aunque exista AGMEN_CLOCK."""
+        for clock in ("real", "sim", "replay"):
+            with self.subTest(clock=clock):
+                (linea,) = bloque_relojes(node_list(con_maq(MAL), clock))
+                self.assertFalse(linea.startswith("⚠"), linea)
+                self.assertIn("si la sesión usa el reloj real", linea)
+                self.assertNotIn("no afecta", linea)
 
     def test_sin_maquinas_identico_con_modo(self):
         self.assertEqual(node_list(con_modo(TM.lineas(), "real")), TM.ANTES_NODES)
@@ -256,14 +261,30 @@ class TestPanel(unittest.TestCase):
         p.clocks = {"robot": R.Estado(True, 35 * MS, 500_000, 0.1), "pi": R.Estado(False, motivo="vieja")}
         t = self.state(p)["stats"]["topics"]
         self.assertEqual((t["/imu"]["latency_ms"], t["/imu"]["latency_raw_ms"], t["/imu"]["latency_fix"]),
-                         (5.0, 40.0, "corregida"))
+                         (75.0, 40.0, "corregida"))
         self.assertIn("robot", t["/imu"]["latency_note"])
+        self.assertIn("corregida con la diferencia de reloj", t["/imu"]["latency_note"])
         self.assertEqual((t["/pi"]["latency_ms"], t["/pi"]["latency_fix"]), (40.0, "sin_corregir"))
         self.assertIn("sin medir", t["/pi"]["latency_note"])
         self.assertEqual((t["/dos"]["latency_ms"], t["/dos"]["latency_fix"]), (40.0, "sin_corregir"))
         self.assertIn("varias computadoras", t["/dos"]["latency_note"])
         self.assertEqual(t["/aqui"]["latency_ms"], 40.0)
         self.assertFalse({"latency_fix", "latency_note", "latency_raw_ms"} & set(t["/aqui"]))
+
+    def test_latencia_fisica(self):
+        """8.1: con relojes de mentira. El robot publica cuando AQUÍ son las 1000 ms y el mensaje llega aquí a las
+        1075 ms: la latencia real es 75 ms, vaya su reloj adelantado o atrasado. (Con el signo viejo, raw − dif, sale
+        5 ms con el robot adelantado y 145 ms con el atrasado: esta prueba falla.)"""
+        aqui_publica, aqui_llega = 1000 * MS, 1075 * MS
+        for dif in (35 * MS, -35 * MS):
+            with self.subTest(dif_ms=dif / MS):
+                t_pub = aqui_publica + dif                    # la marca la pone el reloj del robot
+                cruda = (aqui_llega - t_pub) / 1e6            # lo que mide el panel (server.py: recv − t_pub)
+                p = self.panel()
+                p.hub.update(topics={"/imu": {"topic": "/imu", "type": "X", "rate_hz": 10.0, "latency_ms": cruda}})
+                p.clocks = {"robot": R.Estado(True, dif, 500_000, 0.1)}
+                t = self.state(p)["stats"]["topics"]["/imu"]
+                self.assertEqual((t["latency_raw_ms"], t["latency_ms"]), (cruda, 75.0))
 
     def test_latencias_en_replay_no_se_tocan(self):
         p = self.panel(playing=True)
@@ -325,7 +346,7 @@ class TestGrabacion(TREC.HubCase):
             entre()
         for i in range(5):
             a.publish(TREC.imu(i))
-        time.sleep(0.2)
+        self.assertTrue(TM.TR.until(lambda: rec.summary.messages >= 5))   # (espera con tope, sin sleep fijo)
         rec.stop()
         return path
 
@@ -358,6 +379,27 @@ class TestGrabacion(TREC.HubCase):
         info = TREC.TestPerfilEnLaGrabacion.info(self, path)
         self.assertIn("  reloj de robot: +2.1 ms al empezar, +3.5 ms al terminar (mín +2.1 ms, máx +3.5 ms, "
                       "±0.6 ms, ", info)
+        # 8.6: qué registro agmen.grabacion lee cada lector de Python: el ÚLTIMO (el que trae `relojes`).
+        from agmen.recording import Recording
+        self.assertEqual(record.describe(path)["recording"], ultimo)
+        self.assertEqual(Recording(path).info, ultimo)
+
+    def test_split_consulta_el_hub_al_cerrar_cada_archivo(self):
+        """8.6: en un corte (split) se consulta el hub al cerrar ese archivo: su `fin_ns` es el de ese momento."""
+        self.red("robot:2100000:600000:500")
+        path = os.path.join(self.dir, "s.mcap")
+        rec = record.Recorder(path, ["*"], quiet=True, split="1h").start()
+        a = self.pub(wire.ImuSample, "/imu")
+        self.wait_subscribers(a)
+        self.assertTrue(TM.TR.until(lambda: rec._clocks.por))   # la muestra del principio
+        self.red("robot:4200000:600000:500")                    # cambia… y el hilo no vuelve a mirar en ~10 s
+        rec.split_seconds = 1e-9                                # el próximo tick corta
+        self.assertTrue(TM.TR.until(lambda: len(rec.summary.files) >= 2))
+        rec.split_seconds = 3600
+        rec.stop()
+        primero = rec.summary.files[0]
+        rel = json.loads(record.describe(primero)["recording"]["relojes"])["robot"]
+        self.assertEqual(rel["fin_ns"], 4_200_000)
 
     def test_grabacion_de_antes_se_lee_igual(self):
         path = os.path.join(self.dir, "vieja.mcap")

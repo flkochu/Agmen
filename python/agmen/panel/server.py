@@ -655,9 +655,10 @@ class Panel:
 
     def correct_latency(self, topics: dict, machines: list[dict], here: str) -> None:
         """Bloque 5 (RFC 0011 §3.6, §4.3): la latencia de un topic que sale de OTRA computadora se calcula con dos
-        relojes; en una sesión real se le resta la diferencia medida de esa computadora. Si no se puede (sin
-        medición vigente, o lo publican varias computadoras), queda como siempre pero marcada «sin corregir». En
-        sim/replay no se resta nada (C3). Los topics que solo salen de aquí no cambian (ni ganan claves)."""
+        relojes; en una sesión real se corrige con la diferencia medida de esa computadora (8.1: cruda + dif). Si no
+        se puede (sin medición vigente, o lo publican varias computadoras), queda como siempre pero marcada «sin
+        corregir». En sim/replay no se corrige nada (C3). Los topics que solo salen de aquí no cambian (ni ganan
+        claves)."""
         if self.session_mode() != "real":
             return
         clocks = {m["name"]: m.get("clock") for m in machines if not m.get("here")}
@@ -675,12 +676,14 @@ class Panel:
                 t["latency_fix"] = "sin_corregir"
                 t["latency_note"] = f"sin corregir: el reloj de {pubs[0]} está sin medir ({why})"
             else:
+                # 8.1: dif = (reloj de allá) − (reloj de aquí). El t_pub de allá vale "hora de aquí + dif", así que
+                # la cruda (recepción aquí − t_pub) = real − dif: la latencia real = cruda + dif.
                 raw = t["latency_ms"]
                 t["latency_raw_ms"] = raw
-                t["latency_ms"] = round(raw - c["offset_ms"], 3)
+                t["latency_ms"] = round(raw + c["offset_ms"], 3)
                 t["latency_fix"] = "corregida"
-                t["latency_note"] = (f"corregida: se restó la diferencia del reloj de {pubs[0]} "
-                                     f"({c['offset_ms']:+.1f} ms ±{c['error_ms']:.1f}); sin restar, {raw:.2f} ms")
+                t["latency_note"] = (f"corregida con la diferencia de reloj de {pubs[0]} "
+                                     f"({c['offset_ms']:+.1f} ms ±{c['error_ms']:.1f}); sin corregir, {raw:.2f} ms")
 
     def _handler(self):
         panel = self

@@ -1909,7 +1909,7 @@ class TestSesion(ServerCase):
         self.assertRegex(ok.get("sesion", ""), r"^[0-9a-f]{32}$")   # 3c: el identificador para reanudar…
         self.assertEqual(ok.get("gracia"), 10)                        # … y la gracia
         self.assertEqual(ok, {"op": "sesion_ok", "maquina": "robot", "agmen": __version__, "nodos": ["motor", "imu"],
-                              "sesion": ok["sesion"], "gracia": 10})
+                              "sesion": ok["sesion"], "gracia": 10, "relojes": 1})   # (bloque 5: la laptop lo dijo)
         self.assertTrue(cli.wait(lambda ms: any(m["op"] == "estado" and m["nodo"] == "motor" and m["estado"] == "corriendo"
                                                for m in ms)))
         self.assertTrue(cli.wait(cli.hay("estado", nodo="imu", estado="corriendo")))

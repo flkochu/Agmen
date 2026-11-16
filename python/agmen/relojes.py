@@ -5,15 +5,17 @@ la fórmula (como NTP: cuatro marcas), la ventana de mediciones, los estados ("m
 motivo), el campo `relojes` de la línea `red` del hub y los textos de los avisos. Las horas se inyectan (`hora`,
 `mono`) para probar sin depender del reloj de la máquina.
 
-Las cuatro marcas viajan en el `ping`/`pong` de agmen-agent/1 (decisión C1):
+Las cuatro marcas viajan en el `ping`/`pong` de agmen-agent/1 (decisión C1), solo si los dos lados dijeron
+`"relojes": 1` (la laptop en `sesion` y `reanudar`; el agente, si la laptop lo dijo, en `sesion_ok`/`reanudar_ok`):
 
-    laptop → agente   {"op": "ping", "t": …, "reloj": {}}                   (aún sin medición)
-                      {"op": "ping", "t": …, "reloj": {"dif": ns, "err": ns}} (su mejor medición vigente)
-    agente → laptop   {"op": "pong", "t": …, "reloj": {"rx": ns, "tx": ns}}  (solo si el ping traía "reloj")
+    laptop → agente   {"op": "ping", "t": …, "reloj": {}}                               (sin medición vigente)
+                      {"op": "ping", "t": …, "reloj": {"dif": ns, "err": ns, "edad": ms}} (su mejor medición vigente)
+    agente → laptop   {"op": "pong", "t": …, "reloj": {"rx": ns, "tx": ns, "res": ns}}    (`res` opcional)
 
-`t1` (la laptop manda el ping) y `t4` (le llega el pong) son de la laptop; `rx` y `tx`, del agente. Con un Agmen
-anterior del otro lado nada de esto viaja: el agente anterior contesta sin "reloj" (la laptop deja de mandarlo en
-esa conexión) y una laptop anterior manda el ping sin "reloj" (el agente contesta el pong de siempre).
+`t1` (la laptop manda el ping) y `t4` (le llega el pong) son de la laptop; `rx` y `tx`, del agente (`tx` lo escribe
+el hilo que manda, justo antes de escribir). `res`: la resolución del reloj de pared del agente (8.4). Con un Agmen
+anterior del otro lado nada de esto viaja: `ping` y `pong` son exactamente los de antes desde el primero, y el
+estado es «sin medir (Agmen anterior)».
 
 Signo: la diferencia de una computadora X es (reloj de X) − (reloj de aquí); positivo = X va ADELANTADO.
 """
@@ -21,6 +23,7 @@ Signo: la diferencia de una computadora X es (reloj de X) − (reloj de aquí); 
 from __future__ import annotations
 
 import json
+import math
 import re
 import threading
 import time
@@ -44,15 +47,26 @@ MOTIVOS = {
     "esperando": "aún no hay medición",
     "anterior": "el otro lado tiene un Agmen anterior, que no mide el reloj",
     "vieja": f"la última medición tiene más de {RELOJ_VIGENTE_S:g} s",
-    "sin_conexion": "sin conexión",
+    "sin_conexion": "sin conexión con esa computadora",
     "sin_dato": "el hub no recibió la medición",
+    "descartadas": "las mediciones salen absurdas: ¿la red tarda más de 2 s?",
 }
+RES_MAX_NS = 1_000_000_000           # una resolución de reloj de más de 1 s no es creíble: se ignora
 
 
 def hora_ns() -> int:
     """La hora "de pared" de esta computadora en ns: la misma que usa agmen.clock en modo real para `t_data`
     (time.time_ns), no el reloj monótono."""
     return time.time_ns()
+
+
+def resolucion_ns() -> int:
+    """La resolución de ese reloj de pared en ns (8.4): ~15.6 ms en Windows con Python ≤ 3.12, 1 ns en Linux."""
+    try:
+        res = time.get_clock_info("time").resolution
+    except (ValueError, OSError):
+        return 0
+    return min(RES_MAX_NS, max(0, int(round(res * 1e9))))
 
 
 @dataclass(frozen=True)
@@ -78,17 +92,22 @@ def es_marca(v) -> bool:
     return type(v) is int and 0 <= v < MARCA_MAX
 
 
-def medir(t1: int, rx: int, tx: int, t4: int, cuando: float = 0.0) -> Medicion | None:
-    """Las cuatro marcas → la medición, o None si no sirve (ida y vuelta negativa o de más de 2 s)."""
+def medir(t1: int, rx: int, tx: int, t4: int, cuando: float = 0.0, res_ns: int = 0) -> Medicion | None:
+    """Las cuatro marcas → la medición, o None si no sirve (ida y vuelta negativa o de más de 2 s).
+
+    `res_ns` (8.4): la suma de las resoluciones de los dos relojes de pared. Se suma a la incertidumbre, y una ida y
+    vuelta ligeramente negativa por esa resolución (dentro de −res_ns) no se descarta: cuenta como 0."""
     ida_vuelta = (t4 - t1) - (tx - rx)
-    if ida_vuelta < 0 or ida_vuelta > RELOJ_IDA_VUELTA_MAX_NS or tx < rx:
+    if ida_vuelta < -res_ns or ida_vuelta > RELOJ_IDA_VUELTA_MAX_NS or tx < rx:
         return None
+    ida_vuelta = max(0, ida_vuelta)
     dif = ((rx - t1) + (tx - t4)) // 2
-    return Medicion(dif, ida_vuelta // 2, ida_vuelta, cuando)
+    return Medicion(dif, ida_vuelta // 2 + res_ns, ida_vuelta, cuando)
 
 
 class _Ventana:
-    """Las últimas RELOJ_VENTANA mediciones; la mejor = la de menor ida y vuelta entre las vigentes."""
+    """Las últimas RELOJ_VENTANA mediciones; la mejor = la de menor ida y vuelta entre las vigentes (con empate, la
+    más nueva)."""
 
     def __init__(self) -> None:
         self.ultimas: deque[Medicion] = deque(maxlen=RELOJ_VENTANA)
@@ -97,8 +116,8 @@ class _Ventana:
         self.ultimas.append(m)
 
     def mejor(self, ahora: float) -> Medicion | None:
-        vigentes = [m for m in self.ultimas if ahora - m.cuando <= RELOJ_VIGENTE_S]
-        return min(vigentes, key=lambda m: m.ida_vuelta_ns) if vigentes else None
+        vigentes = [m for m in reversed(self.ultimas) if ahora - m.cuando <= RELOJ_VIGENTE_S]
+        return min(vigentes, key=lambda m: m.ida_vuelta_ns) if vigentes else None   # (min: la primera = más nueva)
 
     def edad(self, ahora: float) -> float | None:
         return max(0.0, ahora - self.ultimas[-1].cuando) if self.ultimas else None
@@ -108,31 +127,43 @@ class Medidor:
     """El lado de la laptop (agmen run), por robot: anota t1 al mandar cada ping y mide con cada pong.
     Seguro entre hilos (el de ping, el lector y el puente)."""
 
-    def __init__(self, hora: Callable[[], int] = hora_ns, mono: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, hora: Callable[[], int] = hora_ns, mono: Callable[[], float] = time.monotonic,
+                 res: int | None = None) -> None:
         self.hora, self.mono = hora, mono
+        self.res = resolucion_ns() if res is None else res   # 8.4: la resolución del reloj de pared de aquí
         self._lock = threading.Lock()
         self._ventana = _Ventana()
         self._pendientes: dict[float, tuple[int, bool]] = {}   # t del ping → (t1, ¿llevaba "reloj"?)
-        self._anterior_en: object | None = None   # la conexión cuyo agente no mide (no se le manda "reloj")
-        self._anterior = False
+        self._anterior = False      # el agente no dijo "relojes" (8.5)
+        self._descartada = False    # la última medición se descartó por absurda (8.6)
         self._dicho: set[str] = set()
 
-    def ping(self, canal: object, t: float) -> dict | None:
-        """Antes de mandar el ping `t` por `canal`: el valor de su clave "reloj" (None = no llevarla)."""
+    def capacidad(self, sabe: bool) -> list[str]:
+        """8.5: el agente dijo (o no) "relojes" en su sesion_ok/reanudar_ok. Sin él: «sin medir (Agmen anterior)»; el
+        evento "anterior" sale con el primer pong de esa conexión (como antes de la negociación: una sesión que se
+        pierde antes de contestar un ping no dice nada de relojes)."""
         with self._lock:
-            lleva = canal is not self._anterior_en
+            self._anterior = not sabe
+            return []
+
+    def ping(self, canal: object, t: float, sabe: bool = True) -> dict | None:
+        """Antes de mandar el ping `t` por `canal`: el valor de su clave "reloj" (None = no llevarla: el agente de esa
+        conexión no dijo "relojes"). La mejor medición vigente va con su edad en ms (8.2); {} si no hay ninguna."""
+        with self._lock:
             valor = None
-            if lleva:
-                mejor = self._ventana.mejor(self.mono())
-                valor = {"dif": mejor.dif_ns, "err": mejor.err_ns} if mejor is not None else {}
+            if sabe:
+                ahora = self.mono()
+                mejor = self._ventana.mejor(ahora)
+                valor = {} if mejor is None else {"dif": mejor.dif_ns, "err": mejor.err_ns,
+                                                  "edad": max(0, int(round((ahora - mejor.cuando) * 1000)))}
             if len(self._pendientes) >= _PENDIENTES_MAX:
                 self._pendientes.pop(next(iter(self._pendientes)))
-            self._pendientes[t] = (self.hora(), lleva)
+            self._pendientes[t] = (self.hora(), sabe)
             return valor
 
     def pong(self, canal: object, msg: dict) -> list[str]:
-        """Llegó un pong por `canal`. Devuelve los avisos que hay que decir (cada uno, una sola vez):
-        "anterior" (el agente no mide) o "mal_formado" (marcas que no sirven: se ignoran)."""
+        """Llegó un pong por `canal`. Devuelve los avisos que hay que decir (cada uno, una sola vez): "mal_formado"
+        (marcas que no sirven: se ignoran) o "descartadas" (todas las mediciones salen absurdas)."""
         t4 = self.hora()
         ahora = self.mono()
         t = msg.get("t")
@@ -143,19 +174,22 @@ class Medidor:
             if pendiente is None:
                 return []
             t1, llevaba = pendiente
+            if not llevaba:   # (un ping sin "reloj": su pong no mide nada)
+                return self._una_vez("anterior") if self._anterior else []
             reloj = msg.get("reloj")
-            if reloj is None:
-                if not llevaba:
-                    return []
-                self._anterior_en, self._anterior = canal, True
-                return self._una_vez("anterior")
             rx, tx = (reloj.get("rx"), reloj.get("tx")) if isinstance(reloj, dict) else (None, None)
-            if not (es_marca(rx) and es_marca(tx) and tx >= rx):
+            res = reloj.get("res", 0) if isinstance(reloj, dict) else 0
+            if not (es_marca(rx) and es_marca(tx) and tx >= rx and type(res) is int and 0 <= res <= RES_MAX_NS):
                 return self._una_vez("mal_formado")
-            self._anterior = False
-            m = medir(t1, rx, tx, t4, ahora)
-            if m is not None:   # (una ida y vuelta absurda se descarta sin más: la red estuvo lenta)
+            m = medir(t1, rx, tx, t4, ahora, res_ns=self.res + res)
+            if m is not None:
+                self._descartada = False
                 self._ventana.poner(m)
+                return []
+            # Una ida y vuelta absurda (negativa o > 2 s) se descarta. Si ya no queda ninguna vigente, se dice.
+            self._descartada = True
+            if self._ventana.mejor(ahora) is None:
+                return self._una_vez("descartadas")
             return []
 
     def _una_vez(self, clave: str) -> list[str]:
@@ -170,11 +204,13 @@ class Medidor:
             edad = self._ventana.edad(ahora)
             if not conectado:
                 return Estado(False, edad_s=edad, motivo="sin_conexion")
+            if self._anterior:
+                return Estado(False, edad_s=edad, motivo="anterior")
             mejor = self._ventana.mejor(ahora)
             if mejor is not None:
                 return Estado(True, mejor.dif_ns, mejor.err_ns, max(0.0, ahora - mejor.cuando))
-            if self._anterior:
-                return Estado(False, edad_s=edad, motivo="anterior")
+            if self._descartada:
+                return Estado(False, edad_s=edad, motivo="descartadas")
             return Estado(False, edad_s=edad, motivo="vieja" if edad is not None else "esperando")
 
 
@@ -186,6 +222,7 @@ class Remoto:
         self.mono = mono
         self._lock = threading.Lock()
         self._ultima: Medicion | None = None
+        self._borrada = False   # la laptop dijo {} (ya no tiene medición vigente): «sin medir» (8.2)
         self._anterior = False
         self._perdida = False
         self._mal = False       # ¿está por encima del umbral? (con histéresis, para las líneas de la terminal)
@@ -193,21 +230,31 @@ class Remoto:
 
     def ping(self, reloj, trae: bool) -> list[str]:
         """Llegó un ping (`trae`: ¿con la clave "reloj"?; `reloj`: su valor). Devuelve los eventos para la terminal
-        del agente: "anterior", "mal_formado" (una vez cada uno), "primera", "mal" y "bien" (al cruzar el umbral)."""
+        del agente: "anterior", "mal_formado" (una vez cada uno), "primera", "mal" y "bien" (al cruzar el umbral).
+
+        8.2: la medición se da por tomada hace `edad` ms (no "ahora") y caduca a los 10 s de verdad; un {} BORRA la
+        que había (la laptop ya no tiene una vigente). Nunca se guarda como medido un valor de más de 10 s."""
         with self._lock:
             self._perdida = False
             if not trae:
                 self._anterior = True
                 return self._una_vez("anterior")
             self._anterior = False
-            if not isinstance(reloj, dict) or not reloj:
-                return [] if isinstance(reloj, dict) else self._una_vez("mal_formado")
-            dif, err = reloj.get("dif"), reloj.get("err")
-            if not (type(dif) is int and abs(dif) < MARCA_MAX and type(err) is int
-                    and 0 <= err <= RELOJ_IDA_VUELTA_MAX_NS // 2):
+            if not isinstance(reloj, dict):
                 return self._una_vez("mal_formado")
+            if not reloj:
+                self._borrada = True
+                return []
+            dif, err, edad = reloj.get("dif"), reloj.get("err"), reloj.get("edad")
+            if not (type(dif) is int and abs(dif) < MARCA_MAX and type(err) is int
+                    and 0 <= err <= RELOJ_IDA_VUELTA_MAX_NS and type(edad) is int and edad >= 0):
+                return self._una_vez("mal_formado")
+            if edad > RELOJ_VIGENTE_S * 1000:   # ya vieja al llegar: como {} (la laptop no debería mandarla)
+                self._borrada = True
+                return []
             primera = self._ultima is None
-            self._ultima = Medicion(-dif, err, 2 * err, self.mono())
+            self._borrada = False
+            self._ultima = Medicion(-dif, err, 2 * err, self.mono() - edad / 1000)
             out = ["primera"] if primera else []
             if not self._mal and abs(dif) > RELOJ_UMBRAL_NS and err <= RELOJ_UMBRAL_NS:
                 self._mal = True
@@ -233,7 +280,7 @@ class Remoto:
             edad = None if u is None else max(0.0, self.mono() - u.cuando)
             if self._perdida:
                 return Estado(False, edad_s=edad, motivo="sin_conexion")
-            if u is not None and edad is not None and edad <= RELOJ_VIGENTE_S:
+            if u is not None and edad is not None and edad <= RELOJ_VIGENTE_S and not self._borrada:
                 return Estado(True, u.dif_ns, u.err_ns, edad)
             if self._anterior:
                 return Estado(False, edad_s=edad, motivo="anterior")
@@ -292,13 +339,20 @@ def aviso_bien(nombre: str, e: Estado) -> str:
 
 
 def aviso_lenta(nombre: str, e: Estado) -> str:
-    return (f"⚠ la red con {nombre} está demasiado lenta para medir su reloj con precisión (±{fmt_ms(e.err_ns)}): "
-            f"no puedo decir si va bien o corrido. Lo sigo midiendo; si la red mejora, aviso solo si está corrido")
+    return (f"⚠ la red con {nombre} está demasiado lenta para medir su reloj con precisión (±{fmt_ms(e.err_ns)}), o "
+            f"el reloj de alguna de las dos avanza a saltos (Windows con Python 3.12 o anterior: de 15.6 ms en "
+            f"15.6 ms): no puedo decir si va bien o corrido. Lo sigo midiendo; si mejora, aviso solo si está corrido")
 
 
 def aviso_anterior(nombre: str) -> str:
     return (f"{nombre} tiene un Agmen anterior: no mide la diferencia entre su reloj y el de esta computadora (queda "
             f"«sin medir»). Actualiza Agmen en {nombre} (pip install -U agmen) para verla")
+
+
+def aviso_descartadas(nombre: str) -> str:
+    return (f"⚠ las mediciones del reloj de {nombre} salen absurdas (la ida y vuelta es negativa o de más de "
+            f"{RELOJ_IDA_VUELTA_MAX_NS / 1e9:g} s): las descarto y su reloj queda «sin medir». ¿La red tarda más de "
+            f"{RELOJ_IDA_VUELTA_MAX_NS / 1e9:g} s, o alguien está cambiando la hora de una de las dos?")
 
 
 def aviso_mal_formado(nombre: str) -> str:
@@ -428,8 +482,10 @@ def leer_maq(f: dict) -> Estado:
     edad = None
     try:
         if "edad" in f:
-            edad = max(0.0, float(f["edad"]))
-    except ValueError:
+            edad = float(f["edad"])
+            if not (math.isfinite(edad) and 0.0 <= edad <= 1e9):   # 8.6: nunca Infinity/NaN en el JSON del panel
+                edad = None
+    except (ValueError, TypeError):
         edad = None
     reloj, err = f.get("reloj"), f.get("err")
     if reloj is not None and err is not None:

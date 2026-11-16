@@ -615,6 +615,7 @@ class Bridge:
         now = time.monotonic()
         with self.lock:
             peers = [p for p in self.peers if p.confirmed and p.ip]
+            perdidos = [p for p in self.peers if not (p.confirmed and p.ip)]   # 8.6: sin conexión ahora
         local = self._read_hub(now, [p.name for p in peers])
         if local is not None and peers:
             parts = self._parts(*local)
@@ -625,7 +626,8 @@ class Bridge:
         if active:
             if active != self._red or now - self._red_at >= hp.NET_BEAT_S:
                 modo = {"modo": self.modo} if self.modo else {}
-                lines.append(hp.encode("red", peers=hp.format_peers(active), **self._relojes(peers), **modo))
+                lines.append(hp.encode("red", peers=hp.format_peers(active), **self._relojes(peers, perdidos),
+                                       **modo))
                 self._red, self._red_at = active, now
         else:
             self._red = None   # deja de repetir `red`: el hub vuelve a modo local en NET_EXPIRE_S
@@ -644,19 +646,27 @@ class Bridge:
         if self.robots:
             self._robots(peers)
 
-    def _relojes(self, peers: list[Peer]) -> dict[str, str]:
-        """Bloque 5: el campo `relojes` de `red` (vacío si ningún Peer sabe su reloj: el `red` de siempre)."""
+    def _relojes(self, peers: list[Peer], perdidos: list[Peer] = ()) -> dict[str, str]:
+        """Bloque 5: el campo `relojes` de `red` (vacío si ningún Peer sabe su reloj: el `red` de siempre). 8.6: una
+        computadora declarada con la que se perdió la conexión (`perdidos`, fuera de `peers`) va solo como «sin medir
+        (sin conexión)», para que node list y el panel no la pierdan de vista."""
         from . import relojes
 
         known = []
-        for p in sorted(peers, key=lambda p: p.name):
+        activos = {p.name for p in peers}
+        todos = [(p, True) for p in peers] + [(p, False) for p in perdidos if p.name not in activos]
+        for p, activo in sorted(todos, key=lambda x: x[0].name):
             if p.reloj is None:
                 continue
             try:
-                known.append((p.name, p.reloj()))
-            except Exception as e:   # nunca en silencio; el `red` sale igual (esa computadora, sin medir)
+                e = p.reloj()
+            except Exception as err:   # nunca en silencio; el `red` sale igual (esa computadora, sin medir)
                 self.say_once(("reloj", p.name), f"⚠ no pude leer la diferencia de reloj de {p.name} "
-                                                 f"({repr(e)[:200]}): queda «sin medir»", "error")
+                                                 f"({repr(err)[:200]}): queda «sin medir»", "error")
+                continue
+            if not activo:
+                e = relojes.Estado(False, edad_s=e.edad_s, motivo="sin_conexion")
+            known.append((p.name, e))
         return {"relojes": relojes.formato_red(known)} if known else {}
 
     def _send(self, data: bytes) -> None:

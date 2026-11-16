@@ -523,6 +523,8 @@ class Recorder:
         w = self._writer
         if (self.split_bytes and w.bytes_written + w.pending_bytes >= self.split_bytes) or \
                 (self.split_seconds and time.monotonic() - self._file_started >= self.split_seconds):
+            if self._clocks_seen:
+                self._sample_clocks()   # bloque 5 (8.6): la diferencia de relojes al cerrar ESTE archivo
             self._close_file()
             self._file_index += 1
             self._open_file()
