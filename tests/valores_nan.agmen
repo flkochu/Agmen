@@ -1,0 +1,15 @@
+# `nan` como valor por defecto (RFC 0013): sueltos, en arreglos y mezclados con
+# números, en f32 y en f64. tests/test_msgs.cpp revisa que el C++ generado
+# compile (GCC, clang y MSVC) y dé los mismos bits que Python
+# (python/test_idl.py, TestNan).
+package pruebas_nan
+
+message ConNan {
+    f32    a = nan
+    f64    b = nan
+    f32[3] v = nan                # todo el arreglo en NaN
+    f64[2] w = nan
+    f32[3] m = [nan, 1.5, nan]    # mezclado con números
+    f64    c = 2.5
+    u8     k = 7
+}

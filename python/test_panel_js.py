@@ -5,7 +5,8 @@
 2. `agmen.js` (el formato v1 en JavaScript, la tercera implementación junto a
    C++ y Python) debe dar EXACTAMENTE lo mismo que Python con los vectores de
    prueba compartidos (tests/vectors/v1.txt): texto canónico, schema_id,
-   tamaño, sobre, anuncios y valores decodificados.
+   tamaño, sobre, anuncios y valores decodificados. Y con los de los mensajes
+   estándar chicos (tests/vectors/estandar.txt, RFC 0013), NaN incluidos.
 
 Usa Node si está instalado; si no, se salta (en el CI de GitHub Node siempre
 está).
@@ -34,6 +35,7 @@ AGMEN_JS = PANEL / "agmen.js"
 MCAP_JS = PANEL / "mcap.js"
 MCAP_VECTOR = HERE.parent / "tests" / "vectors" / "grabacion.mcap"
 VECTORS = HERE.parent / "tests" / "vectors" / "v1.txt"
+VECTORS_ESTANDAR = HERE.parent / "tests" / "vectors" / "estandar.txt"
 SAFE = 2**53 - 1
 
 NODE_SCRIPT = r"""
@@ -165,6 +167,75 @@ class TestPanelJs(unittest.TestCase):
         for case, exp, res in zip(cases, expected, got, strict=True):
             with self.subTest(case=case.get("input") or case.get("text") or case["kind"]):
                 self.assertEqual(res, exp)
+
+    def test_vectores_estandar(self):
+        """Los mensajes estándar chicos (RFC 0013, tests/vectors/estandar.txt): agmen.js da el mismo
+        texto canónico, schema_id y tamaño, y lee los mismos valores que Python, NaN incluidos. flatten
+        (las gráficas) y summarize (el inspector) no truenan con NaN."""
+        script = r"""
+const A = require(process.argv[2]);
+const c = JSON.parse(require("fs").readFileSync(0, "utf8"));
+const hex = (s) => Uint8Array.from(s.match(/../g) || [], (h) => parseInt(h, 16));
+// NaN no existe en JSON (JSON.stringify lo vuelve null): se marca para compararlo con Python.
+const norm = (v) => typeof v === "number" && Number.isNaN(v) ? { $nan: true }
+  : Array.isArray(v) ? v.map(norm)
+  : v !== null && typeof v === "object" ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, norm(x)])) : v;
+const out = { tipos: c.tipos.map((t) => { const L = new A.Layout(t); return { text: L.text, id: A.hex64(L.schemaId), size: L.size,
+                                                                              encoding: L.encoding }; }),
+              valores: c.valores.map(([t, p]) => { const rows = new A.Layout(t).decodeRows(hex(p));
+                                                   const flat = A.flatten(rows[0]); A.summarize(rows[0]);
+                                                   return { rows: norm(rows), nan: Object.keys(flat).filter((k) => Number.isNaN(flat[k])) }; }) };
+process.stdout.write(JSON.stringify(out));
+"""
+        import math
+
+        def norm(v):
+            if isinstance(v, float) and math.isnan(v):
+                return {"$nan": True}
+            if isinstance(v, list):
+                return [norm(x) for x in v]
+            if isinstance(v, dict):
+                return {k: norm(x) for k, x in v.items()}
+            return v
+
+        tipos, valores = [], []
+        for line in VECTORS_ESTANDAR.read_text(encoding="utf-8").splitlines():
+            cols = line.split("\t")
+            if cols[0] == "tipo":
+                tipos.append(cols)
+            elif cols[0] == "valor":
+                valores.append(cols)
+        canon = {c[1]: c[3] for c in tipos}
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "estandar.js"
+            path.write_text(script, encoding="utf-8")
+            r = self._node(str(path), str(AGMEN_JS), stdin=json.dumps(
+                {"tipos": [c[3] for c in tipos], "valores": [[canon[c[1]], c[4]] for c in valores]}))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        got = json.loads(r.stdout)
+        self.assertEqual(len(got["tipos"]), 10)
+        for cols, res in zip(tipos, got["tipos"], strict=True):
+            with self.subTest(cols[1]):
+                self.assertEqual(res, {"text": cols[3], "id": cols[4], "size": int(cols[5]), "encoding": 1})
+        for cols, res in zip(valores, got["valores"], strict=True):
+            with self.subTest(f"{cols[1]} {cols[2]}"):
+                rows = schema.Layout(canon[cols[1]]).unpack_rows(bytes.fromhex(cols[4]))
+                self.assertEqual(res["rows"], norm(rows))
+                self.assertEqual(res["rows"], norm([json.loads(cols[3])]))
+                if cols[1] == "Imu" and cols[2] in ("por_defecto", "sin_orientacion"):
+                    self.assertEqual(sorted(res["nan"]), ["orientation.w", "orientation.x", "orientation.y", "orientation.z"])
+
+    def test_inspector_muestra_nan(self):
+        """El inspector del panel (fmtVal en index.html) escribe NaN, no null ni un error."""
+        m = re.search(r"^function fmtVal\(v\) \{.*?^\}", INDEX.read_text(encoding="utf-8"), re.S | re.M)
+        self.assertIsNotNone(m, "no encontré fmtVal en index.html")
+        script = m.group(0) + "\nprocess.stdout.write(JSON.stringify([fmtVal(NaN), fmtVal(-Infinity), fmtVal(1.5), fmtVal(3)]));"
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "fmt.js"
+            path.write_text(script, encoding="utf-8")
+            r = self._node(str(path))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout), ["NaN", "-Infinity", "1.5", "3"])
 
     def test_errores_claros(self):
         bad = ["Foo{float x}", "Foo{optional f32 s}", "Foo{tensor<bool,2> t}", "Foo{f32 a;f32 a}", "Foo{f32[0] a}", "Foo{}", "Foo{f32 x} extra"]

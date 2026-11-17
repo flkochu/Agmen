@@ -57,12 +57,19 @@ class RecordedSample(Sample):
 # Las clases de los mensajes
 # ---------------------------------------------------------------------------
 
+# Los messages de agmen/msgs.agmen, por nombre. Si agregas uno allá, agrégalo aquí:
+# python/test_msgs_estandar.py falla si falta alguno.
+STANDARD_MESSAGES = ("Imagen", "ImagenComprimida", "MuxEstado", "Pose", "Transform", "Twist", "Odometry", "Imu")
+
+
 def _known_types() -> dict[int, type]:
     """Las clases de mensaje que ya existen en este programa, por schema_id."""
     from . import clock, msgs
 
-    found: dict[int, type] = {c.SCHEMA_ID: c for c in (msgs.Imagen, msgs.ImagenComprimida, clock.Clock,
-                                                         wire.ImuSample)}
+    # Los tipos estándar van primero y ganan siempre: así /imu da agmen.msgs.Imu aunque en este
+    # proceso ya exista otra clase con el mismo esquema (msgs.types(numpy=True), un agmen.load...).
+    standard = [getattr(msgs, n) for n in STANDARD_MESSAGES]
+    found: dict[int, type] = {c.SCHEMA_ID: c for c in (*standard, clock.Clock, wire.ImuSample)}
     stack, seen = list(wire.Message.__subclasses__()), set()
     while stack:
         c = stack.pop()

@@ -75,6 +75,76 @@ En Python: `from agmen.msgs import Imagen, ImagenComprimida`. En C++:
 `#include <agmen/msgs.hpp>` y `agmen::msgs::Imagen`. Así tu cámara, tu IA, el
 panel, Foxglove y (en el nivel 9) las grabaciones hablan el mismo tipo.
 
+### Los mensajes chicos (desde 0.15.0, en curso)
+
+`agmen/msgs.agmen` trae también mensajes chicos para un robot: `Twist` (la
+velocidad que mandas a la base), `Imu` (un sensor inercial), `Pose`,
+`Odometry` y otros. Tienen tamaño fijo y van en `compact`, como tus mensajes de
+siempre. Las unidades son SI (metros, radianes, segundos) y los ejes son: x al
+frente, y a la izquierda, z arriba.
+
+Este ejemplo se corrió tal cual. Antes, en una terminal, arranca el hub con
+`agmen hub`. Luego:
+
+```python
+# mando.py: publica la velocidad y la IMU, 20 veces por segundo
+import agmen
+from agmen.msgs import Imu, Twist, Vector3, Vector3f
+
+node = agmen.Node("mando")
+cmd = node.publisher(Twist, "/cmd_vel")
+sensor = node.publisher(Imu, "/imu")
+
+@node.every(0.05)
+def enviar():
+    cmd.publish(Twist(linear=Vector3(x=0.5, y=0.0, z=0.0),
+                      angular=Vector3(x=0.0, y=0.0, z=0.3)))
+    sensor.publish(Imu(angular_velocity=Vector3f(x=0.0, y=0.0, z=0.3),
+                       linear_acceleration=Vector3f(x=0.0, y=0.0, z=9.81)))
+
+node.spin()
+```
+
+```python
+# oye.py: escucha la velocidad y la IMU
+import math
+import agmen
+from agmen.msgs import Imu, Twist
+
+node = agmen.Node("oye")
+
+@node.on(Twist, "/cmd_vel")
+def velocidad(s):
+    print("avanza", s.message.linear.x, "m/s, gira", s.message.angular.z, "rad/s")
+
+@node.on(Imu, "/imu")
+def sensor(s):
+    # esta IMU no manda orientación: llega NaN, y no es un error
+    print("orientación medida:", not math.isnan(s.message.orientation.w))
+
+node.spin()
+```
+
+Corre `python oye.py` en una terminal y `python mando.py` en otra. `oye`
+imprime una línea por mensaje: `avanza 0.5 m/s, gira 0.3 rad/s` y
+`orientación medida: False`. La IMU no estima su orientación, así que el campo
+sale en `NaN`: lo que no se mide no se inventa.
+
+Si tu simulador (MuJoCo) pone `w` primero, no adivines el orden. Usa `wxyz()` y
+`from_wxyz()`:
+
+```python
+from agmen.msgs import Quaternion
+
+q = Quaternion.from_wxyz([1.0, 0.0, 0.0, 0.0])   # (w, x, y, z), como MuJoCo
+print(q.x, q.y, q.z, q.w)                        # 0.0 0.0 0.0 1.0: sin rotación
+print(q.wxyz())                                  # (1.0, 0.0, 0.0, 0.0)
+```
+
+El capítulo completo de convenciones y de mensajes estándar está planeado en el
+bloque 7 del [RFC 0013](../rfc/0013-mensajes-estandar-y-marcos.md). Esta
+sección solo muestra lo que ya funciona.
+
 ## 3. La cámara
 
 Abre `examples/vision/camara.py`. Con OpenCV y una cámara conectada publica lo
@@ -197,6 +267,8 @@ contador de C++ sigue viendo las 30 por segundo.
   y TCP solo.
 - `agmen.msgs.Imagen` e `ImagenComprimida` vienen con Agmen; `from_array()` y
   `as_array()` van y vienen de NumPy sin copiar.
+- `agmen.msgs` también trae `Twist`, `Imu` y otros mensajes chicos (desde 0.15.0,
+  en curso); un valor que no se mide va en `NaN`.
 - `queue = 1` en la IA y "solo la más nueva" en la cámara: nadie frena a nadie.
 - El panel muestra la cámara y cada navegador pide las imágenes que alcanza.
 

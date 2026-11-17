@@ -7,7 +7,60 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 
 ## [Sin publicar]
 
+**En curso: mensajes estándar y marcos de referencia (RFC 0013, para 0.15.0).**
+Hecho: el bloque 1 del plan (mensajes chicos, `nan` por defecto, el cuaternión
+sin adivinar y los vectores de prueba). El mapeo de los mensajes chicos a
+Foxglove pasa del bloque 1 al bloque 3 (con los marcos): lo decidió el consejo
+(2 votos contra 1) la noche del 2026-11-16, por delegación de Adán, que puede
+revertirlo. Faltan los bloques 2 a 7 del plan del RFC.
+
+### Agregado
+- **Mensajes estándar chicos** (RFC 0013 §3.2 y §3.3) en `agmen/msgs.agmen`, con
+  su código de C++ (`agmen::msgs`) y de Python (`agmen.msgs`): `Vector2`,
+  `Vector3`, `Quaternion`, `Pose`, `Transform`, `Twist`, `Odometry`, `Vector3f`,
+  `Quaternionf` e `Imu`. Son de tamaño fijo, van en `compact` y no llevan texto
+  ni marca de tiempo: el instante es el `t_data` del sobre. Unidades SI, ángulos
+  en radianes, x al frente, y a la izquierda y z arriba. Miden 16, 24, 32, 56, 56,
+  48, 104, 12, 16 y 40 bytes. `ImuSample` y `MotorCommand` no cambian.
+- **`= nan` como valor por defecto** en los campos `f32` y `f64`, sueltos y en
+  arreglos (`f32 x = nan`, `f64[3] p = nan`). El valor por defecto no viaja ni
+  cambia el `schema_id`. `Quaternionf` y la orientación de `Imu` empiezan así:
+  lo que no se mide no se inventa. Un mensaje que lleva un NaN no se compara con
+  `==`: en C++ nunca es igual a nada, ni a sí mismo; en Python dos mensajes
+  distintos con NaN nunca son iguales (`Imu() == Imu()` da falso). Lo mismo
+  `a == a` (el mismo objeto) y `copy.deepcopy(a) == a`: dependen de la versión
+  de Python (en 3.11 y 3.12 dieron verdadero; en 3.13, el segundo dio falso), así
+  que no cuentes con ello. Para saber si algo no se midió, usa `math.isnan`
+  (Python) o `std::isnan` (C++). Para comparar dos mensajes enteros, compara sus
+  bytes con `encode_payload()` (en C++ escribe en un `agmen::wire::Bytes`).
+- **El cuaternión sin adivinar** (RFC 0013 §3.2): `Quaternion.wxyz()` y
+  `Quaternion.from_wxyz(...)` (también en `Quaternionf`) en Python;
+  `agmen::msgs::wxyz()` y `from_wxyz()` en `<agmen/geometry.hpp>` en C++. Sirven
+  para MuJoCo, que pone `w` primero. Solo cambian el orden: no normalizan.
+- **Grabaciones**: `agmen.Recording` devuelve los tipos estándar como sus clases
+  de `agmen.msgs` (por ejemplo, `/imu` da `agmen.msgs.Imu`).
+- **Vectores de prueba compartidos** (`tests/vectors/estandar.txt`): C++, Python
+  (con el núcleo de C++ y con el de Python puro) y `agmen.js` del panel los
+  prueban con los mismos vectores, NaN incluidos.
+- **`scripts/estandar_smoke.py`**: C++ ↔ Python por el hub, `echo`, grabar,
+  reproducir y exportar, con NaN. Corre en el CI de Linux x86-64, Windows y Linux
+  ARM64.
+- **Tutorial**: la sección de `= nan` en el capítulo 11 y la de los mensajes
+  chicos en el capítulo 14, con un ejemplo que se corrió. El capítulo completo de
+  convenciones y mensajes estándar llega con el bloque 7 del RFC.
+
 ### Cambiado
+- **Un `.agmen` no puede definir otro `Pose`, `Transform`, `Twist`, `Odometry`,
+  `Imu`, `Vector2`, `Vector3`, `Vector3f`, `Quaternion` o `Quaternionf`** si
+  importa `agmen/msgs.agmen`: ahora da error con dos salidas. Usa el estándar
+  (y revisa que sus campos te sirvan; si son otros, cambia el `schema_id`) o
+  cambia el nombre de tu tipo. Ojo: cambiar el nombre cambia su `schema_id`, y
+  los nodos y las grabaciones que usaban el nombre de antes ya no lo reconocen.
+- **Valores que el lector de `.agmen` ahora rechaza**: `inf`, `-inf` y `-nan`; un
+  número que no cabe en `f32` (`1e39`); un número que no es 0 y se vuelve 0 en
+  `f32` (`1e-60`); y `nan` fuera de un campo `f32` o `f64` (en un `u8`, por
+  ejemplo). Un `.agmen` que los tenía deja de compilar: usa un número más
+  razonable o `f64`.
 - **`POST /api/teleop` exige `left` y `right`** (los scripts lo notan). Antes,
   `{}` mandaba el alto y un campo que faltaba valía 0. Ahora responde 400 y no
   se manda nada al robot. Para frenar, manda `{"left": 0, "right": 0}`.
@@ -41,6 +94,9 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
   origen.
 
 ### Corregido
+- **El lector de `.agmen` falla antes, no después**: los valores de arriba
+  pasaban el lector y tronaban después, al compilar el C++ o al cargar en Python.
+  Ahora el error dice el archivo, la línea, la columna y qué hacer.
 - **El mando de manejo ya no convierte un NaN en velocidad máxima** (el joystick
   del panel por WebSocket y `POST /api/teleop`). Antes, un NaN en la velocidad se
   volvía la velocidad máxima, y además reiniciaba el freno automático ("hombre
