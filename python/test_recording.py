@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
@@ -445,6 +446,36 @@ class TestCerrar(unittest.TestCase):
         with contextlib.suppress(RuntimeError), _mcap.Reader(self.path):
             raise error
         self.assertEqual(next(g), "sigue vivo")
+
+    def test_generador_suspendido_de_otro_modulo_de_agmen(self):
+        """La regla de los generadores: de Agmen se limpian las funciones que ya terminaron (de cualquier
+        agmen.*), pero un generador de un módulo agmen.* que no es de grabaciones podría estar suspendido y
+        seguir en uso (en 3.11/3.12, frame.clear() lo daría por terminado): no se toca."""
+        ns = {"__name__": "agmen.otro_modulo"}
+        exec(compile(textwrap.dedent("""
+            def gen():
+                try:
+                    raise RuntimeError("guardado")
+                except RuntimeError as e:
+                    capturado = e
+                yield capturado
+                yield "sigue vivo"
+
+            def funcion():
+                local = "de agmen"
+                raise ValueError("de una función de agmen")
+        """), "<agmen.otro_modulo>", "exec"), ns)
+        g = ns["gen"]()
+        error = next(g)                           # el traceback trae el marco de g, suspendido
+        with contextlib.suppress(RuntimeError), _mcap.Reader(self.path):
+            raise error
+        self.assertEqual(next(g), "sigue vivo")
+        try:                                      # y una función de agmen.* que ya terminó sí se limpia
+            with _mcap.Reader(self.path):
+                ns["funcion"]()
+        except ValueError as e:
+            error = e
+        self.assertNotIn("local", self.frame_locals(error, "funcion"))
 
     def test_throw_no_borra_las_variables_del_programa(self):
         """Caso C: un error del programa que entra a messages() con throw() conserva las variables de su marco."""

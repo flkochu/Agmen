@@ -157,6 +157,43 @@ def missing(what: str) -> None:
         print(f"OMITIDO {what}", flush=True)
 
 
+def run(cmd, env, timeout: float = 60) -> subprocess.CompletedProcess:
+    """subprocess.run con la salida como texto (lo que no sea UTF-8 se reemplaza, no truena). Si se vence el
+    tope, no sale un traceback: devuelve código -1 y lo dice en stderr, y la FALLA que lo revisa lo muestra."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env,
+                              timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as e:
+        def text(x):
+            return x.decode("utf-8", "replace") if isinstance(x, bytes) else (x or "")
+        return subprocess.CompletedProcess(cmd, -1, text(e.stdout),
+                                           text(e.stderr) + f"\n[se venció el tope de {timeout:g} s: {cmd[0]} no terminó]")
+
+
+def parities(rows) -> tuple[int, int]:
+    """Cuántos mensajes pares e impares llegaron (por su t_data). Es UDP: no se exigen todos, pero sí de los
+    dos tipos (en Imu, los impares traen orientación y los pares NaN)."""
+    idx = [(t - T0) // 1000 for t, _ in rows]
+    return sum(1 for i in idx if i % 2 == 0), sum(1 for i in idx if i % 2 == 1)
+
+
+def check_imu_nans(rows, label) -> None:
+    """Decodificado de verdad, en TODOS los que llegaron: orientación NaN en los pares, la puesta en los impares."""
+    from agmen import msgs
+
+    bad = []
+    for t_data, h in rows:
+        i = (t_data - T0) // 1000
+        o = msgs.Imu.decode_payload(bytes.fromhex(h)).orientation
+        vals = (o.w, o.x, o.y, o.z)
+        ok = all(math.isnan(v) for v in vals) if i % 2 == 0 else vals == (0.5, 0.5, -0.5, 0.5)
+        if not ok:
+            bad.append(f"i={i}: {vals}")
+    even, odd = parities(rows)
+    check(f"  {label}: la orientación sin medir llega como NaN ({even} pares y {odd} impares revisados)",
+          even > 0 and odd > 0 and not bad, str(bad[:3]))
+
+
 def wait_for(cond, timeout: float, every: float = 0.05) -> bool:
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -382,14 +419,14 @@ def joints_smoke(py, env0, backends, hub_addr, procs) -> None:
             sub = Proc("receptor de Python", py + [str(Path(__file__)), "--pyj", "sub", kind, str(n), topic, str(k)], env)
             procs.append(sub)
             ready = sub.wait_line("LISTO") and wait_for(lambda: hub_has_sub(hub_addr, topic, sub), 15, 0.1)
-            cpp = subprocess.run([jpeer, "pub", kind, str(n), topic, str(k)], capture_output=True, text=True,
-                                 encoding="utf-8", errors="replace", env=env, timeout=60)
+            cpp = run([jpeer, "pub", kind, str(n), topic, str(k)], env)
             sub.wait(30)
             rows = rx_lines(sub, f"C++ -> Python {name}<{n}> ({backend})")
             bad = check_bytes_joints(rows, kind, n, k)
+            even, odd = parities(rows)
             check(f"C++ publica {name}<{n}> -> Python {name}[{n}] ({backend}): bytes y t_data intactos "
-                  f"({len(rows)}/{k} llegaron)",
-                  ready and cpp.returncode == 0 and len(rows) >= k // 2 and not bad,
+                  f"({len(rows)}/{k} llegaron: {even} pares, {odd} impares)",
+                  ready and cpp.returncode == 0 and len(rows) >= k // 2 and even and odd and not bad,
                   f"{bad[:3]}\npeer: {cpp.stdout}{cpp.stderr}\npython: {sub.everything()}")
             check_joint_nans(rows, kind, n, f"C++ -> Python {name} ({backend})")
             # Python -> C++
@@ -397,15 +434,14 @@ def joints_smoke(py, env0, backends, hub_addr, procs) -> None:
             cpp_sub = Proc("receptor de C++", [jpeer, "sub", kind, str(n), topic2, str(k)], env)
             procs.append(cpp_sub)
             ready = cpp_sub.wait_line("LISTO") and wait_for(lambda: hub_has_sub(hub_addr, topic2, cpp_sub), 15, 0.1)
-            pyp = subprocess.run(py + [str(Path(__file__)), "--pyj", "pub", kind, str(n), topic2, str(k)],
-                                 capture_output=True, text=True, encoding="utf-8", errors="replace", env=env,
-                                 timeout=60)
+            pyp = run(py + [str(Path(__file__)), "--pyj", "pub", kind, str(n), topic2, str(k)], env)
             cpp_sub.wait(20)
             rows = rx_lines(cpp_sub, f"Python -> C++ {name} ({backend})")
             bad = check_bytes_joints(rows, kind, n, k)
+            even, odd = parities(rows)
             check(f"Python {name}[{n}] ({backend}) publica -> C++ {name}<{n}>: bytes y t_data intactos "
-                  f"({len(rows)}/{k})",
-                  ready and pyp.returncode == 0 and len(rows) >= k // 2 and not bad,
+                  f"({len(rows)}/{k}: {even} pares, {odd} impares)",
+                  ready and pyp.returncode == 0 and len(rows) >= k // 2 and even and odd and not bad,
                   f"{bad[:3]}\npython: {pyp.stdout}{pyp.stderr}\ncpp: {cpp_sub.everything()}")
             check_joint_nans(rows, kind, n, f"Python -> C++ {name} ({backend})")
         # El número es parte del tipo: con Python escuchando JointState[12], C++ con JointState<2> no entra.
@@ -413,8 +449,7 @@ def joints_smoke(py, env0, backends, hub_addr, procs) -> None:
         sub = Proc("receptor de Python", py + [str(Path(__file__)), "--pyj", "sub", "state", "12", topic, "1"], env)
         procs.append(sub)
         ready = sub.wait_line("LISTO") and wait_for(lambda: hub_has_sub(hub_addr, topic, sub), 15, 0.1)
-        rej = subprocess.run([jpeer, "rechazo", "state", "2", topic], capture_output=True, text=True,
-                             encoding="utf-8", errors="replace", env=env, timeout=60)
+        rej = run([jpeer, "rechazo", "state", "2", topic], env)
         sub.stop()
         check(f"el hub rechaza JointState<2> de C++ en un topic de JointState[12] ({backend})",
               ready and rej.returncode == 0 and "RECHAZADO" in rej.stdout and "ya es de tipo JointState" in rej.stdout,
@@ -422,7 +457,7 @@ def joints_smoke(py, env0, backends, hub_addr, procs) -> None:
 
 
 def main() -> int:
-    from agmen import _backend, msgs
+    from agmen import _backend
     from agmen.hub import ping
 
     hub_addr = f"127.0.0.1:{free_port()}"
@@ -453,34 +488,33 @@ def main() -> int:
                 sub = Proc("receptor de Python", py + [str(Path(__file__)), "--py", "sub", kind, topic, str(n)], env)
                 procs.append(sub)
                 ready = sub.wait_line("LISTO") and wait_for(lambda: hub_has_sub(hub_addr, topic, sub), 15, 0.1)
-                cpp = subprocess.run([peer, "pub", kind, topic, str(n)], capture_output=True, text=True, encoding="utf-8", errors="replace", env=env,
-                                     timeout=60)
+                cpp = run([peer, "pub", kind, topic, str(n)], env)
                 sub.wait(30)                   # termina solo al recibir n (o a los 20 s del propio receptor)
                 rows = rx_lines(sub, f"C++ -> Python {kind} ({backend})")
                 bad = check_bytes(rows, kind, n)
-                check(f"C++ publica {kind} -> Python ({backend}): bytes y t_data intactos ({len(rows)}/{n} llegaron)",
-                      ready and cpp.returncode == 0 and len(rows) >= n // 2 and not bad,
+                even, odd = parities(rows)
+                check(f"C++ publica {kind} -> Python ({backend}): bytes y t_data intactos ({len(rows)}/{n} llegaron: "
+                      f"{even} pares, {odd} impares)",
+                      ready and cpp.returncode == 0 and len(rows) >= n // 2 and even and odd and not bad,
                       f"{bad[:3]}\npeer: {cpp.stdout}{cpp.stderr}\npython: {sub.everything()}")
-                if kind == "imu" and rows:
-                    # decodificado de verdad: NaN en pares, valores en impares
-                    t0, h0 = rows[0]
-                    m = msgs.Imu.decode_payload(bytes.fromhex(h0))
-                    i = (t0 - T0) // 1000
-                    check(f"  la orientación sin medir llega como NaN ({backend})",
-                          math.isnan(m.orientation.w) == (i % 2 == 0), repr(m))
+                if kind == "imu":
+                    check_imu_nans(rows, f"C++ -> Python ({backend})")
                 # 2) Python -> C++
                 topic2 = topic + "_rev"
                 cpp_sub = Proc("receptor de C++", [peer, "sub", kind, topic2, str(n)], env)
                 procs.append(cpp_sub)
                 ready = cpp_sub.wait_line("LISTO") and wait_for(lambda: hub_has_sub(hub_addr, topic2, cpp_sub), 15, 0.1)
-                pyp = subprocess.run(py + [str(Path(__file__)), "--py", "pub", kind, topic2, str(n)],
-                                     capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, timeout=60)
+                pyp = run(py + [str(Path(__file__)), "--py", "pub", kind, topic2, str(n)], env)
                 cpp_sub.wait(20)
                 rows = rx_lines(cpp_sub, f"Python -> C++ {kind} ({backend})")
                 bad = check_bytes(rows, kind, n)
-                check(f"Python ({backend}) publica {kind} -> C++: bytes y t_data intactos ({len(rows)}/{n})",
-                      ready and pyp.returncode == 0 and len(rows) >= n // 2 and not bad,
+                even, odd = parities(rows)
+                check(f"Python ({backend}) publica {kind} -> C++: bytes y t_data intactos ({len(rows)}/{n}: "
+                      f"{even} pares, {odd} impares)",
+                      ready and pyp.returncode == 0 and len(rows) >= n // 2 and even and odd and not bad,
                       f"{bad[:3]}\npython: {pyp.stdout}{pyp.stderr}\ncpp: {cpp_sub.everything()}")
+                if kind == "imu":
+                    check_imu_nans(rows, f"Python ({backend}) -> C++")
 
         # 5) articulaciones (RFC 0013 §3.4): aquí, mientras no hay grabador en el hub
         joints_smoke(py, env0, backends, hub_addr, procs)
@@ -494,7 +528,9 @@ def main() -> int:
             ready = wait_for(lambda: hub_has_sub(hub_addr, topic, echo), 20, 0.1)
             if not ready:
                 print(f"      agmen topic echo no apareció en el hub como suscriptor de {topic}: {echo.everything()}")
-            subprocess.run([peer, "pub", "imu", topic, "60"], capture_output=True, text=True, encoding="utf-8", errors="replace", env=env0, timeout=60)
+            pub = run([peer, "pub", "imu", topic, "60"], env0)
+            if pub.returncode != 0:
+                print(f"      estandar_peer pub terminó con código {pub.returncode}: {pub.stdout}{pub.stderr}")
             code = echo.wait(20)
             out = echo.text()
             if flag:
@@ -510,8 +546,10 @@ def main() -> int:
                       ready and code == 0 and rows >= 1 and not bad_lines,
                       f"{len(bad_lines)} líneas que no son JSON válido: {bad_lines[:2]}\n{echo.everything()[:1500]}")
             else:
-                check("agmen topic echo (texto) con Imu sin orientación: no falla y escribe nan",
-                      ready and code == 0 and "Traceback" not in echo.everything() and "nan" in out.lower(),
+                # el estilo YAML del echo: "orientation:" y debajo "    w: nan" (la w solo la trae el cuaternión)
+                nan_w = re.search(r"^\s+w: nan\s*$", out, re.MULTILINE)
+                check("agmen topic echo (texto) con Imu sin orientación: no falla y escribe w: nan",
+                      ready and code == 0 and "Traceback" not in echo.everything() and nan_w is not None,
                       echo.everything()[:1500])
 
         # 4) record -> info -> play -> export
@@ -521,7 +559,9 @@ def main() -> int:
         rec = Proc("agmen record", py + ["-m", "agmen", "record", "/imu_rec", "-o", mcap, "--duration", "8s"], env0)
         procs.append(rec)
         ready = rec.wait_line("grabando") and wait_for(lambda: hub_has_sub(hub_addr, "/imu_rec", rec), 15, 0.1)
-        subprocess.run([peer, "pub", "imu", "/imu_rec", "40"], capture_output=True, text=True, encoding="utf-8", errors="replace", env=env0, timeout=60)
+        pub = run([peer, "pub", "imu", "/imu_rec", "40"], env0)
+        if pub.returncode != 0:
+            print(f"      estandar_peer pub terminó con código {pub.returncode}: {pub.stdout}{pub.stderr}")
         code = rec.wait(60)
         summary = next((x for x in rec.lines + rec.err if "⏹" in x), "")
         found = re.search(r"(\d+) mensajes", summary)
@@ -532,8 +572,7 @@ def main() -> int:
               f"{'no llegó a decir que estaba grabando' if not ready else 'no recibió nada'}\n{rec.everything()}")
 
         def cli(*args, timeout=60):
-            return subprocess.run(py + ["-m", "agmen", *args], capture_output=True, text=True, encoding="utf-8",
-                                  errors="replace", env=env0, timeout=timeout)
+            return run(py + ["-m", "agmen", *args], env0, timeout)
 
         info = cli("info", mcap)
         check("agmen info lee la grabación con Imu", info.returncode == 0 and "/imu_rec" in info.stdout
@@ -582,8 +621,7 @@ const M = require(process.argv[2]), A = require(process.argv[3]), fs = require("
             jsf = Path(tmp) / "lee.js"
             jsf.write_text(js, encoding="utf-8")
             pn = ROOT / "python" / "agmen" / "panel"
-            r = subprocess.run(["node", str(jsf), str(pn / "mcap.js"), str(pn / "agmen.js"), mcap], capture_output=True,
-                               text=True, encoding="utf-8", timeout=60)
+            r = run(["node", str(jsf), str(pn / "mcap.js"), str(pn / "agmen.js"), mcap], env0)
             try:
                 res = json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else {}
             except ValueError:

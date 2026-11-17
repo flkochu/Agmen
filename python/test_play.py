@@ -263,7 +263,10 @@ class TestReproducir(PlayCase):
         os.remove(path)                      # en Windows falla si sigue mapeado
 
     def test_paquete_cortado_suelta_el_archivo(self):
-        """Un paquete cortado en la grabación: se reproduce lo que hay y al terminar el archivo queda suelto."""
+        """Un paquete cortado en la grabación: Player no revisa los paquetes (los manda tal cual, como se
+        grabaron), así que reproduce los 4 sin error; el Subscriber da WireError en el cortado y recibe los
+        demás. Lo que se prueba aquí es que, al terminar, Player suelta el archivo (con robot.toml adjunto,
+        como los de agmen run), sin aviso."""
         path = os.path.join(self.dir, "corta.mcap")
         w = _mcap.Writer(path)
         cid = w.add_channel("/imu", "agmen", w.add_schema("ImuSample", "agmen", wire.ImuSample.SCHEMA_TEXT.encode()))
@@ -274,16 +277,26 @@ class TestReproducir(PlayCase):
             pkt = env.pack() + imu(i).encode_payload()
             w.add_message(cid, T0 + i * STEP, T0 + i * STEP, i, pkt[:-3] if i == 2 else pkt)
         w.close()
-        err = io.StringIO()
+        imu_sub = self.sub(wire.ImuSample, "/imu")
+        seqs, errors, err = [], [], io.StringIO()
         with contextlib.redirect_stderr(err):
             p = play.Player(path, rate=50, quiet=True)
             p.start()
             self.assertTrue(p.wait(10))
-            try:
-                p.stop()
-            except Exception as e:   # noqa: BLE001 — si el paquete cortado da error, igual debe soltar el archivo
-                error = e
-                self.assertNotIn("sigue abierta", str(error))
+            stats = p.stop()                 # sin error: el cortado también sale
+            end = time.monotonic() + 5
+            while len(seqs) + len(errors) < 4 and time.monotonic() < end:
+                try:
+                    s = imu_sub.receive(0.05)
+                except wire.WireError as e:
+                    errors.append(str(e))
+                    continue
+                if s is not None:
+                    seqs.append(s.envelope.seq)
+        self.assertEqual(stats.messages, 4)
+        self.assertEqual(seqs, [0, 1, 3])
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("payload de 24 bytes pero llegaron 21", errors[0])
         self.assertNotIn("sigue abierta", err.getvalue())
         self.assertFalse(p.reader._mapped)
         self.assertIn(mapped(path), (False, None))
