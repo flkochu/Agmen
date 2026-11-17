@@ -262,7 +262,9 @@ class TestPuente(PanelCase):
         self.connect(headers={"Origin": f"http://{self.base}"})          # el mismo panel sí
 
 
-class TestHombreMuerto(PanelCase):
+class MotorCase(PanelCase):
+    """Un panel con teleop que le manda a un "motor" (un socket UDP de la prueba)."""
+
     def setUp(self):
         self.motor = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.motor.bind(("127.0.0.1", 0))
@@ -280,6 +282,8 @@ class TestHombreMuerto(PanelCase):
             if env.encoding == wire.ENC_COMPACT:
                 return MotorCommand.LAYOUT.unpack(payload)
 
+
+class TestHombreMuerto(MotorCase):
     def test_se_corta_la_conexion_y_manda_alto(self):
         c = self.connect()
         c.send_text(json.dumps({"op": "teleop", "left": 0.5, "right": 2.0}))
@@ -311,6 +315,207 @@ class TestHombreMuerto(PanelCase):
         time.sleep(0.6)
         logs, _ = self.panel.logs.since(0)
         self.assertFalse(any("ALTO" in line["text"] for line in logs))
+
+
+# Lo que un script (no un navegador: JSON.stringify no puede) le manda al mando de manejo. Python lee NaN,
+# Infinity y -Infinity aunque no son JSON, y antes el recorte a max_speed volvía un NaN la VELOCIDAD MÁXIMA.
+MANEJO_MALO = [
+    ("NaN", '{"op": "teleop", "left": NaN, "right": 0.2}', "NaN"),
+    ("NaN a la derecha", '{"op": "teleop", "left": 0.2, "right": NaN}', "NaN"),
+    ("Infinity", '{"op": "teleop", "left": Infinity, "right": 0.2}', "Infinity"),
+    ("-Infinity", '{"op": "teleop", "left": 0.2, "right": -Infinity}', "-Infinity"),
+    ("1e999 (infinito escrito como número)", '{"op": "teleop", "left": 1e999, "right": 0.2}', "infinito"),
+    ("entero enorme", '{"op": "teleop", "left": 1' + "0" * 400 + ', "right": 0.2}', "demasiado grande"),
+    ("texto", '{"op": "teleop", "left": "rápido", "right": 0.2}', "debe ser un número"),
+    ("texto que parece NaN", '{"op": "teleop", "left": "nan", "right": 0.2}', "debe ser un número"),
+    ("null", '{"op": "teleop", "left": null, "right": 0.2}', "debe ser un número"),
+    ("booleano", '{"op": "teleop", "left": true, "right": 0.2}', "debe ser un número"),
+    ("lista", '{"op": "teleop", "left": [0.5], "right": 0.2}', "debe ser un número"),
+    ("falta right", '{"op": "teleop", "left": 0.2}', "falta 'right'"),
+    ("faltan los dos", '{"op": "teleop"}', "falta 'left'"),
+]
+
+
+class TestManejoConValoresMalos(MotorCase):
+    """Un comando de manejo con un valor que no es un número finito se rechaza ENTERO: no se publica nada
+    (ni recortado, ni como cero), el que lo mandó recibe el error y el hombre muerto sigue como estaba."""
+
+    def _nada(self, wait=0.25):
+        """Que en `wait` segundos no llegue ningún MotorCommand al motor (los anuncios de esquema no cuentan)."""
+        self.motor.settimeout(wait)
+        try:
+            while True:
+                env, payload = wire.parse(self.motor.recv(2048))
+                if env.encoding == wire.ENC_COMPACT:
+                    self.fail(f"se publicó un comando: {MotorCommand.LAYOUT.unpack(payload)}")
+        except socket.timeout:
+            pass
+        finally:
+            self.motor.settimeout(3)
+
+    def _error(self, c):
+        return json.loads(self.recv_until(c, lambda m: isinstance(m, str) and json.loads(m)["op"] == "error"))["msg"]
+
+    def _post(self, raw: str):
+        req = urllib.request.Request(f"http://{self.base}/api/teleop", data=raw.encode(), method="POST",
+                                     headers={"X-Agmen": "1"})
+        try:
+            return 200, json.load(urllib.request.urlopen(req, timeout=5))
+        except urllib.error.HTTPError as e:
+            return e.code, json.load(e)
+
+    def test_websocket_rechaza_y_lo_bueno_sigue(self):
+        c = self.connect()
+        for nombre, raw, msg in MANEJO_MALO:
+            with self.subTest(nombre):
+                c.send_text(raw)
+                err = self._error(c)
+                self.assertIn(msg, err)
+                self.assertIn("no se mandó nada", err)
+                self._nada()
+                time.sleep(0.02)                                       # más que el tope de ~60 Hz
+                c.send_text(json.dumps({"op": "teleop", "left": 0.4, "right": -0.4}))   # lo bueno sigue
+                cmd = self._cmd()
+                self.assertAlmostEqual(cmd["left"], 0.4, places=5)
+                self.assertAlmostEqual(cmd["right"], -0.4, places=5)
+                c.send_text(json.dumps({"op": "teleop", "left": 0, "right": 0}))
+                self.assertEqual(self._cmd()["left"], 0.0)
+        self.assertEqual(self.panel.teleop.last_cmd, (0.0, 0.0))
+
+    def test_post_rechaza_y_lo_bueno_sigue(self):
+        for nombre, raw, msg in MANEJO_MALO:
+            with self.subTest(nombre):
+                status, body = self._post(raw)
+                self.assertEqual(status, 400, body)
+                self.assertIn(msg, body["error"])
+                self._nada()
+                time.sleep(0.02)
+                status, body = self._post(json.dumps({"left": 0.4, "right": 0.1}))
+                self.assertEqual((status, body["ok"]), (200, True))
+                self.assertAlmostEqual(self._cmd()["right"], 0.1, places=5)
+
+    def test_post_que_no_es_un_objeto(self):
+        for raw in ("[0.5, 0.5]", "0.5", '"left"', "null"):
+            with self.subTest(raw):
+                status, body = self._post(raw)
+                self.assertEqual(status, 400, body)
+                self.assertIn("objeto JSON", body["error"])
+        self._nada()
+
+    def test_un_comando_malo_no_reinicia_el_hombre_muerto(self):
+        """Manejando, llegan solo comandos con NaN: el robot debe frenar a los 300 ms del último BUENO."""
+        c = self.connect()
+        c.send_text(json.dumps({"op": "teleop", "left": 0.3, "right": 0.3}))
+        self.assertAlmostEqual(self._cmd()["left"], 0.3, places=5)
+        t0 = time.monotonic()
+        stop = threading.Event()
+
+        def malos():
+            while not stop.wait(0.05):
+                c.send_text('{"op": "teleop", "left": NaN, "right": NaN}')
+
+        th = threading.Thread(target=malos, daemon=True)
+        th.start()
+        try:
+            cmd = self._cmd()
+        finally:
+            stop.set()
+            th.join()
+        self.assertEqual((cmd["left"], cmd["right"]), (0.0, 0.0))
+        self.assertLess(time.monotonic() - t0, 0.9)
+
+    def test_teleop_send_desde_python_tambien_rechaza(self):
+        import math
+
+        for malo in (math.nan, math.inf, -math.inf, "0.5", None, True):
+            with self.subTest(malo=malo):
+                with self.assertRaises(ValueError):
+                    self.panel.teleop.send(malo, 0.0)
+                with self.assertRaises(ValueError):
+                    self.panel.teleop.send(0.0, malo)
+        self._nada()
+        self.assertEqual(self.panel.teleop.send(5, -5), (0.8, -0.8))   # un número finito grande sí se recorta
+
+
+class TestJsonDelCliente(PanelCase):
+    """El JSON que llega de un cliente no trae NaN ni Infinity como si fueran números (en ningún op)."""
+
+    def test_constantes_rechazadas_en_cualquier_op(self):
+        c = self.connect()
+        for raw in ('{"op": "subscribe", "topic": "*", "max_hz": NaN}',
+                    '{"op": "subscribe", "topic": "*", "max_hz": Infinity}',
+                    '{"op": "clock", "action": "speed", "value": NaN}',
+                    '{"op": "command", "id": 0, "fields": {"left": -Infinity}}'):
+            with self.subTest(raw):
+                c.send_text(raw)
+                err = json.loads(self.recv_until(c, lambda m: isinstance(m, str) and json.loads(m)["op"] == "error"))
+                self.assertIn("no es JSON válido", err["msg"])
+
+    def test_max_hz_tiene_que_ser_un_numero(self):
+        c = self.connect()
+        for raw in ('{"op": "subscribe", "topic": "*", "max_hz": "10"}',
+                    '{"op": "subscribe", "topic": "*", "max_hz": true}',
+                    '{"op": "subscribe", "topic": "*", "max_hz": -1}'):
+            with self.subTest(raw):
+                c.send_text(raw)
+                err = json.loads(self.recv_until(c, lambda m: isinstance(m, str) and json.loads(m)["op"] == "error"))
+                self.assertIn("max_hz", err["msg"])
+        with self.panel.bridge.lock:
+            (cl,) = self.panel.bridge.agmen
+            self.assertEqual(cl.subs, {}, "ninguna suscripción mala quedó puesta")
+
+    def test_foxglove_con_basura_no_tumba_la_conexion(self):
+        c = self.connect(protocol="foxglove.websocket.v1", headers={"Origin": "https://app.foxglove.dev"})
+        self.assertEqual(json.loads(c.recv())["op"], "serverInfo")
+        for raw in ('{"op": "subscribe", "subscriptions": [{"id": NaN, "channelId": 1}]}',
+                    '{"op": "subscribe", "subscriptions": 5}',
+                    '{"op": "subscribe", "subscriptions": ["x"]}',
+                    '{"op": "subscribe", "subscriptions": [{"id": "x", "channelId": 1}]}',
+                    '{"op": "unsubscribe", "subscriptionIds": 5}'):
+            with self.subTest(raw):
+                c.send_text(raw)
+                st = json.loads(self.recv_until(c, lambda m: isinstance(m, str) and json.loads(m)["op"] == "status"))
+                self.assertEqual(st["level"], 1)
+        self.assertFalse(c.closed)
+
+    def test_content_length_malo(self):
+        for cl in ("abc", "-5"):
+            with self.subTest(cl):
+                s = socket.create_connection(("127.0.0.1", self.panel.port), timeout=5)
+                with s:
+                    s.sendall(f"POST /api/teleop HTTP/1.1\r\nHost: x\r\nX-Agmen: 1\r\nContent-Length: {cl}\r\n\r\n"
+                              .encode())
+                    resp = s.recv(65536).decode()
+                self.assertIn(" 400 ", resp.split("\r\n")[0])
+                self.assertIn("Content-Length", resp)
+
+
+class TestRelojDesdeElPanel(unittest.TestCase):
+    """Pausa, paso y velocidad del tiempo simulado: un valor que no es un número finito no llega al reloj."""
+
+    def setUp(self):
+        from agmen import clock
+
+        self.addCleanup(clock.configure, clock.REAL)
+        self.clock = clock.ClockServer(speed=1.0, paused=False, publish=False)
+        self.panel = Panel("127.0.0.1:0", None, "prueba", None, None, topics=False, clock=self.clock)
+        self.addCleanup(self.panel.server.server_close)
+
+    def test_velocidad_y_paso_malos(self):
+        import math
+
+        for action in ("speed", "step"):
+            for malo in (math.nan, math.inf, -math.inf, "2", "nan", None, True, [2], 0, -1, 1e9):
+                if action == "step" and malo is None:
+                    continue                                   # step sin valor = 0.1 s (lo que manda el botón)
+                with self.subTest(action=action, valor=malo):
+                    err = self.panel.clock_action(action, malo)
+                    self.assertIsNotNone(err)
+                    self.assertEqual((self.clock.speed, self.clock.paused), (1.0, False))
+        self.assertIsNone(self.panel.clock_action("speed", 4))
+        self.assertEqual(self.clock.speed, 4.0)
+        self.assertIsNone(self.panel.clock_action("step", None))
+        self.assertTrue(self.clock.paused)
 
 
 class TestGrabaciones(unittest.TestCase):
