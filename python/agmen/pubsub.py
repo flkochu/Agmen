@@ -109,6 +109,15 @@ def node_name() -> str:
     return base if base and base not in ("-", "-c", "-m", "__main__") else f"python-{os.getpid()}"
 
 
+def _preload_numpy(msg_type) -> None:
+    """Un tipo arrow importa NumPy al crear su Publisher o Subscriber, en el hilo que
+    los crea, y no en la primera decodificación. Un tipo compact no (regla 6)."""
+    if msg_type.LAYOUT.encoding == wire.ENC_ARROW:
+        from . import arrow
+
+        arrow.preload_numpy()
+
+
 class _HubLink:
     """Registro y latido con el hub para un endpoint (un Publisher o Subscriber).
 
@@ -299,6 +308,7 @@ class _PurePublisher(_NetSend):
         el de una grabación (agmen play); si no, uno al azar. `node`: su nombre en
         el hub (si no, el del proceso)."""
         _backend.notice_pure_once()
+        _preload_numpy(msg_type)
         self.type = msg_type
         self.to = to
         # Antes de cualquier hilo: el hub, la conexión TCP y los bloques de memoria
@@ -930,6 +940,7 @@ class _PureSubscriber(_Receiver):
     def __init__(self, msg_type, where: str) -> None:
         """`where` = topic ("/cmd") o dirección donde escuchar ("127.0.0.1:7500")."""
         _backend.notice_pure_once()
+        _preload_numpy(msg_type)
         self.type = msg_type
         self._clock_warned = False
         arrow = msg_type.LAYOUT.encoding == wire.ENC_ARROW
@@ -1234,6 +1245,7 @@ class _NativePublisher:
     def __init__(self, msg_type, to: str, topic: str | None = None) -> None:
         """`to` = topic ("/cmd") o dirección ("127.0.0.1:7500"). Con dirección,
         `topic` es solo una etiqueta (default "/" + nombre del tipo)."""
+        _preload_numpy(msg_type)
         self.type = msg_type
         self.to = to
         if hp.is_topic(to):
@@ -1327,6 +1339,7 @@ class _NativeSubscriber:
 
     def __init__(self, msg_type, where: str) -> None:
         """`where` = topic ("/cmd") o dirección donde escuchar ("127.0.0.1:7500")."""
+        _preload_numpy(msg_type)
         self.type = msg_type
         if hp.is_topic(where):
             hp.check_topic(where)

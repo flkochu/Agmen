@@ -355,5 +355,43 @@ class TestMensaje(unittest.TestCase):
                 os.environ["AGMEN_MAX_MESSAGE_MB"] = old
 
 
+@unittest.skipIf(np is None, "sin NumPy")
+class TestNumpyAlCrear(unittest.TestCase):
+    """8.2: un Publisher o Subscriber de un tipo arrow (también los de un Node) importa NumPy
+    al crearse, no en la primera decodificación; los tipos compact no lo importan. Cada caso
+    en un proceso nuevo (con el núcleo que diga AGMEN_BACKEND), porque sys.modules es global."""
+
+    _PREVIO = ("import sys, agmen\n"
+               "from agmen.msgs import Imagen\n"
+               "from agmen.clock import Clock\n"
+               "assert 'numpy' not in sys.modules, 'numpy ya estaba importado antes de crear nada'\n")
+
+    def _numpy_tras(self, codigo: str) -> bool:
+        import subprocess
+
+        r = subprocess.run([sys.executable, "-c", self._PREVIO + codigo + "\nprint('numpy' in sys.modules)"],
+                           cwd=HERE, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.strip().splitlines()[-1] == "True"
+
+    def test_arrow_lo_importa(self):
+        casos = {
+            "Subscriber": "s = agmen.Subscriber(Imagen, '127.0.0.1:47961'); s.close()",
+            "Publisher": "p = agmen.Publisher(Imagen, '127.0.0.1:47962'); p.close()",
+            "Node.on": "n = agmen.Node('x'); n.on(Imagen, '127.0.0.1:47963', lambda s: None); n.close()",
+        }
+        for nombre, codigo in casos.items():
+            with self.subTest(objeto=nombre):
+                self.assertTrue(self._numpy_tras(codigo), f"{nombre} de un tipo arrow no importó numpy")
+
+    def test_compact_no_lo_importa(self):
+        codigo = ("s = agmen.Subscriber(Clock, '127.0.0.1:47964')\n"
+                  "p = agmen.Publisher(Clock, '127.0.0.1:47964')\n"
+                  "n = agmen.Node('x'); n.on(Clock, '127.0.0.1:47965', lambda s: None)\n"
+                  "p.publish(Clock(t=1)); s.receive(1.0)\n"
+                  "n.close(); p.close(); s.close()")
+        self.assertFalse(self._numpy_tras(codigo), "un tipo compact importó numpy")
+
+
 if __name__ == "__main__":
     unittest.main()

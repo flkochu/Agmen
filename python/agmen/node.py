@@ -40,6 +40,7 @@ from . import _backend, clock, wire
 from . import hubproto as hp
 from .pubsub import (
     Publisher,
+    _preload_numpy,
     Sample,
     Subscriber,
     hub_address,
@@ -630,6 +631,7 @@ class _NativeNode:
             self._check_not_running("on")
             if hp.is_topic(where):
                 hp.check_topic(where)
+            _preload_numpy(msg_type)   # 8.2: como Publisher y Subscriber (el nodo puro usa Subscriber)
             decode, envelope = msg_type.decode_payload, wire.Envelope
 
             def deliver(env, payload, sender):
