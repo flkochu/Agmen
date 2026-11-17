@@ -292,6 +292,10 @@ class Fanout:
         self._warned = False
         self._dropped_gone = 0
         self._last_try: dict[tuple[str, int], float] = {}
+        # La tanda de conexiones nuevas en curso (§11 Q1/Q2): una sola espera de hasta NEW_WAIT_S, que
+        # comparten quien lee al hub (settle) y quien manda en ese hueco. Hora de time.perf_counter().
+        self._new: list[Outgoing] = []
+        self._new_end = 0.0
         self.lock = threading.Lock()
         self._wake_r, self._wake_w = socket.socketpair()
         self._wake_r.setblocking(False)
@@ -314,9 +318,8 @@ class Fanout:
 
     def update(self, addrs: list[tuple[str, int]], announcement) -> None:
         """La lista nueva de suscriptores (del hub o la dirección fija). Solo las direcciones nuevas se
-        conectan en el acto (la misma lista no fuerza nada); a las de esta computadora se les espera, sin
-        el lock, hasta NEW_WAIT_S en total: un suscriptor sano recibe el anuncio y el mensaje de este
-        mismo publish(), como siempre, y uno que no contesta sigue conectándose en segundo plano."""
+        conectan en el acto (la misma lista no fuerza nada). No espera: las de esta computadora entran en
+        la tanda que espera settle(), una vez por pasada de quien lee al hub (no una por update())."""
         with self.lock:
             fresh = {a for a in addrs if a not in self.want}
             self.want = list(addrs)
@@ -326,11 +329,29 @@ class Fanout:
                     self._forget(a)
             for a in [a for a in self._last_try if a not in addrs]:
                 del self._last_try[a]
-            started = self._reconnect(force=fresh)
+            waiting = [c for c in self._reconnect(force=fresh) if c.addr in fresh]
+            if waiting:
+                if not self._new:
+                    self._new_end = time.perf_counter() + NEW_WAIT_S   # empieza la tanda
+                self._new.extend(waiting)
         self._wake()
-        waiting = [c for c in started if c.addr in fresh]
-        if waiting:
-            self._wait_connecting(waiting, NEW_WAIT_S)
+
+    def settle(self) -> None:
+        """Espera, sin el lock, a que terminen las conexiones nuevas de la tanda en curso, hasta lo que
+        quede de sus NEW_WAIT_S (nunca más en total): un suscriptor sano recibe el anuncio y el mensaje
+        de este mismo publish(), como siempre, y uno que no contesta sigue conectándose en segundo plano.
+        La llaman quien lee al hub, al final de su pasada, y quien manda (send/send_message), para no
+        saltarse a un suscriptor nuevo mientras otro hilo espera su conexión."""
+        if not self._new:                        # lo común: nada que esperar (sin tomar el lock)
+            return
+        with self.lock:
+            conns, end = list(self._new), self._new_end
+        self._wait_connecting(conns, end)
+        with self.lock:
+            if self._new_end == end:             # la misma tanda: quedan las que siguen en curso, si hay tiempo
+                now = time.perf_counter()
+                self._new = [c for c in self._new
+                             if now < end and c.connecting and self.conns.get(c.addr) is c]
 
     def _reconnect(self, force=frozenset(), msg: bool = False) -> list[Outgoing]:
         """Empieza (sin bloquear) las conexiones que faltan: las de `force` ya, las demás si pasó RETRY_S
@@ -402,22 +423,23 @@ class Fanout:
             if c.sock is not None and (c.sock in w or c.sock in x):
                 self._finish(c)
 
-    def _wait_connecting(self, conns: list[Outgoing], timeout: float) -> None:
-        """Espera, sin el lock, a que terminen estas conexiones en curso: hasta `timeout` en total."""
-        end = time.monotonic() + timeout
+    def _wait_connecting(self, conns: list[Outgoing], end: float) -> None:
+        """Espera, sin el lock, a que terminen estas conexiones en curso: hasta `end` (time.perf_counter(),
+        un reloj fino también en Windows, donde time.monotonic() avanza de 15.6 ms en 15.6 ms)."""
         while True:
             with self.lock:
                 if self._closed:
                     return
                 socks = [c.sock for c in conns
                          if c.connecting and c.sock is not None and self.conns.get(c.addr) is c]
-            left = end - time.monotonic()
+            left = end - time.perf_counter()
             if not socks or left <= 0:
                 return
             try:
                 _, w, x = select.select([], socks, socks, left)
             except (OSError, ValueError):
-                continue                         # una se cerró mientras tanto: se vuelve a mirar
+                time.sleep(min(left, 0.001))     # una se cerró mientras tanto: se vuelve a mirar, sin girar
+                continue
             if w or x:
                 with self.lock:
                     for c in conns:
@@ -443,6 +465,7 @@ class Fanout:
 
     def send(self, packet) -> bool:
         """Deja un paquete ya armado (un anuncio) en cada conexión. True si hay alguien."""
+        self.settle()                            # Q1: lo que quede de la espera de una tanda nueva
         with self.lock:
             started = self._reconnect()
             self._poll_connecting()
@@ -464,6 +487,7 @@ class Fanout:
     def send_message(self, env: wire.Envelope, payload) -> bool:
         """Un mensaje de datos: a cada suscriptor por memoria compartida si puede
         (el payload se escribe una sola vez) y si no, entero por TCP."""
+        self.settle()                            # Q1: lo que quede de la espera de una tanda nueva
         n = payload.nbytes if isinstance(payload, memoryview) else len(payload)
         with self.lock:
             started = self._reconnect(msg=True)

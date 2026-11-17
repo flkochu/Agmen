@@ -308,7 +308,6 @@ class _PurePublisher(_NetSend):
         el de una grabación (agmen play); si no, uno al azar. `node`: su nombre en
         el hub (si no, el del proceso)."""
         _backend.notice_pure_once()
-        _preload_numpy(msg_type)
         self.type = msg_type
         self.to = to
         # Antes de cualquier hilo: el hub, la conexión TCP y los bloques de memoria
@@ -324,6 +323,7 @@ class _PurePublisher(_NetSend):
         self.arrow = msg_type.LAYOUT.encoding == wire.ENC_ARROW
         if hp.is_topic(to):
             hp.check_topic(to)
+        _preload_numpy(msg_type)   # tras validar el tipo y el topic: los errores de siempre, en su orden
         self.topic = to if hp.is_topic(to) else (topic if topic is not None else "/" + msg_type.NAME)
         self._topic_id = wire.topic_id(self.topic)
         # Modo red (RFC 0011 §3): los destinos que no son 127.0.0.1 salen por otro socket (_net_sock).
@@ -351,6 +351,7 @@ class _PurePublisher(_NetSend):
             self._link = None
             if self._tcp is not None:
                 self._tcp.update(self.dests, self._announcement())
+                self._tcp.settle()
 
     def _announcement(self) -> bytes:
         return wire.encode_announcement(self.type.SCHEMA_TEXT, self.topic, source_id=self.source_id, seq=self.seq)
@@ -373,9 +374,15 @@ class _PurePublisher(_NetSend):
                 self._tcp.flush()      # termina lo que quedó a medias aunque no se publique
 
     def _drain(self) -> None:
-        """Lee las respuestas del hub (a quién mandarle los datos)."""
+        """Lee las respuestas del hub (a quién mandarle los datos). Las direcciones nuevas de toda la
+        pasada se esperan una sola vez, al final (hasta NEW_WAIT_S en total, no una vez por `subs`)."""
         if self._link is None:
             return
+        self._drain_hub()
+        if self._tcp is not None:
+            self._tcp.settle()
+
+    def _drain_hub(self) -> None:
         while True:
             try:
                 data, sender = self._sock.recvfrom(65536)
@@ -940,12 +947,12 @@ class _PureSubscriber(_Receiver):
     def __init__(self, msg_type, where: str) -> None:
         """`where` = topic ("/cmd") o dirección donde escuchar ("127.0.0.1:7500")."""
         _backend.notice_pure_once()
-        _preload_numpy(msg_type)
         self.type = msg_type
         self._clock_warned = False
         arrow = msg_type.LAYOUT.encoding == wire.ENC_ARROW
         super().__init__(where, f"{msg_type.SCHEMA_ID:016x}", msg_type.NAME, tcp=arrow,
                          shm=arrow and _shm.enabled())
+        _preload_numpy(msg_type)   # tras validar el tipo y el topic: los errores de siempre, en su orden
         self._shm = _shm.Receiver(where) if arrow else None
         self._puros.add(self)
 
@@ -1245,7 +1252,6 @@ class _NativePublisher:
     def __init__(self, msg_type, to: str, topic: str | None = None) -> None:
         """`to` = topic ("/cmd") o dirección ("127.0.0.1:7500"). Con dirección,
         `topic` es solo una etiqueta (default "/" + nombre del tipo)."""
-        _preload_numpy(msg_type)
         self.type = msg_type
         self.to = to
         if hp.is_topic(to):
@@ -1255,6 +1261,7 @@ class _NativePublisher:
         self.arrow = layout.encoding == wire.ENC_ARROW
         self._core = _backend.core.Publisher(to, msg_type.NAME, msg_type.SCHEMA_TEXT, msg_type.SCHEMA_ID,
                                              layout.size or 0, self.arrow, label)
+        _preload_numpy(msg_type)   # tras validar el tipo y el topic: los errores de siempre, en su orden
         self.topic = self._core.topic
         self.source_id = self._core.source_id
         self._lock = threading.Lock()
@@ -1339,7 +1346,6 @@ class _NativeSubscriber:
 
     def __init__(self, msg_type, where: str) -> None:
         """`where` = topic ("/cmd") o dirección donde escuchar ("127.0.0.1:7500")."""
-        _preload_numpy(msg_type)
         self.type = msg_type
         if hp.is_topic(where):
             hp.check_topic(where)
@@ -1347,6 +1353,7 @@ class _NativeSubscriber:
         layout = msg_type.LAYOUT
         self._core = _backend.core.Subscriber(where, msg_type.NAME, msg_type.SCHEMA_TEXT, msg_type.SCHEMA_ID,
                                               layout.size or 0, layout.encoding == wire.ENC_ARROW)
+        _preload_numpy(msg_type)   # tras validar el tipo y el topic: los errores de siempre, en su orden
         self._listen = f"127.0.0.1:{self._core.port}" if self.topic else where
         self._lock = threading.Lock()
         _nativos.add(self)

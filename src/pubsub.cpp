@@ -249,11 +249,9 @@ public:
     }
 
     /// La lista nueva de suscriptores (del hub o la dirección fija). Solo las direcciones nuevas se
-    /// conectan en el acto (la misma lista no fuerza nada); a las de esta computadora se les espera, sin
-    /// el candado, hasta kNewWait en total: un suscriptor sano recibe el anuncio y el mensaje de este
-    /// mismo publish(), como siempre, y uno que no contesta sigue conectándose en segundo plano.
+    /// conectan en el acto (la misma lista no fuerza nada). No espera: las de esta computadora entran en
+    /// la tanda que espera settle(), una vez por pasada de drain() (no una por update()).
     void update(std::vector<std::string> addrs, Packet announcement) {
-        std::vector<std::string> waiting;
         {
             std::lock_guard lock(mu_);
             std::set<std::string> fresh;
@@ -278,11 +276,31 @@ public:
                 }
             }
             for (auto& a : reconnect(fresh, false)) {
-                if (fresh.count(a) != 0) waiting.push_back(std::move(a));
+                if (fresh.count(a) == 0) continue;
+                if (new_.empty()) new_end_ = std::chrono::steady_clock::now() + kNewWait;   // empieza la tanda
+                new_.push_back(std::move(a));
             }
         }
         wake();
-        if (!waiting.empty()) wait_connecting(waiting);
+    }
+
+    /// Espera, sin el candado, a que terminen las conexiones nuevas de la tanda en curso, hasta lo que
+    /// quede de sus kNewWait (nunca más en total): un suscriptor sano recibe el anuncio y el mensaje de
+    /// este mismo publish(), como siempre, y uno que no contesta sigue conectándose en segundo plano.
+    /// La llama drain() al final de su pasada (con el candado del Publisher: quien manda espera a que
+    /// termine, así que nadie se salta a un suscriptor nuevo).
+    void settle() {
+        std::vector<std::string> addrs;
+        std::chrono::steady_clock::time_point end;
+        {
+            std::lock_guard lock(mu_);
+            if (new_.empty()) return;
+            addrs = new_;
+            end = new_end_;
+        }
+        wait_connecting(addrs, end);
+        std::lock_guard lock(mu_);
+        if (new_end_ == end) new_.clear();
     }
 
     /// Deja un paquete ya armado (un anuncio) en cada conexión.
@@ -416,6 +434,8 @@ private:
     std::vector<std::string> want_;
     Packet announcement_;
     std::map<std::string, std::chrono::steady_clock::time_point> last_try_;
+    std::vector<std::string> new_;                     // la tanda de conexiones nuevas que espera settle()
+    std::chrono::steady_clock::time_point new_end_{};  // hasta cuándo se le espera
     std::uint64_t dropped_gone_ = 0;   // de conexiones que ya se cerraron
     std::unique_ptr<shm::Pool> pool_;  // se crea cuando un suscriptor dice que puede
     std::uint64_t fallbacks_ = 0;
@@ -667,9 +687,8 @@ private:
         }
     }
 
-    /// Espera, sin el candado, a que terminen las conexiones en curso de `addrs`: hasta kNewWait en total.
-    void wait_connecting(const std::vector<std::string>& addrs) {
-        const auto end = std::chrono::steady_clock::now() + kNewWait;
+    /// Espera, sin el candado, a que terminen las conexiones en curso de `addrs`: hasta `end`.
+    void wait_connecting(const std::vector<std::string>& addrs, std::chrono::steady_clock::time_point end) {
         for (;;) {
             std::vector<std::intptr_t> handles;
             {
@@ -1192,6 +1211,7 @@ struct PublisherCore::State {
             tcp_dests.push_back(to);
             n_subs.store(tcp_dests.size(), std::memory_order_relaxed);
             fanout->update(tcp_dests, std::make_shared<const wire::Bytes>(announcement()));
+            fanout->settle();
         } else {
             dests.push_back(net::Address::resolve(to));
             n_subs.store(dests.size(), std::memory_order_relaxed);
@@ -1272,6 +1292,8 @@ struct PublisherCore::State {
                 }
             }
         }
+        // Las direcciones nuevas de toda la pasada se esperan una sola vez (hasta kNewWait en total).
+        if (fanout) fanout->settle();
     }
 
     /// La primera vez que hay un destino de otra computadora (con `mu`).
