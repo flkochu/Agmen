@@ -324,9 +324,9 @@ class TestCerrar(unittest.TestCase):
         chunks (vistas). Al salir del with, el lector los suelta: cierra de verdad y no culpa al programa."""
         damage_chunk(self.path, 2)
         err = io.StringIO()
-        with contextlib.redirect_stderr(err), self.assertRaisesRegex(_mcap.McapError, "CRC"):
-            with agmen.Recording(self.path) as rec:
-                sum(1 for _ in rec.messages())
+        with (contextlib.redirect_stderr(err), self.assertRaisesRegex(_mcap.McapError, "CRC"),
+              agmen.Recording(self.path) as rec):
+            sum(1 for _ in rec.messages())
         self.assertEqual(err.getvalue(), "")
         self.assertClosed(rec._r)
 
@@ -334,10 +334,10 @@ class TestCerrar(unittest.TestCase):
         """Si lo que retiene el archivo es una variable de quien llamó (la del for), el aviso lo dice como es."""
         damage_chunk(self.path, 2)
         err = io.StringIO()
-        with contextlib.redirect_stderr(err), self.assertRaisesRegex(_mcap.McapError, "CRC"):
-            with _mcap.Reader(self.path) as r:
-                for m in r.messages():
-                    pass
+        with (contextlib.redirect_stderr(err), self.assertRaisesRegex(_mcap.McapError, "CRC"),
+              _mcap.Reader(self.path) as r):
+            for m in r.messages():
+                pass
         text = err.getvalue()
         self.assertEqual(text.count("[agmen] ⚠"), 1, text)
         for words in (self.path, "se cerró por un error", "variable de un for", "Se suelta sola", "Windows"):

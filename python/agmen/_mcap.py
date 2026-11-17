@@ -534,18 +534,18 @@ class Reader:
             return
         self._warned = True
         if self._on_error:
-            text = (f"la grabación sigue abierta: se cerró por un error, y el error (o la función donde pasó, por "
-                    f"ejemplo con la variable de un for) todavía guarda algo leído de ella. Se suelta sola en cuanto "
-                    f"eso deje de usarse; hasta entonces, en Windows no se podrá borrar ni reemplazar el archivo.")
+            text = ("la grabación sigue abierta: se cerró por un error, y el error (o la función donde pasó, por "
+                    "ejemplo con la variable de un for) todavía guarda algo leído de ella. Se suelta sola en cuanto "
+                    "eso deje de usarse; hasta entonces, en Windows no se podrá borrar ni reemplazar el archivo.")
         else:
-            text = (f"la grabación sigue abierta porque algún mensaje (o adjunto) que leíste de ella, o un recorrido "
-                    f"de messages() a medias, sigue en uso (son vistas del archivo, sin copiar). En Windows no se "
-                    f"podrá borrar ni reemplazar el archivo hasta que lo sueltes. Lo típico: la variable del for "
-                    f"sigue apuntando al último mensaje al salir del bucle (for m in rec.messages(...)), o guardaste "
-                    f"un arreglo de as_array(), los bytes de una imagen o una tabla de table(). Qué hacer: suelta "
-                    f"esa variable (por ejemplo del m, o sal de la función); el archivo se suelta solo en cuanto nada "
-                    f"lo use, o con otro close(). Para conservar algo después de cerrar, cópialo antes: "
-                    f"copy.deepcopy(msg), arr.copy() o, una tabla, tabla.take(list(range(tabla.num_rows))).")
+            text = ("la grabación sigue abierta porque algún mensaje (o adjunto) que leíste de ella, o un recorrido "
+                    "de messages() a medias, sigue en uso (son vistas del archivo, sin copiar). En Windows no se "
+                    "podrá borrar ni reemplazar el archivo hasta que lo sueltes. Lo típico: la variable del for "
+                    "sigue apuntando al último mensaje al salir del bucle (for m in rec.messages(...)), o guardaste "
+                    "un arreglo de as_array(), los bytes de una imagen o una tabla de table(). Qué hacer: suelta "
+                    "esa variable (por ejemplo del m, o sal de la función); el archivo se suelta solo en cuanto nada "
+                    "lo use, o con otro close(). Para conservar algo después de cerrar, cópialo antes: "
+                    "copy.deepcopy(msg), arr.copy() o, una tabla, tabla.take(list(range(tabla.num_rows))).")
         print(f"[agmen] ⚠ {self.path}: {text}", file=sys.stderr, flush=True)
 
     def _check_open(self) -> None:
@@ -852,7 +852,7 @@ class Reader:
             traceback.clear_frames(e.__traceback__)
             heap.clear()
             loose.clear()
-            m = it = None   # noqa: F841
+            m = it = None
             raise
 
 

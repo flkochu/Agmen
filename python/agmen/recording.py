@@ -409,7 +409,7 @@ class Recording:
         except BaseException as e:
             # Un error a medio recorrido: que el traceback no guarde el último mensaje (una vista del archivo).
             traceback.clear_frames(e.__traceback__)
-            m = payload = msg = None   # noqa: F841
+            m = payload = msg = None
             raise
 
     # --- tablas (pyarrow) ---
