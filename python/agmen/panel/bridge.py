@@ -26,6 +26,7 @@ Reglas que se cuidan aquí:
 from __future__ import annotations
 
 import json
+import math
 import struct
 import threading
 import time
@@ -50,6 +51,57 @@ TELEOP_WATCHDOG_S = 0.3  # manejando (comando ≠ 0) y sin comandos nuevos en 30
                          # cierra la conexión: TCP tardaría minutos en notarlo).
 
 _FOX_DATA = struct.Struct("<BIQ")   # opcode 1 (messageData), subscription id, timestamp ns
+
+
+# ----------------------------------------------------------------------
+# Lo que manda un cliente (navegador, script o visor): nada se cree a ciegas
+# ----------------------------------------------------------------------
+class ClientError(ValueError):
+    """Lo que mandó un cliente del panel no sirve; el texto dice qué pasó y qué mandar."""
+
+
+def _no_constant(name: str):
+    raise ClientError(f"{name} no es JSON válido (JSON no tiene NaN ni Infinity): manda un número finito")
+
+
+def _finite_float(text: str) -> float:
+    v = float(text)
+    if not math.isfinite(v):
+        raise ClientError(f"el número {text[:40]} no es JSON válido aquí: es tan grande que se vuelve infinito; "
+                          f"manda un número finito")
+    return v
+
+
+def client_json(data: str | bytes):
+    """El ÚNICO lugar donde se lee el JSON de un cliente del panel (WebSocket del panel y de Foxglove, y los
+    POST de /api). Python acepta NaN, Infinity y -Infinity aunque no son JSON (un navegador no puede mandarlos
+    con JSON.stringify, un script sí), y lee 1e999 como infinito: aquí se rechazan, con ClientError. También
+    cualquier JSON roto (o anidado sin fin): ClientError que dice por qué, nunca otra excepción."""
+    try:
+        return json.loads(data, parse_constant=_no_constant, parse_float=_finite_float)
+    except ClientError:
+        raise
+    except (ValueError, TypeError, RecursionError) as e:     # JSONDecodeError y UnicodeDecodeError son ValueError
+        raise ClientError(f"JSON inválido ({type(e).__name__}: {str(e)[:80]})") from None
+
+
+def client_number(v, what: str) -> float:
+    """Un número que mandó un cliente, como float finito. Igual que check_value de los mandos (RFC 0012): ni
+    texto ("0.5", "nan"), ni null, ni listas, ni true/false, ni NaN ni infinito. Si no, ClientError."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ClientError(f"{what} debe ser un número, no {_show(v)}")
+    try:
+        f = float(v)
+    except OverflowError:
+        raise ClientError(f"{what} es demasiado grande para un número ({str(v)[:20]}…)") from None
+    if not math.isfinite(f):
+        raise ClientError(f"{what} no puede ser NaN ni infinito")
+    return f
+
+
+def _show(v) -> str:
+    text = json.dumps(v, ensure_ascii=False) if isinstance(v, (str, list, dict, type(None))) else repr(v)
+    return text if len(text) <= 40 else text[:37] + "…"
 
 
 @dataclass
