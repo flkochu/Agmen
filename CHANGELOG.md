@@ -12,7 +12,9 @@ Hecho: el bloque 1 del plan (mensajes chicos, `nan` por defecto, el cuaternión
 sin adivinar y los vectores de prueba). El mapeo de los mensajes chicos a
 Foxglove pasa del bloque 1 al bloque 3 (con los marcos): lo decidió el consejo
 (2 votos contra 1) la noche del 2026-11-16, por delegación de Adán, que puede
-revertirlo. Faltan también los bloques 2 a 7 del plan del RFC.
+revertirlo. Del bloque 2 está hecha solo la parte de las plantillas de
+articulaciones (ver Agregado); faltan el resto del bloque 2 (`[[joints]]` y los
+nombres declarados al hub) y los bloques 3 a 7 del plan del RFC.
 
 ### Agregado
 - **Mensajes estándar chicos** (RFC 0013 §3.2 y §3.3) en `agmen/msgs.agmen`, con
@@ -48,6 +50,16 @@ revertirlo. Faltan también los bloques 2 a 7 del plan del RFC.
 - **Tutorial**: la sección de `= nan` en el capítulo 11 y la de los mensajes
   chicos en el capítulo 14, con un ejemplo que se corrió. El capítulo completo de
   convenciones y mensajes estándar llega con el bloque 7 del RFC.
+- **Plantillas de articulaciones** (RFC 0013 bloque 2, en curso; solo esta
+  parte): `agmen::msgs::JointState<N>` y `JointCommand<N>` en
+  `<agmen/joints.hpp>` (C++), y `agmen.msgs.JointState[N]` y `JointCommand[N]`
+  (Python), con N el número de articulaciones. Son los mismos bytes y el mismo
+  texto canónico que un `.agmen` con `f32[N]`, con el mismo nombre y, por tanto,
+  el mismo `schema_id`. `JointState` mide 12·N bytes (posición, velocidad y
+  par) y `JointCommand` 20·N (esos tres más `kp` y `kd`). Como los demás
+  mensajes con NaN, no se comparan con `==`. Las adelantó el consejo (3 votos a
+  0), por delegación de Adán. Todavía no tienen capítulo en el tutorial: se
+  escribe al cerrar el bloque 2. El resto del bloque 2 no está hecho.
 
 ### Cambiado
 - **Un `.agmen` no puede definir otro `Pose`, `Transform`, `Twist`, `Odometry`,
@@ -69,7 +81,29 @@ revertirlo. Faltan también los bloques 2 a 7 del plan del RFC.
   `false`. El panel ya no acepta JSON con `NaN` ni `Infinity`: JSON no los tiene,
   y un script de Python los manda sin avisar.
 - **Los `POST` tienen tope de 1 MiB**. Un cuerpo más grande responde 413 sin
-  leerse, y no se hace nada.
+  leerse, y no se hace nada. Un cliente que manda de golpe un cuerpo muy grande
+  puede ver un corte de conexión en vez del 413: el panel cierra sin leer lo que
+  sobra, y eso puede borrarle la respuesta.
+- **Los `POST` del panel son más estrictos con el encabezado**:
+  - `Content-Length` solo puede traer dígitos: `+30` y `3_0` (antes pasaban)
+    responden 400.
+  - `Transfer-Encoding` (chunked) o varios `Content-Length` responden 400 y
+    cierran la conexión.
+  - Sin clave, la respuesta es 401; sin el encabezado `X-Agmen: 1` o con un
+    `Origin` de otra página, 403. Las dos salen antes de leer el cuerpo: si lo
+    traía, la conexión se cierra.
+- **Topics, nodos y acciones tienen largo máximo**: un topic, un nombre de nodo o
+  una acción de más de 200 caracteres se rechaza. El op `node` exige `name` y
+  `action` como texto.
+- **Los errores son más cortos y en español**: repiten lo que mandó el cliente,
+  acotado a unos 40 caracteres; los errores de JSON dicen cerca de qué carácter
+  fallaron, y cambió el texto de varios. Si un script busca un texto de error
+  exacto, hay que revisarlo.
+- **Los rechazos de manejo quedan en los logs del panel**: un comando de manejo
+  rechazado (por WebSocket o por `POST /api/teleop`) y un mensaje ilegible o
+  binario se anotan en los logs: el primero, y luego como mucho uno por segundo,
+  con cuántos hubo. Un `POST` solo se anota si quien lo manda pasó la clave y el
+  origen.
 
 ### Corregido
 - **El lector de `.agmen` falla antes, no después**: los valores de arriba
@@ -82,18 +116,28 @@ revertirlo. Faltan también los bloques 2 a 7 del plan del RFC.
   (NaN, infinito, texto, `null`, un booleano o un campo que falta) se rechaza
   entero: no se manda nada al robot, quien lo mandó recibe el error y el freno
   automático sigue contando como antes.
-- **El WebSocket de Foxglove y los `POST` ya no se caen con datos mal formados**:
-  responden con un error (JSON roto, binario o un `Content-Length` absurdo).
+- **El WebSocket del panel (`agmen.ws.v1`) contesta un error a un mensaje
+  binario**; antes lo ignoraba en silencio. El de Foxglove sigue ignorando los
+  binarios, porque es de solo lectura. Un mensaje roto (JSON inválido, un
+  `Content-Length` absurdo en un `POST`) responde con un error y no tumba la
+  conexión ni el hilo del servidor.
+- **Un entero enorme en un mando (`[[web.command]]`) ya no tumba la conexión**:
+  en un campo `f32` o `f64` da un error que dice que no cabe.
 - **Al cerrar una grabación, el archivo se cierra de verdad.** `Recording.close()`
   y salir del `with` podían dejar el archivo abierto sin avisar; las grabaciones
   de `agmen run`, que llevan `robot.toml` adjunto, pasaban siempre. En Windows eso
   impedía borrar o reemplazar el archivo.
 - **Si algo leído de la grabación sigue en uso al cerrar**, Agmen avisa una vez
-  qué archivo es y qué hacer. Los mensajes son vistas del archivo, sin copiar: el
+  qué archivo es y qué hacer (si la grabación se cerró por un error, el aviso
+  lo dice, con otro texto). Los mensajes son vistas del archivo, sin copiar: el
   archivo se suelta solo en cuanto nada lo usa. Leer de una grabación ya cerrada
   da un error que dice cómo abrirla de nuevo.
+- **Abrir una grabación dañada ya no deja nada abierto**: si la lectura falla
+  (por ejemplo, un archivo que no es MCAP), el archivo se cierra y el error dice
+  qué pasó, sin el aviso de "sigue en uso".
 - **`agmen info --reparar`** ya no deja el archivo a medio escribir si falla a
-  medias: lo borra.
+  medias: lo borra. Y se niega si la salida es la misma grabación que la entrada
+  (la sobrescribiría mientras la lee): da otra ruta de salida.
 
 ## [0.14.0] — 2026-11-16
 

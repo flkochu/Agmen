@@ -237,6 +237,10 @@ print("listo")
 listo
 ```
 
+Si el `with` se sale por un error y algo leído sigue en uso, el aviso es otro:
+dice que la grabación se cerró por un error, y que el error (o el programa)
+guarda lo leído. Lo que hay que hacer es el mismo: copiar y soltar.
+
 La forma de evitarlo es copiar lo que quieras conservar. Así no hay aviso:
 
 ```python
