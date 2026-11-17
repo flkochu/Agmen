@@ -431,7 +431,7 @@ leer mientras otro hilo publica o recibe.
 ### Lo que no se garantiza
 
 - El orden entre mensajes que publican hilos distintos.
-- Usar estos objetos después de un `fork()` con hilos vivos.
+- Usar en el hijo un objeto creado antes de un `fork()`. Ver la sección 10.
 - En C++, un `Subscriber` sigue siendo de un solo receptor a la vez. Lo de esta
   sección es la garantía de los objetos de **Python**.
 
@@ -454,8 +454,100 @@ if paquete is not None:
         print("mensaje con seq", env.seq)
 ```
 
+## 10. `fork` y `multiprocessing`
+
+Regla: **después de un `fork`, los objetos de Agmen que ya existían son del
+padre. En el hijo, crea los tuyos.**
+
+El hijo recibe una copia del objeto, pero el registro en el hub y la memoria
+compartida siguen siendo del padre. Por eso el hijo no puede usarlos.
+
+Esto aplica a `Publisher`, `Subscriber`, `RawPublisher`, `RawSubscriber` y
+`Node`. Con un objeto heredado en el hijo:
+
+- `close()`, salir de un `with` o terminar el hijo: no le hacen nada al padre.
+  El padre sigue recibiendo y publicando sin hueco.
+- Cualquier otra cosa (`publish()`, `receive()`, las propiedades…) lanza un
+  error. Verás esto:
+
+```
+RuntimeError: este Publisher es del proceso padre (pid 12345): después de un fork, crea uno nuevo en el hijo
+```
+
+El número del pid cambia. La solución es crear el objeto dentro del hijo:
+
+```python
+"""Un hijo de fork crea su propio Subscriber y recibe del padre."""
+import multiprocessing
+import time
+from pathlib import Path
+
+import agmen
+
+MotorCommand = agmen.load(Path(__file__).with_name("motor_command.agmen")).MotorCommand
+PUERTO = "127.0.0.1:7540"
+
+# Creado ANTES del fork: en el hijo, este Publisher es del padre.
+pub = agmen.Publisher(MotorCommand, PUERTO, topic="/cmd")
+
+
+def hijo(listo):
+    # El hijo crea SU propio Subscriber. Usar `pub` aquí daría RuntimeError.
+    try:
+        pub.publish(MotorCommand(left=0.0, right=0.0))
+    except RuntimeError as error:
+        print(f"hijo, error esperado: {error}")
+    sub = agmen.Subscriber(MotorCommand, PUERTO)
+    listo.set()
+    s = sub.receive(timeout=3.0)
+    if s is None:
+        print("hijo: no llegó nada")
+    else:
+        print(f"hijo recibió: left={s.message.left} right={s.message.right}")
+    sub.close()
+
+
+if __name__ == "__main__":
+    contexto = multiprocessing.get_context("fork")  # fork explícito
+    listo = contexto.Event()
+    p = contexto.Process(target=hijo, args=(listo,))
+    p.start()
+    listo.wait(5)          # el hijo ya se suscribió...
+    time.sleep(0.3)        # ...y le damos un momento para que el padre lo vea
+    pub.publish(MotorCommand(left=0.5, right=-0.5))
+    p.join()
+    pub.close()
+```
+
+Guárdalo como `fork_hijo.py` en `examples/tutorial/`, junto a
+`motor_command.agmen`, y córrelo desde la raíz del repositorio:
+
+```bash
+python3 examples/tutorial/fork_hijo.py
+```
+
+Salida (el pid cambia):
+
+```
+hijo, error esperado: este Publisher es del proceso padre (pid 12345): después de un fork, crea uno nuevo en el hijo
+hijo recibió: left=0.5 right=-0.5
+```
+
+Lo que conviene saber:
+
+- Pedimos `fork` de forma explícita con `get_context("fork")`. Así el ejemplo
+  no depende de cuál es el método por defecto de tu Python.
+- En Windows no hay `fork`. `multiprocessing` arranca el hijo desde cero: no
+  hereda nada, y crea sus objetos igual.
+- Un hilo del padre que estaba dentro de `receive()` o `publish()` al hacer el
+  `fork` no cuelga al hijo. Aun así, el hijo no usa ese objeto: crea el suyo.
+- Esta regla es para los objetos de Python. Un programa de C++ que haga
+  `fork()` no tiene esta garantía.
+
 ## Lo que aprendiste
 
+- Después de un `fork`, los objetos heredados son del padre: en el hijo, crea
+  los tuyos.
 - `every` para cada ritmo, `subscribe`/`on` para cada mensaje, `spin()` para
   correrlo todo.
 - Varios hilos pueden usar el mismo `Publisher` o `Subscriber`. Cada mensaje

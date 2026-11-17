@@ -26,6 +26,7 @@ Reglas que se cuidan aquí:
 from __future__ import annotations
 
 import json
+import math
 import struct
 import threading
 import time
@@ -35,6 +36,7 @@ from dataclasses import dataclass, field
 from .. import hubproto, schema, wire
 from .._version import __version__
 from ..ws import WebSocket
+from .command import show_value
 
 AGMEN_PROTOCOL = "agmen.ws.v1"
 FOXGLOVE_PROTOCOL = "foxglove.websocket.v1"
@@ -44,12 +46,67 @@ STATE_EVERY_S = 0.5
 LOGS_EVERY_S = 0.1
 INITIAL_LOGS = 300
 MAX_HZ_LIMIT = 10_000.0
+REJECT_LOG_S = 1.0       # un cliente que manda comandos de manejo malos: un aviso en los logs por segundo, como mucho
+MAX_NAME = 200           # un topic, un nodo o una acción más largos que esto no existen: no se devuelven en el error
 TELEOP_WATCHDOG_S = 0.3  # manejando (comando ≠ 0) y sin comandos nuevos en 300 ms → ALTO.
                          # El navegador manda 20 por segundo mientras presionas: 300 ms
                          # sin nada = se cortó la señal (un celular que sale del WiFi no
                          # cierra la conexión: TCP tardaría minutos en notarlo).
 
 _FOX_DATA = struct.Struct("<BIQ")   # opcode 1 (messageData), subscription id, timestamp ns
+
+
+# ----------------------------------------------------------------------
+# Lo que manda un cliente (navegador, script o visor): nada se cree a ciegas
+# ----------------------------------------------------------------------
+class ClientError(ValueError):
+    """Lo que mandó un cliente del panel no sirve; el texto dice qué pasó y qué mandar."""
+
+
+def _no_constant(name: str):
+    raise ClientError(f"{name} no es JSON válido (JSON no tiene NaN ni Infinity): manda un número finito")
+
+
+def _finite_float(text: str) -> float:
+    v = float(text)
+    if not math.isfinite(v):
+        raise ClientError(f"el número {text[:40]} no es JSON válido aquí: es tan grande que se vuelve infinito; "
+                          f"manda un número finito")
+    return v
+
+
+def client_json(data: str | bytes):
+    """El ÚNICO lugar donde se lee el JSON de un cliente del panel (WebSocket del panel y de Foxglove, y los
+    POST de /api). Python acepta NaN, Infinity y -Infinity aunque no son JSON (un navegador no puede mandarlos
+    con JSON.stringify, un script sí), y lee 1e999 como infinito: aquí se rechazan, con ClientError. También
+    cualquier JSON roto (o anidado sin fin): ClientError que dice por qué, nunca otra excepción."""
+    try:
+        return json.loads(data, parse_constant=_no_constant, parse_float=_finite_float)
+    except ClientError:
+        raise
+    except json.JSONDecodeError as e:
+        raise ClientError(f"JSON inválido cerca del carácter {e.pos}") from None
+    except UnicodeDecodeError:
+        raise ClientError("JSON inválido: no es texto UTF-8") from None
+    except RecursionError:
+        raise ClientError("JSON inválido: demasiados niveles de [ ] o { } anidados") from None
+    except (ValueError, TypeError):    # p. ej. un entero de miles de dígitos (Python no lo convierte)
+        raise ClientError("JSON inválido: tiene un valor que no se puede leer (¿un número con miles de dígitos?)") \
+            from None
+
+
+def client_number(v, what: str) -> float:
+    """Un número que mandó un cliente, como float finito. Igual que check_value de los mandos (RFC 0012): ni
+    texto ("0.5", "nan"), ni null, ni listas, ni true/false, ni NaN ni infinito. Si no, ClientError."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ClientError(f"{what} debe ser un número, no {show_value(v)}")
+    try:
+        f = float(v)
+    except OverflowError:
+        raise ClientError(f"{what} es demasiado grande para un número ({show_value(v)})") from None
+    if not math.isfinite(f):
+        raise ClientError(f"{what} no puede ser NaN ni infinito")
+    return f
 
 
 @dataclass
@@ -104,6 +161,23 @@ class _Channel:                     # un canal de Foxglove = un (topic, tipo)
 
 
 @dataclass
+class RejectLog:
+    """Cuenta los mensajes rechazados de un cliente y dice cuándo avisar en los logs del panel: el primero, y
+    luego como mucho uno por segundo (con cuántos hubo). Así el operador se entera si un script ajeno manda
+    basura al mando, sin que la basura llene los logs."""
+    pending: int = 0
+    last_at: float | None = None
+
+    def note(self, now: float) -> int:
+        """Anota un rechazo. Devuelve cuántos hay que contar en el aviso (0 = no avisar todavía)."""
+        self.pending += 1
+        if self.last_at is not None and now - self.last_at < REJECT_LOG_S:
+            return 0
+        n, self.pending, self.last_at = self.pending, 0, now
+        return n
+
+
+@dataclass
 class AgmenClient:
     ws: WebSocket
     peer: str
@@ -112,6 +186,7 @@ class AgmenClient:
     announced: set = field(default_factory=set)       # (topic_id, source_id, schema_id)
     teleop_at: float = 0.0                            # último comando distinto de alto
     sent: int = 0
+    rejects: RejectLog = field(default_factory=RejectLog)   # comandos de manejo rechazados (para los logs)
 
     def wants(self, topic_id: int) -> float | None:
         if topic_id in self.subs:
@@ -140,6 +215,7 @@ class Bridge:
         self.next_channel = 1
         self.session = uuid.uuid4().hex[:12]
         self.total_dropped = 0
+        self.clock = time.monotonic          # el tiempo de los avisos de rechazos (las pruebas lo reemplazan)
 
     # ------------------------------------------------------------------
     # Lo que llega de Agmen (lo llama el hilo receptor del panel)
@@ -233,8 +309,11 @@ class Bridge:
         try:
             while (msg := ws.recv()) is not None:
                 if isinstance(msg, bytes):
-                    continue
-                err = self._agmen_op(c, msg)
+                    err = ("el panel no acepta mensajes binarios: manda JSON como texto, ej. "
+                           "{\"op\": \"teleop\", \"left\": 0.5, \"right\": 0.5} (no se hizo nada)")
+                    self.log_rejected(c.rejects, c.peer, err)
+                else:
+                    err = self._agmen_op(c, msg)
                 if err:
                     ws.send_text(json.dumps({"op": "error", "msg": err}))
         finally:
@@ -253,14 +332,32 @@ class Bridge:
             self.panel.logs.add("agmen", f"panel: {why} ({c.peer}) mientras manejaba → ALTO", "agmen")
             self.panel.teleop.send(0.0, 0.0)
 
+    def log_rejected(self, rejects: RejectLog, peer: str, err: str) -> None:
+        """Deja en los logs del panel que se rechazó un comando de manejo (o un mensaje ilegible o binario, que
+        un navegador nunca manda): el primero de cada cliente y luego como mucho uno por segundo. Para un
+        RejectLog que solo usa un hilo (el de una conexión WebSocket)."""
+        self.log_reject_line(peer, rejects.note(self.clock()), err)
+
+    def log_reject_line(self, peer: str, n: int, err: str) -> None:
+        """La línea del aviso, si RejectLog.note() dijo que toca (n > 0)."""
+        if n:
+            more = f" ({n} rechazados desde el aviso anterior)" if n > 1 else ""
+            self.panel.logs.add("agmen", f"panel: rechacé lo que mandó {peer}{more}: {err}", "agmen")
+
     def _agmen_op(self, c: AgmenClient, text: str) -> str | None:
         try:
-            m = json.loads(text)
-            op = m["op"]
-        except (ValueError, KeyError, TypeError):
+            m = client_json(text)
+        except ClientError as e:
+            err = f"mensaje rechazado entero (no se hizo nada ni se mandó nada al robot): {e}"
+            self.log_rejected(c.rejects, c.peer, err)
+            return err
+        if not isinstance(m, dict) or "op" not in m:
             return "mensaje inválido: se espera JSON con 'op'"
+        op = m["op"]
         if op in ("subscribe", "unsubscribe"):
             topic = m.get("topic")
+            if isinstance(topic, str) and len(topic) > MAX_NAME:
+                return f"nombre de topic inválido {show_value(topic)}: demasiado largo"
             try:
                 hubproto.check_topic(topic if isinstance(topic, str) else "", allow_wildcard=True)
             except hubproto.ProtocolError as e:
@@ -271,9 +368,9 @@ class Bridge:
                     c.subs.pop(key, None)
                     return None
                 try:
-                    max_hz = float(m.get("max_hz", 0))
-                except (TypeError, ValueError):
-                    return "max_hz debe ser un número (0 = sin límite)"
+                    max_hz = client_number(m.get("max_hz", 0), "max_hz")
+                except ClientError as e:
+                    return f"{e} (0 = sin límite)"
                 if not 0 <= max_hz <= MAX_HZ_LIMIT:
                     return f"max_hz fuera de rango (0 a {MAX_HZ_LIMIT:g})"
                 c.subs[key] = max_hz
@@ -285,9 +382,10 @@ class Bridge:
             if self.panel.teleop is None:
                 return "teleoperación no configurada ([web.teleop] en robot.toml, o agmen web --teleop)"
             try:
-                left, right = self.panel.teleop.send(m.get("left", 0.0), m.get("right", 0.0))
-            except (TypeError, ValueError):
-                return "left/right deben ser números"
+                left, right = self.panel.teleop.send_client(m)
+            except ClientError as e:
+                self.log_rejected(c.rejects, c.peer, str(e))
+                return str(e)        # no se publicó nada y el hombre muerto sigue como estaba (teleop_at igual)
             c.teleop_at = time.monotonic() if (left, right) != (0.0, 0.0) else 0.0
             return None
         if op == "command":
@@ -301,8 +399,12 @@ class Bridge:
         if op == "node":
             if self.panel.launcher is None:
                 return "este panel no administra nodos (usa 'agmen run')"
-            return self.panel.launcher.action(str(m.get("name", "")), str(m.get("action", "")))
-        return f"operación desconocida '{op}'"
+            name, action = m.get("name", ""), m.get("action", "")
+            if not isinstance(name, str) or not isinstance(action, str) or max(len(name), len(action)) > MAX_NAME:
+                return (f"node: name y action son textos cortos (llegó name={show_value(name)}, "
+                        f"action={show_value(action)})")
+            return self.panel.launcher.action(name, action)
+        return f"operación desconocida {show_value(op)}"
 
     def _serve_foxglove(self, ws: WebSocket, peer: str) -> None:
         f = FoxgloveClient(ws, peer)
@@ -330,25 +432,36 @@ class Bridge:
 
     def _fox_op(self, f: FoxgloveClient, text: str) -> str | None:
         try:
-            m = json.loads(text)
-            op = m["op"]
-        except (ValueError, KeyError, TypeError):
-            return "mensaje inválido"
+            m = client_json(text)
+        except ClientError as e:
+            return f"mensaje inválido: {e}"
+        if not isinstance(m, dict) or "op" not in m:
+            return "mensaje inválido: se espera JSON con 'op'"
+        op = m["op"]
+        is_id = lambda v: type(v) is int and 0 <= v < 1 << 32   # noqa: E731  (u32 en el protocolo de Foxglove)
         with self.lock:
             known = {ch.id for ch in self.channels.values()}
             if op == "subscribe":
+                subs = m.get("subscriptions", [])
+                if not isinstance(subs, list) or not all(isinstance(s, dict) for s in subs):
+                    return "subscribe: 'subscriptions' debe ser una lista de {id, channelId}"
+                if not all(is_id(s.get("id")) for s in subs):
+                    return "subscribe: cada 'id' debe ser un entero de 0 a 4294967295"
                 bad = []
-                for s in m.get("subscriptions", []):
-                    if s.get("channelId") in known:
-                        f.subs[int(s["id"])] = s["channelId"]
+                for s in subs:
+                    if is_id(s.get("channelId")) and s["channelId"] in known:
+                        f.subs[s["id"]] = s["channelId"]
                     else:
                         bad.append(s.get("channelId"))
-                return f"canales desconocidos: {bad}" if bad else None
+                return f"canales desconocidos: {show_value(bad, 80)}" if bad else None
             if op == "unsubscribe":
-                for sid in m.get("subscriptionIds", []):
+                sids = m.get("subscriptionIds", [])
+                if not isinstance(sids, list) or not all(is_id(s) for s in sids):
+                    return "unsubscribe: 'subscriptionIds' debe ser una lista de enteros"
+                for sid in sids:
                     f.subs.pop(sid, None)
                 return None
-        return f"Agmen todavía no soporta '{op}' desde Foxglove (por ahora es solo lectura)"
+        return f"Agmen todavía no soporta {show_value(op)} desde Foxglove (por ahora es solo lectura)"
 
     # ------------------------------------------------------------------
     # Estado y logs (un hilo para todos los clientes)

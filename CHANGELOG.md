@@ -61,11 +61,71 @@ revertirlo. Faltan los bloques 2 a 7 del plan del RFC.
   `f32` (`1e-60`); y `nan` fuera de un campo `f32` o `f64` (en un `u8`, por
   ejemplo). Un `.agmen` que los tenía deja de compilar: usa un número más
   razonable o `f64`.
+- **`POST /api/teleop` exige `left` y `right`** (los scripts lo notan). Antes,
+  `{}` mandaba el alto y un campo que faltaba valía 0. Ahora responde 400 y no
+  se manda nada al robot. Para frenar, manda `{"left": 0, "right": 0}`.
+- **Los números tienen que ser números**: el mando de manejo, la velocidad y el
+  paso del reloj, y `max_hz` ya no aceptan texto (`"0.5"`, `"10"`) ni `true` o
+  `false`. El panel ya no acepta JSON con `NaN` ni `Infinity`: JSON no los tiene,
+  y un script de Python los manda sin avisar.
+- **Los `POST` tienen tope de 1 MiB**. Un cuerpo más grande responde 413 sin
+  leerse, y no se hace nada. Un cliente que manda de golpe un cuerpo muy grande
+  puede ver un corte de conexión en vez del 413: el panel cierra sin leer lo que
+  sobra, y eso puede borrarle la respuesta.
+- **Los `POST` del panel son más estrictos con el encabezado**:
+  - `Content-Length` solo puede traer dígitos: `+30` y `3_0` (antes pasaban)
+    responden 400.
+  - `Transfer-Encoding` (chunked) o varios `Content-Length` responden 400 y
+    cierran la conexión.
+  - Sin clave, la respuesta es 401; sin el encabezado `X-Agmen: 1` o con un
+    `Origin` de otra página, 403. Las dos salen antes de leer el cuerpo: si lo
+    traía, la conexión se cierra.
+- **Topics, nodos y acciones tienen largo máximo**: un topic, un nombre de nodo o
+  una acción de más de 200 caracteres se rechaza. El op `node` exige `name` y
+  `action` como texto.
+- **Los errores son más cortos y en español**: repiten lo que mandó el cliente,
+  acotado a unos 40 caracteres; los errores de JSON dicen cerca de qué carácter
+  fallaron, y cambió el texto de varios. Si un script busca un texto de error
+  exacto, hay que revisarlo.
+- **Los rechazos de manejo quedan en los logs del panel**: un comando de manejo
+  rechazado (por WebSocket o por `POST /api/teleop`) y un mensaje ilegible o
+  binario se anotan en los logs: el primero, y luego como mucho uno por segundo,
+  con cuántos hubo. Un `POST` solo se anota si quien lo manda pasó la clave y el
+  origen.
 
 ### Corregido
 - **El lector de `.agmen` falla antes, no después**: los valores de arriba
   pasaban el lector y tronaban después, al compilar el C++ o al cargar en Python.
   Ahora el error dice el archivo, la línea, la columna y qué hacer.
+- **El mando de manejo ya no convierte un NaN en velocidad máxima** (el joystick
+  del panel por WebSocket y `POST /api/teleop`). Antes, un NaN en la velocidad se
+  volvía la velocidad máxima, y además reiniciaba el freno automático ("hombre
+  muerto"). Ahora un comando con cualquier valor que no sea un número finito
+  (NaN, infinito, texto, `null`, un booleano o un campo que falta) se rechaza
+  entero: no se manda nada al robot, quien lo mandó recibe el error y el freno
+  automático sigue contando como antes.
+- **El WebSocket del panel (`agmen.ws.v1`) contesta un error a un mensaje
+  binario**; antes lo ignoraba en silencio. El de Foxglove sigue ignorando los
+  binarios, porque es de solo lectura. Un mensaje roto (JSON inválido, un
+  `Content-Length` absurdo en un `POST`) responde con un error y no tumba la
+  conexión ni el hilo del servidor.
+- **Un entero enorme en un mando (`[[web.command]]`) ya no tumba la conexión**:
+  en un campo `f32` o `f64` da un error que dice que no cabe.
+- **Al cerrar una grabación, el archivo se cierra de verdad.** `Recording.close()`
+  y salir del `with` podían dejar el archivo abierto sin avisar; las grabaciones
+  de `agmen run`, que llevan `robot.toml` adjunto, pasaban siempre. En Windows eso
+  impedía borrar o reemplazar el archivo.
+- **Si algo leído de la grabación sigue en uso al cerrar**, Agmen avisa una vez
+  qué archivo es y qué hacer (si la grabación se cerró por un error, el aviso
+  lo dice, con otro texto). Los mensajes son vistas del archivo, sin copiar: el
+  archivo se suelta solo en cuanto nada lo usa. Leer de una grabación ya cerrada
+  da un error que dice cómo abrirla de nuevo.
+- **Abrir una grabación dañada ya no deja nada abierto**: si la lectura falla
+  (por ejemplo, un archivo que no es MCAP), el archivo se cierra y el error dice
+  qué pasó, sin el aviso de "sigue en uso".
+- **`agmen info --reparar`** ya no deja el archivo a medio escribir si falla a
+  medias: lo borra. Y se niega si la salida es la misma grabación que la entrada
+  (la sobrescribiría mientras la lee): da otra ruta de salida.
 
 ## [0.14.0] — 2026-11-16
 
@@ -301,6 +361,13 @@ Los objetos de Agmen en Python se pueden usar desde varios hilos a la vez
 - **ThreadSanitizer**: opción de CMake `AGMEN_TSAN` y un trabajo nuevo en el
   CI que corre la batería con TSan.
 
+- **`fork` y `multiprocessing`** (tutorial, capítulo 12, sección 10): la regla
+  de los objetos heredados, el error que verás y un ejemplo que corre.
+- **Pruebas del `fork`** (`python/test_fork.py`): el hijo que cierra, suelta o
+  termina no toca al padre; la memoria compartida sigue; usar un objeto heredado
+  da el error claro; el hijo que crea los suyos habla con el padre. Corre con los
+  dos núcleos.
+
 ### Cambiado
 - **La terminal de `agmen run` conserva lo más nuevo.** Cuando las líneas llegan más
   rápido de lo que la terminal las escribe, se descartan las más viejas de la cola y
@@ -366,6 +433,24 @@ Los objetos de Agmen en Python se pueden usar desde varios hilos a la vez
   NumPy al crearse, no al recibir la primera imagen. Desde un hilo con otros hilos
   ocupados, ese import podía tardar segundos. Los tipos chicos (`compact`) no lo
   importan.
+
+- **En el hijo, usar un objeto creado antes del `fork` da un error claro.** Antes
+  "medio funcionaba": el hijo le robaba mensajes al padre, publicaba con su
+  identidad y con números de secuencia repetidos, y las imágenes no llegaban.
+  Ahora `publish`, `receive`, `send`, `receive_raw`, `announce`, `fileno`, las
+  propiedades (`seq`, `port`, `subscribers`…) y, en `Node`, `spin`, `on`, `every`
+  y `publisher` lanzan:
+  `RuntimeError: este Publisher es del proceso padre (pid N): después de un fork, crea uno nuevo en el hijo`
+  Lo mismo para `Subscriber`, `RawPublisher`, `RawSubscriber` y `Node`. Solo
+  siguen funcionando `close()`, `closed`, `repr` y salir de un `with`; en `Node`,
+  `stop()`, `close()` y `now()` tampoco dan error. Un hijo de `multiprocessing`
+  que recibía por un `Subscriber` heredado debe crear el suyo.
+- **Lo que el hijo crea después del `fork` funciona normal**, con su propia
+  identidad y su propia memoria compartida. Puede publicar hacia el padre y
+  recibir de él.
+- **Límites:** es para los objetos de Python. Un programa de C++ que haga
+  `fork()` sigue como antes, y en Windows no hay `fork`. El hijo conserva un
+  descriptor por cada socket heredado, apuntando a `/dev/null`.
 
 ### Corregido
 - **`cmd` con la ruta de un ejecutable** (`cmd = "../venv/bin/python nodo.py"`)
@@ -438,6 +523,20 @@ Los objetos de Agmen en Python se pueden usar desde varios hilos a la vez
 - **Cerrar un `Subscriber` de Python puro o un `RawSubscriber` desde otro hilo**: la
   despedida del hub (`bye`) podía no salir, porque el otro hilo cerraba el socket
   antes. Ahora primero se despide.
+
+- **Después de un `fork()` (o de un `multiprocessing.Process` con `fork`), el
+  hijo ya no daña al padre.** Antes, con el núcleo de C++, bastaba que el hijo
+  terminara con `sys.exit` para dar de baja del hub a los objetos del padre y
+  borrar su memoria compartida: el padre dejaba de recibir entre 0.14 y 0.94 s,
+  y los suscriptores nuevos ya no podían usar memoria compartida con él. Con el
+  núcleo de Python puro, pasaba al llamar `close()` en el hijo. Ahora cerrar,
+  soltar o terminar el hijo no manda `bye`, no borra nada del padre y no le
+  quita latidos: el padre sigue registrado, recibe y publica sin hueco.
+- **En el hijo, cerrar objetos heredados no espera ni se cuelga**, aunque un
+  hilo del padre estuviera dentro de `receive()` o `publish()` en el momento del
+  `fork`. Antes, `close()` de un `Subscriber` tardaba 0.75 s y avisaba;
+  `close()` de un `Publisher` del núcleo puro y `publish()` se colgaban. Ahora
+  `close()` vuelve en menos de 0.1 s, sin aviso.
 
 ## [0.13.0] — 2026-11-06
 

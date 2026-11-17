@@ -27,6 +27,7 @@ receptor deja de recibir y aplica su watchdog (hombre muerto).
 
 from __future__ import annotations
 
+import json
 import math
 import threading
 import time
@@ -91,16 +92,31 @@ def _fmt(v) -> str:
     return f"{v:g}" if isinstance(v, float) else str(v)
 
 
+def show_value(v, limit: int = 40) -> str:
+    """Un valor que mandó un cliente, para ponerlo en un error: el texto entre comillas simples ('volar'), lo
+    demás como se escribe en JSON (true, null, [1, 2]), y acotado a `limit` caracteres (un cliente no nos hace
+    devolverle 1 MiB). Nunca lanza: un entero de miles de dígitos (que str() no convierte) se describe por su
+    tamaño."""
+    if isinstance(v, int) and not isinstance(v, bool) and v.bit_length() > 200:
+        return f"un entero de unos {int(v.bit_length() * 0.30103) + 1} dígitos"
+    try:
+        # repr y ensure_ascii escapan lo invisible o peligroso en una terminal o un log (U+202E, U+2028, C1).
+        text = repr(v[:limit + 1]) if isinstance(v, str) else json.dumps(v, ensure_ascii=True)
+    except (TypeError, ValueError, RecursionError):
+        text = f"<{type(v).__name__}>"
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
 def check_value(leaf: Leaf, v, control: Control | None = None, where: str = ""):
     """Revisa un valor contra el tipo del campo (y su rango, si tiene control).
     Devuelve el valor listo para empacar (int, float o bool)."""
     what = f"{where}{leaf.path}"
     if leaf.is_bool:
         if not isinstance(v, bool):
-            raise CommandError(f"{what} debe ser true o false (es bool), no {v!r}")
+            raise CommandError(f"{what} debe ser true o false (es bool), no {show_value(v)}")
         return v
     if isinstance(v, bool) or not isinstance(v, (int, float)):
-        raise CommandError(f"{what} debe ser un número ({leaf.prim}), no {v!r}")
+        raise CommandError(f"{what} debe ser un número ({leaf.prim}), no {show_value(v)}")
     if isinstance(v, float) and not math.isfinite(v):
         raise CommandError(f"{what} no puede ser NaN ni infinito")
     if leaf.is_int:
@@ -110,9 +126,12 @@ def check_value(leaf: Leaf, v, control: Control | None = None, where: str = ""):
             v = int(v)
         lo, hi = _INT_RANGE[leaf.prim]
         if not lo <= v <= hi:
-            raise CommandError(f"{what} = {v} no cabe en {leaf.prim} ({lo} a {hi})")
+            raise CommandError(f"{what} = {show_value(v)} no cabe en {leaf.prim} ({lo} a {hi})")
     else:
-        v = float(v)
+        try:
+            v = float(v)
+        except OverflowError:       # un entero enorme (10**400) no cabe en un float: antes tumbaba la conexión
+            raise CommandError(f"{what} = {show_value(v)} no cabe en {leaf.prim}") from None
         if leaf.prim == "f32" and abs(v) > F32_MAX:
             raise CommandError(f"{what} = {v:g} no cabe en f32")
     if control is not None and control.min is not None and not control.min <= v <= control.max:
@@ -439,12 +458,12 @@ class Command:
         if isinstance(which, str):
             k = next((i for i, (label, _) in enumerate(buttons) if label == which), None)
             if k is None:
-                raise CommandError(f"'{self.cfg.name}' no tiene un botón '{which}' "
+                raise CommandError(f"'{self.cfg.name}' no tiene un botón {show_value(which)} "
                                    f"(tiene: {', '.join(label for label, _ in buttons) or 'ninguno'})")
         else:
             k = which
             if not 0 <= k < len(buttons):
-                raise CommandError(f"'{self.cfg.name}' no tiene el botón {k} (tiene {len(buttons)})")
+                raise CommandError(f"'{self.cfg.name}' no tiene el botón {show_value(k)} (tiene {len(buttons)})")
         label, flat = buttons[k]
         return self._publish(flat, label)
 
@@ -465,7 +484,8 @@ class Command:
         for path, v in values.items():
             control = self.cfg.controls.get(path)
             if control is None:
-                raise CommandError(f"'{path}' no tiene control en '{self.cfg.name}' (robot.toml: [web.command.fields])")
+                raise CommandError(f"{show_value(path)} no tiene control en '{self.cfg.name}' "
+                                   f"(robot.toml: [web.command.fields])")
             flat[path] = check_value(control.leaf, v, control)
         return self._publish(flat, "a mano")
 

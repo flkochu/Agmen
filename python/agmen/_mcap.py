@@ -26,11 +26,15 @@ hasta el último registro completo, y `repair()` le vuelve a escribir el índice
 
 from __future__ import annotations
 
+import contextlib
 import heapq
+import inspect
 import mmap
 import os
 import struct
+import sys
 import time
+import weakref
 import zlib
 from dataclasses import dataclass, field
 
@@ -48,6 +52,30 @@ _FOOTER_LEN = 9 + 8 + 8 + 4             # registro Footer completo
 
 class McapError(ValueError):
     """El archivo no es MCAP, está dañado o usa algo que no se puede leer."""
+
+
+# Al salir por un error se limpian SOLO los marcos de Agmen del traceback (por módulo: agmen y agmen.*). Guardan
+# mensajes y chunks, vistas del archivo (también wire.parse o decode_payload, que reciben esas vistas); los del
+# programa nunca (sus variables le sirven a quien depura: pdb.post_mortem, %debug), ni un generador suyo.
+# De Agmen, los generadores solo se limpian en los módulos de grabaciones: los suyos (messages, los chunks) ya
+# terminaron cuando aparecen en un traceback. Un generador de otro módulo de Agmen podría estar suspendido y
+# seguir en uso, y en Python 3.11/3.12 frame.clear() lo daría por terminado: esos no se tocan.
+_RECORDING_MODULES = frozenset({"agmen._mcap", "agmen.recording", "agmen.play"})
+_GENERATOR_FLAGS = inspect.CO_GENERATOR | inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR
+
+
+def _clear_own_frames(tb) -> None:
+    """Suelta las variables de los marcos del traceback que son de Agmen (y ya terminaron)."""
+    while tb is not None:
+        frame = tb.tb_frame
+        module = frame.f_globals.get("__name__") or ""
+        ours = module == "agmen" or module.startswith("agmen.")
+        if ours and (module in _RECORDING_MODULES or not frame.f_code.co_flags & _GENERATOR_FLAGS):
+            try:
+                frame.clear()
+            except RuntimeError:
+                pass                       # se está ejecutando: sus variables se sueltan al terminar
+        tb = tb.tb_next
 
 
 # ---------------------------------------------------------------------------
@@ -411,22 +439,38 @@ class Reader:
     registro quedó a medias).
 
     `source`: una ruta (se mapea a memoria: los mensajes son vistas, sin copiar)
-    o bytes."""
+    o bytes.
+
+    close() suelta el mapa. Si el programa todavía usa algo leído (un mensaje,
+    un arreglo de as_array(), los bytes de una imagen), el archivo no se puede
+    soltar: close() lo avisa una vez y el archivo se suelta solo cuando eso se
+    libera (o con otro close()). Lo leído sigue sirviendo; el lector, no."""
 
     def __init__(self, source) -> None:
         self._file = None
         self._mm = None
+        self._mm_left = None               # el mapa que close() no pudo cerrar (weakref): se cierra en otro close()
+        self._closed = False
+        self._warned = False
+        self._on_error = False             # close() por un error: el aviso lo dice así
+        self.attachments: list[Attachment] = []
+        self.path = os.fspath(source) if isinstance(source, (str, os.PathLike)) else None
         if isinstance(source, (str, os.PathLike)):
             self._file = open(source, "rb")
             size = os.fstat(self._file.fileno()).st_size
             if size == 0:
                 self._file.close()
                 raise McapError("el archivo está vacío")
-            self._mm = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+            try:
+                self._mm = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+            except BaseException:
+                self._file.close()
+                raise
             self._b = memoryview(self._mm)
         else:
             self._b = memoryview(bytes(source) if not isinstance(source, (bytes, bytearray, memoryview)) else source)
         if len(self._b) < len(MAGIC) or self._b[:len(MAGIC)] != MAGIC:
+            self.close()
             raise McapError("no es un archivo MCAP (falta la marca \\x89MCAP0 al principio)")
         self.profile = self.library = ""
         self.schemas: dict[int, Schema] = {}
@@ -439,32 +483,114 @@ class Reader:
         self.complete = False
         self.truncated = False
         self._data_end = len(self._b)
-        self._read_header()
-        if not self._read_summary():
-            self._scan()
+        try:
+            self._read_header()
+            if not self._read_summary():
+                self._scan()
+        except BaseException as e:
+            self._close_on_error(e)
+            raise
 
     # --- cerrar ---
     def close(self) -> None:
-        if self._mm is not None:
+        """Suelta el archivo. Primero suelta las vistas del mapa que guarda el
+        propio lector (los adjuntos y la vista de todo el archivo): sin eso, una
+        grabación con adjuntos (todas las de agmen run) nunca se soltaba.
+
+        Si aun así queda una vista viva (algo que el programa leyó y conserva),
+        el mapa no se puede cerrar: se avisa una vez y se guarda una referencia
+        débil al mapa. Se cierra solo cuando la última vista se libera, o con
+        otro close(). Desde el primer close() el lector se porta como cerrado."""
+        self._closed = True
+        # Los adjuntos: el lector suelta su referencia, sin soltar la vista (quien la guardó la sigue usando, y
+        # entonces el mapa no cierra y se avisa abajo).
+        self.attachments = []
+        try:
             self._b.release()
+        except BufferError:
+            pass                      # ídem
+        if self._mm is not None:
+            mm, self._mm = self._mm, None
             try:
-                self._mm.close()
+                mm.close()
             except BufferError:
-                pass                  # alguien todavía usa una vista: se cierra cuando la suelte
-            self._mm = None
+                self._mm_left = weakref.ref(mm)
+                self._warn_open()
+        elif self._mm_left is not None:
+            mm = self._mm_left()
+            if mm is None or mm.closed:
+                self._mm_left = None          # ya se soltó solo (la última vista se liberó)
+            else:
+                try:
+                    mm.close()
+                    self._mm_left = None
+                except BufferError:
+                    self._warn_open()         # solo avisa si no había avisado
         if self._file is not None:
-            self._file.close()
+            self._file.close()        # el mapa tiene su propia copia del descriptor
             self._file = None
+
+    @property
+    def _mapped(self) -> bool:
+        """True mientras el archivo siga mapeado (abierto, o cerrado con una vista viva)."""
+        if self._mm is not None:
+            return not self._mm.closed
+        mm = self._mm_left() if self._mm_left is not None else None
+        return mm is not None and not mm.closed
+
+    def _close_on_error(self, exc: BaseException | None) -> None:
+        """close() al salir por un error (with, o el error al abrir o al reparar). El traceback del error guarda
+        las variables de cada función por la que pasó (mensajes, vistas del archivo): se limpian las de este
+        lector, para que no impidan soltar el archivo. Las del programa no se tocan: si una retiene el archivo,
+        se avisa (el aviso del camino de error)."""
+        if exc is None:
+            self.close()
+            return
+        _clear_own_frames(exc.__traceback__)
+        self._on_error = True
+        try:
+            self.close()
+        finally:
+            self._on_error = False
+
+    def _warn_open(self) -> None:
+        if self._warned:
+            return
+        self._warned = True
+        if self._on_error:
+            text = ("la grabación sigue abierta: se cerró por un error y algo leído de ella sigue en uso. Lo guarda "
+                    "el error (las variables de las funciones por las que pasó, como la de un for) o el programa "
+                    "(un mensaje en una lista, un arreglo de as_array()). En Windows no se podrá borrar ni "
+                    "reemplazar el archivo hasta que se suelte; se suelta solo en cuanto nada lo use. Qué hacer: "
+                    "copia lo que quieras conservar (copy.deepcopy(msg), arr.copy()) y suelta el error (del e, o "
+                    "sal del except) o la variable que lo guarda (del m).")
+        else:
+            text = ("la grabación sigue abierta porque algún mensaje (o adjunto) que leíste de ella, o un recorrido "
+                    "de messages() a medias, sigue en uso (son vistas del archivo, sin copiar). En Windows no se "
+                    "podrá borrar ni reemplazar el archivo hasta que lo sueltes. Lo típico: la variable del for "
+                    "sigue apuntando al último mensaje al salir del bucle (for m in rec.messages(...)), o guardaste "
+                    "un arreglo de as_array(), los bytes de una imagen o una tabla de table(). Qué hacer: suelta "
+                    "esa variable (por ejemplo del m, o sal de la función); el archivo se suelta solo en cuanto nada "
+                    "lo use, o con otro close(). Para conservar algo después de cerrar, cópialo antes: "
+                    "copy.deepcopy(msg), arr.copy() o, una tabla, tabla.take(numpy.arange(tabla.num_rows)).")
+        print(f"[agmen] ⚠ {self.path}: {text}", file=sys.stderr, flush=True)
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise ValueError(f"{self.path or 'la grabación'}: el lector ya está cerrado (se llamó a close()); "
+                             f"ábrela de nuevo para leerla")
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc) -> None:
-        self.close()
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._close_on_error(exc)
 
     # --- encabezado y resumen ---
     def _record_at(self, pos: int) -> tuple[int, int, int] | None:
         """(opcode, inicio del contenido, fin) del registro en `pos`, o None si no cabe."""
+        if self._closed:
+            self._check_open()
         if pos + 9 > len(self._b):
             return None
         op, n = _REC.unpack_from(self._b, pos)
@@ -684,7 +810,10 @@ class Reader:
 
     def messages(self, topics=None, start: int | None = None, end: int | None = None):
         """Los mensajes en orden de `log_time` (de los `topics` dados, o todos),
-        con start <= log_time < end. `data` es una vista (sin copiar)."""
+        con start <= log_time < end. `data` es una vista (sin copiar).
+
+        Después de close() da ValueError (también si el recorrido ya iba a medias)."""
+        self._check_open()
         if isinstance(topics, str):
             topics = [topics]
         wanted = None if topics is None else {c.id for c in self.channels.values() if c.topic in set(topics)}
@@ -728,32 +857,64 @@ class Reader:
                 heapq.heappush(heap, (m.log_time, counter, m, it))
                 counter += 1
 
-        if loose:
-            push(iter(loose))
-        i = 0
-        while i < len(chunks) or heap:
-            while i < len(chunks) and (not heap or chunks[i].message_start_time <= heap[0][0]):
-                push(from_chunk(chunks[i]))
-                i += 1
-            if not heap:
-                continue
-            _, _, m, it = heapq.heappop(heap)
-            yield m
-            push(it)
+        m = it = None
+        try:
+            if loose:
+                push(iter(loose))
+            i = 0
+            while i < len(chunks) or heap:
+                while i < len(chunks) and (not heap or chunks[i].message_start_time <= heap[0][0]):
+                    push(from_chunk(chunks[i]))
+                    i += 1
+                if not heap:
+                    continue
+                _, _, m, it = heapq.heappop(heap)
+                if self._closed:
+                    self._check_open()
+                yield m
+                push(it)
+        except BaseException as e:
+            # Un error a medio recorrido (un chunk dañado, Ctrl+C): el traceback guarda este marco y los de
+            # adentro, con mensajes y chunks (vistas del archivo). Se sueltan antes de relanzar (solo los marcos
+            # de este lector: un error que el programa metió con throw() conserva los suyos).
+            _clear_own_frames(e.__traceback__)
+            heap.clear()
+            loose.clear()
+            m = it = None
+            raise
 
 
 def repair(source, output) -> dict:
     """Reescribe un MCAP cortado: todo lo que se pueda leer (hasta el último
     chunk completo), con su resumen e índices. Devuelve cuántos mensajes salvó."""
+    if isinstance(source, (str, os.PathLike)) and isinstance(output, (str, os.PathLike)):
+        try:
+            same = os.path.exists(output) and os.path.samefile(source, output)
+        except OSError:
+            same = False                       # la entrada no existe: Reader lo dice
+        if same:   # Writer abriría la salida con "wb" y truncaría la grabación que se está leyendo (mapeada)
+            raise ValueError(f"{os.fspath(output)}: la salida es la misma grabación que se repara; da otra ruta "
+                             f"de salida (ej. {os.path.splitext(os.fspath(output))[0]}-reparada.mcap)")
     r = Reader(source)
     try:
-        w = Writer(output, profile=r.profile, library=r.library or "agmen")
+        out = _rewrite(r, output)         # en otra función: al cerrar ya no queda viva la variable del for
+    except BaseException as e:
+        r._close_on_error(e)
+        raise
+    r.close()
+    return out
+
+
+def _rewrite(r: Reader, output) -> dict:
+    w = Writer(output, profile=r.profile, library=r.library or "agmen")
+    try:
         new_schema: dict[int, int] = {}
         new_channel: dict[int, int] = {}
         for s in r.schemas.values():
             new_schema[s.id] = w.add_schema(s.name, s.encoding, s.data)
         for c in r.channels.values():
-            new_channel[c.id] = w.add_channel(c.topic, c.message_encoding, new_schema.get(c.schema_id, 0), c.metadata)
+            new_channel[c.id] = w.add_channel(c.topic, c.message_encoding, new_schema.get(c.schema_id, 0),
+                                              c.metadata)
         n = 0
         for m in r.messages():
             w.add_message(new_channel[m.channel.id], m.log_time, m.publish_time, m.sequence, m.data)
@@ -763,6 +924,13 @@ def repair(source, output) -> dict:
         for a in r.attachments:
             w.add_attachment(a.name, a.media_type, a.data, a.log_time, a.create_time)
         w.close()
-        return {"messages": n, "was_complete": r.complete, "was_truncated": r.truncated}
-    finally:
-        r.close()
+    except BaseException as e:
+        if w._own:                # la salida quedó a medias: se cierra sin terminarla y se borra (la creó repair)
+            with contextlib.suppress(OSError):
+                w._f.close()
+            try:
+                os.remove(output)
+            except OSError as why:
+                e.add_note(f"{os.fspath(output)} quedó a medias (no se pudo borrar: {why}); bórralo, no sirve")
+        raise
+    return {"messages": n, "was_complete": r.complete, "was_truncated": r.truncated}

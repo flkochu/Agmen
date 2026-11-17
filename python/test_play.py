@@ -47,9 +47,30 @@ def imu(i: int) -> wire.ImuSample:
     return wire.ImuSample(accel=(float(i), 0.0, 9.8), gyro=(0.0, 0.0, 0.0))
 
 
-def make_recording(path: str, n: int = 20) -> list[bytes]:
-    """Una grabación como la que hace agmen record: /imu cada 50 ms, /camara cada 200 ms."""
-    w = _mcap.Writer(path, profile="agmen", chunk_size=200_000)
+def mapped(path: str) -> bool | None:
+    """¿El archivo sigue mapeado en este proceso? (Linux: /proc/self/maps; en otros, None: no se sabe)."""
+    try:
+        with open("/proc/self/maps", encoding="utf-8", errors="replace") as f:
+            return os.path.realpath(path) in f.read()
+    except OSError:
+        return None
+
+
+def damage_chunk(path: str, k: int) -> None:
+    """Cambia un byte dentro de los datos del chunk k: al leerlo, McapError (CRC)."""
+    with _mcap.Reader(path) as r:
+        start = r.chunks[k].start
+    with open(path, "r+b") as f:
+        f.seek(start + 80)
+        b = f.read(1)
+        f.seek(start + 80)
+        f.write(bytes([b[0] ^ 0xFF]))
+
+
+def make_recording(path: str, n: int = 20, robot_toml: bool = False, chunk_size: int = 200_000) -> list[bytes]:
+    """Una grabación como la que hace agmen record: /imu cada 50 ms, /camara cada 200 ms (y, como las de
+    agmen run, con el robot.toml adjunto si `robot_toml`)."""
+    w = _mcap.Writer(path, profile="agmen", chunk_size=chunk_size)
     s_imu = w.add_schema("ImuSample", "agmen", wire.ImuSample.SCHEMA_TEXT.encode())
     s_img = w.add_schema("Img", "agmen", Img.SCHEMA_TEXT.encode())
     c_imu = w.add_channel("/imu", "agmen", s_imu)
@@ -71,6 +92,8 @@ def make_recording(path: str, n: int = 20) -> list[bytes]:
             w.add_message(c_img, t + 1, t - 1_000_000, i // 4, env.pack(), body)
         if i % 5 == 0:   # un /clock grabado: no se reproduce
             w.add_message(c_clk, t, t, i, wire.encode(clock.Clock(t=0), i, t, topic="/clock"))
+    if robot_toml:
+        w.add_attachment("robot.toml", "text/plain", b'[robot]\nname = "prueba"\n', T0, T0)
     w.close()
     return packets
 
@@ -211,6 +234,91 @@ class TestReproducir(PlayCase):
         self.assertEqual(err.count("'/imu' llega con reloj reproducción"), 1, err)
         self.assertIn("AGMEN_CLOCK=replay", err)
 
+    def test_al_terminar_suelta_el_archivo_aunque_falle(self):
+        """stop() cierra la grabación de verdad (en Windows, si no, no se puede borrar): también si la
+        reproducción falló, aunque el error guarde su traceback (y el traceback, el último mensaje leído)."""
+        path = os.path.join(self.dir, "con-adjunto.mcap")
+        make_recording(path, robot_toml=True)
+
+        def falla(*_):
+            raise RuntimeError("falla a propósito")
+
+        for romper in (False, True):
+            with self.subTest(falla=romper):
+                p = play.Player(path, rate=50, quiet=True)
+                if romper:
+                    p._publisher = falla
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    p.start()
+                    self.assertTrue(p.wait(10))
+                    if romper:
+                        with self.assertRaisesRegex(RuntimeError, "a propósito"):
+                            p.stop()
+                    else:
+                        p.stop()
+                self.assertNotIn("sigue abierta", err.getvalue())
+                self.assertFalse(p.reader._mapped)
+                self.assertIn(mapped(path), (False, None), "/proc/self/maps ya no lo trae")
+        os.remove(path)                      # en Windows falla si sigue mapeado
+
+    def test_paquete_cortado_suelta_el_archivo(self):
+        """Un paquete cortado en la grabación: Player no revisa los paquetes (los manda tal cual, como se
+        grabaron), así que reproduce los 4 sin error; el Subscriber da WireError en el cortado y recibe los
+        demás. Lo que se prueba aquí es que, al terminar, Player suelta el archivo (con robot.toml adjunto,
+        como los de agmen run), sin aviso."""
+        path = os.path.join(self.dir, "corta.mcap")
+        w = _mcap.Writer(path)
+        cid = w.add_channel("/imu", "agmen", w.add_schema("ImuSample", "agmen", wire.ImuSample.SCHEMA_TEXT.encode()))
+        w.add_attachment("robot.toml", "text/plain", b'[robot]\nname = "prueba"\n', T0, T0)
+        for i in range(4):
+            env = wire.Envelope(wire.ENC_COMPACT, 0, wire.ImuSample.SCHEMA_ID, wire.topic_id("/imu"), SRC_IMU, i,
+                                T0 + i * STEP, T0 + i * STEP, 24, wire.CLOCK_REAL)
+            pkt = env.pack() + imu(i).encode_payload()
+            w.add_message(cid, T0 + i * STEP, T0 + i * STEP, i, pkt[:-3] if i == 2 else pkt)
+        w.close()
+        imu_sub = self.sub(wire.ImuSample, "/imu")
+        seqs, errors, err = [], [], io.StringIO()
+        with contextlib.redirect_stderr(err):
+            p = play.Player(path, rate=50, quiet=True)
+            p.start()
+            self.assertTrue(p.wait(10))
+            stats = p.stop()                 # sin error: el cortado también sale
+            end = time.monotonic() + 5
+            while len(seqs) + len(errors) < 4 and time.monotonic() < end:
+                try:
+                    s = imu_sub.receive(0.05)
+                except wire.WireError as e:
+                    errors.append(str(e))
+                    continue
+                if s is not None:
+                    seqs.append(s.envelope.seq)
+        self.assertEqual(stats.messages, 4)
+        self.assertEqual(seqs, [0, 1, 3])
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("payload de 24 bytes pero llegaron 21", errors[0])
+        self.assertNotIn("sigue abierta", err.getvalue())
+        self.assertFalse(p.reader._mapped)
+        self.assertIn(mapped(path), (False, None))
+        os.remove(path)
+
+    def test_chunk_danado_no_culpa_al_programa(self):
+        """Un chunk dañado al abrir (Player lee toda la grabación para saber cuánto dura): el error sale tal
+        cual, sin el aviso de "sigue abierta" (el traceback guardaba los mensajes; el lector los suelta)."""
+        path = os.path.join(self.dir, "danada.mcap")
+        make_recording(path, robot_toml=True, chunk_size=3000)
+        damage_chunk(path, 2)
+        err, error = io.StringIO(), None
+        with contextlib.redirect_stderr(err):
+            try:
+                play.Player(path)
+            except _mcap.McapError as e:
+                error = e                    # con su traceback todavía vivo
+        self.assertIn("CRC", str(error))
+        self.assertEqual(err.getvalue(), "")
+        self.assertIn(mapped(path), (False, None))
+        os.remove(path)
+
     def test_errores_claros(self):
         with self.assertRaisesRegex(ValueError, "no tiene el topic /nada"):
             play.Player(self.path, ["/nada"])
@@ -249,6 +357,15 @@ class TestComando(PlayCase):
         self.assertIn("⏹ 20 mensajes", err)
         self.assertGreater(len(got), 10)
         self.assertTrue(all(s.envelope.clock == wire.CLOCK_REPLAY for s in got))
+
+    def test_agmen_play_con_un_chunk_danado(self):
+        path = os.path.join(self.dir, "danada.mcap")
+        make_recording(path, robot_toml=True, chunk_size=3000)
+        damage_chunk(path, 2)
+        r = self.agmen("play", path)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("CRC", r.stderr)
+        self.assertNotIn("sigue abierta", r.stderr)
 
     def test_errores_del_comando(self):
         r = self.agmen("play", os.path.join(self.dir, "no-existe.mcap"))
