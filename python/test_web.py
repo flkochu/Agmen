@@ -46,6 +46,14 @@ def free_udp() -> int:
             return port
 
 
+def recv_all(s: socket.socket) -> str:
+    """Toda la respuesta HTTP hasta que el panel cierra (puede llegar en varios pedazos: encabezados y cuerpo)."""
+    out = b""
+    while chunk := s.recv(65536):
+        out += chunk
+    return out.decode()
+
+
 class TestWebSocket(unittest.TestCase):
     def test_accept_key_rfc6455(self):
         # Ejemplo del RFC 6455 §1.3
@@ -508,7 +516,7 @@ class TestJsonDelCliente(PanelCase):
                 with s:
                     s.sendall(f"POST /api/teleop HTTP/1.1\r\nHost: x\r\nX-Agmen: 1\r\nContent-Length: {cl}\r\n\r\n"
                               .encode())
-                    resp = s.recv(65536).decode()
+                    resp = recv_all(s)
                 self.assertIn(" 400 ", resp.split("\r\n")[0])
                 self.assertIn("Content-Length", resp)
 
@@ -520,10 +528,8 @@ class TestJsonDelCliente(PanelCase):
                 with s:
                     s.sendall(f"POST /api/command HTTP/1.1\r\nHost: x\r\nX-Agmen: 1\r\nContent-Length: {cl}\r\n\r\n{{}}"
                               .encode())
-                    resp = b""
-                    while chunk := s.recv(65536):        # el panel cierra después de contestar
-                        resp += chunk
-                head, _, body = resp.decode().partition("\r\n\r\n")
+                    resp = recv_all(s)                   # el panel cierra después de contestar
+                head, _, body = resp.partition("\r\n\r\n")
                 self.assertIn(" 413 ", head.split("\r\n")[0])
                 self.assertIn("el máximo es 1048576 bytes", json.loads(body)["error"])
 
@@ -1102,7 +1108,7 @@ class TestClave(PanelCase):
                 with s:
                     s.sendall(f"POST /api/teleop HTTP/1.1\r\nHost: x\r\nX-Agmen: 1\r\nContent-Length: {cl}\r\n\r\n"
                               .encode())
-                    resp = s.recv(65536).decode()
+                    resp = recv_all(s)                   # el panel cierra después de contestar
                 self.assertIn(" 401 ", resp.split("\r\n")[0])
                 self.assertIn("falta la clave", resp)
         req = urllib.request.Request(f"http://{self.base}/api/teleop", data=b'{"left": 0.1, "right": 0.1}',
