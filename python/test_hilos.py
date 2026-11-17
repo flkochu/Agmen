@@ -81,6 +81,13 @@ import faulthandler, itertools, os, sys, threading, time
 sys.path.insert(0, sys.argv[1])
 MODO, TIPO_N, RONDAS = sys.argv[2], sys.argv[3], int(sys.argv[4])
 faulthandler.enable()
+# Turno del GIL corto (por omisión 5 ms). Los casos tienen hilos que giran sin pausa leyendo propiedades; cada
+# llamada al sistema de otro hilo (sendto, recvfrom, select) suelta el GIL y recuperarlo cuesta un turno entero
+# por cada hilo ocupado: con 5 ms cada publish() tardaba ~40 ms y un pull() del nodo (hasta 1024 receive(0)
+# seguidos) ~20 s, sin correr every() ni on() (CI de ARM64: 0 pulsos en 21 s). Con 0.1 ms es 10-50 veces menos
+# y hay MÁS intercalado entre hilos, que es lo que se quiere probar. (Un caso que necesita lo contrario lo
+# cambia a propósito: sub_close_dos_y_aviso.)
+sys.setswitchinterval(0.0001)
 TOPE_PRINCIPAL = float(sys.argv[5])
 # Respaldo: si ni el perro guardián de abajo logra hablar, faulthandler termina con las pilas de todos los hilos.
 faulthandler.dump_traceback_later(TOPE_PRINCIPAL + 5, exit=True)
@@ -1208,6 +1215,7 @@ for r in range(max(1, RONDAS // 3)):
             if not isinstance(t, int) or not isinstance(ts, list) or not isinstance(ss, list):
                 falla("timers/subscriptions/now: tipos inesperados")
             ya.set()
+            time.sleep(0)   # cede el GIL (sin pausa, dos lectores + 3 publicadores hacen un convoy)
     def nuevo():
         # crear publicadores del nodo desde otro hilo
         p = node.publisher(TIPO, topic + "c")
