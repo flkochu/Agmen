@@ -941,10 +941,10 @@ class Panel:
                     self._post_error(*denied, unread=length > 0 or too_big)     # el cuerpo ni se espera
                     return
                 if too_big:
+                    shown = declared if len(declared) <= 20 else declared[:19] + "…"
                     self._post_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                                     f"cuerpo demasiado grande ({declared if len(declared) <= 20 else declared[:19] + '…'} bytes): el máximo es "
-                                     f"{MAX_POST_BODY} bytes ({MAX_POST_BODY >> 20} MiB); no se leyó ni se hizo "
-                                     f"nada", unread=True)
+                                     f"cuerpo demasiado grande ({shown} bytes): el máximo es {MAX_POST_BODY} bytes "
+                                     f"({MAX_POST_BODY >> 20} MiB); no se leyó ni se hizo nada", unread=True)
                     return
                 raw = self.rfile.read(length) if length else b""
                 try:

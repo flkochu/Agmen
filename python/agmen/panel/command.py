@@ -94,8 +94,9 @@ def _fmt(v) -> str:
 
 def show_value(v, limit: int = 40) -> str:
     """Un valor que mandó un cliente, para ponerlo en un error: el texto entre comillas simples ('volar'), lo
-    demás como se escribe en JSON (true, null, [1, 2]), y acotado a `limit` caracteres (un cliente no nos hace devolverle 1 MiB). Nunca lanza: un entero de miles
-    de dígitos (que str() no convierte) se describe por su tamaño."""
+    demás como se escribe en JSON (true, null, [1, 2]), y acotado a `limit` caracteres (un cliente no nos hace
+    devolverle 1 MiB). Nunca lanza: un entero de miles de dígitos (que str() no convierte) se describe por su
+    tamaño."""
     if isinstance(v, int) and not isinstance(v, bool) and v.bit_length() > 200:
         return f"un entero de unos {int(v.bit_length() * 0.30103) + 1} dígitos"
     try:
