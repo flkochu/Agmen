@@ -290,6 +290,80 @@ class MotorCase(PanelCase):
             if env.encoding == wire.ENC_COMPACT:
                 return MotorCommand.LAYOUT.unpack(payload)
 
+    # --- esperas por señal (sin depender de sleeps cortos ni del orden en que llega lo viejo) ---
+    _altos_usados = 0
+    _vistos: set
+
+    def _altos(self) -> int:
+        """Cuántos ALTO del hombre muerto avisó el panel (los avisa en sus logs ANTES de mandarlos)."""
+        logs, _ = self.panel.logs.since(0)
+        return sum("→ ALTO" in line["text"] for line in logs)
+
+    def _leer(self, wait: float):
+        """El siguiente MotorCommand (left, right) que llegue al motor en `wait` s, o None."""
+        end = time.monotonic() + wait
+        try:
+            while (left := end - time.monotonic()) > 0:
+                self.motor.settimeout(left)
+                env, payload = wire.parse(self.motor.recv(2048))
+                if env.encoding == wire.ENC_COMPACT:
+                    m = MotorCommand.LAYOUT.unpack(payload)
+                    return (m["left"], m["right"])
+        except socket.timeout:
+            pass
+        finally:
+            self.motor.settimeout(3)
+        return None
+
+    def _viejo(self, cmd) -> bool:
+        """¿Es algo que ya pasó y puede llegar tarde? Un ALTO del hombre muerto que el panel avisó y nadie ha
+        contado todavía, o la repetición de un comando (distinto de alto) que ya se vio llegar."""
+        if not hasattr(self, "_vistos"):
+            self._vistos = set()
+        if cmd == (0.0, 0.0) and self._altos() > self._altos_usados:
+            self._altos_usados += 1
+            return True
+        return cmd in self._vistos
+
+    def _nada(self, wait=0.25):
+        """Que en `wait` segundos no se publique ningún comando nuevo (lo viejo que llega tarde no cuenta)."""
+        end = time.monotonic() + wait
+        while (got := self._leer(max(0.0, end - time.monotonic()))) is not None:
+            if not self._viejo(got):
+                self.fail(f"se publicó un comando: {got}")
+
+    def _manejar(self, send, left, right, timeout=5.0):
+        """Manda (left, right) como el navegador y espera a que el motor reciba ESE comando (recortado a
+        max_speed y en f32). `send`: el cliente WebSocket, o una función que lo manda (POST).
+
+        Si no llega en 0.3 s, lo vuelve a mandar, como el navegador cada 50 ms: el tope de ~60 Hz del mando
+        descarta sin error un comando que llega demasiado pronto, y en Windows con Python 3.12 time.monotonic
+        avanza de a 15-16 ms (GetTickCount64), así que 20 ms entre dos comandos pueden medirse como 15 ms y
+        la resta en float dar 0.01499… (< 0.015): se descarta, y 300 ms después llega el ALTO del hombre
+        muerto (así falló el CI). Lo viejo que llegue antes (ese ALTO, una repetición) se descarta; cualquier
+        otro comando es un error."""
+        if not hasattr(self, "_vistos"):
+            self._vistos = set()
+        ms = self.panel.teleop.max_speed
+        want = tuple(struct.unpack("<f", struct.pack("<f", max(-ms, min(ms, v))))[0] for v in (left, right))
+        msg = {"op": "teleop", "left": left, "right": right}
+        mandar = send if callable(send) else (lambda: send.send_text(json.dumps(msg)))
+        end = time.monotonic() + timeout
+        mandar()
+        while time.monotonic() < end:
+            got = self._leer(0.3)
+            if got is None:
+                if want != (0.0, 0.0):      # un alto nunca se descarta (no pasa por el tope): no se repite
+                    mandar()
+                continue
+            if got == want:
+                if want != (0.0, 0.0):
+                    self._vistos.add(got)
+                return got
+            if not self._viejo(got):
+                self.fail(f"llegó {got} al motor esperando {want}")
+        self.fail(f"no llegó {want} al motor en {timeout} s")
+
 
 class TestHombreMuerto(MotorCase):
     def test_se_corta_la_conexion_y_manda_alto(self):
@@ -348,19 +422,6 @@ class TestManejoConValoresMalos(MotorCase):
     """Un comando de manejo con un valor que no es un número finito se rechaza ENTERO: no se publica nada
     (ni recortado, ni como cero), el que lo mandó recibe el error y el hombre muerto sigue como estaba."""
 
-    def _nada(self, wait=0.25):
-        """Que en `wait` segundos no llegue ningún MotorCommand al motor (los anuncios de esquema no cuentan)."""
-        self.motor.settimeout(wait)
-        try:
-            while True:
-                env, payload = wire.parse(self.motor.recv(2048))
-                if env.encoding == wire.ENC_COMPACT:
-                    self.fail(f"se publicó un comando: {MotorCommand.LAYOUT.unpack(payload)}")
-        except socket.timeout:
-            pass
-        finally:
-            self.motor.settimeout(3)
-
     def _error(self, c):
         return json.loads(self.recv_until(c, lambda m: isinstance(m, str) and json.loads(m)["op"] == "error"))["msg"]
 
@@ -381,13 +442,8 @@ class TestManejoConValoresMalos(MotorCase):
                 self.assertIn(msg, err)
                 self.assertIn("se mandó nada al robot", err)
                 self._nada()
-                time.sleep(0.02)                                       # más que el tope de ~60 Hz
-                c.send_text(json.dumps({"op": "teleop", "left": 0.4, "right": -0.4}))   # lo bueno sigue
-                cmd = self._cmd()
-                self.assertAlmostEqual(cmd["left"], 0.4, places=5)
-                self.assertAlmostEqual(cmd["right"], -0.4, places=5)
-                c.send_text(json.dumps({"op": "teleop", "left": 0, "right": 0}))
-                self.assertEqual(self._cmd()["left"], 0.0)
+                self._manejar(c, 0.4, -0.4)                             # lo bueno sigue
+                self._manejar(c, 0, 0)
         self.assertEqual(self.panel.teleop.last_cmd, (0.0, 0.0))
 
     def test_post_rechaza_y_lo_bueno_sigue(self):
@@ -397,33 +453,59 @@ class TestManejoConValoresMalos(MotorCase):
                 self.assertEqual(status, 400, body)
                 self.assertIn(msg, body["error"])
                 self._nada()
-                time.sleep(0.02)
-                status, body = self._post(json.dumps({"left": 0.4, "right": 0.1}))
-                self.assertEqual((status, body["ok"]), (200, True))
-                self.assertAlmostEqual(self._cmd()["right"], 0.1, places=5)
+
+                def bueno():
+                    status, body = self._post(json.dumps({"left": 0.4, "right": 0.1}))
+                    self.assertEqual((status, body["ok"]), (200, True))
+                self._manejar(bueno, 0.4, 0.1)
+
+    def _avisos(self) -> list[str]:
+        logs, _ = self.panel.logs.since(0)
+        return [line["text"] for line in logs if "rechacé lo que mandó" in line["text"]]
+
+    @staticmethod
+    def _contados(avisos) -> int:
+        """Cuántos rechazos suman los avisos: cada uno cuenta 1, o los N de "(N rechazados desde el aviso…)"."""
+        import re
+
+        return sum(int(m.group(1)) if (m := re.search(r"\((\d+) rechazados desde", a)) else 1 for a in avisos)
 
     def test_los_rechazos_quedan_en_los_logs_sin_llenarlos(self):
         """Un script ajeno que manda basura al mando: el operador lo ve en los logs del panel (el primero de
-        cada conexión y luego como mucho uno por segundo, con cuántos hubo)."""
+        cada conexión y luego como mucho uno por segundo, con cuántos hubo). Sin depender de cuánto tarda la
+        máquina: se mide el tiempo y se revisan el tope de avisos y que la cuenta no pierda ninguno."""
         c = self.connect()
+        t0 = time.monotonic()
         for _ in range(30):
             c.send_text('{"op": "teleop", "left": NaN, "right": 0}')
             self._error(c)
-        logs, _ = self.panel.logs.since(0)
-        avisos = [line["text"] for line in logs if "rechacé lo que mandó" in line["text"]]
-        self.assertEqual(len(avisos), 1, avisos)
+        dt = time.monotonic() - t0
+        avisos = self._avisos()
+        self.assertGreaterEqual(len(avisos), 1)
+        self.assertLessEqual(len(avisos), 1 + int(dt / 1.0) + 1, avisos)      # el primero + uno por segundo
         self.assertIn("NaN no es JSON válido", avisos[0])
-        time.sleep(1.05)
+        antes = len(avisos)
+        time.sleep(1.05)                         # pasado el segundo: el siguiente rechazo sí se avisa
         c.send_text('{"op": "teleop", "left": "rápido", "right": 0}')
         self._error(c)
-        logs, _ = self.panel.logs.since(0)
-        avisos = [line["text"] for line in logs if "rechacé lo que mandó" in line["text"]]
-        self.assertEqual(len(avisos), 2, avisos)
-        self.assertIn("30 rechazados desde el aviso anterior", avisos[1])
+        avisos = self._avisos()
+        self.assertEqual(len(avisos), antes + 1, avisos)
+        self.assertIn("rápido", avisos[-1])
+        self.assertEqual(self._contados(avisos), 31, avisos)                # ningún rechazo se pierde de la cuenta
         self._post('{"left": NaN, "right": 0}')          # por POST, también (por dirección)
-        logs, _ = self.panel.logs.since(0)
-        self.assertEqual(len([1 for line in logs if "rechacé lo que mandó" in line["text"]]), 3)
+        self.assertEqual(len(self._avisos()), antes + 2)
         self._nada()
+
+    def test_reject_log_uno_por_segundo(self):
+        """La regla de los avisos, con tiempos exactos (sin reloj de verdad)."""
+        from agmen.panel.bridge import RejectLog
+
+        r = RejectLog()
+        self.assertEqual(r.note(10.0), 1)                       # el primero se avisa
+        self.assertEqual([r.note(10.0 + k / 100) for k in range(1, 30)], [0] * 29)
+        self.assertEqual(r.note(11.0), 30)                      # al segundo: los 29 + este
+        self.assertEqual(r.note(11.5), 0)
+        self.assertEqual(r.note(12.5), 2)
 
     def test_post_que_no_es_un_objeto(self):
         for raw in ("[0.5, 0.5]", "0.5", '"left"', "null"):
@@ -436,8 +518,7 @@ class TestManejoConValoresMalos(MotorCase):
     def test_un_comando_malo_no_reinicia_el_hombre_muerto(self):
         """Manejando, llegan solo comandos con NaN: el robot debe frenar a los 300 ms del último BUENO."""
         c = self.connect()
-        c.send_text(json.dumps({"op": "teleop", "left": 0.3, "right": 0.3}))
-        self.assertAlmostEqual(self._cmd()["left"], 0.3, places=5)
+        self._manejar(c, 0.3, 0.3)
         t0 = time.monotonic()
         stop = threading.Event()
 
@@ -589,16 +670,7 @@ class TestManejoAtaques(MotorCase):
     ]
 
     def _sin_comandos(self, wait=0.2):
-        self.motor.settimeout(wait)
-        try:
-            while True:
-                env, payload = wire.parse(self.motor.recv(2048))
-                if env.encoding == wire.ENC_COMPACT:
-                    self.fail(f"se publicó un comando: {MotorCommand.LAYOUT.unpack(payload)}")
-        except socket.timeout:
-            pass
-        finally:
-            self.motor.settimeout(3)
+        self._nada(wait)
 
     def _error(self, c):
         return json.loads(self.recv_until(c, lambda m: isinstance(m, str) and json.loads(m)["op"] == "error"))["msg"]
@@ -610,11 +682,8 @@ class TestManejoAtaques(MotorCase):
                 c.send_text(raw)
                 self.assertTrue(self._error(c))                 # dice qué pasó
                 self._sin_comandos()
-                time.sleep(0.02)
-                c.send_text(json.dumps({"op": "teleop", "left": 0.2, "right": 0.1}))   # lo bueno de después
-                self.assertAlmostEqual(self._cmd()["left"], 0.2, places=5)
-                c.send_text(json.dumps({"op": "teleop", "left": 0, "right": 0}))
-                self.assertEqual(self._cmd()["left"], 0.0)
+                self._manejar(c, 0.2, 0.1)                       # lo bueno de después
+                self._manejar(c, 0, 0)
         self.assertFalse(c.closed)
 
     def test_ataques_por_post(self):
@@ -636,10 +705,8 @@ class TestManejoAtaques(MotorCase):
         self.assertIn("no acepta mensajes binarios", self._error(c))   # se contesta el error; la conexión sigue
         self.assertFalse(c.closed)
         bueno = self.connect()
-        bueno.send_text(json.dumps({"op": "teleop", "left": 0.2, "right": 0.2}))
-        self.assertAlmostEqual(self._cmd()["left"], 0.2, places=5)
-        bueno.send_text(json.dumps({"op": "teleop", "left": 0, "right": 0}))
-        self.assertEqual(self._cmd()["left"], 0.0)
+        self._manejar(bueno, 0.2, 0.2)
+        self._manejar(bueno, 0, 0)
         malo = self.connect()
         malo.sock.sendall(ws.encode_frame(ws.OP_TEXT, b'{"op":"teleop","left":0.5,"right":\xff\xfe}', True))
         self._sin_comandos(0.3)                                 # (RFC 6455: el servidor cierra con 1007)
@@ -651,22 +718,20 @@ class TestManejoAtaques(MotorCase):
         for left, right in ((0.48, -0.48), (0.8, 0.8), (0.30000000000000004, 0.6000000000000001), (0, 0),
                             (1e-7, -1e-7), (5e-324, 0), (0.6, -0.6), (1.7976931348623157e308, -1e300)):
             with self.subTest(left=left, right=right):
-                time.sleep(0.02)                                # más que el tope de ~60 Hz del mando
-                c.send_text(json.dumps({"op": "teleop", "left": left, "right": right}))
-                cmd = self._cmd()
-                self.assertAlmostEqual(cmd["left"], max(-0.8, min(0.8, left)), places=5)
-                self.assertAlmostEqual(cmd["right"], max(-0.8, min(0.8, right)), places=5)
-                self.assertLessEqual(abs(cmd["left"]), 0.8 + 1e-6)
-                self.assertLessEqual(abs(cmd["right"]), 0.8 + 1e-6)
-                self.assertFalse(cmd["left"] != cmd["left"])    # no NaN
-        c.send_text(json.dumps({"op": "teleop", "left": 0, "right": 0}))
+                # Espera ESE comando (reintenta si el tope de ~60 Hz lo descartó y salta un ALTO viejo).
+                cmd_left, cmd_right = self._manejar(c, left, right)
+                self.assertAlmostEqual(cmd_left, max(-0.8, min(0.8, left)), places=5)
+                self.assertAlmostEqual(cmd_right, max(-0.8, min(0.8, right)), places=5)
+                self.assertLessEqual(abs(cmd_left), 0.8 + 1e-6)
+                self.assertLessEqual(abs(cmd_right), 0.8 + 1e-6)
+                self.assertFalse(cmd_left != cmd_left)          # no NaN
+        self._manejar(c, 0, 0)
 
     def test_rafaga_de_malos_desde_dos_clientes_no_aguanta_al_robot(self):
         """Dos clientes mandan comandos malos sin parar: el robot frena a los ~300 ms del último comando BUENO,
         y un comando bueno de un tercero después de la ráfaga funciona."""
         a, b = self.connect(), self.connect()
-        a.send_text(json.dumps({"op": "teleop", "left": 0.3, "right": 0.3}))
-        self.assertAlmostEqual(self._cmd()["left"], 0.3, places=5)
+        self._manejar(a, 0.3, 0.3)
         t0 = time.monotonic()
         stop = threading.Event()
         malos = ['{"op":"teleop","left":NaN,"right":NaN}', '{"op":"teleop","left":1e400,"right":0}',
@@ -688,17 +753,15 @@ class TestManejoAtaques(MotorCase):
             cmd = self._cmd()
             self.assertEqual((cmd["left"], cmd["right"]), (0.0, 0.0))
             self.assertLess(time.monotonic() - t0, 0.9)
-            logs, _ = self.panel.logs.since(0)
-            self.assertTrue(any("ALTO" in line["text"] for line in logs))
+            self.assertGreaterEqual(self._altos(), 1)
+            self._altos_usados = self._altos()                  # ese ALTO ya se contó
         finally:
             stop.set()
             for t in ths:
                 t.join()
         d = self.connect()
-        time.sleep(0.05)                                        # pasado el tope de ~60 Hz desde el ALTO
-        d.send_text(json.dumps({"op": "teleop", "left": 0.25, "right": 0.25}))
-        self.assertAlmostEqual(self._cmd()["left"], 0.25, places=5)
-        d.send_text(json.dumps({"op": "teleop", "left": 0, "right": 0}))
+        self._manejar(d, 0.25, 0.25)
+        self._manejar(d, 0, 0)
 
     def test_content_length_mentiroso_o_enorme_no_tumba_el_hilo(self):
         """Un Content-Length absurdo contesta 400 y no deja una excepción sin atrapar en el servidor (antes:
