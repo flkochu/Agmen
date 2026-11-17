@@ -490,6 +490,154 @@ class TestJsonDelCliente(PanelCase):
                 self.assertIn("Content-Length", resp)
 
 
+class TestManejoAtaques(MotorCase):
+    """Lo que un cliente hostil o torpe puede mandarle al mando de manejo, de punta a punta (panel real, motor
+    simulado con un socket). Nada de lo malo llega al motor y lo bueno de después sí."""
+
+    # JSON que Python lee distinto de lo que parece: mayúsculas, signos, claves repetidas, profundidad, números
+    # enormes. Ninguno debe producir un comando; todos deben dejar la conexión viva y contestar un error.
+    ATAQUES = [
+        ("-NaN", '{"op":"teleop","left":-NaN,"right":0}'),
+        ("nan en minúsculas", '{"op":"teleop","left":nan,"right":0}'),
+        ("INFINITY", '{"op":"teleop","left":INFINITY,"right":0}'),
+        ("+Infinity", '{"op":"teleop","left":+Infinity,"right":0}'),
+        ("1e400", '{"op":"teleop","left":1e400,"right":0}'),
+        ("-1E999", '{"op":"teleop","left":0,"right":-1E999}'),
+        ("clave repetida: bueno y luego NaN", '{"op":"teleop","left":0.1,"left":NaN,"right":0}'),
+        ("clave repetida: NaN y luego bueno", '{"op":"teleop","left":NaN,"left":0.1,"right":0}'),
+        ("NaN en un campo que sobra", '{"op":"teleop","left":0.1,"right":0.1,"extra":NaN}'),
+        ("lista anidada sin fin", '{"op":"teleop","left":' + "[" * 100_000 + "]" * 100_000 + ',"right":0}'),
+        ("objetos anidados sin fin", '{"op":"teleop","left":' + '{"a":' * 100_000 + "1" + "}" * 100_000 + ',"right":0}'),
+        ("entero de 5000 dígitos", '{"op":"teleop","left":1' + "0" * 5000 + ',"right":0}'),
+        ("la raíz es una lista", '[{"op":"teleop","left":0.1,"right":0.1}]'),
+        ("vacío", ""),
+        ("coma final", '{"op":"teleop","left":0.1,"right":0.1,}'),
+        ("dict en vez de número", '{"op":"teleop","left":{"a":1},"right":0}'),
+    ]
+
+    def _sin_comandos(self, wait=0.2):
+        self.motor.settimeout(wait)
+        try:
+            while True:
+                env, payload = wire.parse(self.motor.recv(2048))
+                if env.encoding == wire.ENC_COMPACT:
+                    self.fail(f"se publicó un comando: {MotorCommand.LAYOUT.unpack(payload)}")
+        except socket.timeout:
+            pass
+        finally:
+            self.motor.settimeout(3)
+
+    def _error(self, c):
+        return json.loads(self.recv_until(c, lambda m: isinstance(m, str) and json.loads(m)["op"] == "error"))["msg"]
+
+    def test_ataques_por_websocket(self):
+        c = self.connect()
+        for nombre, raw in self.ATAQUES:
+            with self.subTest(nombre):
+                c.send_text(raw)
+                self.assertTrue(self._error(c))                 # dice qué pasó
+                self._sin_comandos()
+                time.sleep(0.02)
+                c.send_text(json.dumps({"op": "teleop", "left": 0.2, "right": 0.1}))   # lo bueno de después
+                self.assertAlmostEqual(self._cmd()["left"], 0.2, places=5)
+                c.send_text(json.dumps({"op": "teleop", "left": 0, "right": 0}))
+                self.assertEqual(self._cmd()["left"], 0.0)
+        self.assertFalse(c.closed)
+
+    def test_ataques_por_post(self):
+        for nombre, raw in self.ATAQUES:
+            with self.subTest(nombre):
+                req = urllib.request.Request(f"http://{self.base}/api/teleop", data=raw.encode(), method="POST",
+                                             headers={"X-Agmen": "1"})
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(req, timeout=5)
+                self.assertEqual(cm.exception.code, 400)
+                self.assertIn("error", json.load(cm.exception))
+                self._sin_comandos(0.1)
+
+    def test_binario_y_utf8_roto_no_manejan(self):
+        """Un mensaje binario con JSON válido, o un texto que no es UTF-8, no mueve el robot."""
+        c = self.connect()
+        c.send_binary(b'{"op":"teleop","left":0.5,"right":0.5}')
+        self._sin_comandos(0.3)
+        self.assertFalse(c.closed)                              # el binario se ignora; la conexión sigue
+        bueno = self.connect()
+        bueno.send_text(json.dumps({"op": "teleop", "left": 0.2, "right": 0.2}))
+        self.assertAlmostEqual(self._cmd()["left"], 0.2, places=5)
+        bueno.send_text(json.dumps({"op": "teleop", "left": 0, "right": 0}))
+        self.assertEqual(self._cmd()["left"], 0.0)
+        malo = self.connect()
+        malo.sock.sendall(ws.encode_frame(ws.OP_TEXT, b'{"op":"teleop","left":0.5,"right":\xff\xfe}', True))
+        self._sin_comandos(0.3)                                 # (RFC 6455: el servidor cierra con 1007)
+
+    def test_lo_que_manda_el_joystick_del_navegador(self):
+        """Exactamente lo que arma command() de index.html: JSON.stringify de números finitos, incluidos los que
+        quedan con muchos decimales, el cero y los que pasan de max_speed (se recortan, no se rechazan)."""
+        c = self.connect()
+        for left, right in ((0.48, -0.48), (0.8, 0.8), (0.30000000000000004, 0.6000000000000001), (0, 0),
+                            (1e-7, -1e-7), (5e-324, 0), (0.6, -0.6), (1.7976931348623157e308, -1e300)):
+            with self.subTest(left=left, right=right):
+                c.send_text(json.dumps({"op": "teleop", "left": left, "right": right}))
+                cmd = self._cmd()
+                self.assertAlmostEqual(cmd["left"], max(-0.8, min(0.8, left)), places=5)
+                self.assertAlmostEqual(cmd["right"], max(-0.8, min(0.8, right)), places=5)
+                self.assertLessEqual(abs(cmd["left"]), 0.8 + 1e-6)
+                self.assertLessEqual(abs(cmd["right"]), 0.8 + 1e-6)
+                self.assertFalse(cmd["left"] != cmd["left"])    # no NaN
+        c.send_text(json.dumps({"op": "teleop", "left": 0, "right": 0}))
+
+    def test_rafaga_de_malos_desde_dos_clientes_no_aguanta_al_robot(self):
+        """Dos clientes mandan comandos malos sin parar: el robot frena a los ~300 ms del último comando BUENO,
+        y un comando bueno de un tercero después de la ráfaga funciona."""
+        a, b = self.connect(), self.connect()
+        a.send_text(json.dumps({"op": "teleop", "left": 0.3, "right": 0.3}))
+        self.assertAlmostEqual(self._cmd()["left"], 0.3, places=5)
+        t0 = time.monotonic()
+        stop = threading.Event()
+        malos = ['{"op":"teleop","left":NaN,"right":NaN}', '{"op":"teleop","left":1e400,"right":0}',
+                 '{"op":"teleop","left":0.3}', '{"op":"teleop","left":[0.3],"right":0.3}', "[]", "no es json"]
+
+        def spam(c):
+            i = 0
+            while not stop.wait(0.005):
+                try:
+                    c.send_text(malos[i % len(malos)])
+                except OSError:
+                    return
+                i += 1
+
+        ths = [threading.Thread(target=spam, args=(c,), daemon=True) for c in (a, b)]
+        for t in ths:
+            t.start()
+        try:
+            cmd = self._cmd()
+            self.assertEqual((cmd["left"], cmd["right"]), (0.0, 0.0))
+            self.assertLess(time.monotonic() - t0, 0.9)
+            logs, _ = self.panel.logs.since(0)
+            self.assertTrue(any("ALTO" in line["text"] for line in logs))
+        finally:
+            stop.set()
+            for t in ths:
+                t.join()
+        d = self.connect()
+        d.send_text(json.dumps({"op": "teleop", "left": 0.25, "right": 0.25}))
+        self.assertAlmostEqual(self._cmd()["left"], 0.25, places=5)
+        d.send_text(json.dumps({"op": "teleop", "left": 0, "right": 0}))
+
+    def test_content_length_mentiroso_o_enorme_no_tumba_el_hilo(self):
+        """Un Content-Length absurdo contesta 400 y no deja una excepción sin atrapar en el servidor (antes:
+        MemoryError / OverflowError al intentar reservar ese cuerpo, y la conexión moría sin respuesta)."""
+        for cl in (10**12, 2**63, 10**30):
+            with self.subTest(cl=cl):
+                s = socket.create_connection(("127.0.0.1", self.panel.port), timeout=5)
+                with s:
+                    s.sendall(f"POST /api/teleop HTTP/1.1\r\nHost: x\r\nX-Agmen: 1\r\nContent-Length: {cl}\r\n\r\n{{}}"
+                              .encode())
+                    resp = s.recv(65536).decode()
+                self.assertIn(" 4", resp.split("\r\n")[0], f"sin respuesta HTTP de error: {resp!r}")
+        self._sin_comandos(0.1)
+
+
 class TestRelojDesdeElPanel(unittest.TestCase):
     """Pausa, paso y velocidad del tiempo simulado: un valor que no es un número finito no llega al reloj."""
 
