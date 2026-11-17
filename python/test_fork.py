@@ -345,7 +345,8 @@ if proc is not None:
         codigo = proc.exitcode
 elif "codigo" not in globals():
     codigo = espera_hijo(pid, 5)
-print("RESULTADO " + json.dumps(dict(hijo=codigo, c=got_c, i=got_i, ajeno=ajeno, shm=shm)), flush=True)
+print("RESULTADO " + json.dumps(dict(hijo=codigo, c=got_c, i=got_i, ajeno=ajeno, shm=shm, ppid=os.getpid())),
+      flush=True)
 os._exit(0)
 '''
 
@@ -372,11 +373,22 @@ class _Base(unittest.TestCase):
         cls.hub = H.Hub(cls.addr, [], log=cls.log.append, grace_s=0.3)
         cls.hilo = threading.Thread(target=cls.hub.serve, args=(cls.stop,), daemon=True)
         cls.hilo.start()
+        cls.padres: list[int] = []   # los procesos de los guiones (para borrar sus bloques al final)
 
     @classmethod
     def tearDownClass(cls):
         cls.stop.set()
         cls.hilo.join(2)
+        # Los guiones salen con os._exit (el hub debe seguir viendo al padre): sus bloques de memoria
+        # compartida se quedan. Se borran aquí, por nombre (su registro vive en cls.tmp, que se borra).
+        for pid in cls.padres:
+            prefijo = "agm%08x" % (pid & 0xFFFFFFFF)
+            for n in os.listdir("/dev/shm") if os.path.isdir("/dev/shm") else []:
+                if n.startswith(prefijo):
+                    try:
+                        os.unlink(os.path.join("/dev/shm", n))
+                    except OSError:
+                        pass
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def corre(self, guion: str, *args: str) -> subprocess.CompletedProcess:
@@ -389,11 +401,12 @@ class _Base(unittest.TestCase):
         except subprocess.TimeoutExpired as e:
             self.fail(f"colgado: el guion no terminó en {TOPE:.0f} s\n{(e.stderr or b'')[-2000:]}")
 
-    @staticmethod
-    def resultado(r: subprocess.CompletedProcess) -> dict:
+    def resultado(self, r: subprocess.CompletedProcess) -> dict:
         for linea in r.stdout.splitlines():
             if linea.startswith("RESULTADO "):
-                return json.loads(linea[len("RESULTADO "):])
+                res = json.loads(linea[len("RESULTADO "):])
+                self.padres.append(res["ppid"])   # sus bloques se borran en tearDownClass
+                return res
         raise AssertionError(f"sin RESULTADO (código {r.returncode}):\n{r.stdout}\n{r.stderr[-3000:]}")
 
     def del_padre(self, ppid: int) -> list:
