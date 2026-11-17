@@ -1,5 +1,7 @@
 #include "agmen/net.hpp"
 
+#include "agmen/log.hpp"
+
 #include <atomic>
 #include <cstring>
 #include <mutex>
@@ -70,6 +72,9 @@ NativeSocket native(std::intptr_t h) { return static_cast<NativeSocket>(h); }
 // Python los tapa todos con /dev/null en el hijo (detail::cover_inherited_sockets), sin recorrer los
 // objetos heredados ni tomar sus candados. Cuesta un candado al abrir y otro al cerrar un socket; nada
 // por mensaje. Un programa de C++ que haga fork queda como antes: nadie llama a esa función.
+// Límite conocido: entre abrir un socket y anotarlo (o entre quitarlo y cerrarlo) hay ventanas de
+// microsegundos sin el candado; si el fork cae justo ahí, el hijo se queda con ese socket abierto (no se
+// tapa). Nunca se tapa un descriptor ajeno: solo los números que están en el registro.
 // ---------------------------------------------------------------------------
 
 std::atomic<unsigned> g_fork_generation{0};
@@ -686,7 +691,8 @@ void cover_inherited_sockets() noexcept {
     // Con el intérprete ya en estado normal (no dentro del gancho de pthread_atfork). Se sacan del registro
     // todos (un fork del hijo no los vuelve a tocar) y cada número queda apuntando a /dev/null: el socket
     // se suelta (el puerto ya no es del hijo), pero el número sigue ocupado, así que un objeto heredado
-    // que lo cierre después nunca cierra uno nuevo del hijo, y lo que intente mandar o leer falla.
+    // que lo cierre después nunca cierra uno nuevo del hijo, y lo que intente mandar o leer falla. Si no se
+    // puede (sin /dev/null, o falla dup2), el socket NO se cierra: el hijo lo retiene, y se avisa.
     std::vector<int> fds;
     {
         Registry& r = registry();
@@ -694,14 +700,30 @@ void cover_inherited_sockets() noexcept {
         fds.swap(r.fds);
     }
     const int devnull = ::open("/dev/null", O_RDWR | O_CLOEXEC);
+    const int open_err = devnull < 0 ? errno : 0;
+    int dup_err = 0;
     for (const int fd : fds) {
-        if (devnull >= 0 && ::dup2(devnull, fd) >= 0) {
+        if (devnull < 0) break;   // sin /dev/null no se cierra: el número quedaría libre para un socket nuevo
+        if (::dup2(devnull, fd) >= 0) {
             (void)::fcntl(fd, F_SETFD, FD_CLOEXEC);
-        } else {
-            (void)::close(fd);   // sin /dev/null: se cierra (el número puede reutilizarse)
+        } else if (dup_err == 0) {
+            dup_err = errno;      // este se queda abierto (por la misma razón)
         }
     }
     if (devnull >= 0) (void)::close(devnull);
+    if (!fds.empty() && (open_err != 0 || dup_err != 0)) {
+        try {   // una vez, y nunca falla en silencio (regla 1)
+            log::write(open_err != 0
+                           ? "[agmen] ⚠ después del fork no se pudo abrir /dev/null (" + os_message(open_err) +
+                                 "): los sockets heredados quedan abiertos en el proceso hijo (retiene sus "
+                                 "puertos hasta que termine)"
+                           : "[agmen] ⚠ después del fork no se pudo tapar un socket heredado con /dev/null (" +
+                                 os_message(dup_err) +
+                                 "): queda abierto en el proceso hijo (retiene su puerto hasta que termine)");
+        } catch (...) {
+            // sin memoria para el aviso: no hay más que hacer
+        }
+    }
     g_fork_generation.fetch_add(1);
 }
 #else

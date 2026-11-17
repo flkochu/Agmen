@@ -51,7 +51,9 @@ LOCAL_IP = "127.0.0.1"
 
 # Los sockets y las conexiones aceptadas de agmen (Python puro) que siguen vivos: en el hijo de un fork
 # se cierran y se callan todos (soltar_heredados). Anotar uno cuesta lo mismo que crear el socket: nada
-# por mensaje.
+# por mensaje. Límite conocido: entre crear un socket y anotarlo hay una ventana de microsegundos; si el
+# fork de otro hilo cae justo ahí, el hijo se queda con ese socket abierto. Solo se cierran los sockets
+# anotados (cada uno por su propio objeto): nunca un descriptor ajeno.
 _sockets: weakref.WeakSet = weakref.WeakSet()
 _entradas: weakref.WeakSet = weakref.WeakSet()
 
