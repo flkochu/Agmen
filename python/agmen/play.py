@@ -99,8 +99,8 @@ class Player:
         self.reader = _mcap.Reader(path)
         try:
             self._setup(topics, rate, loop, start, end, publish_clock, paused, quiet, out)
-        except BaseException:
-            self.reader.close()
+        except BaseException as e:
+            self.reader._close_on_error(e)     # p. ej. un chunk dañado: el traceback guarda el último mensaje
             raise
 
     def _setup(self, topics, rate, loop, start, end, publish_clock, paused, quiet, out) -> None:

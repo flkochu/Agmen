@@ -47,10 +47,30 @@ def imu(i: int) -> wire.ImuSample:
     return wire.ImuSample(accel=(float(i), 0.0, 9.8), gyro=(0.0, 0.0, 0.0))
 
 
-def make_recording(path: str, n: int = 20, robot_toml: bool = False) -> list[bytes]:
+def mapped(path: str) -> bool | None:
+    """¿El archivo sigue mapeado en este proceso? (Linux: /proc/self/maps; en otros, None: no se sabe)."""
+    try:
+        with open("/proc/self/maps", encoding="utf-8", errors="replace") as f:
+            return os.path.realpath(path) in f.read()
+    except OSError:
+        return None
+
+
+def damage_chunk(path: str, k: int) -> None:
+    """Cambia un byte dentro de los datos del chunk k: al leerlo, McapError (CRC)."""
+    with _mcap.Reader(path) as r:
+        start = r.chunks[k].start
+    with open(path, "r+b") as f:
+        f.seek(start + 80)
+        b = f.read(1)
+        f.seek(start + 80)
+        f.write(bytes([b[0] ^ 0xFF]))
+
+
+def make_recording(path: str, n: int = 20, robot_toml: bool = False, chunk_size: int = 200_000) -> list[bytes]:
     """Una grabación como la que hace agmen record: /imu cada 50 ms, /camara cada 200 ms (y, como las de
     agmen run, con el robot.toml adjunto si `robot_toml`)."""
-    w = _mcap.Writer(path, profile="agmen", chunk_size=200_000)
+    w = _mcap.Writer(path, profile="agmen", chunk_size=chunk_size)
     s_imu = w.add_schema("ImuSample", "agmen", wire.ImuSample.SCHEMA_TEXT.encode())
     s_img = w.add_schema("Img", "agmen", Img.SCHEMA_TEXT.encode())
     c_imu = w.add_channel("/imu", "agmen", s_imu)
@@ -239,7 +259,25 @@ class TestReproducir(PlayCase):
                         p.stop()
                 self.assertNotIn("sigue abierta", err.getvalue())
                 self.assertFalse(p.reader._mapped)
+                self.assertIn(mapped(path), (False, None), "/proc/self/maps ya no lo trae")
         os.remove(path)                      # en Windows falla si sigue mapeado
+
+    def test_chunk_danado_no_culpa_al_programa(self):
+        """Un chunk dañado al abrir (Player lee toda la grabación para saber cuánto dura): el error sale tal
+        cual, sin el aviso de "sigue abierta" (el traceback guardaba los mensajes; el lector los suelta)."""
+        path = os.path.join(self.dir, "danada.mcap")
+        make_recording(path, robot_toml=True, chunk_size=3000)
+        damage_chunk(path, 2)
+        err, error = io.StringIO(), None
+        with contextlib.redirect_stderr(err):
+            try:
+                play.Player(path)
+            except _mcap.McapError as e:
+                error = e                    # con su traceback todavía vivo
+        self.assertIn("CRC", str(error))
+        self.assertEqual(err.getvalue(), "")
+        self.assertIn(mapped(path), (False, None))
+        os.remove(path)
 
     def test_errores_claros(self):
         with self.assertRaisesRegex(ValueError, "no tiene el topic /nada"):
@@ -279,6 +317,15 @@ class TestComando(PlayCase):
         self.assertIn("⏹ 20 mensajes", err)
         self.assertGreater(len(got), 10)
         self.assertTrue(all(s.envelope.clock == wire.CLOCK_REPLAY for s in got))
+
+    def test_agmen_play_con_un_chunk_danado(self):
+        path = os.path.join(self.dir, "danada.mcap")
+        make_recording(path, robot_toml=True, chunk_size=3000)
+        damage_chunk(path, 2)
+        r = self.agmen("play", path)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("CRC", r.stderr)
+        self.assertNotIn("sigue abierta", r.stderr)
 
     def test_errores_del_comando(self):
         r = self.agmen("play", os.path.join(self.dir, "no-existe.mcap"))

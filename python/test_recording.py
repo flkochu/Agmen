@@ -24,6 +24,7 @@ import time
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from unittest import mock
 
 import agmen
 from agmen import _mcap, recording, schema, wire
@@ -127,6 +128,33 @@ def mapped(path: str) -> bool | None:
     except OSError:
         return None
     return os.path.realpath(path) in maps
+
+
+def opened(path: str) -> bool | None:
+    """¿Este proceso tiene el archivo abierto? (Linux: /proc/self/fd; en otros, None: no se sabe)."""
+    try:
+        fds = os.listdir("/proc/self/fd")
+    except OSError:
+        return None
+    real = os.path.realpath(path)
+    for fd in fds:
+        try:
+            if os.readlink(f"/proc/self/fd/{fd}") == real:
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def damage_chunk(path: str, k: int) -> None:
+    """Cambia un byte dentro de los datos del chunk k: al leerlo, McapError (CRC)."""
+    with _mcap.Reader(path) as r:
+        start = r.chunks[k].start
+    with open(path, "r+b") as f:
+        f.seek(start + 80)
+        b = f.read(1)
+        f.seek(start + 80)
+        f.write(bytes([b[0] ^ 0xFF]))
 
 
 class RecordingCase(unittest.TestCase):
@@ -240,8 +268,9 @@ class TestCerrar(unittest.TestCase):
     def assertWarnedOnce(self, text):
         self.assertEqual(text.count("[agmen] ⚠"), 1, text)
         for words in (self.path, "sigue abierta", "sigue en uso", "Windows", "borrar ni reemplazar",
-                      "for m in rec.messages(...)", "as_array()", "bytes de una imagen", "del m",
-                      "copy.deepcopy(msg)", "arr.copy()"):
+                      "recorrido de messages() a medias", "for m in rec.messages(...)", "as_array()",
+                      "bytes de una imagen", "table()", "del m", "copy.deepcopy(msg)", "arr.copy()",
+                      "tabla.take(list(range(tabla.num_rows)))"):
             self.assertIn(words, text)
 
     def read_everything(self, rec):
@@ -263,7 +292,89 @@ class TestCerrar(unittest.TestCase):
         r = _mcap.Reader(self.path)
         self.assertEqual([a.name for a in r.attachments], ["robot.toml"])
         self.assertEqual(close_quoting(r), "")
+        self.assertEqual(r.attachments, [], "el lector suelta su referencia")
         self.assertClosed(r)
+
+    def test_un_adjunto_guardado_sigue_sirviendo_y_avisa(self):
+        r = _mcap.Reader(self.path)
+        keep = r.attachments[0].data          # la vista del adjunto, sin copiar
+        self.assertWarnedOnce(close_quoting(r))
+        self.assertEqual(bytes(keep), b'[robot]\nname = "prueba"\n', "lo leído sigue sirviendo")
+        del keep
+        gc.collect()
+        self.assertFalse(r._mapped)
+        self.assertEqual(close_quoting(r), "")
+        self.assertClosed(r)
+
+    def test_un_recorrido_a_medias_avisa(self):
+        rec = agmen.Recording(self.path)
+        it = rec.messages()
+        next(it)                              # el recorrido guarda el chunk en curso (vistas del archivo)
+        self.assertWarnedOnce(close_quoting(rec))
+        with self.assertRaisesRegex(ValueError, "ya está cerrado"):
+            next(it)                          # se porta como cerrado: no sigue leyendo
+        del it
+        gc.collect()
+        self.assertFalse(rec._r._mapped)
+        self.assertEqual(close_quoting(rec), "")
+        self.assertClosed(rec._r)
+
+    def test_chunk_danado_no_culpa_al_programa(self):
+        """Un error a medio recorrido (aquí, un chunk dañado): el traceback guarda los marcos con mensajes y
+        chunks (vistas). Al salir del with, el lector los suelta: cierra de verdad y no culpa al programa."""
+        damage_chunk(self.path, 2)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaisesRegex(_mcap.McapError, "CRC"):
+            with agmen.Recording(self.path) as rec:
+                sum(1 for _ in rec.messages())
+        self.assertEqual(err.getvalue(), "")
+        self.assertClosed(rec._r)
+
+    def test_chunk_danado_con_la_variable_del_for_viva(self):
+        """Si lo que retiene el archivo es una variable de quien llamó (la del for), el aviso lo dice como es."""
+        damage_chunk(self.path, 2)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaisesRegex(_mcap.McapError, "CRC"):
+            with _mcap.Reader(self.path) as r:
+                for m in r.messages():
+                    pass
+        text = err.getvalue()
+        self.assertEqual(text.count("[agmen] ⚠"), 1, text)
+        for words in (self.path, "se cerró por un error", "variable de un for", "Se suelta sola", "Windows"):
+            self.assertIn(words, text)
+        del m
+        gc.collect()
+        self.assertFalse(r._mapped, "al soltar la variable, se suelta sola")
+        self.assertEqual(close_quoting(r), "")
+        self.assertClosed(r)
+
+    def test_reparar_un_chunk_danado_suelta_los_dos_archivos(self):
+        damage_chunk(self.path, 2)
+        out = os.path.join(os.path.dirname(self.path), "reparada.mcap")
+        err, error = io.StringIO(), None
+        with contextlib.redirect_stderr(err):
+            try:
+                _mcap.repair(self.path, out)
+            except _mcap.McapError as e:
+                error = e                     # con su traceback todavía vivo (assertRaises lo limpiaría)
+        self.assertIn("CRC", str(error))
+        self.assertEqual(err.getvalue(), "")
+        self.assertIn(opened(out), (False, None), "la salida a medias quedó cerrada")
+        os.remove(out)                        # en Windows falla si sigue abierta
+        self.assertIn(mapped(self.path), (False, None))
+        self.assertIn(opened(self.path), (False, None))
+        os.remove(self.path)
+
+    def test_si_el_mapa_falla_no_queda_abierto(self):
+        error = None
+        with mock.patch.object(_mcap.mmap, "mmap", side_effect=OSError("sin memoria para mapear")):
+            try:
+                _mcap.Reader(self.path)
+            except OSError as e:
+                error = e                     # con su traceback (y el lector a medias) todavía vivos
+        self.assertIn("sin memoria", str(error))
+        self.assertIn(opened(self.path), (False, None), "el archivo no quedó abierto")
+        os.remove(self.path)
 
     def test_variable_del_for_avisa_una_vez_y_se_cierra_despues(self):
         rec = agmen.Recording(self.path)
@@ -318,12 +429,35 @@ class TestCerrar(unittest.TestCase):
         self.assertEqual(bytes(cams[-1].data), bytes(range(9, 17)))
         self.assertEqual(type(dets[1]).__name__, "Deteccion")
         self.assertEqual((dets[1].clase, bytes(dets[1].crudo)), ("gato3", b"\x03\x03\x03"))
-        self.assertEqual(list(dets[1].mapa.reshape(-1)), [3, 1, 2, 3, 4, 5])
+        mapa = dets[1].mapa                   # numpy.ndarray, o agmen.Tensor sin NumPy
+        self.assertEqual(tuple(mapa.shape), (2, 3))
+        if hasattr(mapa, "reshape"):
+            self.assertEqual(mapa.reshape(-1).tolist(), [3, 1, 2, 3, 4, 5])
+        else:
+            self.assertNotIsInstance(mapa.data, memoryview, "la copia no es una vista del archivo")
+            self.assertEqual(list(mapa.data), [3, 1, 2, 3, 4, 5])
         self.assertEqual((ests[5].message.seq, ests[5].topic), (1005, "/robot/estado"))
 
 
 @unittest.skipIf(pa is None, "sin pyarrow")
 class TestTablas(RecordingCase):
+    def test_conservar_una_tabla_despues_de_cerrar(self):
+        """Una tabla de un topic en arrow lee los bytes del archivo sin copiar: guardarla detiene el archivo
+        (el aviso lo dice), y lo que el aviso recomienda, tabla.take(...), la despega de verdad."""
+        for filas in (None, 0.001):           # varias filas (varios lotes) y una sola
+            with self.subTest(filas=filas):
+                rec = agmen.Recording(self.path)
+                tabla = rec.table("/det", end=filas)
+                text = close_quoting(rec)
+                self.assertIn("tabla.take(list(range(tabla.num_rows)))", text)
+                rec = agmen.Recording(self.path)
+                tabla = rec.table("/det", end=filas)
+                copia = tabla.take(list(range(tabla.num_rows)))
+                del tabla
+                self.assertEqual(close_quoting(rec), "", "la copia ya no apunta al archivo")
+                self.assertFalse(rec._r._mapped)
+                self.assertEqual(copia.column("clase").to_pylist()[0], "gato0", "la copia sigue sirviendo")
+
     def test_imu(self):
         t = self.rec.table("/imu")
         self.assertEqual(t.column_names, ["t_data", "t_pub", "log_time", "source_id", "seq",

@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sys
+import traceback
 from dataclasses import dataclass
 
 from . import _mcap, relojes, schema, wire
@@ -242,8 +243,8 @@ class Recording:
         self._r = _mcap.Reader(self.path)
         try:
             self._setup(types)
-        except BaseException:
-            self._r.close()
+        except BaseException as e:
+            self._r._close_on_error(e)
             raise
 
     def _setup(self, types) -> None:
@@ -396,13 +397,20 @@ class Recording:
         names = self._pick(topics)
         t0, t1 = self._window(start, end)
         sender = os.path.basename(self.path)
-        for m in self._r.messages(names, start=t0, end=t1):
-            env, payload = wire.parse(m.data)
-            cls = self._by_schema.get(env.schema_id)
-            if cls is None:
-                continue                      # un mensaje de otro tipo en el canal: no es de este topic
-            for msg in _decode(cls, payload):
-                yield RecordedSample(env, msg, sender, m.channel.topic, m.log_time)
+        m = payload = msg = None
+        try:
+            for m in self._r.messages(names, start=t0, end=t1):
+                env, payload = wire.parse(m.data)
+                cls = self._by_schema.get(env.schema_id)
+                if cls is None:
+                    continue                      # un mensaje de otro tipo en el canal: no es de este topic
+                for msg in _decode(cls, payload):
+                    yield RecordedSample(env, msg, sender, m.channel.topic, m.log_time)
+        except BaseException as e:
+            # Un error a medio recorrido: que el traceback no guarde el último mensaje (una vista del archivo).
+            traceback.clear_frames(e.__traceback__)
+            m = payload = msg = None   # noqa: F841
+            raise
 
     # --- tablas (pyarrow) ---
     def arrow_schema(self, topic: str):
@@ -568,8 +576,8 @@ class Recording:
     def __enter__(self) -> "Recording":
         return self
 
-    def __exit__(self, *exc) -> None:
-        self.close()
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._r.__exit__(exc_type, exc, tb)      # al salir por un error, suelta también lo que guarda el traceback
 
 
 # ---------------------------------------------------------------------------
