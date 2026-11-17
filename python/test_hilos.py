@@ -81,9 +81,53 @@ import faulthandler, itertools, os, sys, threading, time
 sys.path.insert(0, sys.argv[1])
 MODO, TIPO_N, RONDAS = sys.argv[2], sys.argv[3], int(sys.argv[4])
 faulthandler.enable()
-# Un cuelgue que el guion no vio (el hilo principal atascado) termina con las pilas de todos los hilos.
-faulthandler.dump_traceback_later(float(sys.argv[5]), exit=True)
+TOPE_PRINCIPAL = float(sys.argv[5])
+# Respaldo: si ni el perro guardián de abajo logra hablar, faulthandler termina con las pilas de todos los hilos.
+faulthandler.dump_traceback_later(TOPE_PRINCIPAL + 5, exit=True)
 PID = os.getpid()
+T_INICIO = time.monotonic()
+CONTADORES = {}   # nombre -> f: cuánto lleva cada hilo; f() devuelve un entero que solo crece
+
+def registra(nombre, f):
+    CONTADORES[nombre] = f   # una ronda nueva reemplaza al contador de la anterior
+
+def informe(que, codigo):
+    """Un tope vencido: ¿lentitud o cuelgue? Mide durante ~1 s si algo avanza (contadores y el cuadro en que está
+    cada hilo), lo dice, vuelca las pilas COMPLETAS de todos los hilos y termina el proceso."""
+    antes = [(n, f()) for n, f in list(CONTADORES.items())]
+    pos = {}   # hilo -> cuadros distintos vistos en 5 muestras
+    for _ in range(5):
+        nombres = {t.ident: t.name for t in threading.enumerate()}
+        for ident, fr in sys._current_frames().items():
+            if nombres.get(ident) == "perro-guardian":
+                continue
+            c = fr.f_code
+            pos.setdefault(nombres.get(ident, str(ident)), set()).add("%s:%d" % (os.path.basename(c.co_filename), fr.f_lineno))
+        time.sleep(0.2)
+    avanzan = []
+    print("TOPE VENCIDO tras %.0f s: %s" % (time.monotonic() - T_INICIO, que), flush=True)
+    for n, a in antes:
+        b = CONTADORES[n]()
+        avanzan.append(b > a)
+        print("  contador %-22s %8d -> %8d en 1 s: %s" % (n, a, b, "avanza" if b > a else "QUIETO"), flush=True)
+    quietos = [(h, next(iter(c))) for h, c in pos.items() if len(c) == 1]
+    movidos = [h for h, c in pos.items() if len(c) > 1]
+    print("  hilos que cambiaron de línea en 1 s: %d de %d; quietos: %s" % (
+        len(movidos), len(pos), ", ".join("%s en %s" % q for q in quietos[:12]) or "ninguno"), flush=True)
+    if any(avanzan) or movidos:
+        print("  DIAGNÓSTICO: LENTITUD (algo seguía avanzando: no es una espera sin fin; mira en las pilas dónde pasan el tiempo)",
+              flush=True)
+    else:
+        print("  DIAGNÓSTICO: CUELGUE (ningún contador ni hilo avanzó en 1 s)", flush=True)
+    print("  pilas completas:", flush=True)
+    faulthandler.dump_traceback(all_threads=True)
+    sys.stderr.flush()
+    os._exit(codigo)
+
+def _perro():
+    time.sleep(TOPE_PRINCIPAL)
+    informe("el hilo principal no terminó", 4)
+threading.Thread(target=_perro, name="perro-guardian", daemon=True).start()
 import agmen
 from dataclasses import dataclass
 from agmen import wire, pubsub
@@ -96,6 +140,15 @@ class Chico(wire.Message):
     b: int = 0
 
 TIPO = Chico if TIPO_N == "compact" else Imagen
+# Arrow importa NumPy la primera vez que decodifica (arrow.py _np), y ese import cuesta ~0.06 s con la
+# máquina libre pero DECENAS de segundos si otros hilos están ocupados (cada acceso a disco del import suelta
+# el GIL y tarda un turno de GIL por cada hilo ocupado en recuperarlo; medido: 2 hilos 4.5 s, 6 hilos 23 s,
+# 10 hilos 41 s). Es costo único del proceso, no lo que se prueba: se paga antes de lanzar hilos.
+if TIPO is not Chico:
+    try:
+        import numpy  # noqa: F401
+    except ImportError:
+        pass
 FALLAS = {}   # texto -> cuántas veces
 _cont = itertools.count()
 _mu = threading.Lock()
@@ -143,9 +196,7 @@ def espera(hs, tope, que):
         h.join(max(0.0, fin - time.monotonic()))
     vivos = sum(h.is_alive() for h in hs)
     if vivos:
-        print("CUELGUE: %d hilo(s) siguen vivos tras %.0f s (%s)" % (vivos, tope, que), flush=True)
-        faulthandler.dump_traceback(all_threads=True)
-        os._exit(3)
+        informe("%d hilo(s) siguen vivos tras %.0f s (%s)" % (vivos, tope, que), 3)
 
 # El tope de Subscriber.close() con otros hilos dentro de receive(): 1 s; con ThreadSanitizer, 3 s (TSan hace
 # todo 5-15 veces más lento). Solo ese tope cambia bajo TSan.
@@ -203,6 +254,7 @@ def termina():
 PUBLICA = r'''
 def publicador(pub, h, alto, cuenta, ya=None):
     k = 0
+    registra("publicador %d" % h, lambda: cuenta[h])
     while not alto.is_set():
         pub.publish(mk(h, k % 200))
         k += 1
@@ -1161,11 +1213,17 @@ for r in range(max(1, RONDAS // 3)):
         p = node.publisher(TIPO, topic + "c")
         while not alto.is_set():
             p.publish(mk(2, 0))
+    registra("every() del nodo (pulsos)", lambda: pulsos[0])
+    registra("on() del nodo (recibidos)", lambda: recibidos[0])
     def parador():
-        ya.wait(10)
-        fin = time.monotonic() + 15
-        while pulsos[0] < 5 and time.monotonic() < fin:   # que el nodo ya esté corriendo
+        # Presupuesto TOTAL de 8 s (antes ya.wait(10) + 15 s = 25 s, más que el tope del hijo, y un every()
+        # hambriento se veía como un cuelgue mudo). Si no hubo 5 pulsos en ese tiempo se dice, con los números.
+        t0 = time.monotonic()
+        ya.wait(4)
+        while pulsos[0] < 5 and time.monotonic() - t0 < 8:   # que el nodo ya esté corriendo
             time.sleep(0.01)
+        if pulsos[0] < 5:
+            falla("el every(5 ms) solo dio %d pulsos en %.1f s (publicado: %s)" % (pulsos[0], time.monotonic() - t0, cuenta))
         node.stop()
     hs = lanza(*[trabajo(publicador, pub, h, alto, cuenta) for h in range(3)], trabajo(lee), trabajo(lee),
                trabajo(nuevo), trabajo(parador, permite_cierre=False))
@@ -1296,10 +1354,12 @@ class _Base(unittest.TestCase):
             if os.environ.get("AGMEN_HILOS_GUARDA"):   # el stderr completo de cada corrida (informes de TSan)
                 (Path(os.environ["AGMEN_HILOS_GUARDA"]) / f"{self.backend}_{nombre}_{modo}_{tipo}_{i}.txt").write_text(
                     out + "\n=====STDERR\n" + err)
-            if "Timeout (0:" in err:
-                pilas = [x.strip() for x in err.splitlines() if x.strip().startswith("File ")][:12]
-                malas.append(f"corrida {i}: CUELGUE (el hilo principal no terminó en {TOPE_HIJO - 10:.0f} s). Pilas: "
-                             + " <- ".join(pilas))
+            if "TOPE VENCIDO" in out:   # el perro guardián del hijo: dijo si fue lentitud o cuelgue y volcó las pilas
+                malas.append(f"corrida {i}: {out[out.index('TOPE VENCIDO'):]}\n{err.strip()[-12000:]}")
+                continue
+            if "Timeout (0:" in err:   # el respaldo de faulthandler (el perro guardián no alcanzó a hablar)
+                malas.append(f"corrida {i}: CUELGUE (ni el perro guardián habló en {TOPE_HIJO - 5:.0f} s). Pilas completas:\n"
+                             + err.strip()[-12000:])
                 continue
             tsan = _resumen_tsan(err) if TSAN else []
             if tsan:
