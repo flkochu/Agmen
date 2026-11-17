@@ -34,6 +34,7 @@ import struct
 import sys
 import threading
 import time
+import weakref
 
 from . import _shm, wire
 
@@ -47,6 +48,39 @@ BIG_BUFFER = 4 << 20          # SO_SNDBUF / SO_RCVBUF que se pide fuera de Linux
 READ_CHUNK = 1 << 18
 SHM_NO, SHM_PROBING, SHM_YES = 0, 1, 2
 LOCAL_IP = "127.0.0.1"
+
+# Los sockets y las conexiones aceptadas de agmen (Python puro) que siguen vivos: en el hijo de un fork
+# se cierran y se callan todos (soltar_heredados). Anotar uno cuesta lo mismo que crear el socket: nada
+# por mensaje. Límite conocido: entre crear un socket y anotarlo hay una ventana de microsegundos; si el
+# fork de otro hilo cae justo ahí, el hijo se queda con ese socket abierto. Solo se cierran los sockets
+# anotados (cada uno por su propio objeto): nunca un descriptor ajeno.
+_sockets: weakref.WeakSet = weakref.WeakSet()
+_entradas: weakref.WeakSet = weakref.WeakSet()
+
+
+def propio(s: socket.socket) -> socket.socket:
+    """Anota un socket de agmen (para cerrarlo en el hijo de un fork) y lo devuelve."""
+    _sockets.add(s)
+    return s
+
+
+def soltar_heredados() -> None:
+    """En el hijo de un fork (un solo hilo), antes que nada: cierra los sockets heredados del padre (el
+    hijo no lee ni manda por ellos, ni retiene sus puertos) y calla las conexiones aceptadas (un mensaje
+    prestado que el hijo suelte no le devuelve nada al publicador del padre). Sin tomar candados: los pudo
+    dejar tomados un hilo del padre que en el hijo no existe. La memoria compartida no se toca."""
+    for c in list(_entradas):
+        c.lock = threading.Lock()
+        c.closed = True
+        c.dropped = True
+        c.out = bytearray()
+    for s in list(_sockets):
+        try:
+            s.close()
+        except OSError:
+            pass
+    _sockets.clear()
+    _entradas.clear()
 
 
 def _error_text(err: int) -> str:
@@ -165,7 +199,7 @@ class Outgoing:
 
     def _connect(self, src_ip: str | None) -> None:
         """Sin bloquear: el suscriptor puede tardar o no contestar nunca, y publish() no espera."""
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s = propio(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
         try:
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             _tune(s, socket.SO_SNDBUF)
@@ -313,6 +347,8 @@ class Fanout:
         self._no_link_warned: set = set()
         self.lock = threading.Lock()
         self._wake_r, self._wake_w = socket.socketpair()
+        propio(self._wake_r)
+        propio(self._wake_w)
         self._wake_r.setblocking(False)
         self._wake_w.setblocking(False)
         self._closed = False
@@ -706,6 +742,14 @@ class Fanout:
         with self.lock:
             return sum(1 for c in self.conns.values() if c.alive and c.shm == SHM_YES)
 
+    def soltar_en_el_hijo(self) -> None:
+        """En el hijo de un fork (sus sockets ya los cerró soltar_heredados): queda cerrado sin despedirse.
+        El hilo del padre no existe aquí; el pool no se toca (sus bloques y su registro son del padre)."""
+        self._closed = True
+        self.lock = threading.Lock()
+        self.conns = {}
+        self.want = []
+
     def close(self) -> None:
         self._closed = True
         with self.lock:
@@ -750,6 +794,7 @@ class _Incoming:
         self.hello = False                      # le dijimos que podemos memoria compartida
         self.leases = 0
         self.dropped = False                    # ya no se lee: se cierra al soltar el último préstamo
+        _entradas.add(self)
 
     # --- avisos al publicador (RFC 0009 §3.7) ---
     def say(self, data: bytes) -> None:
@@ -880,7 +925,7 @@ class Listener:
 
     @staticmethod
     def _open(bind: tuple[str, int]) -> socket.socket:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s = propio(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         except OSError:
@@ -932,6 +977,7 @@ class Listener:
                     c, peer = s.accept()
                 except OSError:
                     continue
+                propio(c)
                 if self.allow is not None and peer[0] not in self.allow:
                     c.close()                    # de una computadora que no es de [[machine]]
                     self.on_reject(peer[0])

@@ -951,6 +951,7 @@ struct Lease {
     std::uint32_t slot = 0;
     std::uint64_t generation = 0;
     std::size_t length = 0;
+    unsigned born_in = net::detail::fork_generation();   // en el hijo de un fork, el préstamo es del padre
 
     Lease(std::shared_ptr<Peer> p, std::shared_ptr<const shm::Segment> s, std::shared_ptr<Lent> l, std::uint32_t sl,
           std::uint64_t g, std::size_t n)
@@ -963,6 +964,10 @@ struct Lease {
     ~Lease() {
         lent->count.fetch_sub(1);
         lent->bytes.fetch_sub(length);
+        // Heredado de un fork (el hijo suelta un mensaje que recibió el padre): el bloque no se le devuelve
+        // al publicador, que se lo prestó al padre, y no se toma el candado de la conexión (lo pudo dejar
+        // tomado un hilo del padre). Su socket ya apunta a /dev/null (net::detail::cover_inherited_sockets).
+        if (born_in != net::detail::fork_generation()) return;
         try {
             peer->say(shm::Record{shm::Op::Release, slot, generation});
         } catch (...) {

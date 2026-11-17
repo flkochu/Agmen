@@ -601,14 +601,41 @@ auto without_gil(Fn&& fn) {
     return fn();
 }
 
+// En el hijo de un fork, los núcleos heredados del padre se abandonan aquí, SIN destruirlos: destruirlos
+// mandaría el `bye` con los ids del padre y borraría su memoria compartida, y exige candados que pudo
+// dejar tomados un hilo del padre (y el join de hilos que en el hijo no existen). Sus sockets ya apuntan a
+// /dev/null (net::detail::cover_inherited_sockets). Nunca se libera: son los objetos del padre.
+std::vector<std::shared_ptr<void>>* g_heredados = nullptr;   // se toca solo con el GIL
+
+void abandon_after_fork(std::shared_ptr<void> core) {
+    if (!core) return;
+    if (g_heredados == nullptr) g_heredados = new std::vector<std::shared_ptr<void>>();
+    g_heredados->push_back(std::move(core));
+}
+
+class PyPublisher;
+std::vector<PyPublisher*> g_pubs;   // los Publisher vivos (para el fork); se toca solo con el GIL
+
 class PyPublisher {
 public:
     PyPublisher(const std::string& to, const std::string& name, const std::string& text, std::uint64_t id,
                 std::size_t size, bool arrow, const std::string& topic)
         : arrow_(arrow) {
-        const NoGil nogil(Inside::Create);
-        if (!nogil.released()) throw closing_error("un Publisher");
-        core_ = std::make_shared<agmen::PublisherCore>(to, type_info(name, text, id, size, arrow), topic);
+        {
+            const NoGil nogil(Inside::Create);
+            if (!nogil.released()) throw closing_error("un Publisher");
+            core_ = std::make_shared<agmen::PublisherCore>(to, type_info(name, text, id, size, arrow), topic);
+        }
+        g_pubs.push_back(this);   // ya con el GIL
+    }
+    ~PyPublisher() { std::erase(g_pubs, this); }
+    PyPublisher(const PyPublisher&) = delete;
+    PyPublisher& operator=(const PyPublisher&) = delete;
+
+    /// En el hijo de un fork (con el GIL, un solo hilo): el núcleo es del padre. Se abandona sin destruirlo
+    /// (ver g_heredados): desde entonces es como si estuviera cerrado, y close() no hace nada.
+    static void abandon_all_after_fork() {
+        for (PyPublisher* p : g_pubs) abandon_after_fork(std::move(p->core_));
     }
 
     bool publish(nb::handle payload, std::int64_t t_data) {
@@ -721,6 +748,13 @@ public:
             p->turn_busy_ = false;
             p->turn_waiting_ = 0;
         }
+    }
+
+    /// En el hijo de un fork (con el GIL, un solo hilo, después de reset_turns_after_fork): el núcleo es
+    /// del padre. Se abandona sin destruirlo (ver g_heredados; su borrador nunca corre): desde entonces es
+    /// como si estuviera cerrado, y close() vuelve en el acto, sin esperar ni avisar.
+    static void abandon_all_after_fork() {
+        for (PySubscriber* p : g_subs) abandon_after_fork(std::move(p->core_));
     }
 
     /// None, o (sobre, payload, "ip:puerto"). timeout en segundos (None = sin límite).
@@ -920,6 +954,15 @@ public:
     ~PyNode() { std::erase(g_nodes, this); }
     PyNode(const PyNode&) = delete;
     PyNode& operator=(const PyNode&) = delete;
+
+    /// En el hijo de un fork (con el GIL, un solo hilo): el executor es del padre (sus hilos aquí no
+    /// existen). Se abandona sin destruirlo (ver g_heredados): desde entonces es como si estuviera cerrado.
+    static void abandon_all_after_fork() {
+        for (PyNode* p : g_nodes) {
+            agmen::Node* heredado = p->node_.release();   // nunca se destruye
+            (void)heredado;
+        }
+    }
 
     /// Del cierre (con el GIL): que spin() vuelva.
     static void stop_all() {
@@ -1161,9 +1204,17 @@ void cierre(nb::handle resto, nb::handle modulo, double limit_s) {
 
 /// En el hijo de un fork (os.register_at_fork): solo existe el hilo que hizo
 /// fork, así que nada está "dentro" del núcleo, el cierre empieza de cero y
-/// ningún turno de receive() queda tomado.
+/// ningún turno de receive() queda tomado. Los Publisher, Subscriber y Node
+/// heredados son del padre: se abandonan sin destruirlos y sus sockets quedan
+/// tapados con /dev/null, sin tomar sus candados. Así el hijo nunca manda el
+/// `bye` ni late con los ids del padre, no borra su memoria compartida y no
+/// retiene sus puertos (PR "fork", G1-G3); lo que cree después es suyo.
 void after_fork_child() {
     PySubscriber::reset_turns_after_fork();
+    PyPublisher::abandon_all_after_fork();
+    PySubscriber::abandon_all_after_fork();
+    PyNode::abandon_all_after_fork();
+    agmen::net::detail::cover_inherited_sockets();
     for (auto& c : g_inside) c.n.store(0);
     g_retaking.store(0);
     g_closing.store(false);

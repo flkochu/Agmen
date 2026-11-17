@@ -362,14 +362,17 @@ _sweep_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 
 class _Block:
-    __slots__ = ("name", "mm", "size", "holders", "used", "order")
+    __slots__ = ("name", "mm", "size", "holders", "used", "order", "pid")
 
     def __init__(self, name: str, mm: mmap.mmap, size: int) -> None:
         self.name, self.mm, self.size, self.holders = name, mm, size, 0
+        self.pid = os.getpid()            # quien lo creó: el hijo de un fork no lo borra
         self.used = time.monotonic()      # la última vez que se escribió o se soltó (para trim)
         self.order = 0                    # y en qué orden (para elegir el más reciente)
 
     def close(self) -> None:
+        if self.pid != os.getpid():
+            return   # heredado de un fork: el bloque es del padre, que lo sigue usando (ni se borra ni se desmapea)
         unlink(self.name)
         try:
             self.mm.close()
@@ -388,6 +391,7 @@ class Pool:
     def __init__(self, owner: int) -> None:
         global _swept
         self.owner = owner
+        self.pid = os.getpid()   # el hijo de un fork no borra los bloques ni el registro del padre
         self.counter = 0
         self.blocks: list[_Block | None] = []
         self._probe: _Block | None = None
@@ -534,7 +538,7 @@ class Pool:
         return freed
 
     def _rewrite_registry(self) -> None:
-        if not self.registry:
+        if not self.registry or self.pid != os.getpid():
             return
         names = [b.name for b in self.blocks if b is not None]
         if self._probe is not None:
@@ -551,6 +555,8 @@ class Pool:
             pass   # el registro es para limpiar si el proceso muere: nunca tumba al nodo
 
     def close(self) -> None:
+        if self.pid != os.getpid():
+            return   # heredado de un fork: los bloques y el registro son del padre
         for b in self.blocks:
             if b is not None:
                 b.close()
