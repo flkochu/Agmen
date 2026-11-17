@@ -277,8 +277,15 @@ public:
             }
             for (auto& a : reconnect(fresh, false)) {
                 if (fresh.count(a) == 0) continue;
-                if (new_.empty()) new_end_ = std::chrono::steady_clock::now() + kNewWait;   // empieza la tanda
+                const auto now = std::chrono::steady_clock::now();
+                if (new_.empty() || now >= new_end_) {
+                    // Empieza la tanda. También si la de antes ya venció sin que settle() la cerrara (una
+                    // pasada que se cortó con una excepción): si no, la nueva heredaría una espera de 0 ms.
+                    new_.clear();
+                    new_end_ = now + kNewWait;
+                }
                 new_.push_back(std::move(a));
+                has_new_.store(true, std::memory_order_release);
             }
         }
         wake();
@@ -292,6 +299,7 @@ public:
     void settle() {
         std::vector<std::string> addrs;
         std::chrono::steady_clock::time_point end;
+        if (!has_new_.load(std::memory_order_acquire)) return;   // lo común: nada que esperar (sin candado)
         {
             std::lock_guard lock(mu_);
             if (new_.empty()) return;
@@ -300,7 +308,10 @@ public:
         }
         wait_connecting(addrs, end);
         std::lock_guard lock(mu_);
-        if (new_end_ == end) new_.clear();
+        if (new_end_ == end) {
+            new_.clear();
+            has_new_.store(false, std::memory_order_release);
+        }
     }
 
     /// Deja un paquete ya armado (un anuncio) en cada conexión.
@@ -436,6 +447,7 @@ private:
     std::map<std::string, std::chrono::steady_clock::time_point> last_try_;
     std::vector<std::string> new_;                     // la tanda de conexiones nuevas que espera settle()
     std::chrono::steady_clock::time_point new_end_{};  // hasta cuándo se le espera
+    std::atomic<bool> has_new_{false};                 // ¿new_ no está vacía? (se escribe con mu_; settle() lo lee sin él)
     std::uint64_t dropped_gone_ = 0;   // de conexiones que ya se cerraron
     std::unique_ptr<shm::Pool> pool_;  // se crea cuando un suscriptor dice que puede
     std::uint64_t fallbacks_ = 0;

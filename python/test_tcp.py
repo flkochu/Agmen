@@ -359,12 +359,19 @@ class TestSinBloquear(unittest.TestCase):
     def test_una_sola_espera_por_pasada(self):
         # Varias respuestas del hub, cada una con una dirección nueva que no contesta, esperan en el
         # socket: el publish() que las lee espera una sola vez (50 ms), no una por respuesta.
+        # El latido de este Publisher se calla durante la prueba: si no, su hilo puede leer las listas
+        # antes que el publish() medido (y la prueba pasaría sin probar nada).
         muertos = [_DestinoMuerto() for _ in range(5)]
         pub = agmen.Publisher(Img, "/cam")
         try:
+            if isinstance(pub, pubsub._PurePublisher):
+                pub._link._on_tick = None        # su hilo de latido sigue latiendo, pero ya no lee al hub
+            else:
+                pub._beat = lambda: None         # el hilo de latidos del núcleo de C++ se lo salta
             for k in range(1, len(muertos) + 1):
                 self.hub.lista([f"127.0.0.1:{m.port}" for m in muertos[:k]])
             time.sleep(0.1)                      # todas ya están en el socket
+            self.assertEqual(pub.subscribers, 0, "nadie leyó las listas antes del publish() medido")
             t = time.perf_counter()
             pub.publish(Img(1, 0, b"x"))
             primero = time.perf_counter() - t
@@ -447,26 +454,64 @@ def _vaciar(s: socket.socket) -> None:
 
 
 class TestTandaCompartida(unittest.TestCase):
-    """§11 Q1 (Python puro): mientras un hilo espera la conexión de un suscriptor nuevo, el publish() de
-    otro hilo comparte lo que quede de esa espera y no se lo salta."""
+    """§11 Q1 (Python puro): el publish() que llega mientras la tanda de un suscriptor nuevo sigue en
+    curso comparte lo que quede de esa espera y no se lo salta.
+
+    Corre en un solo hilo: el par de sockets se vacía (el saludo termina) dentro de la espera misma de
+    settle(), sin un temporizador (en Windows uno de 5 ms dura ~16 ms más el arranque de su hilo, y se
+    comería los 50 ms de la tanda). Sin esa espera la conexión sigue en curso y el mensaje no le llega."""
+
+    def _vaciar_al_esperar(self, fan, vencida):
+        """Que settle() de `fan` termine el saludo de las conexiones lentas en cuanto espera, si le
+        queda tiempo; anota en `vencida` las veces que se le pidió esperar una tanda ya vencida."""
+        original = fan._wait_connecting
+
+        def espera(conns, end):
+            if end - time.perf_counter() > 0:
+                for o in _ConexionLenta.otros:
+                    _vaciar(o)
+            else:
+                vencida.append(end)
+            original(conns, end)
+
+        fan._wait_connecting = espera
 
     def test_quien_manda_no_se_salta_a_un_suscriptor_nuevo(self):
         fan = _tcp.Fanout("/cam")
         _ConexionLenta.otros = []
+        vencida: list = []
         try:
             with unittest.mock.patch.object(_tcp, "Outgoing", _ConexionLenta):
                 fan.update([("127.0.0.1", 9)], b"anuncio")   # la tanda nueva queda en curso, sin esperar
-                otro = _ConexionLenta.otros[0]
-                # El saludo termina a los ~5 ms, ya dentro de send_message (antes no lo esperaba: daba False).
-                hilo = threading.Timer(0.005, _vaciar, args=(otro,))
-                hilo.start()
+                self._vaciar_al_esperar(fan, vencida)
                 t = time.perf_counter()
                 ok = fan.send_message(wire.Envelope(seq=1), b"hola")
                 tardo = time.perf_counter() - t
-                hilo.join()
             self.assertTrue(ok, "el suscriptor nuevo debe recibir este mensaje")
+            self.assertEqual(vencida, [], "la tanda venció antes de esperarla (runner muy lento)")
             self.assertLess(tardo, 0.25, f"send_message tardó {tardo:.3f} s")
             self.assertEqual(fan.connected, 1)
+        finally:
+            fan.close()
+            for o in _ConexionLenta.otros:
+                o.close()
+
+    def test_una_tanda_vencida_no_le_quita_la_espera_al_nuevo(self):
+        # §12 S1: una pasada que se corta (una excepción entre update() y settle()) deja la tanda con su
+        # hora de fin ya pasada. El siguiente suscriptor nuevo empieza una tanda propia, con sus 50 ms.
+        fan = _tcp.Fanout("/cam")
+        _ConexionLenta.otros = []
+        vencida: list = []
+        try:
+            with unittest.mock.patch.object(_tcp, "Outgoing", _ConexionLenta):
+                fan.update([("127.0.0.1", 9)], b"anuncio")
+                with fan.lock:
+                    fan._new_end = time.perf_counter() - 1.0   # la tanda quedó sin cerrar y ya venció
+                fan.update([("127.0.0.1", 9), ("127.0.0.1", 10)], b"anuncio")
+                self._vaciar_al_esperar(fan, vencida)
+                ok = fan.send_message(wire.Envelope(seq=1), b"hola")
+            self.assertEqual(vencida, [], "el suscriptor nuevo heredó la hora de fin de una tanda vencida")
+            self.assertTrue(ok, "el suscriptor nuevo debe recibir este mensaje")
         finally:
             fan.close()
             for o in _ConexionLenta.otros:

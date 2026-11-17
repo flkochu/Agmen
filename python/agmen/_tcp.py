@@ -331,8 +331,12 @@ class Fanout:
                 del self._last_try[a]
             waiting = [c for c in self._reconnect(force=fresh) if c.addr in fresh]
             if waiting:
-                if not self._new:
-                    self._new_end = time.perf_counter() + NEW_WAIT_S   # empieza la tanda
+                now = time.perf_counter()
+                if not self._new or now >= self._new_end:
+                    # Empieza la tanda. También si la de antes ya venció sin que settle() la cerrara (una
+                    # pasada que se cortó con una excepción): si no, el nuevo heredaría una espera de 0 ms.
+                    self._new = []
+                    self._new_end = now + NEW_WAIT_S
                 self._new.extend(waiting)
         self._wake()
 
