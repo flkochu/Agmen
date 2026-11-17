@@ -129,6 +129,12 @@ template <std::size_t N>
 inline constexpr auto kCommandText =
     make_text<text_size(kCommandName, kCommandFields, N)>(kCommandName, kCommandFields, N);
 
+/// N si es válido (de 1 a `max`); si no, 1. Lo usan los miembros de las plantillas: con un N
+/// inválido, el único error que ve quien compila es el static_assert en español, y no una
+/// cascada (un esquema "f32[0]", un std::array gigante...). Con un N válido es N, sin más.
+template <std::size_t N, std::size_t Max>
+inline constexpr std::size_t safe_n = (N >= 1 && N <= Max) ? N : 1;
+
 template <std::size_t N>
 void put_all(wire::Bytes& _out, const std::array<float, N>& _a) {
     for (float _v : _a) wire::put_f32(_out, _v);
@@ -148,16 +154,20 @@ void get_all(wire::ByteView _p, std::size_t _at, std::array<float, N>& _a) {
 /// agmen/1 JointState{f32[N] position;f32[N] velocity;f32[N] effort}
 template <std::size_t N>
 struct JointState {
+    // Un solo error por caso: cada condición deja pasar lo que ya dijo la anterior.
     static_assert(N >= 1, "JointState<N>: N es cuántas articulaciones y va de 1 en adelante");
     static_assert(N <= wire::schema::kMaxArray,
                   "JointState<N>: el formato admite arreglos de hasta 1048576 elementos (RFC 0001)");
-    static_assert(N <= joints_detail::kMaxStateJoints,
+    static_assert(N > wire::schema::kMaxArray || N <= joints_detail::kMaxStateJoints,
                   "JointState<N> no cabe en un paquete UDP: mide 12·N bytes y caben 65443, así que N va de 1 "
                   "a 5453. Con más articulaciones, repártelas en varios grupos (un topic por grupo)");
 
+    /// N, o 1 si N no es válido (así un N inválido da solo el error de arriba).
+    static constexpr std::size_t kN = joints_detail::safe_n<N, joints_detail::kMaxStateJoints>;
+
     static constexpr std::string_view kName = joints_detail::kStateName;
-    static constexpr std::string_view kSchema = joints_detail::kStateText<N>.view();
-    static constexpr std::size_t kPayloadLen = 12 * N;
+    static constexpr std::string_view kSchema = joints_detail::kStateText<kN>.view();
+    static constexpr std::size_t kPayloadLen = 12 * kN;
 
     // Las mismas revisiones que lleva un tipo generado: el texto es canónico,
     // va en compact y su tamaño es el que dice el esquema.
@@ -166,11 +176,11 @@ struct JointState {
     static_assert(wire::schema::check(kSchema).size == kPayloadLen, "JointState<N>: el tamaño no es 12·N");
 
     /// Posición: rad (o m en una lineal). NaN = no se mide.
-    std::array<float, N> position = wire::filled<float, N>(joints_detail::kNaN);
+    std::array<float, kN> position = wire::filled<float, kN>(joints_detail::kNaN);
     /// Velocidad: rad/s (o m/s). NaN = no se mide.
-    std::array<float, N> velocity = wire::filled<float, N>(joints_detail::kNaN);
+    std::array<float, kN> velocity = wire::filled<float, kN>(joints_detail::kNaN);
     /// Esfuerzo: par en N·m (o fuerza en N). NaN = no se mide.
-    std::array<float, N> effort = wire::filled<float, N>(joints_detail::kNaN);
+    std::array<float, kN> effort = wire::filled<float, kN>(joints_detail::kNaN);
 
     /// Escribe los bytes (layout compact) al final de `_out`.
     void encode_into(wire::Bytes& _out) const {
@@ -183,8 +193,8 @@ struct JointState {
     [[nodiscard]] static JointState decode_at(wire::ByteView _p, std::size_t _at) {
         JointState _m;
         joints_detail::get_all(_p, _at, _m.position);
-        joints_detail::get_all(_p, _at + 4 * N, _m.velocity);
-        joints_detail::get_all(_p, _at + 8 * N, _m.effort);
+        joints_detail::get_all(_p, _at + 4 * kN, _m.velocity);
+        joints_detail::get_all(_p, _at + 8 * kN, _m.effort);
         return _m;
     }
 
@@ -221,31 +231,35 @@ struct JointState {
 /// agmen/1 JointCommand{f32[N] position;f32[N] velocity;f32[N] effort;f32[N] kp;f32[N] kd}
 template <std::size_t N>
 struct JointCommand {
+    // Un solo error por caso: cada condición deja pasar lo que ya dijo la anterior.
     static_assert(N >= 1, "JointCommand<N>: N es cuántas articulaciones y va de 1 en adelante");
     static_assert(N <= wire::schema::kMaxArray,
                   "JointCommand<N>: el formato admite arreglos de hasta 1048576 elementos (RFC 0001)");
-    static_assert(N <= joints_detail::kMaxCommandJoints,
+    static_assert(N > wire::schema::kMaxArray || N <= joints_detail::kMaxCommandJoints,
                   "JointCommand<N> no cabe en un paquete UDP: mide 20·N bytes y caben 65443, así que N va de 1 "
                   "a 3272. Con más articulaciones, repártelas en varios grupos (un topic por grupo)");
 
+    /// N, o 1 si N no es válido (así un N inválido da solo el error de arriba).
+    static constexpr std::size_t kN = joints_detail::safe_n<N, joints_detail::kMaxCommandJoints>;
+
     static constexpr std::string_view kName = joints_detail::kCommandName;
-    static constexpr std::string_view kSchema = joints_detail::kCommandText<N>.view();
-    static constexpr std::size_t kPayloadLen = 20 * N;
+    static constexpr std::string_view kSchema = joints_detail::kCommandText<kN>.view();
+    static constexpr std::size_t kPayloadLen = 20 * kN;
 
     static_assert(wire::schema::check(kSchema).ok, "JointCommand<N>: kSchema no es un esquema canónico");
     static_assert(!wire::schema::check(kSchema).variable, "JointCommand<N> va en compact (tamaño fijo)");
     static_assert(wire::schema::check(kSchema).size == kPayloadLen, "JointCommand<N>: el tamaño no es 20·N");
 
     /// Objetivo de posición: rad (o m). NaN = sin objetivo de posición.
-    std::array<float, N> position = wire::filled<float, N>(joints_detail::kNaN);
+    std::array<float, kN> position = wire::filled<float, kN>(joints_detail::kNaN);
     /// Objetivo de velocidad: rad/s (o m/s).
-    std::array<float, N> velocity = wire::filled<float, N>(0.0f);
+    std::array<float, kN> velocity = wire::filled<float, kN>(0.0f);
     /// Par (o fuerza) que se suma directo: N·m (o N).
-    std::array<float, N> effort = wire::filled<float, N>(0.0f);
+    std::array<float, kN> effort = wire::filled<float, kN>(0.0f);
     /// Ganancia de posición: N·m/rad (o N/m). NaN = la declarada para el grupo.
-    std::array<float, N> kp = wire::filled<float, N>(joints_detail::kNaN);
+    std::array<float, kN> kp = wire::filled<float, kN>(joints_detail::kNaN);
     /// Ganancia de velocidad: N·m·s/rad (o N·s/m). NaN = la declarada para el grupo.
-    std::array<float, N> kd = wire::filled<float, N>(joints_detail::kNaN);
+    std::array<float, kN> kd = wire::filled<float, kN>(joints_detail::kNaN);
 
     /// Escribe los bytes (layout compact) al final de `_out`.
     void encode_into(wire::Bytes& _out) const {
@@ -260,10 +274,10 @@ struct JointCommand {
     [[nodiscard]] static JointCommand decode_at(wire::ByteView _p, std::size_t _at) {
         JointCommand _m;
         joints_detail::get_all(_p, _at, _m.position);
-        joints_detail::get_all(_p, _at + 4 * N, _m.velocity);
-        joints_detail::get_all(_p, _at + 8 * N, _m.effort);
-        joints_detail::get_all(_p, _at + 12 * N, _m.kp);
-        joints_detail::get_all(_p, _at + 16 * N, _m.kd);
+        joints_detail::get_all(_p, _at + 4 * kN, _m.velocity);
+        joints_detail::get_all(_p, _at + 8 * kN, _m.effort);
+        joints_detail::get_all(_p, _at + 12 * kN, _m.kp);
+        joints_detail::get_all(_p, _at + 16 * kN, _m.kd);
         return _m;
     }
 

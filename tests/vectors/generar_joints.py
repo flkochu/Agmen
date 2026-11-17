@@ -66,6 +66,8 @@ def solo_posicion(n: int) -> dict:
 
 
 def main() -> None:
+    # Siempre UTF-8 y '\n' (el archivo lleva acentos y "§"): así sale igual al redirigirlo en Windows.
+    sys.stdout.reconfigure(encoding="utf-8", newline="\n")
     print("# Vectores de prueba de JointState<N> y JointCommand<N> (RFC 0013 §3.4, D5 = f). Generado por")
     print("# generar_joints.py. Columnas separadas por TAB. Los valores, en JSON de Python (NaN = NaN).")
     print("#")

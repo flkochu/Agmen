@@ -65,6 +65,12 @@ def load_vectors():
     return tipos, valores
 
 
+def child_env(**extra) -> dict:
+    """El entorno de un proceso hijo: encuentra este agmen y escribe en UTF-8 (en Windows, por una
+    tubería, Python escribiría en cp1252 y los acentos no se leerían)."""
+    return {**os.environ, "PYTHONPATH": str(HERE), "PYTHONIOENCODING": "utf-8", **extra}
+
+
 def family(name: str, numpy: bool = False):
     return getattr(msgs.types(numpy=numpy), name)
 
@@ -79,9 +85,8 @@ class TestVectores(unittest.TestCase):
 
     def test_el_archivo_sale_del_generador(self):
         """joints.txt es lo que escribe generar_joints.py (si no, alguien lo cambió a mano)."""
-        r = subprocess.run([sys.executable, str(GENERADOR)], capture_output=True, text=True, encoding="utf-8",
-                           check=True, env={**os.environ, "PYTHONPATH": str(HERE)})
-        self.assertEqual(r.stdout, VECTORS.read_text(encoding="utf-8"),
+        out = subprocess.run([sys.executable, str(GENERADOR)], capture_output=True, check=True, env=child_env()).stdout
+        self.assertEqual(out.decode("utf-8").replace("\r\n", "\n"), VECTORS.read_text(encoding="utf-8"),
                          "corre: python tests/vectors/generar_joints.py > tests/vectors/joints.txt")
 
     def test_texto_schema_id_y_tamano(self):
@@ -99,32 +104,36 @@ class TestVectores(unittest.TestCase):
         self.assertEqual(JointState[2].SCHEMA_ID, 0x7363645D20087FC9)
         self.assertEqual(JointState[12].SCHEMA_ID, 0x1BAE3D5CDDAD3EC8)
 
-    def test_bytes_con_y_sin_numpy(self):
+    def test_bytes(self):
+        self._bytes(numpy=False)
+
+    @unittest.skipIf(np is None, "NumPy no está instalado: las clases con numpy=True no se revisaron")
+    def test_bytes_con_numpy(self):
+        self._bytes(numpy=True)
+
+    def _bytes(self, numpy: bool):
         self.assertGreaterEqual(len(self.valores), 10)
-        for numpy in (False, True):
-            if numpy and np is None:
-                continue
-            for name, n, label, values, payload in self.valores:
-                with self.subTest(f"{name}[{n}] {label} numpy={numpy}"):
-                    cls = family(name, numpy)[n]
-                    if label == "por_defecto":
-                        self.assertEqual(cls().encode_payload(), payload)
-                    built = cls(**{k: (np.asarray(v, dtype="f4") if numpy else v) for k, v in values.items()})
-                    self.assertEqual(built.encode_payload(), payload)
-                    m = cls.decode_payload(payload)
-                    self.assertIs(type(m), cls)
-                    self.assertEqual(m.encode_payload(), payload)          # NaN incluidos, bit por bit
-                    for k, v in values.items():
-                        got = getattr(m, k)
-                        self.assertEqual(len(got), n)
-                        if numpy:
-                            self.assertIsInstance(got, np.ndarray)
-                        for a, b in zip(got, v, strict=True):
-                            self.assertTrue((math.isnan(a) and math.isnan(b)) or a == b, (k, a, b))
-                    # Y por el sobre: wire.encode / wire.parse.
-                    packet = wire.encode(built, 5, t_data=1234, t_pub=1234)
-                    env, body = wire.parse(packet)
-                    self.assertEqual((env.schema_id, bytes(body)), (cls.SCHEMA_ID, payload))
+        for name, n, label, values, payload in self.valores:
+            with self.subTest(f"{name}[{n}] {label} numpy={numpy}"):
+                cls = family(name, numpy)[n]
+                if label == "por_defecto":
+                    self.assertEqual(cls().encode_payload(), payload)
+                built = cls(**{k: (np.asarray(v, dtype="f4") if numpy else v) for k, v in values.items()})
+                self.assertEqual(built.encode_payload(), payload)
+                m = cls.decode_payload(payload)
+                self.assertIs(type(m), cls)
+                self.assertEqual(m.encode_payload(), payload)          # NaN incluidos, bit por bit
+                for k, v in values.items():
+                    got = getattr(m, k)
+                    self.assertEqual(len(got), n)
+                    if numpy:
+                        self.assertIsInstance(got, np.ndarray)
+                    for a, b in zip(got, v, strict=True):
+                        self.assertTrue((math.isnan(a) and math.isnan(b)) or a == b, (k, a, b))
+                # Y por el sobre: wire.encode / wire.parse.
+                packet = wire.encode(built, 5, t_data=1234, t_pub=1234)
+                env, body = wire.parse(packet)
+                self.assertEqual((env.schema_id, bytes(body)), (cls.SCHEMA_ID, payload))
 
     def test_orden(self):
         """"distintos": cada número cae en su campo y en su articulación."""
@@ -148,7 +157,7 @@ class TestVectores(unittest.TestCase):
                 "        c = T[n]; out[f'{c.NAME}{n}'] = [c.SCHEMA_TEXT, c.SCHEMA_ID, c().encode_payload().hex()]\n"
                 "print(json.dumps(out))")
         r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, encoding="utf-8",
-                           env={**os.environ, "PYTHONPATH": str(HERE), "AGMEN_BACKEND": "pure"})
+                           errors="replace", env=child_env(AGMEN_BACKEND="pure"))
         self.assertEqual(r.returncode, 0, r.stderr)
         got = json.loads(r.stdout)
         for name, n, label, _values, payload in self.valores:
@@ -164,16 +173,58 @@ class TestTipo(unittest.TestCase):
         self.assertIsNot(JointState[2], JointState[12])
         self.assertIsNot(JointState[12], JointCommand[12])
         self.assertIs(msgs.types().JointState, JointState)
-        self.assertIs(msgs.types(numpy=True).JointState[12], msgs.types(numpy=True).JointState[12])
-        if np is not None:
-            self.assertEqual(msgs.types(numpy=True).JointState[12].SCHEMA_ID, JointState[12].SCHEMA_ID)
-        self.assertIs(JointState[np.int64(12)] if np is not None else JointState[12], JointState[12])
         cls = JointState[12]
         self.assertEqual((cls.__module__, cls.__qualname__, cls.N), ("agmen.msgs", "JointState[12]", 12))
         self.assertTrue(issubclass(cls, wire.Message))
         self.assertIsInstance(cls(), JointState)
         self.assertNotIsInstance(cls(), JointCommand)
         self.assertNotIsInstance(msgs.Imu(), JointState)
+
+    @unittest.skipIf(np is None, "NumPy no está instalado: las clases con numpy=True no se revisaron")
+    def test_la_misma_clase_con_numpy(self):
+        S = msgs.types(numpy=True).JointState
+        self.assertIs(S[12], msgs.types(numpy=True).JointState[12])
+        self.assertIsNot(S[12], JointState[12])
+        self.assertEqual(S[12].SCHEMA_ID, JointState[12].SCHEMA_ID)
+        self.assertIs(JointState[np.int64(12)], JointState[12])       # un entero de NumPy también vale
+
+    @unittest.skipUnless(np is None, "NumPy está instalado")
+    def test_sin_numpy_lo_dice(self):
+        """Sin NumPy, lo de NumPy dice qué falta; lo demás funciona igual."""
+        with self.assertRaisesRegex(ImportError, "pip install numpy"):
+            msgs.types(numpy=True)
+        self.assertEqual(JointState[12]().encode_payload(), struct.pack("<I", NAN32) * 36)
+
+    def test_la_misma_clase_entre_hilos(self):
+        """Dos hilos que piden el mismo N por primera vez a la vez reciben LA MISMA clase (sin candado,
+        cada uno armaba la suya: `is`, isinstance y pickle fallaban)."""
+        from agmen import joints
+
+        hilos = 8
+        antes = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)              # que los hilos se turnen seguido: así la carrera sí se da
+        self.addCleanup(sys.setswitchinterval, antes)
+        for ronda in range(30):
+            n = 1000 + ronda                     # N que nadie pidió antes en este proceso
+            name = "JointState" if ronda % 2 else "JointCommand"
+            self.assertNotIn((name, n, False), joints._TYPES)
+            barrera = threading.Barrier(hilos)
+            got: list = [None] * hilos
+
+            def pide(k, n=n, name=name, barrera=barrera, got=got):
+                barrera.wait()
+                got[k] = joints.joint_type(name, n)
+
+            ts = [threading.Thread(target=pide, args=(k,)) for k in range(hilos)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(10)
+            self.assertNotIn(None, got, "un hilo no terminó o lanzó un error")
+            self.assertTrue(all(c is got[0] for c in got), f"ronda {ronda}: {len({id(c) for c in got})} clases distintas")
+            self.assertIs(got[0], joints.joint_type(name, n))
+            self.assertIsInstance(got[3](), getattr(msgs, name))
+            self.assertIs(type(pickle.loads(pickle.dumps(got[5]()))), got[0])
 
     def test_valores_por_defecto(self):
         for n in (1, 2, 12):
@@ -223,7 +274,7 @@ class TestTipo(unittest.TestCase):
         for bad in (1.5, None, "abcdefghijkl", b"x" * 12):
             with self.subTest(bad=bad), self.assertRaisesRegex(schema.SchemaError, "debe ser una lista o un arreglo"):
                 S(effort=bad)
-        if np is not None:
+        if np is not None:            # (con NumPy, también un arreglo de NumPy; sin él, test_numpy lo dice)
             with self.assertRaisesRegex(schema.SchemaError, r"debe tener 12 elementos \(uno por articulación\), tiene 11"):
                 msgs.types(numpy=True).JointState[12](position=np.zeros(11, dtype="f4"))
         # Si se cambia después de construir, lo dice al publicar (como cualquier tipo de Agmen).
@@ -265,8 +316,7 @@ class TestTipo(unittest.TestCase):
         data = pickle.dumps(JointCommand[12].decode_payload(payload))
         code = ("import pickle, sys; m = pickle.loads(sys.stdin.buffer.read()); "
                 "print(type(m).__qualname__, m.encode_payload().hex())")
-        r = subprocess.run([sys.executable, "-c", code], input=data, capture_output=True,
-                           env={**os.environ, "PYTHONPATH": str(HERE)})
+        r = subprocess.run([sys.executable, "-c", code], input=data, capture_output=True, env=child_env())
         self.assertEqual(r.returncode, 0, r.stderr.decode("utf-8", "replace"))
         self.assertEqual(r.stdout.decode().split(), ["JointCommand[12]", payload.hex()])
 
@@ -393,6 +443,7 @@ process.stdout.write(JSON.stringify(out));
             path = Path(d) / "joints.js"
             path.write_text(script, encoding="utf-8")
             r = subprocess.run(["node", str(path), str(AGMEN_JS)], capture_output=True, text=True, encoding="utf-8",
+                               errors="replace",
                                input=json.dumps({"tipos": [tipos[k][0] for k in keys],
                                                  "valores": [[tipos[(name, n)][0], p.hex()]
                                                              for name, n, _l, _v, p in valores]}))
@@ -456,6 +507,9 @@ int usa() {
                         r = self._compile(cxx, src)
                         self.assertNotEqual(r.returncode, 0, f"{tipo} compiló")
                         self.assertIn(texto, r.stderr)
+                        # Un solo error: el static_assert en español, sin una cascada detrás.
+                        errores = [x for x in r.stderr.splitlines() if ": error:" in x]
+                        self.assertEqual(len(errores), 1, r.stderr)
 
     @staticmethod
     def _compile(cxx: str, src: Path):

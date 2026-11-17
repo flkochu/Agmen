@@ -64,6 +64,10 @@ static_assert(m::JointState<5453>::kSchema ==
               "JointState{f32[5453] position;f32[5453] velocity;f32[5453] effort}");
 static_assert(m::JointState<2>::kName == "JointState" && m::JointCommand<2>::kName == "JointCommand");
 static_assert(m::JointState<2>::kPayloadLen == 24 && m::JointCommand<12>::kPayloadLen == 240);
+// Con un N válido, los arreglos son std::array<float, N> tal cual (kN solo cambia con un N inválido).
+static_assert(m::JointState<12>::kN == 12 && m::JointCommand<3272>::kN == 3272);
+static_assert(std::same_as<decltype(m::JointState<12>::position), std::array<float, 12>>);
+static_assert(std::same_as<decltype(m::JointCommand<2>::kd), std::array<float, 2>>);
 // Con N distinto el tipo es otro (el hub no deja mezclar 2 y 12 en un topic).
 static_assert(w::schema_id_v<m::JointState<2>> != w::schema_id_v<m::JointState<12>>);
 // El .agmen normal de hoy y la plantilla: el mismo tipo en la red.

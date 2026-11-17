@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import math
 import operator
+import threading
 from dataclasses import field, make_dataclass
 
 from . import schema, wire
@@ -84,15 +85,22 @@ def _check_n(name: str, n) -> int:
 
 
 _TYPES: dict[tuple[str, int, bool], type] = {}
+# Crear y guardar una clase va con candado: si dos hilos piden JointState[12] por primera vez a la
+# vez, los dos reciben LA MISMA clase (si no, `is`, isinstance y pickle fallarían entre hilos).
+_TYPES_LOCK = threading.Lock()
 
 
 def joint_type(name: str, n, numpy: bool = False) -> type:
-    """La clase de `name` ("JointState" o "JointCommand") con n articulaciones. La misma cada vez."""
+    """La clase de `name` ("JointState" o "JointCommand") con n articulaciones. La misma cada vez,
+    también entre hilos."""
     n = _check_n(name, n)
     key = (name, n, bool(numpy))
-    cls = _TYPES.get(key)
+    cls = _TYPES.get(key)                   # lo de siempre: ya existe, sin esperar el candado
     if cls is None:
-        cls = _TYPES[key] = _make(name, n, bool(numpy))
+        with _TYPES_LOCK:
+            cls = _TYPES.get(key)           # otro hilo pudo crearla mientras esperábamos
+            if cls is None:
+                cls = _TYPES[key] = _make(name, n, bool(numpy))
     return cls
 
 
@@ -192,7 +200,7 @@ class JointFamily:
         return self.__subclasscheck__(type(obj))
 
     def __subclasscheck__(self, cls) -> bool:
-        return any(c is cls for (k, _, _), c in _TYPES.items() if k == self._name)
+        return any(c is cls for (k, _, _), c in list(_TYPES.items()) if k == self._name)
 
     def __repr__(self) -> str:
         return f"agmen.msgs.{self._name}  (escribe {self._name}[N], N = cuántas articulaciones)"
