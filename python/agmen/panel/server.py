@@ -38,7 +38,7 @@ from .. import ws as wsmod
 from .._version import __version__
 from ..machines import lan_addresses   # vive en machines: también la usa agmen run (RFC 0011 §3.4)
 from ..pubsub import RawSubscriber, _PurePublisher, is_closed_error
-from .bridge import FOXGLOVE_PROTOCOL, PROTOCOLS, Bridge
+from .bridge import FOXGLOVE_PROTOCOL, PROTOCOLS, Bridge, ClientError, client_json, client_number
 
 HERE = Path(__file__).resolve().parent
 INDEX_HTML = (HERE / "index.html").read_bytes()
@@ -316,8 +316,24 @@ class Teleop:
         self.last_sent = 0.0
         self.last_cmd = (0.0, 0.0)
 
+    def send_client(self, m: dict) -> tuple[float, float]:
+        """Un comando de manejo como lo manda un cliente ({"left": x, "right": y}, por WebSocket o POST).
+        Los dos campos son obligatorios: uno que falta no se vuelve 0 (sería un giro que nadie pidió)."""
+        for k in ("left", "right"):
+            if k not in m:
+                raise ClientError(f"comando de manejo rechazado, no se mandó nada al robot: falta '{k}' "
+                                  f"(manda {{\"left\": x, \"right\": y}}, números de -1 a 1)")
+        return self.send(m["left"], m["right"])
+
     def send(self, left: float, right: float) -> tuple[float, float]:
-        clamp = lambda v: max(-self.max_speed, min(self.max_speed, float(v)))  # noqa: E731
+        """Publica un MotorCommand recortado a ±max_speed. Un valor que no es un número finito (NaN, ±inf,
+        texto, null, true...) rechaza el comando ENTERO con ClientError, antes de tocar nada: no se publica,
+        no se "arregla" a 0 ni al máximo (antes, min/max volvían un NaN la velocidad máxima)."""
+        try:
+            left, right = client_number(left, "left"), client_number(right, "right")
+        except ClientError as e:
+            raise ClientError(f"comando de manejo rechazado, no se mandó nada al robot: {e}") from None
+        clamp = lambda v: max(-self.max_speed, min(self.max_speed, v))  # noqa: E731  (v ya es finito)
         left, right = clamp(left), clamp(right)
         with self.lock:
             now = time.monotonic()
@@ -588,12 +604,12 @@ class Panel:
             elif action == "resume":
                 self.clock.resume()
             elif action == "step":
-                self.clock.step(float(value if value is not None else 0.1))
+                self.clock.step(client_number(value if value is not None else 0.1, "el paso del reloj"))
             elif action == "speed":
-                self.clock.set_speed(float(value))
+                self.clock.set_speed(client_number(value, "la velocidad del reloj"))
             else:
                 return f"acción de reloj desconocida '{action}' (pause, resume, step, speed)"
-        except (TypeError, ValueError) as e:
+        except (TypeError, ValueError) as e:      # ClientError es ValueError; los rangos los revisa el reloj
             return str(e)
         return None
 
@@ -868,7 +884,15 @@ class Panel:
 
             # --- POST (para scripts; el panel usa el WebSocket) ---
             def do_POST(self):
-                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length < 0:
+                        raise ValueError
+                except ValueError:
+                    self.close_connection = True      # no sabemos dónde termina el cuerpo: no se lee
+                    self._json({"error": f"Content-Length inválido: {self.headers.get('Content-Length')!r:.40} "
+                                         f"(debe ser el tamaño del cuerpo en bytes)"}, HTTPStatus.BAD_REQUEST)
+                    return
                 raw = self.rfile.read(length) if length else b""
                 if not self._authorized():
                     self._json({"error": "falta la clave del panel"}, HTTPStatus.UNAUTHORIZED)
@@ -877,9 +901,14 @@ class Panel:
                     self._json({"error": "petición rechazada (protección CSRF)"}, HTTPStatus.FORBIDDEN)
                     return
                 try:
-                    body = json.loads(raw or b"{}")
-                except json.JSONDecodeError:
-                    self._json({"error": "JSON inválido"}, HTTPStatus.BAD_REQUEST)
+                    body = client_json(raw or b"{}")     # sin NaN ni Infinity (ver bridge.client_json)
+                except ClientError as e:
+                    self._json({"error": f"petición rechazada entera (no se hizo nada ni se mandó nada al robot): "
+                                         f"{e}"}, HTTPStatus.BAD_REQUEST)
+                    return
+                if not isinstance(body, dict):
+                    self._json({"error": "no se hizo nada: el cuerpo debe ser un objeto JSON ({...})"},
+                               HTTPStatus.BAD_REQUEST)
                     return
                 parts = urlsplit(self.path).path.strip("/").split("/")
                 # /api/node/<nombre>/<start|stop|restart>
@@ -909,9 +938,9 @@ class Panel:
                                    HTTPStatus.BAD_REQUEST)
                         return
                     try:
-                        sent = panel.teleop.send(body.get("left", 0.0), body.get("right", 0.0))
-                    except (TypeError, ValueError):
-                        self._json({"error": "left/right deben ser números"}, HTTPStatus.BAD_REQUEST)
+                        sent = panel.teleop.send_client(body)
+                    except ClientError as e:
+                        self._json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
                         return
                     self._json({"ok": True, "sent": sent})
                 else:

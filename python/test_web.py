@@ -371,7 +371,7 @@ class TestManejoConValoresMalos(MotorCase):
                 c.send_text(raw)
                 err = self._error(c)
                 self.assertIn(msg, err)
-                self.assertIn("no se mandó nada", err)
+                self.assertIn("se mandó nada al robot", err)
                 self._nada()
                 time.sleep(0.02)                                       # más que el tope de ~60 Hz
                 c.send_text(json.dumps({"op": "teleop", "left": 0.4, "right": -0.4}))   # lo bueno sigue
@@ -979,6 +979,34 @@ class TestMandos(unittest.TestCase):
         self.rx.settimeout(0.6)
         with self.assertRaises(socket.timeout):     # ni un ALTO inventado: el receptor aplica su watchdog
             self.recibido()
+
+    def test_nan_e_infinito_no_llegan_al_mando(self):
+        """[[web.command]] ya revisaba cada valor (check_value): aquí, por el camino completo del panel."""
+        import math
+
+        c = self.connect()
+        for raw in ('{"op": "command", "id": 0, "fields": {"left": NaN}}',
+                    '{"op": "command", "id": 0, "fields": {"left": Infinity}}',
+                    '{"op": "command", "id": 0, "fields": {"left": 1e999}}',
+                    '{"op": "command", "id": 0, "button": NaN}'):
+            with self.subTest(raw):
+                c.send_text(raw)
+                err = json.loads(self.recv_text(c, lambda m: m.get("op") == "error"))
+                self.assertIn("no es JSON válido", err["msg"])
+        # Sin pasar por JSON (un nodo de Python que llama al panel): lo para check_value.
+        for kw, msg in (({"fields": {"left": math.nan}}, "NaN ni infinito"),
+                        ({"fields": {"left": -math.inf}}, "NaN ni infinito"),
+                        ({"fields": {"left": "0.5"}}, "debe ser un número"),
+                        ({"fields": {"left": None}}, "debe ser un número"),
+                        ({"button": math.nan}, "botón")):
+            with self.subTest(kw=kw):
+                self.assertIn(msg, self.panel.command(0, **kw) or "")
+        self.rx.settimeout(0.3)
+        with self.assertRaises(socket.timeout):     # nada de lo malo se publicó
+            self.recibido()
+        self.rx.settimeout(2)
+        c.send_text(json.dumps({"op": "command", "id": 0, "fields": {"left": 0.5}}))   # lo bueno sigue
+        self.assertEqual(self.recibido().left, 0.5)
 
     def test_post_para_scripts(self):
         self.assertEqual(self.post({"command": "Brazo", "button": "abre"}), {"ok": True})

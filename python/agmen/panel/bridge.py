@@ -100,7 +100,11 @@ def client_number(v, what: str) -> float:
 
 
 def _show(v) -> str:
-    text = json.dumps(v, ensure_ascii=False) if isinstance(v, (str, list, dict, type(None))) else repr(v)
+    """El valor como lo escribió el cliente (en JSON: true, null, "texto"), cortado si es largo."""
+    try:
+        text = json.dumps(v, ensure_ascii=False)
+    except (TypeError, ValueError):
+        text = repr(v)
     return text if len(text) <= 40 else text[:37] + "…"
 
 
@@ -307,10 +311,12 @@ class Bridge:
 
     def _agmen_op(self, c: AgmenClient, text: str) -> str | None:
         try:
-            m = json.loads(text)
-            op = m["op"]
-        except (ValueError, KeyError, TypeError):
+            m = client_json(text)
+        except ClientError as e:
+            return f"mensaje rechazado entero (no se hizo nada ni se mandó nada al robot): {e}"
+        if not isinstance(m, dict) or "op" not in m:
             return "mensaje inválido: se espera JSON con 'op'"
+        op = m["op"]
         if op in ("subscribe", "unsubscribe"):
             topic = m.get("topic")
             try:
@@ -323,9 +329,9 @@ class Bridge:
                     c.subs.pop(key, None)
                     return None
                 try:
-                    max_hz = float(m.get("max_hz", 0))
-                except (TypeError, ValueError):
-                    return "max_hz debe ser un número (0 = sin límite)"
+                    max_hz = client_number(m.get("max_hz", 0), "max_hz")
+                except ClientError as e:
+                    return f"{e} (0 = sin límite)"
                 if not 0 <= max_hz <= MAX_HZ_LIMIT:
                     return f"max_hz fuera de rango (0 a {MAX_HZ_LIMIT:g})"
                 c.subs[key] = max_hz
@@ -337,9 +343,9 @@ class Bridge:
             if self.panel.teleop is None:
                 return "teleoperación no configurada ([web.teleop] en robot.toml, o agmen web --teleop)"
             try:
-                left, right = self.panel.teleop.send(m.get("left", 0.0), m.get("right", 0.0))
-            except (TypeError, ValueError):
-                return "left/right deben ser números"
+                left, right = self.panel.teleop.send_client(m)
+            except ClientError as e:
+                return str(e)        # no se publicó nada y el hombre muerto sigue como estaba (teleop_at igual)
             c.teleop_at = time.monotonic() if (left, right) != (0.0, 0.0) else 0.0
             return None
         if op == "command":
@@ -382,22 +388,33 @@ class Bridge:
 
     def _fox_op(self, f: FoxgloveClient, text: str) -> str | None:
         try:
-            m = json.loads(text)
-            op = m["op"]
-        except (ValueError, KeyError, TypeError):
-            return "mensaje inválido"
+            m = client_json(text)
+        except ClientError as e:
+            return f"mensaje inválido: {e}"
+        if not isinstance(m, dict) or "op" not in m:
+            return "mensaje inválido: se espera JSON con 'op'"
+        op = m["op"]
+        is_id = lambda v: type(v) is int and 0 <= v < 1 << 32   # noqa: E731  (u32 en el protocolo de Foxglove)
         with self.lock:
             known = {ch.id for ch in self.channels.values()}
             if op == "subscribe":
+                subs = m.get("subscriptions", [])
+                if not isinstance(subs, list) or not all(isinstance(s, dict) for s in subs):
+                    return "subscribe: 'subscriptions' debe ser una lista de {id, channelId}"
+                if not all(is_id(s.get("id")) for s in subs):
+                    return "subscribe: cada 'id' debe ser un entero de 0 a 4294967295"
                 bad = []
-                for s in m.get("subscriptions", []):
-                    if s.get("channelId") in known:
-                        f.subs[int(s["id"])] = s["channelId"]
+                for s in subs:
+                    if is_id(s.get("channelId")) and s["channelId"] in known:
+                        f.subs[s["id"]] = s["channelId"]
                     else:
                         bad.append(s.get("channelId"))
                 return f"canales desconocidos: {bad}" if bad else None
             if op == "unsubscribe":
-                for sid in m.get("subscriptionIds", []):
+                sids = m.get("subscriptionIds", [])
+                if not isinstance(sids, list) or not all(is_id(s) for s in sids):
+                    return "unsubscribe: 'subscriptionIds' debe ser una lista de enteros"
+                for sid in sids:
                     f.subs.pop(sid, None)
                 return None
         return f"Agmen todavía no soporta '{op}' desde Foxglove (por ahora es solo lectura)"
