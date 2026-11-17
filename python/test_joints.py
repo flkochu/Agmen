@@ -362,7 +362,8 @@ class TestMismoTipoQueUnAgmen(unittest.TestCase):
 
 class TestHub(unittest.TestCase):
     def test_2_contra_12_en_el_mismo_topic(self):
-        """El número es parte del tipo: el hub rechaza al segundo (ya lo hacía por schema_id; aquí solo se fija)."""
+        """El número es parte del tipo: el hub rechaza al segundo (ya lo hacía por schema_id) y dice en qué
+        cambian: f32[12] contra f32[2]."""
         import socket
 
         from agmen import hub as H
@@ -384,14 +385,21 @@ class TestHub(unittest.TestCase):
             p12.publish(JointState[12]())
             p2 = agmen.Publisher(JointState[2], "/patas/estado")
             closers.append(p2)
-            with self.assertRaisesRegex(wire.WireError, r"ya es de tipo JointState.*JointState"):
+            with self.assertRaisesRegex(wire.WireError, r"ya es de tipo JointState.*JointState") as ctx:
                 for _ in range(100):           # el rechazo llega en la respuesta del hub (de inmediato o al siguiente)
                     p2.publish(JointState[2]())
                     threading.Event().wait(0.01)
+            # Los dos se llaman JointState: el aviso muestra la forma (RFC 0013 §3.4), y sigue diciendo qué hacer.
+            msg = str(ctx.exception)
+            self.assertIn("se llaman igual pero no tienen la misma forma, JointState{f32[12] position;…} contra "
+                          "JointState{f32[2] position;…}", msg)
+            self.assertIn("Un topic, un tipo: usa otro nombre de topic o el mismo esquema", msg)
             sub = agmen.Subscriber(JointState[2], "/patas/estado")
             closers.append(sub)
-            with self.assertRaisesRegex(wire.WireError, "ya es de tipo JointState"):
+            with self.assertRaisesRegex(wire.WireError, "ya es de tipo JointState") as ctx:
                 sub.receive(1.0)
+            # Un Subscriber no manda el texto de su esquema: solo se ve la forma del que ya está.
+            self.assertIn("(el que ya está es JointState{f32[12] position;…})", str(ctx.exception))
             # Con el mismo N, entra sin problema.
             again = agmen.Subscriber(JointState[12], "/patas/estado")
             closers.append(again)

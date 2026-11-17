@@ -12,7 +12,7 @@
    `JointCommand<12>` de <agmen/joints.hpp>, tests/joints_peer.cpp) y `JointState[12]` /
    `JointCommand[12]` de Python, en los dos sentidos y con los dos núcleos: bytes, t_data y NaN
    intactos. Y el número es parte del tipo: C++ con `JointState<2>` en un topic que ya es de
-   `JointState[12]` es rechazado por el hub.
+   `JointState[12]` es rechazado por el hub, y el aviso muestra `f32[2]`.
 
     python scripts/estandar_smoke.py              # requiere haber compilado antes (build/bin/estandar_peer y joints_peer)
     python scripts/estandar_smoke.py --required   # en el CI: sin núcleo de C++, Node o pyarrow, falla
@@ -451,8 +451,11 @@ def joints_smoke(py, env0, backends, hub_addr, procs) -> None:
         ready = sub.wait_line("LISTO") and wait_for(lambda: hub_has_sub(hub_addr, topic, sub), 15, 0.1)
         rej = run([jpeer, "rechazo", "state", "2", topic], env)
         sub.stop()
-        check(f"el hub rechaza JointState<2> de C++ en un topic de JointState[12] ({backend})",
-              ready and rej.returncode == 0 and "RECHAZADO" in rej.stdout and "ya es de tipo JointState" in rej.stdout,
+        # El aviso dice en qué cambian (RFC 0013 §3.4): el Subscriber de Python no manda su esquema, el
+        # Publisher de C++ sí, así que se ve la forma del que llega.
+        check(f"el hub rechaza JointState<2> de C++ en un topic de JointState[12] ({backend}) y muestra f32[2]",
+              ready and rej.returncode == 0 and "RECHAZADO" in rej.stdout and "ya es de tipo JointState" in rej.stdout
+              and "el que llega es JointState{f32[2] position;" in rej.stdout,
               f"código {rej.returncode}\n{rej.stdout}{rej.stderr}")
 
 

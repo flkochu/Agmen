@@ -4,6 +4,7 @@
 """
 
 import io
+import json
 import os
 import re
 import sys
@@ -1084,6 +1085,293 @@ class TestMaquinas(unittest.TestCase):
 
     def test_machine_dentro_de_robot_o_profile_es_clave_desconocida(self):
         self.assertConfigError('[robot]\nname = "r"\nmachine = "x"\n', "machine")
+
+
+# [[joints]] (RFC 0013 §3.4, D6): los nombres y el orden de las articulaciones, una vez.
+PATAS = ["FR_hip", "FR_thigh", "FR_calf", "FL_hip", "FL_thigh", "FL_calf",
+         "RR_hip", "RR_thigh", "RR_calf", "RL_hip", "RL_thigh", "RL_calf"]
+
+
+def toml_valor(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, str):
+        return json.dumps(v, ensure_ascii=False)   # las secuencias de escape de JSON también valen en TOML
+    if isinstance(v, list):
+        return "[" + ", ".join(toml_valor(x) for x in v) + "]"
+    return str(v)
+
+
+def joints(name="patas", **campos):
+    """Un [[joints]] en TOML. Por defecto, el del RFC; un campo en None no se escribe."""
+    valores = {"name": name, "state": f"/{name}/estado", "command": f"/{name}/cmd", "kp": 20.0, "kd": 0.5,
+               "names": PATAS}
+    valores.update(campos)
+    lineas = "".join(f"{k} = {toml_valor(v)}\n" for k, v in valores.items() if v is not None)
+    return "\n[[joints]]\n" + lineas
+
+
+class TestJoints(unittest.TestCase):
+    """[[joints]] en robot.toml: se lee, se revisa antes de arrancar y queda en RobotConfig.joints."""
+
+    def load(self, text: str, profile=None):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "robot.toml"
+            path.write_text(text, encoding="utf-8")
+            return load_config(path, profile)
+
+    def assertConfigError(self, text: str, *must_contain: str, profile=None) -> str:
+        with self.assertRaises(ConfigError) as ctx:
+            self.load(text, profile)
+        for frag in must_contain:
+            self.assertIn(frag, str(ctx.exception))
+        return str(ctx.exception)
+
+    # --- lo que sí vale ---
+    def test_el_del_rfc(self):
+        cfg = self.load(MINIMO + joints())
+        self.assertEqual(len(cfg.joints), 1)
+        j = cfg.joints[0]
+        self.assertEqual((j.name, j.state, j.command), ("patas", "/patas/estado", "/patas/cmd"))
+        self.assertEqual(j.names, tuple(PATAS))
+        self.assertEqual(j.kp, (20.0,) * 12)        # un número se expande a uno por articulación
+        self.assertEqual(j.kd, (0.5,) * 12)
+        self.assertFalse(j.require_names)
+        self.assertEqual(j.profiles, ())
+        self.assertTrue({"/patas/estado", "/patas/cmd"} <= cfg.topics_used())
+
+    def test_lista_de_ganancias_se_respeta(self):
+        kp = [float(i) for i in range(12)]
+        j = self.load(MINIMO + joints(kp=kp, kd=[0] * 12)).joints[0]
+        self.assertEqual(j.kp, tuple(kp))
+        self.assertEqual(j.kd, (0.0,) * 12)
+        self.assertTrue(all(isinstance(v, float) for v in j.kd))
+
+    def test_sin_ganancias(self):
+        j = self.load(MINIMO + joints(kp=None, kd=None)).joints[0]
+        self.assertEqual((j.kp, j.kd), (None, None))
+
+    def test_require_names_y_profile(self):
+        cfg = self.load(MINIMO + joints(require_names=True, profile="sim"), "sim")
+        j = cfg.joints[0]
+        self.assertTrue(j.require_names)
+        self.assertEqual(j.profiles, ("sim",))
+        self.assertEqual(self.load(MINIMO + joints(profile="sim")).joints, [])   # en real no se usa
+
+    def test_solo_estado_o_solo_comando(self):
+        j = self.load(MINIMO + joints(command=None, kp=None, kd=None)).joints[0]
+        self.assertEqual((j.state, j.command), ("/patas/estado", ""))
+        j = self.load(MINIMO + joints(state=None)).joints[0]
+        self.assertEqual((j.state, j.command), ("", "/patas/cmd"))
+
+    def test_nombres_de_mujoco_y_urdf(self):
+        nombres = ["FR_hip", "brazo/codo.1", "joint-2", "J3"]
+        j = self.load(MINIMO + joints(names=nombres, kp=1, kd=0)).joints[0]
+        self.assertEqual(j.names, tuple(nombres))
+        self.assertEqual(j.kp, (1.0,) * 4)
+
+    def test_dos_grupos(self):
+        cfg = self.load(MINIMO + joints() + joints("brazo", names=["hombro", "codo"]))
+        self.assertEqual([j.name for j in cfg.joints], ["patas", "brazo"])
+
+    def test_mismo_name_en_perfiles_distintos_conviven(self):
+        texto = MINIMO + joints(profile="real") + joints(profile="sim", state="/sim/estado", command="/sim/cmd")
+        real, sim = self.load(texto, "real"), self.load(texto, "sim")
+        self.assertEqual([(j.name, j.state) for j in real.joints], [("patas", "/patas/estado")])
+        self.assertEqual([(j.name, j.state) for j in sim.joints], [("patas", "/sim/estado")])
+        # Hasta con los mismos topics y los mismos nombres: nunca se usan juntos.
+        self.load(MINIMO + joints(profile="real") + joints(profile="sim"))
+
+    def test_topic_declarado_con_su_tipo_o_sin_tipo(self):
+        self.load(MINIMO + '\n[[topic]]\nname = "/patas/estado"\ntype = "JointState"\n' + joints())
+        self.load(MINIMO + '\n[[topic]]\nname = "/patas/cmd"\ntype = "JointCommand"\n' + joints())
+        self.load(MINIMO + '\n[[topic]]\nname = "/patas/cmd"\n' + joints())   # sin type: lo revisa el hub
+
+    def test_el_perfil_de_joints_cuenta_como_conocido(self):
+        cfg = self.load(MINIMO + joints(profile="mesa"), "mesa")
+        self.assertEqual(cfg.joints[0].profiles, ("mesa",))
+
+    def test_aviso_de_perfil_mal_escrito(self):
+        cfg = self.load(MINIMO + joints(profile="rael"))
+        self.assertTrue(any("[[joints]] 'patas'" in w and "'real'" in w and "se usa" in w
+                            and "[[topic]] o [[joints]] nombra" in w for w in cfg.warnings),
+                        cfg.warnings)
+
+    def test_lineas_de_arranque(self):
+        from agmen.run import joints_lines
+
+        cfg = self.load(MINIMO + joints() + joints("brazo", names=["hombro", "codo"], kp=[1, 2], kd=None,
+                                                  require_names=True)
+                        + joints("cabeza", command=None, kp=None, kd=None, names=["cuello"]))
+        lineas = joints_lines(cfg)
+        self.assertEqual(lineas[0], "articulaciones 'patas': 12 (FR_hip, FR_thigh … RL_calf) · estado "
+                                    "/patas/estado · comando /patas/cmd · kp 20, kd 0.5")
+        self.assertEqual(lineas[1], "articulaciones 'brazo': 2 (hombro, codo) · estado /brazo/estado · comando "
+                                    "/brazo/cmd · kp por articulación (1 a 2) · require_names")
+        self.assertEqual(lineas[2], "articulaciones 'cabeza': 1 (cuello) · estado /cabeza/estado")
+        self.assertIn("sin kp ni kd (se usan las del driver)",
+                      joints_lines(self.load(MINIMO + joints(kp=None, kd=None)))[0])
+        self.assertEqual(joints_lines(self.load(MINIMO)), [])
+
+    def test_agmen_run_nombra_el_archivo(self):
+        import contextlib
+
+        from agmen import cli
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "robot.toml"
+            path.write_text(MINIMO + joints(names=["a", "a"], kp=1, kd=1), encoding="utf-8")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                code = cli.main(["run", str(path), "--no-web"])
+        self.assertEqual(code, 2)
+        self.assertIn(f"error en {path}: [[joints]] 'patas': 'a' está dos veces en names", err.getvalue())
+
+    # --- lo que no vale: no arranca y dice qué pasó y qué hacer ---
+    def test_nombre_repetido_en_el_grupo(self):
+        self.assertConfigError(MINIMO + joints(names=PATAS[:3] + ["FR_hip"], kp=1, kd=1),
+                               "[[joints]] 'patas'", "'FR_hip' está dos veces en names (names[0] y names[3])",
+                               "quita una o corrige el nombre")
+
+    def test_nombre_repetido_entre_grupos(self):
+        self.assertConfigError(MINIMO + joints() + joints("brazo", names=["hombro", "FL_calf"], kp=1, kd=1),
+                               "la articulación 'FL_calf' está en dos grupos", "[[joints]] 'patas'",
+                               "[[joints]] 'brazo'", "quítala de uno")
+
+    def test_nombre_repetido_entre_grupos_de_perfiles_distintos_vale(self):
+        cfg = self.load(MINIMO + joints(profile="real")
+                        + joints("sim_patas", profile="sim", state="/s/estado", command="/s/cmd"), "sim")
+        self.assertEqual([j.name for j in cfg.joints], ["sim_patas"])
+
+    def test_nombre_repetido_entre_grupos_que_comparten_un_perfil(self):
+        self.assertConfigError(MINIMO + joints(profile=["real", "mesa"])
+                               + joints("otro", profile=["sim", "mesa"], state="/o/e", command="/o/c"),
+                               "la articulación 'FR_hip' está en dos grupos que se usan juntos en el perfil 'mesa'")
+
+    def test_dos_grupos_con_el_mismo_name(self):
+        self.assertConfigError(MINIMO + joints() + joints(state="/b/e", command="/b/c", names=["x"]),
+                               "hay dos [[joints]] llamados 'patas'", "ponles perfiles distintos")
+
+    def test_dos_grupos_con_el_mismo_name_en_el_mismo_perfil(self):
+        self.assertConfigError(MINIMO + joints(profile="sim") + joints(state="/b/e", command="/b/c", names=["x"]),
+                               "hay dos [[joints]] llamados 'patas' que se usan juntos en el perfil 'sim'",
+                               "Cambia el name de uno")
+
+    def test_state_y_command_iguales(self):
+        self.assertConfigError(MINIMO + joints(state="/patas", command="/patas"),
+                               "[[joints]] 'patas': state y command son el mismo topic ('/patas')", "Usa dos topics")
+
+    def test_topic_de_otro_grupo(self):
+        for clave in ("state", "command"):
+            with self.subTest(clave=clave):
+                otro = {"state": "/x/e", "command": "/x/c", clave: "/patas/cmd"}
+                self.assertConfigError(MINIMO + joints() + joints("brazo", names=["codo"], **otro),
+                                       f"[[joints]] 'brazo': {clave} = '/patas/cmd' ya es el command del "
+                                       f"[[joints]] 'patas'", "cambia uno")
+
+    def test_topic_declarado_con_otro_tipo(self):
+        self.assertConfigError(MINIMO + '\n[[topic]]\nname = "/patas/estado"\ntype = "Imu"\n' + joints(),
+                               "[[joints]] 'patas': state = '/patas/estado' es un topic de JointState, pero "
+                               "[[topic]] '/patas/estado' dice type = \"Imu\"", "type = \"JointState\"")
+        self.assertConfigError(MINIMO + '\n[[topic]]\nname = "/patas/cmd"\ntype = "JointState"\n' + joints(),
+                               "command = '/patas/cmd' es un topic de JointCommand")
+
+    def test_topic_con_otro_tipo_en_otro_perfil_vale(self):
+        self.load(MINIMO + '\n[[topic]]\nname = "/patas/estado"\ntype = "Imu"\nprofile = "sim"\n'
+                  + joints(profile="real"))
+
+    def test_topic_de_agmen_o_del_mux(self):
+        self.assertConfigError(MINIMO + joints(state="/clock"), "state = '/clock' es un topic de Agmen (de tipo Clock)")
+        mux = ('\n[[mux]]\nname = "ruedas"\noutput = "127.0.0.1:7500"\n[[mux.input]]\nname = "a"\n'
+               'listen = "127.0.0.1:7510"\npriority = 1\n')
+        self.assertConfigError(MINIMO + mux + joints(command="/mux/ruedas"), "es un topic de Agmen (de tipo MuxEstado)")
+
+    def test_topic_del_panel_con_otro_tipo(self):
+        self.assertConfigError(MINIMO + '\n[web.teleop]\ntarget = "/patas/cmd"\n' + joints(),
+                               "[[joints]] 'patas': command = '/patas/cmd' es un topic de JointCommand, pero "
+                               "[web.teleop] manda MotorCommand")
+
+    def test_topic_invalido(self):
+        self.assertConfigError(MINIMO + joints(state="patas"), "[[joints]] 'patas' state:")
+        self.assertConfigError(MINIMO + joints(command=5), "command es el topic de JointCommand")
+
+    def test_sin_state_ni_command(self):
+        self.assertConfigError(MINIMO + joints(state=None, command=None),
+                               "[[joints]] 'patas': falta 'state'", "o 'command'", "Pon al menos uno")
+
+    def test_falta_name(self):
+        self.assertConfigError(MINIMO + joints(name=None, state="/a", command="/b"),
+                               "[[joints]] #1: falta 'name'", 'name = "patas"')
+        self.assertConfigError(MINIMO + joints(name="mis patas", state="/a", command="/b"),
+                               "no es un nombre de grupo válido")
+
+    def test_names_falta_o_vacia(self):
+        self.assertConfigError(MINIMO + joints(names=None), "[[joints]] 'patas': falta 'names'", "ESTE es el orden")
+        self.assertConfigError(MINIMO + joints(names=[]), "names es una lista no vacía")
+        self.assertConfigError(MINIMO + joints(names="FR_hip"), "names es una lista no vacía")
+
+    def test_names_con_algo_que_no_es_texto(self):
+        self.assertConfigError(MINIMO + joints(names=["a", 3], kp=1, kd=1),
+                               "[[joints]] 'patas': names[1] = 3 no es un texto")
+
+    def test_nombres_invalidos(self):
+        casos = {"": "está vacío", "FR hip": "tiene un espacio", "a,b": "tiene una coma", "a=b": "tiene un '='",
+                 "a\tb": "carácter de control", "a\x01": "carácter de control", "cadera_izquierdá": "tiene 'á'",
+                 "a:b": "tiene ':'"}
+        for nombre, por_que in casos.items():
+            with self.subTest(nombre=nombre):
+                self.assertConfigError(MINIMO + joints(names=["ok", nombre], kp=1, kd=1),
+                                       "[[joints]] 'patas': names[1] =", "no es un nombre de articulación válido",
+                                       por_que, "'_', '-', '.' o '/'")
+
+    def test_mas_articulaciones_de_las_que_caben(self):
+        from agmen.joints import max_joints
+
+        sc, cmd = max_joints("JointState"), max_joints("JointCommand")
+        self.assertEqual((sc, cmd), (5453, 3272))
+        muchos = [f"j{i}" for i in range(cmd + 1)]
+        self.assertConfigError(MINIMO + joints(names=muchos, kp=1, kd=1),
+                               f"names tiene {cmd + 1} articulaciones y un JointCommand cabe en un paquete UDP "
+                               f"con hasta {cmd}", "varios [[joints]]")
+        self.load(MINIMO + joints(names=muchos, command=None, kp=None, kd=None))   # JointState sí las admite
+        self.load(MINIMO + joints(names=muchos[:cmd], kp=1, kd=1))
+        demasiados = [f"j{i}" for i in range(sc + 1)]
+        self.assertConfigError(MINIMO + joints(names=demasiados, command=None, kp=None, kd=None),
+                               f"un JointState cabe en un paquete UDP con hasta {sc}")
+
+    def test_ganancias_invalidas(self):
+        casos = [(-1, "kp = -1 es negativo"), ("nan", "no es un número finito"), ("inf", "no es un número finito"),
+                 ("-inf", "no es un número finito"), ('"20"', "kp = '20' no es un número"),
+                 ("true", "kp = True no es un número"), ("[1, 2]", "La lista de kp tiene 2 y names tiene 12"),
+                 ("[" + ", ".join(["1"] * 11) + ", -0.5]", "kp[11] = -0.5 es negativo"),
+                 ("[" + ", ".join(["1"] * 11) + ", nan]", "kp[11] = nan no es un número finito"),
+                 ("[" + ", ".join(["1"] * 11) + ", false]", "kp[11] = False no es un número"),
+                 ("[]", "La lista de kp tiene 0")]
+        for valor, frag in casos:
+            with self.subTest(valor=valor):
+                texto = MINIMO + joints(kp=None) + f"kp = {valor}\n"
+                self.assertConfigError(texto, "[[joints]] 'patas': kp es la ganancia de posición", frag,
+                                       "un número ≥ 0 para todas")
+        self.assertConfigError(MINIMO + joints(kd=None) + "kd = -0.1\n",
+                               "kd es la ganancia de velocidad", "kd = -0.1 es negativo")
+
+    def test_require_names(self):
+        self.assertConfigError(MINIMO + joints(require_names="si"), "require_names es true o false")
+        self.assertConfigError(MINIMO + joints(require_names=True, command=None),
+                               "require_names = true exige la lista", "este grupo no tiene command")
+
+    def test_clave_desconocida(self):
+        self.assertConfigError(MINIMO + joints(nmaes=["a"]), "clave desconocida 'nmaes' en [[joints]] #1",
+                               "¿Quisiste decir 'names'?")
+
+    def test_joints_no_es_lista_de_tablas(self):
+        self.assertConfigError('joints = "patas"\n' + MINIMO, "[[joints]]")
+        self.assertConfigError('[joints]\nname = "patas"\n' + MINIMO, "[[joints]]")
+
+    def test_profile_con_las_reglas_de_topic(self):
+        self.assertConfigError(MINIMO + joints(profile=[]), "[[joints]] 'patas': profile es un perfil")
+        self.assertConfigError(MINIMO + joints(profile="sí"), "no es un nombre de perfil válido")
+        self.assertConfigError(MINIMO + joints(), "el perfil 'mesa' no existe", "[[joints]]", profile="mesa")
 
 
 if __name__ == "__main__":

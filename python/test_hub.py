@@ -523,6 +523,18 @@ class TestModoRed(unittest.TestCase):
         self.assertEqual(op, "error")
         self.assertIn("de 'n_p1' en esta computadora", f["msg"])
         self.assertIn("'cam' (en la computadora 'robot') quiere usarlo con Imu", f["msg"])
+        self.assertNotIn("misma forma", f["msg"])   # los nombres ya dicen la diferencia
+
+    def test_mismo_nombre_otra_forma_entre_computadoras(self):
+        """RFC 0013 §3.4: si los dos se llaman igual, el aviso muestra en qué cambia el texto del esquema."""
+        self.red()
+        self.pub(schema="00000000000000aa")       # Cmd{f32 a}
+        ((op, f), _), = self.send("pub", id="r1", node="cam", pid=7, topic="/cmd", schema="00000000000000bb",
+                                  type="Cmd", text="agmen/1 Cmd{f64 a}", machine="robot")
+        self.assertEqual(op, "error")
+        self.assertIn("(en la computadora 'robot') quiere usarlo con Cmd (schema_id 00000000000000bb): se llaman "
+                      "igual pero no tienen la misma forma, Cmd{f32 a} contra Cmd{f64 a}. Un topic, un tipo, también "
+                      "entre computadoras", f["msg"])
 
     def test_topics_esperados_y_obligatorios(self):
         self.hub.expected = {e.topic: e for e in H.parse_expected(["/cmd=Cmd"], ["/cmd"])}
@@ -885,6 +897,39 @@ class TestNetIp(unittest.TestCase):
             self.hub("300.1.1.1")
         with self.assertRaisesRegex(OSError, "AGMEN_NET_IP=192.0.2.77 no es una IP de esta computadora"):
             self.hub("192.0.2.77")
+
+
+class TestDiferenciaDeEsquemas(unittest.TestCase):
+    """hub.schema_difference: el texto del aviso cuando dos esquemas se llaman igual (RFC 0013 §3.4)."""
+
+    def test_primer_campo_distinto(self):
+        a = "agmen/1 JointState{f32[12] position;f32[12] velocity;f32[12] effort}"
+        b = "agmen/1 JointState{f32[2] position;f32[2] velocity;f32[2] effort}"
+        self.assertEqual(H.schema_difference(a, b), ("JointState{f32[12] position;…}", "JointState{f32[2] position;…}"))
+        self.assertEqual(H.schema_difference("agmen/1 A{f32 x;f32 y;f32 z}", "agmen/1 A{f32 x;f64 y;f32 z}"),
+                         ("A{…;f32 y;…}", "A{…;f64 y;…}"))
+
+    def test_campos_de_mas(self):
+        self.assertEqual(H.schema_difference("agmen/1 A{f32 x;f32 y}", "agmen/1 A{f32 x;f32 y;f32 z}"),
+                         ("A{…} (2 campos)", "A{…;f32 z} (3 campos)"))
+
+    def test_anidados_quedan_enteros(self):
+        a = "agmen/1 P{V{f32 x;f32 y} v;u8 k}"
+        b = "agmen/1 P{V{f32 x;f64 y} v;u8 k}"
+        self.assertEqual(H.schema_difference(a, b), ("P{V{f32 x;f32 y} v;…}", "P{V{f32 x;f64 y} v;…}"))
+
+    def test_acotado(self):
+        largo = "agmen/1 A{f32[3] " + "x" * 500 + "}"
+        a, b = H.schema_difference(largo, "agmen/1 A{f32[4] y}")
+        self.assertLessEqual(len(a), H.SHAPE_MAX)
+        self.assertTrue(a.endswith("…}"))
+        self.assertEqual(b, "A{f32[4] y}")
+        raro = "z" * 500   # sin la forma de siempre: se recorta tal cual
+        self.assertEqual(len(H.schema_difference(raro, largo)[0]), H.SHAPE_MAX)
+
+    def test_un_lado_sin_texto(self):
+        self.assertEqual(H.schema_difference("", "agmen/1 A{f32 x;f32 y}"), ("", "A{f32 x;…}"))
+        self.assertEqual(H.schema_difference("", ""), ("", ""))
 
 
 if __name__ == "__main__":

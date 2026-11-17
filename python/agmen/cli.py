@@ -243,6 +243,10 @@ def _run(args) -> int:
     launcher.say(f"Agmen {__version__} · robot '{config.name}' · {len(config.nodes)} nodos · {hub_note}")
     if args.play or config.profile != "real" or config.skipped:   # un robot.toml sin perfiles se ve como antes
         launcher.say(_profile_line(config, bool(args.play)))
+    from .run import joints_lines
+
+    for line in joints_lines(config):   # [[joints]] (RFC 0013 §3.4): nombres y orden de las articulaciones
+        launcher.say(line)
     if config.machines:
         from .machines import placement_lines
 

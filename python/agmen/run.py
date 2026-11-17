@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import difflib
+import math
 import os
 import re
 import shlex
@@ -144,6 +145,21 @@ class MuxConfig:
 
 
 @dataclass
+class JointsConfig:
+    """Un grupo [[joints]] de robot.toml (RFC 0013 §3.4, D6), ya revisado: los nombres y el orden de
+    las articulaciones van aquí una sola vez. Por ahora solo se lee y se muestra al arrancar; el hub
+    lo usará para comparar listas (D6 = d) en una tarea aparte."""
+    name: str
+    names: tuple[str, ...]                 # ESTE es el orden (en el robot, el simulador y la política)
+    state: str = ""                        # topic de JointState<N>; vacío = el grupo no tiene estado
+    command: str = ""                      # topic de JointCommand<N>; vacío = el grupo no tiene comando
+    kp: tuple[float, ...] | None = None    # una por articulación (N·m/rad); None = no se declararon
+    kd: tuple[float, ...] | None = None    # una por articulación (N·m·s/rad); None = no se declararon
+    require_names: bool = False            # exigir la lista a quien publique el comando (lo aplica el hub)
+    profiles: tuple[str, ...] = ()         # en qué perfiles se usa (RFC 0011); vacía = en todos
+
+
+@dataclass
 class RobotConfig:
     name: str
     base_dir: Path
@@ -163,14 +179,16 @@ class RobotConfig:
     local: bool = False                                      # [profile.X] local (RFC 0011 §3.4): se ignora machine
     machines: list[MachineConfig] = field(default_factory=list)   # [[machine]] (RFC 0011 §3.4)
     warnings: list[str] = field(default_factory=list)        # avisos (no errores) de robot.toml, ej. un perfil mal escrito
+    joints: list[JointsConfig] = field(default_factory=list)   # [[joints]] del perfil activo (RFC 0013 §3.4)
 
     def topics_used(self) -> set[str]:
         """Los topics que este robot.toml dice que usa: [[topic]], los de los [[mux]],
-        el de [web.teleop] y /clock si el tiempo es simulado. Los nodos pueden usar
-        más (eso solo lo sabe el hub cuando corren)."""
+        los de [[joints]], el de [web.teleop] y /clock si el tiempo es simulado. Los
+        nodos pueden usar más (eso solo lo sabe el hub cuando corren)."""
         from .mux import state_topic
 
         out = {t.name for t in self.topics}
+        out.update(x for j in self.joints for x in (j.state, j.command) if x)
         for m in self.muxes:
             out.update(x for x in [m.output, *(i[1] for i in m.inputs)] if x.startswith("/"))
             if self.hub:
@@ -250,7 +268,7 @@ def _of_profiles(profiles: tuple[str, ...]) -> str:
     return ("del " if len(profiles) == 1 else "de los ") + _fmt_profiles(profiles)
 
 
-def _typo_warnings(mentions: list[tuple[str, str, tuple[str, ...]]], tables) -> list[str]:
+def _typo_warnings(mentions: list[tuple[str, str, tuple[str, ...]]], tables, joints: bool = False) -> list[str]:
     """Avisos (RFC 0011 §3.2, reto 1) para un perfil que parece un error de dedo
     de real/sim/replay: no es de Agmen, no tiene [profile.P] y solo lo nombra un
     lugar del archivo. No es error: inventar perfiles se vale (ej. "mesa")."""
@@ -267,11 +285,13 @@ def _typo_warnings(mentions: list[tuple[str, str, tuple[str, ...]]], tables) -> 
             if not hint:
                 continue
             meant = " o ".join(f"'{h}'" for h in hint)   # "rela" se parece a real y a replay: se dicen los dos
-            verb = "se espera" if where.startswith("[[topic]]") else "corre"
+            verb = ("se espera" if where.startswith("[[topic]]")
+                    else "se usa" if where.startswith("[[joints]]") else "corre")
             so = (f"Así, '{name}' solo {verb} con --profile {p}" if len(profiles) == 1
                   else f"Así, '{name}' {verb} con --profile {p}"
                   + (f" y no con --profile {hint[0]}" if len(hint) == 1 and hint[0] not in profiles else ""))
-            out.append(f"{where}: profile = \"{p}\" y ningún otro [[node]], [[mux]] o [[topic]] nombra ese "
+            others = "[[node]], [[mux]], [[topic]] o [[joints]]" if joints else "[[node]], [[mux]] o [[topic]]"
+            out.append(f"{where}: profile = \"{p}\" y ningún otro {others} nombra ese "
                        f"perfil. ¿Quisiste decir {meant}? {so}. Si el perfil es a propósito, declara "
                        f"[profile.{p}] y este aviso se quita")
     return out
@@ -389,6 +409,256 @@ def _parse_machine(raw: dict, where: str, machines: list[MachineConfig]) -> str:
                       f"Sin machine, corre donde corres agmen run")
 
 
+# [[joints]] (RFC 0013 §3.4, D6). Un nombre de articulación viaja después en una línea de texto del hub
+# (la tarea de D6 = d): por eso solo letras ASCII, dígitos y los signos que usan MuJoCo y URDF en la
+# práctica. Sin espacios, comas, '=' ni caracteres de control.
+JOINTS_KEYS = {"name", "state", "command", "kp", "kd", "names", "require_names", "profile"}
+_JOINT_NAME = re.compile(r"[A-Za-z0-9_./-]+")
+_JOINT_NAME_HELP = ("Usa letras (sin acentos), dígitos, '_', '-', '.' o '/', como en el modelo (MuJoCo o URDF), "
+                    "ej. \"FR_hip\" o \"brazo/codo.1\"")
+_JOINT_KIND = {"state": "JointState", "command": "JointCommand"}
+_GAIN_HELP = {"kp": "de posición (N·m/rad)", "kd": "de velocidad (N·m·s/rad)"}
+
+
+def _bad_char(name: str) -> str:
+    """Por qué un nombre de articulación no vale, en palabras."""
+    if not name:
+        return "está vacío"
+    for c in name:
+        if not _JOINT_NAME.fullmatch(c):
+            if c == " ":
+                return "tiene un espacio"
+            if c == ",":
+                return "tiene una coma"
+            if c == "=":
+                return "tiene un '='"
+            if ord(c) < 32 or ord(c) == 127:
+                return f"tiene un carácter de control ({ord(c):#04x})"
+            return f"tiene '{c}'"
+    return "no es válido"
+
+
+def _parse_gains(raw: dict, key: str, n: int, where: str) -> tuple[float, ...] | None:
+    """kp o kd: un número finito ≥ 0 para todas, o una lista con uno por articulación. Se expande a n valores."""
+    if key not in raw:
+        return None
+    value = raw[key]
+    rule = (f"{where}: {key} es la ganancia {_GAIN_HELP[key]} que se usa cuando el comando trae NaN: un número "
+            f"≥ 0 para todas (ej. {key} = {20.0 if key == 'kp' else 0.5}) o una lista con uno por articulación "
+            f"({n} números, en el orden de names)")
+
+    def number(v, label: str) -> float:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ConfigError(f"{rule}. {label} = {v!r} no es un número")
+        if not math.isfinite(v):
+            raise ConfigError(f"{rule}. {label} = {v} no es un número finito (ni nan ni inf)")
+        if v < 0:
+            raise ConfigError(f"{rule}. {label} = {v} es negativo")
+        return float(v)
+
+    if isinstance(value, list):
+        if len(value) != n:
+            raise ConfigError(f"{rule}. La lista de {key} tiene {len(value)} y names tiene {n}")
+        return tuple(number(v, f"{key}[{i}]") for i, v in enumerate(value))
+    return (number(value, key),) * n
+
+
+def _parse_joints(data: dict, topics: list[TopicConfig], mux_names: list[tuple[str, tuple[str, ...]]],
+                  hub_enabled: bool) -> list[JointsConfig]:
+    """Los [[joints]] de todo el archivo (de todos los perfiles), revisados ANTES de arrancar
+    (RFC 0013 §3.4): nombres repetidos, topics que chocan, ganancias y límites del tipo. Lo que
+    solo se sabe al correr (el N del tipo que se anuncia) lo revisa el hub."""
+    raw_groups = data.get("joints", [])
+    if not isinstance(raw_groups, list) or not all(isinstance(g, dict) for g in raw_groups):
+        raise ConfigError("'joints' se declara como [[joints]] (un grupo de articulaciones por tabla), ej.\n\n"
+                          "  [[joints]]\n  name = \"patas\"\n  state = \"/patas/estado\"\n"
+                          "  command = \"/patas/cmd\"\n  names = [\"cadera\", \"rodilla\"]")
+    if not raw_groups:
+        return []
+    from . import hubproto as hp
+    from .hub import builtin_type
+    from .joints import max_joints
+    from .mux import state_topic
+
+    out: list[JointsConfig] = []
+    for i, raw in enumerate(raw_groups, start=1):
+        where = f"[[joints]] #{i}"
+        _check_keys(raw, JOINTS_KEYS, where)
+        name = raw.get("name")
+        if name is None:
+            raise ConfigError(f"{where}: falta 'name' (cómo se llama este grupo de articulaciones), "
+                              f"ej. name = \"patas\"")
+        if not isinstance(name, str) or not _PROFILE_NAME.fullmatch(name):
+            raise ConfigError(f"{where}: {name!r} no es un nombre de grupo válido. Usa letras (sin acentos), "
+                              f"dígitos, '_' o '-', ej. \"patas\" o \"brazo_izq\"")
+        where = f"[[joints]] '{name}'"
+        profiles = _parse_profiles(raw, where)
+        for other in out:
+            shared = _shared(profiles, other.profiles) if other.name == name else None
+            if shared is None:
+                continue
+            if not profiles and not other.profiles:
+                raise ConfigError(f"hay dos [[joints]] llamados '{name}': los nombres de grupo deben ser únicos "
+                                  f"(o, si nunca se usan juntos, ponles perfiles distintos: profile = \"real\" en "
+                                  f"uno y profile = \"sim\" en el otro)")
+            raise ConfigError(f"hay dos [[joints]] llamados '{name}' que se usan juntos {shared} (uno: "
+                              f"{_fmt_profiles(other.profiles)}; el otro: {_fmt_profiles(profiles)}). Cambia el "
+                              f"name de uno, o ponles perfiles que no se repitan")
+
+        # Los topics: al menos uno; válidos; ni entre sí, ni con otro grupo, ni con un tipo que no es el suyo.
+        found: dict[str, str] = {}
+        for key, kind in _JOINT_KIND.items():
+            if key not in raw:
+                continue
+            topic = raw[key]
+            if not isinstance(topic, str):
+                raise ConfigError(f"{where}: {key} es el topic de {kind} del grupo, un texto que empieza con '/', "
+                                  f"ej. {key} = \"/{name}/{'estado' if key == 'state' else 'cmd'}\"")
+            try:
+                hp.check_topic(topic)
+            except hp.ProtocolError as e:
+                raise ConfigError(f"{where} {key}: {e}") from None
+            found[key] = topic
+        if not found:
+            raise ConfigError(f"{where}: falta 'state' (el topic de JointState) o 'command' (el topic de "
+                              f"JointCommand). Pon al menos uno, ej. state = \"/{name}/estado\" y "
+                              f"command = \"/{name}/cmd\"")
+        if found.get("state") is not None and found.get("state") == found.get("command"):
+            raise ConfigError(f"{where}: state y command son el mismo topic ('{found['state']}'): el estado "
+                              f"(JointState) y el comando (JointCommand) son tipos distintos y un topic tiene un "
+                              f"solo tipo. Usa dos topics, ej. state = \"/{name}/estado\" y command = \"/{name}/cmd\"")
+        for key, topic in found.items():
+            kind = _JOINT_KIND[key]
+            fixed = builtin_type(topic)
+            if fixed is not None:
+                raise ConfigError(f"{where}: {key} = '{topic}' es un topic de Agmen (de tipo {fixed}). Usa otro "
+                                  f"topic para {kind}, ej. \"/{name}/{'estado' if key == 'state' else 'cmd'}\"")
+            if hub_enabled:
+                mux = next((m for m, mp in mux_names if state_topic(m) == topic and _shared(profiles, mp)), None)
+                if mux is not None:
+                    raise ConfigError(f"{where}: {key} = '{topic}' es donde el [[mux]] '{mux}' dice quién manda "
+                                      f"(tipo MuxEstado). Usa otro topic para {kind}")
+            for other in out:
+                shared = _shared(profiles, other.profiles)
+                if shared is None:
+                    continue
+                for okey in _JOINT_KIND:
+                    if getattr(other, okey) == topic:
+                        when = "" if not profiles and not other.profiles else f" (los dos se usan {shared})"
+                        raise ConfigError(f"{where}: {key} = '{topic}' ya es el {okey} del [[joints]] "
+                                          f"'{other.name}'{when}. Cada grupo usa sus propios topics (dos listas "
+                                          f"de nombres en un topic no se pueden distinguir): cambia uno")
+            for t in topics:
+                if t.name != topic or not t.type or t.type == kind:
+                    continue   # sin type en [[topic]] no se sabe el tipo: lo revisa el hub al correr
+                shared = _shared(profiles, t.profiles)
+                if shared is None:
+                    continue
+                when = "" if not profiles and not t.profiles else f" (los dos se usan {shared})"
+                raise ConfigError(f"{where}: {key} = '{topic}' es un topic de {kind}, pero [[topic]] '{topic}' "
+                                  f"dice type = \"{t.type}\"{when}. Un topic, un tipo: corrige el type de "
+                                  f"[[topic]] (type = \"{kind}\") o usa otro topic")
+
+        # names: el orden. Una lista no vacía de nombres válidos, sin repetir, que quepa en el tipo.
+        if "names" not in raw:
+            raise ConfigError(f"{where}: falta 'names', la lista de las articulaciones en orden (ESTE es el orden "
+                              f"en el robot, el simulador y la política), ej. names = [\"cadera\", \"rodilla\"]")
+        names = raw["names"]
+        if not isinstance(names, list) or not names:
+            raise ConfigError(f"{where}: names es una lista no vacía de nombres de articulación, en orden, "
+                              f"ej. names = [\"cadera\", \"rodilla\"]")
+        seen: dict[str, int] = {}
+        for k, n in enumerate(names):
+            if not isinstance(n, str):
+                raise ConfigError(f"{where}: names[{k}] = {n!r} no es un texto. Cada articulación es un nombre "
+                                  f"entre comillas, ej. \"FR_hip\"")
+            if not _JOINT_NAME.fullmatch(n):
+                raise ConfigError(f"{where}: names[{k}] = {n!r} no es un nombre de articulación válido "
+                                  f"({_bad_char(n)}). {_JOINT_NAME_HELP}")
+            if n in seen:
+                raise ConfigError(f"{where}: '{n}' está dos veces en names (names[{seen[n]}] y names[{k}]). "
+                                  f"Cada articulación va una sola vez: quita una o corrige el nombre")
+            seen[n] = k
+        for key in found:
+            kind = _JOINT_KIND[key]
+            top = max_joints(kind)
+            if len(names) > top:
+                raise ConfigError(f"{where}: names tiene {len(names)} articulaciones y un {kind} cabe en un paquete "
+                                  f"UDP con hasta {top}. Reparte las articulaciones en varios [[joints]], cada uno "
+                                  f"con sus topics")
+        for other in out:
+            shared = _shared(profiles, other.profiles)
+            if shared is None:
+                continue
+            dup = next((n for n in names if n in other.names), None)
+            if dup is not None:
+                raise ConfigError(f"la articulación '{dup}' está en dos grupos que se usan juntos {shared}: "
+                                  f"[[joints]] '{other.name}' y [[joints]] '{name}'. Una articulación es de un "
+                                  f"solo grupo: quítala de uno (o, si los grupos nunca se usan juntos, ponles "
+                                  f"perfiles distintos)")
+
+        require = raw.get("require_names", False)
+        if not isinstance(require, bool):
+            raise ConfigError(f"{where}: require_names es true o false (true = quien publique el comando debe "
+                              f"declarar su lista de nombres)")
+        if require and "command" not in found:
+            raise ConfigError(f"{where}: require_names = true exige la lista de nombres a quien publique el "
+                              f"comando, y este grupo no tiene command. Agrega command = \"/{name}/cmd\" o quita "
+                              f"require_names")
+        out.append(JointsConfig(name=name, names=tuple(names), state=found.get("state", ""),
+                                command=found.get("command", ""),
+                                kp=_parse_gains(raw, "kp", len(names), where),
+                                kd=_parse_gains(raw, "kd", len(names), where),
+                                require_names=require, profiles=profiles))
+    return out
+
+
+def _check_joints_web(joints: list[JointsConfig], web: WebConfig) -> None:
+    """Un topic de [[joints]] que el panel usa con otro tipo ([web.teleop] manda MotorCommand; cada
+    [[web.command]], el tipo de su layout). Solo el perfil activo: su [web] es el que se usa."""
+    uses = []
+    if web.teleop is not None:
+        uses.append(("[web.teleop]", web.teleop.target, "MotorCommand"))
+    for c in web.commands:
+        uses.append((f"[[web.command]] '{c.name}'", c.target, c.layout.name))
+    for j in joints:
+        for key, kind in _JOINT_KIND.items():
+            topic = getattr(j, key)
+            for who, target, type_name in uses:
+                if topic and target == topic and type_name != kind:
+                    raise ConfigError(f"[[joints]] '{j.name}': {key} = '{topic}' es un topic de {kind}, pero "
+                                      f"{who} manda {type_name} a ese topic. Un topic, un tipo: usa otro topic "
+                                      f"en uno de los dos")
+
+
+def joints_lines(config: RobotConfig) -> list[str]:
+    """Una línea por [[joints]] del perfil activo, para el arranque de agmen run (un comando, una pantalla)."""
+    def gains(key: str, values: tuple[float, ...] | None) -> str:
+        if values is None:
+            return ""
+        if all(v == values[0] for v in values):
+            return f"{key} {values[0]:g}"
+        return f"{key} por articulación ({min(values):g} a {max(values):g})"
+
+    out = []
+    for j in config.joints:
+        shown = ", ".join(j.names) if len(j.names) <= 4 else f"{', '.join(j.names[:2])} … {j.names[-1]}"
+        parts = [f"articulaciones '{j.name}': {len(j.names)} ({shown})"]
+        if j.state:
+            parts.append(f"estado {j.state}")
+        if j.command:
+            parts.append(f"comando {j.command}")
+        g = ", ".join(x for x in (gains("kp", j.kp), gains("kd", j.kd)) if x)
+        if j.command:
+            parts.append(g or "sin kp ni kd (se usan las del driver)")
+        elif g:
+            parts.append(g)
+        if j.require_names:
+            parts.append("require_names")
+        out.append(" · ".join(parts))
+    return out
+
+
 def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
     """Lee robot.toml y lo resuelve para un perfil (RFC 0011): nodes, muxes y
     topics traen solo lo que corre en él. Sin `profile`, usa [robot] profile o
@@ -401,8 +671,8 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{path.name} no es TOML válido: {e}") from None
 
-    _check_keys(data, {"robot", "node", "mux", "topic", "hub", "web", "clock", "record", "profile", "machine"},
-                path.name)
+    _check_keys(data, {"robot", "node", "mux", "topic", "hub", "web", "clock", "record", "profile", "machine",
+                       "joints"}, path.name)
     robot = data.get("robot", {})
     _check_keys(robot, {"name", "before", "profile"}, "[robot]")
     base_dir = path.parent
@@ -554,6 +824,11 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
         topics.append(TopicConfig(raw["name"], str(raw.get("type", "")), bool(raw.get("required", False)),
                                   float(gap) if gap is not None else None, profiles))
 
+    # [[joints]]: los nombres y el orden de las articulaciones (RFC 0013 §3.4), de todos los perfiles.
+    joints_all = _parse_joints(data, topics, [(m.name, m.profiles) for m in mux_configs], hub_enabled)
+    for j in joints_all:
+        mentions.append((f"[[joints]] '{j.name}'", j.name, j.profiles))
+
     # Perfiles conocidos y el activo (RFC 0011 §3.2).
     raw_tables = data.get("profile", {})
     if not isinstance(raw_tables, dict) or not all(isinstance(v, dict) for v in raw_tables.values()):
@@ -563,7 +838,9 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
         _check_keys(table, {"clock", "web", "record", "local"}, f"[profile.{x}]")
         if "local" in table and not isinstance(table["local"], bool):
             raise ConfigError(f"[profile.{x}] local: true o false (true = todo corre en esta computadora)")
-    named = {p for n in nodes for p in n.profiles} | {p for t in topics for p in t.profiles} | set(raw_tables)
+    named = ({p for n in nodes for p in n.profiles} | {p for t in topics for p in t.profiles}
+             | {p for j in joints_all for p in j.profiles} | set(raw_tables))
+    who_names = "[[node]], [[mux]], [[topic]] o [[joints]]" if joints_all else "[[node]], [[mux]] o [[topic]]"
     known = PROFILES + tuple(sorted(named - set(PROFILES)))
 
     def check_known(name: str, source_of: str) -> None:
@@ -572,7 +849,7 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
             extra = (f" ¿Quisiste decir '{hint[0]}'?" if hint
                      else f" Perfiles conocidos: {', '.join(known)}.")
             raise ConfigError(f"{source_of}{extra} Un perfil existe si "
-                              f"algún [[node]], [[mux]] o [[topic]] lo nombra en su profile, o si tiene su tabla "
+                              f"algún {who_names} lo nombra en su profile, o si tiene su tabla "
                               f"[profile.{name}]")
 
     # [robot] profile se revisa siempre, aunque --profile o --sim lo reemplacen.
@@ -601,10 +878,12 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
     nodes = [n for n in nodes if _runs_in(n.profiles, profile)]
     mux_configs = [m for m in mux_configs if _runs_in(m.profiles, profile)]
     topics = [t for t in topics if _runs_in(t.profiles, profile)]
+    joints = [j for j in joints_all if _runs_in(j.profiles, profile)]
 
     web = _parse_web(data.get("web", {}), base_dir)   # con [profile.X] web no se usa, pero se revisa
     if "web" in active:
         web = _parse_web(active["web"], base_dir, f"[profile.{profile}.web]")
+    _check_joints_web(joints, web)
 
     top_clock = data.get("clock", {})
     if "clock" in active:
@@ -631,7 +910,7 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
                        muxes=mux_configs, profile=profile, profiles=known,
                        skipped=[(n.name, n.profiles) for n in skipped_nodes],
                        local=bool(active.get("local", False)), machines=machines,
-                       warnings=_typo_warnings(mentions, raw_tables))
+                       warnings=_typo_warnings(mentions, raw_tables, bool(joints_all)), joints=joints)
 
 
 def _parse_web(web_raw, base_dir: Path, where: str = "[web]") -> WebConfig:

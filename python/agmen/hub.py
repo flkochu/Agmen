@@ -48,6 +48,62 @@ def builtin_type(topic: str) -> str | None:
     return next((t for p, t in BUILTIN_PREFIXES.items() if topic.startswith(p)), None)
 
 
+SHAPE_MAX = 80   # caracteres por lado en el aviso de dos esquemas distintos (que no salga una línea enorme)
+
+
+def _schema_parts(text: str) -> tuple[str, list[str]] | None:
+    """ "agmen/1 JointState{f32[2] position;f32[2] velocity}" → ("JointState", ["f32[2] position", …]).
+    Los tipos anidados ("Vector3f{f32 x;…} v") quedan enteros en su campo. None si no tiene esa forma."""
+    body = text.split(" ", 1)[1] if " " in text.split("{", 1)[0] else text   # sin "agmen/1 "
+    name, brace, rest = body.partition("{")
+    if not brace or not rest.endswith("}"):
+        return None
+    fields, depth, start = [], 0, 0
+    inner = rest[:-1]
+    for k, c in enumerate(inner):
+        depth += (c == "{") - (c == "}")
+        if c == ";" and depth == 0:
+            fields.append(inner[start:k])
+            start = k + 1
+    if inner:
+        fields.append(inner[start:])
+    return name, fields
+
+
+def _cut(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def schema_difference(a: str, b: str, limit: int = SHAPE_MAX) -> tuple[str, str]:
+    """Cada esquema acotado alrededor del primer campo en que cambian, para un aviso:
+    ("JointState{f32[12] position;…}", "JointState{f32[2] position;…}"). Un texto vacío (no se
+    conoce) queda vacío; si no se conoce el otro, se muestra el primer campo."""
+    pa, pb = (_schema_parts(a) if a else None), (_schema_parts(b) if b else None)
+    fa, fb = (pa[1] if pa else []), (pb[1] if pb else [])
+    k = 0
+    if pa and pb:
+        while k < len(fa) and k < len(fb) and fa[k] == fb[k]:
+            k += 1
+        if k == len(fa) == len(fb):   # los mismos campos (cambia otra cosa): el texto entero, acotado
+            return _cut(a, limit), _cut(b, limit)
+
+    def show(text: str, parts, fields: list[str]) -> str:
+        if not text:
+            return ""
+        if parts is None:
+            return _cut(text, limit)
+        name = parts[0]
+        count = f" ({len(fields)} campos)" if pa and pb and len(fa) != len(fb) else ""
+        if k >= len(fields):
+            return _cut(f"{name}{{{'…' if fields else ''}}}{count}", limit)
+        before = "…;" if k > 0 else ""
+        after = ";…" if k + 1 < len(fields) else ""
+        room = max(8, limit - len(name) - len(before) - len(after) - len(count) - 2)
+        return _cut(f"{name}{{{before}{_cut(fields[k], room)}{after}}}{count}", limit)
+
+    return show(a, pa, fa), show(b, pb, fb)
+
+
 @dataclass
 class Endpoint:
     id: str
@@ -284,6 +340,22 @@ class Hub:
         e = self._typed_endpoint(topic, exclude)
         return (e.schema, e.type) if e is not None else None
 
+    def _shapes(self, topic: str, have: Endpoint, theirs: str, text: str) -> str:
+        """Cuando los dos tipos se llaman igual (JointState con 12 y con 2 articulaciones), los dos números
+        no dicen nada: se muestra en qué cambia el texto del esquema que ya mandan los Publisher (RFC 0013
+        §3.4). Solo es el texto del aviso: no cambia el protocolo. "" si no hay nada útil que decir."""
+        if have.type and theirs and have.type != theirs:
+            return ""        # los nombres ya dicen la diferencia
+        mine = have.text or next((e.text for e in self.endpoints.values()
+                                  if e.topic == topic and e.schema == have.schema and e.text), "")
+        a, b = schema_difference(mine, text)
+        if a and b:
+            return f": se llaman igual pero no tienen la misma forma, {a} contra {b}"
+        if a or b:   # un Subscriber no manda el texto de su esquema: solo se conoce el del otro lado
+            known = f"el que ya está es {a}" if a else f"el que llega es {b}"
+            return f": se llaman igual pero no tienen la misma forma ({known})"
+        return ""
+
     def _typed_endpoint(self, topic: str, exclude: str = "") -> Endpoint | None:
         for e in self.endpoints.values():
             if e.id != exclude and e.topic == topic and e.schema != "*":
@@ -437,16 +509,17 @@ class Hub:
             have = self._typed_endpoint(topic, exclude=eid)
             if have is not None and have.schema != schema:
                 theirs = f.get("type") or schema
+                shapes = self._shapes(topic, have, theirs, f.get("text", ""))
                 if not machine and not have.machine:     # todo en esta computadora: el texto de siempre
                     raise hp.ProtocolError(f"'{topic}' ya es de tipo {have.type or have.schema} (schema_id "
                                            f"{have.schema}) y '{node}' quiere usarlo con {theirs} (schema_id "
-                                           f"{schema}). Un topic, un tipo: usa otro nombre de topic o el mismo "
-                                           f"esquema")
+                                           f"{schema}){shapes}. Un topic, un tipo: usa otro nombre de topic o el "
+                                           f"mismo esquema")
                 donde_have = f"la computadora '{have.machine}'" if have.machine else "esta computadora"
                 donde = f"la computadora '{machine}'" if machine else "esta computadora"
                 raise hp.ProtocolError(f"'{topic}' ya es de tipo {have.type or have.schema} (schema_id "
                                        f"{have.schema}, de '{have.node}' en {donde_have}) y '{node}' (en "
-                                       f"{donde}) quiere usarlo con {theirs} (schema_id {schema}). Un topic, "
+                                       f"{donde}) quiere usarlo con {theirs} (schema_id {schema}){shapes}. Un topic, "
                                        f"un tipo, también entre computadoras: usa otro nombre de topic o el "
                                        f"mismo esquema")
         src = addr
