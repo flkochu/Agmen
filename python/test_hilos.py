@@ -17,7 +17,12 @@ sistema ("Bad file descriptor") y no pierde ni duplica donde no debe:
 
 Cada caso corre en un SUBPROCESO (un aborto del núcleo no tumba la suite) con tope de tiempo. Un caso pasa
 si no hay aborto, cuelgue, error del sistema ni pérdida/duplicado prohibidos: nunca depende de ganar una
-carrera. Una carrera que casi nunca se ve no falla de verdad aquí; para eso está ThreadSanitizer:
+carrera. Los hijos corren con el turno del GIL corto (sys.setswitchinterval(0.0001)) y con NumPy ya
+importado antes de lanzar hilos: así la batería prueba el intercalado entre hilos, no el convoy del GIL. El
+convoy con el turno por omisión (5 ms) lo cubre TestPullConTope (python/test_node.py: pull() con tope por
+tiempo) y el import perezoso de NumPy desde un hilo, TestNumpyAlCrear (python/test_arrow.py).
+
+Una carrera que casi nunca se ve no falla de verdad aquí; para eso está ThreadSanitizer:
 
     cmake -S . -B build-tsan -DAGMEN_TSAN=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
     cmake --build build-tsan --parallel

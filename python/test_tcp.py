@@ -167,26 +167,54 @@ class TestConHub(unittest.TestCase):
             pub.close()
 
 
-def _destino_muerto() -> tuple[int, list[socket.socket]]:
+class _DestinoMuerto:
     """Un puerto TCP que no contesta. En Linux, uno que escucha con la cola de conexiones llena: el sistema
     descarta el SYN y quien se conecta se queda esperando (como una computadora que no contesta). En
-    Windows, un puerto sin nadie que escuche: ahí tarda ~1 s en rechazar. Devuelve el puerto y los
-    sockets que hay que cerrar al final."""
-    if sys.platform == "win32":
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind(("127.0.0.1", 0))                 # sin listen(): nadie acepta, y nadie más toma el puerto
-        return s.getsockname()[1], [s]
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.bind(("127.0.0.1", 0))
-    srv.listen(0)
-    port = srv.getsockname()[1]
-    tapan = [srv]
-    for _ in range(3):                           # llenan la cola (nadie las acepta)
-        c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        c.setblocking(False)
-        c.connect_ex(("127.0.0.1", port))
-        tapan.append(c)
-    return port, tapan
+    Windows, un puerto atado sin listen(): nadie acepta (ahí tarda ~1 s en rechazar) y nadie más lo toma.
+    revivir() lo vuelve un puerto que acepta: así se ve si el Publisher lo reintenta."""
+
+    def __init__(self) -> None:
+        self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.srv.bind(("127.0.0.1", 0))
+        self.port = self.srv.getsockname()[1]
+        self.tapan: list[socket.socket] = []
+        self.aceptadas: list[socket.socket] = []
+        self._de_tapon: set[int] = set()         # puertos de origen de las que llenan la cola
+        if sys.platform == "win32":
+            return
+        self.srv.listen(0)
+        for _ in range(3):                       # llenan la cola (nadie las acepta)
+            c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            c.setblocking(False)
+            c.connect_ex(("127.0.0.1", self.port))
+            self._de_tapon.add(c.getsockname()[1])
+            self.tapan.append(c)
+
+    def revivir(self) -> None:
+        """Desde ya acepta conexiones (las cuenta atender())."""
+        for c in self.tapan:
+            c.close()
+        self.tapan = []
+        if sys.platform == "win32":
+            self.srv.listen(16)
+        self.srv.setblocking(False)
+
+    def atender(self) -> int:
+        """Acepta lo que haya llegado y devuelve cuántas conexiones del Publisher lleva."""
+        while True:
+            try:
+                c, peer = self.srv.accept()
+            except (BlockingIOError, InterruptedError, OSError):
+                break
+            if peer[1] in self._de_tapon:
+                c.close()                        # una de las que llenaban la cola
+            else:
+                self.aceptadas.append(c)
+        return len(self.aceptadas)
+
+    def close(self) -> None:
+        for s in self.tapan + self.aceptadas + [self.srv]:
+            s.close()
 
 
 class _HubFalso:
@@ -269,21 +297,49 @@ class TestSinBloquear(unittest.TestCase):
             os.environ["AGMEN_HUB"] = self.old
 
     def test_publicar_no_espera_a_un_suscriptor_que_no_contesta(self):
-        muertos = [_destino_muerto() for _ in range(3)]
+        # Corre lo bastante para ver el plazo de conexión (1 s) vencer y el reintento (1 s después del
+        # fallo), ~2 s: ni la primera espera ni el reintento pueden frenar a publish(). A 1.3 s el primer
+        # muerto revive; que acepte una conexión prueba que se reintentó (su primer intento ya se dio
+        # por fallido). En Python puro, además, se cuentan los intentos por destino.
+        muertos = [_DestinoMuerto() for _ in range(3)]
         vivo = agmen.Subscriber(Img, "127.0.0.1:0")
         pub = agmen.Publisher(Img, "/cam")
+        puro = isinstance(pub, pubsub._PurePublisher)
+        intentos: dict = {}
+
+        class Contada(_tcp.Outgoing):
+            def __init__(self, addr, *a, **k):
+                intentos[addr] = intentos.get(addr, 0) + 1
+                super().__init__(addr, *a, **k)
+
+        def reintentados() -> bool:
+            return not puro or all(intentos.get(("127.0.0.1", m.port), 0) >= 2 for m in muertos)
+
         try:
-            self.hub.lista([f"127.0.0.1:{p}" for p, _ in muertos] + [f"127.0.0.1:{vivo.tcp_port}"])
-            time.sleep(0.05)                     # la lista ya está en el socket: la lee el primer publish()
-            peor, n = 0.0, 0
-            inicio = time.monotonic()
-            while n < 150 and time.monotonic() - inicio < 5:   # ~1.5 s: pasa el plazo y un reintento
-                t = time.perf_counter()
-                pub.publish(Img(n, 0, b"x" * 100))
-                peor = max(peor, time.perf_counter() - t)
-                n += 1
-                time.sleep(0.01)
+            with unittest.mock.patch.object(_tcp, "Outgoing", Contada):
+                self.hub.lista([f"127.0.0.1:{m.port}" for m in muertos] + [f"127.0.0.1:{vivo.tcp_port}"])
+                time.sleep(0.05)                 # la lista ya está en el socket: la lee el primer publish()
+                peor, n, revivido = 0.0, 0, None
+                inicio = time.monotonic()
+                while time.monotonic() - inicio < 8:
+                    if revivido is None and time.monotonic() - inicio >= 1.3:
+                        muertos[0].revivir()
+                        revivido = time.monotonic()
+                    t = time.perf_counter()
+                    pub.publish(Img(n, 0, b"x" * 100))
+                    peor = max(peor, time.perf_counter() - t)
+                    n += 1
+                    if revivido is not None and muertos[0].atender() >= 1 and reintentados():
+                        break
+                    time.sleep(0.01)
+                dura = time.monotonic() - inicio
+            print(f"\n  peor publish() con 3 destinos muertos: {peor:.4f} s ({n} en {dura:.2f} s)", file=sys.stderr)
             self.assertEqual(pub.subscribers, 4)
+            self.assertGreaterEqual(muertos[0].atender(), 1, "el destino que revivió se reintentó")
+            if puro:
+                for m in muertos:
+                    self.assertGreaterEqual(intentos.get(("127.0.0.1", m.port), 0), 2,
+                                            f"intentos por destino: {intentos}")
             self.assertLess(peor, 0.25, f"el peor publish() tardó {peor:.3f} s")
             got = drain(vivo)
             self.assertEqual([s.message.w for s in got], list(range(n)), "el vivo recibe todo, en orden")
@@ -296,10 +352,28 @@ class TestSinBloquear(unittest.TestCase):
             pub.close()
             cierre = time.perf_counter() - t
             vivo.close()
-            for _, tapan in muertos:
-                for s in tapan:
-                    s.close()
+            for m in muertos:
+                m.close()
         self.assertLess(cierre, 0.2, f"close() tardó {cierre:.3f} s")
+
+    def test_una_sola_espera_por_pasada(self):
+        # Varias respuestas del hub, cada una con una dirección nueva que no contesta, esperan en el
+        # socket: el publish() que las lee espera una sola vez (50 ms), no una por respuesta.
+        muertos = [_DestinoMuerto() for _ in range(5)]
+        pub = agmen.Publisher(Img, "/cam")
+        try:
+            for k in range(1, len(muertos) + 1):
+                self.hub.lista([f"127.0.0.1:{m.port}" for m in muertos[:k]])
+            time.sleep(0.1)                      # todas ya están en el socket
+            t = time.perf_counter()
+            pub.publish(Img(1, 0, b"x"))
+            primero = time.perf_counter() - t
+            self.assertEqual(pub.subscribers, len(muertos))
+            self.assertLess(primero, 0.2, f"el publish() que leyó {len(muertos)} listas tardó {primero:.3f} s")
+        finally:
+            pub.close()
+            for m in muertos:
+                m.close()
 
     def test_la_misma_lista_no_reintenta(self):
         # Un suscriptor que acepta y cierra en seguida: el Publisher pierde la conexión cada vez. El hub
@@ -341,6 +415,62 @@ class TestSinBloquear(unittest.TestCase):
             alto.set()
             hilo.join(2)
             srv.close()
+
+
+class _ConexionLenta(_tcp.Outgoing):
+    """Una conexión a esta computadora cuyo saludo TCP tarda lo que la prueba diga: un par de sockets
+    con el envío lleno, que queda lista para escribir (conectada) cuando la prueba vacía el otro lado."""
+
+    otros: list = []
+
+    def _connect(self, src_ip) -> None:
+        a, b = socket.socketpair()
+        a.setblocking(False)
+        b.setblocking(False)
+        try:
+            while True:
+                a.send(b"\0" * 65536)
+        except (BlockingIOError, InterruptedError):
+            pass
+        self.sock, self.alive, self.connecting = a, True, True
+        self.deadline = time.monotonic() + _tcp.CONNECT_TIMEOUT_S
+        self.otros.append(b)
+
+
+def _vaciar(s: socket.socket) -> None:
+    while True:
+        try:
+            if not s.recv(1 << 20):
+                return
+        except (BlockingIOError, InterruptedError):
+            return
+
+
+class TestTandaCompartida(unittest.TestCase):
+    """§11 Q1 (Python puro): mientras un hilo espera la conexión de un suscriptor nuevo, el publish() de
+    otro hilo comparte lo que quede de esa espera y no se lo salta."""
+
+    def test_quien_manda_no_se_salta_a_un_suscriptor_nuevo(self):
+        fan = _tcp.Fanout("/cam")
+        _ConexionLenta.otros = []
+        try:
+            with unittest.mock.patch.object(_tcp, "Outgoing", _ConexionLenta):
+                fan.update([("127.0.0.1", 9)], b"anuncio")   # la tanda nueva queda en curso, sin esperar
+                otro = _ConexionLenta.otros[0]
+                # El saludo termina a los ~5 ms, ya dentro de send_message (antes no lo esperaba: daba False).
+                hilo = threading.Timer(0.005, _vaciar, args=(otro,))
+                hilo.start()
+                t = time.perf_counter()
+                ok = fan.send_message(wire.Envelope(seq=1), b"hola")
+                tardo = time.perf_counter() - t
+                hilo.join()
+            self.assertTrue(ok, "el suscriptor nuevo debe recibir este mensaje")
+            self.assertLess(tardo, 0.25, f"send_message tardó {tardo:.3f} s")
+            self.assertEqual(fan.connected, 1)
+        finally:
+            fan.close()
+            for o in _ConexionLenta.otros:
+                o.close()
 
 
 def _bloque_libre(n: int, lo: int = 20000, hi: int = 30000) -> int | None:

@@ -2,6 +2,7 @@
 // viajan por TCP, un suscriptor lento recibe solo lo más nuevo y no frena a
 // nadie. La misma prueba en Python: python/test_tcp.py.
 #include <agmen/agmen.hpp>
+#include <agmen/platform.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -15,7 +16,10 @@
 #include <utility>
 #include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -144,50 +148,103 @@ void unset_env(const char* name) {
 #endif
 }
 
+#ifdef _WIN32
+using Fd = SOCKET;
+const Fd kSinFd = INVALID_SOCKET;
+void cerrar(Fd fd) { (void)::closesocket(fd); }
+void sin_bloqueo(Fd fd) {
+    u_long si = 1;
+    (void)::ioctlsocket(fd, FIONBIO, &si);
+}
+#else
+using Fd = int;
+const Fd kSinFd = -1;
+void cerrar(Fd fd) { (void)::close(fd); }
+void sin_bloqueo(Fd fd) { (void)::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL) | O_NONBLOCK); }
+#endif
+
 /// Un puerto TCP que no contesta. En Linux, uno que escucha con la cola de conexiones llena: el sistema
 /// descarta el SYN y quien se conecta se queda esperando (como una computadora que no contesta). En
-/// Windows, un puerto sin nadie que escuche: ahí tarda ~1 s en rechazar.
+/// Windows, un puerto atado sin listen(): nadie acepta (ahí tarda ~1 s en rechazar) y nadie más lo toma.
+/// revivir() lo vuelve un puerto que acepta: así se ve si el Publisher lo reintenta.
 class DestinoMuerto {
 public:
     DestinoMuerto() {
 #ifdef _WIN32
-        auto l = net::TcpListener::bind("127.0.0.1:0");
-        port_ = l.local_port();   // se cierra al salir: nadie escucha ahí
-#else
-        const int srv = ::socket(AF_INET, SOCK_STREAM, 0);
+        WSADATA wsa{};
+        (void)::WSAStartup(MAKEWORD(2, 2), &wsa);   // ya lo hizo el núcleo; aquí solo suma una referencia
+#endif
+        srv_ = ::socket(AF_INET, SOCK_STREAM, 0);
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        socklen_t len = sizeof addr;
-        if (srv < 0 || ::bind(srv, reinterpret_cast<const sockaddr*>(&addr), sizeof addr) != 0 || ::listen(srv, 0) != 0 ||
-            ::getsockname(srv, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+        socklen_t len = static_cast<socklen_t>(sizeof addr);
+        if (srv_ == kSinFd || ::bind(srv_, reinterpret_cast<const sockaddr*>(&addr), len) != 0 ||
+            ::getsockname(srv_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
             std::fprintf(stderr, "  no pude abrir el destino muerto\n");
             std::abort();
         }
         port_ = ntohs(addr.sin_port);
-        fds_.push_back(srv);
+#ifndef _WIN32
+        if (::listen(srv_, 0) != 0) {
+            std::fprintf(stderr, "  no pude abrir el destino muerto\n");
+            std::abort();
+        }
         for (int i = 0; i < 3; ++i) {   // llenan la cola (nadie las acepta)
-            const int c = ::socket(AF_INET, SOCK_STREAM, 0);
-            (void)::fcntl(c, F_SETFL, ::fcntl(c, F_GETFL) | O_NONBLOCK);
+            const Fd c = ::socket(AF_INET, SOCK_STREAM, 0);
+            sin_bloqueo(c);
             (void)::connect(c, reinterpret_cast<const sockaddr*>(&addr), sizeof addr);
-            fds_.push_back(c);
+            sockaddr_in mio{};
+            socklen_t n = static_cast<socklen_t>(sizeof mio);
+            if (::getsockname(c, reinterpret_cast<sockaddr*>(&mio), &n) == 0) de_tapon_.push_back(ntohs(mio.sin_port));
+            tapan_.push_back(c);
         }
 #endif
     }
     DestinoMuerto(const DestinoMuerto&) = delete;
     DestinoMuerto& operator=(const DestinoMuerto&) = delete;
     ~DestinoMuerto() {
-#ifndef _WIN32
-        for (const int fd : fds_) ::close(fd);
+        for (const Fd fd : tapan_) cerrar(fd);
+        for (const Fd fd : aceptadas_) cerrar(fd);
+        cerrar(srv_);
+#ifdef _WIN32
+        (void)::WSACleanup();
 #endif
     }
     [[nodiscard]] std::string addr() const { return "127.0.0.1:" + std::to_string(port_); }
 
-private:
-    std::uint16_t port_ = 0;
-#ifndef _WIN32
-    std::vector<int> fds_;
+    /// Desde ya acepta conexiones (las cuenta atender()).
+    void revivir() {
+        for (const Fd fd : tapan_) cerrar(fd);
+        tapan_.clear();
+#ifdef _WIN32
+        (void)::listen(srv_, 16);
 #endif
+        sin_bloqueo(srv_);
+    }
+
+    /// Acepta lo que haya llegado y devuelve cuántas conexiones del Publisher lleva.
+    std::size_t atender() {
+        for (;;) {
+            sockaddr_in peer{};
+            socklen_t n = static_cast<socklen_t>(sizeof peer);
+            const Fd c = ::accept(srv_, reinterpret_cast<sockaddr*>(&peer), &n);
+            if (c == kSinFd) break;
+            if (std::find(de_tapon_.begin(), de_tapon_.end(), ntohs(peer.sin_port)) != de_tapon_.end()) {
+                cerrar(c);   // una de las que llenaban la cola
+            } else {
+                aceptadas_.push_back(c);
+            }
+        }
+        return aceptadas_.size();
+    }
+
+private:
+    Fd srv_ = kSinFd;
+    std::uint16_t port_ = 0;
+    std::vector<Fd> tapan_;
+    std::vector<Fd> aceptadas_;
+    std::vector<std::uint16_t> de_tapon_;   // puertos de origen de las que llenan la cola
 };
 
 /// Un hub de mentira: al `pub` le contesta `subs` con la lista TCP que diga la prueba y, si se le pide,
@@ -273,16 +330,25 @@ private:
 };
 
 /// Un Publisher por topic que habla con `h`.
+/// AGMEN_HUB queda como estaba.
 std::unique_ptr<agmen::Publisher<Img>> publisher_de(const HubFalso& h) {
+    const std::string antes = agmen::platform::env("AGMEN_HUB");
     set_env("AGMEN_HUB", h.addr.c_str());
     auto out = std::make_unique<agmen::Publisher<Img>>("/cam");
-    unset_env("AGMEN_HUB");
+    if (antes.empty()) {
+        unset_env("AGMEN_HUB");
+    } else {
+        set_env("AGMEN_HUB", antes.c_str());
+    }
     return out;
 }
 
 double segundos(std::chrono::steady_clock::duration d) { return std::chrono::duration<double>(d).count(); }
 
 void test_publicar_no_espera_a_un_suscriptor_que_no_contesta() {
+    // Corre lo bastante para ver el plazo de conexión (1 s) vencer y el reintento (1 s después del fallo),
+    // ~2 s: ni la primera espera ni el reintento pueden frenar a publish(). A 1.3 s el primer muerto
+    // revive; que acepte una conexión prueba que se reintentó (su primer intento ya se dio por fallido).
     HubFalso h;
     DestinoMuerto m1;
     DestinoMuerto m2;
@@ -293,16 +359,24 @@ void test_publicar_no_espera_a_un_suscriptor_que_no_contesta() {
     std::this_thread::sleep_for(50ms);   // la lista ya está en el socket: la lee el primer publish()
     std::chrono::steady_clock::duration peor{};
     std::uint32_t n = 0;
+    bool revivido = false;
     const auto inicio = std::chrono::steady_clock::now();
-    while (n < 150 && std::chrono::steady_clock::now() - inicio < 5s) {   // ~1.5 s: pasa el plazo y un reintento
+    while (std::chrono::steady_clock::now() - inicio < 8s) {
+        if (!revivido && std::chrono::steady_clock::now() - inicio >= 1300ms) {
+            m1.revivir();
+            revivido = true;
+        }
         const auto t = std::chrono::steady_clock::now();
         (void)pub->publish(Img{n, 0, std::vector<std::uint8_t>(100, 1)});
         peor = std::max(peor, std::chrono::steady_clock::now() - t);
         ++n;
+        if (revivido && m1.atender() >= 1) break;
         std::this_thread::sleep_for(10ms);
     }
-    std::printf("  peor publish() con 3 destinos muertos: %.4f s\n", segundos(peor));
+    std::printf("  peor publish() con 3 destinos muertos: %.4f s (%u en %.2f s)\n", segundos(peor),
+                static_cast<unsigned>(n), segundos(std::chrono::steady_clock::now() - inicio));
     CHECK(pub->subscribers() == 4);
+    CHECK(m1.atender() >= 1);   // el destino que revivió se reintentó
     CHECK(peor < 250ms);
     std::uint32_t expect = 0;
     while (const auto s = vivo.receive(300ms)) {
@@ -356,6 +430,26 @@ void test_la_misma_lista_no_reintenta() {
     acepta.join();
 }
 
+void test_una_sola_espera_por_pasada() {
+    // Varias respuestas del hub, cada una con una dirección nueva que no contesta, esperan en el socket:
+    // el publish() que las lee espera una sola vez (50 ms), no una por respuesta.
+    HubFalso h;
+    DestinoMuerto m[5];
+    auto pub = publisher_de(h);
+    std::vector<std::string> lista;
+    for (const auto& d : m) {
+        lista.push_back(d.addr());
+        h.lista(lista);
+    }
+    std::this_thread::sleep_for(100ms);   // todas ya están en el socket
+    const auto t = std::chrono::steady_clock::now();
+    (void)pub->publish(Img{1, 0, {1}});
+    const auto primero = std::chrono::steady_clock::now() - t;
+    std::printf("  el publish() que leyó 5 listas: %.4f s\n", segundos(primero));
+    CHECK(pub->subscribers() == 5);
+    CHECK(primero < 200ms);
+}
+
 }  // namespace
 
 int main() {
@@ -364,6 +458,7 @@ int main() {
     test_muchos_chicos_en_orden();
     test_publicar_no_espera_a_un_suscriptor_que_no_contesta();
     test_la_misma_lista_no_reintenta();
+    test_una_sola_espera_por_pasada();
     if (g_failures == 0) std::printf("test_tcp: todo bien\n");
     return g_failures == 0 ? 0 : 1;
 }
