@@ -883,9 +883,13 @@ class _Receiver:
         sockets lanzan "ya se cerró". Si el turno no llega a tiempo (un hilo detenido con él, o este
         mismo hilo dentro de receive()), se avisa y los cierra quien suelte el turno, o la recolección
         del objeto."""
-        self._closed = True
+        # Primero la baja del hub, y solo después la marca de cierre: un receive() de otro hilo que ve
+        # _closed cierra los sockets al soltar su turno, y la despedida (`bye`) sale por uno de ellos.
+        # Con el orden al revés, ese hilo podía cerrar el socket debajo del envío de la despedida
+        # (lo vio ThreadSanitizer) o antes de él, y el hub no se enteraba de la baja.
         if self._link is not None:
             self._link.close()
+        self._closed = True
         if not self._rx.acquire(timeout=_RX_CIERRE_S):
             if not self._close_warned:
                 self._close_warned = True
