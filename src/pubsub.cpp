@@ -29,8 +29,11 @@ const char* clock_name(wire::Clock c) {
     return c == wire::Clock::Sim ? "simulación" : c == wire::Clock::Replay ? "reproducción" : "real";
 }
 
+/// Una conexión TCP a esta computadora que no termina en este tiempo se da por fallida (sin bloquear a nadie).
 constexpr std::chrono::milliseconds kConnectTimeout{1000};
 constexpr std::chrono::milliseconds kRetryEvery{1000};
+/// Ante direcciones nuevas, quien las descubre espera esto a que se conecten (una vez por tanda).
+constexpr std::chrono::milliseconds kNewWait{50};
 constexpr std::size_t kReadChunk = 1 << 18;
 
 using Packet = std::shared_ptr<const wire::Bytes>;
@@ -45,7 +48,7 @@ std::string host_of(const std::string& address) {
 // Modo red (RFC 0011 §2 y §3): lo mismo que python/agmen/pubsub.py y _tcp.py
 // ---------------------------------------------------------------------------
 
-/// Conectar por TCP a otra computadora espera hasta esto, sin frenar a nadie (a 127.0.0.1, kConnectTimeout).
+/// Conectar por TCP a otra computadora espera hasta esto, sin frenar a nadie (a esta, kConnectTimeout).
 // 3 s, como REMOTE_CONNECT_S en Python (la especificación no da el número).
 constexpr std::chrono::milliseconds kRemoteConnect{3000};
 /// Tras la confirmación del hub, los sockets de antes se siguen leyendo esto (NET_OLD_S en Python).
@@ -126,10 +129,10 @@ struct Outgoing {
     std::map<std::pair<std::uint32_t, std::uint64_t>, std::size_t> lent;   // mandados y no devueltos → bytes
     std::size_t lent_bytes = 0;
     wire::Bytes inbox;            // avisos a medio llegar
-    // Modo red (RFC 0011 §3): de otra computadora, sin memoria compartida y sin bloquear al conectar.
+    // Modo red (RFC 0011 §3): de otra computadora, sin memoria compartida y con aviso si no contesta.
     std::string addr;             // "ip:puerto" del suscriptor
     bool remote = false;
-    bool connecting = false;      // conexión en curso (la termina el hilo del Fanout)
+    bool connecting = false;      // conexión en curso (la termina el hilo del Fanout o quien publica)
     std::chrono::steady_clock::time_point deadline{};
 
     [[nodiscard]] bool alive() const { return stream.valid(); }
@@ -245,23 +248,41 @@ public:
         pool_.reset();   // borra los bloques (los suscriptores que aún los ven los siguen viendo)
     }
 
-    /// La lista nueva de suscriptores (del hub o la dirección fija).
+    /// La lista nueva de suscriptores (del hub o la dirección fija). Solo las direcciones nuevas se
+    /// conectan en el acto (la misma lista no fuerza nada); a las de esta computadora se les espera, sin
+    /// el candado, hasta kNewWait en total: un suscriptor sano recibe el anuncio y el mensaje de este
+    /// mismo publish(), como siempre, y uno que no contesta sigue conectándose en segundo plano.
     void update(std::vector<std::string> addrs, Packet announcement) {
+        std::vector<std::string> waiting;
         {
             std::lock_guard lock(mu_);
+            std::set<std::string> fresh;
+            for (const auto& a : addrs) {
+                if (std::find(want_.begin(), want_.end(), a) == want_.end()) fresh.insert(a);
+            }
             want_ = std::move(addrs);
             announcement_ = std::move(announcement);
+            const auto wanted = [this](const std::string& a) { return std::find(want_.begin(), want_.end(), a) != want_.end(); };
             for (auto it = conns_.begin(); it != conns_.end();) {
-                if (std::find(want_.begin(), want_.end(), it->first) == want_.end()) {
-                    last_try_.erase(it->first);
+                if (!wanted(it->first)) {
                     it = forget(it);
                 } else {
                     ++it;
                 }
             }
-            reconnect(true, false);
+            for (auto it = last_try_.begin(); it != last_try_.end();) {
+                if (!wanted(it->first)) {
+                    it = last_try_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            for (auto& a : reconnect(fresh, false)) {
+                if (fresh.count(a) != 0) waiting.push_back(std::move(a));
+            }
         }
         wake();
+        if (!waiting.empty()) wait_connecting(waiting);
     }
 
     /// Deja un paquete ya armado (un anuncio) en cada conexión.
@@ -270,10 +291,15 @@ public:
         bool wake_up = false;
         {
             std::lock_guard lock(mu_);
-            reconnect(false, false);
+            wake_up = !reconnect({}, false).empty();
+            poll_connecting();
             for (auto it = conns_.begin(); it != conns_.end();) {
                 if (!it->second.alive()) {
                     it = forget(it);
+                    continue;
+                }
+                if (waiting_local(it->second)) {   // su anuncio ya la espera: sale al conectarse
+                    ++it;
                     continue;
                 }
                 it->second.offer(Item{packet}, pool_.get());
@@ -294,7 +320,8 @@ public:
         bool wake_up = false;
         {
             std::lock_guard lock(mu_);
-            reconnect(false, true);
+            wake_up = !reconnect({}, true).empty();
+            poll_connecting();
             // D3: el mensaje nuevo reemplaza al que esperaba. Se suelta antes de
             // escribir, así su bloque se puede reutilizar para este.
             for (auto& [_, c] : conns_) {
@@ -311,6 +338,10 @@ public:
                 auto& c = it->second;
                 if (!c.alive()) {
                     it = forget(it);
+                    continue;
+                }
+                if (waiting_local(c)) {
+                    ++it;
                     continue;
                 }
                 Item item;
@@ -513,48 +544,157 @@ private:
         c.step(pool_.get());
     }
 
-    /// `msg`: lo llama un mensaje de datos; a otra computadora sin conexión, se cuenta como no salido.
-    void reconnect(bool force, bool msg) {
+    /// Empieza (sin esperar) las conexiones que faltan: las de `force` ya, las demás si pasó kRetryEvery
+    /// desde el último intento. `msg`: lo llama un mensaje de datos; a otra computadora sin conexión, se
+    /// cuenta como no salido. Devuelve las direcciones de esta computadora que quedaron en curso.
+    std::vector<std::string> reconnect(const std::set<std::string>& force, bool msg) {
         const auto now = std::chrono::steady_clock::now();
+        std::vector<std::string> started;
         for (const auto& a : want_) {
-            if (const auto it = conns_.find(a); it != conns_.end() && it->second.alive()) continue;
+            if (const auto it = conns_.find(a); it != conns_.end() && it->second.alive()) continue;   // o en curso
             const auto host = host_of(a);   // AGMEN_NET_IP también es esta computadora (RFC 0011 §9.5)
             const bool remote = net_ && host != hub::kLocalhost && host != net_ip_;
-            if (!force) {
+            if (force.count(a) == 0) {
                 if (const auto t = last_try_.find(a); t != last_try_.end() && now - t->second < kRetryEvery) {
                     if (remote && msg) ++unreachable_;
                     continue;
                 }
             }
-            last_try_[a] = now;
+            if (remote) last_try_[a] = now;   // a otra computadora, como siempre: al empezar
             if (const auto it = conns_.find(a); it != conns_.end()) forget(it);
             Outgoing c;
             c.addr = a;
-            if (remote) {
-                // A otra computadora puede tardar o no contestar nunca: sin esperar (lo termina el hilo).
-                c.remote = true;
-                try {
-                    bool pending = false;
-                    c.stream = net::TcpStream::connect_async(net::Address::resolve(a), net_ip_, pending);
-                    c.connecting = pending;
-                    c.deadline = now + kRemoteConnect;
-                } catch (const net::NetError& e) {
+            c.remote = remote;
+            // El suscriptor puede tardar o no contestar nunca: sin esperar (lo termina el hilo del
+            // Fanout, o quien publica, o vence el plazo).
+            try {
+                bool pending = false;
+                c.stream = net::TcpStream::connect_async(net::Address::resolve(a),
+                                                         remote ? std::string_view(net_ip_) : std::string_view(),
+                                                         pending);
+                c.connecting = pending;
+                c.deadline = now + (remote ? kRemoteConnect : kConnectTimeout);
+            } catch (const net::NetError& e) {
+                if (remote) {
                     if (msg) ++unreachable_;
                     warn_unreachable(a, e.code().value() != 0 ? e.code().message() : std::string(e.what()));
-                    continue;
+                } else {
+                    last_try_[a] = now;   // callado: el suscriptor no está; se reintenta en un rato
                 }
-            } else {
-                try {
-                    c.stream = net::TcpStream::connect(net::Address::resolve(a), kConnectTimeout);
-                } catch (const net::NetError&) {
-                    continue;   // el suscriptor no está; se reintenta en un rato (o el hub lo quita)
+                continue;
+            }
+            if (!remote) {
+                if (c.connecting) {
+                    started.push_back(a);
+                } else {
+                    last_try_[a] = now;   // el intento ya terminó
                 }
             }
             if (announcement_) {
-                c.offer(Item{announcement_}, pool_.get());
+                c.offer(Item{announcement_}, pool_.get());   // lo primero que sale por ella
                 c.step(pool_.get());
             }
             conns_.emplace(a, std::move(c));
+        }
+        return started;
+    }
+
+    /// ¿Una conexión a esta computadora que sigue en curso? Se trata como una que aún no está: no recibe
+    /// este mensaje ni cuenta como "hay alguien" ni en dropped (a otra computadora, lo de siempre).
+    [[nodiscard]] static bool waiting_local(const Outgoing& c) { return c.connecting && !c.remote; }
+
+    /// Una conexión en curso que el sistema dio por terminada (con el candado).
+    void finish(Outgoing& c) {
+        if (!c.alive() || !c.connecting) return;
+        if (const int err = c.stream.finish_connect(); err != 0) {
+            if (c.remote) {
+                remote_failed(c, err == -1 ? std::string("se cerró") : std::system_category().message(err));
+            } else {
+                local_failed(c);
+            }
+            return;
+        }
+        c.connecting = false;
+        if (!c.remote) last_try_[c.addr] = std::chrono::steady_clock::now();
+        c.step(pool_.get());   // sale el anuncio
+    }
+
+    /// Una conexión a esta computadora que no se pudo terminar (con el candado): callada, como siempre.
+    /// Nada le esperaba más que el anuncio: no se cuenta nada.
+    void local_failed(Outgoing& c) {
+        c.fail(pool_.get());
+        c.connecting = false;
+        last_try_[c.addr] = std::chrono::steady_clock::now();
+    }
+
+    /// De `handles` (conexiones en curso), las que el sistema ya dio por terminadas, esperando hasta
+    /// `wait`. Un error en la espera cuenta como "ninguna": las cubre el plazo.
+    static std::vector<std::intptr_t> finished_of(const std::vector<std::intptr_t>& handles,
+                                                  std::chrono::milliseconds wait) {
+        const std::size_t n_handles = handles.size();
+        const auto write = std::make_unique<bool[]>(n_handles);
+        const auto readable = std::make_unique<bool[]>(n_handles);
+        const auto writable = std::make_unique<bool[]>(n_handles);
+        for (std::size_t i = 0; i < n_handles; ++i) write[i] = true;
+        std::vector<std::intptr_t> out;
+        try {
+            // Windows dice que una conexión en curso falló como "legible" (POLLERR/POLLHUP), o no lo
+            // dice: entonces vence el plazo.
+            if (net::wait_rw(handles, std::span<const bool>(write.get(), n_handles), wait,
+                             std::span<bool>(readable.get(), n_handles),
+                             std::span<bool>(writable.get(), n_handles)) <= 0) {
+                return out;
+            }
+        } catch (const net::NetError&) {
+            return out;
+        }
+        for (std::size_t i = 0; i < n_handles; ++i) {
+            if (readable[i] || writable[i]) out.push_back(handles[i]);
+        }
+        return out;
+    }
+
+    /// Quien publica termina las conexiones a esta computadora que ya terminaron (consulta de 0 s), para
+    /// no depender de que despierte el hilo del Fanout (con el candado).
+    void poll_connecting() {
+        std::vector<std::intptr_t> handles;
+        for (const auto& [_, c] : conns_) {
+            if (c.alive() && waiting_local(c)) handles.push_back(c.stream.native_handle());
+        }
+        if (handles.empty()) return;
+        for (const auto h : finished_of(handles, std::chrono::milliseconds(0))) {
+            if (Outgoing* c = find(h)) finish(*c);
+        }
+    }
+
+    /// Espera, sin el candado, a que terminen las conexiones en curso de `addrs`: hasta kNewWait en total.
+    void wait_connecting(const std::vector<std::string>& addrs) {
+        const auto end = std::chrono::steady_clock::now() + kNewWait;
+        for (;;) {
+            std::vector<std::intptr_t> handles;
+            {
+                std::lock_guard lock(mu_);
+                if (closed_) return;
+                for (const auto& a : addrs) {
+                    const auto it = conns_.find(a);
+                    if (it != conns_.end() && it->second.alive() && it->second.connecting) {
+                        handles.push_back(it->second.stream.native_handle());
+                    }
+                }
+            }
+            const auto left = std::chrono::ceil<std::chrono::milliseconds>(end - std::chrono::steady_clock::now());
+            if (handles.empty() || left.count() <= 0) return;
+            const auto done = finished_of(handles, left);
+            if (done.empty()) continue;
+            std::lock_guard lock(mu_);
+            for (const auto& a : addrs) {
+                // Por dirección y socket: la conexión pudo cambiar mientras se esperaba sin el candado.
+                const auto it = conns_.find(a);
+                if (it == conns_.end() || !it->second.alive()) continue;
+                if (std::find(done.begin(), done.end(), it->second.stream.native_handle()) != done.end()) {
+                    finish(it->second);
+                }
+            }
         }
     }
 
@@ -596,7 +736,11 @@ private:
                 }
                 for (auto& [_, c] : conns_) {
                     if (c.alive() && c.connecting && now >= c.deadline) {
-                        remote_failed(c, "no contestó en " + std::to_string(kRemoteConnect.count() / 1000) + " s");
+                        if (c.remote) {
+                            remote_failed(c, "no contestó en " + std::to_string(kRemoteConnect.count() / 1000) + " s");
+                        } else {
+                            local_failed(c);   // Windows a veces no avisa un connect fallido: lo cubre el plazo
+                        }
                     }
                 }
                 for (const auto& [_, c] : conns_) {
@@ -630,12 +774,7 @@ private:
                 if (c == nullptr) continue;
                 if (c->connecting) {
                     // Windows dice que una conexión en curso falló como "legible" (POLLERR/POLLHUP).
-                    if (const int err = c->stream.finish_connect(); err != 0) {
-                        remote_failed(*c, err == -1 ? std::string("se cerró") : std::system_category().message(err));
-                        continue;
-                    }
-                    c->connecting = false;
-                    c->step(pool_.get());
+                    finish(*c);
                     continue;
                 }
                 if (readable[i]) serve_reads(*c);
