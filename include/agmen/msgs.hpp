@@ -700,7 +700,8 @@ struct Vector3f {
 
 /// Una rotación en f32: x, y, z, w, con w al final. Empieza en NaN porque se
 /// mide: vacía hasta que la llenes (lo que no se mide no se inventa). En Python,
-/// wxyz() y from_wxyz(); en C++, agmen::msgs::wxyz() y from_wxyz().
+/// wxyz() y from_wxyz(); en C++, agmen::msgs::wxyz() y from_wxyz()
+/// (<agmen/geometry.hpp>).
 /// Quaternionf · 16 bytes · Tipo auxiliar: va dentro de otros.
 /// agmen/1 Quaternionf{f32 x;f32 y;f32 z;f32 w}
 struct Quaternionf {
