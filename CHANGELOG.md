@@ -360,7 +360,10 @@ Los objetos de Agmen en Python se pueden usar desde varios hilos a la vez
   uno local que se cayó; en cualquier sistema, una dirección fija a una computadora
   que no contesta) y lo reintentaba cada segundo. Con 3 suscriptores muertos, un
   `publish()` tardaba de 9 a 15 s; ahora, 50 ms la primera vez y nada después. Con
-  un suscriptor sano nada cambia: su primer mensaje le sigue llegando.
+  un suscriptor sano nada cambia: su primer mensaje le sigue llegando. Una
+  excepción: con dirección fija a otra computadora, si la red tarda más de 50 ms en
+  conectar, los primeros mensajes no salen (`publish()` devuelve `False`) hasta que
+  la conexión termina; antes el `Publisher` esperaba hasta 1 s al crearse.
 - **El hub ya no reintenta cada segundo** a cada suscriptor TCP caído. Antes hacía un
   intento de conexión por segundo a cada uno (40 conexiones en 0.85 s con la misma
   lista); ahora, 1.
