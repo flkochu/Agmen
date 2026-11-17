@@ -34,6 +34,8 @@ constexpr std::chrono::milliseconds kConnectTimeout{1000};
 constexpr std::chrono::milliseconds kRetryEvery{1000};
 /// Ante direcciones nuevas, quien las descubre espera esto a que se conecten (una vez por tanda).
 constexpr std::chrono::milliseconds kNewWait{50};
+/// Al crear un Publisher con dirección fija a otra computadora, se espera esto, una sola vez (§13 C).
+constexpr std::chrono::milliseconds kFixedRemoteWait{1000};
 constexpr std::size_t kReadChunk = 1 << 18;
 
 using Packet = std::shared_ptr<const wire::Bytes>;
@@ -84,6 +86,19 @@ std::string unreachable_text(const std::string& topic, const std::string& addr, 
     return "[agmen] ⚠ '" + topic + "': no pude mandar a la computadora " + ip + " (" + addr + "): " + why +
            ". Los demás destinos siguen igual; revisa que " + ip +
            " esté en la red y que su firewall deje pasar a Agmen. Lo que no sale se cuenta (unreachable).";
+}
+
+/// El aviso (una vez por dirección) de una dirección fija cuya conexión sigue en curso (§13 D).
+std::string connecting_text(const std::string& topic, const std::string& addr) {
+    return "[agmen] ⚠ '" + topic + "': todavía conectando con " + addr +
+           "; los mensajes no salen hasta que la conexión termine. ¿Está encendida esa computadora y hay un "
+           "Subscriber escuchando ahí?";
+}
+
+/// ¿`host` es de esta computadora? 127.x, "localhost" o AGMEN_NET_IP (§9.5). Una IP propia de la red no se
+/// reconoce: con nadie escuchando, el sistema la rechaza en el acto y no hay espera.
+bool this_computer(const std::string& host, const std::string& net_ip) {
+    return host.rfind("127.", 0) == 0 || host == "localhost" || (!net_ip.empty() && host == net_ip);
 }
 
 /// ¿La IP de `from` ("ip:puerto" o "ip") está en `allowed`?
@@ -251,9 +266,13 @@ public:
     /// La lista nueva de suscriptores (del hub o la dirección fija). Solo las direcciones nuevas se
     /// conectan en el acto (la misma lista no fuerza nada). No espera: las de esta computadora entran en
     /// la tanda que espera settle(), una vez por pasada de drain() (no una por update()).
-    void update(std::vector<std::string> addrs, Packet announcement) {
+    /// `fixed`: la dirección fija del constructor. Si es de otra computadora, su tanda espera hasta
+    /// kFixedRemoteWait en vez de kNewWait (§13 C); si su conexión sigue en curso cuando sale un mensaje,
+    /// se avisa una vez (§13 D).
+    void update(std::vector<std::string> addrs, Packet announcement, bool fixed = false) {
         {
             std::lock_guard lock(mu_);
+            if (fixed) fixed_.insert(addrs.begin(), addrs.end());
             std::set<std::string> fresh;
             for (const auto& a : addrs) {
                 if (std::find(want_.begin(), want_.end(), a) == want_.end()) fresh.insert(a);
@@ -278,11 +297,14 @@ public:
             for (auto& a : reconnect(fresh, false)) {
                 if (fresh.count(a) == 0) continue;
                 const auto now = std::chrono::steady_clock::now();
+                const auto espera = fixed && !this_computer(host_of(a), net_ip_) ? kFixedRemoteWait : kNewWait;
                 if (new_.empty() || now >= new_end_) {
                     // Empieza la tanda. También si la de antes ya venció sin que settle() la cerrara (una
                     // pasada que se cortó con una excepción): si no, la nueva heredaría una espera de 0 ms.
                     new_.clear();
-                    new_end_ = now + kNewWait;
+                    new_end_ = now + espera;
+                } else if (espera > kNewWait) {
+                    new_end_ = std::max(new_end_, now + espera);
                 }
                 new_.push_back(std::move(a));
                 has_new_.store(true, std::memory_order_release);
@@ -347,6 +369,7 @@ public:
     bool send(const wire::Envelope& env, wire::ByteView payload) {
         bool ok = false;
         bool wake_up = false;
+        std::vector<std::string> avisos;   // §13 D: se emiten sin el candado
         {
             std::lock_guard lock(mu_);
             wake_up = !reconnect({}, true).empty();
@@ -395,8 +418,10 @@ public:
                 ok = true;
                 ++it;
             }
+            if (!fixed_.empty()) avisos = still_connecting();
         }
         if (wake_up) wake();
+        for (const auto& a : avisos) log::write(connecting_text(topic_, a));   // el aviso puede tomar el GIL
         return ok;
     }
 
@@ -448,6 +473,8 @@ private:
     std::vector<std::string> new_;                     // la tanda de conexiones nuevas que espera settle()
     std::chrono::steady_clock::time_point new_end_{};  // hasta cuándo se le espera
     std::atomic<bool> has_new_{false};                 // ¿new_ no está vacía? (se escribe con mu_; settle() lo lee sin él)
+    std::set<std::string> fixed_;                      // las direcciones fijas (no del hub): avisan si siguen conectando
+    std::set<std::string> connecting_warned_;
     std::uint64_t dropped_gone_ = 0;   // de conexiones que ya se cerraron
     std::unique_ptr<shm::Pool> pool_;  // se crea cuando un suscriptor dice que puede
     std::uint64_t fallbacks_ = 0;
@@ -634,6 +661,18 @@ private:
     /// ¿Una conexión a esta computadora que sigue en curso? Se trata como una que aún no está: no recibe
     /// este mensaje ni cuenta como "hay alguien" ni en dropped (a otra computadora, lo de siempre).
     [[nodiscard]] static bool waiting_local(const Outgoing& c) { return c.connecting && !c.remote; }
+
+    /// Las direcciones fijas cuya conexión sigue en curso y aún no se avisaron (con el candado): este
+    /// mensaje no salió hacia ellas (§13 D). Una rechazada en el acto no está en curso: callada.
+    std::vector<std::string> still_connecting() {
+        std::vector<std::string> out;
+        for (const auto& a : fixed_) {
+            const auto it = conns_.find(a);
+            if (it == conns_.end() || !it->second.alive() || !waiting_local(it->second)) continue;
+            if (connecting_warned_.insert(a).second) out.push_back(a);
+        }
+        return out;
+    }
 
     /// Una conexión en curso que el sistema dio por terminada (con el candado).
     void finish(Outgoing& c) {
@@ -1222,7 +1261,8 @@ struct PublisherCore::State {
         } else if (fanout) {
             tcp_dests.push_back(to);
             n_subs.store(tcp_dests.size(), std::memory_order_relaxed);
-            fanout->update(tcp_dests, std::make_shared<const wire::Bytes>(announcement()));
+            // Dirección fija: a otra computadora espera hasta 1 s, una sola vez (§13 C).
+            fanout->update(tcp_dests, std::make_shared<const wire::Bytes>(announcement()), true);
             fanout->settle();
         } else {
             dests.push_back(net::Address::resolve(to));

@@ -42,6 +42,7 @@ _HEADER_LEN_AT = struct.Struct("<H")         # offset 4
 _PAYLOAD_LEN_AT = struct.Struct("<I")        # offset 56
 CONNECT_TIMEOUT_S = 1.0       # una conexión a esta computadora que no termina en este tiempo se da por fallida
 NEW_WAIT_S = 0.05             # ante direcciones nuevas, quien las descubre espera esto (una vez por tanda)
+FIXED_REMOTE_WAIT_S = 1.0     # al crear un Publisher con dirección fija a otra computadora, una sola vez (§13 C)
 BIG_BUFFER = 4 << 20          # SO_SNDBUF / SO_RCVBUF que se pide fuera de Linux
 READ_CHUNK = 1 << 18
 SHM_NO, SHM_PROBING, SHM_YES = 0, 1, 2
@@ -74,6 +75,18 @@ def unreachable_text(topic: str, addr: tuple[str, int], why: str) -> str:
     return (f"[agmen] ⚠ '{topic}': no pude mandar a la computadora {addr[0]} ({addr[0]}:{addr[1]}): {why}. "
             f"Los demás destinos siguen igual; revisa que {addr[0]} esté en la red y que su firewall deje "
             f"pasar a Agmen. Lo que no sale se cuenta (unreachable).")
+
+
+def connecting_text(topic: str, addr: tuple[str, int]) -> str:
+    """El aviso (una vez por dirección) de una dirección fija cuya conexión sigue en curso (§13 D)."""
+    return (f"[agmen] ⚠ '{topic}': todavía conectando con {addr[0]}:{addr[1]}; los mensajes no salen hasta que "
+            f"la conexión termine. ¿Está encendida esa computadora y hay un Subscriber escuchando ahí?")
+
+
+def this_computer(host: str, net_ip: str | None) -> bool:
+    """¿`host` es de esta computadora? 127.x, "localhost" o AGMEN_NET_IP (§9.5). Una IP propia de la red
+    no se reconoce: con nadie escuchando, el sistema la rechaza en el acto y no hay espera."""
+    return host.startswith("127.") or host == "localhost" or (net_ip is not None and host == net_ip)
 
 
 def _tune(sock: socket.socket, option: int) -> None:
@@ -296,6 +309,8 @@ class Fanout:
         # comparten quien lee al hub (settle) y quien manda en ese hueco. Hora de time.perf_counter().
         self._new: list[Outgoing] = []
         self._new_end = 0.0
+        self._fixed: set = set()                 # las direcciones fijas (no del hub): avisan si siguen conectando
+        self._connecting_warned: set = set()
         self.lock = threading.Lock()
         self._wake_r, self._wake_w = socket.socketpair()
         self._wake_r.setblocking(False)
@@ -316,11 +331,16 @@ class Fanout:
             self._dropped_gone += c.dropped
             c.fail(self.pool)
 
-    def update(self, addrs: list[tuple[str, int]], announcement) -> None:
+    def update(self, addrs: list[tuple[str, int]], announcement, fixed: bool = False) -> None:
         """La lista nueva de suscriptores (del hub o la dirección fija). Solo las direcciones nuevas se
         conectan en el acto (la misma lista no fuerza nada). No espera: las de esta computadora entran en
-        la tanda que espera settle(), una vez por pasada de quien lee al hub (no una por update())."""
+        la tanda que espera settle(), una vez por pasada de quien lee al hub (no una por update()).
+        `fixed`: la dirección fija del constructor. Si es de otra computadora, su tanda espera hasta
+        FIXED_REMOTE_WAIT_S en vez de NEW_WAIT_S (§13 C); si su conexión sigue en curso cuando sale un
+        mensaje, se avisa una vez (§13 D)."""
         with self.lock:
+            if fixed:
+                self._fixed = set(addrs)
             fresh = {a for a in addrs if a not in self.want}
             self.want = list(addrs)
             self.announcement = announcement
@@ -332,11 +352,16 @@ class Fanout:
             waiting = [c for c in self._reconnect(force=fresh) if c.addr in fresh]
             if waiting:
                 now = time.perf_counter()
+                wait = NEW_WAIT_S
+                if fixed and any(not this_computer(c.addr[0], self.net_ip) for c in waiting):
+                    wait = FIXED_REMOTE_WAIT_S
                 if not self._new or now >= self._new_end:
                     # Empieza la tanda. También si la de antes ya venció sin que settle() la cerrara (una
                     # pasada que se cortó con una excepción): si no, el nuevo heredaría una espera de 0 ms.
                     self._new = []
-                    self._new_end = now + NEW_WAIT_S
+                    self._new_end = now + wait
+                elif wait > NEW_WAIT_S:
+                    self._new_end = max(self._new_end, now + wait)
                 self._new.extend(waiting)
         self._wake()
 
@@ -531,9 +556,23 @@ class Fanout:
                 c.step(self.pool)
                 ok = True
             busy = bool(started) or any(c.wants_write() for c in self.conns.values() if not self._waiting(c))
+            warn = self._still_connecting() if self._fixed else []
         if busy:
             self._wake()
+        for a in warn:                           # sin el lock, como todo aviso que no lo necesita
+            print(connecting_text(self.topic, a), file=sys.stderr, flush=True)
         return ok
+
+    def _still_connecting(self) -> list:
+        """Las direcciones fijas cuya conexión sigue en curso y aún no se avisaron (con el lock): este
+        mensaje no salió hacia ellas (§13 D). Una rechazada en el acto no está en curso: callada."""
+        out = []
+        for a in self._fixed:
+            c = self.conns.get(a)
+            if c is not None and c.alive and self._waiting(c) and a not in self._connecting_warned:
+                self._connecting_warned.add(a)
+                out.append(a)
+        return out
 
     def _write_shared(self, env: wire.Envelope, payload):
         got = self.pool.write(env.seq, payload)

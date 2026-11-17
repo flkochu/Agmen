@@ -2,6 +2,7 @@
 // viajan por TCP, un suscriptor lento recibe solo lo más nuevo y no frena a
 // nadie. La misma prueba en Python: python/test_tcp.py.
 #include <agmen/agmen.hpp>
+#include <agmen/log.hpp>
 #include <agmen/platform.hpp>
 
 #include <algorithm>
@@ -450,6 +451,97 @@ void test_una_sola_espera_por_pasada() {
     CHECK(primero < 200ms);
 }
 
+/// Los avisos de Agmen, para contarlos.
+struct Avisos {
+    std::mutex mu;
+    std::vector<std::string> lineas;
+    Avisos() {
+        agmen::log::set_sink([this](std::string_view l) {
+            const std::lock_guard lock(mu);
+            lineas.emplace_back(l);
+        });
+    }
+    ~Avisos() { agmen::log::set_sink({}); }
+    Avisos(const Avisos&) = delete;
+    Avisos& operator=(const Avisos&) = delete;
+    std::size_t con(const std::string& parte) {
+        const std::lock_guard lock(mu);
+        std::size_t n = 0;
+        for (const auto& l : lineas) n += l.find(parte) != std::string::npos ? 1U : 0U;
+        return n;
+    }
+};
+
+const std::string kTodaviaConectando = "todavía conectando con";
+
+/// Publica cada 20 ms durante `dura`; devuelve el peor publish().
+std::chrono::steady_clock::duration publicar_durante(agmen::Publisher<Img>& pub, std::chrono::milliseconds dura) {
+    std::chrono::steady_clock::duration peor{};
+    std::uint32_t n = 0;
+    const auto inicio = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - inicio < dura) {
+        const auto t = std::chrono::steady_clock::now();
+        (void)pub.publish(Img{n++, 0, {1}});
+        peor = std::max(peor, std::chrono::steady_clock::now() - t);
+        std::this_thread::sleep_for(20ms);
+    }
+    return peor;
+}
+
+void test_direccion_fija_a_otra_computadora_que_no_contesta() {
+    // §13 C y D: crear espera hasta 1 s (una vez), publicar nunca; el aviso sale una vez. Sin ruta a esa
+    // red (o si la máquina la rechaza en el acto) no hay espera, y a lo más un aviso (el de un reintento).
+    const std::string ip = agmen::platform::env("AGMEN_PRUEBA_IP_MUDA").empty()
+                               ? std::string("192.0.2.1")
+                               : agmen::platform::env("AGMEN_PRUEBA_IP_MUDA");
+    Avisos avisos;
+    auto t = std::chrono::steady_clock::now();
+    auto pub = std::make_unique<agmen::Publisher<Img>>(ip + ":9");
+    const auto crear = std::chrono::steady_clock::now() - t;
+    const auto peor = publicar_durante(*pub, 2500ms);
+    t = std::chrono::steady_clock::now();
+    pub.reset();   // close()
+    const auto cierre = std::chrono::steady_clock::now() - t;
+    const auto n_avisos = avisos.con(kTodaviaConectando);
+    std::printf("  hacia %s:9: crear %.3f s, peor publish() %.4f s, close() %.4f s, %u aviso(s)%s\n", ip.c_str(),
+                segundos(crear), segundos(peor), segundos(cierre), static_cast<unsigned>(n_avisos),
+                crear < 500ms ? " (el connect terminó en el acto: sin espera)" : "");
+    CHECK(crear < 1300ms);
+    CHECK(peor < 200ms);
+    CHECK(cierre < 200ms);
+    if (crear >= 500ms) {
+        CHECK(n_avisos == 1);
+    } else {
+        CHECK(n_avisos <= 1);
+    }
+}
+
+void test_direccion_fija_local_donde_nadie_escucha() {
+    // §13: una dirección de esta computadora sigue con 50 ms y, rechazada en el acto, callada. En Windows el
+    // rechazo local tarda ~1 s (la conexión queda en curso): ahí se acepta un aviso.
+    std::uint16_t puerto = 0;
+    {
+        auto srv = net::TcpListener::bind("127.0.0.1:0");
+        puerto = srv.local_port();
+    }
+    Avisos avisos;
+    const auto t = std::chrono::steady_clock::now();
+    auto pub = std::make_unique<agmen::Publisher<Img>>("127.0.0.1:" + std::to_string(puerto));
+    const auto crear = std::chrono::steady_clock::now() - t;
+    const auto peor = publicar_durante(*pub, 200ms);
+    pub.reset();
+    const auto n_avisos = avisos.con(kTodaviaConectando);
+    std::printf("  hacia 127.0.0.1:%u sin nadie: crear %.4f s, %u aviso(s)\n", static_cast<unsigned>(puerto),
+                segundos(crear), static_cast<unsigned>(n_avisos));
+    CHECK(crear < 200ms);
+    CHECK(peor < 200ms);
+#ifdef _WIN32
+    CHECK(n_avisos <= 1);
+#else
+    CHECK(n_avisos == 0);
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -459,6 +551,8 @@ int main() {
     test_publicar_no_espera_a_un_suscriptor_que_no_contesta();
     test_la_misma_lista_no_reintenta();
     test_una_sola_espera_por_pasada();
+    test_direccion_fija_a_otra_computadora_que_no_contesta();
+    test_direccion_fija_local_donde_nadie_escucha();
     if (g_failures == 0) std::printf("test_tcp: todo bien\n");
     return g_failures == 0 ? 0 : 1;
 }

@@ -5,8 +5,11 @@ Corre con los dos núcleos (AGMEN_BACKEND=pure|native)."""
 
 from __future__ import annotations
 
+import contextlib
 import errno
+import io
 import os
+import select
 import socket
 import sys
 import threading
@@ -514,6 +517,109 @@ class TestTandaCompartida(unittest.TestCase):
             self.assertTrue(ok, "el suscriptor nuevo debe recibir este mensaje")
         finally:
             fan.close()
+            for o in _ConexionLenta.otros:
+                o.close()
+
+
+class TestDireccionFija(unittest.TestCase):
+    """§13 (los dos núcleos): con dirección fija a otra computadora, crear el Publisher espera hasta 1 s, una
+    sola vez; publicar nunca. Si un mensaje no sale porque la conexión sigue en curso, se avisa una vez."""
+
+    AVISO = "todavía conectando con"
+
+    @staticmethod
+    def _publicar(pub, segundos: float) -> float:
+        peor, n = 0.0, 0
+        inicio = time.monotonic()
+        while time.monotonic() - inicio < segundos:
+            t = time.perf_counter()
+            pub.publish(Img(n, 0, b"x"))
+            peor = max(peor, time.perf_counter() - t)
+            n += 1
+            time.sleep(0.02)
+        return peor
+
+    def test_otra_computadora_que_no_contesta(self):
+        # Sin ruta a esa red (o si la máquina la rechaza en el acto) no hay espera, y a lo más un aviso (el
+        # de un reintento que alcanzó a verse en curso). AGMEN_PRUEBA_IP_MUDA: otra IP, donde 192.0.2.1 sí
+        # contesta (p. ej. es la puerta de enlace).
+        ip = os.environ.get("AGMEN_PRUEBA_IP_MUDA", "192.0.2.1")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            t = time.perf_counter()
+            pub = agmen.Publisher(Img, f"{ip}:9")
+            crear = time.perf_counter() - t
+            try:
+                peor = self._publicar(pub, 2.5)
+            finally:
+                t = time.perf_counter()
+                pub.close()
+                cierre = time.perf_counter() - t
+        avisos = err.getvalue().count(self.AVISO)
+        nota = " (el connect terminó en el acto: sin espera)" if crear < 0.5 else ""
+        print(f"\n  hacia {ip}:9: crear {crear:.3f} s, peor publish() {peor:.4f} s, close() {cierre:.4f} s, "
+              f"{avisos} aviso(s){nota}", file=sys.stderr)
+        self.assertLess(crear, 1.3, f"crear tardó {crear:.3f} s")
+        self.assertLess(peor, 0.2, f"el peor publish() tardó {peor:.3f} s")
+        self.assertLess(cierre, 0.2, f"close() tardó {cierre:.3f} s")
+        if crear >= 0.5:
+            self.assertEqual(avisos, 1, err.getvalue())
+        else:
+            self.assertLessEqual(avisos, 1, err.getvalue())
+
+    def test_local_donde_nadie_escucha(self):
+        # Una dirección de esta computadora sigue con 50 ms y, rechazada en el acto, callada. En Windows el
+        # rechazo local tarda ~1 s (la conexión queda en curso): ahí se acepta un aviso.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            puerto = s.getsockname()[1]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            t = time.perf_counter()
+            pub = agmen.Publisher(Img, f"127.0.0.1:{puerto}")
+            crear = time.perf_counter() - t
+            try:
+                peor = self._publicar(pub, 0.2)
+            finally:
+                pub.close()
+        avisos = err.getvalue().count(self.AVISO)
+        self.assertLess(crear, 0.2, f"crear tardó {crear:.3f} s")
+        self.assertLess(peor, 0.2)
+        self.assertLessEqual(avisos, 1 if sys.platform == "win32" else 0, err.getvalue())
+
+    def test_puro_espera_una_conexion_lenta_al_crear(self):
+        # Python puro, con el doble de conexión lenta: una dirección fija no local cuya conexión termina a
+        # los ~150 ms. El constructor la espera (no 50 ms) y el primer mensaje ya sale, sin aviso.
+        _ConexionLenta.otros = []
+        termina = threading.Timer(0.15, lambda: [_vaciar(o) for o in list(_ConexionLenta.otros)])
+        err = io.StringIO()
+        pub = None
+        try:
+            with unittest.mock.patch.object(_tcp, "Outgoing", _ConexionLenta), contextlib.redirect_stderr(err):
+                termina.start()
+                t = time.perf_counter()
+                pub = pubsub._PurePublisher(Img, "192.0.2.1:9")
+                crear = time.perf_counter() - t
+                ok = pub.publish(Img(1, 0, b"x"))
+            self.assertGreaterEqual(crear, 0.1, f"crear no esperó la conexión ({crear:.3f} s)")
+            self.assertLess(crear, 1.0, f"crear tardó {crear:.3f} s")
+            self.assertTrue(ok, "el primer mensaje debe salir")
+            self.assertEqual(pub._tcp.connected, 1)
+            self.assertEqual(err.getvalue().count(self.AVISO), 0, err.getvalue())
+            otro = _ConexionLenta.otros[0]
+            llego = b""
+            fin = time.monotonic() + 1.0
+            while b"/Img" not in llego and time.monotonic() < fin:
+                select.select([otro], [], [], 0.05)
+                try:
+                    llego += otro.recv(1 << 20)
+                except (BlockingIOError, InterruptedError):
+                    pass
+            self.assertIn(b"/Img", llego, "el anuncio (y el mensaje) llegaron")
+        finally:
+            termina.cancel()
+            if pub is not None:
+                pub.close()
             for o in _ConexionLenta.otros:
                 o.close()
 

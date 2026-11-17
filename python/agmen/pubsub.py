@@ -350,7 +350,8 @@ class _PurePublisher(_NetSend):
             self.dests = [_addr(to)]
             self._link = None
             if self._tcp is not None:
-                self._tcp.update(self.dests, self._announcement())
+                # Dirección fija: a otra computadora espera hasta 1 s, una sola vez (§13 C).
+                self._tcp.update(self.dests, self._announcement(), fixed=True)
                 self._tcp.settle()
 
     def _announcement(self) -> bytes:
