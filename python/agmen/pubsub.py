@@ -1437,22 +1437,10 @@ class _NativeSubscriber:
         return self._core.port
 
     def fileno(self) -> int:
-        self._usado_en_el_hijo()
         return self._core.fileno()
 
     def filenos(self) -> list:
-        self._usado_en_el_hijo()
         return self._core.filenos()
-
-    _heredado = False   # True en el hijo de un fork, hasta que lo usa (ver _despues_de_fork)
-
-    def _usado_en_el_hijo(self) -> None:
-        """Heredado de un fork y vigilado con select(): que el hijo lata por él (si el padre muere, el
-        hub lo quitaría y el hijo esperaría sordo). receive() late solo, así que no lo necesita."""
-        if self._heredado:
-            self._heredado = False
-            if self.topic:
-                _beats.add(self)
 
     @property
     def tcp_port(self) -> int:
@@ -1575,10 +1563,13 @@ if _backend.NATIVE:
         _avisado = True
 
     def _despues_de_fork() -> None:
-        """En el hijo de un fork (un solo hilo): el cierre empieza de cero, en C++ y aquí. Un lock que
-        tenía un hilo del padre (el de latidos en _beat, un close()) quedaría tomado para siempre: se
-        reponen los de los Publisher y Subscriber nativos vivos y el estado del hilo de latidos, que en
-        el hijo no existe (el próximo Publisher o Subscriber lo arranca de nuevo)."""
+        """En el hijo de un fork (un solo hilo): el cierre empieza de cero, en C++ y aquí. Los Publisher,
+        Subscriber y Node nativos heredados son del padre: _after_fork_child abandona sus núcleos sin
+        destruirlos y tapa sus sockets, así que quedan como cerrados (close() no hace nada y no espera) y
+        el hijo nunca despide al padre del hub ni borra su memoria compartida (PR "fork", G1-G3). Un lock
+        que tenía un hilo del padre (el de latidos en _beat, un close()) quedaría tomado para siempre: se
+        reponen los de los objetos vivos y el estado del hilo de latidos, que en el hijo no existe (el
+        próximo Publisher o Subscriber del hijo lo arranca de nuevo, y no late por los heredados)."""
         global _cerrando, _avisado, _hijo_de_fork
         _backend.core._after_fork_child()
         _cerrando = False
@@ -1586,18 +1577,6 @@ if _backend.NATIVE:
         _hijo_de_fork = True
         for o in list(_nativos):
             o._lock = threading.Lock()
-            o._heredado = True
-        # El hilo de latidos del hijo no late por los objetos heredados: su estado de C++ puede tener
-        # tomado un mutex que retenía un hilo del padre (un publish() a medias: el de PublisherCore), y
-        # el latido se quedaría esperándolo para siempre (al salir: "1 en un latido; el hilo de latidos").
-        # Mientras el padre vive, sobran: llevan el mismo id en el hub que los del padre, que late por
-        # ellos. Si el padre muere, el hub quita a los que nadie usa a los 3 s; publish() y receive()
-        # laten solos (y los vuelven a registrar), y un Subscriber vigilado con fileno()/filenos() vuelve
-        # a la lista de latidos al pedirlos (_usado_en_el_hijo). Límite: si su mutex quedó tomado, ese
-        # objeto no sirve en el hijo (publish() o receive() también se quedarían esperando).
-        # Límite conocido (sin arreglar): cerrar o destruir en el hijo un objeto heredado da de baja en el
-        # hub los ids del padre y borra sus bloques de memoria compartida (en los dos núcleos). Hasta que
-        # se arregle, el hijo no debe cerrar los objetos heredados: basta con salir.
         _beats.pubs = weakref.WeakSet()
         _beats.lock = threading.Lock()
         _beats.stopping = threading.Event()
