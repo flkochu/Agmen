@@ -3,7 +3,8 @@ con los mismos campos que los tipos de Foxglove (RFC 0008, D4), `MuxEstado`,
 quién tiene el mando de un `[[mux]]` (RFC 0012), y los mensajes chicos de
 geometría, velocidad, odometría e IMU (RFC 0013): `Vector2`, `Vector3`,
 `Quaternion`, `Pose`, `Transform`, `Twist`, `Odometry`, `Vector3f`,
-`Quaternionf` e `Imu`.
+`Quaternionf` e `Imu`. Y el estado y el comando de N articulaciones,
+`JointState[N]` y `JointCommand[N]` (RFC 0013 §3.4; viven en agmen.joints).
 
     from agmen.msgs import Imagen, ImagenComprimida, MuxEstado, Pose, Quaternion
 
@@ -21,7 +22,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import gen, wire
+from . import gen, joints, wire
 
 PATH = Path(__file__).with_name("msgs.agmen")
 
@@ -137,6 +138,9 @@ def types(numpy: bool = False):
         for q in (mod.Quaternion, mod.Quaternionf):
             q.wxyz = _wxyz
             q.from_wxyz = classmethod(_from_wxyz)
+        # JointState[12], JointCommand[12] (RFC 0013 §3.4): con numpy=True, los arreglos llegan como numpy.ndarray.
+        mod.JointState = joints.JointState if not numpy else joints.JointFamily("JointState", numpy=True)
+        mod.JointCommand = joints.JointCommand if not numpy else joints.JointFamily("JointCommand", numpy=True)
         _cache[numpy] = mod
     return mod
 
@@ -155,11 +159,13 @@ Odometry = _mod.Odometry
 Vector3f = _mod.Vector3f
 Quaternionf = _mod.Quaternionf
 Imu = _mod.Imu
+JointState = joints.JointState          # JointState[12]: la clase para 12 articulaciones
+JointCommand = joints.JointCommand
 # Que se llamen agmen.msgs.Imagen (en repr y en pickle) y no agmen_msgs.msgs.Imagen:
 # así otro proceso los encuentra con solo importar agmen.
 for _cls in (Imagen, ImagenComprimida, MuxEstado, Vector2, Vector3, Quaternion, Pose, Transform, Twist, Odometry,
              Vector3f, Quaternionf, Imu):
     _cls.__module__ = __name__
 
-__all__ = ["ENCODINGS", "Imagen", "ImagenComprimida", "Imu", "MuxEstado", "Odometry", "PATH", "Pose", "Quaternion",
-           "Quaternionf", "Transform", "Twist", "Vector2", "Vector3", "Vector3f", "types"]
+__all__ = ["ENCODINGS", "Imagen", "ImagenComprimida", "Imu", "JointCommand", "JointState", "MuxEstado", "Odometry",
+           "PATH", "Pose", "Quaternion", "Quaternionf", "Transform", "Twist", "Vector2", "Vector3", "Vector3f", "types"]

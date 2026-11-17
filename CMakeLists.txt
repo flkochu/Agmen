@@ -295,6 +295,21 @@ if(AGMEN_BUILD_TESTS)
     target_link_libraries(estandar_peer PRIVATE agmen::core)
     agmen_set_warnings(estandar_peer)
 
+    # JointState<N> y JointCommand<N> de <agmen/joints.hpp> (RFC 0013 §3.4, D5 = f): contra sus vectores
+    # (los mismos de Python y JavaScript), contra el mismo tipo escrito en un .agmen normal, código general
+    # sobre N y el header solo en otra unidad de traducción; y el compañero de C++ de scripts/estandar_smoke.py.
+    agmen_add_messages(joints_usuario_msgs tests/joints_usuario.agmen)
+    add_executable(test_joints tests/test_joints.cpp tests/test_joints_solo.cpp)
+    target_link_libraries(test_joints PRIVATE joints_usuario_msgs)
+    target_compile_definitions(test_joints PRIVATE
+        AGMEN_JOINTS_FILE="${CMAKE_CURRENT_SOURCE_DIR}/tests/vectors/joints.txt")
+    agmen_set_warnings(test_joints)
+    add_test(NAME joints COMMAND test_joints)
+
+    add_executable(joints_peer tests/joints_peer.cpp)
+    target_link_libraries(joints_peer PRIVATE agmen::core)
+    agmen_set_warnings(joints_peer)
+
     # Fuzzers (tests/fuzz). Las entradas que alguna vez rompieron el
     # decodificador (tests/fuzz/regresiones/) se vuelven a correr con cualquier
     # compilador; con AGMEN_FUZZ=ON (Clang) además salen los fuzzers de libFuzzer.

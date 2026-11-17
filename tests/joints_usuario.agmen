@@ -1,0 +1,15 @@
+# Un .agmen normal de hoy con el mismo tipo que la plantilla de <agmen/joints.hpp>
+# (RFC 0013 §3.4): como el package no entra en el texto canónico, es EL MISMO
+# tipo en la red que agmen::msgs::JointState<12> y agmen.msgs.JointState[12].
+# tests/test_joints.cpp y python/test_joints.py lo comparan (texto, schema_id y bytes).
+package pruebas_joints
+
+message JointState { f32[12] position; f32[12] velocity; f32[12] effort }
+
+message JointCommand {
+    f32[2] position = nan
+    f32[2] velocity = 0
+    f32[2] effort   = 0
+    f32[2] kp       = nan
+    f32[2] kd       = nan
+}

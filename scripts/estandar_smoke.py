@@ -8,8 +8,13 @@
    válido (sin la palabra NaN).
 4. `agmen record` -> `agmen info` -> `agmen play` -> `agmen export --parquet` y `--foxglove`, y el
    .mcap leído por mcap.js + agmen.js (el lector del panel, si hay Node).
+5. Articulaciones (RFC 0013 §3.4, bloque 2): la plantilla de C++ (`JointState<12>` y
+   `JointCommand<12>` de <agmen/joints.hpp>, tests/joints_peer.cpp) y `JointState[12]` /
+   `JointCommand[12]` de Python, en los dos sentidos y con los dos núcleos: bytes, t_data y NaN
+   intactos. Y el número es parte del tipo: C++ con `JointState<2>` en un topic que ya es de
+   `JointState[12]` es rechazado por el hub.
 
-    python scripts/estandar_smoke.py              # requiere haber compilado antes (build/bin/estandar_peer)
+    python scripts/estandar_smoke.py              # requiere haber compilado antes (build/bin/estandar_peer y joints_peer)
     python scripts/estandar_smoke.py --required   # en el CI: sin núcleo de C++, Node o pyarrow, falla
 """
 
@@ -56,6 +61,49 @@ def make(kind: str, i: int):
     if i % 2 == 1:
         u.orientation = msgs.Quaternionf.from_wxyz(0.5, 0.5, -0.5, 0.5)
     return u
+
+
+def make_joint(kind: str, n: int, i: int):
+    """El mensaje i de las articulaciones: el mismo que arma tests/joints_peer.cpp.
+    Estado: position[j] = i + j/8; velocity[j] = -(i + j) en las impares, NaN en las pares; effort, NaN.
+    Comando: position[j] = i + j/2; velocity 0; effort = -j/4; kp = 20 + j en los i impares y NaN en los
+    pares; kd, NaN siempre."""
+    from agmen.msgs import JointCommand, JointState
+
+    if kind == "state":
+        return JointState[n](position=[i + 0.125 * j for j in range(n)],
+                             velocity=[-(i + j) if j % 2 == 1 else math.nan for j in range(n)])
+    c = JointCommand[n](position=[i + 0.5 * j for j in range(n)], effort=[-0.25 * j for j in range(n)])
+    if i % 2 == 1:
+        c.kp = [20.0 + j for j in range(n)]
+    return c
+
+
+def worker_joints() -> int:
+    """`--pyj pub|sub state|command N /topic K`: el lado de Python de las articulaciones."""
+    import agmen
+    from agmen.msgs import JointCommand, JointState
+
+    mode, kind, n, topic, k = sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5], int(sys.argv[6])
+    cls = (JointState if kind == "state" else JointCommand)[n]
+    if mode == "pub":
+        pub = agmen.Publisher(cls, topic)
+        for i in range(k):
+            pub.publish(make_joint(kind, n, i), t_data=T0 + 1000 * i)
+            time.sleep(0.01)
+        pub.close()
+        return 0
+    sub = agmen.Subscriber(cls, topic)
+    print("LISTO", flush=True)
+    got, end = 0, time.monotonic() + 20
+    while got < k and time.monotonic() < end:
+        s = sub.receive(0.1)
+        if s is not None:
+            sys.stdout.write(f"RX {s.envelope.t_data} {s.message.encode_payload().hex()}\n")   # una escritura por línea
+            sys.stdout.flush()
+            got += 1
+    sub.close()
+    return 0 if got else 2
 
 
 def worker() -> int:
@@ -286,6 +334,93 @@ def check_bytes(rows, kind, n):
     return bad
 
 
+def check_bytes_joints(rows, kind, n, k):
+    bad = []
+    for t_data, h in rows:
+        i = (t_data - T0) // 1000
+        if t_data != T0 + 1000 * i or not 0 <= i < k:
+            bad.append(f"t_data inesperado {t_data}")
+        elif bytes.fromhex(h) != make_joint(kind, n, i).encode_payload():
+            bad.append(f"bytes distintos en i={i}")
+    return bad
+
+
+def check_joint_nans(rows, kind, n, label):
+    """Decodificado de verdad con la clase de Python: los NaN están donde los puso quien publicó."""
+    from agmen.msgs import JointCommand, JointState
+
+    bad = []
+    for t_data, h in rows:
+        i = (t_data - T0) // 1000
+        if kind == "state":
+            m = JointState[n].decode_payload(bytes.fromhex(h))
+            ok = (all(math.isnan(e) for e in m.effort)
+                  and all(math.isnan(v) == (j % 2 == 0) for j, v in enumerate(m.velocity))
+                  and m.position[n - 1] == i + 0.125 * (n - 1))
+        else:
+            m = JointCommand[n].decode_payload(bytes.fromhex(h))
+            ok = (all(math.isnan(x) for x in m.kd) and all(math.isnan(x) == (i % 2 == 0) for x in m.kp)
+                  and m.velocity == [0.0] * n and m.position[1] == i + 0.5)
+        if not ok:
+            bad.append(f"i={i}: {m!r}")
+    check(f"  {label}: los NaN llegan donde estaban ({len(rows)} revisados)", bool(rows) and not bad, str(bad[:2]))
+
+
+def joints_smoke(py, env0, backends, hub_addr, procs) -> None:
+    """5) Articulaciones: C++ (JointState<12>, JointCommand<12>) <-> Python (JointState[12], JointCommand[12])."""
+    jpeer = str(BIN / f"joints_peer{EXE}")
+    if not Path(jpeer).exists():
+        check("articulaciones: existe joints_peer", False, f"no existe {jpeer}: compila antes (cmake --build build)")
+        return
+    n, k = 12, 40
+    for backend in backends:
+        env = {**env0, "AGMEN_BACKEND": backend}
+        for kind in ("state", "command"):
+            name = {"state": "JointState", "command": "JointCommand"}[kind]
+            topic = f"/joints_{kind}_{backend}"
+            # C++ -> Python
+            sub = Proc("receptor de Python", py + [str(Path(__file__)), "--pyj", "sub", kind, str(n), topic, str(k)], env)
+            procs.append(sub)
+            ready = sub.wait_line("LISTO") and wait_for(lambda: hub_has_sub(hub_addr, topic, sub), 15, 0.1)
+            cpp = subprocess.run([jpeer, "pub", kind, str(n), topic, str(k)], capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace", env=env, timeout=60)
+            sub.wait(30)
+            rows = rx_lines(sub, f"C++ -> Python {name}<{n}> ({backend})")
+            bad = check_bytes_joints(rows, kind, n, k)
+            check(f"C++ publica {name}<{n}> -> Python {name}[{n}] ({backend}): bytes y t_data intactos "
+                  f"({len(rows)}/{k} llegaron)",
+                  ready and cpp.returncode == 0 and len(rows) >= k // 2 and not bad,
+                  f"{bad[:3]}\npeer: {cpp.stdout}{cpp.stderr}\npython: {sub.everything()}")
+            check_joint_nans(rows, kind, n, f"C++ -> Python {name} ({backend})")
+            # Python -> C++
+            topic2 = topic + "_rev"
+            cpp_sub = Proc("receptor de C++", [jpeer, "sub", kind, str(n), topic2, str(k)], env)
+            procs.append(cpp_sub)
+            ready = cpp_sub.wait_line("LISTO") and wait_for(lambda: hub_has_sub(hub_addr, topic2, cpp_sub), 15, 0.1)
+            pyp = subprocess.run(py + [str(Path(__file__)), "--pyj", "pub", kind, str(n), topic2, str(k)],
+                                 capture_output=True, text=True, encoding="utf-8", errors="replace", env=env,
+                                 timeout=60)
+            cpp_sub.wait(20)
+            rows = rx_lines(cpp_sub, f"Python -> C++ {name} ({backend})")
+            bad = check_bytes_joints(rows, kind, n, k)
+            check(f"Python {name}[{n}] ({backend}) publica -> C++ {name}<{n}>: bytes y t_data intactos "
+                  f"({len(rows)}/{k})",
+                  ready and pyp.returncode == 0 and len(rows) >= k // 2 and not bad,
+                  f"{bad[:3]}\npython: {pyp.stdout}{pyp.stderr}\ncpp: {cpp_sub.everything()}")
+            check_joint_nans(rows, kind, n, f"Python -> C++ {name} ({backend})")
+        # El número es parte del tipo: con Python escuchando JointState[12], C++ con JointState<2> no entra.
+        topic = f"/joints_mezcla_{backend}"
+        sub = Proc("receptor de Python", py + [str(Path(__file__)), "--pyj", "sub", "state", "12", topic, "1"], env)
+        procs.append(sub)
+        ready = sub.wait_line("LISTO") and wait_for(lambda: hub_has_sub(hub_addr, topic, sub), 15, 0.1)
+        rej = subprocess.run([jpeer, "rechazo", "state", "2", topic], capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", env=env, timeout=60)
+        sub.stop()
+        check(f"el hub rechaza JointState<2> de C++ en un topic de JointState[12] ({backend})",
+              ready and rej.returncode == 0 and "RECHAZADO" in rej.stdout and "ya es de tipo JointState" in rej.stdout,
+              f"código {rej.returncode}\n{rej.stdout}{rej.stderr}")
+
+
 def main() -> int:
     from agmen import _backend, msgs
     from agmen.hub import ping
@@ -346,6 +481,9 @@ def main() -> int:
                 check(f"Python ({backend}) publica {kind} -> C++: bytes y t_data intactos ({len(rows)}/{n})",
                       ready and pyp.returncode == 0 and len(rows) >= n // 2 and not bad,
                       f"{bad[:3]}\npython: {pyp.stdout}{pyp.stderr}\ncpp: {cpp_sub.everything()}")
+
+        # 5) articulaciones (RFC 0013 §3.4): aquí, mientras no hay grabador en el hub
+        joints_smoke(py, env0, backends, hub_addr, procs)
 
         # 3) topic echo con Imu sin orientación (los pares)
         for k, flag in enumerate(([], ["--json"])):
@@ -478,4 +616,5 @@ def _has(cmd: str) -> bool:
 
 
 if __name__ == "__main__":
-    sys.exit(worker() if len(sys.argv) > 1 and sys.argv[1] == "--py" else main())
+    _mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    sys.exit(worker() if _mode == "--py" else worker_joints() if _mode == "--pyj" else main())
