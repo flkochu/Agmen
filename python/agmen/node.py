@@ -166,12 +166,13 @@ class _Sub:
 
     def pull(self, deadline_ns: int) -> None:
         """Recibe lo que ya llegó, sin esperar. Deja de recibir si no hay más, si
-        llegó a _PULL_MAX, o si ya recibió _PULL_MIN y time.monotonic_ns() llegó a
-        `deadline_ns` (la hora del siguiente temporizador del grupo): así los
+        llegó a _PULL_MAX, o si ya recibió _PULL_MIN y time.perf_counter_ns() llegó a
+        `deadline_ns` (la hora del siguiente temporizador del grupo; un reloj fino
+        también en Windows, donde time.monotonic() avanza de 15.6 ms en 15.6 ms): así los
         temporizadores tienen su turno aunque lleguen mensajes sin parar, y la
         suscripción avanza aunque siempre haya un temporizador vencido."""
         for i in range(_PULL_MAX):
-            if i >= _PULL_MIN and time.monotonic_ns() >= deadline_ns:
+            if i >= _PULL_MIN and time.perf_counter_ns() >= deadline_ns:
                 return
             try:
                 s = self.sub.receive(0)
@@ -484,7 +485,7 @@ class _PureNode:
                 else:
                     wait = min(wait, wu)
                     if clock.mode() == clock.REAL:
-                        timer_at = time.monotonic_ns() + int(wu * 1e9)
+                        timer_at = time.perf_counter_ns() + int(wu * 1e9)   # el reloj fino de pull()
             if end is not None:
                 wait = min(wait, (end - time.monotonic_ns()) / 1e9)
             if any(s.q for s in g.subs):
@@ -498,7 +499,7 @@ class _PureNode:
                 if not ready and wait > 0:
                     time.sleep(min(wait, 0.0005))
             if ready:
-                deadline = timer_at if timer_at is not None else time.monotonic_ns() + _PULL_BUDGET_NS
+                deadline = timer_at if timer_at is not None else time.perf_counter_ns() + _PULL_BUDGET_NS
                 for s in ready:
                     s.pull(deadline)
 
@@ -631,7 +632,6 @@ class _NativeNode:
             self._check_not_running("on")
             if hp.is_topic(where):
                 hp.check_topic(where)
-            _preload_numpy(msg_type)   # 8.2: como Publisher y Subscriber (el nodo puro usa Subscriber)
             decode, envelope = msg_type.decode_payload, wire.Envelope
 
             def deliver(env, payload, sender):
@@ -650,6 +650,7 @@ class _NativeNode:
             self._core.subscribe(where, msg_type.NAME, msg_type.SCHEMA_TEXT, msg_type.SCHEMA_ID,
                                  layout.size or 0, layout.encoding == wire.ENC_ARROW, deliver, max(1, int(queue)),
                                  (group or Group()).name)
+            _preload_numpy(msg_type)   # 8.2, tras validar el tipo y el topic (el nodo puro usa Subscriber)
             return f
 
         return add if fn is None else add(fn)

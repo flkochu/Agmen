@@ -174,6 +174,45 @@ class TestPullConTope(unittest.TestCase):
         self.assertGreater(recibidos_en_pulso[-1], recibidos_en_pulso[0], "los recibidos dejaron de subir")
         self.assertGreaterEqual(recibidos_en_pulso[1] - recibidos_en_pulso[0], node_mod._PULL_MIN)
 
+    @unittest.skipUnless(node_mod.Node is node_mod._NativeNode, "nodo nativo (el puro lo cubre la de arriba)")
+    def test_every_corre_con_un_topic_inundado(self):
+        # La hermana de punta a punta, con el nodo nativo: dos hilos publican sin parar junto a un
+        # every(5 ms). Cota generosa (lo ideal son ~120 pulsos en 0.6 s): con una máquina rápida la
+        # recepción le gana a la inundación aun sin el tope, así que no siempre fallaría sin él; la
+        # determinista es test_pull_deadline (C++). Con el nodo puro, los hilos que inundan se quedan
+        # con el GIL (el convoy) y el pulso depende del sistema: lo cubre la de arriba, determinista.
+        where = _port()
+        node = agmen.Node("prueba")
+        recibidos = [0]
+        en_pulso = []
+        node.every(0.005, lambda: en_pulso.append(recibidos[0]))
+        node.on(Clock, where, lambda s: recibidos.__setitem__(0, recibidos[0] + 1))
+        alto = threading.Event()
+
+        def inunda():
+            pub = agmen.Publisher(Clock, where, topic="/prueba")
+            try:
+                i = 0
+                while not alto.is_set():
+                    pub.publish(Clock(t=i))
+                    i += 1
+            finally:
+                pub.close()
+
+        hilos = [threading.Thread(target=inunda, daemon=True) for _ in range(2)]
+        for h in hilos:
+            h.start()
+        try:
+            time.sleep(0.05)   # que ya esté inundado
+            node.spin_for(0.6)
+        finally:
+            alto.set()
+            for h in hilos:
+                h.join(5)
+            node.close()
+        self.assertGreaterEqual(len(en_pulso), 10, f"el every(5 ms) corrió {len(en_pulso)} veces en 0.6 s")
+        self.assertGreater(en_pulso[-1], en_pulso[0], "los recibidos dejaron de subir")
+
 
 class TestSimClock(unittest.TestCase):
     def tearDown(self):
