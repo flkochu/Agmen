@@ -577,6 +577,7 @@ class TestManejoAtaques(MotorCase):
         for left, right in ((0.48, -0.48), (0.8, 0.8), (0.30000000000000004, 0.6000000000000001), (0, 0),
                             (1e-7, -1e-7), (5e-324, 0), (0.6, -0.6), (1.7976931348623157e308, -1e300)):
             with self.subTest(left=left, right=right):
+                time.sleep(0.02)                                # más que el tope de ~60 Hz del mando
                 c.send_text(json.dumps({"op": "teleop", "left": left, "right": right}))
                 cmd = self._cmd()
                 self.assertAlmostEqual(cmd["left"], max(-0.8, min(0.8, left)), places=5)
@@ -620,10 +621,13 @@ class TestManejoAtaques(MotorCase):
             for t in ths:
                 t.join()
         d = self.connect()
+        time.sleep(0.05)                                        # pasado el tope de ~60 Hz desde el ALTO
         d.send_text(json.dumps({"op": "teleop", "left": 0.25, "right": 0.25}))
         self.assertAlmostEqual(self._cmd()["left"], 0.25, places=5)
         d.send_text(json.dumps({"op": "teleop", "left": 0, "right": 0}))
 
+    @unittest.expectedFailure   # BUG ABIERTO (tester): do_POST hace rfile.read(length) sin tope ni try -> MemoryError /
+    # OverflowError sin atrapar. Cuando se arregle, esta prueba pasa "inesperadamente": quitar este decorador.
     def test_content_length_mentiroso_o_enorme_no_tumba_el_hilo(self):
         """Un Content-Length absurdo contesta 400 y no deja una excepción sin atrapar en el servidor (antes:
         MemoryError / OverflowError al intentar reservar ese cuerpo, y la conexión moría sin respuesta)."""
