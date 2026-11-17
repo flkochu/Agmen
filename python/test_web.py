@@ -46,6 +46,14 @@ def free_udp() -> int:
             return port
 
 
+def recv_all(s: socket.socket) -> str:
+    """Toda la respuesta HTTP hasta que el panel cierra (puede llegar en varios pedazos: encabezados y cuerpo)."""
+    out = b""
+    while chunk := s.recv(65536):
+        out += chunk
+    return out.decode()
+
+
 class TestWebSocket(unittest.TestCase):
     def test_accept_key_rfc6455(self):
         # Ejemplo del RFC 6455 §1.3
@@ -262,7 +270,9 @@ class TestPuente(PanelCase):
         self.connect(headers={"Origin": f"http://{self.base}"})          # el mismo panel sí
 
 
-class TestHombreMuerto(PanelCase):
+class MotorCase(PanelCase):
+    """Un panel con teleop que le manda a un "motor" (un socket UDP de la prueba)."""
+
     def setUp(self):
         self.motor = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.motor.bind(("127.0.0.1", 0))
@@ -280,6 +290,97 @@ class TestHombreMuerto(PanelCase):
             if env.encoding == wire.ENC_COMPACT:
                 return MotorCommand.LAYOUT.unpack(payload)
 
+    # --- esperas por señal (sin depender de sleeps cortos ni del orden en que llega lo viejo) ---
+    _altos_usados = 0          # ALTOs del hombre muerto (avisados en los logs) cuyo (0, 0) ya se vio llegar
+
+    def _altos(self) -> int:
+        """Cuántos ALTO del hombre muerto avisó el panel (los avisa en sus logs ANTES de mandarlos)."""
+        logs, _ = self.panel.logs.since(0)
+        return sum("→ ALTO" in line["text"] for line in logs)
+
+    def _leer(self, wait: float):
+        """El siguiente MotorCommand (left, right) que llegue al motor en `wait` s, o None."""
+        end = time.monotonic() + wait
+        try:
+            while (left := end - time.monotonic()) > 0:
+                self.motor.settimeout(left)
+                env, payload = wire.parse(self.motor.recv(2048))
+                if env.encoding == wire.ENC_COMPACT:
+                    m = MotorCommand.LAYOUT.unpack(payload)
+                    return (m["left"], m["right"])
+        except socket.timeout:
+            pass
+        finally:
+            self.motor.settimeout(3)
+        return None
+
+    def _alto_avisado(self, cmd) -> bool:
+        """¿Este (0, 0) es un ALTO del hombre muerto que el panel avisó en sus logs y nadie ha contado? Si sí,
+        lo cuenta."""
+        if cmd == (0.0, 0.0) and self._altos() > self._altos_usados:
+            self._altos_usados += 1
+            return True
+        return False
+
+    def _viejo(self, cmd) -> bool:
+        """¿Es algo que ya pasó y puede llegar tarde? Solo un ALTO del hombre muerto avisado y sin contar (las
+        copias de un comando reenviado las recoge _manejar antes de regresar)."""
+        return self._alto_avisado(cmd)
+
+    def _nada(self, wait=0.25):
+        """Que en `wait` segundos no se publique ningún comando nuevo (lo viejo que llega tarde no cuenta)."""
+        end = time.monotonic() + wait
+        while (got := self._leer(max(0.0, end - time.monotonic()))) is not None:
+            if not self._viejo(got):
+                self.fail(f"se publicó un comando: {got}")
+
+    def _manejar(self, send, left, right, timeout=5.0):
+        """Manda (left, right) como el navegador y espera a que el motor reciba ESE comando (recortado a
+        max_speed y en f32). `send`: el cliente WebSocket, o una función que lo manda (POST).
+
+        Si no llega en 0.3 s, lo vuelve a mandar, como el navegador cada 50 ms: el tope de ~60 Hz del mando
+        descarta sin error un comando que llega demasiado pronto, y en Windows con Python 3.12 time.monotonic
+        avanza de a 15-16 ms (GetTickCount64), así que 20 ms entre dos comandos pueden medirse como 15 ms y
+        la resta en float dar 0.01499… (< 0.015): se descarta, y 300 ms después llega el ALTO del hombre
+        muerto (así falló el CI).
+
+        "Es un alto" se decide como el panel: con el recorte en f64 (un alto no pasa por el tope, así que no
+        se reenvía). (5e-324, 0) NO es un alto para el panel aunque llegue al motor como (0.0, 0.0) en f32:
+        se reenvía como cualquier comando, y un (0, 0) que coincide con un ALTO avisado en los logs y sin
+        contar se cuenta como ese ALTO, nunca como el comando esperado. Otra cosa que llegue y no sea vieja
+        (_viejo) es un error."""
+        ms = self.panel.teleop.max_speed
+        clipped = tuple(max(-ms, min(ms, v)) for v in (left, right))
+        is_stop = clipped == (0.0, 0.0)
+        want = tuple(struct.unpack("<f", struct.pack("<f", v))[0] for v in clipped)
+        msg = {"op": "teleop", "left": left, "right": right}
+        mandar = send if callable(send) else (lambda: send.send_text(json.dumps(msg)))
+        copias = 0                          # reenvíos: si el primero solo tardaba, llega más de un `want`
+        end = time.monotonic() + timeout
+        mandar()
+        while time.monotonic() < end:
+            got = self._leer(0.3)
+            if got is None:
+                if not is_stop:             # se descartó por el tope (o tarda): otra vez, como el navegador
+                    copias += 1
+                    mandar()
+                continue
+            if self._alto_avisado(got):     # el ALTO del hombre muerto: nunca es el comando esperado
+                continue
+            if got == want:
+                # Las copias de los reenvíos llegan enseguida (es localhost): se recogen aquí, para que
+                # después ningún (0, 0) ni otro valor se acepte "por si acaso" como viejo.
+                while copias and (extra := self._leer(0.15)) is not None:
+                    if extra == want:
+                        copias -= 1
+                    elif not self._alto_avisado(extra):
+                        self.fail(f"llegó {extra} al motor después de {want}")
+                return got
+            self.fail(f"llegó {got} al motor esperando {want}")
+        self.fail(f"no llegó {want} al motor en {timeout} s")
+
+
+class TestHombreMuerto(MotorCase):
     def test_se_corta_la_conexion_y_manda_alto(self):
         c = self.connect()
         c.send_text(json.dumps({"op": "teleop", "left": 0.5, "right": 2.0}))
@@ -311,6 +412,451 @@ class TestHombreMuerto(PanelCase):
         time.sleep(0.6)
         logs, _ = self.panel.logs.since(0)
         self.assertFalse(any("ALTO" in line["text"] for line in logs))
+
+
+# Lo que un script (no un navegador: JSON.stringify no puede) le manda al mando de manejo. Python lee NaN,
+# Infinity y -Infinity aunque no son JSON, y antes el recorte a max_speed volvía un NaN la VELOCIDAD MÁXIMA.
+MANEJO_MALO = [
+    ("NaN", '{"op": "teleop", "left": NaN, "right": 0.2}', "NaN"),
+    ("NaN a la derecha", '{"op": "teleop", "left": 0.2, "right": NaN}', "NaN"),
+    ("Infinity", '{"op": "teleop", "left": Infinity, "right": 0.2}', "Infinity"),
+    ("-Infinity", '{"op": "teleop", "left": 0.2, "right": -Infinity}', "-Infinity"),
+    ("1e999 (infinito escrito como número)", '{"op": "teleop", "left": 1e999, "right": 0.2}', "infinito"),
+    ("entero enorme", '{"op": "teleop", "left": 1' + "0" * 400 + ', "right": 0.2}', "demasiado grande"),
+    ("texto", '{"op": "teleop", "left": "rápido", "right": 0.2}', "debe ser un número"),
+    ("texto que parece NaN", '{"op": "teleop", "left": "nan", "right": 0.2}', "debe ser un número"),
+    ("null", '{"op": "teleop", "left": null, "right": 0.2}', "debe ser un número"),
+    ("booleano", '{"op": "teleop", "left": true, "right": 0.2}', "debe ser un número"),
+    ("lista", '{"op": "teleop", "left": [0.5], "right": 0.2}', "debe ser un número"),
+    ("falta right", '{"op": "teleop", "left": 0.2}', "falta 'right'"),
+    ("faltan los dos", '{"op": "teleop"}', "falta 'left'"),
+]
+
+
+class TestManejoConValoresMalos(MotorCase):
+    """Un comando de manejo con un valor que no es un número finito se rechaza ENTERO: no se publica nada
+    (ni recortado, ni como cero), el que lo mandó recibe el error y el hombre muerto sigue como estaba."""
+
+    def _error(self, c):
+        return json.loads(self.recv_until(c, lambda m: isinstance(m, str) and json.loads(m)["op"] == "error"))["msg"]
+
+    def _post(self, raw: str):
+        req = urllib.request.Request(f"http://{self.base}/api/teleop", data=raw.encode(), method="POST",
+                                     headers={"X-Agmen": "1"})
+        try:
+            return 200, json.load(urllib.request.urlopen(req, timeout=5))
+        except urllib.error.HTTPError as e:
+            return e.code, json.load(e)
+
+    def test_websocket_rechaza_y_lo_bueno_sigue(self):
+        c = self.connect()
+        for nombre, raw, msg in MANEJO_MALO:
+            with self.subTest(nombre):
+                c.send_text(raw)
+                err = self._error(c)
+                self.assertIn(msg, err)
+                self.assertIn("se mandó nada al robot", err)
+                self._nada()
+                self._manejar(c, 0.4, -0.4)                             # lo bueno sigue
+                self._manejar(c, 0, 0)
+        self.assertEqual(self.panel.teleop.last_cmd, (0.0, 0.0))
+
+    def test_post_rechaza_y_lo_bueno_sigue(self):
+        for nombre, raw, msg in MANEJO_MALO:
+            with self.subTest(nombre):
+                status, body = self._post(raw)
+                self.assertEqual(status, 400, body)
+                self.assertIn(msg, body["error"])
+                self._nada()
+
+                def bueno():
+                    status, body = self._post(json.dumps({"left": 0.4, "right": 0.1}))
+                    self.assertEqual((status, body["ok"]), (200, True))
+                self._manejar(bueno, 0.4, 0.1)
+
+    def _avisos(self) -> list[str]:
+        logs, _ = self.panel.logs.since(0)
+        return [line["text"] for line in logs if "rechacé lo que mandó" in line["text"]]
+
+    @staticmethod
+    def _contados(avisos) -> int:
+        """Cuántos rechazos suman los avisos: cada uno cuenta 1, o los N de "(N rechazados desde el aviso…)"."""
+        import re
+
+        return sum(int(m.group(1)) if (m := re.search(r"\((\d+) rechazados desde", a)) else 1 for a in avisos)
+
+    def test_los_rechazos_quedan_en_los_logs_sin_llenarlos(self):
+        """Un script ajeno que manda basura al mando: el operador lo ve en los logs del panel (el primero de
+        cada conexión y luego como mucho uno por segundo, con cuántos hubo). El tiempo de los avisos es uno
+        falso (bridge.clock): no depende de lo rápida que sea la máquina."""
+        ahora = [100.0]
+        self.panel.bridge.clock = lambda: ahora[0]
+        c = self.connect()
+        for _ in range(30):
+            c.send_text('{"op": "teleop", "left": NaN, "right": 0}')
+            self._error(c)
+        avisos = self._avisos()
+        self.assertEqual(len(avisos), 1, avisos)                       # 30 rechazos en el mismo "instante"
+        self.assertIn("NaN no es JSON válido", avisos[0])
+        ahora[0] += 1.0                                                # pasa un segundo
+        c.send_text('{"op": "teleop", "left": "rápido", "right": 0}')
+        self._error(c)
+        avisos = self._avisos()
+        self.assertEqual(len(avisos), 2, avisos)
+        self.assertIn("(30 rechazados desde el aviso anterior)", avisos[1])
+        self.assertIn("rápido", avisos[1])
+        c.send_binary(b"\x00\x01")                                    # un binario también cuenta (sin aviso aún)
+        self._error(c)
+        self.assertEqual(len(self._avisos()), 2)
+        self._post('{"left": NaN, "right": 0}')          # por POST, también (por dirección)
+        self.assertEqual(len(self._avisos()), 3)
+        self._post('{"left": NaN, "right": 0}')
+        self.assertEqual(len(self._avisos()), 3)                       # mismo segundo, misma dirección
+        self._nada()
+
+    def test_reject_log_uno_por_segundo(self):
+        """La regla de los avisos, con tiempos exactos (sin reloj de verdad)."""
+        from agmen.panel.bridge import RejectLog
+
+        r = RejectLog()
+        self.assertEqual(r.note(10.0), 1)                       # el primero se avisa
+        self.assertEqual([r.note(10.0 + k / 100) for k in range(1, 30)], [0] * 29)
+        self.assertEqual(r.note(11.0), 30)                      # al segundo: los 29 + este
+        self.assertEqual(r.note(11.5), 0)
+        self.assertEqual(r.note(12.5), 2)
+
+    def test_post_que_no_es_un_objeto(self):
+        for raw in ("[0.5, 0.5]", "0.5", '"left"', "null"):
+            with self.subTest(raw):
+                status, body = self._post(raw)
+                self.assertEqual(status, 400, body)
+                self.assertIn("objeto JSON", body["error"])
+        self._nada()
+
+    def test_un_comando_malo_no_reinicia_el_hombre_muerto(self):
+        """Manejando, llegan solo comandos con NaN: el robot debe frenar a los 300 ms del último BUENO."""
+        c = self.connect()
+        self._manejar(c, 0.3, 0.3)
+        t0 = time.monotonic()
+        stop = threading.Event()
+
+        def malos():
+            while not stop.wait(0.05):
+                c.send_text('{"op": "teleop", "left": NaN, "right": NaN}')
+
+        th = threading.Thread(target=malos, daemon=True)
+        th.start()
+        try:
+            cmd = self._cmd()
+        finally:
+            stop.set()
+            th.join()
+        self.assertEqual((cmd["left"], cmd["right"]), (0.0, 0.0))
+        self.assertLess(time.monotonic() - t0, 0.9)
+
+    def test_teleop_send_desde_python_tambien_rechaza(self):
+        import math
+
+        for malo in (math.nan, math.inf, -math.inf, "0.5", None, True):
+            with self.subTest(malo=malo):
+                with self.assertRaises(ValueError):
+                    self.panel.teleop.send(malo, 0.0)
+                with self.assertRaises(ValueError):
+                    self.panel.teleop.send(0.0, malo)
+        self._nada()
+        self.assertEqual(self.panel.teleop.send(5, -5), (0.8, -0.8))   # un número finito grande sí se recorta
+
+
+class TestJsonDelCliente(PanelCase):
+    """El JSON que llega de un cliente no trae NaN ni Infinity como si fueran números (en ningún op)."""
+
+    def test_constantes_rechazadas_en_cualquier_op(self):
+        c = self.connect()
+        for raw in ('{"op": "subscribe", "topic": "*", "max_hz": NaN}',
+                    '{"op": "subscribe", "topic": "*", "max_hz": Infinity}',
+                    '{"op": "clock", "action": "speed", "value": NaN}',
+                    '{"op": "command", "id": 0, "fields": {"left": -Infinity}}'):
+            with self.subTest(raw):
+                c.send_text(raw)
+                err = json.loads(self.recv_until(c, lambda m: isinstance(m, str) and json.loads(m)["op"] == "error"))
+                self.assertIn("no es JSON válido", err["msg"])
+
+    def test_max_hz_tiene_que_ser_un_numero(self):
+        c = self.connect()
+        for raw in ('{"op": "subscribe", "topic": "*", "max_hz": "10"}',
+                    '{"op": "subscribe", "topic": "*", "max_hz": true}',
+                    '{"op": "subscribe", "topic": "*", "max_hz": -1}'):
+            with self.subTest(raw):
+                c.send_text(raw)
+                err = json.loads(self.recv_until(c, lambda m: isinstance(m, str) and json.loads(m)["op"] == "error"))
+                self.assertIn("max_hz", err["msg"])
+        with self.panel.bridge.lock:
+            (cl,) = self.panel.bridge.agmen
+            self.assertEqual(cl.subs, {}, "ninguna suscripción mala quedó puesta")
+
+    def test_foxglove_con_basura_no_tumba_la_conexion(self):
+        c = self.connect(protocol="foxglove.websocket.v1", headers={"Origin": "https://app.foxglove.dev"})
+        self.assertEqual(json.loads(c.recv())["op"], "serverInfo")
+        for raw in ('{"op": "subscribe", "subscriptions": [{"id": NaN, "channelId": 1}]}',
+                    '{"op": "subscribe", "subscriptions": 5}',
+                    '{"op": "subscribe", "subscriptions": ["x"]}',
+                    '{"op": "subscribe", "subscriptions": [{"id": "x", "channelId": 1}]}',
+                    '{"op": "unsubscribe", "subscriptionIds": 5}'):
+            with self.subTest(raw):
+                c.send_text(raw)
+                st = json.loads(self.recv_until(c, lambda m: isinstance(m, str) and json.loads(m)["op"] == "status"))
+                self.assertEqual(st["level"], 1)
+        self.assertFalse(c.closed)
+
+    def test_content_length_malo(self):
+        for cl in ("abc", "-5", "+30", "3_0", "\u0663", " 1 2"):     # int() acepta "+30", "3_0" y "٣": aquí no
+            with self.subTest(cl):
+                s = socket.create_connection(("127.0.0.1", self.panel.port), timeout=5)
+                with s:
+                    s.sendall(f"POST /api/teleop HTTP/1.1\r\nHost: x\r\nX-Agmen: 1\r\nContent-Length: {cl}\r\n\r\n"
+                              .encode())
+                    resp = recv_all(s)
+                self.assertIn(" 400 ", resp.split("\r\n")[0])
+                self.assertIn("Content-Length", resp)
+
+    def test_chunked_y_content_length_repetido_no_cuelan_otra_peticion(self):
+        """Transfer-Encoding o dos Content-Length: 400 y se cierra la conexión. Antes el cuerpo se tomaba como
+        0 bytes y sus bytes se leían como una segunda petición (aquí, un POST /api/record de contrabando)."""
+        oculta = "POST /api/record HTTP/1.1\r\nHost: x\r\nX-Agmen: 1\r\nContent-Length: 19\r\n\r\n{\"action\": \"start\"}"
+        for extra in ("Transfer-Encoding: chunked\r\n", "Content-Length: 0\r\nContent-Length: 0\r\n"):
+            with self.subTest(extra=extra.split(":")[0]):
+                s = socket.create_connection(("127.0.0.1", self.panel.port), timeout=5)
+                with s:
+                    s.sendall(f"POST /api/teleop HTTP/1.1\r\nHost: x\r\nX-Agmen: 1\r\n{extra}\r\n{oculta}".encode())
+                    resp = recv_all(s)
+                self.assertEqual(resp.count("HTTP/1.1 "), 1, resp)          # una sola respuesta: la oculta no corrió
+                self.assertIn(" 400 ", resp.split("\r\n")[0])
+                self.assertIn("un solo Content-Length", json.loads(resp.partition("\r\n\r\n")[2])["error"])
+
+    def test_post_sin_cuerpo_ni_content_length_sigue(self):
+        """Un script que hace POST /api/node/<n>/<acción> sin cuerpo (ni Content-Length) sigue funcionando."""
+        s = socket.create_connection(("127.0.0.1", self.panel.port), timeout=5)
+        with s:
+            s.sendall(b"POST /api/node/imu/start HTTP/1.1\r\nHost: x\r\nX-Agmen: 1\r\nConnection: close\r\n\r\n")
+            resp = recv_all(s)
+        self.assertIn("no administra nodos", resp)          # llegó a la ruta (este panel no tiene agmen run)
+
+    def test_accion_de_nodo_larga_dice_lo_que_pasa(self):
+        class Lanzador:
+            def action(self, name, what):
+                return None
+        self.panel.launcher = Lanzador()
+        req = urllib.request.Request(f"http://{self.base}/api/node/imu/{'x' * 300}", data=b"", method="POST",
+                                     headers={"X-Agmen": "1"})
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=5)
+        err = json.load(cm.exception)["error"]
+        self.assertIn("acción desconocida", err)
+        self.assertIn("'imu'", err)
+        self.assertLess(len(err), 200)
+
+    def test_cuerpo_demasiado_grande(self):
+        """Más de 1 MiB declarado: 413 sin leer nada (antes se intentaba reservar todo ese cuerpo)."""
+        for cl in (ws.MAX_MESSAGE + 1, 10**12, 2**63, 10**30, int("9" * 40)):
+            with self.subTest(cl=cl):
+                s = socket.create_connection(("127.0.0.1", self.panel.port), timeout=5)
+                with s:
+                    s.sendall(f"POST /api/command HTTP/1.1\r\nHost: x\r\nX-Agmen: 1\r\nContent-Length: {cl}\r\n\r\n{{}}"
+                              .encode())
+                    resp = recv_all(s)                   # el panel cierra después de contestar
+                head, _, body = resp.partition("\r\n\r\n")
+                self.assertIn(" 413 ", head.split("\r\n")[0])
+                self.assertIn("el máximo es 1048576 bytes", json.loads(body)["error"])
+
+    def test_mensaje_de_json_invalido_en_espanol(self):
+        c = self.connect()
+        c.send_text('{"op": "teleop", "left": ,}')
+        err = json.loads(self.recv_until(c, lambda m: isinstance(m, str) and json.loads(m)["op"] == "error"))["msg"]
+        self.assertIn("JSON inválido cerca del carácter 25", err)
+        self.assertNotIn("Expecting", err)
+        c.send_text('{"op": "teleop", "left": -NaN, "right": 0}')
+        err = json.loads(self.recv_until(c, lambda m: isinstance(m, str) and json.loads(m)["op"] == "error"))["msg"]
+        self.assertIn("JSON inválido cerca del carácter", err)
+
+    def test_lo_del_cliente_no_se_devuelve_entero(self):
+        """Un op (o un mando, o un topic) de casi 1 MiB: el error lo cita acotado, no lo devuelve entero."""
+        c = self.connect()
+        grande = "x" * 1_000_000
+        for m in ({"op": grande}, {"op": "command", "id": grande, "button": 0},
+                  {"op": "subscribe", "topic": "/" + grande}, {"op": "clock", "action": grande},
+                  {"op": "record", "action": grande}, {"op": ["y"] * 200_000}):
+            with self.subTest(m=str(m)[:30]):
+                c.send_text(json.dumps(m))
+                msg = self.recv_until(c, lambda t: isinstance(t, str) and json.loads(t)["op"] == "error")
+                self.assertLess(len(msg), 600, msg[:200])
+
+    def test_binario_contesta_error(self):
+        c = self.connect()
+        c.send_binary(b'{"op":"teleop","left":0.5,"right":0.5}')
+        err = json.loads(self.recv_until(c, lambda m: isinstance(m, str) and json.loads(m)["op"] == "error"))["msg"]
+        self.assertIn("no acepta mensajes binarios", err)
+        self.assertFalse(c.closed)
+
+
+class TestManejoAtaques(MotorCase):
+    """Lo que un cliente hostil o torpe puede mandarle al mando de manejo, de punta a punta (panel real, motor
+    simulado con un socket). Nada de lo malo llega al motor y lo bueno de después sí."""
+
+    # JSON que Python lee distinto de lo que parece: mayúsculas, signos, claves repetidas, profundidad, números
+    # enormes. Ninguno debe producir un comando; todos deben dejar la conexión viva y contestar un error.
+    ATAQUES = [
+        ("-NaN", '{"op":"teleop","left":-NaN,"right":0}'),
+        ("nan en minúsculas", '{"op":"teleop","left":nan,"right":0}'),
+        ("INFINITY", '{"op":"teleop","left":INFINITY,"right":0}'),
+        ("+Infinity", '{"op":"teleop","left":+Infinity,"right":0}'),
+        ("1e400", '{"op":"teleop","left":1e400,"right":0}'),
+        ("-1E999", '{"op":"teleop","left":0,"right":-1E999}'),
+        ("clave repetida: bueno y luego NaN", '{"op":"teleop","left":0.1,"left":NaN,"right":0}'),
+        ("clave repetida: NaN y luego bueno", '{"op":"teleop","left":NaN,"left":0.1,"right":0}'),
+        ("NaN en un campo que sobra", '{"op":"teleop","left":0.1,"right":0.1,"extra":NaN}'),
+        ("lista anidada sin fin", '{"op":"teleop","left":' + "[" * 100_000 + "]" * 100_000 + ',"right":0}'),
+        ("objetos anidados sin fin", '{"op":"teleop","left":' + '{"a":' * 100_000 + "1" + "}" * 100_000 + ',"right":0}'),
+        ("entero de 5000 dígitos", '{"op":"teleop","left":1' + "0" * 5000 + ',"right":0}'),
+        ("la raíz es una lista", '[{"op":"teleop","left":0.1,"right":0.1}]'),
+        ("vacío", ""),
+        ("coma final", '{"op":"teleop","left":0.1,"right":0.1,}'),
+        ("dict en vez de número", '{"op":"teleop","left":{"a":1},"right":0}'),
+    ]
+
+    def _sin_comandos(self, wait=0.2):
+        self._nada(wait)
+
+    def _error(self, c):
+        return json.loads(self.recv_until(c, lambda m: isinstance(m, str) and json.loads(m)["op"] == "error"))["msg"]
+
+    def test_ataques_por_websocket(self):
+        c = self.connect()
+        for nombre, raw in self.ATAQUES:
+            with self.subTest(nombre):
+                c.send_text(raw)
+                self.assertTrue(self._error(c))                 # dice qué pasó
+                self._sin_comandos()
+                self._manejar(c, 0.2, 0.1)                       # lo bueno de después
+                self._manejar(c, 0, 0)
+        self.assertFalse(c.closed)
+
+    def test_ataques_por_post(self):
+        for nombre, raw in self.ATAQUES:
+            with self.subTest(nombre):
+                req = urllib.request.Request(f"http://{self.base}/api/teleop", data=raw.encode(), method="POST",
+                                             headers={"X-Agmen": "1"})
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(req, timeout=5)
+                self.assertEqual(cm.exception.code, 400)
+                self.assertIn("error", json.load(cm.exception))
+                self._sin_comandos(0.1)
+
+    def test_binario_y_utf8_roto_no_manejan(self):
+        """Un mensaje binario con JSON válido, o un texto que no es UTF-8, no mueve el robot."""
+        c = self.connect()
+        c.send_binary(b'{"op":"teleop","left":0.5,"right":0.5}')
+        self._sin_comandos(0.3)
+        self.assertIn("no acepta mensajes binarios", self._error(c))   # se contesta el error; la conexión sigue
+        self.assertFalse(c.closed)
+        bueno = self.connect()
+        self._manejar(bueno, 0.2, 0.2)
+        self._manejar(bueno, 0, 0)
+        malo = self.connect()
+        malo.sock.sendall(ws.encode_frame(ws.OP_TEXT, b'{"op":"teleop","left":0.5,"right":\xff\xfe}', True))
+        self._sin_comandos(0.3)                                 # (RFC 6455: el servidor cierra con 1007)
+
+    def test_lo_que_manda_el_joystick_del_navegador(self):
+        """Exactamente lo que arma command() de index.html: JSON.stringify de números finitos, incluidos los que
+        quedan con muchos decimales, el cero y los que pasan de max_speed (se recortan, no se rechazan)."""
+        c = self.connect()
+        for left, right in ((0.48, -0.48), (0.8, 0.8), (0.30000000000000004, 0.6000000000000001), (0, 0),
+                            (1e-7, -1e-7), (5e-324, 0), (0.6, -0.6), (1.7976931348623157e308, -1e300)):
+            with self.subTest(left=left, right=right):
+                # Espera ESE comando (reintenta si el tope de ~60 Hz lo descartó y salta un ALTO viejo).
+                cmd_left, cmd_right = self._manejar(c, left, right)
+                self.assertAlmostEqual(cmd_left, max(-0.8, min(0.8, left)), places=5)
+                self.assertAlmostEqual(cmd_right, max(-0.8, min(0.8, right)), places=5)
+                self.assertLessEqual(abs(cmd_left), 0.8 + 1e-6)
+                self.assertLessEqual(abs(cmd_right), 0.8 + 1e-6)
+                self.assertFalse(cmd_left != cmd_left)          # no NaN
+        self._manejar(c, 0, 0)
+
+    def test_rafaga_de_malos_desde_dos_clientes_no_aguanta_al_robot(self):
+        """Dos clientes mandan comandos malos sin parar: el robot frena a los ~300 ms del último comando BUENO,
+        y un comando bueno de un tercero después de la ráfaga funciona."""
+        a, b = self.connect(), self.connect()
+        self._manejar(a, 0.3, 0.3)
+        t0 = time.monotonic()
+        stop = threading.Event()
+        malos = ['{"op":"teleop","left":NaN,"right":NaN}', '{"op":"teleop","left":1e400,"right":0}',
+                 '{"op":"teleop","left":0.3}', '{"op":"teleop","left":[0.3],"right":0.3}', "[]", "no es json"]
+
+        def spam(c):
+            i = 0
+            while not stop.wait(0.005):
+                try:
+                    c.send_text(malos[i % len(malos)])
+                except OSError:
+                    return
+                i += 1
+
+        ths = [threading.Thread(target=spam, args=(c,), daemon=True) for c in (a, b)]
+        for t in ths:
+            t.start()
+        try:
+            cmd = self._cmd()
+            self.assertEqual((cmd["left"], cmd["right"]), (0.0, 0.0))
+            self.assertLess(time.monotonic() - t0, 0.9)
+            self.assertGreaterEqual(self._altos(), 1)
+            self._altos_usados = self._altos()                  # ese ALTO ya se contó
+        finally:
+            stop.set()
+            for t in ths:
+                t.join()
+        d = self.connect()
+        self._manejar(d, 0.25, 0.25)
+        self._manejar(d, 0, 0)
+
+    def test_content_length_mentiroso_o_enorme_no_tumba_el_hilo(self):
+        """Un Content-Length absurdo contesta 400 y no deja una excepción sin atrapar en el servidor (antes:
+        MemoryError / OverflowError al intentar reservar ese cuerpo, y la conexión moría sin respuesta)."""
+        for cl in (10**12, 2**63, 10**30):
+            with self.subTest(cl=cl):
+                s = socket.create_connection(("127.0.0.1", self.panel.port), timeout=5)
+                with s:
+                    s.sendall(f"POST /api/teleop HTTP/1.1\r\nHost: x\r\nX-Agmen: 1\r\nContent-Length: {cl}\r\n\r\n{{}}"
+                              .encode())
+                    resp = s.recv(65536).decode()
+                self.assertIn(" 4", resp.split("\r\n")[0], f"sin respuesta HTTP de error: {resp!r}")
+        self._sin_comandos(0.1)
+
+
+class TestRelojDesdeElPanel(unittest.TestCase):
+    """Pausa, paso y velocidad del tiempo simulado: un valor que no es un número finito no llega al reloj."""
+
+    def setUp(self):
+        from agmen import clock
+
+        self.addCleanup(clock.configure, clock.REAL)
+        self.clock = clock.ClockServer(speed=1.0, paused=False, publish=False)
+        self.panel = Panel("127.0.0.1:0", None, "prueba", None, None, topics=False, clock=self.clock)
+        self.addCleanup(self.panel.server.server_close)
+
+    def test_velocidad_y_paso_malos(self):
+        import math
+
+        for action in ("speed", "step"):
+            for malo in (math.nan, math.inf, -math.inf, "2", "nan", None, True, [2], 0, -1, 1e9):
+                if action == "step" and malo is None:
+                    continue                                   # step sin valor = 0.1 s (lo que manda el botón)
+                with self.subTest(action=action, valor=malo):
+                    err = self.panel.clock_action(action, malo)
+                    self.assertIsNotNone(err)
+                    self.assertEqual((self.clock.speed, self.clock.paused), (1.0, False))
+        self.assertIsNone(self.panel.clock_action("speed", 4))
+        self.assertEqual(self.clock.speed, 4.0)
+        self.assertIsNone(self.panel.clock_action("step", None))
+        self.assertTrue(self.clock.paused)
 
 
 class TestGrabaciones(unittest.TestCase):
@@ -670,6 +1216,38 @@ class TestClave(PanelCase):
         self.assertEqual(json.loads(c2.recv())["op"], "hello")
         self.assertTrue(self.panel.url.endswith("?t=clave-de-prueba-123"))
 
+    def test_sin_clave_nada_llega_a_los_logs(self):
+        """Sin la clave, un POST malo al mando (JSON con NaN, o un Content-Length inválido) no escribe en los
+        logs del panel: solo quien pasó la clave y el origen deja avisos."""
+        for raw, cl in (('{"left": NaN, "right": 0}', None), ("{}", "+2")):
+            with self.subTest(cl=cl):
+                s = socket.create_connection(("127.0.0.1", self.panel.port), timeout=5)
+                with s:
+                    s.sendall(f"POST /api/teleop HTTP/1.1\r\nHost: x\r\nX-Agmen: 1\r\nContent-Length: "
+                              f"{cl or len(raw)}\r\n\r\n{raw}".encode())
+                    resp = recv_all(s)
+                self.assertRegex(resp.split("\r\n")[0], " 40[01] ")
+        logs, _ = self.panel.logs.since(0)
+        self.assertFalse([line for line in logs if "rechacé" in line["text"]], logs)
+
+    def test_sin_clave_no_se_lee_el_cuerpo(self):
+        """Sin la clave, el panel contesta 401 sin esperar el cuerpo (aquí nunca llega) ni reservar memoria
+        para él, aunque declare 1 TB, y sin llegar al mando."""
+        for cl in (100, 10**12):
+            with self.subTest(cl=cl):
+                s = socket.create_connection(("127.0.0.1", self.panel.port), timeout=5)
+                with s:
+                    s.sendall(f"POST /api/teleop HTTP/1.1\r\nHost: x\r\nX-Agmen: 1\r\nContent-Length: {cl}\r\n\r\n"
+                              .encode())
+                    resp = recv_all(s)                   # el panel cierra después de contestar
+                self.assertIn(" 401 ", resp.split("\r\n")[0])
+                self.assertIn("falta la clave", resp)
+        req = urllib.request.Request(f"http://{self.base}/api/teleop", data=b'{"left": 0.1, "right": 0.1}',
+                                     method="POST", headers={"X-Agmen": "1"})
+        with self.assertRaises(urllib.error.HTTPError) as e:     # un cliente normal recibe su 401 entero
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(e.exception.code, 401)
+
 
 class TestPuertoOcupado(unittest.TestCase):
     """[web] listen ocupado por otro robot (0.12.1, PENDIENTES de Arca9 #7): antes el
@@ -774,6 +1352,50 @@ class TestMandos(unittest.TestCase):
         self.rx.settimeout(0.6)
         with self.assertRaises(socket.timeout):     # ni un ALTO inventado: el receptor aplica su watchdog
             self.recibido()
+
+    def test_nan_e_infinito_no_llegan_al_mando(self):
+        """[[web.command]] ya revisaba cada valor (check_value): aquí, por el camino completo del panel."""
+        import math
+
+        c = self.connect()
+        for raw in ('{"op": "command", "id": 0, "fields": {"left": NaN}}',
+                    '{"op": "command", "id": 0, "fields": {"left": Infinity}}',
+                    '{"op": "command", "id": 0, "fields": {"left": 1e999}}',
+                    '{"op": "command", "id": 0, "button": NaN}'):
+            with self.subTest(raw):
+                c.send_text(raw)
+                err = json.loads(self.recv_text(c, lambda m: m.get("op") == "error"))
+                self.assertIn("no es JSON válido", err["msg"])
+        # Un entero enorme es JSON válido, pero no cabe en f32: antes float() lanzaba OverflowError y tumbaba la
+        # conexión (por WebSocket) o la dejaba sin respuesta (POST).
+        enorme = "1" + "0" * 400
+        c.send_text('{"op": "command", "id": 0, "fields": {"left": ' + enorme + '}}')
+        err = json.loads(self.recv_text(c, lambda m: m.get("op") == "error"))["msg"]
+        self.assertIn("no cabe en f32", err)
+        self.assertIn("unos 401 dígitos", err)
+        req = urllib.request.Request(f"http://{self.base}/api/command", method="POST", headers={"X-Agmen": "1"},
+                                     data=('{"command": 0, "fields": {"left": ' + enorme + '}}').encode())
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(cm.exception.code, 400)
+        self.assertIn("no cabe en f32", json.load(cm.exception)["error"])
+        # Sin pasar por JSON (un nodo de Python que llama al panel): lo para check_value.
+        for kw, msg in (({"fields": {"left": math.nan}}, "NaN ni infinito"),
+                        ({"fields": {"left": -math.inf}}, "NaN ni infinito"),
+                        ({"fields": {"left": "0.5"}}, "debe ser un número"),
+                        ({"fields": {"left": None}}, "debe ser un número"),
+                        ({"button": math.nan}, "botón"),
+                        ({"fields": {"left": 10**400}}, "no cabe en f32"),
+                        ({"fields": {"left": 10**5000}}, "no cabe en f32"),
+                        ({"button": 10**5000}, "no tiene el botón un entero de unos 5001 dígitos")):
+            with self.subTest(kw=kw):
+                self.assertIn(msg, self.panel.command(0, **kw) or "")
+        self.rx.settimeout(0.3)
+        with self.assertRaises(socket.timeout):     # nada de lo malo se publicó
+            self.recibido()
+        self.rx.settimeout(2)
+        c.send_text(json.dumps({"op": "command", "id": 0, "fields": {"left": 0.5}}))   # lo bueno sigue
+        self.assertEqual(self.recibido().left, 0.5)
 
     def test_post_para_scripts(self):
         self.assertEqual(self.post({"command": "Brazo", "button": "abre"}), {"ok": True})

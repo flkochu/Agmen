@@ -7,6 +7,70 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 
 ## [Sin publicar]
 
+### Cambiado
+- **`POST /api/teleop` exige `left` y `right`** (los scripts lo notan). Antes,
+  `{}` mandaba el alto y un campo que faltaba valía 0. Ahora responde 400 y no
+  se manda nada al robot. Para frenar, manda `{"left": 0, "right": 0}`.
+- **Los números tienen que ser números**: el mando de manejo, la velocidad y el
+  paso del reloj, y `max_hz` ya no aceptan texto (`"0.5"`, `"10"`) ni `true` o
+  `false`. El panel ya no acepta JSON con `NaN` ni `Infinity`: JSON no los tiene,
+  y un script de Python los manda sin avisar.
+- **Los `POST` tienen tope de 1 MiB**. Un cuerpo más grande responde 413 sin
+  leerse, y no se hace nada. Un cliente que manda de golpe un cuerpo muy grande
+  puede ver un corte de conexión en vez del 413: el panel cierra sin leer lo que
+  sobra, y eso puede borrarle la respuesta.
+- **Los `POST` del panel son más estrictos con el encabezado**:
+  - `Content-Length` solo puede traer dígitos: `+30` y `3_0` (antes pasaban)
+    responden 400.
+  - `Transfer-Encoding` (chunked) o varios `Content-Length` responden 400 y
+    cierran la conexión.
+  - Sin clave, la respuesta es 401; sin el encabezado `X-Agmen: 1` o con un
+    `Origin` de otra página, 403. Las dos salen antes de leer el cuerpo: si lo
+    traía, la conexión se cierra.
+- **Topics, nodos y acciones tienen largo máximo**: un topic, un nombre de nodo o
+  una acción de más de 200 caracteres se rechaza. El op `node` exige `name` y
+  `action` como texto.
+- **Los errores son más cortos y en español**: repiten lo que mandó el cliente,
+  acotado a unos 40 caracteres; los errores de JSON dicen cerca de qué carácter
+  fallaron, y cambió el texto de varios. Si un script busca un texto de error
+  exacto, hay que revisarlo.
+- **Los rechazos de manejo quedan en los logs del panel**: un comando de manejo
+  rechazado (por WebSocket o por `POST /api/teleop`) y un mensaje ilegible o
+  binario se anotan en los logs: el primero, y luego como mucho uno por segundo,
+  con cuántos hubo. Un `POST` solo se anota si quien lo manda pasó la clave y el
+  origen.
+
+### Corregido
+- **El mando de manejo ya no convierte un NaN en velocidad máxima** (el joystick
+  del panel por WebSocket y `POST /api/teleop`). Antes, un NaN en la velocidad se
+  volvía la velocidad máxima, y además reiniciaba el freno automático ("hombre
+  muerto"). Ahora un comando con cualquier valor que no sea un número finito
+  (NaN, infinito, texto, `null`, un booleano o un campo que falta) se rechaza
+  entero: no se manda nada al robot, quien lo mandó recibe el error y el freno
+  automático sigue contando como antes.
+- **El WebSocket del panel (`agmen.ws.v1`) contesta un error a un mensaje
+  binario**; antes lo ignoraba en silencio. El de Foxglove sigue ignorando los
+  binarios, porque es de solo lectura. Un mensaje roto (JSON inválido, un
+  `Content-Length` absurdo en un `POST`) responde con un error y no tumba la
+  conexión ni el hilo del servidor.
+- **Un entero enorme en un mando (`[[web.command]]`) ya no tumba la conexión**:
+  en un campo `f32` o `f64` da un error que dice que no cabe.
+- **Al cerrar una grabación, el archivo se cierra de verdad.** `Recording.close()`
+  y salir del `with` podían dejar el archivo abierto sin avisar; las grabaciones
+  de `agmen run`, que llevan `robot.toml` adjunto, pasaban siempre. En Windows eso
+  impedía borrar o reemplazar el archivo.
+- **Si algo leído de la grabación sigue en uso al cerrar**, Agmen avisa una vez
+  qué archivo es y qué hacer (si la grabación se cerró por un error, el aviso
+  lo dice, con otro texto). Los mensajes son vistas del archivo, sin copiar: el
+  archivo se suelta solo en cuanto nada lo usa. Leer de una grabación ya cerrada
+  da un error que dice cómo abrirla de nuevo.
+- **Abrir una grabación dañada ya no deja nada abierto**: si la lectura falla
+  (por ejemplo, un archivo que no es MCAP), el archivo se cierra y el error dice
+  qué pasó, sin el aviso de "sigue en uso".
+- **`agmen info --reparar`** ya no deja el archivo a medio escribir si falla a
+  medias: lo borra. Y se niega si la salida es la misma grabación que la entrada
+  (la sobrescribiría mientras la lee): da otra ruta de salida.
+
 ## [0.14.0] — 2026-11-16
 
 **Simulación y real, y nodos en varias computadoras.** Implementa el

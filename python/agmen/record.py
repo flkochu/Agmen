@@ -679,6 +679,7 @@ def describe(path: str) -> dict:
                 counts[m.channel.id] = counts.get(m.channel.id, 0) + 1
                 t0 = m.log_time if t0 is None else min(t0, m.log_time)
                 t1 = m.log_time if t1 is None else max(t1, m.log_time)
+            m = None                  # el último mensaje es una vista del archivo: que no impida soltarlo al cerrar
         meta = dict(r.metadata)
         topics = []
         for c in sorted(r.channels.values(), key=lambda c: c.topic):

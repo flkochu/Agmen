@@ -9,6 +9,7 @@ grabación cortada se repara.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import os
 import subprocess
@@ -77,7 +78,9 @@ class HubCase(unittest.TestCase):
         with _mcap.Reader(path) as r:
             for m in r.messages():
                 env, payload = wire.parse(bytes(m.data))
-                out.append((m.channel.topic, env, bytes(payload), m))
+                # Copiado: un Message trae una vista del archivo, y si sobrevive al close() el archivo no se suelta.
+                out.append((m.channel.topic, env, bytes(payload), dataclasses.replace(m, data=bytes(m.data))))
+            m = None
             return out, dict(r.metadata), r
 
 
