@@ -115,7 +115,7 @@ public:
     /// hace pasar por el hub.
     [[nodiscard]] std::uint64_t rejected() const;
     /// El puerto local del socket para mandar a otra computadora (RFC 0011 §3); 0 si no está abierto
-    /// (no hay destinos de fuera, §9.3). Como subscribers(): desde el hilo que publica.
+    /// (no hay destinos de fuera, §9.3). Como todas las lecturas, desde cualquier hilo.
     [[nodiscard]] std::uint16_t net_port() const;
 
 private:
@@ -166,8 +166,12 @@ struct ListenAddress {
 };
 
 /// Recibe mensajes de un tipo, sin decodificar el payload. Valida el sobre, el
-/// tipo y el tamaño; procesa los anuncios y el control del hub. heartbeat() se
-/// puede llamar desde otro hilo mientras uno espera en receive_raw().
+/// tipo y el tamaño; procesa los anuncios y el control del hub. receive_raw() es
+/// de un hilo a la vez (el binding de Python turna a los hilos); heartbeat() y las
+/// lecturas (announced(), shm_mapped(), native_handle(s)(), local_port(),
+/// tcp_port(), listen_ip(), listen_address(), rejected()) se pueden llamar desde
+/// otros hilos mientras uno espera en receive_raw(). last_from(), solo desde el
+/// hilo que recibe.
 class SubscriberCore {
 public:
     SubscriberCore(const std::string& where, const TypeInfo& type);
@@ -208,8 +212,9 @@ public:
     [[nodiscard]] std::uint64_t rejected() const;
     [[nodiscard]] const std::string& where() const;
     [[nodiscard]] const TypeInfo& type() const;
-    /// Anuncios vistos: schema_id → (topic, esquema).
-    [[nodiscard]] const std::map<std::uint64_t, wire::Announcement>& announced() const;
+    /// Anuncios vistos: schema_id → (topic, esquema). Una copia (se puede pedir desde otro hilo
+    /// mientras uno recibe).
+    [[nodiscard]] std::map<std::uint64_t, wire::Announcement> announced() const;
 
 private:
     struct State;
@@ -336,10 +341,8 @@ public:
     /// Topic o dirección donde escucha.
     [[nodiscard]] const std::string& where() const { return core_.where(); }
 
-    /// Anuncios vistos: schema_id → (topic, esquema).
-    [[nodiscard]] const std::map<std::uint64_t, wire::Announcement>& announced() const {
-        return core_.announced();
-    }
+    /// Anuncios vistos: schema_id → (topic, esquema). Una copia.
+    [[nodiscard]] std::map<std::uint64_t, wire::Announcement> announced() const { return core_.announced(); }
 
 private:
     SubscriberCore core_;

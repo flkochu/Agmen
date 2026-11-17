@@ -31,7 +31,15 @@ option(AGMEN_BUILD_TESTS    "Compilar las pruebas"                ${AGMEN_DEV_DE
 option(AGMEN_PYTHON         "Compilar agmen._core, el núcleo de C++ para Python (necesita nanobind)" ${AGMEN_TOP_LEVEL})
 option(AGMEN_WERROR         "Tratar las advertencias como errores (CI)" OFF)
 option(AGMEN_SANITIZE       "Activar AddressSanitizer + UBSan (solo GCC/Clang)" OFF)
+option(AGMEN_TSAN           "Activar ThreadSanitizer, para buscar carreras entre hilos (solo GCC/Clang; excluye AGMEN_SANITIZE)" OFF)
 option(AGMEN_FUZZ           "Compilar los fuzzers de libFuzzer con ASan + UBSan (tests/fuzz; solo Clang)" OFF)
+
+if(AGMEN_TSAN AND (AGMEN_SANITIZE OR AGMEN_FUZZ))
+    message(FATAL_ERROR "AGMEN_TSAN no se combina con AGMEN_SANITIZE ni con AGMEN_FUZZ: son sanitizadores distintos, compila cada uno en su carpeta")
+endif()
+if(AGMEN_TSAN AND MSVC)
+    message(FATAL_ERROR "AGMEN_TSAN es solo para GCC/Clang")
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -82,6 +90,21 @@ function(agmen_set_warnings target)
         if(AGMEN_SANITIZE)
             target_compile_options(${target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
             target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+        endif()
+        if(AGMEN_TSAN)
+            # -O1 -g: las pilas de ThreadSanitizer con archivo:línea. No se mezcla con ASan.
+            target_compile_options(${target} PRIVATE -fsanitize=thread -fno-omit-frame-pointer -g -O1)
+            # GCC avisa (-Wtsan) de los atomic_thread_fence del núcleo (la memoria compartida), que TSan no
+            # modela: el aviso se queda, pero con AGMEN_WERROR no tumba el build. Esas rutas quedan SIN
+            # cubrir por TSan (no ve el orden que dan los fence: ni avisa bien ni avisa de más ahí); las
+            # cubren las pruebas de memoria compartida y la revisión, no este build.
+            # Con -O1 + -fsanitize=thread, GCC 13 da un -Wmaybe-uninitialized falso con std::optional
+            # (examples/nivel0/common.hpp: SeqTracker::expected_), que con -O2/-O3 no da: también queda
+            # como aviso, sin tumbar el build con AGMEN_WERROR (los builds normales siguen con -Werror).
+            if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+                target_compile_options(${target} PRIVATE -Wno-error=tsan -Wno-error=maybe-uninitialized)
+            endif()
+            target_link_options(${target} PRIVATE -fsanitize=thread)
         endif()
     endif()
 endfunction()
@@ -163,6 +186,24 @@ elseif(AGMEN_PYTHON OR SKBUILD)
         endif()
         if(SKBUILD)
             install(TARGETS agmen_python LIBRARY DESTINATION agmen)
+        elseif(AGMEN_TSAN)
+            # Con ThreadSanitizer el _core NO se deja en python/agmen (taparía al normal): sale en
+            # <build>/python_tsan/agmen/, junto a enlaces al resto del paquete. Se usa con
+            #   PYTHONPATH=<build>/python_tsan LD_PRELOAD=$(gcc -print-file-name=libtsan.so) python ...
+            set(AGMEN_TSAN_PKG ${CMAKE_BINARY_DIR}/python_tsan/agmen)
+            file(MAKE_DIRECTORY ${AGMEN_TSAN_PKG})
+            file(GLOB AGMEN_PKG_FILES ${CMAKE_CURRENT_SOURCE_DIR}/python/agmen/*)
+            foreach(f ${AGMEN_PKG_FILES})
+                get_filename_component(fname ${f} NAME)
+                if(NOT fname MATCHES "^_core" AND NOT fname STREQUAL "__pycache__")
+                    file(CREATE_LINK ${f} ${AGMEN_TSAN_PKG}/${fname} SYMBOLIC)
+                endif()
+            endforeach()
+            set_target_properties(agmen_python PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${AGMEN_TSAN_PKG})
+            foreach(cfg Debug Release RelWithDebInfo MinSizeRel)
+                string(TOUPPER ${cfg} CFG)
+                set_target_properties(agmen_python PROPERTIES LIBRARY_OUTPUT_DIRECTORY_${CFG} ${AGMEN_TSAN_PKG})
+            endforeach()
         else()
             set_target_properties(agmen_python PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/python/agmen)
             foreach(cfg Debug Release RelWithDebInfo MinSizeRel)
@@ -258,6 +299,13 @@ if(AGMEN_BUILD_TESTS)
     target_link_libraries(test_node PRIVATE agmen::core)
     agmen_set_warnings(test_node)
     add_test(NAME node COMMAND test_node)
+
+    # Los objetos del núcleo desde varios hilos a la vez (PR "hilos"). Con -DAGMEN_TSAN=ON, ThreadSanitizer
+    # dice además si hay carreras de datos.
+    add_executable(test_hilos tests/test_hilos.cpp)
+    target_link_libraries(test_hilos PRIVATE agmen::core)
+    agmen_set_warnings(test_hilos)
+    add_test(NAME hilos COMMAND test_hilos)
 
     # El C++ que genera agmen gen pone los mismos bytes que los vectores.
     agmen_add_messages(vectores_msgs tests/vectors/v1.agmen)

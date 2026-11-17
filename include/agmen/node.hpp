@@ -157,8 +157,13 @@ public:
     [[nodiscard]] std::intptr_t handle() const { return sub_.native_handle(); }
     /// Todos los sockets (UDP, y los de TCP si el tipo es arrow; cambian con las conexiones).
     [[nodiscard]] std::vector<std::intptr_t> handles() const { return sub_.native_handles(); }
-    /// Lee lo que ya llegó al socket (sin esperar) y lo pone en la cola.
-    void pull();
+    /// Cuántos recibe pull() por vuelta: como mínimo (si hay) y como máximo.
+    static constexpr int kPullMin = 32;
+    static constexpr int kPullMax = 1024;
+    /// Lee lo que ya llegó al socket (sin esperar) y lo pone en la cola. Deja de
+    /// recibir si no hay más, si llegó a kPullMax, o si ya recibió kPullMin y
+    /// steady_now_ns() llegó a `deadline_ns`.
+    void pull(std::int64_t deadline_ns);
     [[nodiscard]] bool pending() const { return !q_.empty(); }
     /// Entrega a tu función lo que hay en la cola.
     void dispatch();

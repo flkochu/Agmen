@@ -109,6 +109,26 @@ void test_queue(std::size_t queue, int port) {
     CHECK(s[0].delivered == got.size());
 }
 
+// 8.1 (tope por tiempo): con la hora del temporizador ya vencida, pull()
+// recibe el mínimo (32) y se corta, aunque haya más esperando; con la hora
+// lejos, recibe todo lo que hay. Sin el tope, la primera vuelta se los lleva todos.
+void test_pull_deadline(int port) {
+    const std::string where = "127.0.0.1:" + std::to_string(port);
+    using Raw = agmen::detail::RawSub;
+    Raw sub(where, agmen::TypeInfo::of<ClockMsg>(), [](const agmen::RawSample&) {}, {.queue = 1000});
+    agmen::Publisher<ClockMsg> pub(where, "/prueba");
+    const int sent = 100;
+    for (int i = 0; i < sent; ++i) (void)pub.publish(ClockMsg{.t = i});
+    std::this_thread::sleep_for(50ms);   // que lleguen al socket
+    const std::int64_t past = agmen::detail::steady_now_ns() - 1;
+    sub.pull(past);
+    CHECK(sub.received == static_cast<std::uint64_t>(Raw::kPullMin));
+    sub.pull(past);
+    CHECK(sub.received == static_cast<std::uint64_t>(2 * Raw::kPullMin));
+    sub.pull(agmen::detail::steady_now_ns() + 10'000'000'000);
+    CHECK(sub.received == static_cast<std::uint64_t>(sent));
+}
+
 void test_sample_callback(int port) {
     const std::string where = "127.0.0.1:" + std::to_string(port);
     agmen::Node node("prueba");
@@ -678,6 +698,7 @@ int main() {
     test_queue(1, 47811);
     test_queue(5, 47812);
     test_sample_callback(47813);
+    test_pull_deadline(47816);
     test_invalid_packets(47814);   // y 47815
     test_exception();
     test_stop();

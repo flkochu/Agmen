@@ -40,6 +40,7 @@ from . import _backend, clock, wire
 from . import hubproto as hp
 from .pubsub import (
     Publisher,
+    _preload_numpy,
     Sample,
     Subscriber,
     hub_address,
@@ -49,6 +50,12 @@ from .pubsub import (
 
 _MS = 1_000_000
 _SEC = 1_000_000_000
+# Tope de _Sub.pull() por vuelta: mínimo (si hay), máximo, y presupuesto de
+# tiempo real cuando no hay hora de temporizador (sin temporizadores, o el reloj
+# de Agmen en pausa o simulado).
+_PULL_MIN = 32
+_PULL_MAX = 1024
+_PULL_BUDGET_NS = 2 * _MS
 
 
 @dataclass(frozen=True)
@@ -157,8 +164,15 @@ class _Sub:
         """Los sockets de la suscripción: UDP, y el TCP de los mensajes arrow (RFC 0008)."""
         return self.sub.filenos()
 
-    def pull(self) -> None:
-        for _ in range(1024):
+    def pull(self, deadline_ns: int) -> None:
+        """Recibe lo que ya llegó, sin esperar. Deja de recibir si no hay más, si
+        llegó a _PULL_MAX, o si ya recibió _PULL_MIN y time.monotonic_ns() llegó a
+        `deadline_ns` (la hora del siguiente temporizador del grupo): así los
+        temporizadores tienen su turno aunque lleguen mensajes sin parar, y la
+        suscripción avanza aunque siempre haya un temporizador vencido."""
+        for i in range(_PULL_MAX):
+            if i >= _PULL_MIN and time.monotonic_ns() >= deadline_ns:
+                return
             try:
                 s = self.sub.receive(0)
             except wire.HubRejected:
@@ -462,12 +476,15 @@ class _PureNode:
 
             # 4. Esperar al siguiente temporizador o a que llegue algo.
             wait = 0.1
+            timer_at = None   # tope de pull(); None = usar el presupuesto fijo
             if g.timers:
                 wu = clock.wall_until(min(t.next for t in g.timers))
                 if wu is None:
                     wait = min(wait, 0.02 if clock.state().paused else 0.001)
                 else:
                     wait = min(wait, wu)
+                    if clock.mode() == clock.REAL:
+                        timer_at = time.monotonic_ns() + int(wu * 1e9)
             if end is not None:
                 wait = min(wait, (end - time.monotonic_ns()) / 1e9)
             if any(s.q for s in g.subs):
@@ -480,8 +497,10 @@ class _PureNode:
                 ready = self._wait(g, 0.0)
                 if not ready and wait > 0:
                     time.sleep(min(wait, 0.0005))
-            for s in ready:
-                s.pull()
+            if ready:
+                deadline = timer_at if timer_at is not None else time.monotonic_ns() + _PULL_BUDGET_NS
+                for s in ready:
+                    s.pull(deadline)
 
     def _wait(self, g: _GroupRt, timeout: float) -> list[_Sub]:
         if not g.subs:
@@ -612,6 +631,7 @@ class _NativeNode:
             self._check_not_running("on")
             if hp.is_topic(where):
                 hp.check_topic(where)
+            _preload_numpy(msg_type)   # 8.2: como Publisher y Subscriber (el nodo puro usa Subscriber)
             decode, envelope = msg_type.decode_payload, wire.Envelope
 
             def deliver(env, payload, sender):

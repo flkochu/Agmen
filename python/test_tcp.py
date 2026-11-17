@@ -8,6 +8,7 @@ from __future__ import annotations
 import errno
 import os
 import socket
+import sys
 import threading
 import time
 import unittest
@@ -17,6 +18,7 @@ from dataclasses import dataclass
 import agmen
 from agmen import _tcp, pubsub, wire
 from agmen import hub as hubmod
+from agmen import hubproto as hp
 
 
 @dataclass
@@ -163,6 +165,182 @@ class TestConHub(unittest.TestCase):
                 second.close()
         finally:
             pub.close()
+
+
+def _destino_muerto() -> tuple[int, list[socket.socket]]:
+    """Un puerto TCP que no contesta. En Linux, uno que escucha con la cola de conexiones llena: el sistema
+    descarta el SYN y quien se conecta se queda esperando (como una computadora que no contesta). En
+    Windows, un puerto sin nadie que escuche: ahí tarda ~1 s en rechazar. Devuelve el puerto y los
+    sockets que hay que cerrar al final."""
+    if sys.platform == "win32":
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))                 # sin listen(): nadie acepta, y nadie más toma el puerto
+        return s.getsockname()[1], [s]
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(0)
+    port = srv.getsockname()[1]
+    tapan = [srv]
+    for _ in range(3):                           # llenan la cola (nadie las acepta)
+        c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        c.setblocking(False)
+        c.connect_ex(("127.0.0.1", port))
+        tapan.append(c)
+    return port, tapan
+
+
+class _HubFalso:
+    """Un hub de mentira: al `pub` le contesta `subs` con la lista TCP que diga la prueba y, si se le
+    pide, se la repite cada tanto (el hub de verdad la manda en cada latido)."""
+
+    def __init__(self) -> None:
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.settimeout(0.01)
+        self.addr = f"127.0.0.1:{self.sock.getsockname()[1]}"
+        self.tcp: list[str] = []
+        self.cada: float | None = None
+        self.pub = None                          # (id, dirección) del Publisher
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def lista(self, tcp: list[str], cada: float | None = None) -> None:
+        with self.lock:
+            self.tcp, self.cada = list(tcp), cada
+        self._push()
+
+    def _push(self) -> None:
+        with self.lock:
+            if self.pub is None:
+                return
+            pid, to = self.pub
+            data = hp.encode("subs", id=pid, topic="/cam", to=",".join(self.tcp), tcp=",".join(self.tcp))
+        try:
+            self.sock.sendto(data, to)
+        except OSError:
+            pass
+
+    def _loop(self) -> None:
+        last = time.monotonic()
+        while not self.stop.is_set():
+            try:
+                data, sender = self.sock.recvfrom(65536)
+            except (socket.timeout, BlockingIOError):
+                data = None
+            except OSError:
+                data = None
+            if data:
+                try:
+                    msgs = hp.parse(data)
+                except hp.ProtocolError:
+                    msgs = []
+                for op, f in msgs:
+                    if op == "pub":
+                        with self.lock:
+                            self.pub = (f["id"], sender)
+                        self._push()
+            with self.lock:
+                cada = self.cada
+            if cada is not None and time.monotonic() - last >= cada:
+                last = time.monotonic()
+                self._push()
+
+    def close(self) -> None:
+        self.stop.set()
+        self.thread.join(2)
+        self.sock.close()
+
+
+class TestSinBloquear(unittest.TestCase):
+    """Un Publisher nunca se queda esperando a que un suscriptor conteste la conexión TCP."""
+
+    def setUp(self):
+        self.hub = _HubFalso()
+        self.old = os.environ.get("AGMEN_HUB")
+        os.environ["AGMEN_HUB"] = self.hub.addr
+
+    def tearDown(self):
+        self.hub.close()
+        if self.old is None:
+            os.environ.pop("AGMEN_HUB", None)
+        else:
+            os.environ["AGMEN_HUB"] = self.old
+
+    def test_publicar_no_espera_a_un_suscriptor_que_no_contesta(self):
+        muertos = [_destino_muerto() for _ in range(3)]
+        vivo = agmen.Subscriber(Img, "127.0.0.1:0")
+        pub = agmen.Publisher(Img, "/cam")
+        try:
+            self.hub.lista([f"127.0.0.1:{p}" for p, _ in muertos] + [f"127.0.0.1:{vivo.tcp_port}"])
+            time.sleep(0.05)                     # la lista ya está en el socket: la lee el primer publish()
+            peor, n = 0.0, 0
+            inicio = time.monotonic()
+            while n < 150 and time.monotonic() - inicio < 5:   # ~1.5 s: pasa el plazo y un reintento
+                t = time.perf_counter()
+                pub.publish(Img(n, 0, b"x" * 100))
+                peor = max(peor, time.perf_counter() - t)
+                n += 1
+                time.sleep(0.01)
+            self.assertEqual(pub.subscribers, 4)
+            self.assertLess(peor, 0.25, f"el peor publish() tardó {peor:.3f} s")
+            got = drain(vivo)
+            self.assertEqual([s.message.w for s in got], list(range(n)), "el vivo recibe todo, en orden")
+            t = time.perf_counter()
+            dropped = pub.dropped
+            self.assertLess(time.perf_counter() - t, 0.2)
+            self.assertEqual(dropped, 0)
+        finally:
+            t = time.perf_counter()
+            pub.close()
+            cierre = time.perf_counter() - t
+            vivo.close()
+            for _, tapan in muertos:
+                for s in tapan:
+                    s.close()
+        self.assertLess(cierre, 0.2, f"close() tardó {cierre:.3f} s")
+
+    def test_la_misma_lista_no_reintenta(self):
+        # Un suscriptor que acepta y cierra en seguida: el Publisher pierde la conexión cada vez. El hub
+        # repite la misma lista cada 20 ms; eso no debe forzar una conexión nueva: se reintenta cada 1 s.
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(16)
+        srv.settimeout(0.02)
+        intentos = [0]
+        alto = threading.Event()
+
+        def acepta():
+            while not alto.is_set():
+                try:
+                    c, _ = srv.accept()
+                except (socket.timeout, BlockingIOError):
+                    continue
+                except OSError:
+                    return
+                intentos[0] += 1
+                c.close()
+
+        hilo = threading.Thread(target=acepta, daemon=True)
+        hilo.start()
+        pub = agmen.Publisher(Img, "/cam")
+        try:
+            self.hub.lista([f"127.0.0.1:{srv.getsockname()[1]}"], cada=0.02)
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < 0.8:
+                pub.publish(Img(1, 0, b"x"))
+                time.sleep(0.01)
+            time.sleep(0.05)
+            pasaron = time.monotonic() - t0
+            n = intentos[0]
+            self.assertGreaterEqual(n, 1, "sí se conecta")
+            self.assertLessEqual(n, 2 + int(pasaron / 1.0), f"{n} conexiones en {pasaron:.2f} s")
+        finally:
+            pub.close()
+            alto.set()
+            hilo.join(2)
+            srv.close()
 
 
 def _bloque_libre(n: int, lo: int = 20000, hi: int = 30000) -> int | None:

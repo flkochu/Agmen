@@ -132,6 +132,49 @@ class TestQueue(unittest.TestCase):
         self.assertEqual((s.received, s.replaced, s.dropped, s.delivered), (10, 0, 5, 5))
 
 
+class _RecepcionLenta:
+    """Envuelve al Subscriber de una suscripción: receive() tarda 1 ms y siempre trae un
+    mensaje (lo que pasa si llegan más rápido de lo que el nodo los recibe). El socket
+    queda legible porque nadie lee el paquete que se mandó de verdad."""
+
+    def __init__(self, sub) -> None:
+        self._sub = sub
+
+    def receive(self, timeout=None):
+        time.sleep(0.001)
+        return object()
+
+    def __getattr__(self, name):
+        return getattr(self._sub, name)
+
+
+class TestPullConTope(unittest.TestCase):
+    """8.1: pull() se corta cuando toca un temporizador (tras al menos 32 recibidos),
+    así un every() corre aunque la suscripción siempre tenga algo listo."""
+
+    def test_every_corre_con_recepcion_inagotable(self):
+        where = _port()
+        node = node_mod._PureNode("prueba")
+        recibidos_en_pulso = []
+        node.every(0.005, lambda: recibidos_en_pulso.append(rt.stats.received))
+        node.on(Clock, where, lambda s: None, queue=1)
+        rt = node._groups[""].subs[0]
+        pub = agmen.Publisher(Clock, where, topic="/prueba")
+        pub.publish(Clock(t=1))
+        time.sleep(0.02)   # que el paquete llegue al socket
+        rt.sub = _RecepcionLenta(rt.sub)
+        try:
+            node.spin_for(0.6)
+        finally:
+            pub.close()
+            node.close()
+        t = node.timers()[0]
+        self.assertGreaterEqual(t.runs, 8, f"el every(5 ms) corrió {t.runs} veces en 0.6 s")
+        self.assertLess(t.worst_late_ns, 100_000_000, f"peor atraso {t.worst_late_ns / 1e6:.1f} ms")
+        self.assertGreater(recibidos_en_pulso[-1], recibidos_en_pulso[0], "los recibidos dejaron de subir")
+        self.assertGreaterEqual(recibidos_en_pulso[1] - recibidos_en_pulso[0], node_mod._PULL_MIN)
+
+
 class TestSimClock(unittest.TestCase):
     def tearDown(self):
         clock.configure(clock.REAL)

@@ -126,7 +126,8 @@ una vieja ni se le acumulan.
 Y del otro lado, en el publicador: si un suscriptor lee lento, la cámara **no
 lo espera**. Le guarda solo la imagen más nueva y tira las anteriores;
 `pub.dropped` las cuenta. Un suscriptor lento jamás frena a la cámara ni a los
-demás (regla 12).
+demás (regla 12). Y si un suscriptor se cae o no contesta, pasa igual: quien
+publica no se detiene a esperarlo.
 
 ## 5. Lo mismo en C++
 

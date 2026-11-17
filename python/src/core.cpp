@@ -39,6 +39,7 @@
 #include <cfloat>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -50,6 +51,7 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 namespace nb = nanobind;
@@ -583,28 +585,45 @@ nb::object payload_object(agmen::Payload p) {
 // Publisher / Subscriber
 // ---------------------------------------------------------------------------
 
+// Varios hilos sobre el mismo objeto (PR "hilos"): el núcleo lo tiene un std::shared_ptr. Toda
+// llamada que suelta el GIL toma antes, con el GIL, su propia copia (live()), así que close() desde
+// otro hilo nunca destruye un núcleo que alguien está usando: close() suelta la referencia del objeto
+// y el núcleo se destruye cuando sale el último hilo que estaba dentro. Ese destructor corre siempre
+// con el GIL (la copia local vive fuera del NoGil), como antes en close(): sus avisos no esperan.
+// Las llamadas posteriores a close() dan "ya se cerró".
+
+/// Una lectura que puede esperar un candado del núcleo que tiene un hilo que, con él, emite un aviso
+/// (y el aviso toma el GIL): se suelta el GIL mientras tanto. Cerrando el núcleo, sin soltarlo (los
+/// avisos ya no toman el GIL).
+template <class Fn>
+auto without_gil(Fn&& fn) {
+    const NoGil nogil(Inside::Heartbeat);
+    return fn();
+}
+
 class PyPublisher {
 public:
     PyPublisher(const std::string& to, const std::string& name, const std::string& text, std::uint64_t id,
-                std::size_t size, bool arrow, const std::string& topic) {
+                std::size_t size, bool arrow, const std::string& topic)
+        : arrow_(arrow) {
         const NoGil nogil(Inside::Create);
         if (!nogil.released()) throw closing_error("un Publisher");
-        core_ = std::make_unique<agmen::PublisherCore>(to, type_info(name, text, id, size, arrow), topic);
+        core_ = std::make_shared<agmen::PublisherCore>(to, type_info(name, text, id, size, arrow), topic);
     }
 
     bool publish(nb::handle payload, std::int64_t t_data) {
         // El payload se lee del buffer de Python sin copiarlo aquí (una imagen de
         // varios MB): se copia una vez al armar el paquete, con el GIL suelto.
+        const auto c = live();   // antes que el NoGil: se suelta ya con el GIL
         Py_buffer view;
         if (PyObject_GetBuffer(payload.ptr(), &view, PyBUF_SIMPLE) != 0) throw nb::python_error();
         try {
-            auto& c = live();
             const agmen::wire::ByteView data(static_cast<const std::uint8_t*>(view.buf),
                                              static_cast<std::size_t>(view.len));
             bool ok = false;   // cerrando: no se manda
             {
                 const NoGil nogil(Inside::Publish);
-                if (nogil.released()) ok = c.publish_payload(data, t_data) == agmen::net::SendStatus::Ok;
+                if (nogil.released()) ok = c->publish_payload(data, t_data) == agmen::net::SendStatus::Ok;
             }
             PyBuffer_Release(&view);
             return ok;
@@ -613,31 +632,59 @@ public:
             throw;
         }
     }
-    void announce() { live().announce(); }
-    void heartbeat() {
-        auto& c = live();
-        const NoGil nogil(Inside::Heartbeat);
-        if (nogil.released()) c.heartbeat();
+    void announce() {
+        // Sin el GIL: el candado del núcleo lo puede tener un publish() de otro hilo que, con él, emite un
+        // aviso (y el aviso toma el GIL). Cerrando el núcleo, no se anuncia (como publish()).
+        const auto c = live();
+        const NoGil nogil(Inside::Publish);
+        if (nogil.released()) c->announce();
     }
-    void close() { core_.reset(); }
+    void heartbeat() {
+        const auto c = live();
+        const NoGil nogil(Inside::Heartbeat);
+        if (nogil.released()) c->heartbeat();
+    }
+    void close() {
+        // Con el GIL: suelta la referencia del objeto. Si otro hilo está dentro (publish sin el GIL),
+        // el núcleo se destruye cuando ese hilo sale. Dos veces, o desde dos hilos: inofensivo.
+        std::shared_ptr<agmen::PublisherCore> old;
+        old.swap(core_);
+        old.reset();   // aquí y con el GIL, si nadie más lo usa
+    }
     [[nodiscard]] bool closed() const { return !core_; }
-    [[nodiscard]] std::uint64_t seq() { return live().seq(); }
-    [[nodiscard]] std::uint64_t source_id() { return live().source_id(); }
-    [[nodiscard]] std::string topic() { return live().topic(); }
-    [[nodiscard]] std::size_t subscribers() { return live().subscribers(); }
-    [[nodiscard]] std::uint64_t dropped() { return live().dropped(); }
-    [[nodiscard]] std::size_t shm_subscribers() { return live().shm_subscribers(); }
-    [[nodiscard]] std::uint64_t shm_fallbacks() { return live().shm_fallbacks(); }
-    [[nodiscard]] std::size_t shm_bytes() { return live().shm_bytes(); }
-    [[nodiscard]] std::uint64_t unreachable() { return live().unreachable(); }
-    [[nodiscard]] std::uint64_t rejected() { return live().rejected(); }
+    [[nodiscard]] std::uint64_t seq() { return live()->seq(); }
+    [[nodiscard]] std::uint64_t source_id() { return live()->source_id(); }
+    [[nodiscard]] std::string topic() { return live()->topic(); }
+    [[nodiscard]] std::size_t subscribers() { return live()->subscribers(); }
+    // Las de un tipo arrow leen el Fanout con su candado, que un hilo del núcleo tiene a veces mientras
+    // emite un aviso: sin el GIL. Las demás son atómicas.
+    [[nodiscard]] std::uint64_t dropped() { return fanout_read([](const auto& c) { return c->dropped(); }); }
+    [[nodiscard]] std::size_t shm_subscribers() {
+        return fanout_read([](const auto& c) { return c->shm_subscribers(); });
+    }
+    [[nodiscard]] std::uint64_t shm_fallbacks() {
+        return fanout_read([](const auto& c) { return c->shm_fallbacks(); });
+    }
+    [[nodiscard]] std::size_t shm_bytes() { return fanout_read([](const auto& c) { return c->shm_bytes(); }); }
+    [[nodiscard]] std::uint64_t unreachable() {
+        return fanout_read([](const auto& c) { return c->unreachable(); });
+    }
+    [[nodiscard]] std::uint64_t rejected() { return live()->rejected(); }
 
 private:
-    agmen::PublisherCore& live() {
+    /// Una copia del núcleo (con el GIL), o "ya se cerró".
+    [[nodiscard]] std::shared_ptr<agmen::PublisherCore> live() const {
         if (!core_) throw std::logic_error("el Publisher ya se cerró");
-        return *core_;
+        return core_;
     }
-    std::unique_ptr<agmen::PublisherCore> core_;
+    template <class Fn>
+    std::invoke_result_t<Fn&, const std::shared_ptr<agmen::PublisherCore>&> fanout_read(Fn&& fn) {
+        const auto c = live();
+        if (!arrow_) return fn(c);
+        return without_gil([&] { return fn(c); });
+    }
+    std::shared_ptr<agmen::PublisherCore> core_;   // solo se toca con el GIL
+    bool arrow_ = false;
 };
 
 class PySubscriber;
@@ -650,10 +697,15 @@ public:
         {
             const NoGil nogil(Inside::Create);
             if (!nogil.released()) throw closing_error("un Subscriber");
-            core_ = std::make_unique<agmen::SubscriberCore>(where, type_info(name, text, id, size, arrow));
+            // Con un borrador propio: avisa a close() cuando el núcleo ya se destruyó (ver close()).
+            core_ = std::shared_ptr<agmen::SubscriberCore>(
+                new agmen::SubscriberCore(where, type_info(name, text, id, size, arrow)), CoreDeleter{this});
         }
         g_subs.push_back(this);   // ya con el GIL
     }
+    // core_ se declara al final: se destruye antes que turn_mu_, gone_cv_ y core_gone_, que usa su
+    // borrador (también si el constructor falla a medias). Aquí nadie más tiene una copia (las copias
+    // solo viven dentro de un método).
     ~PySubscriber() { std::erase(g_subs, this); }
     PySubscriber(const PySubscriber&) = delete;
     PySubscriber& operator=(const PySubscriber&) = delete;
@@ -662,15 +714,22 @@ public:
     /// pudo quedar tomado por un hilo del padre que en el hijo no existe. Se
     /// construye de nuevo, libre (no se destruye: un mutex tomado no se puede).
     static void reset_turns_after_fork() {
-        for (PySubscriber* p : g_subs) new (&p->rx_mu_) std::timed_mutex();
+        for (PySubscriber* p : g_subs) {
+            new (&p->turn_mu_) std::mutex();
+            new (&p->turn_cv_) std::condition_variable();
+            new (&p->gone_cv_) std::condition_variable();
+            p->turn_busy_ = false;
+            p->turn_waiting_ = 0;
+        }
     }
 
     /// None, o (sobre, payload, "ip:puerto"). timeout en segundos (None = sin límite).
     /// El payload es bytes o, si llegó por memoria compartida, un ShmPayload.
-    /// Cerrando el núcleo (el programa sale), regresa None sin esperar.
+    /// Cerrando el núcleo (el programa sale), regresa None sin esperar. Si otro hilo
+    /// cierra el Subscriber, lanza "el Subscriber ya se cerró" en a lo más un tramo.
     std::optional<std::tuple<EnvTuple, nb::object, std::string>> receive(std::optional<double> timeout) {
         using namespace std::chrono;
-        (void)live();
+        const auto c = live();   // fuera del NoGil: si es la última copia, se destruye con el GIL
         const auto start = steady_clock::now();
         for (;;) {
             milliseconds slice(200);   // Ctrl+C, latidos y el cierre, aunque el timeout sea largo
@@ -686,22 +745,10 @@ public:
                 if (!nogil.released()) return std::nullopt;
                 // receive_raw() es de un solo hilo (agmen/pubsub.hpp): los receive() de
                 // varios hilos sobre el mismo Subscriber se turnan, sin el GIL y sin
-                // pasarse de su tramo. El lock se suelta antes de retomar el GIL.
-                std::unique_lock lock(rx_mu_, std::try_to_lock);   // lo normal: un solo hilo, sin esperar
+                // pasarse de su tramo. El turno se suelta antes de retomar el GIL.
                 milliseconds left = slice;
-                if (!lock.owns_lock()) {
-                    const auto t = steady_clock::now();
-                    if (lock.try_lock_for(slice)) {
-                        left = std::max(milliseconds(0), slice - duration_cast<milliseconds>(steady_clock::now() - t));
-                    }
-                }
-                if (lock.owns_lock()) {
-                    if (core_) {
-                        s = core_->receive_raw(left);
-                    } else {
-                        gone = true;   // otro hilo lo cerró mientras este esperaba su turno
-                    }
-                }
+                const Turn turn(*this, slice, left, gone);
+                if (turn.taken()) s = c->receive_raw(left);
             }
             if (gone) throw std::logic_error("el Subscriber ya se cerró");
             if (s) return std::make_tuple(env_tuple(s->envelope), payload_object(std::move(s->payload)), s->from);
@@ -711,62 +758,153 @@ public:
     }
 
     nb::dict announced() {
+        const auto anns = live()->announced();   // una copia, con el candado chico del núcleo
         nb::dict d;
-        for (const auto& [id, a] : live().announced()) d[nb::int_(id)] = nb::make_tuple(a.topic, a.schema);
+        for (const auto& [id, a] : anns) d[nb::int_(id)] = nb::make_tuple(a.topic, a.schema);
         return d;
     }
     void heartbeat() {
-        auto& c = live();
+        const auto c = live();
         const NoGil nogil(Inside::Heartbeat);
-        if (nogil.released()) c.heartbeat();
+        if (nogil.released()) c->heartbeat();
     }
     void close() {
-        // Un receive() de otro hilo puede estar dentro (sin el GIL): se espera su
-        // turno sin el GIL. Con el cierre ya declarado (desde cualquier hilo, también
-        // el que cierra), con límite: si un hilo detenido para siempre tiene el
-        // turno, el Subscriber se deja vivo. Desde otro hilo, esa espera es con el GIL.
-        std::unique_lock lock(rx_mu_, std::defer_lock);
+        // 1) Con el GIL, sin esperar a nadie: marca el cierre (los receive() que esperan su turno
+        //    despiertan ya; el que está dentro sale al terminar su tramo, a lo más 200 ms) y suelta la
+        //    referencia del objeto. El núcleo se destruye cuando sale el último hilo que lo usaba, con el
+        //    GIL (su copia es local de receive(), heartbeat() o listen_address()).
+        // 2) Si alguien más lo tenía, espera SIN el GIL (si no, ese hilo no podría retomarlo para salir y
+        //    soltar su copia) a que el borrador avise que ya se destruyó: sockets cerrados, baja del hub
+        //    hecha, puerto libre. Tope 750 ms (250 ms si el programa sale); pasado el tope regresa igual y
+        //    el núcleo se destruye cuando salga ese hilo (o nunca, si quedó detenido al salir).
+        //    Con un solo hilo el núcleo ya se destruyó en el paso 1 y no se espera ni se suelta el GIL.
+        // 3) Si vence el tope con el núcleo vivo, lo avisa una vez por agmen::log, con el GIL y sin
+        //    candados (el aviso puede tomar el GIL). No se avisa si el programa sale.
+        // Solo espera la llamada que soltó el núcleo (la que encontró core_ no vacío): dos veces, o desde
+        // dos hilos a la vez, es inofensivo y nunca suma más de un tope (la segunda regresa en seguida).
+        {
+            const std::lock_guard lock(turn_mu_);
+            turn_closed_ = true;
+        }
+        turn_cv_.notify_all();
+        std::shared_ptr<agmen::SubscriberCore> old;
+        old.swap(core_);
+        if (!old) return;   // otra llamada ya lo soltó (y es la que espera, si hace falta)
+        old.reset();        // aquí y con el GIL, si nadie más lo usa
+        {
+            const std::lock_guard lock(turn_mu_);
+            if (core_gone_) return;   // lo normal: un solo hilo
+        }
+        using namespace std::chrono;
+        const milliseconds limit = g_closing.load() ? milliseconds(250) : milliseconds(750);
+        bool freed = false;
         {
             const NoGil nogil(Inside::Close);
-            if (!g_closing.load()) {
-                lock.lock();
-            } else if (!lock.try_lock_for(std::chrono::milliseconds(250))) {
-                return;
-            }
+            if (!nogil.released()) return;   // el programa sale y este hilo no es el que cierra: no se espera
+            std::unique_lock lock(turn_mu_);
+            freed = gone_cv_.wait_for(lock, limit, [this] { return core_gone_; });
         }
-        std::unique_ptr<agmen::SubscriberCore> old = std::move(core_);   // con el GIL y el turno
-        lock.unlock();
-        old.reset();   // con el GIL, como siempre
+        if (freed || g_closing.load()) return;
+        agmen::log::write(
+            "agmen: close() del Subscriber regresó sin liberar el puerto: otro hilo sigue dentro de "
+            "receive(). El puerto se libera cuando ese hilo salga.");
     }
     [[nodiscard]] bool closed() const { return !core_; }
-    [[nodiscard]] std::intptr_t fileno() { return live().native_handle(); }
-    [[nodiscard]] std::vector<std::intptr_t> filenos() { return live().native_handles(); }
-    [[nodiscard]] std::uint16_t port() { return live().local_port(); }
-    [[nodiscard]] std::uint16_t tcp_port() { return live().tcp_port(); }
-    [[nodiscard]] std::size_t shm_mapped() { return live().shm_mapped(); }
+    // Las lecturas no esperan el turno de receive(): el núcleo las da con un candado chico.
+    [[nodiscard]] std::intptr_t fileno() { return live()->native_handle(); }
+    [[nodiscard]] std::vector<std::intptr_t> filenos() { return live()->native_handles(); }
+    [[nodiscard]] std::uint16_t port() { return live()->local_port(); }
+    [[nodiscard]] std::uint16_t tcp_port() { return live()->tcp_port(); }
+    [[nodiscard]] std::size_t shm_mapped() { return live()->shm_mapped(); }
     [[nodiscard]] std::string listen_ip() { return std::get<0>(listen_address()); }
     /// (ip, puerto UDP, puerto TCP) leídos juntos, sin carrera con el paso a la red, que los cambia
     /// desde el hilo de receive() con el candado del enlace (RFC 0011 §10.4). Ese candado se pide sin el
     /// GIL: quien lo tiene puede necesitar el GIL para un aviso. Cerrando el núcleo: RuntimeError.
     [[nodiscard]] std::tuple<std::string, std::uint16_t, std::uint16_t> listen_address() {
-        auto& c = live();
+        const auto c = live();
         agmen::ListenAddress a;
         {
             const NoGil nogil(Inside::Heartbeat);
             if (!nogil.released()) throw std::runtime_error("el Subscriber se está cerrando");
-            a = c.listen_address();
+            a = c->listen_address();
         }
         return {std::move(a.ip), a.port, a.tcp_port};
     }
-    [[nodiscard]] std::uint64_t rejected() { return live().rejected(); }
+    [[nodiscard]] std::uint64_t rejected() { return live()->rejected(); }
 
 private:
-    agmen::SubscriberCore& live() {
+    /// Destruye el núcleo y avisa a close() (en el hilo que soltó la última copia, con el GIL).
+    struct CoreDeleter {
+        PySubscriber* p;
+        void operator()(agmen::SubscriberCore* c) const noexcept {
+            delete c;
+            {
+                const std::lock_guard lock(p->turn_mu_);
+                p->core_gone_ = true;
+            }
+            p->gone_cv_.notify_all();
+        }
+    };
+
+    /// El turno de receive_raw() entre hilos (sin el GIL). Con un solo hilo, tomarlo es un candado
+    /// libre y una bandera; solo quien no lo consigue espera en la condición, a lo más su tramo.
+    /// std::mutex + std::condition_variable (y no un std::timed_mutex): ThreadSanitizer los ve.
+    class Turn {
+    public:
+        Turn(PySubscriber& p, std::chrono::milliseconds slice, std::chrono::milliseconds& left, bool& gone) : p_(p) {
+            using namespace std::chrono;
+            std::unique_lock lock(p_.turn_mu_);
+            if (!p_.turn_closed_ && !p_.turn_busy_) {   // lo normal: un solo hilo, sin esperar
+                p_.turn_busy_ = true;
+                taken_ = true;
+                return;
+            }
+            const auto t = steady_clock::now();
+            ++p_.turn_waiting_;
+            p_.turn_cv_.wait_for(lock, slice, [this] { return p_.turn_closed_ || !p_.turn_busy_; });
+            --p_.turn_waiting_;
+            if (p_.turn_closed_) {
+                gone = true;   // otro hilo lo cerró mientras este esperaba su turno
+                return;
+            }
+            if (p_.turn_busy_) return;   // se acabó el tramo sin turno
+            p_.turn_busy_ = true;
+            taken_ = true;
+            left = std::max(milliseconds(0), slice - duration_cast<milliseconds>(steady_clock::now() - t));
+        }
+        ~Turn() {
+            if (!taken_) return;
+            bool wake = false;
+            {
+                const std::lock_guard lock(p_.turn_mu_);
+                p_.turn_busy_ = false;
+                wake = p_.turn_waiting_ > 0;
+            }
+            if (wake) p_.turn_cv_.notify_one();
+        }
+        Turn(const Turn&) = delete;
+        Turn& operator=(const Turn&) = delete;
+        [[nodiscard]] bool taken() const { return taken_; }
+
+    private:
+        PySubscriber& p_;
+        bool taken_ = false;
+    };
+
+    /// Una copia del núcleo (con el GIL), o "ya se cerró".
+    [[nodiscard]] std::shared_ptr<agmen::SubscriberCore> live() const {
         if (!core_) throw std::logic_error("el Subscriber ya se cerró");
-        return *core_;
+        return core_;
     }
-    std::unique_ptr<agmen::SubscriberCore> core_;
-    std::timed_mutex rx_mu_;   // el turno de receive_raw() (y close())
+    std::mutex turn_mu_;                           // turn_busy_, turn_waiting_, turn_closed_, core_gone_
+    std::condition_variable turn_cv_;
+    std::condition_variable gone_cv_;                 // core_gone_ (close() espera la destrucción del núcleo)
+    bool turn_busy_ = false;     // un hilo está en receive_raw()
+    int turn_waiting_ = 0;       // hilos esperando el turno
+    bool turn_closed_ = false;   // close(): los receive() en curso o por venir dan "ya se cerró"
+    bool core_gone_ = false;     // el borrador ya destruyó el núcleo
+    // Al final: se destruye primero (su borrador usa lo de arriba). Solo se toca con el GIL.
+    std::shared_ptr<agmen::SubscriberCore> core_;
 };
 
 // ---------------------------------------------------------------------------
