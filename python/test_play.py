@@ -47,8 +47,9 @@ def imu(i: int) -> wire.ImuSample:
     return wire.ImuSample(accel=(float(i), 0.0, 9.8), gyro=(0.0, 0.0, 0.0))
 
 
-def make_recording(path: str, n: int = 20) -> list[bytes]:
-    """Una grabación como la que hace agmen record: /imu cada 50 ms, /camara cada 200 ms."""
+def make_recording(path: str, n: int = 20, robot_toml: bool = False) -> list[bytes]:
+    """Una grabación como la que hace agmen record: /imu cada 50 ms, /camara cada 200 ms (y, como las de
+    agmen run, con el robot.toml adjunto si `robot_toml`)."""
     w = _mcap.Writer(path, profile="agmen", chunk_size=200_000)
     s_imu = w.add_schema("ImuSample", "agmen", wire.ImuSample.SCHEMA_TEXT.encode())
     s_img = w.add_schema("Img", "agmen", Img.SCHEMA_TEXT.encode())
@@ -71,6 +72,8 @@ def make_recording(path: str, n: int = 20) -> list[bytes]:
             w.add_message(c_img, t + 1, t - 1_000_000, i // 4, env.pack(), body)
         if i % 5 == 0:   # un /clock grabado: no se reproduce
             w.add_message(c_clk, t, t, i, wire.encode(clock.Clock(t=0), i, t, topic="/clock"))
+    if robot_toml:
+        w.add_attachment("robot.toml", "text/plain", b'[robot]\nname = "prueba"\n', T0, T0)
     w.close()
     return packets
 
@@ -210,6 +213,33 @@ class TestReproducir(PlayCase):
         self.assertIn("recibidos 5", out, "el dato llega igual")
         self.assertEqual(err.count("'/imu' llega con reloj reproducción"), 1, err)
         self.assertIn("AGMEN_CLOCK=replay", err)
+
+    def test_al_terminar_suelta_el_archivo_aunque_falle(self):
+        """stop() cierra la grabación de verdad (en Windows, si no, no se puede borrar): también si la
+        reproducción falló, aunque el error guarde su traceback (y el traceback, el último mensaje leído)."""
+        path = os.path.join(self.dir, "con-adjunto.mcap")
+        make_recording(path, robot_toml=True)
+
+        def falla(*_):
+            raise RuntimeError("falla a propósito")
+
+        for romper in (False, True):
+            with self.subTest(falla=romper):
+                p = play.Player(path, rate=50, quiet=True)
+                if romper:
+                    p._publisher = falla
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    p.start()
+                    self.assertTrue(p.wait(10))
+                    if romper:
+                        with self.assertRaisesRegex(RuntimeError, "a propósito"):
+                            p.stop()
+                    else:
+                        p.stop()
+                self.assertNotIn("sigue abierta", err.getvalue())
+                self.assertFalse(p.reader._mapped)
+        os.remove(path)                      # en Windows falla si sigue mapeado
 
     def test_errores_claros(self):
         with self.assertRaisesRegex(ValueError, "no tiene el topic /nada"):

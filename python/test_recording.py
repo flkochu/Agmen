@@ -10,6 +10,10 @@ MCAP es el juez). Sin pyarrow o sin `mcap`, esas pruebas se saltan.
 from __future__ import annotations
 
 import base64
+import contextlib
+import copy
+import gc
+import io
 import json
 import os
 import subprocess
@@ -107,6 +111,24 @@ def write_recording(path: str, compression=None) -> None:
     w.close()
 
 
+def close_quoting(obj) -> str:
+    """obj.close(), y lo que dijo por stderr (el aviso de un archivo que no se pudo soltar)."""
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        obj.close()
+    return err.getvalue()
+
+
+def mapped(path: str) -> bool | None:
+    """¿El archivo sigue mapeado en este proceso? (Linux: /proc/self/maps; en otros, None: no se sabe)."""
+    try:
+        with open("/proc/self/maps", encoding="utf-8", errors="replace") as f:
+            maps = f.read()
+    except OSError:
+        return None
+    return os.path.realpath(path) in maps
+
+
 class RecordingCase(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -163,8 +185,10 @@ class TestLeer(RecordingCase):
 
     def test_cerrar_con_mensajes_vivos(self):
         cams = list(self.rec.messages("/camara"))
-        self.rec.close()
+        text = close_quoting(self.rec)
         self.assertEqual(bytes(cams[-1].message.data), bytes(range(9, 17)), "lo leído sigue sirviendo")
+        self.assertEqual(text.count("[agmen] ⚠"), 1, "los mensajes vivos detienen el archivo: close() lo avisa")
+        self.assertIn(self.path, text)
 
     def test_comprimida_y_cortada(self):
         z = os.path.join(self.dir, "z.mcap")
@@ -194,6 +218,108 @@ class TestLeer(RecordingCase):
             agmen.Recording(other)
         with self.assertRaisesRegex(FileNotFoundError, "no existe"):
             agmen.Recording(os.path.join(self.dir, "no-existe.mcap"))
+
+
+class TestCerrar(unittest.TestCase):
+    """close() suelta el archivo de verdad (en Windows, si no, no se puede borrar ni reemplazar): el lector
+    suelta sus propias vistas del mapa (los adjuntos, como el robot.toml de agmen run), y si el programa
+    conserva un mensaje, avisa una vez y lo suelta en otro close() o en cuanto nada lo use."""
+
+    def setUp(self):
+        self.path = os.path.join(tempfile.mkdtemp(), "vuelta.mcap")
+        write_recording(self.path)          # con un adjunto, como las de agmen run
+
+    def assertClosed(self, reader):
+        self.assertFalse(reader._mapped, "el estado del lector: ya no tiene el archivo mapeado")
+        self.assertIsNone(reader._mm)
+        self.assertIsNone(reader._mm_left)
+        self.assertIn(mapped(self.path), (False, None), "/proc/self/maps ya no lo trae")
+        os.remove(self.path)                # en Windows falla si sigue mapeado
+        self.assertFalse(os.path.exists(self.path))
+
+    def assertWarnedOnce(self, text):
+        self.assertEqual(text.count("[agmen] ⚠"), 1, text)
+        for words in (self.path, "sigue abierta", "sigue en uso", "Windows", "borrar ni reemplazar",
+                      "for m in rec.messages(...)", "as_array()", "bytes de una imagen", "del m",
+                      "copy.deepcopy(msg)", "arr.copy()"):
+            self.assertIn(words, text)
+
+    def read_everything(self, rec):
+        """Lee todo sin quedarse con nada (en otra función: al volver no queda ninguna variable viva)."""
+        self.assertEqual(rec.attachments, {"robot.toml": b'[robot]\nname = "prueba"\n'})
+        self.assertEqual(sum(1 for _ in rec.messages()), 3 * N + 2 * 4 + 1)
+        for s in rec.messages("/camara"):
+            self.assertEqual(len(s.message.data), 8)
+
+    def test_con_adjuntos_y_sin_conservar_nada_queda_cerrada(self):
+        rec = agmen.Recording(self.path)
+        self.read_everything(rec)
+        self.assertTrue(rec._r._mapped)
+        self.assertEqual(close_quoting(rec), "", "no conserva nada: no avisa")
+        self.assertClosed(rec._r)
+        self.assertEqual(close_quoting(rec), "", "cerrar dos veces no hace nada")
+
+    def test_el_lector_suelta_sus_adjuntos(self):
+        r = _mcap.Reader(self.path)
+        self.assertEqual([a.name for a in r.attachments], ["robot.toml"])
+        self.assertEqual(close_quoting(r), "")
+        self.assertClosed(r)
+
+    def test_variable_del_for_avisa_una_vez_y_se_cierra_despues(self):
+        rec = agmen.Recording(self.path)
+        for m in rec.messages("/camara"):       # al salir, m sigue apuntando a la última imagen (una vista)
+            pass
+        self.assertWarnedOnce(close_quoting(rec))
+        self.assertTrue(rec._r._mapped, "sigue abierta mientras m la use")
+        self.assertEqual(bytes(m.message.data), bytes(range(9, 17)), "lo leído sigue sirviendo")
+        self.assertEqual(close_quoting(rec), "", "un solo aviso por lector")
+        # Entre un close() que no pudo y el siguiente, el lector se porta como cerrado.
+        with self.assertRaisesRegex(ValueError, "ya está cerrado"):
+            list(rec.messages())
+        with self.assertRaisesRegex(ValueError, "ya está cerrado"):
+            _ = rec.attachments
+        del m
+        self.assertEqual(close_quoting(rec), "", "ya soltó la vista: cierra sin avisar")
+        self.assertClosed(rec._r)
+
+    def test_al_soltar_la_vista_se_suelta_sola(self):
+        r = _mcap.Reader(self.path)
+        m = next(iter(r.messages()))
+        self.assertIn(self.path, close_quoting(r))
+        del m
+        gc.collect()
+        self.assertFalse(r._mapped, "sin otro close(): en cuanto nada la usa, se suelta")
+        self.assertEqual(close_quoting(r), "")
+        self.assertClosed(r)
+
+    def test_as_array_guardado(self):
+        try:
+            import numpy  # noqa: F401
+        except ImportError:
+            self.skipTest("sin numpy")
+        rec = agmen.Recording(self.path)
+        arr = [s.message.as_array() for s in rec.messages("/camara")][-1]
+        self.assertWarnedOnce(close_quoting(rec))
+        self.assertEqual(arr.tolist(), [[9, 10, 11, 12], [13, 14, 15, 16]], "el arreglo sigue sirviendo")
+        copia = arr.copy()
+        del arr
+        self.assertEqual(close_quoting(rec), "")
+        self.assertClosed(rec._r)
+        self.assertEqual(copia.tolist(), [[9, 10, 11, 12], [13, 14, 15, 16]], "la copia no depende del archivo")
+
+    def test_deepcopy_no_apunta_al_archivo(self):
+        rec = agmen.Recording(self.path)
+        cams = [copy.deepcopy(s.message) for s in rec.messages("/camara")]      # Imagen
+        dets = [copy.deepcopy(s.message) for s in rec.messages("/det")]         # armado con el esquema grabado
+        ests = [copy.deepcopy(s) for s in rec.messages("/robot/estado")]        # el Sample completo
+        self.assertEqual(close_quoting(rec), "", "las copias no detienen el archivo")
+        self.assertClosed(rec._r)
+        self.assertIsInstance(cams[-1], Imagen)
+        self.assertEqual(bytes(cams[-1].data), bytes(range(9, 17)))
+        self.assertEqual(type(dets[1]).__name__, "Deteccion")
+        self.assertEqual((dets[1].clase, bytes(dets[1].crudo)), ("gato3", b"\x03\x03\x03"))
+        self.assertEqual(list(dets[1].mapa.reshape(-1)), [3, 1, 2, 3, 4, 5])
+        self.assertEqual((ests[5].message.seq, ests[5].topic), (1005, "/robot/estado"))
 
 
 @unittest.skipIf(pa is None, "sin pyarrow")
