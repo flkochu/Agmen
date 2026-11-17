@@ -37,6 +37,8 @@ node.spin();   // hasta Ctrl+C
 - **`every(periodo, función)`** llama a tu función cada `periodo`. Programa
   por *deadline*: el ciclo *k* es en `inicio + k·periodo`, así que el atraso
   nunca se acumula.
+  Un topic muy rápido tampoco los deja sin correr: en cada vuelta, el nodo
+  recibe al menos 32 mensajes y luego le toca al siguiente temporizador.
 - **`node.spin()`** corre todo hasta Ctrl+C (o hasta que `agmen run` lo
   detenga). Si una de tus funciones lanza una excepción, el nodo se detiene y
   `spin()` la vuelve a lanzar: nunca falla en silencio.
