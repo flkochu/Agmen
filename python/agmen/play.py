@@ -25,7 +25,6 @@ import struct
 import sys
 import threading
 import time
-import traceback
 from dataclasses import dataclass, field
 
 from . import _mcap, clock, schema, wire
@@ -246,7 +245,7 @@ class Player:
         except BaseException as e:   # noqa: BLE001 — se relanza en stop()
             # El error se guarda con su traceback, y el traceback guarda las variables de cada función (los
             # mensajes, vistas del archivo): sin soltarlas, reader.close() no podría soltar la grabación.
-            traceback.clear_frames(e.__traceback__)
+            _mcap._clear_own_frames(e.__traceback__)     # solo los de Agmen: no los de un callback del programa
             self.error = e
         finally:
             m = None                 # la vista del último mensaje: que no la conserve este marco

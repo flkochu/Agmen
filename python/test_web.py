@@ -394,6 +394,29 @@ class TestManejoConValoresMalos(MotorCase):
                 self.assertEqual((status, body["ok"]), (200, True))
                 self.assertAlmostEqual(self._cmd()["right"], 0.1, places=5)
 
+    def test_los_rechazos_quedan_en_los_logs_sin_llenarlos(self):
+        """Un script ajeno que manda basura al mando: el operador lo ve en los logs del panel (el primero de
+        cada conexión y luego como mucho uno por segundo, con cuántos hubo)."""
+        c = self.connect()
+        for _ in range(30):
+            c.send_text('{"op": "teleop", "left": NaN, "right": 0}')
+            self._error(c)
+        logs, _ = self.panel.logs.since(0)
+        avisos = [line["text"] for line in logs if "rechacé lo que mandó" in line["text"]]
+        self.assertEqual(len(avisos), 1, avisos)
+        self.assertIn("NaN no es JSON válido", avisos[0])
+        time.sleep(1.05)
+        c.send_text('{"op": "teleop", "left": "rápido", "right": 0}')
+        self._error(c)
+        logs, _ = self.panel.logs.since(0)
+        avisos = [line["text"] for line in logs if "rechacé lo que mandó" in line["text"]]
+        self.assertEqual(len(avisos), 2, avisos)
+        self.assertIn("30 rechazados desde el aviso anterior", avisos[1])
+        self._post('{"left": NaN, "right": 0}')          # por POST, también (por dirección)
+        logs, _ = self.panel.logs.since(0)
+        self.assertEqual(len([1 for line in logs if "rechacé lo que mandó" in line["text"]]), 3)
+        self._nada()
+
     def test_post_que_no_es_un_objeto(self):
         for raw in ("[0.5, 0.5]", "0.5", '"left"', "null"):
             with self.subTest(raw):
@@ -479,7 +502,7 @@ class TestJsonDelCliente(PanelCase):
         self.assertFalse(c.closed)
 
     def test_content_length_malo(self):
-        for cl in ("abc", "-5"):
+        for cl in ("abc", "-5", "+30", "3_0", "\u0663", " 1 2"):     # int() acepta "+30", "3_0" y "٣": aquí no
             with self.subTest(cl):
                 s = socket.create_connection(("127.0.0.1", self.panel.port), timeout=5)
                 with s:
@@ -488,6 +511,50 @@ class TestJsonDelCliente(PanelCase):
                     resp = s.recv(65536).decode()
                 self.assertIn(" 400 ", resp.split("\r\n")[0])
                 self.assertIn("Content-Length", resp)
+
+    def test_cuerpo_demasiado_grande(self):
+        """Más de 1 MiB declarado: 413 sin leer nada (antes se intentaba reservar todo ese cuerpo)."""
+        for cl in (ws.MAX_MESSAGE + 1, 10**12, 2**63, 10**30, int("9" * 40)):
+            with self.subTest(cl=cl):
+                s = socket.create_connection(("127.0.0.1", self.panel.port), timeout=5)
+                with s:
+                    s.sendall(f"POST /api/command HTTP/1.1\r\nHost: x\r\nX-Agmen: 1\r\nContent-Length: {cl}\r\n\r\n{{}}"
+                              .encode())
+                    resp = b""
+                    while chunk := s.recv(65536):        # el panel cierra después de contestar
+                        resp += chunk
+                head, _, body = resp.decode().partition("\r\n\r\n")
+                self.assertIn(" 413 ", head.split("\r\n")[0])
+                self.assertIn("el máximo es 1048576 bytes", json.loads(body)["error"])
+
+    def test_mensaje_de_json_invalido_en_espanol(self):
+        c = self.connect()
+        c.send_text('{"op": "teleop", "left": ,}')
+        err = json.loads(self.recv_until(c, lambda m: isinstance(m, str) and json.loads(m)["op"] == "error"))["msg"]
+        self.assertIn("JSON inválido cerca del carácter 25", err)
+        self.assertNotIn("Expecting", err)
+        c.send_text('{"op": "teleop", "left": -NaN, "right": 0}')
+        err = json.loads(self.recv_until(c, lambda m: isinstance(m, str) and json.loads(m)["op"] == "error"))["msg"]
+        self.assertIn("JSON inválido cerca del carácter", err)
+
+    def test_lo_del_cliente_no_se_devuelve_entero(self):
+        """Un op (o un mando, o un topic) de casi 1 MiB: el error lo cita acotado, no lo devuelve entero."""
+        c = self.connect()
+        grande = "x" * 1_000_000
+        for m in ({"op": grande}, {"op": "command", "id": grande, "button": 0},
+                  {"op": "subscribe", "topic": "/" + grande}, {"op": "clock", "action": grande},
+                  {"op": "record", "action": grande}, {"op": ["y"] * 200_000}):
+            with self.subTest(m=str(m)[:30]):
+                c.send_text(json.dumps(m))
+                msg = self.recv_until(c, lambda t: isinstance(t, str) and json.loads(t)["op"] == "error")
+                self.assertLess(len(msg), 600, msg[:200])
+
+    def test_binario_contesta_error(self):
+        c = self.connect()
+        c.send_binary(b'{"op":"teleop","left":0.5,"right":0.5}')
+        err = json.loads(self.recv_until(c, lambda m: isinstance(m, str) and json.loads(m)["op"] == "error"))["msg"]
+        self.assertIn("no acepta mensajes binarios", err)
+        self.assertFalse(c.closed)
 
 
 class TestManejoAtaques(MotorCase):
@@ -560,7 +627,8 @@ class TestManejoAtaques(MotorCase):
         c = self.connect()
         c.send_binary(b'{"op":"teleop","left":0.5,"right":0.5}')
         self._sin_comandos(0.3)
-        self.assertFalse(c.closed)                              # el binario se ignora; la conexión sigue
+        self.assertIn("no acepta mensajes binarios", self._error(c))   # se contesta el error; la conexión sigue
+        self.assertFalse(c.closed)
         bueno = self.connect()
         bueno.send_text(json.dumps({"op": "teleop", "left": 0.2, "right": 0.2}))
         self.assertAlmostEqual(self._cmd()["left"], 0.2, places=5)
@@ -626,8 +694,6 @@ class TestManejoAtaques(MotorCase):
         self.assertAlmostEqual(self._cmd()["left"], 0.25, places=5)
         d.send_text(json.dumps({"op": "teleop", "left": 0, "right": 0}))
 
-    @unittest.expectedFailure   # BUG ABIERTO (tester): do_POST hace rfile.read(length) sin tope ni try -> MemoryError /
-    # OverflowError sin atrapar. Cuando se arregle, esta prueba pasa "inesperadamente": quitar este decorador.
     def test_content_length_mentiroso_o_enorme_no_tumba_el_hilo(self):
         """Un Content-Length absurdo contesta 400 y no deja una excepción sin atrapar en el servidor (antes:
         MemoryError / OverflowError al intentar reservar ese cuerpo, y la conexión moría sin respuesta)."""
@@ -1027,6 +1093,24 @@ class TestClave(PanelCase):
         self.assertEqual(json.loads(c2.recv())["op"], "hello")
         self.assertTrue(self.panel.url.endswith("?t=clave-de-prueba-123"))
 
+    def test_sin_clave_no_se_lee_el_cuerpo(self):
+        """Sin la clave, el panel contesta 401 sin esperar el cuerpo (aquí nunca llega) ni reservar memoria
+        para él, aunque declare 1 TB, y sin llegar al mando."""
+        for cl in (100, 10**12):
+            with self.subTest(cl=cl):
+                s = socket.create_connection(("127.0.0.1", self.panel.port), timeout=5)
+                with s:
+                    s.sendall(f"POST /api/teleop HTTP/1.1\r\nHost: x\r\nX-Agmen: 1\r\nContent-Length: {cl}\r\n\r\n"
+                              .encode())
+                    resp = s.recv(65536).decode()
+                self.assertIn(" 401 ", resp.split("\r\n")[0])
+                self.assertIn("falta la clave", resp)
+        req = urllib.request.Request(f"http://{self.base}/api/teleop", data=b'{"left": 0.1, "right": 0.1}',
+                                     method="POST", headers={"X-Agmen": "1"})
+        with self.assertRaises(urllib.error.HTTPError) as e:     # un cliente normal recibe su 401 entero
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(e.exception.code, 401)
+
 
 class TestPuertoOcupado(unittest.TestCase):
     """[web] listen ocupado por otro robot (0.12.1, PENDIENTES de Arca9 #7): antes el
@@ -1145,12 +1229,28 @@ class TestMandos(unittest.TestCase):
                 c.send_text(raw)
                 err = json.loads(self.recv_text(c, lambda m: m.get("op") == "error"))
                 self.assertIn("no es JSON válido", err["msg"])
+        # Un entero enorme es JSON válido, pero no cabe en f32: antes float() lanzaba OverflowError y tumbaba la
+        # conexión (por WebSocket) o la dejaba sin respuesta (POST).
+        enorme = "1" + "0" * 400
+        c.send_text('{"op": "command", "id": 0, "fields": {"left": ' + enorme + '}}')
+        err = json.loads(self.recv_text(c, lambda m: m.get("op") == "error"))["msg"]
+        self.assertIn("no cabe en f32", err)
+        self.assertIn("unos 401 dígitos", err)
+        req = urllib.request.Request(f"http://{self.base}/api/command", method="POST", headers={"X-Agmen": "1"},
+                                     data=('{"command": 0, "fields": {"left": ' + enorme + '}}').encode())
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(cm.exception.code, 400)
+        self.assertIn("no cabe en f32", json.load(cm.exception)["error"])
         # Sin pasar por JSON (un nodo de Python que llama al panel): lo para check_value.
         for kw, msg in (({"fields": {"left": math.nan}}, "NaN ni infinito"),
                         ({"fields": {"left": -math.inf}}, "NaN ni infinito"),
                         ({"fields": {"left": "0.5"}}, "debe ser un número"),
                         ({"fields": {"left": None}}, "debe ser un número"),
-                        ({"button": math.nan}, "botón")):
+                        ({"button": math.nan}, "botón"),
+                        ({"fields": {"left": 10**400}}, "no cabe en f32"),
+                        ({"fields": {"left": 10**5000}}, "no cabe en f32"),
+                        ({"button": 10**5000}, "no tiene el botón un entero de unos 5001 dígitos")):
             with self.subTest(kw=kw):
                 self.assertIn(msg, self.panel.command(0, **kw) or "")
         self.rx.settimeout(0.3)

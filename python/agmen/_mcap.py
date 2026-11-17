@@ -26,13 +26,13 @@ hasta el último registro completo, y `repair()` le vuelve a escribir el índice
 
 from __future__ import annotations
 
+import contextlib
 import heapq
 import mmap
 import os
 import struct
 import sys
 import time
-import traceback
 import weakref
 import zlib
 from dataclasses import dataclass, field
@@ -51,6 +51,25 @@ _FOOTER_LEN = 9 + 8 + 8 + 4             # registro Footer completo
 
 class McapError(ValueError):
     """El archivo no es MCAP, está dañado o usa algo que no se puede leer."""
+
+
+# Los módulos de Agmen que leen grabaciones. Al salir por un error se limpian SOLO sus marcos del traceback
+# (guardan mensajes y chunks: vistas del archivo); los del programa nunca (sus variables le sirven a quien
+# depura: pdb.post_mortem, %debug), ni un generador suyo que aparezca ahí.
+_OWN_FILES = frozenset(os.path.normcase(os.path.join(os.path.dirname(os.path.abspath(__file__)), name))
+                       for name in ("_mcap.py", "recording.py", "play.py"))
+
+
+def _clear_own_frames(tb) -> None:
+    """Suelta las variables de los marcos del traceback que son de este lector (y ya terminaron)."""
+    while tb is not None:
+        frame = tb.tb_frame
+        if os.path.normcase(os.path.abspath(frame.f_code.co_filename)) in _OWN_FILES:
+            try:
+                frame.clear()
+            except RuntimeError:
+                pass                       # se está ejecutando: sus variables se sueltan al terminar
+        tb = tb.tb_next
 
 
 # ---------------------------------------------------------------------------
@@ -445,7 +464,6 @@ class Reader:
         else:
             self._b = memoryview(bytes(source) if not isinstance(source, (bytes, bytearray, memoryview)) else source)
         if len(self._b) < len(MAGIC) or self._b[:len(MAGIC)] != MAGIC:
-            self._warned = True
             self.close()
             raise McapError("no es un archivo MCAP (falta la marca \\x89MCAP0 al principio)")
         self.profile = self.library = ""
@@ -464,7 +482,6 @@ class Reader:
             if not self._read_summary():
                 self._scan()
         except BaseException as e:
-            self._warned = True            # el error ya dice qué pasó: que close() no avise además
             self._close_on_error(e)
             raise
 
@@ -517,12 +534,13 @@ class Reader:
 
     def _close_on_error(self, exc: BaseException | None) -> None:
         """close() al salir por un error (with, o el error al abrir o al reparar). El traceback del error guarda
-        las variables de cada función por la que pasó (mensajes, vistas del archivo): se limpian las que ya
-        terminaron, para que no impidan soltar el archivo ni hagan culpar al programa de algo que no guarda."""
+        las variables de cada función por la que pasó (mensajes, vistas del archivo): se limpian las de este
+        lector, para que no impidan soltar el archivo. Las del programa no se tocan: si una retiene el archivo,
+        se avisa (el aviso del camino de error)."""
         if exc is None:
             self.close()
             return
-        traceback.clear_frames(exc.__traceback__)
+        _clear_own_frames(exc.__traceback__)
         self._on_error = True
         try:
             self.close()
@@ -534,9 +552,12 @@ class Reader:
             return
         self._warned = True
         if self._on_error:
-            text = ("la grabación sigue abierta: se cerró por un error, y el error (o la función donde pasó, por "
-                    "ejemplo con la variable de un for) todavía guarda algo leído de ella. Se suelta sola en cuanto "
-                    "eso deje de usarse; hasta entonces, en Windows no se podrá borrar ni reemplazar el archivo.")
+            text = ("la grabación sigue abierta: se cerró por un error y algo leído de ella sigue en uso. Lo guarda "
+                    "el error (las variables de las funciones por las que pasó, como la de un for) o el programa "
+                    "(un mensaje en una lista, un arreglo de as_array()). En Windows no se podrá borrar ni "
+                    "reemplazar el archivo hasta que se suelte; se suelta solo en cuanto nada lo use. Qué hacer: "
+                    "copia lo que quieras conservar (copy.deepcopy(msg), arr.copy()) y suelta el error (del e, o "
+                    "sal del except).")
         else:
             text = ("la grabación sigue abierta porque algún mensaje (o adjunto) que leíste de ella, o un recorrido "
                     "de messages() a medias, sigue en uso (son vistas del archivo, sin copiar). En Windows no se "
@@ -545,7 +566,7 @@ class Reader:
                     "un arreglo de as_array(), los bytes de una imagen o una tabla de table(). Qué hacer: suelta "
                     "esa variable (por ejemplo del m, o sal de la función); el archivo se suelta solo en cuanto nada "
                     "lo use, o con otro close(). Para conservar algo después de cerrar, cópialo antes: "
-                    "copy.deepcopy(msg), arr.copy() o, una tabla, tabla.take(list(range(tabla.num_rows))).")
+                    "copy.deepcopy(msg), arr.copy() o, una tabla, tabla.take(numpy.arange(tabla.num_rows)).")
         print(f"[agmen] ⚠ {self.path}: {text}", file=sys.stderr, flush=True)
 
     def _check_open(self) -> None:
@@ -848,8 +869,9 @@ class Reader:
                 push(it)
         except BaseException as e:
             # Un error a medio recorrido (un chunk dañado, Ctrl+C): el traceback guarda este marco y los de
-            # adentro, con mensajes y chunks (vistas del archivo). Se sueltan antes de relanzar.
-            traceback.clear_frames(e.__traceback__)
+            # adentro, con mensajes y chunks (vistas del archivo). Se sueltan antes de relanzar (solo los marcos
+            # de este lector: un error que el programa metió con throw() conserva los suyos).
+            _clear_own_frames(e.__traceback__)
             heap.clear()
             loose.clear()
             m = it = None
@@ -888,8 +910,13 @@ def _rewrite(r: Reader, output) -> dict:
         for a in r.attachments:
             w.add_attachment(a.name, a.media_type, a.data, a.log_time, a.create_time)
         w.close()
-    except BaseException:
-        if w._own:
-            w._f.close()          # la salida quedó a medias: se suelta sin terminarla (en Windows, si no, sigue abierta)
+    except BaseException as e:
+        if w._own:                # la salida quedó a medias: se cierra sin terminarla y se borra (la creó repair)
+            with contextlib.suppress(OSError):
+                w._f.close()
+            try:
+                os.remove(output)
+            except OSError as why:
+                e.add_note(f"{os.fspath(output)} quedó a medias (no se pudo borrar: {why}); bórralo, no sirve")
         raise
     return {"messages": n, "was_complete": r.complete, "was_truncated": r.truncated}

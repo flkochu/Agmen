@@ -32,7 +32,6 @@ import json
 import os
 import re
 import sys
-import traceback
 from dataclasses import dataclass
 
 from . import _mcap, relojes, schema, wire
@@ -407,8 +406,9 @@ class Recording:
                 for msg in _decode(cls, payload):
                     yield RecordedSample(env, msg, sender, m.channel.topic, m.log_time)
         except BaseException as e:
-            # Un error a medio recorrido: que el traceback no guarde el último mensaje (una vista del archivo).
-            traceback.clear_frames(e.__traceback__)
+            # Un error a medio recorrido: que el traceback no guarde el último mensaje (una vista del archivo). Solo
+            # los marcos de Agmen: los del programa (un error suyo que entró con throw()) conservan sus variables.
+            _mcap._clear_own_frames(e.__traceback__)
             m = payload = msg = None
             raise
 

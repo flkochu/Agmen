@@ -270,7 +270,7 @@ class TestCerrar(unittest.TestCase):
         for words in (self.path, "sigue abierta", "sigue en uso", "Windows", "borrar ni reemplazar",
                       "recorrido de messages() a medias", "for m in rec.messages(...)", "as_array()",
                       "bytes de una imagen", "table()", "del m", "copy.deepcopy(msg)", "arr.copy()",
-                      "tabla.take(list(range(tabla.num_rows)))"):
+                      "tabla.take(numpy.arange(tabla.num_rows))"):
             self.assertIn(words, text)
 
     def read_everything(self, rec):
@@ -319,34 +319,146 @@ class TestCerrar(unittest.TestCase):
         self.assertEqual(close_quoting(rec), "")
         self.assertClosed(rec._r)
 
-    def test_chunk_danado_no_culpa_al_programa(self):
-        """Un error a medio recorrido (aquí, un chunk dañado): el traceback guarda los marcos con mensajes y
-        chunks (vistas). Al salir del with, el lector los suelta: cierra de verdad y no culpa al programa."""
+    def assertErrorWarning(self, text):
+        self.assertEqual(text.count("[agmen] ⚠"), 1, text)
+        for words in (self.path, "se cerró por un error", "Lo guarda el error", "como la de un for",
+                      "o el programa", "un mensaje en una lista", "Windows", "se suelta solo",
+                      "copy.deepcopy(msg)", "arr.copy()", "del e"):
+            self.assertIn(words, text)
+
+    def test_chunk_danado_sin_que_el_programa_guarde_nada(self):
+        """Un error a medio recorrido (aquí, un chunk dañado): el traceback guarda los marcos del lector, con
+        mensajes y chunks (vistas). Al salir del with, el lector suelta los suyos: cierra de verdad, sin aviso."""
         damage_chunk(self.path, 2)
-        err = io.StringIO()
-        with (contextlib.redirect_stderr(err), self.assertRaisesRegex(_mcap.McapError, "CRC"),
-              agmen.Recording(self.path) as rec):
-            sum(1 for _ in rec.messages())
+        err, error = io.StringIO(), None
+        with contextlib.redirect_stderr(err):
+            try:
+                with agmen.Recording(self.path) as rec:
+                    list(rec.messages())          # la lista a medias se descarta con el error
+            except _mcap.McapError as e:
+                error = e                         # con su traceback vivo
+        self.assertIn("CRC", str(error))
         self.assertEqual(err.getvalue(), "")
         self.assertClosed(rec._r)
 
+    def test_chunk_danado_en_un_genexpr(self):
+        """sum(1 for _ in r.messages()): el marco del genexpr (código del programa) terminó por el error y su
+        `_` (el último mensaje, una vista) queda en el traceback. Agmen no toca marcos del programa: mientras
+        el error vive, el archivo sigue abierto y el aviso del camino de error lo dice; en cuanto nadie guarda
+        el error (al salir del except), se suelta solo."""
+        damage_chunk(self.path, 2)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            try:
+                with _mcap.Reader(self.path) as r:
+                    sum(1 for _ in r.messages())
+            except _mcap.McapError:
+                pass                              # nadie guarda el error: al salir del except se descarta
+        self.assertErrorWarning(err.getvalue())
+        gc.collect()
+        self.assertFalse(r._mapped, "sin el error, nada lo usa: se suelta solo")
+        self.assertEqual(close_quoting(r), "")
+        self.assertClosed(r)
+
     def test_chunk_danado_con_la_variable_del_for_viva(self):
-        """Si lo que retiene el archivo es una variable de quien llamó (la del for), el aviso lo dice como es."""
+        """La variable de un for normal también es del programa: el aviso del camino de error, una vez."""
         damage_chunk(self.path, 2)
         err = io.StringIO()
         with (contextlib.redirect_stderr(err), self.assertRaisesRegex(_mcap.McapError, "CRC"),
               _mcap.Reader(self.path) as r):
             for m in r.messages():
                 pass
-        text = err.getvalue()
-        self.assertEqual(text.count("[agmen] ⚠"), 1, text)
-        for words in (self.path, "se cerró por un error", "variable de un for", "Se suelta sola", "Windows"):
-            self.assertIn(words, text)
+        self.assertErrorWarning(err.getvalue())
         del m
         gc.collect()
-        self.assertFalse(r._mapped, "al soltar la variable, se suelta sola")
+        self.assertFalse(r._mapped, "al soltar la variable, se suelta solo")
         self.assertEqual(close_quoting(r), "")
         self.assertClosed(r)
+
+    def test_un_mensaje_guardado_y_luego_un_error_cualquiera(self):
+        guardados = []
+        err = io.StringIO()
+        with (contextlib.redirect_stderr(err), self.assertRaisesRegex(KeyError, "otra cosa"),
+              agmen.Recording(self.path) as rec):
+            guardados.append(next(iter(rec.messages("/camara"))))
+            raise KeyError("otra cosa")
+        self.assertErrorWarning(err.getvalue())       # dice que puede ser el programa (la lista), no solo el error
+        self.assertEqual(len(guardados[0].message.data), 8, "lo guardado sigue sirviendo")
+        guardados.clear()
+        gc.collect()
+        self.assertFalse(rec._r._mapped)
+        self.assertEqual(close_quoting(rec), "")
+        self.assertClosed(rec._r)
+
+    @staticmethod
+    def frame_locals(error, name):
+        tb = error.__traceback__
+        while tb is not None:
+            if tb.tb_frame.f_code.co_name == name:
+                return dict(tb.tb_frame.f_locals)
+            tb = tb.tb_next
+        raise AssertionError(f"{name} no está en el traceback")
+
+    def test_no_borra_las_variables_del_programa(self):
+        """Caso A: un error del programa (aunque no tenga que ver con la grabación) sale del with: sus marcos
+        conservan sus variables (pdb.post_mortem, %debug, pytest --showlocals)."""
+        def helper(r):
+            secreto = 42      # noqa: F841 — la variable que debe sobrevivir
+            raise RuntimeError("ajeno")
+
+        for open_ in (_mcap.Reader, agmen.Recording):
+            with self.subTest(open_.__name__):
+                error, err = None, io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    try:
+                        with open_(self.path) as r:
+                            helper(r)
+                    except RuntimeError as e:
+                        error = e
+                self.assertEqual(self.frame_locals(error, "helper")["secreto"], 42)
+                self.assertEqual(err.getvalue(), "", "helper no guarda nada leído: cierra sin avisar")
+                self.assertFalse((r._r if open_ is agmen.Recording else r)._mapped)
+
+    def test_no_termina_un_generador_del_programa(self):
+        """Caso B: un generador del programa (suspendido) aparece en el traceback: sigue vivo después."""
+        def gen():
+            try:
+                raise RuntimeError("guardado")
+            except RuntimeError as e:
+                capturado = e
+            yield capturado
+            yield "sigue vivo"
+
+        g = gen()
+        error = next(g)                           # el traceback del error trae el marco de g (ahora suspendido)
+        with contextlib.suppress(RuntimeError), _mcap.Reader(self.path):
+            raise error
+        self.assertEqual(next(g), "sigue vivo")
+
+    def test_throw_no_borra_las_variables_del_programa(self):
+        """Caso C: un error del programa que entra a messages() con throw() conserva las variables de su marco."""
+        def falla():
+            local = "del programa"   # noqa: F841 — la variable que debe sobrevivir
+            raise ValueError("ajeno")
+
+        for which in ("Reader", "Recording"):
+            with self.subTest(which):
+                try:
+                    falla()
+                except ValueError as e:
+                    error = e
+                src = _mcap.Reader(self.path) if which == "Reader" else agmen.Recording(self.path)
+                it = src.messages()
+                next(it)
+                got = None
+                try:                              # sin assertRaises: en 3.13 le quita el traceback al error
+                    it.throw(error)
+                except ValueError as e:
+                    got = e
+                self.assertIs(got, error)
+                self.assertEqual(self.frame_locals(error, "falla")["local"], "del programa")
+                del it, error, got
+                self.assertEqual(close_quoting(src), "")
 
     def test_reparar_un_chunk_danado_suelta_los_dos_archivos(self):
         damage_chunk(self.path, 2)
@@ -359,8 +471,7 @@ class TestCerrar(unittest.TestCase):
                 error = e                     # con su traceback todavía vivo (assertRaises lo limpiaría)
         self.assertIn("CRC", str(error))
         self.assertEqual(err.getvalue(), "")
-        self.assertIn(opened(out), (False, None), "la salida a medias quedó cerrada")
-        os.remove(out)                        # en Windows falla si sigue abierta
+        self.assertFalse(os.path.exists(out), "la salida a medias se borra (no sirve)")
         self.assertIn(mapped(self.path), (False, None))
         self.assertIn(opened(self.path), (False, None))
         os.remove(self.path)
@@ -444,15 +555,19 @@ class TestTablas(RecordingCase):
     def test_conservar_una_tabla_despues_de_cerrar(self):
         """Una tabla de un topic en arrow lee los bytes del archivo sin copiar: guardarla detiene el archivo
         (el aviso lo dice), y lo que el aviso recomienda, tabla.take(...), la despega de verdad."""
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest("sin numpy")
         for filas in (None, 0.001):           # varias filas (varios lotes) y una sola
             with self.subTest(filas=filas):
                 rec = agmen.Recording(self.path)
                 tabla = rec.table("/det", end=filas)
                 text = close_quoting(rec)
-                self.assertIn("tabla.take(list(range(tabla.num_rows)))", text)
+                self.assertIn("tabla.take(numpy.arange(tabla.num_rows))", text)
                 rec = agmen.Recording(self.path)
                 tabla = rec.table("/det", end=filas)
-                copia = tabla.take(list(range(tabla.num_rows)))
+                copia = tabla.take(np.arange(tabla.num_rows))
                 del tabla
                 self.assertEqual(close_quoting(rec), "", "la copia ya no apunta al archivo")
                 self.assertFalse(rec._r._mapped)

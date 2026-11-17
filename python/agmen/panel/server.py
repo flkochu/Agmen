@@ -22,7 +22,9 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import re
 import secrets
+import socket
 import threading
 import time
 import webbrowser
@@ -38,7 +40,14 @@ from .. import ws as wsmod
 from .._version import __version__
 from ..machines import lan_addresses   # vive en machines: también la usa agmen run (RFC 0011 §3.4)
 from ..pubsub import RawSubscriber, _PurePublisher, is_closed_error
-from .bridge import FOXGLOVE_PROTOCOL, PROTOCOLS, Bridge, ClientError, client_json, client_number
+from .bridge import (FOXGLOVE_PROTOCOL, MAX_NAME, PROTOCOLS, Bridge, ClientError, RejectLog, client_json,
+                     client_number)
+from .command import show_value
+
+# Lo más grande que se lee de un POST: lo mismo que un mensaje del WebSocket (1 MiB). Los POST del panel son
+# comandos de unos cientos de bytes; más que esto no se lee (413), para que nadie haga reservar memoria al panel.
+MAX_POST_BODY = wsmod.MAX_MESSAGE
+_DIGITS = re.compile(r"[0-9]+")
 
 HERE = Path(__file__).resolve().parent
 INDEX_HTML = (HERE / "index.html").read_bytes()
@@ -384,6 +393,8 @@ class Panel:
         self.muxes = MuxBoard()
         self.hub = SensorHub()
         self.bridge = Bridge(self)
+        self._post_rejects: dict[str, RejectLog] = {}     # por dirección: comandos de manejo rechazados por POST
+        self._post_rejects_lock = threading.Lock()
         self.stop = threading.Event()
         if launcher is not None:
             self.logs = launcher.logs
@@ -527,7 +538,7 @@ class Panel:
             cmd = None
         if cmd is None:
             names = ", ".join(f"{c.cfg.index} = '{c.cfg.name}'" for c in self.commands)
-            return f"no hay un mando {which!r} (hay: {names})"
+            return f"no hay un mando {show_value(which)} (hay: {names})"
         if (button is None) == (fields is None):
             return "di qué mandar: button (el número o el letrero del botón) o fields (los deslizadores)"
         try:
@@ -540,6 +551,15 @@ class Panel:
         except (OSError, wire.WireError) as e:
             return f"no se pudo publicar en {cmd.cfg.target}: {e}"
         return None
+
+    def log_post_rejected(self, peer: str, err: str) -> None:
+        """Un comando de manejo rechazado por POST, a los logs (como el del WebSocket: el primero de cada
+        dirección y luego como mucho uno por segundo)."""
+        with self._post_rejects_lock:
+            if peer not in self._post_rejects and len(self._post_rejects) >= 256:
+                self._post_rejects.clear()       # muchas direcciones distintas: se empieza de nuevo
+            rejects = self._post_rejects.setdefault(peer, RejectLog())
+        self.bridge.log_rejected(rejects, peer, err)
 
     def gap_info(self) -> list[dict]:
         watch = getattr(self.launcher, "watch", None) if self.launcher is not None else None
@@ -566,7 +586,7 @@ class Panel:
             # Cerrar escribe lo que quedó en la cola: que no espere el navegador.
             threading.Thread(target=rc.stop, daemon=True, name="panel-record-stop").start()
             return None
-        return f"acción de grabación desconocida '{action}' (start, stop)"
+        return f"acción de grabación desconocida {show_value(action)} (start, stop)"
 
     def recording_chunk(self, start: int) -> bytes | None:
         """Los registros de un chunk ya descomprimidos (zstd: el navegador no lo trae)."""
@@ -608,7 +628,7 @@ class Panel:
             elif action == "speed":
                 self.clock.set_speed(client_number(value, "la velocidad del reloj"))
             else:
-                return f"acción de reloj desconocida '{action}' (pause, resume, step, speed)"
+                return f"acción de reloj desconocida {show_value(action)} (pause, resume, step, speed)"
         except (TypeError, ValueError) as e:      # ClientError es ValueError; los rangos los revisa el reloj
             return str(e)
         return None
@@ -883,32 +903,59 @@ class Panel:
                         pass               # el navegador ya no lo quiso (saltó a otra parte)
 
             # --- POST (para scripts; el panel usa el WebSocket) ---
-            def do_POST(self):
+            def _post_error(self, status, err: str, unread: bool) -> None:
+                """Contesta un POST rechazado. `unread`: el cuerpo no se leyó, así que la conexión se cierra (si
+                no, esos bytes se leerían como la siguiente petición)."""
+                if urlsplit(self.path).path.rstrip("/") == "/api/teleop" and status == HTTPStatus.BAD_REQUEST:
+                    panel.log_post_rejected(self.client_address[0], err)
+                if not unread:
+                    self._json({"error": err}, status)
+                    return
+                self.close_connection = True
+                self._json({"error": err}, status)
                 try:
-                    length = int(self.headers.get("Content-Length") or 0)
-                    if length < 0:
-                        raise ValueError
-                except ValueError:
-                    self.close_connection = True      # no sabemos dónde termina el cuerpo: no se lee
-                    self._json({"error": f"Content-Length inválido: {self.headers.get('Content-Length')!r:.40} "
-                                         f"(debe ser el tamaño del cuerpo en bytes)"}, HTTPStatus.BAD_REQUEST)
+                    # Cerrar con bytes sin leer manda un RST, que puede borrarle la respuesta al cliente: primero
+                    # el FIN (la respuesta ya salió) y luego se tira lo que ya llegó, sin esperar más.
+                    self.wfile.flush()
+                    self.connection.shutdown(socket.SHUT_WR)
+                    self.connection.setblocking(False)
+                    while self.connection.recv(65536):
+                        pass
+                except OSError:
+                    pass
+
+            def do_POST(self):
+                # Primero lo que no necesita el cuerpo (su tamaño, la clave, el origen) y solo entonces se lee:
+                # sin clave nadie hace que el panel reserve memoria ni espere un cuerpo.
+                declared = (self.headers.get("Content-Length") or "0").strip()
+                if not _DIGITS.fullmatch(declared):      # ni "+30", ni "3_0", ni "-5", ni dígitos no ASCII
+                    self._post_error(HTTPStatus.BAD_REQUEST, f"Content-Length inválido: {show_value(declared)} (debe "
+                                     f"ser el tamaño del cuerpo en bytes, solo dígitos)", unread=True)
+                    return
+                too_big = len(declared) > 12 or int(declared) > MAX_POST_BODY
+                length = 0 if too_big else int(declared)
+                denied = ((HTTPStatus.UNAUTHORIZED, "falta la clave del panel") if not self._authorized() else
+                          (HTTPStatus.FORBIDDEN, "petición rechazada (protección CSRF)") if not self._allowed() else
+                          None)
+                if denied is not None:
+                    self._post_error(*denied, unread=length > 0 or too_big)     # el cuerpo ni se espera
+                    return
+                if too_big:
+                    self._post_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                                     f"cuerpo demasiado grande ({declared if len(declared) <= 20 else declared[:19] + '…'} bytes): el máximo es "
+                                     f"{MAX_POST_BODY} bytes ({MAX_POST_BODY >> 20} MiB); no se leyó ni se hizo "
+                                     f"nada", unread=True)
                     return
                 raw = self.rfile.read(length) if length else b""
-                if not self._authorized():
-                    self._json({"error": "falta la clave del panel"}, HTTPStatus.UNAUTHORIZED)
-                    return
-                if not self._allowed():
-                    self._json({"error": "petición rechazada (protección CSRF)"}, HTTPStatus.FORBIDDEN)
-                    return
                 try:
                     body = client_json(raw or b"{}")     # sin NaN ni Infinity (ver bridge.client_json)
                 except ClientError as e:
-                    self._json({"error": f"petición rechazada entera (no se hizo nada ni se mandó nada al robot): "
-                                         f"{e}"}, HTTPStatus.BAD_REQUEST)
+                    self._post_error(HTTPStatus.BAD_REQUEST, f"petición rechazada entera (no se hizo nada ni se "
+                                     f"mandó nada al robot): {e}", unread=False)
                     return
                 if not isinstance(body, dict):
-                    self._json({"error": "no se hizo nada: el cuerpo debe ser un objeto JSON ({...})"},
-                               HTTPStatus.BAD_REQUEST)
+                    self._post_error(HTTPStatus.BAD_REQUEST, "no se hizo nada: el cuerpo debe ser un objeto JSON "
+                                     "({...})", unread=False)
                     return
                 parts = urlsplit(self.path).path.strip("/").split("/")
                 # /api/node/<nombre>/<start|stop|restart>
@@ -916,6 +963,9 @@ class Panel:
                     if panel.launcher is None:
                         self._json({"error": "este panel no administra nodos (usa 'agmen run')"},
                                    HTTPStatus.BAD_REQUEST)
+                        return
+                    if max(len(parts[2]), len(parts[3])) > MAX_NAME:
+                        self._json({"error": f"no existe el nodo {show_value(parts[2])}"}, HTTPStatus.BAD_REQUEST)
                         return
                     err = panel.launcher.action(parts[2], parts[3])
                     from ..run import NoConnection
@@ -940,7 +990,7 @@ class Panel:
                     try:
                         sent = panel.teleop.send_client(body)
                     except ClientError as e:
-                        self._json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
+                        self._post_error(HTTPStatus.BAD_REQUEST, str(e), unread=False)
                         return
                     self._json({"ok": True, "sent": sent})
                 else:

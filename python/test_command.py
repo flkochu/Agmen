@@ -201,6 +201,9 @@ class TestServidor(MandoCase):
             ({"q[1]": math.inf}, "NaN ni infinito"),
             ({"q[1]": "90"}, "debe ser un número"),
             ({"q[1]": True}, "debe ser un número"),
+            ({"q[1]": 10**400}, "no cabe en f32"),          # antes: OverflowError, no CommandError
+            ({"q[1]": 10**5000}, "unos 5001 dígitos"),
+            ({"q[1]": "x" * 100_000}, "debe ser un número (f32), no 'xxxx"),
             ({"activo[1]": 1}, "true o false"),
             ({"q[12]": 90}, "no tiene control"),
             ({"__proto__": 1}, "no tiene control"),
