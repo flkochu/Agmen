@@ -316,7 +316,9 @@ class TestSinBloquear(unittest.TestCase):
                 super().__init__(addr, *a, **k)
 
         def reintentados() -> bool:
-            return not puro or all(intentos.get(("127.0.0.1", m.port), 0) >= 2 for m in muertos)
+            # El que revive puede conectar con su PRIMER intento (en Windows ese intento sigue en curso
+            # cuando empieza a escuchar): a ese se le pide que acepte; a los que siguen muertos, 2 intentos.
+            return not puro or all(intentos.get(("127.0.0.1", m.port), 0) >= 2 for m in muertos[1:])
 
         try:
             with unittest.mock.patch.object(_tcp, "Outgoing", Contada):
@@ -340,9 +342,11 @@ class TestSinBloquear(unittest.TestCase):
             self.assertEqual(pub.subscribers, 4)
             self.assertGreaterEqual(muertos[0].atender(), 1, "el destino que revivió se reintentó")
             if puro:
-                for m in muertos:
+                for m in muertos[1:]:
                     self.assertGreaterEqual(intentos.get(("127.0.0.1", m.port), 0), 2,
                                             f"intentos por destino: {intentos}")
+                self.assertGreaterEqual(intentos.get(("127.0.0.1", muertos[0].port), 0), 1,
+                                        f"intentos por destino: {intentos}")
             self.assertLess(peor, 0.25, f"el peor publish() tardó {peor:.3f} s")
             got = drain(vivo)
             self.assertEqual([s.message.w for s in got], list(range(n)), "el vivo recibe todo, en orden")
@@ -447,13 +451,17 @@ class _ConexionLenta(_tcp.Outgoing):
         self.otros.append(b)
 
 
-def _vaciar(s: socket.socket) -> None:
+def _vaciar(s: socket.socket) -> bytes:
+    """Saca todo lo que haya en `s` y lo devuelve (el relleno y, si ya salió, lo que mandó el Publisher)."""
+    sacado = bytearray()
     while True:
         try:
-            if not s.recv(1 << 20):
-                return
+            trozo = s.recv(1 << 20)
         except (BlockingIOError, InterruptedError):
-            return
+            return bytes(sacado)
+        if not trozo:
+            return bytes(sacado)
+        sacado += trozo
 
 
 class TestTandaCompartida(unittest.TestCase):
@@ -591,7 +599,10 @@ class TestDireccionFija(unittest.TestCase):
         # Python puro, con el doble de conexión lenta: una dirección fija no local cuya conexión termina a
         # los ~150 ms. El constructor la espera (no 50 ms) y el primer mensaje ya sale, sin aviso.
         _ConexionLenta.otros = []
-        termina = threading.Timer(0.15, lambda: [_vaciar(o) for o in list(_ConexionLenta.otros)])
+        # Lo que saca el temporizador se guarda: en cuanto hay sitio, el Publisher puede mandar el anuncio
+        # mientras todavía se está vaciando el relleno, y se iría con él (pasó en el CI de ARM64).
+        vaciado: list = []
+        termina = threading.Timer(0.15, lambda: vaciado.extend(_vaciar(o) for o in list(_ConexionLenta.otros)))
         err = io.StringIO()
         pub = None
         try:
@@ -607,7 +618,8 @@ class TestDireccionFija(unittest.TestCase):
             self.assertEqual(pub._tcp.connected, 1)
             self.assertEqual(err.getvalue().count(self.AVISO), 0, err.getvalue())
             otro = _ConexionLenta.otros[0]
-            llego = b""
+            termina.join()
+            llego = b"".join(vaciado)
             fin = time.monotonic() + 1.0
             while b"/Img" not in llego and time.monotonic() < fin:
                 select.select([otro], [], [], 0.05)
