@@ -345,6 +345,7 @@ class TestMcapJs(unittest.TestCase):
                         ids[c.id] = w.add_channel(c.topic, "agmen", w.add_schema(s.name, s.encoding, bytes(s.data)))
                     for m in r.messages():
                         w.add_message(ids[m.channel.id], m.log_time, m.publish_time, m.sequence, bytes(m.data))
+                    m = None             # la última vista del archivo: que close() lo pueda soltar
                 w.close()
                 paths.append(lz4)
             except _mcap.McapError:
