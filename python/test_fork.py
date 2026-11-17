@@ -269,7 +269,12 @@ for i in range(6):
         sys.exit(0)
     res.append(espera_hijo(pid, 15))
     time.sleep(0.1)
-print("RESULTADO " + json.dumps(dict(hijos=res, ppid=os.getpid())), flush=True)
+# G6: tras los forks, el padre sigue latiendo por sus tres objetos (Python puro: el hilo de latido de cada
+# uno vivo y sin cerrar; el núcleo de C++ no expone el suyo).
+links = [o._link for o in (sq, pg, sg) if getattr(o, "_link", None) is not None]
+latiendo = all(k._thread.is_alive() and not k._closed for k in links)
+print("RESULTADO " + json.dumps(dict(hijos=res, ppid=os.getpid(), latiendo=latiendo, links=len(links))),
+      flush=True)
 os._exit(0)
 '''
 
@@ -622,7 +627,17 @@ class _Base(unittest.TestCase):
         self.assertEqual(len(tiempos), 6, r.stdout)
         self.assertLess(max(tiempos), 0.1, f"close() de un heredado tardó: {r.stdout}")
         self.assertEqual(self.bajas(), [], "un hijo dio de baja al padre")
-        self.assertEqual(len(self.del_padre(res["ppid"])), 3, self.log)
+        # Ninguna salida del hub por otra causa que el vencimiento de 3 s. No se exige que los tres sigan
+        # registrados: con Python puro, dos hilos que mueven 490 KB sin pausa le quitan el GIL a los hilos
+        # de latido hasta 1.7 s seguidos y, a veces, más de 3 s (medido también sin ningún fork y con el
+        # código de antes de este PR): el hub los vence y los vuelve a registrar al siguiente latido. Que el
+        # padre siga latiendo (G6) se comprueba en el propio padre.
+        self.assertEqual([x for x in list(self.log) if "se quita de" in x and "no latió" not in x], [], self.log)
+        self.assertTrue(res["latiendo"], f"el padre dejó de latir tras los forks: {res}")
+        if self.backend == "pure":
+            self.assertEqual(res["links"], 3, res)
+        if len(self.del_padre(res["ppid"])) != 3:
+            self.assertTrue(any("no latió" in x for x in list(self.log)), self.log)
         self.sin_avisos(r.stderr)
         self.assertNotIn("Traceback", r.stderr)
 
