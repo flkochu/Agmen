@@ -22,6 +22,7 @@ topic, de registrarse con el hub y latir cada segundo.
 
 from __future__ import annotations
 
+import inspect
 import os
 import select
 import socket
@@ -314,6 +315,8 @@ class _NetSend:
 
 
 class _PurePublisher(_NetSend):
+    _NOMBRE = "Publisher"   # el nombre en el error de un heredado (heredado_text)
+
     def __init__(self, msg_type, to: str, topic: str | None = None, *, source_id: int | None = None,
                  node: str | None = None) -> None:
         """`to` = topic ("/cmd") o dirección ("127.0.0.1:7500"). Con dirección,
@@ -1048,6 +1051,56 @@ class _PureSubscriber(_Receiver):
               file=sys.stderr, flush=True)
 
 
+# El pid del proceso que hace fork (lo anota el gancho `before`): el "padre" del error de un heredado.
+_pid_antes_del_fork = 0
+
+
+def _antes_del_fork() -> None:
+    global _pid_antes_del_fork
+    _pid_antes_del_fork = os.getpid()
+
+
+def heredado_text(nombre: str, pid: int) -> str:
+    """El error de usar en el hijo de un fork un objeto heredado (PR "fork", G4)."""
+    return f"este {nombre} es del proceso padre (pid {pid}): después de un fork, crea uno nuevo en el hijo"
+
+
+_clases_heredadas: dict = {}
+
+
+def _heredar(o, nombre: str, siguen: tuple = (), silenciosos: tuple = ()) -> None:
+    """En el hijo de un fork: `o` (un objeto de agmen creado antes del fork) pasa a una subclase en la que
+    todo método o propiedad pública, y todo atributo público del objeto, lanza heredado_text al instante,
+    salvo close() (que no hace nada: ya quedó soltado), salir de un `with`, __repr__ y lo de `siguen`; lo
+    de `silenciosos` no hace nada. Se cambia la clase solo en el hijo: nada cuesta a quien no hace fork."""
+    cls = type(o)
+    publicos = frozenset(k for k in vars(o) if not k.startswith("_"))
+    clave = (cls, publicos, nombre, siguen, silenciosos)
+    h = _clases_heredadas.get(clave)
+    if h is None:
+        def falla(self, *_a, **_k):
+            raise RuntimeError(heredado_text(nombre, self._pid_del_padre))
+
+        def nada(self, *_a, **_k) -> None:
+            return None
+
+        attrs = {"__module__": cls.__module__, "__qualname__": cls.__qualname__, "__doc__": cls.__doc__}
+        nombres = publicos | {n for n in dir(cls) if not n.startswith("_")} | {"__enter__"}
+        for n in nombres - {"close", "closed", *siguen}:
+            if n == "__enter__" and not hasattr(cls, "__enter__"):
+                continue
+            if n in silenciosos:
+                attrs[n] = nada
+            elif n in publicos or isinstance(inspect.getattr_static(cls, n, None), property):
+                attrs[n] = property(falla)   # un descriptor de datos: gana también al atributo del objeto
+            else:
+                attrs[n] = falla
+        h = type(cls.__name__, (cls,), attrs)
+        _clases_heredadas[clave] = h
+    o._pid_del_padre = _pid_antes_del_fork
+    o.__class__ = h
+
+
 def _soltar_heredados() -> None:
     """En el hijo de un fork (un solo hilo), con los dos núcleos: los objetos de Python puro creados antes
     del fork son del padre. Se cierran sus sockets en el acto (el hijo no retiene sus puertos ni lee lo que
@@ -1057,11 +1110,12 @@ def _soltar_heredados() -> None:
     _tcp.soltar_heredados()
     for o in list(_puros):
         o._soltar_en_el_hijo()
+        _heredar(o, o._NOMBRE)   # usarlo en el hijo: un error claro (G4)
     _puros.clear()
 
 
 if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_soltar_heredados)
+    os.register_at_fork(before=_antes_del_fork, after_in_child=_soltar_heredados)
 
 
 class RawSubscriber(_Receiver):
@@ -1089,6 +1143,8 @@ class RawPublisher(_NetSend):
     """Reenvía paquetes ya armados a un topic (para el mux). Se registra con el
     hub cuando conoce el esquema (por el primer anuncio que reenvía). En modo red
     manda a otra computadora como un Publisher (RFC 0011 §10.1)."""
+
+    _NOMBRE = "RawPublisher"
 
     def __init__(self, topic: str) -> None:
         hp.check_topic(topic)
@@ -1304,6 +1360,8 @@ _beats = _Beats()
 
 
 class _NativePublisher:
+    _NOMBRE = "Publisher"
+
     def __init__(self, msg_type, to: str, topic: str | None = None) -> None:
         """`to` = topic ("/cmd") o dirección ("127.0.0.1:7500"). Con dirección,
         `topic` es solo una etiqueta (default "/" + nombre del tipo)."""
@@ -1394,6 +1452,8 @@ class _NativePublisher:
 
 
 class _NativeSubscriber:
+    _NOMBRE = "Subscriber"
+
     def __new__(cls, msg_type, where: str):
         if where == "*":   # todos los topics con un tipo: solo en Python puro (lo usan pocas herramientas)
             return _PureSubscriber(msg_type, where)
@@ -1577,6 +1637,8 @@ if _backend.NATIVE:
         _hijo_de_fork = True
         for o in list(_nativos):
             o._lock = threading.Lock()
+            _heredar(o, o._NOMBRE)   # usarlo en el hijo: un error claro (G4)
+        _nativos.clear()
         _beats.pubs = weakref.WeakSet()
         _beats.lock = threading.Lock()
         _beats.stopping = threading.Event()

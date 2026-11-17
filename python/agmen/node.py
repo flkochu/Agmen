@@ -34,6 +34,7 @@ import socket
 import sys
 import threading
 import time
+import weakref
 from dataclasses import dataclass
 
 from . import _backend, _tcp, clock, wire
@@ -43,10 +44,27 @@ from .pubsub import (
     _preload_numpy,
     Sample,
     Subscriber,
+    _heredar,
     hub_address,
     node_name,
     set_default_node_name,
 )
+
+# Los Node vivos (los dos núcleos): en el hijo de un fork, usar uno heredado da un error claro (G4).
+_nodos: weakref.WeakSet = weakref.WeakSet()
+
+
+def _nodos_despues_de_fork() -> None:
+    """En el hijo de un fork: los Node creados antes son del padre (sus hilos aquí no existen; el núcleo
+    de C++ ya se abandonó y los sockets se taparon en pubsub). Todo lo suyo da el error de heredado_text,
+    salvo close() y stop() (silenciosos) y now() (el reloj no es del objeto)."""
+    for n in list(_nodos):
+        _heredar(n, "Node", siguen=("now",), silenciosos=("stop",))
+    _nodos.clear()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_nodos_despues_de_fork)
 
 _MS = 1_000_000
 _SEC = 1_000_000_000
@@ -249,6 +267,7 @@ class _PureNode:
         self._error: BaseException | None = None
         self._err_lock = threading.Lock()
         self._stats_sock: socket.socket | None = None
+        _nodos.add(self)
 
     # --- armar el nodo ---
     def publisher(self, msg_type, to: str) -> Publisher:
@@ -595,6 +614,7 @@ class _NativeNode:
         self._pubs: list = []
         self._running = False
         self._error: BaseException | None = None
+        _nodos.add(self)
 
     # --- armar el nodo ---
     def publisher(self, msg_type, to: str) -> Publisher:

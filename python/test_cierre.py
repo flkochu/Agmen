@@ -1051,6 +1051,8 @@ class TestFormasDeSalir(_ConHub):
         m = re.search(r"HIJO error=(\w+) t_error=([\d.]+) t_close=([\d.]+) recibidos=(\d+)", r.stdout)
         self.assertIsNotNone(m, f"{r.stdout}\n{r.stderr}")
         self.assertEqual(m.group(1), "True", f"receive() de un Subscriber heredado no dio error: {r.stdout}")
+        self.assertRegex(r.stdout, r"HIJO texto=este Subscriber es del proceso padre \(pid \d+\): después de un "
+                                   r"fork, crea uno nuevo en el hijo")
         self.assertLess(float(m.group(2)), 0.1, "el error del heredado no fue inmediato")
         self.assertLess(float(m.group(3)), 0.1, "close() del heredado esperó (el turno heredado quedó tomado)")
         self.assertEqual(m.group(4), "1", "el Subscriber propio del hijo no recibió nada en 5 s")

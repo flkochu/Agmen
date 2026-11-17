@@ -9,6 +9,9 @@ Con los dos núcleos (Python puro y C++), para los Publisher y Subscriber creado
   T2  los bloques de memoria compartida del padre (/dev/shm/agm<pid>*) y su registro siguen ahí, y un
       suscriptor nuevo entra por memoria compartida (sin el aviso de TCP);
   T3  una imagen que el padre retiene sin copiar no cambia aunque el hijo salga y el padre publique más;
+  T4  usar un heredado (publish, receive, filenos, propiedades, send, receive_raw, Node.spin...) da al
+      instante "RuntimeError: este <clase> es del proceso padre (pid N): después de un fork, crea uno nuevo
+      en el hijo"; close(), stop(), now() y salir de un `with` siguen; el hijo no le roba mensajes al padre;
   T5  con el hijo vivo, el padre cierra un Subscriber de dirección fija y otro proceso abre ese puerto;
   T6  con hilos del padre dentro de receive() y publish() en el fork: en el hijo close() < 0.1 s, sin
       avisos y sin baja; sys.exit no se cuelga (6 forks);
@@ -24,6 +27,7 @@ el padre lo recoge con límite. El hub corre en este proceso. Se saltan donde no
 
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -350,6 +354,114 @@ print("RESULTADO " + json.dumps(dict(hijo=codigo, c=got_c, i=got_i, ajeno=ajeno,
 os._exit(0)
 '''
 
+# T4: el hijo usa los heredados (Publisher, Subscriber, RawSubscriber, RawPublisher, Node): cada uso da el
+# error de G4 al instante; close(), stop(), now(), __repr__ y salir de un `with` siguen; el padre recibe
+# los N mensajes numerados completos (el hijo no robó ninguno).
+USO = PRE + r'''
+from agmen.pubsub import RawPublisher, RawSubscriber
+pc = agmen.Publisher(Chico, "/fork/t4")
+sc = agmen.Subscriber(Chico, "/fork/t4")
+pi = agmen.Publisher(Imagen, "/fork/t4i")
+si = agmen.Subscriber(Imagen, "/fork/t4i")
+rs = RawSubscriber("/fork/t4")
+rp = RawPublisher("/fork/t4raw")
+node = agmen.Node("t4")
+node.every(0.05, lambda: None)
+npub = node.publisher(Chico, "/fork/t4n")
+fin = time.monotonic() + 8
+ok = False
+while time.monotonic() < fin and not ok:
+    pc.publish(Chico(0))
+    ok = sc.receive(0.02) is not None
+assert ok, "el padre no recibió antes del fork"
+while sc.receive(0.05) is not None:
+    pass
+ppid = os.getpid()
+N = 60
+pid = os.fork()
+if pid == 0:
+    signal.alarm(10)
+    casos = [
+        ("Publisher", "publish", lambda: pc.publish(Chico(1))),
+        ("Publisher", "publish (imagen)", lambda: pi.publish(imagen(1))),
+        ("Publisher", "announce", lambda: pc.announce()),
+        ("Publisher", "seq", lambda: pc.seq),
+        ("Publisher", "subscribers", lambda: pc.subscribers),
+        ("Publisher", "topic", lambda: pc.topic),
+        ("Publisher", "source_id", lambda: pc.source_id),
+        ("Publisher", "shm_subscribers", lambda: pi.shm_subscribers),
+        ("Subscriber", "receive", lambda: sc.receive(1.0)),
+        ("Subscriber", "receive (imagen)", lambda: si.receive(1.0)),
+        ("Subscriber", "filenos", lambda: sc.filenos()),
+        ("Subscriber", "port", lambda: sc.port),
+        ("Subscriber", "listen", lambda: sc.listen),
+        ("Subscriber", "announced", lambda: sc.announced),
+        ("Subscriber", "rejected", lambda: sc.rejected),
+        ("RawSubscriber", "receive_raw", lambda: rs.receive_raw(1.0)),
+        ("RawSubscriber", "filenos", lambda: rs.filenos()),
+        ("RawPublisher", "send", lambda: rp.send(bytes(64))),
+        ("RawPublisher", "set_schema", lambda: rp.set_schema("agmen/1 X{u8 a}", "X", 1)),
+        ("Node", "spin", lambda: node.spin()),
+        ("Node", "spin_for", lambda: node.spin_for(1.0)),
+        ("Node", "every", lambda: node.every(1.0, lambda: None)),
+        ("Node", "on", lambda: node.on(Chico, "/fork/t4", lambda s: None)),
+        ("Node", "publisher", lambda: node.publisher(Chico, "/fork/x")),
+        ("Node", "timers", lambda: node.timers()),
+        ("Node", "name", lambda: node.name),
+        ("Node", "with", lambda: node.__enter__()),
+        ("Publisher", "publish (del Node)", lambda: npub.publish(Chico(1))),
+    ]
+    malos = []
+    for clase, que, f in casos:
+        esperado = ("este %s es del proceso padre (pid %d): después de un fork, crea uno nuevo en el hijo"
+                    % (clase, ppid))
+        t = time.monotonic()
+        try:
+            f()
+            malos.append("%s.%s: no dio error" % (clase, que))
+        except RuntimeError as e:
+            if str(e) != esperado:
+                malos.append("%s.%s: %s" % (clase, que, e))
+        except BaseException as e:
+            malos.append("%s.%s: %s: %s" % (clase, que, type(e).__name__, e))
+        if time.monotonic() - t > 0.05:
+            malos.append("%s.%s: tardó %.3f s" % (clase, que, time.monotonic() - t))
+    # lo que sigue funcionando, en silencio
+    try:
+        node.stop()
+        assert isinstance(node.now(), int)
+        for o in (pc, sc, pi, si, rs, rp, npub, node):
+            repr(o)
+        node.__exit__(None, None, None)
+        for o in (pc, sc, pi, si, rs, rp, npub, node):
+            o.close()
+            o.close()
+    except BaseException as e:
+        malos.append("lo que sigue: %s: %s" % (type(e).__name__, e))
+    print("HIJO malos=" + json.dumps(malos), flush=True)
+    time.sleep(1.0)            # vivo mientras el padre publica y recibe
+    sys.exit(0)
+time.sleep(0.3)                # el hijo ya intentó recibir
+vistos = set()
+for k in range(1, N + 1):
+    pc.publish(Chico(k))
+    fin = time.monotonic() + 0.01
+    while time.monotonic() < fin:
+        s = sc.receive(0.002)
+        if s is not None:
+            vistos.add(s.message.n)
+fin = time.monotonic() + 1.0
+while time.monotonic() < fin and len(vistos) < N:
+    s = sc.receive(0.05)
+    if s is not None:
+        vistos.add(s.message.n)
+hijo = espera_hijo(pid)
+print("RESULTADO " + json.dumps(dict(hijo=hijo, ppid=ppid, faltan=sorted(set(range(1, N + 1)) - vistos))),
+      flush=True)
+os._exit(0)
+'''
+
+
 AVISOS = ("regresó sin liberar el puerto", "esperó", "al salir no terminaron", "Segmentation", "Aborted",
           "terminate called", "Fatal Python error")
 
@@ -476,6 +588,19 @@ class _Base(unittest.TestCase):
     def test_t1_process_fork_que_cierra(self):
         r = self._salida("process", 0)
         self.assertIn("HIJO t_close=", r.stdout)
+
+    # --- T4 ---
+
+    def test_t4_usar_un_heredado_da_un_error_claro(self):
+        r = self.corre(USO, "uso")
+        res = self.resultado(r)
+        self.assertEqual(res["hijo"], 0, f"{res}\n{r.stdout}\n{r.stderr[-3000:]}")
+        m = re.search(r"HIJO malos=(.*)", r.stdout)
+        self.assertIsNotNone(m, f"{r.stdout}\n{r.stderr[-3000:]}")
+        self.assertEqual(json.loads(m.group(1)), [], r.stderr[-2000:])
+        self.assertEqual(res["faltan"], [], "el padre no recibió todos sus mensajes (¿se los robó el hijo?)")
+        self.assertNotIn("Traceback", r.stderr)
+        self.sin_avisos(r.stderr)
 
     # --- T5 ---
 
