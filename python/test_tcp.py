@@ -372,7 +372,7 @@ class TestSinBloquear(unittest.TestCase):
         pub = agmen.Publisher(Img, "/cam")
         try:
             if isinstance(pub, pubsub._PurePublisher):
-                pub._link._on_tick = None        # su hilo de latido sigue latiendo, pero ya no lee al hub
+                pub._link._on_tick = lambda: None   # su hilo de latido sigue latiendo, pero ya no lee al hub
             else:
                 pub._beat = lambda: None         # el hilo de latidos del núcleo de C++ se lo salta
             for k in range(1, len(muertos) + 1):
@@ -530,10 +530,11 @@ class TestTandaCompartida(unittest.TestCase):
 
 
 class TestDireccionFija(unittest.TestCase):
-    """§13 (los dos núcleos): con dirección fija a otra computadora, crear el Publisher espera hasta 1 s, una
-    sola vez; publicar nunca. Si un mensaje no sale porque la conexión sigue en curso, se avisa una vez."""
+    """§13 C y §14 (los dos núcleos): con dirección fija a otra computadora, crear el Publisher espera hasta
+    1 s, una sola vez; publicar nunca. Si un mensaje no sale porque no hay conexión (en curso o rechazada,
+    local o no), se avisa una vez por dirección."""
 
-    AVISO = "todavía conectando con"
+    AVISO = "no hay conexión con"
 
     @staticmethod
     def _publicar(pub, segundos: float) -> float:
@@ -548,8 +549,8 @@ class TestDireccionFija(unittest.TestCase):
         return peor
 
     def test_otra_computadora_que_no_contesta(self):
-        # Sin ruta a esa red (o si la máquina la rechaza en el acto) no hay espera, y a lo más un aviso (el
-        # de un reintento que alcanzó a verse en curso). AGMEN_PRUEBA_IP_MUDA: otra IP, donde 192.0.2.1 sí
+        # Sin ruta a esa red (o si la máquina la rechaza en el acto) no hay espera, pero el aviso sale igual
+        # (§14: rechazada también es "no hay conexión"). AGMEN_PRUEBA_IP_MUDA: otra IP, donde 192.0.2.1 sí
         # contesta (p. ej. es la puerta de enlace).
         ip = os.environ.get("AGMEN_PRUEBA_IP_MUDA", "192.0.2.1")
         err = io.StringIO()
@@ -570,14 +571,49 @@ class TestDireccionFija(unittest.TestCase):
         self.assertLess(crear, 1.3, f"crear tardó {crear:.3f} s")
         self.assertLess(peor, 0.2, f"el peor publish() tardó {peor:.3f} s")
         self.assertLess(cierre, 0.2, f"close() tardó {cierre:.3f} s")
-        if crear >= 0.5:
-            self.assertEqual(avisos, 1, err.getvalue())
-        else:
-            self.assertLessEqual(avisos, 1, err.getvalue())
+        self.assertEqual(avisos, 1, err.getvalue())
+
+    def test_otra_computadora_que_rechaza(self):
+        # La IP de red de esta computadora: Agmen no la reconoce como local (§9.5), así que cuenta como otra
+        # computadora; con nadie escuchando, el sistema rechaza la conexión. Un aviso, aunque se publique mucho.
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            try:
+                s.connect(("192.0.2.1", 9))      # UDP: no manda nada, solo elige la interfaz de salida
+                ip = s.getsockname()[0]
+            except OSError:
+                ip = ""
+        if not ip or ip.startswith("127.") or ip == "0.0.0.0":
+            self.skipTest("esta máquina no tiene una IP de red fuera de 127.x")
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((ip, 0))
+            puerto = s.getsockname()[1]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            pub = agmen.Publisher(Img, f"{ip}:{puerto}")
+            try:
+                peor = self._publicar(pub, 0.5)
+            finally:
+                pub.close()
+        self.assertLess(peor, 0.2)
+        self.assertEqual(err.getvalue().count(self.AVISO), 1, err.getvalue())
+
+    def test_con_un_subscriber_escuchando_no_avisa(self):
+        sub = agmen.Subscriber(Img, "127.0.0.1:0")
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                pub = agmen.Publisher(Img, f"127.0.0.1:{sub.port}")
+                try:
+                    self._publicar(pub, 0.3)
+                finally:
+                    pub.close()
+        finally:
+            sub.close()
+        self.assertEqual(err.getvalue().count(self.AVISO), 0, err.getvalue())
 
     def test_local_donde_nadie_escucha(self):
-        # Una dirección de esta computadora sigue con 50 ms y, rechazada en el acto, callada. En Windows el
-        # rechazo local tarda ~1 s (la conexión queda en curso): ahí se acepta un aviso.
+        # Una dirección de esta computadora sigue con 50 ms. Rechazada en el acto (Linux) o todavía en curso
+        # (Windows tarda ~1 s en rechazar): en los dos casos no hay conexión, y se avisa una sola vez (§14).
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(("127.0.0.1", 0))
             puerto = s.getsockname()[1]
@@ -593,7 +629,7 @@ class TestDireccionFija(unittest.TestCase):
         avisos = err.getvalue().count(self.AVISO)
         self.assertLess(crear, 0.2, f"crear tardó {crear:.3f} s")
         self.assertLess(peor, 0.2)
-        self.assertLessEqual(avisos, 1 if sys.platform == "win32" else 0, err.getvalue())
+        self.assertEqual(avisos, 1, err.getvalue())
 
     def test_puro_espera_una_conexion_lenta_al_crear(self):
         # Python puro, con el doble de conexión lenta: una dirección fija no local cuya conexión termina a

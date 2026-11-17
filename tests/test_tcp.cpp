@@ -472,7 +472,7 @@ struct Avisos {
     }
 };
 
-const std::string kTodaviaConectando = "todavía conectando con";
+const std::string kSinConexion = "no hay conexión con";
 
 /// Publica cada 20 ms durante `dura`; devuelve el peor publish().
 std::chrono::steady_clock::duration publicar_durante(agmen::Publisher<Img>& pub, std::chrono::milliseconds dura) {
@@ -489,8 +489,9 @@ std::chrono::steady_clock::duration publicar_durante(agmen::Publisher<Img>& pub,
 }
 
 void test_direccion_fija_a_otra_computadora_que_no_contesta() {
-    // §13 C y D: crear espera hasta 1 s (una vez), publicar nunca; el aviso sale una vez. Sin ruta a esa
-    // red (o si la máquina la rechaza en el acto) no hay espera, y a lo más un aviso (el de un reintento).
+    // §13 C y §14: crear espera hasta 1 s (una vez), publicar nunca; el aviso sale una vez. Sin ruta a esa
+    // red (o si la máquina la rechaza en el acto) no hay espera, pero el aviso sale igual (rechazada también
+    // es "no hay conexión").
     const std::string ip = agmen::platform::env("AGMEN_PRUEBA_IP_MUDA").empty()
                                ? std::string("192.0.2.1")
                                : agmen::platform::env("AGMEN_PRUEBA_IP_MUDA");
@@ -502,23 +503,19 @@ void test_direccion_fija_a_otra_computadora_que_no_contesta() {
     t = std::chrono::steady_clock::now();
     pub.reset();   // close()
     const auto cierre = std::chrono::steady_clock::now() - t;
-    const auto n_avisos = avisos.con(kTodaviaConectando);
+    const auto n_avisos = avisos.con(kSinConexion);
     std::printf("  hacia %s:9: crear %.3f s, peor publish() %.4f s, close() %.4f s, %u aviso(s)%s\n", ip.c_str(),
                 segundos(crear), segundos(peor), segundos(cierre), static_cast<unsigned>(n_avisos),
                 crear < 500ms ? " (el connect terminó en el acto: sin espera)" : "");
     CHECK(crear < 1300ms);
     CHECK(peor < 200ms);
     CHECK(cierre < 200ms);
-    if (crear >= 500ms) {
-        CHECK(n_avisos == 1);
-    } else {
-        CHECK(n_avisos <= 1);
-    }
+    CHECK(n_avisos == 1);
 }
 
 void test_direccion_fija_local_donde_nadie_escucha() {
-    // §13: una dirección de esta computadora sigue con 50 ms y, rechazada en el acto, callada. En Windows el
-    // rechazo local tarda ~1 s (la conexión queda en curso): ahí se acepta un aviso.
+    // §13/§14: una dirección de esta computadora sigue con 50 ms. Rechazada en el acto (Linux) o todavía en
+    // curso (Windows tarda ~1 s en rechazar): en los dos casos no hay conexión, y se avisa una sola vez.
     std::uint16_t puerto = 0;
     {
         auto srv = net::TcpListener::bind("127.0.0.1:0");
@@ -530,16 +527,23 @@ void test_direccion_fija_local_donde_nadie_escucha() {
     const auto crear = std::chrono::steady_clock::now() - t;
     const auto peor = publicar_durante(*pub, 200ms);
     pub.reset();
-    const auto n_avisos = avisos.con(kTodaviaConectando);
+    const auto n_avisos = avisos.con(kSinConexion);
     std::printf("  hacia 127.0.0.1:%u sin nadie: crear %.4f s, %u aviso(s)\n", static_cast<unsigned>(puerto),
                 segundos(crear), static_cast<unsigned>(n_avisos));
     CHECK(crear < 200ms);
     CHECK(peor < 200ms);
-#ifdef _WIN32
-    CHECK(n_avisos <= 1);
-#else
-    CHECK(n_avisos == 0);
-#endif
+    CHECK(n_avisos == 1);
+}
+
+void test_direccion_fija_con_un_subscriber_escuchando_no_avisa() {
+    // §14: con alguien escuchando ya hay conexión: ningún aviso.
+    agmen::Subscriber<Img> sub("127.0.0.1:0");
+    Avisos avisos;
+    {
+        agmen::Publisher<Img> pub("127.0.0.1:" + std::to_string(sub.local_port()));
+        (void)publicar_durante(pub, 300ms);
+    }
+    CHECK(avisos.con(kSinConexion) == 0);
 }
 
 }  // namespace
@@ -553,6 +557,7 @@ int main() {
     test_una_sola_espera_por_pasada();
     test_direccion_fija_a_otra_computadora_que_no_contesta();
     test_direccion_fija_local_donde_nadie_escucha();
+    test_direccion_fija_con_un_subscriber_escuchando_no_avisa();
     if (g_failures == 0) std::printf("test_tcp: todo bien\n");
     return g_failures == 0 ? 0 : 1;
 }

@@ -88,11 +88,11 @@ std::string unreachable_text(const std::string& topic, const std::string& addr, 
            " esté en la red y que su firewall deje pasar a Agmen. Lo que no sale se cuenta (unreachable).";
 }
 
-/// El aviso (una vez por dirección) de una dirección fija cuya conexión sigue en curso (§13 D).
-std::string connecting_text(const std::string& topic, const std::string& addr) {
-    return "[agmen] ⚠ '" + topic + "': todavía conectando con " + addr +
-           "; los mensajes no salen hasta que la conexión termine. ¿Está encendida esa computadora y hay un "
-           "Subscriber escuchando ahí?";
+/// El aviso (una vez por dirección y por Publisher) de una dirección fija sin conexión (§14).
+std::string no_link_text(const std::string& topic, const std::string& addr) {
+    return "[agmen] ⚠ '" + topic + "': no hay conexión con " + addr +
+           " (nadie escucha ahí todavía, o esa computadora no contesta); los mensajes no salen hasta que la haya."
+           " Agmen sigue intentando.";
 }
 
 /// ¿`host` es de esta computadora? 127.x, "localhost" o AGMEN_NET_IP (§9.5). Una IP propia de la red no se
@@ -267,8 +267,8 @@ public:
     /// conectan en el acto (la misma lista no fuerza nada). No espera: las de esta computadora entran en
     /// la tanda que espera settle(), una vez por pasada de drain() (no una por update()).
     /// `fixed`: la dirección fija del constructor. Si es de otra computadora, su tanda espera hasta
-    /// kFixedRemoteWait en vez de kNewWait (§13 C); si su conexión sigue en curso cuando sale un mensaje,
-    /// se avisa una vez (§13 D).
+    /// kFixedRemoteWait en vez de kNewWait (§13 C); si un mensaje no sale hacia ella porque no hay
+    /// conexión, se avisa una vez (§14).
     void update(std::vector<std::string> addrs, Packet announcement, bool fixed = false) {
         {
             std::lock_guard lock(mu_);
@@ -369,7 +369,7 @@ public:
     bool send(const wire::Envelope& env, wire::ByteView payload) {
         bool ok = false;
         bool wake_up = false;
-        std::vector<std::string> avisos;   // §13 D: se emiten sin el candado
+        std::vector<std::string> avisos;   // §14: se emiten sin el candado
         {
             std::lock_guard lock(mu_);
             wake_up = !reconnect({}, true).empty();
@@ -418,10 +418,10 @@ public:
                 ok = true;
                 ++it;
             }
-            if (!fixed_.empty()) avisos = still_connecting();
+            if (!fixed_.empty()) avisos = no_link();
         }
         if (wake_up) wake();
-        for (const auto& a : avisos) log::write(connecting_text(topic_, a));   // el aviso puede tomar el GIL
+        for (const auto& a : avisos) log::write(no_link_text(topic_, a));   // el aviso puede tomar el GIL
         return ok;
     }
 
@@ -473,8 +473,8 @@ private:
     std::vector<std::string> new_;                     // la tanda de conexiones nuevas que espera settle()
     std::chrono::steady_clock::time_point new_end_{};  // hasta cuándo se le espera
     std::atomic<bool> has_new_{false};                 // ¿new_ no está vacía? (se escribe con mu_; settle() lo lee sin él)
-    std::set<std::string> fixed_;                      // las direcciones fijas (no del hub): avisan si siguen conectando
-    std::set<std::string> connecting_warned_;
+    std::set<std::string> fixed_;                      // las direcciones fijas (no del hub): avisan si no hay conexión
+    std::set<std::string> no_link_warned_;
     std::uint64_t dropped_gone_ = 0;   // de conexiones que ya se cerraron
     std::unique_ptr<shm::Pool> pool_;  // se crea cuando un suscriptor dice que puede
     std::uint64_t fallbacks_ = 0;
@@ -662,14 +662,16 @@ private:
     /// este mensaje ni cuenta como "hay alguien" ni en dropped (a otra computadora, lo de siempre).
     [[nodiscard]] static bool waiting_local(const Outgoing& c) { return c.connecting && !c.remote; }
 
-    /// Las direcciones fijas cuya conexión sigue en curso y aún no se avisaron (con el candado): este
-    /// mensaje no salió hacia ellas (§13 D). Una rechazada en el acto no está en curso: callada.
-    std::vector<std::string> still_connecting() {
+    /// Las direcciones fijas sin conexión (en curso, rechazada o perdida) que aún no se avisaron (con el
+    /// candado): este mensaje no salió hacia ellas (§14). Una sola vez por dirección, aunque vuelva y se pierda.
+    std::vector<std::string> no_link() {
         std::vector<std::string> out;
         for (const auto& a : fixed_) {
+            if (no_link_warned_.count(a) != 0) continue;
             const auto it = conns_.find(a);
-            if (it == conns_.end() || !it->second.alive() || !waiting_local(it->second)) continue;
-            if (connecting_warned_.insert(a).second) out.push_back(a);
+            if (it != conns_.end() && it->second.alive() && !waiting_local(it->second)) continue;
+            no_link_warned_.insert(a);
+            out.push_back(a);
         }
         return out;
     }

@@ -77,10 +77,10 @@ def unreachable_text(topic: str, addr: tuple[str, int], why: str) -> str:
             f"pasar a Agmen. Lo que no sale se cuenta (unreachable).")
 
 
-def connecting_text(topic: str, addr: tuple[str, int]) -> str:
-    """El aviso (una vez por dirección) de una dirección fija cuya conexión sigue en curso (§13 D)."""
-    return (f"[agmen] ⚠ '{topic}': todavía conectando con {addr[0]}:{addr[1]}; los mensajes no salen hasta que "
-            f"la conexión termine. ¿Está encendida esa computadora y hay un Subscriber escuchando ahí?")
+def no_link_text(topic: str, addr: tuple[str, int]) -> str:
+    """El aviso (una vez por dirección y por Publisher) de una dirección fija sin conexión (§14)."""
+    return (f"[agmen] ⚠ '{topic}': no hay conexión con {addr[0]}:{addr[1]} (nadie escucha ahí todavía, o esa "
+            f"computadora no contesta); los mensajes no salen hasta que la haya. Agmen sigue intentando.")
 
 
 def this_computer(host: str, net_ip: str | None) -> bool:
@@ -309,8 +309,8 @@ class Fanout:
         # comparten quien lee al hub (settle) y quien manda en ese hueco. Hora de time.perf_counter().
         self._new: list[Outgoing] = []
         self._new_end = 0.0
-        self._fixed: set = set()                 # las direcciones fijas (no del hub): avisan si siguen conectando
-        self._connecting_warned: set = set()
+        self._fixed: set = set()                 # las direcciones fijas (no del hub): avisan si no hay conexión
+        self._no_link_warned: set = set()
         self.lock = threading.Lock()
         self._wake_r, self._wake_w = socket.socketpair()
         self._wake_r.setblocking(False)
@@ -336,8 +336,8 @@ class Fanout:
         conectan en el acto (la misma lista no fuerza nada). No espera: las de esta computadora entran en
         la tanda que espera settle(), una vez por pasada de quien lee al hub (no una por update()).
         `fixed`: la dirección fija del constructor. Si es de otra computadora, su tanda espera hasta
-        FIXED_REMOTE_WAIT_S en vez de NEW_WAIT_S (§13 C); si su conexión sigue en curso cuando sale un
-        mensaje, se avisa una vez (§13 D)."""
+        FIXED_REMOTE_WAIT_S en vez de NEW_WAIT_S (§13 C); si un mensaje no sale hacia ella porque no hay
+        conexión, se avisa una vez (§14)."""
         with self.lock:
             if fixed:
                 self._fixed = set(addrs)
@@ -556,21 +556,23 @@ class Fanout:
                 c.step(self.pool)
                 ok = True
             busy = bool(started) or any(c.wants_write() for c in self.conns.values() if not self._waiting(c))
-            warn = self._still_connecting() if self._fixed else []
+            warn = self._no_link() if self._fixed else []
         if busy:
             self._wake()
         for a in warn:                           # sin el lock, como todo aviso que no lo necesita
-            print(connecting_text(self.topic, a), file=sys.stderr, flush=True)
+            print(no_link_text(self.topic, a), file=sys.stderr, flush=True)
         return ok
 
-    def _still_connecting(self) -> list:
-        """Las direcciones fijas cuya conexión sigue en curso y aún no se avisaron (con el lock): este
-        mensaje no salió hacia ellas (§13 D). Una rechazada en el acto no está en curso: callada."""
+    def _no_link(self) -> list:
+        """Las direcciones fijas sin conexión (en curso, rechazada o perdida) que aún no se avisaron (con el
+        lock): este mensaje no salió hacia ellas (§14). Una sola vez por dirección, aunque vuelva y se pierda."""
         out = []
         for a in self._fixed:
+            if a in self._no_link_warned:
+                continue
             c = self.conns.get(a)
-            if c is not None and c.alive and self._waiting(c) and a not in self._connecting_warned:
-                self._connecting_warned.add(a)
+            if c is None or not c.alive or self._waiting(c):
+                self._no_link_warned.add(a)
                 out.append(a)
         return out
 
