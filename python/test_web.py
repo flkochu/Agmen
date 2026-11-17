@@ -472,28 +472,31 @@ class TestManejoConValoresMalos(MotorCase):
 
     def test_los_rechazos_quedan_en_los_logs_sin_llenarlos(self):
         """Un script ajeno que manda basura al mando: el operador lo ve en los logs del panel (el primero de
-        cada conexión y luego como mucho uno por segundo, con cuántos hubo). Sin depender de cuánto tarda la
-        máquina: se mide el tiempo y se revisan el tope de avisos y que la cuenta no pierda ninguno."""
+        cada conexión y luego como mucho uno por segundo, con cuántos hubo). El tiempo de los avisos es uno
+        falso (bridge.clock): no depende de lo rápida que sea la máquina."""
+        ahora = [100.0]
+        self.panel.bridge.clock = lambda: ahora[0]
         c = self.connect()
-        t0 = time.monotonic()
         for _ in range(30):
             c.send_text('{"op": "teleop", "left": NaN, "right": 0}')
             self._error(c)
-        dt = time.monotonic() - t0
         avisos = self._avisos()
-        self.assertGreaterEqual(len(avisos), 1)
-        self.assertLessEqual(len(avisos), 1 + int(dt / 1.0) + 1, avisos)      # el primero + uno por segundo
+        self.assertEqual(len(avisos), 1, avisos)                       # 30 rechazos en el mismo "instante"
         self.assertIn("NaN no es JSON válido", avisos[0])
-        antes = len(avisos)
-        time.sleep(1.05)                         # pasado el segundo: el siguiente rechazo sí se avisa
+        ahora[0] += 1.0                                                # pasa un segundo
         c.send_text('{"op": "teleop", "left": "rápido", "right": 0}')
         self._error(c)
         avisos = self._avisos()
-        self.assertEqual(len(avisos), antes + 1, avisos)
-        self.assertIn("rápido", avisos[-1])
-        self.assertEqual(self._contados(avisos), 31, avisos)                # ningún rechazo se pierde de la cuenta
+        self.assertEqual(len(avisos), 2, avisos)
+        self.assertIn("(30 rechazados desde el aviso anterior)", avisos[1])
+        self.assertIn("rápido", avisos[1])
+        c.send_binary(b"\x00\x01")                                    # un binario también cuenta (sin aviso aún)
+        self._error(c)
+        self.assertEqual(len(self._avisos()), 2)
         self._post('{"left": NaN, "right": 0}')          # por POST, también (por dirección)
-        self.assertEqual(len(self._avisos()), antes + 2)
+        self.assertEqual(len(self._avisos()), 3)
+        self._post('{"left": NaN, "right": 0}')
+        self.assertEqual(len(self._avisos()), 3)                       # mismo segundo, misma dirección
         self._nada()
 
     def test_reject_log_uno_por_segundo(self):
@@ -600,6 +603,42 @@ class TestJsonDelCliente(PanelCase):
                     resp = recv_all(s)
                 self.assertIn(" 400 ", resp.split("\r\n")[0])
                 self.assertIn("Content-Length", resp)
+
+    def test_chunked_y_content_length_repetido_no_cuelan_otra_peticion(self):
+        """Transfer-Encoding o dos Content-Length: 400 y se cierra la conexión. Antes el cuerpo se tomaba como
+        0 bytes y sus bytes se leían como una segunda petición (aquí, un POST /api/record de contrabando)."""
+        oculta = "POST /api/record HTTP/1.1\r\nHost: x\r\nX-Agmen: 1\r\nContent-Length: 19\r\n\r\n{\"action\": \"start\"}"
+        for extra in ("Transfer-Encoding: chunked\r\n", "Content-Length: 0\r\nContent-Length: 0\r\n"):
+            with self.subTest(extra=extra.split(":")[0]):
+                s = socket.create_connection(("127.0.0.1", self.panel.port), timeout=5)
+                with s:
+                    s.sendall(f"POST /api/teleop HTTP/1.1\r\nHost: x\r\nX-Agmen: 1\r\n{extra}\r\n{oculta}".encode())
+                    resp = recv_all(s)
+                self.assertEqual(resp.count("HTTP/1.1 "), 1, resp)          # una sola respuesta: la oculta no corrió
+                self.assertIn(" 400 ", resp.split("\r\n")[0])
+                self.assertIn("un solo Content-Length", json.loads(resp.partition("\r\n\r\n")[2])["error"])
+
+    def test_post_sin_cuerpo_ni_content_length_sigue(self):
+        """Un script que hace POST /api/node/<n>/<acción> sin cuerpo (ni Content-Length) sigue funcionando."""
+        s = socket.create_connection(("127.0.0.1", self.panel.port), timeout=5)
+        with s:
+            s.sendall(b"POST /api/node/imu/start HTTP/1.1\r\nHost: x\r\nX-Agmen: 1\r\nConnection: close\r\n\r\n")
+            resp = recv_all(s)
+        self.assertIn("no administra nodos", resp)          # llegó a la ruta (este panel no tiene agmen run)
+
+    def test_accion_de_nodo_larga_dice_lo_que_pasa(self):
+        class Lanzador:
+            def action(self, name, what):
+                return None
+        self.panel.launcher = Lanzador()
+        req = urllib.request.Request(f"http://{self.base}/api/node/imu/{'x' * 300}", data=b"", method="POST",
+                                     headers={"X-Agmen": "1"})
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=5)
+        err = json.load(cm.exception)["error"]
+        self.assertIn("acción desconocida", err)
+        self.assertIn("'imu'", err)
+        self.assertLess(len(err), 200)
 
     def test_cuerpo_demasiado_grande(self):
         """Más de 1 MiB declarado: 413 sin leer nada (antes se intentaba reservar todo ese cuerpo)."""
@@ -1161,6 +1200,20 @@ class TestClave(PanelCase):
         c2 = self.connect(headers={"Cookie": f"agmen_t={self.panel.token}"})   # el navegador usa la cookie
         self.assertEqual(json.loads(c2.recv())["op"], "hello")
         self.assertTrue(self.panel.url.endswith("?t=clave-de-prueba-123"))
+
+    def test_sin_clave_nada_llega_a_los_logs(self):
+        """Sin la clave, un POST malo al mando (JSON con NaN, o un Content-Length inválido) no escribe en los
+        logs del panel: solo quien pasó la clave y el origen deja avisos."""
+        for raw, cl in (('{"left": NaN, "right": 0}', None), ("{}", "+2")):
+            with self.subTest(cl=cl):
+                s = socket.create_connection(("127.0.0.1", self.panel.port), timeout=5)
+                with s:
+                    s.sendall(f"POST /api/teleop HTTP/1.1\r\nHost: x\r\nX-Agmen: 1\r\nContent-Length: "
+                              f"{cl or len(raw)}\r\n\r\n{raw}".encode())
+                    resp = recv_all(s)
+                self.assertRegex(resp.split("\r\n")[0], " 40[01] ")
+        logs, _ = self.panel.logs.since(0)
+        self.assertFalse([line for line in logs if "rechacé" in line["text"]], logs)
 
     def test_sin_clave_no_se_lee_el_cuerpo(self):
         """Sin la clave, el panel contesta 401 sin esperar el cuerpo (aquí nunca llega) ni reservar memoria

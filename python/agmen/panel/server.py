@@ -555,11 +555,13 @@ class Panel:
     def log_post_rejected(self, peer: str, err: str) -> None:
         """Un comando de manejo rechazado por POST, a los logs (como el del WebSocket: el primero de cada
         dirección y luego como mucho uno por segundo)."""
-        with self._post_rejects_lock:
-            if peer not in self._post_rejects and len(self._post_rejects) >= 256:
-                self._post_rejects.clear()       # muchas direcciones distintas: se empieza de nuevo
-            rejects = self._post_rejects.setdefault(peer, RejectLog())
-        self.bridge.log_rejected(rejects, peer, err)
+        with self._post_rejects_lock:            # varios hilos HTTP: note() también va dentro del candado
+            rejects = self._post_rejects.pop(peer, None) or RejectLog()
+            self._post_rejects[peer] = rejects          # al final: la más reciente
+            if len(self._post_rejects) > 256:           # muchas direcciones: se va la que lleva más sin usarse
+                self._post_rejects.pop(next(iter(self._post_rejects)))
+            n = rejects.note(self.bridge.clock())
+        self.bridge.log_reject_line(peer, n, err)
 
     def gap_info(self) -> list[dict]:
         watch = getattr(self.launcher, "watch", None) if self.launcher is not None else None
@@ -903,10 +905,11 @@ class Panel:
                         pass               # el navegador ya no lo quiso (saltó a otra parte)
 
             # --- POST (para scripts; el panel usa el WebSocket) ---
-            def _post_error(self, status, err: str, unread: bool) -> None:
+            def _post_error(self, status, err: str, unread: bool, log: bool = False) -> None:
                 """Contesta un POST rechazado. `unread`: el cuerpo no se leyó, así que la conexión se cierra (si
-                no, esos bytes se leerían como la siguiente petición)."""
-                if urlsplit(self.path).path.rstrip("/") == "/api/teleop" and status == HTTPStatus.BAD_REQUEST:
+                no, esos bytes se leerían como la siguiente petición). `log`: va a los logs del panel (solo
+                comandos de manejo de quien ya pasó la clave y el origen: sin clave nadie escribe en los logs)."""
+                if log and urlsplit(self.path).path.rstrip("/") == "/api/teleop":
                     panel.log_post_rejected(self.client_address[0], err)
                 if not unread:
                     self._json({"error": err}, status)
@@ -927,6 +930,14 @@ class Panel:
             def do_POST(self):
                 # Primero lo que no necesita el cuerpo (su tamaño, la clave, el origen) y solo entonces se lee:
                 # sin clave nadie hace que el panel reserve memoria ni espere un cuerpo.
+                if self.headers.get("Transfer-Encoding") is not None or len(self.headers.get_all("Content-Length")
+                                                                                or []) > 1:
+                    # Sin un solo Content-Length no se sabe dónde termina el cuerpo: leerlo como 0 dejaría sus
+                    # bytes como si fueran la siguiente petición (una petición "de contrabando").
+                    self._post_error(HTTPStatus.BAD_REQUEST, "el panel no acepta Transfer-Encoding (chunked) ni "
+                                     "varios Content-Length: manda el cuerpo entero con un solo Content-Length "
+                                     "(su tamaño en bytes); no se hizo nada", unread=True)
+                    return
                 declared = (self.headers.get("Content-Length") or "0").strip()
                 if not _DIGITS.fullmatch(declared):      # ni "+30", ni "3_0", ni "-5", ni dígitos no ASCII
                     self._post_error(HTTPStatus.BAD_REQUEST, f"Content-Length inválido: {show_value(declared)} (debe "
@@ -951,11 +962,11 @@ class Panel:
                     body = client_json(raw or b"{}")     # sin NaN ni Infinity (ver bridge.client_json)
                 except ClientError as e:
                     self._post_error(HTTPStatus.BAD_REQUEST, f"petición rechazada entera (no se hizo nada ni se "
-                                     f"mandó nada al robot): {e}", unread=False)
+                                     f"mandó nada al robot): {e}", unread=False, log=True)
                     return
                 if not isinstance(body, dict):
                     self._post_error(HTTPStatus.BAD_REQUEST, "no se hizo nada: el cuerpo debe ser un objeto JSON "
-                                     "({...})", unread=False)
+                                     "({...})", unread=False, log=True)
                     return
                 parts = urlsplit(self.path).path.strip("/").split("/")
                 # /api/node/<nombre>/<start|stop|restart>
@@ -964,8 +975,12 @@ class Panel:
                         self._json({"error": "este panel no administra nodos (usa 'agmen run')"},
                                    HTTPStatus.BAD_REQUEST)
                         return
-                    if max(len(parts[2]), len(parts[3])) > MAX_NAME:
+                    if len(parts[2]) > MAX_NAME:
                         self._json({"error": f"no existe el nodo {show_value(parts[2])}"}, HTTPStatus.BAD_REQUEST)
+                        return
+                    if len(parts[3]) > MAX_NAME:
+                        self._json({"error": f"acción desconocida {show_value(parts[3])} para el nodo "
+                                             f"{show_value(parts[2])} (start, stop, restart)"}, HTTPStatus.BAD_REQUEST)
                         return
                     err = panel.launcher.action(parts[2], parts[3])
                     from ..run import NoConnection
@@ -990,7 +1005,7 @@ class Panel:
                     try:
                         sent = panel.teleop.send_client(body)
                     except ClientError as e:
-                        self._post_error(HTTPStatus.BAD_REQUEST, str(e), unread=False)
+                        self._post_error(HTTPStatus.BAD_REQUEST, str(e), unread=False, log=True)
                         return
                     self._json({"ok": True, "sent": sent})
                 else:

@@ -150,6 +150,19 @@ class TestRobotToml(MandoCase):
             with self.subTest(msg=msg):
                 self.assertError(msg, **raw)
 
+    def test_show_value_no_deja_pasar_caracteres_invisibles(self):
+        """Lo que manda un cliente puede acabar en los logs: sin U+202E (invierte el texto), U+2028 ni C1."""
+        from agmen.panel.command import show_value
+
+        for v in (["a\u202eb", "\u2028", "\x9b"], {"k\u202e": "\x9b"}, "a\u202eb\u2028\x9b"):
+            with self.subTest(v=v):
+                text = show_value(v, 200)
+                for ch in ("\u202e", "\u2028", "\x9b"):
+                    self.assertNotIn(ch, text)
+        self.assertEqual(show_value("volar"), "'volar'")
+        self.assertEqual(show_value([1, True, None]), "[1, true, null]")
+        self.assertEqual(len(show_value("x" * 10_000)), 40)
+
     def test_tipos_de_agmen_sin_messages(self):
         c = self.cfg(type="MotorCommand", messages=None, button=[{"label": "adelante", "value": {"left": 0.5, "right": 0.5}}])
         self.assertEqual(c.layout.text, "agmen/1 MotorCommand{f32 left;f32 right}")

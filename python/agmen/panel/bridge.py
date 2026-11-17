@@ -215,6 +215,7 @@ class Bridge:
         self.next_channel = 1
         self.session = uuid.uuid4().hex[:12]
         self.total_dropped = 0
+        self.clock = time.monotonic          # el tiempo de los avisos de rechazos (las pruebas lo reemplazan)
 
     # ------------------------------------------------------------------
     # Lo que llega de Agmen (lo llama el hilo receptor del panel)
@@ -310,6 +311,7 @@ class Bridge:
                 if isinstance(msg, bytes):
                     err = ("el panel no acepta mensajes binarios: manda JSON como texto, ej. "
                            "{\"op\": \"teleop\", \"left\": 0.5, \"right\": 0.5} (no se hizo nada)")
+                    self.log_rejected(c.rejects, c.peer, err)
                 else:
                     err = self._agmen_op(c, msg)
                 if err:
@@ -331,9 +333,13 @@ class Bridge:
             self.panel.teleop.send(0.0, 0.0)
 
     def log_rejected(self, rejects: RejectLog, peer: str, err: str) -> None:
-        """Deja en los logs del panel que se rechazó un comando de manejo (o un mensaje ilegible, que un
-        navegador nunca manda): el primero de cada cliente y luego como mucho uno por segundo."""
-        n = rejects.note(time.monotonic())
+        """Deja en los logs del panel que se rechazó un comando de manejo (o un mensaje ilegible o binario, que
+        un navegador nunca manda): el primero de cada cliente y luego como mucho uno por segundo. Para un
+        RejectLog que solo usa un hilo (el de una conexión WebSocket)."""
+        self.log_reject_line(peer, rejects.note(self.clock()), err)
+
+    def log_reject_line(self, peer: str, n: int, err: str) -> None:
+        """La línea del aviso, si RejectLog.note() dijo que toca (n > 0)."""
         if n:
             more = f" ({n} rechazados desde el aviso anterior)" if n > 1 else ""
             self.panel.logs.add("agmen", f"panel: rechacé lo que mandó {peer}{more}: {err}", "agmen")

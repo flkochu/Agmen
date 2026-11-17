@@ -100,7 +100,8 @@ def show_value(v, limit: int = 40) -> str:
     if isinstance(v, int) and not isinstance(v, bool) and v.bit_length() > 200:
         return f"un entero de unos {int(v.bit_length() * 0.30103) + 1} dígitos"
     try:
-        text = repr(v[:limit + 1]) if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+        # repr y ensure_ascii escapan lo invisible o peligroso en una terminal o un log (U+202E, U+2028, C1).
+        text = repr(v[:limit + 1]) if isinstance(v, str) else json.dumps(v, ensure_ascii=True)
     except (TypeError, ValueError, RecursionError):
         text = f"<{type(v).__name__}>"
     return text if len(text) <= limit else text[:limit - 1] + "…"

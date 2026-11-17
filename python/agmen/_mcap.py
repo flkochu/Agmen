@@ -69,12 +69,12 @@ def _clear_own_frames(tb) -> None:
     while tb is not None:
         frame = tb.tb_frame
         module = frame.f_globals.get("__name__") or ""
-        if module == "agmen" or module.startswith("agmen."):
-            if module in _RECORDING_MODULES or not frame.f_code.co_flags & _GENERATOR_FLAGS:
-                try:
-                    frame.clear()
-                except RuntimeError:
-                    pass                   # se está ejecutando: sus variables se sueltan al terminar
+        ours = module == "agmen" or module.startswith("agmen.")
+        if ours and (module in _RECORDING_MODULES or not frame.f_code.co_flags & _GENERATOR_FLAGS):
+            try:
+                frame.clear()
+            except RuntimeError:
+                pass                       # se está ejecutando: sus variables se sueltan al terminar
         tb = tb.tb_next
 
 
