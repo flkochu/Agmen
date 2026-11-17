@@ -9,9 +9,10 @@ Todos los cambios importantes de Agmen se anotan aquí. Formato basado en
 
 **En curso: mensajes estándar y marcos de referencia (RFC 0013, para 0.15.0).**
 Hecho: el bloque 1 del plan (mensajes chicos, `nan` por defecto, el cuaternión
-sin adivinar y los vectores de prueba). Falta el puente de Foxglove de ese
-bloque: se propone pasarlo al bloque 3 (con los marcos), pendiente de que Adán
-lo confirme. Faltan también los bloques 2 a 7 del plan del RFC.
+sin adivinar y los vectores de prueba). El mapeo de los mensajes chicos a
+Foxglove pasa del bloque 1 al bloque 3 (con los marcos): lo decidió el consejo
+(2 votos contra 1) la noche del 2026-11-16, por delegación de Adán, que puede
+revertirlo. Faltan también los bloques 2 a 7 del plan del RFC.
 
 ### Agregado
 - **Mensajes estándar chicos** (RFC 0013 §3.2 y §3.3) en `agmen/msgs.agmen`, con
@@ -24,9 +25,14 @@ lo confirme. Faltan también los bloques 2 a 7 del plan del RFC.
 - **`= nan` como valor por defecto** en los campos `f32` y `f64`, sueltos y en
   arreglos (`f32 x = nan`, `f64[3] p = nan`). El valor por defecto no viaja ni
   cambia el `schema_id`. `Quaternionf` y la orientación de `Imu` empiezan así:
-  lo que no se mide no se inventa. Un NaN no es igual a otro, así que
-  `Imu() == Imu()` da falso: para saber si algo no se midió, usa `math.isnan`
-  (Python) o `std::isnan` (C++).
+  lo que no se mide no se inventa. Un mensaje que lleva un NaN no se compara con
+  `==`: en C++ nunca es igual a nada, ni a sí mismo; en Python dos mensajes
+  distintos con NaN nunca son iguales (`Imu() == Imu()` da falso). Lo mismo
+  `a == a` (el mismo objeto) y `copy.deepcopy(a) == a`: dependen de la versión
+  de Python (en 3.11 y 3.12 dieron verdadero; en 3.13, el segundo dio falso), así
+  que no cuentes con ello. Para saber si algo no se midió, usa `math.isnan`
+  (Python) o `std::isnan` (C++). Para comparar dos mensajes enteros, compara sus
+  bytes con `encode_payload()` (en C++ escribe en un `agmen::wire::Bytes`).
 - **El cuaternión sin adivinar** (RFC 0013 §3.2): `Quaternion.wxyz()` y
   `Quaternion.from_wxyz(...)` (también en `Quaternionf`) en Python;
   `agmen::msgs::wxyz()` y `from_wxyz()` en `<agmen/geometry.hpp>` en C++. Sirven
@@ -55,11 +61,39 @@ lo confirme. Faltan también los bloques 2 a 7 del plan del RFC.
   `f32` (`1e-60`); y `nan` fuera de un campo `f32` o `f64` (en un `u8`, por
   ejemplo). Un `.agmen` que los tenía deja de compilar: usa un número más
   razonable o `f64`.
+- **`POST /api/teleop` exige `left` y `right`** (los scripts lo notan). Antes,
+  `{}` mandaba el alto y un campo que faltaba valía 0. Ahora responde 400 y no
+  se manda nada al robot. Para frenar, manda `{"left": 0, "right": 0}`.
+- **Los números tienen que ser números**: el mando de manejo, la velocidad y el
+  paso del reloj, y `max_hz` ya no aceptan texto (`"0.5"`, `"10"`) ni `true` o
+  `false`. El panel ya no acepta JSON con `NaN` ni `Infinity`: JSON no los tiene,
+  y un script de Python los manda sin avisar.
+- **Los `POST` tienen tope de 1 MiB**. Un cuerpo más grande responde 413 sin
+  leerse, y no se hace nada.
 
 ### Corregido
 - **El lector de `.agmen` falla antes, no después**: los valores de arriba
   pasaban el lector y tronaban después, al compilar el C++ o al cargar en Python.
   Ahora el error dice el archivo, la línea, la columna y qué hacer.
+- **El mando de manejo ya no convierte un NaN en velocidad máxima** (el joystick
+  del panel por WebSocket y `POST /api/teleop`). Antes, un NaN en la velocidad se
+  volvía la velocidad máxima, y además reiniciaba el freno automático ("hombre
+  muerto"). Ahora un comando con cualquier valor que no sea un número finito
+  (NaN, infinito, texto, `null`, un booleano o un campo que falta) se rechaza
+  entero: no se manda nada al robot, quien lo mandó recibe el error y el freno
+  automático sigue contando como antes.
+- **El WebSocket de Foxglove y los `POST` ya no se caen con datos mal formados**:
+  responden con un error (JSON roto, binario o un `Content-Length` absurdo).
+- **Al cerrar una grabación, el archivo se cierra de verdad.** `Recording.close()`
+  y salir del `with` podían dejar el archivo abierto sin avisar; las grabaciones
+  de `agmen run`, que llevan `robot.toml` adjunto, pasaban siempre. En Windows eso
+  impedía borrar o reemplazar el archivo.
+- **Si algo leído de la grabación sigue en uso al cerrar**, Agmen avisa una vez
+  qué archivo es y qué hacer. Los mensajes son vistas del archivo, sin copiar: el
+  archivo se suelta solo en cuanto nada lo usa. Leer de una grabación ya cerrada
+  da un error que dice cómo abrirla de nuevo.
+- **`agmen info --reparar`** ya no deja el archivo a medio escribir si falla a
+  medias: lo borra.
 
 ## [0.14.0] — 2026-11-16
 

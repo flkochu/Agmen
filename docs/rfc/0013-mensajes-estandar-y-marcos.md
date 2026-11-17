@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Estado** | ✅ **Aceptado** (2026-11-14: D5 = f, D6 = d, D14 = b; las demás, a); en curso en Agmen 0.15.0, por bloques según la [sección 7](#7-plan-por-bloques): el bloque 1 hecho (mensajes chicos, `nan` por defecto, cuaternión y vectores de prueba); falta el puente de Foxglove de ese bloque, pendiente de que Adán confirme si pasa al bloque 3. Decisiones en la [sección 5](#5-decisiones). Propuesto el 2026-11-13 |
+| **Estado** | ✅ **Aceptado** (2026-11-14: D5 = f, D6 = d, D14 = b; las demás, a); en curso en Agmen 0.15.0, por bloques según la [sección 7](#7-plan-por-bloques): el bloque 1 hecho (mensajes chicos, `nan` por defecto, cuaternión y vectores de prueba). El mapeo de los mensajes chicos a Foxglove (`Pose` → `foxglove.PoseInFrame`, `Odometry` → `foxglove.Odometry`) pasa del bloque 1 al bloque 3, cuando existan los marcos, **por decisión del consejo (2 votos contra 1) la noche del 2026-11-16, por delegación de Adán, que Adán puede revertir**; el bloque 3 no se da por cerrado sin ese mapeo. Decisiones en la [sección 5](#5-decisiones). Propuesto el 2026-11-13 |
 | **Depende de** | RFC 0001 (sobre v1, `compact` y `arrow`), RFC 0004 (el hub y su protocolo `agmen-hub/1`), RFC 0005 (archivos `.agmen`), RFC 0006 (el reloj de Agmen y los grupos de un nodo), RFC 0008 (datos grandes; D4: los mismos campos que Foxglove), RFC 0010 (grabaciones), RFC 0011 (`robot.toml` con perfiles; el mundo de MuJoCo), RFC 0012 (`[[mux]]`) |
 | **Versión** | Agmen 0.15.0, después del nivel 10 (D1 = a) |
 | **Requisitos** | a (datos grandes sin copias), c (grabaciones que sirven como datasets), d (misma interfaz en simulación y en el robot real), f (microcontroladores) |

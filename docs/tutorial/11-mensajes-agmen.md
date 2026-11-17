@@ -207,9 +207,23 @@ Ojo con tres cosas:
 
 - `nan` solo vale en `f32` y `f64`. En un `u8` da error, y `inf` o `-inf` no
   valen en ningún campo.
-- Un NaN no es igual a otro: `Lectura() == Lectura()` da falso. Para saber si
-  algo no se midió, usa `math.isnan(l.distancia)` en Python o
-  `std::isnan(l.distancia)` en C++.
+- Un mensaje con un NaN **no se compara con `==`**. `Lectura() == Lectura()` da
+  falso, y en C++ un NaN no es igual a nada, ni a sí mismo. En Python, `a == a`
+  (el mismo objeto) y `copy.deepcopy(a) == a` dependen de la versión de Python:
+  no cuentes con ellos. Para saber si algo no se midió, usa
+  `math.isnan(l.distancia)` en Python o `std::isnan(l.distancia)` en C++. Para
+  comparar dos mensajes enteros, compara sus bytes con `encode_payload()`. Con
+  el `Lectura` de arriba guardado en `lectura.agmen`:
+
+  ```python
+  import agmen
+
+  msgs = agmen.load("lectura.agmen")
+  a = msgs.Lectura()
+  b = msgs.Lectura()
+  print(a == b)                                    # False: un NaN no es igual a otro
+  print(a.encode_payload() == b.encode_payload())  # True: los mismos bytes
+  ```
 - El valor por defecto no viaja ni cambia el esquema: el `schema_id` es el mismo
   con `= nan` que sin él.
 

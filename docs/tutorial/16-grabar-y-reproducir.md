@@ -201,16 +201,55 @@ Las imágenes de `agmen.msgs` quedan como `foxglove.RawImage` y
 
 En Python, una grabación se lee como si fuera un `Subscriber`:
 
+Úsala con `with`, como un archivo: al salir del bloque, el archivo se cierra.
+
 ```python
 import agmen
 
-rec = agmen.Recording("vuelta1.mcap")
-rec.topics                         # {"/cmd": MotorCommand, "/cmd/cerebro": MotorCommand, "/imu": ImuSample}
-for s in rec.messages("/imu"):     # un agmen.Sample, más s.topic y s.log_time
-    print(s.envelope.t_data, s.message.accel)
+with agmen.Recording("vuelta1.mcap") as rec:    # al salir del with, el archivo se cierra
+    rec.topics                         # {"/cmd": MotorCommand, "/cmd/cerebro": MotorCommand, "/imu": ImuSample}
+    for s in rec.messages("/imu"):     # un agmen.Sample, más s.topic y s.log_time
+        print(s.envelope.t_data, s.message.accel)
 
-tabla = rec.table("/imu")          # pyarrow.Table: t_data, t_pub, log_time, source_id, seq, ax, ay, …
-df = tabla.to_pandas()
+    tabla = rec.table("/imu")          # pyarrow.Table: t_data, t_pub, log_time, source_id, seq, ax, ay, …
+    df = tabla.to_pandas()
+print("filas:", len(df))
+```
+
+Los mensajes que lees son **vistas del archivo**, no copias: por eso leer es
+rápido, aun con una grabación de varios GB. Si guardas uno para usarlo después
+de cerrar, cópialo antes con `copy.deepcopy(msg)` (y un arreglo, con
+`arr.copy()`).
+
+Si no lo haces, Agmen avisa una vez, con el archivo y lo que hay que hacer.
+Por ejemplo, esta imagen se guarda fuera del `with`:
+
+```python
+import agmen
+
+with agmen.Recording("vuelta1.mcap") as rec:
+    cam = next(iter(rec.messages("/camara")))    # una imagen: sus bytes son una vista del archivo
+print("listo")
+```
+
+```
+[agmen] ⚠ vuelta1.mcap: la grabación sigue abierta porque algún mensaje (o adjunto) que leíste de ella, o un recorrido de messages() a medias, sigue en uso (son vistas del archivo, sin copiar). En Windows no se podrá borrar ni reemplazar el archivo hasta que lo sueltes. Lo típico: la variable del for sigue apuntando al último mensaje al salir del bucle (for m in rec.messages(...)), o guardaste un arreglo de as_array(), los bytes de una imagen o una tabla de table(). Qué hacer: suelta esa variable (por ejemplo del m, o sal de la función); el archivo se suelta solo en cuanto nada lo use, o con otro close(). Para conservar algo después de cerrar, cópialo antes: copy.deepcopy(msg), arr.copy() o, una tabla, tabla.take(numpy.arange(tabla.num_rows)).
+listo
+```
+
+La forma de evitarlo es copiar lo que quieras conservar. Así no hay aviso:
+
+```python
+import copy
+import agmen
+
+with agmen.Recording("vuelta1.mcap") as rec:
+    cam = copy.deepcopy(next(iter(rec.messages("/camara"))).message)   # una copia: ya no depende del archivo
+print("listo, sin aviso:", len(cam.data), "bytes")
+```
+
+```
+listo, sin aviso: 8 bytes
 ```
 
 - Cada mensaje llega con **su clase**: la tuya si existe en tu programa
