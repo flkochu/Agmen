@@ -262,6 +262,33 @@ class TestReproducir(PlayCase):
                 self.assertIn(mapped(path), (False, None), "/proc/self/maps ya no lo trae")
         os.remove(path)                      # en Windows falla si sigue mapeado
 
+    def test_paquete_cortado_suelta_el_archivo(self):
+        """Un paquete cortado en la grabación: se reproduce lo que hay y al terminar el archivo queda suelto."""
+        path = os.path.join(self.dir, "corta.mcap")
+        w = _mcap.Writer(path)
+        cid = w.add_channel("/imu", "agmen", w.add_schema("ImuSample", "agmen", wire.ImuSample.SCHEMA_TEXT.encode()))
+        w.add_attachment("robot.toml", "text/plain", b'[robot]\nname = "prueba"\n', T0, T0)
+        for i in range(4):
+            env = wire.Envelope(wire.ENC_COMPACT, 0, wire.ImuSample.SCHEMA_ID, wire.topic_id("/imu"), SRC_IMU, i,
+                                T0 + i * STEP, T0 + i * STEP, 24, wire.CLOCK_REAL)
+            pkt = env.pack() + imu(i).encode_payload()
+            w.add_message(cid, T0 + i * STEP, T0 + i * STEP, i, pkt[:-3] if i == 2 else pkt)
+        w.close()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            p = play.Player(path, rate=50, quiet=True)
+            p.start()
+            self.assertTrue(p.wait(10))
+            try:
+                p.stop()
+            except Exception as e:   # noqa: BLE001 — si el paquete cortado da error, igual debe soltar el archivo
+                error = e
+                self.assertNotIn("sigue abierta", str(error))
+        self.assertNotIn("sigue abierta", err.getvalue())
+        self.assertFalse(p.reader._mapped)
+        self.assertIn(mapped(path), (False, None))
+        os.remove(path)
+
     def test_chunk_danado_no_culpa_al_programa(self):
         """Un chunk dañado al abrir (Player lee toda la grabación para saber cuánto dura): el error sale tal
         cual, sin el aviso de "sigue abierta" (el traceback guardaba los mensajes; el lector los suelta)."""
