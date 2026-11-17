@@ -556,6 +556,8 @@ t.join(5)
 res["close_colgado"] = cierra.is_alive()
 res["close_hilos_vivos"] = sum(h.is_alive() for h in hilos2)
 res["close_errores"] = fin2
+sub.close()
+pub.close()   # Python puro no borra al salir los bloques de un Publisher sin cerrar: que no se queden
 print("RESULTADO " + json.dumps(res), flush=True)
 """
 
@@ -573,12 +575,14 @@ sub = agmen.Subscriber(Imagen, "/cierre/frx")
 def rx():
     while True:
         sub.receive(0.2)
+parar = threading.Event()
 def tx():
-    while True:
+    while not parar.is_set():
         pub.publish(msg)
         time.sleep(0.01)
-for f in (rx, rx, tx):
-    threading.Thread(target=f, daemon=True).start()
+hilo_tx = threading.Thread(target=tx, daemon=True)
+for h in [threading.Thread(target=rx, daemon=True) for _ in range(2)] + [hilo_tx]:
+    h.start()
 time.sleep(0.5)
 pid = os.fork()
 if pid == 0:
@@ -607,7 +611,10 @@ for _ in range(150):
 else:
     os.kill(pid, 9); os.waitpid(pid, 0)
     print("HIJO COLGADO", flush=True)
-os._exit(0)   # sin cierre: lo que se prueba es el hijo
+parar.set()
+hilo_tx.join(2)
+pub.close()   # sus bloques de memoria compartida y su registro no se quedan
+os._exit(0)   # sin cerrar el Subscriber: lo que se prueba es el hijo
 """
 
 # Una excepción que NO es KeyboardInterrupt, levantada por un manejador de señales del usuario durante la
