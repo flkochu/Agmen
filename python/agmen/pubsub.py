@@ -1135,28 +1135,31 @@ class RawPublisher(_NetSend):
     def send(self, packet: bytes | bytearray) -> bool:
         """Manda un paquete de datos ya armado (topic_id y source_id se reescriben aquí). Devuelve False
         si no se pudo entregar a nadie (lo que no salió hacia otra computadora se cuenta en unreachable)."""
+        # Todo el envío va con el candado: close() cierra los sockets con él, así que nunca los cierra
+        # debajo de un sendto() en curso (lo vio ThreadSanitizer: close() contra sendto()). Un envío UDP
+        # tarda microsegundos; quien llega con el RawPublisher ya cerrado recibe "ya se cerró".
         with self._lock:
-            if self._closed:   # como Publisher; un envío ya fuera del lock que encuentre el socket cerrado da False
+            if self._closed:
                 raise RuntimeError(_RAWPUB_CERRADO)
             self._drain()
             dests = list(self.dests)
             remote = self._remote
-        now = time.monotonic()
-        if self.schema_text and (self._announced_at is None or now - self._announced_at >= ANNOUNCE_EVERY_S):
-            ann = self._announcement()
+            now = time.monotonic()
+            if self.schema_text and (self._announced_at is None or now - self._announced_at >= ANNOUNCE_EVERY_S):
+                ann = self._announcement()
+                for d in dests:
+                    if remote is not None and d in remote:
+                        self._send_net(ann, d)
+                    else:
+                        self._send(ann, d)
+                self._announced_at = now
+            out = bytearray(packet)
+            out[16:24] = self.topic_id.to_bytes(8, "little")
+            out[wire.SOURCE_OFFSET:wire.SOURCE_OFFSET + 8] = self.source_id.to_bytes(8, "little")
+            ok = False
             for d in dests:
-                if remote is not None and d in remote:
-                    self._send_net(ann, d)
-                else:
-                    self._send(ann, d)
-            self._announced_at = now
-        out = bytearray(packet)
-        out[16:24] = self.topic_id.to_bytes(8, "little")
-        out[wire.SOURCE_OFFSET:wire.SOURCE_OFFSET + 8] = self.source_id.to_bytes(8, "little")
-        ok = False
-        for d in dests:
-            ok = (self._send_net(out, d) if remote is not None and d in remote else self._send(out, d)) or ok
-        return ok
+                ok = (self._send_net(out, d) if remote is not None and d in remote else self._send(out, d)) or ok
+            return ok
 
     @property
     def unreachable(self) -> int:
