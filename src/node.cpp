@@ -52,10 +52,14 @@ void RawSub::note_invalid(const std::string& why) {
     last_warn_ = now;
 }
 
-void RawSub::pull() {
+void RawSub::pull(std::int64_t deadline_ns) {
     // Tope por vuelta: si llegan mensajes sin parar, los temporizadores del
-    // grupo también tienen su turno.
-    for (int i = 0; i < 1024; ++i) {
+    // grupo también tienen su turno. Se deja de recibir al llegar a 1024, o
+    // tras al menos 32 si ya es la hora `deadline_ns` (tiempo real
+    // monotónico; la calcula el bucle del grupo). Los 32 garantizan que la
+    // suscripción avanza aunque siempre haya un temporizador vencido.
+    for (int i = 0; i < kPullMax; ++i) {
+        if (i >= kPullMin && steady_now_ns() >= deadline_ns) return;
         std::optional<RawSample> s;
         try {
             s = sub_.receive_raw(std::chrono::milliseconds(0));
@@ -118,6 +122,8 @@ namespace {
 
 constexpr std::int64_t kMs = 1'000'000;
 constexpr std::int64_t kSec = 1'000'000'000;
+// Presupuesto de pull() sin hora de temporizador (tiempo real monotónico).
+constexpr std::int64_t kPullBudgetNs = 2 * kMs;
 
 // "1 ms", "250 µs", "0.5 s", "2.5 ms"
 std::string format_ns(std::int64_t ns) {
@@ -465,8 +471,12 @@ struct NodeImpl {
             std::int64_t wait = 100 * kMs;   // para revisar stop() y latir
             std::int64_t earliest = std::numeric_limits<std::int64_t>::max();
             for (const auto& t : g.timers) earliest = std::min(earliest, t->next);
+            std::int64_t timer_at = 0;   // tope de pull(): 0 = usar el presupuesto fijo
             if (earliest != std::numeric_limits<std::int64_t>::max()) {
                 const auto wu = clock::wall_until(earliest);
+                if (clock::mode() == clock::Mode::Real && wu != clock::kUnknown) {
+                    timer_at = steady_now_ns() + static_cast<std::int64_t>(wu.count());
+                }
                 if (wu == clock::kUnknown) {
                     // Pausa o simulador paso a paso: preguntar seguido.
                     wait = std::min(wait, clock::state().paused ? 20 * kMs : kMs);
@@ -498,11 +508,15 @@ struct NodeImpl {
                 }
             }
             if (n > 0) {
+                // Hasta cuándo puede recibir pull(): la hora del siguiente
+                // temporizador o, sin temporizadores o con el reloj de Agmen en
+                // pausa o simulado, un presupuesto fijo de tiempo real.
+                const std::int64_t deadline = timer_at != 0 ? timer_at : steady_now_ns() + kPullBudgetNs;
                 std::vector<bool> pulled(g.subs.size(), false);
                 for (std::size_t i = 0; i < handles.size(); ++i) {
                     if (ready[i] && !pulled[owner[i]]) {
                         pulled[owner[i]] = true;
-                        g.subs[owner[i]]->pull();
+                        g.subs[owner[i]]->pull(deadline);
                     }
                 }
             }
