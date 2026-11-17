@@ -1,0 +1,37 @@
+# Vectores de prueba de los mensajes estándar chicos (RFC 0013 §3.3). Generado por generar_estandar.py
+# desde python/agmen/msgs.agmen. Columnas separadas por TAB. Los valores, en JSON de Python (NaN = NaN).
+#
+# tipo  nombre  struct|message  texto_canónico  schema_id  tamaño_compact
+tipo	Vector2	struct	agmen/1 Vector2{f64 x;f64 y}	0x6cae9353134a06a2	16
+tipo	Vector3	struct	agmen/1 Vector3{f64 x;f64 y;f64 z}	0xd64275d3d1813e80	24
+tipo	Quaternion	struct	agmen/1 Quaternion{f64 x;f64 y;f64 z;f64 w}	0xcbf10272848be93c	32
+tipo	Pose	message	agmen/1 Pose{Vector3{f64 x;f64 y;f64 z} position;Quaternion{f64 x;f64 y;f64 z;f64 w} orientation}	0x0ddd001323c61ac4	56
+tipo	Transform	message	agmen/1 Transform{Vector3{f64 x;f64 y;f64 z} translation;Quaternion{f64 x;f64 y;f64 z;f64 w} rotation}	0x6d70abe3cd89424f	56
+tipo	Twist	message	agmen/1 Twist{Vector3{f64 x;f64 y;f64 z} linear;Vector3{f64 x;f64 y;f64 z} angular}	0xd20d1470e78f60ac	48
+tipo	Odometry	message	agmen/1 Odometry{Pose{Vector3{f64 x;f64 y;f64 z} position;Quaternion{f64 x;f64 y;f64 z;f64 w} orientation} pose;Vector3{f64 x;f64 y;f64 z} linear_velocity;Vector3{f64 x;f64 y;f64 z} angular_velocity}	0x284dc2a8b388e10f	104
+tipo	Vector3f	struct	agmen/1 Vector3f{f32 x;f32 y;f32 z}	0x4c945c57313f4359	12
+tipo	Quaternionf	struct	agmen/1 Quaternionf{f32 x;f32 y;f32 z;f32 w}	0xc346ef76df6b0c9c	16
+tipo	Imu	message	agmen/1 Imu{Quaternionf{f32 x;f32 y;f32 z;f32 w} orientation;Vector3f{f32 x;f32 y;f32 z} angular_velocity;Vector3f{f32 x;f32 y;f32 z} linear_acceleration}	0xb656f8a397bcbc97	40
+#
+# valor  nombre  etiqueta  valores(JSON)  payload_hex
+valor	Vector2	por_defecto	{"x": 0.0, "y": 0.0}	00000000000000000000000000000000
+valor	Vector2	ejemplo	{"x": 1.5, "y": -2.25}	000000000000f83f00000000000002c0
+valor	Vector3	por_defecto	{"x": 0.0, "y": 0.0, "z": 0.0}	000000000000000000000000000000000000000000000000
+valor	Vector3	ejemplo	{"x": 1.5, "y": -2.25, "z": 0.125}	000000000000f83f00000000000002c0000000000000c03f
+valor	Quaternion	por_defecto	{"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}	000000000000000000000000000000000000000000000000000000000000f03f
+valor	Quaternion	rotacion	{"x": 0.0916432938695913, "y": 0.1832865877391826, "z": 0.2749298816087739, "w": 0.9393727128473789}	044f1156ef75b73f044f1156ef75c73f43fb8c807398d13fb7e50d5d570fee3f
+valor	Pose	por_defecto	{"position": {"x": 0.0, "y": 0.0, "z": 0.0}, "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}}	000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000f03f
+valor	Pose	ejemplo	{"position": {"x": 1.5, "y": -2.25, "z": 0.125}, "orientation": {"x": 0.0916432938695913, "y": 0.1832865877391826, "z": 0.2749298816087739, "w": 0.9393727128473789}}	000000000000f83f00000000000002c0000000000000c03f044f1156ef75b73f044f1156ef75c73f43fb8c807398d13fb7e50d5d570fee3f
+valor	Transform	por_defecto	{"translation": {"x": 0.0, "y": 0.0, "z": 0.0}, "rotation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}}	000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000f03f
+valor	Transform	ejemplo	{"translation": {"x": 0.1, "y": -0.05, "z": 0.35}, "rotation": {"x": -0.24643017856379415, "y": 0.12321508928189707, "z": 0.4928603571275883, "w": 0.8253356149096783}}	9a9999999999b93f9a9999999999a9bf666666666666d63f61e7d62a068bcfbf61e7d62a068bbf3f61e7d62a068bdf3f155b483c2669ea3f
+valor	Twist	por_defecto	{"linear": {"x": 0.0, "y": 0.0, "z": 0.0}, "angular": {"x": 0.0, "y": 0.0, "z": 0.0}}	000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+valor	Twist	ejemplo	{"linear": {"x": 0.5, "y": -0.1, "z": 0.0}, "angular": {"x": 0.01, "y": -0.02, "z": 0.3}}	000000000000e03f9a9999999999b9bf00000000000000007b14ae47e17a843f7b14ae47e17a94bf333333333333d33f
+valor	Odometry	por_defecto	{"pose": {"position": {"x": 0.0, "y": 0.0, "z": 0.0}, "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}}, "linear_velocity": {"x": 0.0, "y": 0.0, "z": 0.0}, "angular_velocity": {"x": 0.0, "y": 0.0, "z": 0.0}}	000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+valor	Odometry	ejemplo	{"pose": {"position": {"x": 12.5, "y": -3.75, "z": 0.0}, "orientation": {"x": -0.24643017856379415, "y": 0.12321508928189707, "z": 0.4928603571275883, "w": 0.8253356149096783}}, "linear_velocity": {"x": 0.4, "y": 0.01, "z": -0.002}, "angular_velocity": {"x": 0.0, "y": 0.003, "z": -0.25}}	00000000000029400000000000000ec0000000000000000061e7d62a068bcfbf61e7d62a068bbf3f61e7d62a068bdf3f155b483c2669ea3f9a9999999999d93f7b14ae47e17a843ffca9f1d24d6260bf0000000000000000fa7e6abc7493683f000000000000d0bf
+valor	Vector3f	por_defecto	{"x": 0.0, "y": 0.0, "z": 0.0}	000000000000000000000000
+valor	Vector3f	ejemplo	{"x": 0.25, "y": -9.8100004196167, "z": 1.5}	0000803ec3f51cc10000c03f
+valor	Quaternionf	por_defecto	{"x": NaN, "y": NaN, "z": NaN, "w": NaN}	0000c07f0000c07f0000c07f0000c07f
+valor	Quaternionf	rotacion	{"x": 0.09164329618215561, "y": 0.18328659236431122, "z": 0.27492988109588623, "w": 0.939372718334198}	7bafbb3d7baf3b3e9cc38c3ebb7a703f
+valor	Imu	por_defecto	{"orientation": {"x": NaN, "y": NaN, "z": NaN, "w": NaN}, "angular_velocity": {"x": 0.0, "y": 0.0, "z": 0.0}, "linear_acceleration": {"x": 0.0, "y": 0.0, "z": 0.0}}	0000c07f0000c07f0000c07f0000c07f000000000000000000000000000000000000000000000000
+valor	Imu	ejemplo	{"orientation": {"x": -0.2464301735162735, "y": 0.12321508675813675, "z": 0.492860347032547, "w": 0.8253356218338013}, "angular_velocity": {"x": 0.009999999776482582, "y": -0.019999999552965164, "z": 0.029999999329447746}, "linear_acceleration": {"x": 0.10000000149011612, "y": -0.20000000298023224, "z": 9.8100004196167}}	31587cbe3158fc3d3158fc3e3249533f0ad7233c0ad7a3bc8fc2f53ccdcccc3dcdcc4cbec3f51c41
+valor	Imu	sin_orientacion	{"orientation": {"x": NaN, "y": NaN, "z": NaN, "w": NaN}, "angular_velocity": {"x": 0.009999999776482582, "y": -0.019999999552965164, "z": 0.029999999329447746}, "linear_acceleration": {"x": 0.10000000149011612, "y": -0.20000000298023224, "z": 9.8100004196167}}	0000c07f0000c07f0000c07f0000c07f0ad7233c0ad7a3bc8fc2f53ccdcccc3dcdcc4cbec3f51c41

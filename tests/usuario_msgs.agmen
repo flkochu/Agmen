@@ -1,0 +1,15 @@
+# Un .agmen de usuario que importa los mensajes estándar (RFC 0013): Pose,
+# Vector3 y Quaternion como campos de un mensaje propio.
+# tests/test_estandar_usuario.cpp y python/test_msgs_estandar_extra.py comparan los bytes.
+package pruebas_usuario
+import "agmen/msgs.agmen"
+
+message Dron {
+    Pose       pose
+    Vector3    viento
+    Quaternion giro
+    Twist      orden
+    f32[3]     calib = nan
+    f64        bateria = nan
+    u8         id = 3
+}

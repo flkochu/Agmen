@@ -316,6 +316,33 @@ if(AGMEN_BUILD_TESTS)
     agmen_set_warnings(test_gen)
     add_test(NAME gen COMMAND test_gen)
 
+    # Los mensajes estándar chicos de <agmen/msgs.hpp> (RFC 0013) contra sus
+    # vectores, los mismos que revisan Python y JavaScript; y `= nan` en .agmen.
+    agmen_add_messages(valores_nan_msgs tests/valores_nan.agmen)
+    add_executable(test_msgs tests/test_msgs.cpp)
+    target_link_libraries(test_msgs PRIVATE valores_nan_msgs)
+    target_compile_definitions(test_msgs PRIVATE
+        AGMEN_ESTANDAR_FILE="${CMAKE_CURRENT_SOURCE_DIR}/tests/vectors/estandar.txt")
+    agmen_set_warnings(test_msgs)
+    add_test(NAME msgs COMMAND test_msgs)
+
+    # Pruebas de cazador del bloque 1 del RFC 0013: los headers se bastan solos, un .agmen de usuario
+    # que importa agmen/msgs.agmen, y el compañero de C++ de scripts/estandar_smoke.py.
+    add_executable(test_geometry_solo tests/test_geometry_solo.cpp tests/test_geometry_solo2.cpp)
+    target_link_libraries(test_geometry_solo PRIVATE agmen::core)
+    agmen_set_warnings(test_geometry_solo)
+    add_test(NAME geometry_solo COMMAND test_geometry_solo)
+
+    agmen_add_messages(usuario_msgs tests/usuario_msgs.agmen)
+    add_executable(test_estandar_usuario tests/test_estandar_usuario.cpp)
+    target_link_libraries(test_estandar_usuario PRIVATE usuario_msgs)
+    agmen_set_warnings(test_estandar_usuario)
+    add_test(NAME estandar_usuario COMMAND test_estandar_usuario)
+
+    add_executable(estandar_peer tests/estandar_peer.cpp)
+    target_link_libraries(estandar_peer PRIVATE agmen::core)
+    agmen_set_warnings(estandar_peer)
+
     # Fuzzers (tests/fuzz). Las entradas que alguna vez rompieron el
     # decodificador (tests/fuzz/regresiones/) se vuelven a correr con cualquier
     # compilador; con AGMEN_FUZZ=ON (Clang) además salen los fuzzers de libFuzzer.
