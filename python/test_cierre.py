@@ -559,8 +559,10 @@ res["close_errores"] = fin2
 print("RESULTADO " + json.dumps(res), flush=True)
 """
 
-# Dos hilos del padre en receive() del MISMO Subscriber y otro publicando; fork; el hijo usa ese Subscriber:
-# el turno de receive() (y los locks) heredados no pueden quedar tomados en el hijo.
+# Dos hilos del padre en receive() del MISMO Subscriber y otro publicando; fork; el hijo intenta usar ese
+# Subscriber: es del padre (PR "fork"), así que da un error claro al instante, sin colgarse (el turno de
+# receive() y los locks heredados no pueden quedar tomados) y sin robarle mensajes al padre; su close() no
+# espera. El hijo crea el suyo y ese sí recibe.
 FORK_RECEIVE_HEREDADO = CABECERA + """
 import os
 import agmen
@@ -580,13 +582,21 @@ for f in (rx, rx, tx):
 time.sleep(0.5)
 pid = os.fork()
 if pid == 0:
-    t0 = time.monotonic(); got = 0
-    while time.monotonic() - t0 < 3 and not got:
-        if sub.receive(0.1) is not None:
-            got += 1
+    t0 = time.monotonic(); error = ""
+    try:
+        sub.receive(0.1)
+    except RuntimeError as e:
+        error = str(e)
     t1 = time.monotonic()
     sub.close()
-    print("HIJO recibidos=%d t_receive=%.2f t_close=%.2f" % (got, t1 - t0, time.monotonic() - t1), flush=True)
+    t2 = time.monotonic()
+    propio = agmen.Subscriber(Imagen, "/cierre/frx")
+    got = 0
+    while time.monotonic() - t2 < 5 and not got:
+        if propio.receive(0.1) is not None:
+            got += 1
+    print("HIJO error=%s t_error=%.2f t_close=%.2f recibidos=%d" % (bool(error), t1 - t0, t2 - t1, got), flush=True)
+    print("HIJO texto=" + error, flush=True)
     os._exit(0)
 for _ in range(150):
     r, st = os.waitpid(pid, os.WNOHANG)
@@ -1034,14 +1044,16 @@ class TestFormasDeSalir(_ConHub):
         self.assertNotIn("HIJO FALLO", r.stderr)
 
     @unittest.skipUnless(POSIX, "os.fork: solo POSIX")
-    def test_fork_con_hilos_en_receive_el_hijo_recibe_y_close_no_se_cuelga(self):
+    def test_fork_con_hilos_en_receive_el_heredado_da_error_y_el_propio_recibe(self):
         r = correr(FORK_RECEIVE_HEREDADO, hub=self.addr, timeout=40)
         self.assertIn("hijo=0", r.stdout, f"{r.stdout}\n{r.stderr}")
         self.assertNotIn("HIJO COLGADO", r.stdout)
-        m = re.search(r"HIJO recibidos=(\d+) t_receive=([\d.]+) t_close=([\d.]+)", r.stdout)
+        m = re.search(r"HIJO error=(\w+) t_error=([\d.]+) t_close=([\d.]+) recibidos=(\d+)", r.stdout)
         self.assertIsNotNone(m, f"{r.stdout}\n{r.stderr}")
-        self.assertEqual(m.group(1), "1", "el hijo no recibió nada en 3 s")
-        self.assertLess(float(m.group(3)), 2.0, "close() del hijo tardó (el turno heredado quedó tomado)")
+        self.assertEqual(m.group(1), "True", f"receive() de un Subscriber heredado no dio error: {r.stdout}")
+        self.assertLess(float(m.group(2)), 0.1, "el error del heredado no fue inmediato")
+        self.assertLess(float(m.group(3)), 0.1, "close() del heredado esperó (el turno heredado quedó tomado)")
+        self.assertEqual(m.group(4), "1", "el Subscriber propio del hijo no recibió nada en 5 s")
 
     @unittest.skipUnless(POSIX, "os.fork: solo POSIX")
     def test_fork_con_el_cierre_ya_declarado_el_hijo_empieza_de_cero(self):
