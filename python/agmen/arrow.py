@@ -165,6 +165,14 @@ def _np():
         return None
 
 
+def preload_numpy() -> None:
+    """Importa NumPy ya (si está instalado). Lo llaman Publisher y Subscriber de un
+    tipo arrow al crearse: importarlo en la primera decodificación, desde un hilo con
+    otros hilos ocupados, puede tardar segundos. Sin NumPy no pasa nada: el error
+    claro sale donde siempre."""
+    _np()
+
+
 _NP_DTYPES = {"i8": "<i1", "u8": "<u1", "i16": "<i2", "u16": "<u2", "i32": "<i4", "u32": "<u4",
               "i64": "<i8", "u64": "<u8", "f32": "<f4", "f64": "<f8", "time": "<i8", "duration": "<i8"}
 

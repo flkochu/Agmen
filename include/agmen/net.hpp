@@ -89,7 +89,7 @@ public:
                                                     std::chrono::milliseconds timeout);
 
 private:
-    explicit UdpSocket(std::intptr_t handle) : handle_(handle) {}
+    explicit UdpSocket(std::intptr_t handle);   // lo anota en el registro (ver detail::cover_inherited_sockets)
     void close() noexcept;
 
     std::intptr_t handle_ = -1;  // SOCKET en Windows, int en POSIX
@@ -153,7 +153,7 @@ public:
 
 private:
     friend class TcpListener;
-    TcpStream(std::intptr_t handle, std::string peer) : handle_(handle), peer_(std::move(peer)) {}
+    TcpStream(std::intptr_t handle, std::string peer);   // lo anota en el registro
 
     std::intptr_t handle_ = -1;
     std::string peer_;   ///< "ip:puerto" del otro lado
@@ -181,8 +181,24 @@ public:
     void close() noexcept;
 
 private:
-    explicit TcpListener(std::intptr_t handle) : handle_(handle) {}
+    explicit TcpListener(std::intptr_t handle);   // lo anota en el registro
     std::intptr_t handle_ = -1;
 };
+
+namespace detail {
+
+/// Solo para el hijo de un fork, y solo la llama el binding de Python (un programa de C++ que hace fork
+/// queda como siempre): cada socket de agmen abierto en el momento del fork (los heredados del padre)
+/// queda apuntando a /dev/null y sale del registro. Así el hijo no retiene los puertos del padre ni lee o
+/// manda por ellos, sin tocar los objetos que los tienen (sus candados los pudo dejar tomados un hilo del
+/// padre que en el hijo no existe). Los que el hijo abra después se anotan normal. En Windows no hace nada.
+void cover_inherited_sockets() noexcept;
+
+/// Cuántas veces cover_inherited_sockets() corrió en este proceso: un préstamo de memoria compartida
+/// nacido antes del fork (el payload de un mensaje heredado) no le devuelve el bloque al publicador del
+/// padre (ni espera el candado de su conexión).
+[[nodiscard]] unsigned fork_generation() noexcept;
+
+}  // namespace detail
 
 }  // namespace agmen::net

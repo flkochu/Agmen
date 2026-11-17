@@ -1,0 +1,11 @@
+# Supresiones de ThreadSanitizer para python/test_hilos.py (AGMEN_HILOS_TSAN=1) y ctest con AGMEN_TSAN=ON.
+#
+# Vacío a propósito. Python no está compilado con TSan (solo agmen._core y el núcleo), así que el intérprete
+# no produce informes: TSan solo vigila el código instrumentado, y de ese código no se suprime nada
+# (una carrera en Agmen se arregla, no se calla).
+#
+# Una entrada solo se agrega si el informe es del intérprete o de una biblioteca ajena, nunca de src/,
+# include/agmen/ o python/src/, y con un comentario que diga qué es y por qué es un falso positivo.
+#
+# El turno de receive() del Subscriber (python/src/core.cpp) usa std::mutex + std::condition_variable,
+# que TSan sí ve: ya no hay std::timed_mutex ni falsos positivos por pthread_mutex_clocklock.

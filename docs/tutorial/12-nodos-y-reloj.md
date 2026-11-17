@@ -37,6 +37,8 @@ node.spin();   // hasta Ctrl+C
 - **`every(periodo, función)`** llama a tu función cada `periodo`. Programa
   por *deadline*: el ciclo *k* es en `inicio + k·periodo`, así que el atraso
   nunca se acumula.
+  Un topic muy rápido tampoco los deja sin correr: en cada vuelta, el nodo
+  recibe al menos 32 mensajes y luego le toca al siguiente temporizador.
 - **`node.spin()`** corre todo hasta Ctrl+C (o hasta que `agmen run` lo
   detenga). Si una de tus funciones lanza una excepción, el nodo se detiene y
   `spin()` la vuelve a lanzar: nunca falla en silencio.
@@ -320,10 +322,236 @@ evitarlo:
   0.14.0; desde ella, el comportamiento al salir es el
   mismo en los dos.
 
+## 9. Varios hilos, el mismo objeto
+
+Un `Publisher` o un `Subscriber` se pueden usar desde **varios hilos a la
+vez**. No necesitas candados para llamar a sus métodos.
+
+### Qué puedes hacer
+
+Desde varios hilos, a la vez, puedes llamar a cualquier método o propiedad de
+`Publisher`, `Subscriber`, `RawPublisher`, `RawSubscriber`, `Node` y
+`agmen.clock`, sobre el **mismo** objeto. El programa no se cae, no se
+corrompe nada y no se cuelga.
+
+- **`publish()` desde varios hilos:** cada mensaje sale entero, una sola vez,
+  con su propio `seq`. El orden entre hilos no se garantiza. Dentro de un mismo
+  hilo, sí.
+- **`receive()` desde varios hilos:** se turnan. Cada mensaje lo recibe **un
+  solo hilo**.
+
+Guarda este ejemplo como `hilos_varios.py`, en `examples/tutorial/`, junto a
+`motor_command.agmen`:
+
+```python
+"""Varios hilos publican y reciben con el mismo Publisher y Subscriber."""
+import threading
+from pathlib import Path
+
+import agmen
+
+MotorCommand = agmen.load(Path(__file__).with_name("motor_command.agmen")).MotorCommand
+sub = agmen.Subscriber(MotorCommand, "127.0.0.1:7520")
+pub = agmen.Publisher(MotorCommand, "127.0.0.1:7520", topic="/cmd")
+
+recibidos = []                 # los seq que llegaron
+candado = threading.Lock()     # la lista la usan varios hilos: protégela tú
+
+
+def escuchar():
+    while True:
+        s = sub.receive(timeout=2.0)   # None: pasaron 2 s sin mensajes
+        if s is None:
+            break
+        with candado:
+            recibidos.append(s.envelope.seq)
+
+
+def publicar(n):
+    for _ in range(n):
+        pub.publish(MotorCommand(left=0.5, right=0.5))
+
+
+recs = [threading.Thread(target=escuchar) for _ in range(2)]
+pubs = [threading.Thread(target=publicar, args=(50,)) for _ in range(3)]
+for t in recs + pubs:
+    t.start()
+for t in pubs + recs:
+    t.join()
+
+print(f"publicados: 150 · recibidos: {len(recibidos)} · seq distintos: {len(set(recibidos))}")
+```
+
+```bash
+python3 examples/tutorial/hilos_varios.py
+```
+
+```
+publicados: 150 · recibidos: 150 · seq distintos: 150
+```
+
+Agmen cuida sus propias variables. **Tu** lista `recibidos` la comparten dos
+hilos, así que la proteges con un `threading.Lock`.
+
+⚠ Por UDP, un mensaje se puede perder si la red se satura. El ejemplo cuenta
+lo que llegó; no supone que llegue todo.
+
+⚠ Este ejemplo usa el puerto 7520. Si otro programa lo usa, cámbialo.
+
+### Cerrar desde otro hilo
+
+Puedes llamar a `close()` desde otro hilo, aunque haya hilos dentro de
+`receive()` o de `publish()`:
+
+- `close()` regresa en **menos de 1 segundo**.
+- Los hilos que estaban dentro reciben un `RuntimeError` con "ya se cerró":
+
+| Objeto | Mensaje |
+|---|---|
+| `Publisher` | `el Publisher ya se cerró` |
+| `Subscriber` | `el Subscriber ya se cerró` |
+| `RawPublisher` | `el RawPublisher ya se cerró` |
+| `RawSubscriber` | `el RawSubscriber ya se cerró` |
+
+- Cuando regresa `close()` de un `Subscriber`, su puerto ya está libre. Puedes
+  abrir otro `Subscriber` en ese mismo puerto.
+- Si un hilo se quedó atorado dentro de `receive()` y no sale a tiempo,
+  `close()` no espera para siempre: regresa y avisa una vez por stderr
+  ("`close()` del Subscriber regresó sin liberar el puerto…"). El puerto se
+  libera cuando ese hilo salga.
+- Cerrar dos veces, o desde dos hilos a la vez, no hace daño.
+
+💡 Esto es distinto de salir del programa (sección 8). Al salir, `receive()`
+regresa `None`. Al cerrar un objeto desde otro hilo, el hilo que esperaba
+recibe `RuntimeError`. Un `receive()` sin límite de tiempo también lo recibe.
+
+Las propiedades de solo lectura, como `subscribers` o `seq`, también se pueden
+leer mientras otro hilo publica o recibe.
+
+### Lo que no se garantiza
+
+- El orden entre mensajes que publican hilos distintos.
+- Usar en el hijo un objeto creado antes de un `fork()`. Ver la sección 10.
+- En C++, un `Subscriber` sigue siendo de un solo receptor a la vez. Lo de esta
+  sección es la garantía de los objetos de **Python**.
+
+### Ojo con `RawSubscriber`
+
+`receive_raw()` entrega **todos** los paquetes, también los anuncios de
+esquema. El publicador repite el anuncio cada segundo y lo manda también a cada
+receptor nuevo. Un anuncio tiene `encoding` igual a 3 (`wire.ENC_SCHEMA`) y no
+es un mensaje. Si cuentas mensajes por `seq`, sáltatelos:
+
+```python
+from agmen import wire
+from agmen.pubsub import RawSubscriber
+
+raw = RawSubscriber("127.0.0.1:7521")
+paquete = raw.receive_raw(timeout=1.0)     # (bytes, "ip:puerto") o None
+if paquete is not None:
+    env, _ = wire.parse(paquete[0])
+    if env.encoding != wire.ENC_SCHEMA:    # 3 = anuncio de esquema: no es un mensaje
+        print("mensaje con seq", env.seq)
+```
+
+## 10. `fork` y `multiprocessing`
+
+Regla: **después de un `fork`, los objetos de Agmen que ya existían son del
+padre. En el hijo, crea los tuyos.**
+
+El hijo recibe una copia del objeto, pero el registro en el hub y la memoria
+compartida siguen siendo del padre. Por eso el hijo no puede usarlos.
+
+Esto aplica a `Publisher`, `Subscriber`, `RawPublisher`, `RawSubscriber` y
+`Node`. Con un objeto heredado en el hijo:
+
+- `close()`, salir de un `with` o terminar el hijo: no le hacen nada al padre.
+  El padre sigue recibiendo y publicando sin hueco.
+- Cualquier otra cosa (`publish()`, `receive()`, las propiedades…) lanza un
+  error. Verás esto:
+
+```
+RuntimeError: este Publisher es del proceso padre (pid 12345): después de un fork, crea uno nuevo en el hijo
+```
+
+El número del pid cambia. La solución es crear el objeto dentro del hijo:
+
+```python
+"""Un hijo de fork crea su propio Subscriber y recibe del padre."""
+import multiprocessing
+import time
+from pathlib import Path
+
+import agmen
+
+MotorCommand = agmen.load(Path(__file__).with_name("motor_command.agmen")).MotorCommand
+PUERTO = "127.0.0.1:7540"
+
+# Creado ANTES del fork: en el hijo, este Publisher es del padre.
+pub = agmen.Publisher(MotorCommand, PUERTO, topic="/cmd")
+
+
+def hijo(listo):
+    # El hijo crea SU propio Subscriber. Usar `pub` aquí daría RuntimeError.
+    try:
+        pub.publish(MotorCommand(left=0.0, right=0.0))
+    except RuntimeError as error:
+        print(f"hijo, error esperado: {error}")
+    sub = agmen.Subscriber(MotorCommand, PUERTO)
+    listo.set()
+    s = sub.receive(timeout=3.0)
+    if s is None:
+        print("hijo: no llegó nada")
+    else:
+        print(f"hijo recibió: left={s.message.left} right={s.message.right}")
+    sub.close()
+
+
+if __name__ == "__main__":
+    contexto = multiprocessing.get_context("fork")  # fork explícito
+    listo = contexto.Event()
+    p = contexto.Process(target=hijo, args=(listo,))
+    p.start()
+    listo.wait(5)          # el hijo ya se suscribió...
+    time.sleep(0.3)        # ...y le damos un momento para que el padre lo vea
+    pub.publish(MotorCommand(left=0.5, right=-0.5))
+    p.join()
+    pub.close()
+```
+
+Guárdalo como `fork_hijo.py` en `examples/tutorial/`, junto a
+`motor_command.agmen`, y córrelo desde la raíz del repositorio:
+
+```bash
+python3 examples/tutorial/fork_hijo.py
+```
+
+Salida (el pid cambia):
+
+```
+hijo, error esperado: este Publisher es del proceso padre (pid 12345): después de un fork, crea uno nuevo en el hijo
+hijo recibió: left=0.5 right=-0.5
+```
+
+Lo que conviene saber:
+
+- Pedimos `fork` de forma explícita con `get_context("fork")`. Así el ejemplo
+  no depende de cuál es el método por defecto de tu Python.
+- En Windows no hay `fork`. `multiprocessing` arranca el hijo desde cero: no
+  hereda nada, y crea sus objetos igual.
+- Un hilo del padre que estaba dentro de `receive()` o `publish()` al hacer el
+  `fork` no cuelga al hijo. Aun así, el hijo no usa ese objeto: crea el suyo.
+- Esta regla es para los objetos de Python. Un programa de C++ que haga
+  `fork()` no tiene esta garantía.
+
 ## Lo que aprendiste
 
+- Después de un `fork`, los objetos heredados son del padre: en el hijo, crea
+  los tuyos.
 - `every` para cada ritmo, `subscribe`/`on` para cada mensaje, `spin()` para
   correrlo todo.
+- Varios hilos pueden usar el mismo `Publisher` o `Subscriber`. Cada mensaje
+  lo recibe un solo hilo, y `close()` despierta a los que esperan.
 - Lo lento va en otro grupo (`node.group`): su propio hilo, y el control no
   pierde ciclos. En Python puro, lo pesado va en otro nodo.
 - `queue = 1` te da siempre el dato más reciente.

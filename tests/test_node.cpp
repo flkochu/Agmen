@@ -109,6 +109,57 @@ void test_queue(std::size_t queue, int port) {
     CHECK(s[0].delivered == got.size());
 }
 
+// 8.1 (tope por tiempo): con la hora del temporizador ya vencida, pull()
+// recibe el mínimo (32) y se corta, aunque haya más esperando; con la hora
+// lejos, recibe todo lo que hay. Sin el tope, la primera vuelta se los lleva todos.
+void test_pull_deadline(int port) {
+    const std::string where = "127.0.0.1:" + std::to_string(port);
+    using Raw = agmen::detail::RawSub;
+    Raw sub(where, agmen::TypeInfo::of<ClockMsg>(), [](const agmen::RawSample&) {}, {.queue = 1000});
+    agmen::Publisher<ClockMsg> pub(where, "/prueba");
+    const int sent = 100;
+    for (int i = 0; i < sent; ++i) (void)pub.publish(ClockMsg{.t = i});
+    std::this_thread::sleep_for(50ms);   // que lleguen al socket
+    const std::int64_t past = agmen::detail::steady_now_ns() - 1;
+    sub.pull(past);
+    CHECK(sub.received == static_cast<std::uint64_t>(Raw::kPullMin));
+    sub.pull(past);
+    CHECK(sub.received == static_cast<std::uint64_t>(2 * Raw::kPullMin));
+    sub.pull(agmen::detail::steady_now_ns() + 10'000'000'000);
+    CHECK(sub.received == static_cast<std::uint64_t>(sent));
+}
+
+// 8.1 de punta a punta, en el bucle del grupo: un topic inundado (dos hilos que publican sin parar)
+// junto a un every(5 ms). El temporizador sigue corriendo y los recibidos siguen subiendo. Cota
+// generosa (lo ideal son ~200 pulsos): en una máquina rápida la recepción le gana a la inundación
+// aun sin el tope, así que esta no siempre fallaría sin él; la determinista es test_pull_deadline.
+void test_pull_flood(int port) {
+    const std::string where = "127.0.0.1:" + std::to_string(port);
+    agmen::Node node("prueba");
+    std::atomic<std::uint64_t> recibidos{0};
+    std::vector<std::uint64_t> en_pulso;   // los recibidos en cada pulso (mismo hilo que el every)
+    node.every(5ms, [&] { en_pulso.push_back(recibidos.load()); });
+    node.subscribe<ClockMsg>(where, [&](const ClockMsg&) { ++recibidos; });
+    std::atomic<bool> alto{false};
+    std::vector<std::thread> inundan;
+    for (int k = 0; k < 2; ++k) {
+        inundan.emplace_back([&] {
+            agmen::Publisher<ClockMsg> pub(where, "/prueba");
+            std::int64_t i = 0;
+            while (!alto) (void)pub.publish(ClockMsg{.t = i++});
+        });
+    }
+    std::this_thread::sleep_for(50ms);   // que ya esté inundado
+    node.spin_for(1s);
+    alto = true;
+    for (auto& h : inundan) h.join();
+    const auto s = node.subscriptions();
+    std::printf("  inundado: every(5 ms) corrió %zu veces en 1 s; %llu recibidos\n", en_pulso.size(),
+                static_cast<unsigned long long>(s.empty() ? 0 : s[0].received));
+    CHECK(en_pulso.size() >= 20);
+    CHECK(en_pulso.size() >= 2 && en_pulso.back() > en_pulso.front());   // los recibidos siguen subiendo
+}
+
 void test_sample_callback(int port) {
     const std::string where = "127.0.0.1:" + std::to_string(port);
     agmen::Node node("prueba");
@@ -678,6 +729,8 @@ int main() {
     test_queue(1, 47811);
     test_queue(5, 47812);
     test_sample_callback(47813);
+    test_pull_deadline(47816);
+    test_pull_flood(47817);
     test_invalid_packets(47814);   // y 47815
     test_exception();
     test_stop();

@@ -1,6 +1,10 @@
 #include "agmen/net.hpp"
 
+#include "agmen/log.hpp"
+
+#include <atomic>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -17,6 +21,7 @@
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
 #  include <poll.h>
+#  include <pthread.h>
 #  include <sys/socket.h>
 #  include <unistd.h>
 #endif
@@ -61,6 +66,70 @@ void ensure_winsock() {}
 #endif
 
 NativeSocket native(std::intptr_t h) { return static_cast<NativeSocket>(h); }
+
+// ---------------------------------------------------------------------------
+// El registro de los sockets abiertos (solo POSIX), para el hijo de un fork (PR "fork"): el binding de
+// Python los tapa todos con /dev/null en el hijo (detail::cover_inherited_sockets), sin recorrer los
+// objetos heredados ni tomar sus candados. Cuesta un candado al abrir y otro al cerrar un socket; nada
+// por mensaje. Un programa de C++ que haga fork queda como antes: nadie llama a esa función.
+// Límite conocido: entre abrir un socket y anotarlo (o entre quitarlo y cerrarlo) hay ventanas de
+// microsegundos sin el candado; si el fork cae justo ahí, el hijo se queda con ese socket abierto (no se
+// tapa). Nunca se tapa un descriptor ajeno: solo los números que están en el registro.
+// ---------------------------------------------------------------------------
+
+std::atomic<unsigned> g_fork_generation{0};
+
+#ifndef _WIN32
+struct Registry {
+    std::mutex mu;
+    std::vector<int> fds;
+};
+
+Registry* g_registry = nullptr;
+
+// pthread_atfork: el padre toma el candado del registro antes del fork y lo suelta después, en los dos
+// procesos. Así el hijo lo hereda libre y con la lista entera (ningún hilo la dejó a medio cambiar). El
+// gancho del hijo solo suelta el candado: no reserva memoria ni toma otros.
+void registry_before_fork() { g_registry->mu.lock(); }
+void registry_after_fork() { g_registry->mu.unlock(); }
+
+Registry& registry() {
+    // Nunca se destruye: un socket se puede cerrar al salir del programa, después de los estáticos.
+    static Registry* const r = [] {
+        g_registry = new Registry();
+        ::pthread_atfork(&registry_before_fork, &registry_after_fork, &registry_after_fork);
+        return g_registry;
+    }();
+    return *r;
+}
+
+void note_open(std::intptr_t h) noexcept {
+    if (h == -1) return;
+    try {
+        Registry& r = registry();
+        const std::lock_guard lock(r.mu);
+        r.fds.push_back(static_cast<int>(h));
+    } catch (...) {
+        // sin memoria: este socket no se tapa en el hijo de un fork (queda abierto ahí, como antes)
+    }
+}
+
+void note_close(std::intptr_t h) noexcept {
+    if (h == -1) return;
+    Registry& r = registry();
+    const std::lock_guard lock(r.mu);
+    for (auto& fd : r.fds) {
+        if (fd == static_cast<int>(h)) {
+            fd = r.fds.back();
+            r.fds.pop_back();
+            return;
+        }
+    }
+}
+#else
+void note_open(std::intptr_t) noexcept {}
+void note_close(std::intptr_t) noexcept {}
+#endif
 
 std::string os_message(int code) { return std::system_category().message(code); }
 
@@ -159,6 +228,8 @@ UdpSocket UdpSocket::bind(std::string_view address) {
     return sock;
 }
 
+UdpSocket::UdpSocket(std::intptr_t handle) : handle_(handle) { note_open(handle_); }
+
 UdpSocket::UdpSocket(UdpSocket&& other) noexcept : handle_(other.handle_) {
     other.handle_ = -1;
 }
@@ -176,6 +247,7 @@ UdpSocket::~UdpSocket() { close(); }
 
 void UdpSocket::close() noexcept {
     if (handle_ == -1) return;
+    note_close(handle_);   // antes de cerrar: después, otro hilo puede abrir uno con el mismo número
 #ifdef _WIN32
     ::closesocket(native(handle_));
 #else
@@ -305,6 +377,7 @@ namespace agmen::net {
 namespace {
 
 void close_native(std::intptr_t h) noexcept {
+    note_close(h);   // antes de cerrar (ver UdpSocket::close)
 #ifdef _WIN32
     ::closesocket(native(h));
 #else
@@ -489,6 +562,10 @@ int TcpStream::finish_connect() {
     return err;
 }
 
+TcpStream::TcpStream(std::intptr_t handle, std::string peer) : handle_(handle), peer_(std::move(peer)) {
+    note_open(handle_);
+}
+
 TcpStream::TcpStream(TcpStream&& other) noexcept : handle_(other.handle_), peer_(std::move(other.peer_)) {
     other.handle_ = -1;
 }
@@ -567,6 +644,8 @@ TcpListener TcpListener::bind(std::string_view address) {
     return TcpListener(static_cast<std::intptr_t>(s));
 }
 
+TcpListener::TcpListener(std::intptr_t handle) : handle_(handle) { note_open(handle_); }
+
 TcpListener::TcpListener(TcpListener&& other) noexcept : handle_(other.handle_) { other.handle_ = -1; }
 
 TcpListener& TcpListener::operator=(TcpListener&& other) noexcept {
@@ -604,5 +683,55 @@ std::uint16_t TcpListener::local_port() const {
     }
     return ntohs(addr.sin_port);
 }
+
+namespace detail {
+
+#ifndef _WIN32
+void cover_inherited_sockets() noexcept {
+    // Con el intérprete ya en estado normal (no dentro del gancho de pthread_atfork). Se sacan del registro
+    // todos (un fork del hijo no los vuelve a tocar) y cada número queda apuntando a /dev/null: el socket
+    // se suelta (el puerto ya no es del hijo), pero el número sigue ocupado, así que un objeto heredado
+    // que lo cierre después nunca cierra uno nuevo del hijo, y lo que intente mandar o leer falla. Si no se
+    // puede (sin /dev/null, o falla dup2), el socket NO se cierra: el hijo lo retiene, y se avisa.
+    std::vector<int> fds;
+    {
+        Registry& r = registry();
+        const std::lock_guard lock(r.mu);
+        fds.swap(r.fds);
+    }
+    const int devnull = ::open("/dev/null", O_RDWR | O_CLOEXEC);
+    const int open_err = devnull < 0 ? errno : 0;
+    int dup_err = 0;
+    for (const int fd : fds) {
+        if (devnull < 0) break;   // sin /dev/null no se cierra: el número quedaría libre para un socket nuevo
+        if (::dup2(devnull, fd) >= 0) {
+            (void)::fcntl(fd, F_SETFD, FD_CLOEXEC);
+        } else if (dup_err == 0) {
+            dup_err = errno;      // este se queda abierto (por la misma razón)
+        }
+    }
+    if (devnull >= 0) (void)::close(devnull);
+    if (!fds.empty() && (open_err != 0 || dup_err != 0)) {
+        try {   // una vez, y nunca falla en silencio (regla 1)
+            log::write(open_err != 0
+                           ? "[agmen] ⚠ después del fork no se pudo abrir /dev/null (" + os_message(open_err) +
+                                 "): los sockets heredados quedan abiertos en el proceso hijo (retiene sus "
+                                 "puertos hasta que termine)"
+                           : "[agmen] ⚠ después del fork no se pudo tapar un socket heredado con /dev/null (" +
+                                 os_message(dup_err) +
+                                 "): queda abierto en el proceso hijo (retiene su puerto hasta que termine)");
+        } catch (...) {
+            // sin memoria para el aviso: no hay más que hacer
+        }
+    }
+    g_fork_generation.fetch_add(1);
+}
+#else
+void cover_inherited_sockets() noexcept {}
+#endif
+
+unsigned fork_generation() noexcept { return g_fork_generation.load(std::memory_order_relaxed); }
+
+}  // namespace detail
 
 }  // namespace agmen::net

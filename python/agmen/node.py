@@ -34,21 +34,46 @@ import socket
 import sys
 import threading
 import time
+import weakref
 from dataclasses import dataclass
 
-from . import _backend, clock, wire
+from . import _backend, _tcp, clock, wire
 from . import hubproto as hp
 from .pubsub import (
     Publisher,
+    _preload_numpy,
     Sample,
     Subscriber,
+    _heredar,
     hub_address,
     node_name,
     set_default_node_name,
 )
 
+# Los Node vivos (los dos núcleos): en el hijo de un fork, usar uno heredado da un error claro (G4).
+_nodos: weakref.WeakSet = weakref.WeakSet()
+
+
+def _nodos_despues_de_fork() -> None:
+    """En el hijo de un fork: los Node creados antes son del padre (sus hilos aquí no existen; el núcleo
+    de C++ ya se abandonó y los sockets se taparon en pubsub). Todo lo suyo da el error de heredado_text,
+    salvo close() y stop() (silenciosos) y now() (el reloj no es del objeto)."""
+    for n in list(_nodos):
+        _heredar(n, "Node", siguen=("now",), silenciosos=("stop",))
+    _nodos.clear()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_nodos_despues_de_fork)
+
 _MS = 1_000_000
 _SEC = 1_000_000_000
+# Tope de _Sub.pull() por vuelta: mínimo (si hay), máximo, y presupuesto de
+# tiempo real cuando no hay hora de temporizador (sin temporizadores, o el reloj
+# de Agmen en pausa o simulado).
+_PULL_MIN = 32
+_PULL_MAX = 1024
+_PULL_BUDGET_NS = 2 * _MS
 
 
 @dataclass(frozen=True)
@@ -157,8 +182,16 @@ class _Sub:
         """Los sockets de la suscripción: UDP, y el TCP de los mensajes arrow (RFC 0008)."""
         return self.sub.filenos()
 
-    def pull(self) -> None:
-        for _ in range(1024):
+    def pull(self, deadline_ns: int) -> None:
+        """Recibe lo que ya llegó, sin esperar. Deja de recibir si no hay más, si
+        llegó a _PULL_MAX, o si ya recibió _PULL_MIN y time.perf_counter_ns() llegó a
+        `deadline_ns` (la hora del siguiente temporizador del grupo; un reloj fino
+        también en Windows, donde time.monotonic() avanza de 15.6 ms en 15.6 ms): así los
+        temporizadores tienen su turno aunque lleguen mensajes sin parar, y la
+        suscripción avanza aunque siempre haya un temporizador vencido."""
+        for i in range(_PULL_MAX):
+            if i >= _PULL_MIN and time.perf_counter_ns() >= deadline_ns:
+                return
             try:
                 s = self.sub.receive(0)
             except wire.HubRejected:
@@ -234,6 +267,7 @@ class _PureNode:
         self._error: BaseException | None = None
         self._err_lock = threading.Lock()
         self._stats_sock: socket.socket | None = None
+        _nodos.add(self)
 
     # --- armar el nodo ---
     def publisher(self, msg_type, to: str) -> Publisher:
@@ -462,12 +496,15 @@ class _PureNode:
 
             # 4. Esperar al siguiente temporizador o a que llegue algo.
             wait = 0.1
+            timer_at = None   # tope de pull(); None = usar el presupuesto fijo
             if g.timers:
                 wu = clock.wall_until(min(t.next for t in g.timers))
                 if wu is None:
                     wait = min(wait, 0.02 if clock.state().paused else 0.001)
                 else:
                     wait = min(wait, wu)
+                    if clock.mode() == clock.REAL:
+                        timer_at = time.perf_counter_ns() + int(wu * 1e9)   # el reloj fino de pull()
             if end is not None:
                 wait = min(wait, (end - time.monotonic_ns()) / 1e9)
             if any(s.q for s in g.subs):
@@ -480,8 +517,10 @@ class _PureNode:
                 ready = self._wait(g, 0.0)
                 if not ready and wait > 0:
                     time.sleep(min(wait, 0.0005))
-            for s in ready:
-                s.pull()
+            if ready:
+                deadline = timer_at if timer_at is not None else time.perf_counter_ns() + _PULL_BUDGET_NS
+                for s in ready:
+                    s.pull(deadline)
 
     def _wait(self, g: _GroupRt, timeout: float) -> list[_Sub]:
         if not g.subs:
@@ -547,7 +586,7 @@ class _PureNode:
             return
         try:
             if self._stats_sock is None:
-                self._stats_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self._stats_sock = _tcp.propio(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
                 self._stats_sock.bind(("127.0.0.1", 0))
                 self._stats_sock.setblocking(False)
             host, port = hub_address().rsplit(":", 1)
@@ -575,6 +614,7 @@ class _NativeNode:
         self._pubs: list = []
         self._running = False
         self._error: BaseException | None = None
+        _nodos.add(self)
 
     # --- armar el nodo ---
     def publisher(self, msg_type, to: str) -> Publisher:
@@ -630,6 +670,7 @@ class _NativeNode:
             self._core.subscribe(where, msg_type.NAME, msg_type.SCHEMA_TEXT, msg_type.SCHEMA_ID,
                                  layout.size or 0, layout.encoding == wire.ENC_ARROW, deliver, max(1, int(queue)),
                                  (group or Group()).name)
+            _preload_numpy(msg_type)   # 8.2, tras validar el tipo y el topic (el nodo puro usa Subscriber)
             return f
 
         return add if fn is None else add(fn)

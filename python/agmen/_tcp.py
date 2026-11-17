@@ -34,17 +34,53 @@ import struct
 import sys
 import threading
 import time
+import weakref
 
 from . import _shm, wire
 
 ENVELOPE_LEN = wire.ENVELOPE_LEN
 _HEADER_LEN_AT = struct.Struct("<H")         # offset 4
 _PAYLOAD_LEN_AT = struct.Struct("<I")        # offset 56
-CONNECT_TIMEOUT_S = 1.0
+CONNECT_TIMEOUT_S = 1.0       # una conexión a esta computadora que no termina en este tiempo se da por fallida
+NEW_WAIT_S = 0.05             # ante direcciones nuevas, quien las descubre espera esto (una vez por tanda)
+FIXED_REMOTE_WAIT_S = 1.0     # al crear un Publisher con dirección fija a otra computadora, una sola vez (§13 C)
 BIG_BUFFER = 4 << 20          # SO_SNDBUF / SO_RCVBUF que se pide fuera de Linux
 READ_CHUNK = 1 << 18
 SHM_NO, SHM_PROBING, SHM_YES = 0, 1, 2
 LOCAL_IP = "127.0.0.1"
+
+# Los sockets y las conexiones aceptadas de agmen (Python puro) que siguen vivos: en el hijo de un fork
+# se cierran y se callan todos (soltar_heredados). Anotar uno cuesta lo mismo que crear el socket: nada
+# por mensaje. Límite conocido: entre crear un socket y anotarlo hay una ventana de microsegundos; si el
+# fork de otro hilo cae justo ahí, el hijo se queda con ese socket abierto. Solo se cierran los sockets
+# anotados (cada uno por su propio objeto): nunca un descriptor ajeno.
+_sockets: weakref.WeakSet = weakref.WeakSet()
+_entradas: weakref.WeakSet = weakref.WeakSet()
+
+
+def propio(s: socket.socket) -> socket.socket:
+    """Anota un socket de agmen (para cerrarlo en el hijo de un fork) y lo devuelve."""
+    _sockets.add(s)
+    return s
+
+
+def soltar_heredados() -> None:
+    """En el hijo de un fork (un solo hilo), antes que nada: cierra los sockets heredados del padre (el
+    hijo no lee ni manda por ellos, ni retiene sus puertos) y calla las conexiones aceptadas (un mensaje
+    prestado que el hijo suelte no le devuelve nada al publicador del padre). Sin tomar candados: los pudo
+    dejar tomados un hilo del padre que en el hijo no existe. La memoria compartida no se toca."""
+    for c in list(_entradas):
+        c.lock = threading.Lock()
+        c.closed = True
+        c.dropped = True
+        c.out = bytearray()
+    for s in list(_sockets):
+        try:
+            s.close()
+        except OSError:
+            pass
+    _sockets.clear()
+    _entradas.clear()
 
 
 def _error_text(err: int) -> str:
@@ -60,9 +96,10 @@ def _error_text(err: int) -> str:
         except (ImportError, AttributeError, OSError, ValueError):
             pass
     return os.strerror(err)
-# Conectar a OTRA computadora (RFC 0011 §3) no bloquea a nadie: la conexión se termina en el hilo del
-# Fanout, y si no contesta en este tiempo se da por fallida (se reintenta cada Fanout.RETRY_S).
-# 3 s (la especificación no da el número; a 127.0.0.1 se sigue esperando 1 s, bloqueando).
+# Conectar no bloquea a nadie (ni a otra computadora, RFC 0011 §3, ni a esta): la conexión se termina en
+# el hilo del Fanout (o la termina quien publica), y si no contesta a tiempo se da por fallida (se
+# reintenta cada Fanout.RETRY_S). A otra computadora, 3 s (la especificación no da el número); a esta,
+# CONNECT_TIMEOUT_S.
 REMOTE_CONNECT_S = 3.0
 _IN_PROGRESS = {0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EAGAIN, getattr(errno, "WSAEWOULDBLOCK", 10035)}
 
@@ -72,6 +109,18 @@ def unreachable_text(topic: str, addr: tuple[str, int], why: str) -> str:
     return (f"[agmen] ⚠ '{topic}': no pude mandar a la computadora {addr[0]} ({addr[0]}:{addr[1]}): {why}. "
             f"Los demás destinos siguen igual; revisa que {addr[0]} esté en la red y que su firewall deje "
             f"pasar a Agmen. Lo que no sale se cuenta (unreachable).")
+
+
+def no_link_text(topic: str, addr: tuple[str, int]) -> str:
+    """El aviso (una vez por dirección y por Publisher) de una dirección fija sin conexión (§14)."""
+    return (f"[agmen] ⚠ '{topic}': no hay conexión con {addr[0]}:{addr[1]} (nadie escucha ahí todavía, o esa "
+            f"computadora no contesta); los mensajes no salen hasta que la haya. Agmen sigue intentando.")
+
+
+def this_computer(host: str, net_ip: str | None) -> bool:
+    """¿`host` es de esta computadora? 127.x, "localhost" o AGMEN_NET_IP (§9.5). Una IP propia de la red
+    no se reconoce: con nadie escuchando, el sistema la rechaza en el acto y no hay espera."""
+    return host.startswith("127.") or host == "localhost" or (net_ip is not None and host == net_ip)
 
 
 def _tune(sock: socket.socket, option: int) -> None:
@@ -142,32 +191,15 @@ class Outgoing:
         self.lent: dict[tuple[int, int], int] = {}   # descriptores mandados y no devueltos → bytes
         self.lent_bytes = 0
         self.inbox = bytearray()
-        self.remote = remote          # de otra computadora (RFC 0011): sin memoria compartida, sin bloquear
-        self.connecting = False       # conexión a otra computadora en curso (la termina el hilo del Fanout)
+        self.remote = remote          # de otra computadora (RFC 0011): sin memoria compartida, con aviso
+        self.connecting = False       # conexión en curso (la termina el hilo del Fanout o quien publica)
         self.deadline = 0.0
         self.error = ""               # por qué no se pudo conectar (para el aviso)
-        if remote:
-            self._connect_remote(src_ip)
-        else:
-            self._connect()
+        self._connect(src_ip if remote else None)
 
-    def _connect(self) -> None:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            _tune(s, socket.SO_SNDBUF)
-            s.settimeout(CONNECT_TIMEOUT_S)      # a 127.0.0.1 tarda microsegundos
-            s.connect(self.addr)
-            s.setblocking(False)
-        except OSError:
-            s.close()
-            return                               # el suscriptor ya no está; el hub lo quitará
-        self.sock = s
-        self.alive = True
-
-    def _connect_remote(self, src_ip: str | None) -> None:
-        """Sin bloquear: a otra computadora puede tardar o no contestar nunca, y publish() no espera."""
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    def _connect(self, src_ip: str | None) -> None:
+        """Sin bloquear: el suscriptor puede tardar o no contestar nunca, y publish() no espera."""
+        s = propio(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
         try:
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             _tune(s, socket.SO_SNDBUF)
@@ -186,7 +218,7 @@ class Outgoing:
         self.sock = s
         self.alive = True
         self.connecting = err != 0
-        self.deadline = time.monotonic() + REMOTE_CONNECT_S
+        self.deadline = time.monotonic() + (REMOTE_CONNECT_S if self.remote else CONNECT_TIMEOUT_S)
 
     def finish_connect(self) -> bool:
         """El select dijo que la conexión en curso terminó: True si quedó lista."""
@@ -215,6 +247,7 @@ class Outgoing:
                 pass
         self.sock = None
         self.alive = False
+        self.connecting = False
         self._give_back(self.cur, pool)
         self._give_back(self.next, pool)
         if pool is not None:
@@ -306,8 +339,16 @@ class Fanout:
         self._warned = False
         self._dropped_gone = 0
         self._last_try: dict[tuple[str, int], float] = {}
+        # La tanda de conexiones nuevas en curso (§11 Q1/Q2): una sola espera de hasta NEW_WAIT_S, que
+        # comparten quien lee al hub (settle) y quien manda en ese hueco. Hora de time.perf_counter().
+        self._new: list[Outgoing] = []
+        self._new_end = 0.0
+        self._fixed: set = set()                 # las direcciones fijas (no del hub): avisan si no hay conexión
+        self._no_link_warned: set = set()
         self.lock = threading.Lock()
         self._wake_r, self._wake_w = socket.socketpair()
+        propio(self._wake_r)
+        propio(self._wake_w)
         self._wake_r.setblocking(False)
         self._wake_w.setblocking(False)
         self._closed = False
@@ -326,43 +367,149 @@ class Fanout:
             self._dropped_gone += c.dropped
             c.fail(self.pool)
 
-    def update(self, addrs: list[tuple[str, int]], announcement) -> None:
-        """La lista nueva de suscriptores (del hub o la dirección fija)."""
+    def update(self, addrs: list[tuple[str, int]], announcement, fixed: bool = False) -> None:
+        """La lista nueva de suscriptores (del hub o la dirección fija). Solo las direcciones nuevas se
+        conectan en el acto (la misma lista no fuerza nada). No espera: las de esta computadora entran en
+        la tanda que espera settle(), una vez por pasada de quien lee al hub (no una por update()).
+        `fixed`: la dirección fija del constructor. Si es de otra computadora, su tanda espera hasta
+        FIXED_REMOTE_WAIT_S en vez de NEW_WAIT_S (§13 C); si un mensaje no sale hacia ella porque no hay
+        conexión, se avisa una vez (§14)."""
         with self.lock:
+            if fixed:
+                self._fixed = set(addrs)
+            fresh = {a for a in addrs if a not in self.want}
             self.want = list(addrs)
             self.announcement = announcement
             for a in list(self.conns):
                 if a not in addrs:
                     self._forget(a)
-                    self._last_try.pop(a, None)
-            self._reconnect(force=True)
+            for a in [a for a in self._last_try if a not in addrs]:
+                del self._last_try[a]
+            waiting = [c for c in self._reconnect(force=fresh) if c.addr in fresh]
+            if waiting:
+                now = time.perf_counter()
+                wait = NEW_WAIT_S
+                if fixed and any(not this_computer(c.addr[0], self.net_ip) for c in waiting):
+                    wait = FIXED_REMOTE_WAIT_S
+                if not self._new or now >= self._new_end:
+                    # Empieza la tanda. También si la de antes ya venció sin que settle() la cerrara (una
+                    # pasada que se cortó con una excepción): si no, el nuevo heredaría una espera de 0 ms.
+                    self._new = []
+                    self._new_end = now + wait
+                elif wait > NEW_WAIT_S:
+                    self._new_end = max(self._new_end, now + wait)
+                self._new.extend(waiting)
         self._wake()
 
-    def _reconnect(self, force: bool = False, msg: bool = False) -> None:
-        """`msg`: lo llama un mensaje de datos; a otra computadora sin conexión, se cuenta como no salido."""
+    def settle(self) -> None:
+        """Espera, sin el lock, a que terminen las conexiones nuevas de la tanda en curso, hasta lo que
+        quede de sus NEW_WAIT_S (nunca más en total): un suscriptor sano recibe el anuncio y el mensaje
+        de este mismo publish(), como siempre, y uno que no contesta sigue conectándose en segundo plano.
+        La llaman quien lee al hub, al final de su pasada, y quien manda (send/send_message), para no
+        saltarse a un suscriptor nuevo mientras otro hilo espera su conexión."""
+        if not self._new:                        # lo común: nada que esperar (sin tomar el lock)
+            return
+        with self.lock:
+            conns, end = list(self._new), self._new_end
+        self._wait_connecting(conns, end)
+        with self.lock:
+            if self._new_end == end:             # la misma tanda: quedan las que siguen en curso, si hay tiempo
+                now = time.perf_counter()
+                self._new = [c for c in self._new
+                             if now < end and c.connecting and self.conns.get(c.addr) is c]
+
+    def _reconnect(self, force=frozenset(), msg: bool = False) -> list[Outgoing]:
+        """Empieza (sin bloquear) las conexiones que faltan: las de `force` ya, las demás si pasó RETRY_S
+        desde el último intento. `msg`: lo llama un mensaje de datos; a otra computadora sin conexión, se
+        cuenta como no salido. Devuelve las conexiones a esta computadora que quedaron en curso."""
         now = time.monotonic()
+        started = []
         for a in self.want:
             c = self.conns.get(a)
             if c is not None and c.alive:
-                continue
+                continue                         # conectada o en curso
             remote = self.net and a[0] != LOCAL_IP and a[0] != self.net_ip   # AGMEN_NET_IP es local (§9.5)
-            if not force and now - self._last_try.get(a, 0.0) < self.RETRY_S:
+            if a not in force and now - self._last_try.get(a, 0.0) < self.RETRY_S:
                 if remote and msg:
                     self.unreachable += 1
                 continue
-            self._last_try[a] = now
+            if remote:
+                self._last_try[a] = now          # a otra computadora, como siempre: al empezar
             self._forget(a)
             c = Outgoing(a, True, self.net_ip) if remote else Outgoing(a)
             if c.alive:
                 self.conns[a] = c
                 if self.announcement is not None:
-                    c.offer(_Item(self.announcement), self.pool)
+                    c.offer(_Item(self.announcement), self.pool)   # lo primero que sale por ella
                     c.step(self.pool)
+                if not remote:
+                    if c.connecting:
+                        started.append(c)
+                    else:
+                        self._last_try[a] = now  # el intento ya terminó
             elif remote:
                 if msg:
                     self.unreachable += 1
                 self._warn_unreachable(a, c.error)
-            # si no está, se reintenta en un rato
+            else:
+                self._last_try[a] = now          # falló en el acto: callado, se reintenta en un rato
+        return started
+
+    def _finish(self, c: Outgoing) -> None:
+        """Una conexión en curso que el sistema dio por terminada (con el lock)."""
+        if not c.connecting or c.sock is None or self.conns.get(c.addr) is not c:
+            return
+        if c.finish_connect():
+            if not c.remote:
+                self._last_try[c.addr] = time.monotonic()
+            c.step(self.pool)                    # sale el anuncio
+        elif c.remote:
+            self._remote_failed(c, c.error)
+        else:
+            self._local_failed(c)
+
+    def _local_failed(self, c: Outgoing) -> None:
+        """Una conexión a esta computadora que no se pudo terminar (con el lock): callada, como siempre.
+        Nada le esperaba más que el anuncio: no se cuenta nada."""
+        c.fail(self.pool)
+        self._last_try[c.addr] = time.monotonic()
+
+    def _poll_connecting(self) -> None:
+        """Quien publica termina las conexiones a esta computadora que ya terminaron (consulta de 0 s),
+        para no depender de que despierte el hilo del Fanout (con el lock)."""
+        socks = [c.sock for c in self.conns.values() if c.connecting and not c.remote and c.sock is not None]
+        if not socks:
+            return
+        try:
+            _, w, x = select.select([], socks, socks, 0)
+        except (OSError, ValueError):
+            return
+        for c in list(self.conns.values()):
+            if c.sock is not None and (c.sock in w or c.sock in x):
+                self._finish(c)
+
+    def _wait_connecting(self, conns: list[Outgoing], end: float) -> None:
+        """Espera, sin el lock, a que terminen estas conexiones en curso: hasta `end` (time.perf_counter(),
+        un reloj fino también en Windows, donde time.monotonic() avanza de 15.6 ms en 15.6 ms)."""
+        while True:
+            with self.lock:
+                if self._closed:
+                    return
+                socks = [c.sock for c in conns
+                         if c.connecting and c.sock is not None and self.conns.get(c.addr) is c]
+            left = end - time.perf_counter()
+            if not socks or left <= 0:
+                return
+            try:
+                _, w, x = select.select([], socks, socks, left)
+            except (OSError, ValueError):
+                time.sleep(min(left, 0.001))     # una se cerró mientras tanto: se vuelve a mirar, sin girar
+                continue
+            if w or x:
+                with self.lock:
+                    for c in conns:
+                        if c.sock is not None and (c.sock in w or c.sock in x):
+                            self._finish(c)
 
     def _warn_unreachable(self, a, why: str) -> None:
         if a not in self._unreach_warned:
@@ -375,19 +522,29 @@ class Fanout:
             self.unreachable += 1                # lo que esperaba salir por ella
         c.fail(self.pool)
         self._warn_unreachable(c.addr, why)
+    @staticmethod
+    def _waiting(c: Outgoing) -> bool:
+        """¿Una conexión a esta computadora que sigue en curso? Se trata como una que aún no está: no
+        recibe este mensaje, no cuenta como "hay alguien" ni en dropped (a otra computadora, lo de siempre)."""
+        return c.connecting and not c.remote
+
     def send(self, packet) -> bool:
         """Deja un paquete ya armado (un anuncio) en cada conexión. True si hay alguien."""
+        self.settle()                            # Q1: lo que quede de la espera de una tanda nueva
         with self.lock:
-            self._reconnect()
+            started = self._reconnect()
+            self._poll_connecting()
             ok = False
             for a, c in list(self.conns.items()):
                 if not c.alive:
                     self._forget(a)
                     continue
+                if self._waiting(c):
+                    continue                     # su anuncio ya la espera: sale al conectarse
                 c.offer(_Item(packet), self.pool)
                 c.step(self.pool)                # casi siempre sale entero de una vez
                 ok = True
-            busy = any(c.wants_write() for c in self.conns.values())
+            busy = bool(started) or any(c.wants_write() for c in self.conns.values() if not self._waiting(c))
         if busy:
             self._wake()
         return ok
@@ -395,9 +552,11 @@ class Fanout:
     def send_message(self, env: wire.Envelope, payload) -> bool:
         """Un mensaje de datos: a cada suscriptor por memoria compartida si puede
         (el payload se escribe una sola vez) y si no, entero por TCP."""
+        self.settle()                            # Q1: lo que quede de la espera de una tanda nueva
         n = payload.nbytes if isinstance(payload, memoryview) else len(payload)
         with self.lock:
-            self._reconnect(msg=True)
+            started = self._reconnect(msg=True)
+            self._poll_connecting()
             # D3: el mensaje nuevo reemplaza al que esperaba. Se suelta antes de
             # escribir, así su bloque se puede reutilizar para este.
             for c in self.conns.values():
@@ -412,6 +571,8 @@ class Fanout:
             for a, c in list(self.conns.items()):
                 if not c.alive:
                     self._forget(a)
+                    continue
+                if self._waiting(c):
                     continue
                 item = None
                 if c.shm == SHM_YES and n >= _shm.MIN_PAYLOAD:
@@ -430,10 +591,26 @@ class Fanout:
                 c.offer(item, self.pool)
                 c.step(self.pool)
                 ok = True
-            busy = any(c.wants_write() for c in self.conns.values())
+            busy = bool(started) or any(c.wants_write() for c in self.conns.values() if not self._waiting(c))
+            warn = self._no_link() if self._fixed else []
         if busy:
             self._wake()
+        for a in warn:                           # sin el lock, como todo aviso que no lo necesita
+            print(no_link_text(self.topic, a), file=sys.stderr, flush=True)
         return ok
+
+    def _no_link(self) -> list:
+        """Las direcciones fijas sin conexión (en curso, rechazada o perdida) que aún no se avisaron (con el
+        lock): este mensaje no salió hacia ellas (§14). Una sola vez por dirección, aunque vuelva y se pierda."""
+        out = []
+        for a in self._fixed:
+            if a in self._no_link_warned:
+                continue
+            c = self.conns.get(a)
+            if c is None or not c.alive or self._waiting(c):
+                self._no_link_warned.add(a)
+                out.append(a)
+        return out
 
     def _write_shared(self, env: wire.Envelope, payload):
         got = self.pool.write(env.seq, payload)
@@ -514,8 +691,11 @@ class Fanout:
                 if self.pool is not None and now - last_trim >= 1.0:
                     last_trim = now
                     self.pool.trim(now)
-                for c in [c for c in self.conns.values() if c.connecting and now >= c.deadline]:
-                    self._remote_failed(c, f"no contestó en {REMOTE_CONNECT_S:.0f} s")
+                for c in [c for c in self.conns.values() if c.alive and c.connecting and now >= c.deadline]:
+                    if c.remote:
+                        self._remote_failed(c, f"no contestó en {REMOTE_CONNECT_S:.0f} s")
+                    else:
+                        self._local_failed(c)    # Windows a veces no avisa un connect fallido: lo cubre el plazo
                 alive = [c for c in self.conns.values() if c.alive]
                 rs = [c.sock for c in alive if not c.connecting]
                 ws = [c.sock for c in alive if c.wants_write()]
@@ -535,10 +715,10 @@ class Fanout:
                 continue
             with self.lock:
                 for c in alive:
-                    if c.connecting and c.sock is not None and (c.sock in w or c.sock in x):
-                        if not c.finish_connect():
-                            self._remote_failed(c, c.error)
-                            continue
+                    if c.connecting:
+                        if c.sock is not None and (c.sock in w or c.sock in x):
+                            self._finish(c)
+                        continue
                     if c.sock is not None and c.sock in r:
                         self._serve_reads(c)
                     if c.alive and c.sock in w:
@@ -561,6 +741,14 @@ class Fanout:
     def shm_subscribers(self) -> int:
         with self.lock:
             return sum(1 for c in self.conns.values() if c.alive and c.shm == SHM_YES)
+
+    def soltar_en_el_hijo(self) -> None:
+        """En el hijo de un fork (sus sockets ya los cerró soltar_heredados): queda cerrado sin despedirse.
+        El hilo del padre no existe aquí; el pool no se toca (sus bloques y su registro son del padre)."""
+        self._closed = True
+        self.lock = threading.Lock()
+        self.conns = {}
+        self.want = []
 
     def close(self) -> None:
         self._closed = True
@@ -606,6 +794,7 @@ class _Incoming:
         self.hello = False                      # le dijimos que podemos memoria compartida
         self.leases = 0
         self.dropped = False                    # ya no se lee: se cierra al soltar el último préstamo
+        _entradas.add(self)
 
     # --- avisos al publicador (RFC 0009 §3.7) ---
     def say(self, data: bytes) -> None:
@@ -736,7 +925,7 @@ class Listener:
 
     @staticmethod
     def _open(bind: tuple[str, int]) -> socket.socket:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s = propio(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         except OSError:
@@ -788,6 +977,7 @@ class Listener:
                     c, peer = s.accept()
                 except OSError:
                     continue
+                propio(c)
                 if self.allow is not None and peer[0] not in self.allow:
                     c.close()                    # de una computadora que no es de [[machine]]
                     self.on_reject(peer[0])

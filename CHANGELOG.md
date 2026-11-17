@@ -148,6 +148,10 @@ ejemplo, `agmen agent` en cada computadora, los topics entre computadoras de la
 misma red, la prueba de red antes de arrancar, los relojes medidos (no
 corregidos) y un banco para medir la latencia y los MB/s entre dos computadoras.
 
+Los objetos de Agmen en Python se pueden usar desde varios hilos a la vez
+(`Publisher`, `Subscriber`, `RawPublisher`, `RawSubscriber`, `Node` y
+`agmen.clock`). Tutorial, capítulo 12, sección 9.
+
 ### Agregado
 - **Perfiles en `robot.toml`** (RFC 0011 §3.2): `profile = "real"`, `"sim"`,
   `"replay"` o un nombre propio (`"mesa"`) en `[[node]]`, `[[mux]]` y
@@ -354,6 +358,27 @@ corregidos) y un banco para medir la latencia y los MB/s entre dos computadoras.
   Raspberry Pi y `agmen run` en la laptop. `--local` lo prueba en una sola máquina
   (dos IP de loopback; sus números no son de una red), y `--rapido` mide solo 64 B,
   el máximo de UDP y 1 MiB, con menos muestras. Capítulo 18 del tutorial, sección 13.
+- **Varios hilos sobre el mismo objeto** (Python, con el núcleo de C++ y con
+  Python puro): cualquier método o propiedad pública de los objetos de arriba
+  se puede llamar desde varios hilos a la vez sin que el programa se caiga,
+  se corrompa o se cuelgue. Varios `publish()` a la vez: cada mensaje sale
+  entero, una vez, con su `seq`. Varios `receive()` a la vez: se turnan y cada
+  mensaje lo recibe un solo hilo.
+- **`close()` desde otro hilo**: regresa en menos de 1 s aunque haya hilos
+  dentro de `receive()` o `publish()`. Esos hilos reciben `RuntimeError` con
+  "ya se cerró". Al regresar, el puerto de un `Subscriber` ya está libre; si
+  un hilo atorado no lo deja libre a tiempo, `close()` lo avisa por stderr.
+- **Pruebas**: `python/test_hilos.py` (batería de estrés por objeto, con los
+  dos núcleos) y `tests/test_hilos.cpp` (ctest `hilos`).
+- **ThreadSanitizer**: opción de CMake `AGMEN_TSAN` y un trabajo nuevo en el
+  CI que corre la batería con TSan.
+
+- **`fork` y `multiprocessing`** (tutorial, capítulo 12, sección 10): la regla
+  de los objetos heredados, el error que verás y un ejemplo que corre.
+- **Pruebas del `fork`** (`python/test_fork.py`): el hijo que cierra, suelta o
+  termina no toca al padre; la memoria compartida sigue; usar un objeto heredado
+  da el error claro; el hijo que crea los suyos habla con el padre. Corre con los
+  dos núcleos.
 
 ### Cambiado
 - **La terminal de `agmen run` conserva lo más nuevo.** Cuando las líneas llegan más
@@ -400,6 +425,44 @@ corregidos) y un banco para medir la latencia y los MB/s entre dos computadoras.
   (con el reloj de la grabación, y `agmen run` avisa). Los `robot.toml` sin
   perfiles no cambian: `--play` arranca los mismos nodos que en 0.13.0, y
   `--skip` funciona igual.
+- **Con un solo hilo, tras `close()`**: los errores son los de siempre,
+  `RuntimeError` con "ya se cerró", en vez de errores del sistema.
+  - `Subscriber.port` y `Subscriber.tcp_port` del núcleo puro: `OSError` pasa
+    a `RuntimeError`.
+  - `RawSubscriber.receive_raw()`: antes daba `None` o `ValueError`; ahora da
+    `RuntimeError`.
+  - `RawPublisher.send()`: antes daba `False` o `OSError`; ahora da
+    `RuntimeError`.
+  - `RawPublisher.set_schema()`: da `RuntimeError`.
+- **`RawSubscriber` se turna entre hilos** igual que `Subscriber`.
+- **`Subscriber.announced` del núcleo puro** devuelve una copia, como ya hacía
+  el nativo.
+- **C++**: `announced()` de `SubscriberCore` y de `Subscriber<M>` devuelve una
+  copia (`std::map` por valor) en vez de una referencia `const&`. Quien guardaba
+  la referencia debe guardar la copia.
+- **NumPy se importa al crear el objeto**: un `Publisher` o un `Subscriber` de un
+  tipo arrow (como `Imagen`), y la suscripción de un `Node` a ese tipo, importan
+  NumPy al crearse, no al recibir la primera imagen. Desde un hilo con otros hilos
+  ocupados, ese import podía tardar segundos. Los tipos chicos (`compact`) no lo
+  importan.
+
+- **En el hijo, usar un objeto creado antes del `fork` da un error claro.** Antes
+  "medio funcionaba": el hijo le robaba mensajes al padre, publicaba con su
+  identidad y con números de secuencia repetidos, y las imágenes no llegaban.
+  Ahora `publish`, `receive`, `send`, `receive_raw`, `announce`, `fileno`, las
+  propiedades (`seq`, `port`, `subscribers`…) y, en `Node`, `spin`, `on`, `every`
+  y `publisher` lanzan:
+  `RuntimeError: este Publisher es del proceso padre (pid N): después de un fork, crea uno nuevo en el hijo`
+  Lo mismo para `Subscriber`, `RawPublisher`, `RawSubscriber` y `Node`. Solo
+  siguen funcionando `close()`, `closed`, `repr` y salir de un `with`; en `Node`,
+  `stop()`, `close()` y `now()` tampoco dan error. Un hijo de `multiprocessing`
+  que recibía por un `Subscriber` heredado debe crear el suyo.
+- **Lo que el hijo crea después del `fork` funciona normal**, con su propia
+  identidad y su propia memoria compartida. Puede publicar hacia el padre y
+  recibir de él.
+- **Límites:** es para los objetos de Python. Un programa de C++ que haga
+  `fork()` sigue como antes, y en Windows no hay `fork`. El hijo conserva un
+  descriptor por cada socket heredado, apuntando a `/dev/null`.
 
 ### Corregido
 - **`cmd` con la ruta de un ejecutable** (`cmd = "../venv/bin/python nodo.py"`)
@@ -434,6 +497,58 @@ corregidos) y un banco para medir la latencia y los MB/s entre dos computadoras.
   - Con Python 3.13 nunca hubo aborto; el comportamiento al salir es el mismo
     en 3.12 y 3.13. El CI corre las pruebas del cierre también con 3.13 (job
     `cierre-313`).
+- **Núcleo nativo, `Publisher`**: `publish()` mientras otro hilo cerraba el
+  `Publisher` tumbaba el programa (SIGSEGV, SIGABRT, `bad_alloc`, destinos
+  corruptos).
+- **Núcleo nativo, `Subscriber.close()`**: con otro hilo dentro de `receive()`,
+  `close()` tardaba lo que el timeout del `receive` o no volvía nunca.
+- **Núcleo nativo, `Subscriber.announced`**: leerlo mientras otro hilo recibía
+  daba texto a medias (a veces `UnicodeDecodeError`).
+- **Núcleo nativo, carreras de datos**: al leer `seq`, `subscribers`,
+  `shm_mapped` y `filenos()` mientras otro hilo publicaba, recibía o cerraba.
+- **Ambos núcleos, `RawPublisher` y `RawSubscriber`**: tras `close()`, o
+  durante él, daban `OSError: [Errno 9] Bad file descriptor`.
+- **Ambos núcleos, `RawPublisher.set_schema()`** desde varios hilos a la vez
+  dejaba hilos de latido (`agmen-latido-*`) vivos para siempre.
+- **Python puro, `Subscriber.port`, `tcp_port` y `listen`** tras o durante
+  `close()`: daban `Bad file descriptor` en vez de "ya se cerró".
+- **`Publisher` de un tipo arrow por TCP: `publish()` ya no se queda detenido** con
+  suscriptores que no contestan. Antes esperaba hasta 1 s por cada uno (en Windows,
+  uno local que se cayó; en cualquier sistema, una dirección fija a una computadora
+  que no contesta) y lo reintentaba cada segundo. Con 3 suscriptores muertos, un
+  `publish()` tardaba de 9 a 15 s; ahora, 50 ms la primera vez y nada después. Con
+  un suscriptor sano nada cambia: su primer mensaje le sigue llegando. Con
+  dirección fija a otra computadora, el `Publisher` espera hasta 1 s al crearse
+  (como antes), una sola vez. Y con cualquier dirección fija, la primera vez que un
+  mensaje no puede salir porque no hay conexión (nadie escucha ahí todavía, o esa
+  computadora no contesta), Agmen lo avisa una vez por stderr: "no hay conexión con
+  …; los mensajes no salen hasta que la haya. Agmen sigue intentando". Antes
+  `publish()` devolvía `False` sin decir nada.
+- **El hub ya no reintenta cada segundo** a cada suscriptor TCP caído. Antes hacía un
+  intento de conexión por segundo a cada uno (40 conexiones en 0.85 s con la misma
+  lista); ahora, 1.
+- **`pull()` no deja sin correr los `every()`**: a un nodo al que le llegan mensajes
+  más rápido de lo que los recibe, sus `every()` dejaban de correr. `pull()` recibía
+  hasta 1024 mensajes seguidos; ahora recibe al menos 32 por vuelta y se corta cuando
+  le toca al siguiente temporizador (o a los 2 ms si no hay temporizadores, o en
+  simulación y reproducción).
+- **Cerrar un `Subscriber` de Python puro o un `RawSubscriber` desde otro hilo**: la
+  despedida del hub (`bye`) podía no salir, porque el otro hilo cerraba el socket
+  antes. Ahora primero se despide.
+
+- **Después de un `fork()` (o de un `multiprocessing.Process` con `fork`), el
+  hijo ya no daña al padre.** Antes, con el núcleo de C++, bastaba que el hijo
+  terminara con `sys.exit` para dar de baja del hub a los objetos del padre y
+  borrar su memoria compartida: el padre dejaba de recibir entre 0.14 y 0.94 s,
+  y los suscriptores nuevos ya no podían usar memoria compartida con él. Con el
+  núcleo de Python puro, pasaba al llamar `close()` en el hijo. Ahora cerrar,
+  soltar o terminar el hijo no manda `bye`, no borra nada del padre y no le
+  quita latidos: el padre sigue registrado, recibe y publica sin hueco.
+- **En el hijo, cerrar objetos heredados no espera ni se cuelga**, aunque un
+  hilo del padre estuviera dentro de `receive()` o `publish()` en el momento del
+  `fork`. Antes, `close()` de un `Subscriber` tardaba 0.75 s y avisaba;
+  `close()` de un `Publisher` del núcleo puro y `publish()` se colgaban. Ahora
+  `close()` vuelve en menos de 0.1 s, sin aviso.
 
 ## [0.13.0] — 2026-11-06
 
