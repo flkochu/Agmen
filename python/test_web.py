@@ -291,8 +291,7 @@ class MotorCase(PanelCase):
                 return MotorCommand.LAYOUT.unpack(payload)
 
     # --- esperas por señal (sin depender de sleeps cortos ni del orden en que llega lo viejo) ---
-    _altos_usados = 0
-    _vistos: set
+    _altos_usados = 0          # ALTOs del hombre muerto (avisados en los logs) cuyo (0, 0) ya se vio llegar
 
     def _altos(self) -> int:
         """Cuántos ALTO del hombre muerto avisó el panel (los avisa en sus logs ANTES de mandarlos)."""
@@ -315,15 +314,18 @@ class MotorCase(PanelCase):
             self.motor.settimeout(3)
         return None
 
-    def _viejo(self, cmd) -> bool:
-        """¿Es algo que ya pasó y puede llegar tarde? Un ALTO del hombre muerto que el panel avisó y nadie ha
-        contado todavía, o la repetición de un comando (distinto de alto) que ya se vio llegar."""
-        if not hasattr(self, "_vistos"):
-            self._vistos = set()
+    def _alto_avisado(self, cmd) -> bool:
+        """¿Este (0, 0) es un ALTO del hombre muerto que el panel avisó en sus logs y nadie ha contado? Si sí,
+        lo cuenta."""
         if cmd == (0.0, 0.0) and self._altos() > self._altos_usados:
             self._altos_usados += 1
             return True
-        return cmd in self._vistos
+        return False
+
+    def _viejo(self, cmd) -> bool:
+        """¿Es algo que ya pasó y puede llegar tarde? Solo un ALTO del hombre muerto avisado y sin contar (las
+        copias de un comando reenviado las recoge _manejar antes de regresar)."""
+        return self._alto_avisado(cmd)
 
     def _nada(self, wait=0.25):
         """Que en `wait` segundos no se publique ningún comando nuevo (lo viejo que llega tarde no cuenta)."""
@@ -340,28 +342,41 @@ class MotorCase(PanelCase):
         descarta sin error un comando que llega demasiado pronto, y en Windows con Python 3.12 time.monotonic
         avanza de a 15-16 ms (GetTickCount64), así que 20 ms entre dos comandos pueden medirse como 15 ms y
         la resta en float dar 0.01499… (< 0.015): se descarta, y 300 ms después llega el ALTO del hombre
-        muerto (así falló el CI). Lo viejo que llegue antes (ese ALTO, una repetición) se descarta; cualquier
-        otro comando es un error."""
-        if not hasattr(self, "_vistos"):
-            self._vistos = set()
+        muerto (así falló el CI).
+
+        "Es un alto" se decide como el panel: con el recorte en f64 (un alto no pasa por el tope, así que no
+        se reenvía). (5e-324, 0) NO es un alto para el panel aunque llegue al motor como (0.0, 0.0) en f32:
+        se reenvía como cualquier comando, y un (0, 0) que coincide con un ALTO avisado en los logs y sin
+        contar se cuenta como ese ALTO, nunca como el comando esperado. Otra cosa que llegue y no sea vieja
+        (_viejo) es un error."""
         ms = self.panel.teleop.max_speed
-        want = tuple(struct.unpack("<f", struct.pack("<f", max(-ms, min(ms, v))))[0] for v in (left, right))
+        clipped = tuple(max(-ms, min(ms, v)) for v in (left, right))
+        is_stop = clipped == (0.0, 0.0)
+        want = tuple(struct.unpack("<f", struct.pack("<f", v))[0] for v in clipped)
         msg = {"op": "teleop", "left": left, "right": right}
         mandar = send if callable(send) else (lambda: send.send_text(json.dumps(msg)))
+        copias = 0                          # reenvíos: si el primero solo tardaba, llega más de un `want`
         end = time.monotonic() + timeout
         mandar()
         while time.monotonic() < end:
             got = self._leer(0.3)
             if got is None:
-                if want != (0.0, 0.0):      # un alto nunca se descarta (no pasa por el tope): no se repite
+                if not is_stop:             # se descartó por el tope (o tarda): otra vez, como el navegador
+                    copias += 1
                     mandar()
                 continue
+            if self._alto_avisado(got):     # el ALTO del hombre muerto: nunca es el comando esperado
+                continue
             if got == want:
-                if want != (0.0, 0.0):
-                    self._vistos.add(got)
+                # Las copias de los reenvíos llegan enseguida (es localhost): se recogen aquí, para que
+                # después ningún (0, 0) ni otro valor se acepte "por si acaso" como viejo.
+                while copias and (extra := self._leer(0.15)) is not None:
+                    if extra == want:
+                        copias -= 1
+                    elif not self._alto_avisado(extra):
+                        self.fail(f"llegó {extra} al motor después de {want}")
                 return got
-            if not self._viejo(got):
-                self.fail(f"llegó {got} al motor esperando {want}")
+            self.fail(f"llegó {got} al motor esperando {want}")
         self.fail(f"no llegó {want} al motor en {timeout} s")
 
 
