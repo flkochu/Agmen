@@ -452,7 +452,7 @@ class TestCerrar(unittest.TestCase):
         agmen.*), pero un generador de un módulo agmen.* que no es de grabaciones podría estar suspendido y
         seguir en uso (en 3.11/3.12, frame.clear() lo daría por terminado): no se toca."""
         ns = {"__name__": "agmen.otro_modulo"}
-        exec(compile(textwrap.dedent("""
+        code = compile(textwrap.dedent("""
             def gen():
                 try:
                     raise RuntimeError("guardado")
@@ -464,7 +464,8 @@ class TestCerrar(unittest.TestCase):
             def funcion():
                 local = "de agmen"
                 raise ValueError("de una función de agmen")
-        """), "<agmen.otro_modulo>", "exec"), ns)
+        """), "<agmen.otro_modulo>", "exec")
+        exec(code, ns)  # noqa: S102 — código fijo de la prueba, con __name__ de un módulo agmen.*
         g = ns["gen"]()
         error = next(g)                           # el traceback trae el marco de g, suspendido
         with contextlib.suppress(RuntimeError), _mcap.Reader(self.path):
