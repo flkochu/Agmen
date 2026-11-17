@@ -36,7 +36,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from . import _backend, clock, wire
+from . import _backend, _tcp, clock, wire
 from . import hubproto as hp
 from .pubsub import (
     Publisher,
@@ -567,7 +567,7 @@ class _PureNode:
             return
         try:
             if self._stats_sock is None:
-                self._stats_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self._stats_sock = _tcp.propio(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
                 self._stats_sock.bind(("127.0.0.1", 0))
                 self._stats_sock.setblocking(False)
             host, port = hub_address().rsplit(":", 1)

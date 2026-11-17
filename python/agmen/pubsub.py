@@ -118,6 +118,11 @@ def _preload_numpy(msg_type) -> None:
         arrow.preload_numpy()
 
 
+# Los Publisher, Subscriber, RawSubscriber y RawPublisher de Python puro vivos: en el hijo de un fork
+# quedan cerrados sin despedirse del hub (_soltar_heredados).
+_puros: weakref.WeakSet = weakref.WeakSet()
+
+
 class _HubLink:
     """Registro y latido con el hub para un endpoint (un Publisher o Subscriber).
 
@@ -194,6 +199,14 @@ class _HubLink:
 
     def got_reply(self) -> None:
         self.last_reply = time.monotonic()
+
+    def soltar_en_el_hijo(self) -> None:
+        """En el hijo de un fork: callado para siempre, sin `bye` (el id es del padre, que sigue registrado).
+        Sin tomar candados: el de latidos lo pudo dejar tomado un hilo del padre que aquí no existe."""
+        self._beat_lock = threading.Lock()
+        self._closed = True
+        self._stop = threading.Event()
+        self._stop.set()
 
     def close(self, bye: bool = True) -> None:
         """Detiene el latido. Con `bye`, se despide del hub; sin él (un enlace que sobró y comparte el id
@@ -278,7 +291,7 @@ class _NetSend:
         """La primera vez que hay un destino de otra computadora (con self._lock)."""
         if self._net_sock is not None:
             return
-        s = wire.udp_socket()
+        s = _tcp.propio(wire.udp_socket())
         try:
             s.bind((self._net_ip or "0.0.0.0", 0))   # AGMEN_NET_IP: los envíos salen desde esa IP
             s.setblocking(False)
@@ -314,10 +327,13 @@ class _PurePublisher(_NetSend):
         # compartida (su dueño) nacen ya con este source_id.
         self.source_id = source_id or wire.new_source_id()
         self.seq = 0
-        self._sock = wire.udp_socket()
+        self._sock = _tcp.propio(wire.udp_socket())
         self._announced_at: float | None = None
         self._pub_lock = threading.Lock()   # se puede publicar desde varios grupos de un Node
         self._closed = False                # close(): publish() lanza el error claro, como el nativo
+        self._link = None
+        self._tcp = None
+        _puros.add(self)
         # Un tipo arrow (string, bytes, T[], tensor) va por TCP (RFC 0008 D2) o, en la misma
         # computadora, por memoria compartida (RFC 0009); compact, por UDP.
         self.arrow = msg_type.LAYOUT.encoding == wire.ENC_ARROW
@@ -502,6 +518,18 @@ class _PurePublisher(_NetSend):
         with self._tcp.lock:
             return self._tcp.pool.bytes() if self._tcp.pool is not None else 0
 
+    def _soltar_en_el_hijo(self) -> None:
+        """En el hijo de un fork (sus sockets ya los cerró _tcp.soltar_heredados): cerrado, sin `bye` y sin
+        borrar la memoria compartida del padre. Los candados, nuevos: los pudo dejar tomados un hilo del padre."""
+        self._closed = True
+        self._pub_lock = threading.Lock()
+        self._count_lock = threading.Lock()
+        if self._link is not None:
+            self._lock = threading.Lock()
+            self._link.soltar_en_el_hijo()
+        if self._tcp is not None:
+            self._tcp.soltar_en_el_hijo()
+
     def close(self) -> None:
         # Un publish() de otro hilo puede estar dentro: se espera a que suelte sus locks (los
         # tiene microsegundos) y desde entonces publish() lanza "el Publisher ya se cerró".
@@ -576,9 +604,10 @@ class _Receiver:
         self._expired = False                   # ya se volvió a solo lo local por falta de `ok` (avisado)
         self._quiet_peers: frozenset = frozenset()   # los peers de cuando el hub calló (§10.2)
         self._quiet_warned: set = set()
-        self._sock = wire.udp_socket()
+        self._sock = _tcp.propio(wire.udp_socket())
         self._announced: dict[int, tuple[str, str]] = {}   # schema_id → (topic, esquema)
         self._link = None
+        _puros.add(self)
         # Los mensajes arrow llegan por TCP (RFC 0008): un puerto más, que se registra en el hub.
         self._tcp: _tcp.Listener | None = None
         if by_topic:
@@ -633,7 +662,7 @@ class _Receiver:
         last: OSError | None = None
         for _ in range(_SAME_PORT_TRIES):
             listener = _tcp.Listener((host, 0), shm=shm)
-            udp = wire.udp_socket()
+            udp = _tcp.propio(wire.udp_socket())
             try:
                 udp.bind((host, listener.port))
             except OSError as e:
@@ -797,7 +826,7 @@ class _Receiver:
         """Sockets nuevos en todas las interfaces (o en AGMEN_NET_IP); se registra con ellos y net=1.
         Los de antes se siguen leyendo hasta NET_OLD_S después de que el hub confirme."""
         ip = self._net_ip or "0.0.0.0"
-        udp = wire.udp_socket()
+        udp = _tcp.propio(wire.udp_socket())
         try:
             udp.bind((ip, 0))
             if self._tcp is not None:
@@ -933,6 +962,18 @@ class _Receiver:
             if self._old_udp is not None:
                 self._old_udp.close()
 
+    def _soltar_en_el_hijo(self) -> None:
+        """En el hijo de un fork (sus sockets ya los cerró _tcp.soltar_heredados): cerrado, sin `bye`. El
+        turno y los candados, nuevos: los pudo dejar tomados un hilo del padre que aquí no existe."""
+        self._rx = threading.Lock()
+        self._closed = True
+        self._sockets_closed = True
+        if self._link is not None:
+            self._link.soltar_en_el_hijo()
+        shm = getattr(self, "_shm", None)
+        if shm is not None:
+            shm._lock = threading.Lock()   # un préstamo que el hijo suelte cuenta sin esperar a nadie
+
     def __del__(self) -> None:
         # Un close() que quedó pendiente: sin referencias, ningún hilo puede estar en receive().
         try:
@@ -940,8 +981,6 @@ class _Receiver:
                 self._close_sockets()
         except Exception:  # noqa: BLE001 — al salir del intérprete puede faltar de todo
             pass
-
-    _puros: weakref.WeakSet = weakref.WeakSet()   # para reponer el turno en el hijo de un fork
 
 
 class _PureSubscriber(_Receiver):
@@ -955,7 +994,6 @@ class _PureSubscriber(_Receiver):
                          shm=arrow and _shm.enabled())
         _preload_numpy(msg_type)   # tras validar el tipo y el topic: los errores de siempre, en su orden
         self._shm = _shm.Receiver(where) if arrow else None
-        self._puros.add(self)
 
     def receive(self, timeout: float | None = None):
         """Espera hasta `timeout` s un mensaje. Devuelve Sample, o None si no llegó.
@@ -1010,15 +1048,20 @@ class _PureSubscriber(_Receiver):
               file=sys.stderr, flush=True)
 
 
-def _turnos_despues_de_fork() -> None:
-    """En el hijo de un fork (un solo hilo): el turno de receive() de un Subscriber puro pudo quedar
-    tomado por un hilo del padre que en el hijo no existe. Se repone, libre (como el nativo)."""
-    for o in list(_Receiver._puros):
-        o._rx = threading.Lock()
+def _soltar_heredados() -> None:
+    """En el hijo de un fork (un solo hilo), con los dos núcleos: los objetos de Python puro creados antes
+    del fork son del padre. Se cierran sus sockets en el acto (el hijo no retiene sus puertos ni lee lo que
+    es del padre) y quedan cerrados sin despedirse: cerrarlos, soltarlos o salir no le da de baja al padre
+    en el hub ni borra su memoria compartida, y nada espera un candado o un hilo del padre (G1-G3). Lo que
+    el hijo cree después es suyo y funciona normal."""
+    _tcp.soltar_heredados()
+    for o in list(_puros):
+        o._soltar_en_el_hijo()
+    _puros.clear()
 
 
 if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_turnos_despues_de_fork)
+    os.register_at_fork(after_in_child=_soltar_heredados)
 
 
 class RawSubscriber(_Receiver):
@@ -1032,7 +1075,6 @@ class RawSubscriber(_Receiver):
 
     def __init__(self, where: str, node: str | None = None) -> None:
         super().__init__(where, "*", node=node)
-        self._puros.add(self)
 
     def receive_raw(self, timeout: float | None = None):
         """(bytes, "ip:puerto") del siguiente paquete Agmen, o None. Las
@@ -1054,7 +1096,7 @@ class RawPublisher(_NetSend):
         self.topic_id = wire.topic_id(topic)
         self._init_net(_net_ip())   # antes de abrir nada: si AGMEN_NET_IP no sirve, error claro
         self.source_id = wire.new_source_id()
-        self._sock = wire.udp_socket()
+        self._sock = _tcp.propio(wire.udp_socket())
         self._sock.bind(("127.0.0.1", 0))
         self._sock.setblocking(False)
         self.dests: list[tuple[str, int]] = []
@@ -1063,6 +1105,15 @@ class RawPublisher(_NetSend):
         self._announced_at: float | None = None
         self._lock = threading.Lock()
         self._closed = False
+        _puros.add(self)
+
+    def _soltar_en_el_hijo(self) -> None:
+        """En el hijo de un fork (sus sockets ya los cerró _tcp.soltar_heredados): cerrado y sin `bye`."""
+        self._closed = True
+        self._lock = threading.Lock()
+        self._count_lock = threading.Lock()
+        if self._link is not None:
+            self._link.soltar_en_el_hijo()
 
     def _drain_locked(self) -> None:
         with self._lock:
