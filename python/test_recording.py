@@ -157,6 +157,17 @@ def damage_chunk(path: str, k: int) -> None:
         f.write(bytes([b[0] ^ 0xFF]))
 
 
+def write_short_packet(path: str) -> None:
+    """Una grabación (con robot.toml adjunto) cuyo tercer /cmd es un paquete cortado: wire.parse da WireError."""
+    w = _mcap.Writer(path)
+    cid = w.add_channel("/cmd", "agmen", w.add_schema(Cmd.LAYOUT.name, "agmen", Cmd.LAYOUT.text.encode()))
+    w.add_attachment("robot.toml", "text/plain", b'[robot]\nname = "prueba"\n', T0, T0)
+    for i in range(4):
+        pkt = packet(Cmd.LAYOUT, Cmd(i, -i).encode_payload(), "/cmd", 0x22, i, T0 + i * STEP)
+        w.add_message(cid, T0 + i * STEP, T0, i, pkt[:-3] if i == 2 else pkt)
+    w.close()
+
+
 class RecordingCase(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -323,7 +334,7 @@ class TestCerrar(unittest.TestCase):
         self.assertEqual(text.count("[agmen] ⚠"), 1, text)
         for words in (self.path, "se cerró por un error", "Lo guarda el error", "como la de un for",
                       "o el programa", "un mensaje en una lista", "Windows", "se suelta solo",
-                      "copy.deepcopy(msg)", "arr.copy()", "del e"):
+                      "copy.deepcopy(msg)", "arr.copy()", "del e", "o la variable que lo guarda (del m)"):
             self.assertIn(words, text)
 
     def test_chunk_danado_sin_que_el_programa_guarde_nada(self):
@@ -459,6 +470,59 @@ class TestCerrar(unittest.TestCase):
                 self.assertEqual(self.frame_locals(error, "falla")["local"], "del programa")
                 del it, error, got
                 self.assertEqual(close_quoting(src), "")
+
+    def test_paquete_cortado_no_culpa_al_programa(self):
+        """wire.parse (y decode_payload) reciben las vistas del archivo: al salir por su error, sus marcos (de
+        agmen.wire, de Agmen) también se sueltan. Sin aviso y sin mapear, aunque el error siga vivo."""
+        write_short_packet(self.path)
+        for which in ("Recording", "Reader"):
+            with self.subTest(which):
+                err, error = io.StringIO(), None
+                with contextlib.redirect_stderr(err):
+                    try:
+                        if which == "Recording":
+                            with agmen.Recording(self.path) as src:
+                                for _s in src.messages():
+                                    pass
+                        else:
+                            with _mcap.Reader(self.path) as reader:
+                                for _p in map(wire.parse, (m.data for m in reader.messages())):
+                                    pass
+                    except wire.WireError as e:
+                        error = e                 # con su traceback vivo
+                    if which == "Recording":
+                        reader = src._r
+                self.assertIsInstance(error, wire.WireError)
+                self.assertEqual(err.getvalue(), "")
+                self.assertFalse(reader._mapped)
+                self.assertIn(mapped(self.path), (False, None))
+        os.remove(self.path)
+
+    def test_reparar_sobre_si_misma_se_rechaza_antes_de_abrir(self):
+        """repair(x, x) truncaría la grabación que está leyendo (mapeada: en Linux, Bus error)."""
+        size = os.path.getsize(self.path)
+        for out in (self.path, os.path.join(os.path.dirname(self.path), ".", "vuelta.mcap")):
+            with self.assertRaisesRegex(ValueError, "la salida es la misma grabación.*da otra ruta"):
+                _mcap.repair(self.path, out)
+        self.assertEqual(os.path.getsize(self.path), size, "no la tocó")
+        self.assertIn(opened(self.path), (False, None))
+
+    def test_reparar_deja_nota_si_no_puede_borrar_la_salida(self):
+        damage_chunk(self.path, 2)
+        out = os.path.join(os.path.dirname(self.path), "reparada.mcap")
+        error = None
+        with mock.patch.object(_mcap.os, "remove", side_effect=PermissionError("en uso")):
+            try:
+                _mcap.repair(self.path, out)
+            except _mcap.McapError as e:
+                error = e
+        self.assertIn("CRC", str(error))
+        notes = getattr(error, "__notes__", [])
+        self.assertEqual(len(notes), 1, notes)
+        self.assertIn(out, notes[0])
+        self.assertIn("quedó a medias", notes[0])
+        self.assertIn("bórralo", notes[0])
+        os.remove(out)
 
     def test_reparar_un_chunk_danado_suelta_los_dos_archivos(self):
         damage_chunk(self.path, 2)

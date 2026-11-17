@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import heapq
+import inspect
 import mmap
 import os
 import struct
@@ -53,22 +54,27 @@ class McapError(ValueError):
     """El archivo no es MCAP, está dañado o usa algo que no se puede leer."""
 
 
-# Los módulos de Agmen que leen grabaciones. Al salir por un error se limpian SOLO sus marcos del traceback
-# (guardan mensajes y chunks: vistas del archivo); los del programa nunca (sus variables le sirven a quien
-# depura: pdb.post_mortem, %debug), ni un generador suyo que aparezca ahí.
-_OWN_FILES = frozenset(os.path.normcase(os.path.join(os.path.dirname(os.path.abspath(__file__)), name))
-                       for name in ("_mcap.py", "recording.py", "play.py"))
+# Al salir por un error se limpian SOLO los marcos de Agmen del traceback (por módulo: agmen y agmen.*). Guardan
+# mensajes y chunks, vistas del archivo (también wire.parse o decode_payload, que reciben esas vistas); los del
+# programa nunca (sus variables le sirven a quien depura: pdb.post_mortem, %debug), ni un generador suyo.
+# De Agmen, los generadores solo se limpian en los módulos de grabaciones: los suyos (messages, los chunks) ya
+# terminaron cuando aparecen en un traceback. Un generador de otro módulo de Agmen podría estar suspendido y
+# seguir en uso, y en Python 3.11/3.12 frame.clear() lo daría por terminado: esos no se tocan.
+_RECORDING_MODULES = frozenset({"agmen._mcap", "agmen.recording", "agmen.play"})
+_GENERATOR_FLAGS = inspect.CO_GENERATOR | inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR
 
 
 def _clear_own_frames(tb) -> None:
-    """Suelta las variables de los marcos del traceback que son de este lector (y ya terminaron)."""
+    """Suelta las variables de los marcos del traceback que son de Agmen (y ya terminaron)."""
     while tb is not None:
         frame = tb.tb_frame
-        if os.path.normcase(os.path.abspath(frame.f_code.co_filename)) in _OWN_FILES:
-            try:
-                frame.clear()
-            except RuntimeError:
-                pass                       # se está ejecutando: sus variables se sueltan al terminar
+        module = frame.f_globals.get("__name__") or ""
+        if module == "agmen" or module.startswith("agmen."):
+            if module in _RECORDING_MODULES or not frame.f_code.co_flags & _GENERATOR_FLAGS:
+                try:
+                    frame.clear()
+                except RuntimeError:
+                    pass                   # se está ejecutando: sus variables se sueltan al terminar
         tb = tb.tb_next
 
 
@@ -557,7 +563,7 @@ class Reader:
                     "(un mensaje en una lista, un arreglo de as_array()). En Windows no se podrá borrar ni "
                     "reemplazar el archivo hasta que se suelte; se suelta solo en cuanto nada lo use. Qué hacer: "
                     "copia lo que quieras conservar (copy.deepcopy(msg), arr.copy()) y suelta el error (del e, o "
-                    "sal del except).")
+                    "sal del except) o la variable que lo guarda (del m).")
         else:
             text = ("la grabación sigue abierta porque algún mensaje (o adjunto) que leíste de ella, o un recorrido "
                     "de messages() a medias, sigue en uso (son vistas del archivo, sin copiar). En Windows no se "
@@ -881,6 +887,14 @@ class Reader:
 def repair(source, output) -> dict:
     """Reescribe un MCAP cortado: todo lo que se pueda leer (hasta el último
     chunk completo), con su resumen e índices. Devuelve cuántos mensajes salvó."""
+    if isinstance(source, (str, os.PathLike)) and isinstance(output, (str, os.PathLike)):
+        try:
+            same = os.path.exists(output) and os.path.samefile(source, output)
+        except OSError:
+            same = False                       # la entrada no existe: Reader lo dice
+        if same:   # Writer abriría la salida con "wb" y truncaría la grabación que se está leyendo (mapeada)
+            raise ValueError(f"{os.fspath(output)}: la salida es la misma grabación que se repara; da otra ruta "
+                             f"de salida (ej. {os.path.splitext(os.fspath(output))[0]}-reparada.mcap)")
     r = Reader(source)
     try:
         out = _rewrite(r, output)         # en otra función: al cerrar ya no queda viva la variable del for
