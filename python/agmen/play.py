@@ -25,6 +25,7 @@ import struct
 import sys
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 
 from . import _mcap, clock, schema, wire
@@ -217,6 +218,7 @@ class Player:
 
     def _run(self) -> None:
         t0 = time.monotonic()
+        m = None
         try:
             shift = 0
             span = (self.t_end if self.t_end is not None else self.t_last) - self.t_start
@@ -242,8 +244,12 @@ class Player:
                 shift += span + gap
                 self.clock.seek(self.t_start + shift)
         except BaseException as e:   # noqa: BLE001 — se relanza en stop()
+            # El error se guarda con su traceback, y el traceback guarda las variables de cada función (los
+            # mensajes, vistas del archivo): sin soltarlas, reader.close() no podría soltar la grabación.
+            traceback.clear_frames(e.__traceback__)
             self.error = e
         finally:
+            m = None                 # la vista del último mensaje: que no la conserve este marco
             self.stats.seconds = time.monotonic() - t0
             if not self._stop.is_set() and self.error is None and not self.quiet:
                 print(f"[agmen] ⏹ terminó {os.path.basename(self.path)}: {self.stats.messages} mensajes; "

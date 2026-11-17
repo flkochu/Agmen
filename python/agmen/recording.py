@@ -316,6 +316,7 @@ class Recording:
     @property
     def attachments(self) -> dict[str, bytes]:
         """Los archivos adjuntos (con agmen run, el robot.toml)."""
+        self._r._check_open()
         return {a.name: bytes(a.data) for a in self._r.attachments}
 
     @property
@@ -503,6 +504,7 @@ class Recording:
         Escribe por partes (grupos de filas): una grabación de varios GB no
         tiene que caber en la memoria. Devuelve los archivos escritos."""
         _pyarrow()
+        self._r._check_open()
         import pyarrow.parquet as pq
 
         out = []
@@ -527,6 +529,7 @@ class Recording:
         if os.path.abspath(output) == os.path.abspath(self.path):
             raise ValueError("la salida es la misma grabación: dale otro nombre (ej. vuelta1-foxglove.mcap)")
         names = self._pick(topics)
+        self._r._check_open()                # antes de crear la salida
         w = _mcap.Writer(output, profile="", library=f"agmen {__version__}", compression=compression)
         n = 0
         try:
@@ -555,6 +558,11 @@ class Recording:
 
     # --- cerrar ---
     def close(self) -> None:
+        """Suelta el archivo. Lo leído sigue sirviendo (los mensajes son vistas
+        del archivo): si el programa todavía conserva alguno, el archivo no se
+        puede soltar todavía y close() lo avisa (una vez); se suelta solo en
+        cuanto nada lo use, o con otro close(). Para conservar un mensaje
+        después de cerrar, cópialo antes: copy.deepcopy(msg)."""
         self._r.close()
 
     def __enter__(self) -> "Recording":
