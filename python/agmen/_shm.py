@@ -29,6 +29,7 @@ mismos nombres y los mismos bytes.
 
 from __future__ import annotations
 
+import atexit
 import itertools
 import mmap
 import os
@@ -356,6 +357,21 @@ def sweep() -> None:
 _swept = False
 _sweep_lock = threading.Lock()
 
+# Los Pool abiertos (de este proceso o heredados de un fork): al terminar el programa (salida normal, sys.exit o
+# una excepción) se borran los nombres de los bloques y el registro de los que son de ESTE proceso, como el núcleo
+# de C++. El hijo de un fork no toca los del padre (cada Pool guarda su pid) y os._exit no corre nada (el que
+# arranque después los barre con sweep()). Sin candado: add/discard/list de un set no sueltan el GIL, y un candado
+# que un hilo del padre dejó tomado colgaría al hijo al salir.
+_open_pools: set = set()
+_exit_hook = False
+
+
+def _clean_at_exit() -> None:
+    me = os.getpid()
+    for p in list(_open_pools):
+        if p.pid == me:
+            p.unlink_all()
+
 
 # ---------------------------------------------------------------------------
 # Lado del publicador: el pool de bloques (§3.4)
@@ -408,6 +424,11 @@ class Pool:
                 self.registry = os.path.join(d, f"{os.getpid()}-{owner:016x}.txt")
             except OSError:
                 self.registry = ""
+        global _exit_hook
+        _open_pools.add(self)
+        if not _exit_hook:
+            _exit_hook = True
+            atexit.register(_clean_at_exit)
 
     def _name(self) -> str:
         # "/agm" + pid + 8 hex del publicador + contador = 24 caracteres (macOS acepta 31).
@@ -554,9 +575,25 @@ class Pool:
         except OSError:
             pass   # el registro es para limpiar si el proceso muere: nunca tumba al nodo
 
+    def unlink_all(self) -> None:
+        """Al terminar el programa: borra los nombres de sus bloques y su registro, sin desmapear (algún hilo
+        daemon puede seguir escribiendo en ellos). Si después se crea otro bloque, el registro vuelve a escribirse y
+        sweep() lo borra cuando este proceso ya no esté."""
+        if self.pid != os.getpid():
+            return
+        for b in [*self.blocks, self._probe]:
+            if b is not None and b.pid == self.pid:
+                unlink(b.name)
+        if self.registry:
+            try:
+                os.remove(self.registry)
+            except OSError:
+                pass
+
     def close(self) -> None:
         if self.pid != os.getpid():
             return   # heredado de un fork: los bloques y el registro son del padre
+        _open_pools.discard(self)
         for b in self.blocks:
             if b is not None:
                 b.close()
