@@ -1610,6 +1610,9 @@ class TestNodoConNombreRaro(unittest.TestCase):
         self.assertNotIn("bye id=x", " ".join(self.fixture.logs))        # el \r\n no coló otra línea
 
     @unittest.skipUnless(agmen._backend.NATIVE, "solo con el núcleo de C++")
+    @unittest.skipUnless(hasattr(os, "environb"),
+                         "en Windows el entorno es UTF-16 (os.environb no existe): no se le pueden poner a AGMEN_NODE "
+                         "bytes que no son UTF-8; lo que lee el núcleo de C++ depende de la página de códigos")
     def test_nombre_de_nodo_que_no_es_utf8_con_el_nucleo_el_usuario_ve_el_porque(self):
         # AGMEN_NODE con bytes que no son UTF-8 (el sistema los deja pasar): C++ los manda como %FF; el hub no
         # puede leer la línea, pero como el id sí se lee, contesta `error` y el nodo lo dice (antes: silencio).

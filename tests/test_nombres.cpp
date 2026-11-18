@@ -757,7 +757,9 @@ void test_atacan_hilos_creando_publishers_con_lista() {
     FakeHub h;
     constexpr int kHilos = 8, kPorHilo = 25;
     std::atomic<int> fallos{0};
-    std::vector<std::thread> hilos;
+    // jthread: si algo lanza en este hilo antes de los join, se esperan al destruirse (un std::thread sin join
+    // llamaría a std::terminate y el proceso moriría sin decir en qué prueba).
+    std::vector<std::jthread> hilos;
     for (int t = 0; t < kHilos; ++t) {
         hilos.emplace_back([&, t] {
             try {
@@ -807,23 +809,27 @@ void test_atacan_fugas_200_publishers_con_lista() {
     FakeHub h;
     // Un hilo vacía el socket del hub de mentira mientras se crean y destruyen (si no, el buffer del sistema se
     // llena y se pierden datagramas).
-    std::atomic<bool> fin{false};
     std::set<std::string> registrados, despedidos;
-    int pubs_total = 0;
-    std::thread lector([&] {
-        while (!fin) {
-            const auto line = h.next("", 50ms);
-            if (line.empty()) continue;
-            if (line.rfind("agmen-hub/1 pub ", 0) == 0) {
-                registrados.insert(field(line, "id"));
-                ++pubs_total;
-                h.reply(hub::line("ok", {{"id", field(line, "id")}}));   // (así el constructor no espera 100 ms)
-            } else if (line.rfind("agmen-hub/1 sub ", 0) == 0) {
-                registrados.insert(field(line, "id"));
-                h.reply(hub::line("ok", {{"id", field(line, "id")}}));
-            } else if (line.rfind("agmen-hub/1 bye ", 0) == 0) {
-                despedidos.insert(field(line, "id"));
+    std::string error_del_lector;   // lo que lanzó el lector (un hilo no puede dejar escapar una excepción)
+    // jthread: si algo lanza en este hilo antes del join, al destruirse pide parar y espera (un std::thread sin
+    // join llamaría a std::terminate y el proceso moriría sin decir en qué prueba).
+    std::jthread lector([&](std::stop_token parar) {
+        try {
+            while (!parar.stop_requested()) {
+                const auto line = h.next("", 50ms);
+                if (line.empty()) continue;
+                if (line.rfind("agmen-hub/1 pub ", 0) == 0) {
+                    registrados.insert(field(line, "id"));
+                    h.reply(hub::line("ok", {{"id", field(line, "id")}}));   // (así el constructor no espera 100 ms)
+                } else if (line.rfind("agmen-hub/1 sub ", 0) == 0) {
+                    registrados.insert(field(line, "id"));
+                    h.reply(hub::line("ok", {{"id", field(line, "id")}}));
+                } else if (line.rfind("agmen-hub/1 bye ", 0) == 0) {
+                    despedidos.insert(field(line, "id"));
+                }
             }
+        } catch (const std::exception& e) {
+            error_del_lector = e.what();
         }
     });
     {   // calienta: el primer Publisher crea recursos globales que no son fugas
@@ -841,8 +847,10 @@ void test_atacan_fugas_200_publishers_con_lista() {
         if (despues > antes) std::fprintf(stderr, "  fds antes=%d despues=%d\n", antes, despues);
         CHECK(despues <= antes);
     }
-    fin = true;
+    lector.request_stop();
     lector.join();
+    if (!error_del_lector.empty()) std::fprintf(stderr, "  el lector lanzó: %s\n", error_del_lector.c_str());
+    CHECK(error_del_lector.empty());
     // Cada uno que se registró dice `bye` al irse: ninguno queda en el hub.
     CHECK(registrados.size() >= 200);
     if (registrados != despedidos) {
@@ -865,6 +873,8 @@ void correr(const char* nombre, void (*prueba)()) {
         std::fprintf(stderr, "  FALLA %s: lanzó algo que no es std::exception\n", nombre);
         ++g_failures;
     }
+    // Si la prueba se cortó a la mitad, el nombre del nodo puede haber quedado cambiado: las demás empiezan igual.
+    set_env("AGMEN_NODE", "prueba-nombres");
     std::fflush(stderr);
 }
 

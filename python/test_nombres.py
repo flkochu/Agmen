@@ -2032,6 +2032,21 @@ class TestNombresSinDuplicar(unittest.TestCase):
                                              "máximo es 8192: usa nombres más cortos o reparte las articulaciones "
                                              "en varios grupos (un topic por grupo)")
 
+# --- nombres de nodo enormes que caben en una variable de entorno de Windows ----------------------------------------
+# En Windows una variable de entorno mide como mucho 32 767 caracteres: os.environ["AGMEN_NODE"] = "n" * 60000 da
+# ValueError (y en un subproceso, env= con ese valor tampoco sirve). Con '%', que en la línea del hub va como "%25"
+# (3 bytes por carácter, y es ASCII: mide lo mismo leído por Python y por el núcleo de C++ en cualquier página de
+# códigos), el registro pasa de 65507 bytes con menos de 25 000 caracteres: la MISMA prueba corre en Linux y Windows.
+MAX_ENV = 32766
+
+
+def nodo_que_mide(n: int) -> str:
+    """Un nombre de nodo que, escrito como va en la línea del hub (hp.quote), mide `n` bytes ((n - 4) % 3 == 0)."""
+    nodo = "nodo" + "%" * ((n - 4) // 3)
+    assert len(hp.quote(nodo)) == n and len(nodo) <= MAX_ENV, (n, len(nodo))
+    return nodo
+
+
 # --- ataques del tester: el rechazo sigue siendo un WireError, mezclas C++/Python y fugas ---------------------------
 
 class _HubPlano(unittest.TestCase):
@@ -2279,9 +2294,9 @@ print("DATAGRAMA" if grande else "NADA: " + err.getvalue().strip().replace("\n",
     def test_publisher_y_subscriber_con_nombre_de_nodo_enorme_no_se_quedan_callados(self):
         for cls in ("Publisher", "Subscriber"):
             with self.subTest(cls=cls):
-                out = self.corre(cls, "n" * 60000)
+                out = self.corre(cls, nodo_que_mide(60001))
                 self.assertTrue(out.startswith("ERROR:") or out.startswith("DATAGRAMA"),
-                                f"{cls} con names y un AGMEN_NODE de 60000 caracteres no registra nada y no lo dice "
+                                f"{cls} con names y un AGMEN_NODE de 60001 bytes en la línea no registra nada y no lo dice "
                                 f"claro (el registro mide más de 65507 bytes): {out}")
                 if out.startswith("ERROR:"):
                     self.assertIn("65507", out)
@@ -2297,19 +2312,20 @@ class TestRegistroQueNoCabe(unittest.TestCase):
     """Con o sin names, el registro de un Publisher o un Subscriber de topic debe caber en un datagrama (65507): si
     no, error claro al crear, con el mismo texto en los dos núcleos (y en C++: tests/test_nombres.cpp)."""
 
+    NODO = nodo_que_mide(70000)   # 70000 bytes en la línea, 23 336 caracteres (cabe en el entorno de Windows)
     FIX_NODO = ("Lo más largo es el nombre del nodo: usa un nombre de nodo más corto (AGMEN_NODE, o el name de su "
                 "[[node]] en robot.toml)")
 
     def setUp(self):
         self.falso = FalsoHub(self)
-        patch = mock.patch.dict(os.environ, {"AGMEN_NODE": "n" * 70000})
+        patch = mock.patch.dict(os.environ, {"AGMEN_NODE": self.NODO})
         patch.start()
         self.addCleanup(patch.stop)
 
     @staticmethod
     def esperado(cls_name: str, tipo, names=None) -> str:
         """El texto, armado aquí a mano (el mismo que arma C++)."""
-        nodo = "n" * 70000
+        nodo = TestRegistroQueNoCabe.NODO
         if cls_name == "Publisher":
             linea = hp.encode("pub", id="0" * 16, node=nodo, pid=os.getpid(), topic="/x", schema="0" * 16,
                               type=tipo.NAME, text=tipo.SCHEMA_TEXT, **({"names": ",".join(names)} if names else {}))
@@ -2355,7 +2371,7 @@ class TestRegistroQueNoCabe(unittest.TestCase):
                                                         "que Grande"), str(ctx.exception))
             self.assertIn("el nombre del nodo, 4 bytes; el esquema de Grande, ", str(ctx.exception))
         largos = [f"{'j' * 60}{i:04d}" for i in range(125)]   # 125 nombres de 64 caracteres: 8124 bytes
-        with mock.patch.dict(os.environ, {"AGMEN_NODE": "n" * 58000}):
+        with mock.patch.dict(os.environ, {"AGMEN_NODE": nodo_que_mide(58000)}):
             with self.assertRaises(ValueError) as ctx:
                 pubsub._PureSubscriber(JointCommand[125], "/x", names=largos)
             self.assertIn("names, 8124 bytes", str(ctx.exception))
@@ -2377,11 +2393,12 @@ class TestRegistroQueNoCabe(unittest.TestCase):
 
     def test_quien_cabe_registra_la_linea_de_siempre(self):
         err = io.StringIO()
-        with mock.patch.dict(os.environ, {"AGMEN_NODE": "n" * 60000}), contextlib.redirect_stderr(err):
+        nodo = nodo_que_mide(60001)
+        with mock.patch.dict(os.environ, {"AGMEN_NODE": nodo}), contextlib.redirect_stderr(err):
             p = pubsub._PurePublisher(JointCommand[2], "/x")
             self.addCleanup(p.close)
             self.assertEqual(self.falso.registro("pub"),
-                             hp.encode("pub", id=f"{p.source_id:016x}", node="n" * 60000, pid=os.getpid(), topic="/x",
+                             hp.encode("pub", id=f"{p.source_id:016x}", node=nodo, pid=os.getpid(), topic="/x",
                                        schema=f"{JointCommand[2].SCHEMA_ID:016x}", type="JointCommand",
                                        text=JointCommand[2].SCHEMA_TEXT))
 
