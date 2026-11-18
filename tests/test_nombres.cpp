@@ -12,7 +12,11 @@
 #include <agmen/agmen.hpp>
 #include <agmen/joints.hpp>
 
+#include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <map>
+#include <set>
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
@@ -445,6 +449,313 @@ void test_el_codigo_de_antes_compila() {
     CHECK(registros >= 9);
 }
 
+
+// ---------------------------------------------------------------------------
+// Ataques (tester): entradas feas, copias, hilos, fugas y la línea de siempre.
+
+/// Los dígitos de i en base 63 con el primer signo siempre válido ("a", "b", ..., "aa", "ab"...): nombres cortos
+/// y distintos.
+std::string nombre_corto(std::size_t i) {
+    static const char kAbc[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+    constexpr std::size_t base = sizeof kAbc - 1;
+    std::string out;
+    do {
+        out += kAbc[i % base];
+        i /= base;
+    } while (i != 0);
+    return out;
+}
+
+/// Los fd abiertos de este proceso (solo en Linux; -1 si no se sabe).
+int fds_abiertos() {
+#ifdef __linux__
+    int n = 0;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator("/proc/self/fd", ec)) {
+        (void)e;
+        ++n;
+    }
+    return ec ? -1 : n;
+#else
+    return -1;
+#endif
+}
+
+void test_atacan_nombres_con_bytes_raros() {
+    FakeHub h;
+    const std::vector<std::string> malos = {
+        std::string("a\0b", 3),               // byte 0 en medio
+        std::string("\0", 1),                 // solo byte 0
+        std::string("ab\0", 3),               // byte 0 al final (c_str() lo escondería)
+        "caf\xC3",                            // UTF-8 cortado
+        "\xC0\xAF",                           // sobrelargo
+        "\xED\xA0\x80",                       // sustituto
+        "\xF4\x90\x80\x80",                   // arriba de U+10FFFF
+        "\xFF\xFE",                           // BOM al revés
+        "a\r\nagmen-hub/1 bye id=x",          // intento de meter otra línea en el datagrama
+        "a\tb", "a\nb", "a%2Cb", "a%", "%41", // control, % sin escapar
+        " nbsp", " sep", "﻿bom", "á",    // espacios raros y marcas
+    };
+    for (const auto& n : malos) {
+        for (const auto& lista : {std::vector<std::string>{n}, std::vector<std::string>{"ok", n},
+                                  std::vector<std::string>{n, "ok"}}) {
+            const auto pub = wire_error([&] { agmen::PublisherCore p("/x", agmen::TypeInfo{"X", "agmen/1 X{u8 a}", 1, 1, false}, "", agmen::TopicOptions{lista}); });
+            CHECK(pub.has_value());
+            if (!pub) std::fprintf(stderr, "    (nombre aceptado: %zu bytes, primer byte 0x%02x)\n", n.size(), static_cast<unsigned>(static_cast<unsigned char>(n[0])));
+            if (pub) {
+                CHECK(pub->find('\0') == std::string::npos);                 // el error no lleva el byte 0
+                CHECK(pub->find('\x1b') == std::string::npos);
+                CHECK(pub->size() < 1000);                                    // acotado
+                for (char c : *pub) CHECK(c == '\n' ? false : (static_cast<unsigned char>(c) >= 0x20 || static_cast<unsigned char>(c) >= 0x80));
+            }
+        }
+    }
+    CHECK(!h.any("pub", 100ms));   // nada se registró
+}
+
+void test_atacan_topes_de_nombre_y_lista() {
+    using Big = m::JointState<2>;
+    FakeHub h;
+    // Un nombre de 64 caracteres entra; uno de 65, no (el error nombra el tope).
+    {
+        agmen::Publisher<Big> p("/t64", {.names = {std::string(64, 'a'), "b"}});
+        CHECK_EQ(field(h.next("pub"), "names"), std::string(64, 'a') + ",b");
+    }
+    {
+        const auto e = wire_error([&] { agmen::Publisher<Big> p("/t65", {.names = {std::string(65, 'a'), "b"}}); });
+        CHECK(e.has_value() && e->find("mide 65 caracteres y el máximo es 64") != std::string::npos);
+    }
+    // Un nombre de 64 con el primer carácter malo sigue siendo malo; 64 de '-' no empieza bien.
+    {
+        const auto e = wire_error([&] { agmen::Publisher<Big> p("/tm", {.names = {std::string(64, '-'), "b"}}); });
+        CHECK(e.has_value());
+    }
+    // Una lista de exactamente 8192 caracteres entra por Publisher y por Subscriber, y llega entera al hub.
+    std::vector<std::string> justo;
+    std::size_t largo = 0;   // con las comas
+    for (std::size_t i = 0;; ++i) {
+        const std::size_t resta = hub::kJointNamesMax - largo - (justo.empty() ? 0 : 1);   // lo que queda para nombres
+        if (resta <= 64) {
+            auto ult = nombre_corto(i) + std::string(64, 'y');
+            ult.resize(resta);
+            justo.push_back(std::move(ult));
+            break;
+        }
+        auto n = nombre_corto(i) + std::string(64, 'x');
+        n.resize(std::min<std::size_t>(64, resta - 2));
+        largo += n.size() + (justo.empty() ? 0 : 1);
+        justo.push_back(std::move(n));
+    }
+    CHECK(hub::format_joint_names(justo).size() == hub::kJointNamesMax);
+    {
+        agmen::PublisherCore p("/t8192", agmen::TypeInfo{"X", "agmen/1 X{u8 a}", 1, 1, false}, "", agmen::TopicOptions{justo});
+        CHECK_EQ(field(h.next("pub"), "names"), hub::format_joint_names(justo));
+        agmen::SubscriberCore s("/t8192", agmen::TypeInfo{"X", "agmen/1 X{u8 a}", 1, 1, false}, agmen::TopicOptions{justo});
+        CHECK_EQ(field(h.next("sub"), "names"), hub::format_joint_names(justo));
+    }
+    justo.back() += 'z';   // 8193
+    {
+        const auto e = wire_error([&] { agmen::PublisherCore p("/t8193", agmen::TypeInfo{"X", "agmen/1 X{u8 a}", 1, 1, false}, "", agmen::TopicOptions{justo}); });
+        CHECK(e.has_value() && e->find("names ocupa 8193 caracteres") != std::string::npos);
+        const auto e2 = wire_error([&] { agmen::SubscriberCore s("/t8193", agmen::TypeInfo{"X", "agmen/1 X{u8 a}", 1, 1, false}, agmen::TopicOptions{justo}); });
+        CHECK(e2.has_value() && e2->find("names ocupa 8193 caracteres") != std::string::npos);
+    }
+    CHECK(!h.any("pub", 50ms));
+    CHECK(!h.any("sub", 50ms));
+}
+
+void test_atacan_5453_articulaciones() {
+    // JointState<5453>: ¿cabe? Con los nombres más cortos posibles la lista pasa de 8192 caracteres: debe dar el
+    // error de siempre (qué pasó y qué hacer), no tirar nada ni mandar nada.
+    FakeHub h;
+    std::vector<std::string> nombres;
+    for (std::size_t i = 0; i < 5453; ++i) nombres.push_back(nombre_corto(i));
+    const auto e = wire_error([&] { agmen::Publisher<m::JointState<5453>> p("/enorme", {.names = nombres}); });
+    CHECK(e.has_value());
+    if (e) {
+        CHECK(e->find("el máximo es 8192") != std::string::npos);
+        CHECK(e->find("usa nombres más cortos o reparte las articulaciones en varios grupos") != std::string::npos);
+        CHECK(e->size() < 600);
+    }
+    // Con el número que no es: antes el error de la lista o el del número? (Python revisa la lista primero.)
+    nombres.pop_back();
+    const auto e2 = wire_error([&] { agmen::Publisher<m::JointState<5453>> p("/enorme", {.names = nombres}); });
+    CHECK(e2.has_value());
+    if (e2) CHECK(e2->find("el máximo es 8192") != std::string::npos);
+    CHECK(!h.any("pub", 100ms));
+}
+
+void test_atacan_repetido_al_final_de_una_lista_larga() {
+    FakeHub h;
+    std::vector<std::string> nombres;
+    for (std::size_t i = 0; i < 1500; ++i) nombres.push_back(nombre_corto(i));
+    CHECK(hub::format_joint_names(nombres).size() < hub::kJointNamesMax);
+    nombres.push_back(nombres.front());
+    const auto e = wire_error([&] { agmen::PublisherCore p("/larga", agmen::TypeInfo{"X", "agmen/1 X{u8 a}", 1, 1, false}, "", agmen::TopicOptions{nombres}); });
+    CHECK(e.has_value());
+    if (e) CHECK(e->find("'a' está dos veces en names (names[0] y names[1500])") != std::string::npos);
+    // Mayúsculas distintas no son repetidas.
+    agmen::PublisherCore ok("/larga", agmen::TypeInfo{"X", "agmen/1 X{u8 a}", 1, 1, false}, "", agmen::TopicOptions{{"a", "A"}});
+    CHECK_EQ(field(h.next("pub"), "names"), "a,A");
+}
+
+void test_options_copiadas_y_movidas_y_publisher_movido() {
+    using Cmd = m::JointCommand<2>;
+    FakeHub h;
+    agmen::TopicOptions o{{"cadera", "rodilla"}};
+    agmen::TopicOptions copia = o;
+    o.names[0] = "otra";                       // cambiar el original no cambia la copia
+    agmen::TopicOptions movida = std::move(copia);
+    {
+        agmen::Publisher<Cmd> p("/cp", movida);
+        CHECK_EQ(field(h.next("pub"), "names"), "cadera,rodilla");
+        movida.names.clear();                   // y borrar la fuente no toca al Publisher ya creado
+        CHECK(until_beat(h, p, " names=cadera,rodilla"));
+        // Un Publisher movido sigue latiendo con su lista.
+        agmen::Publisher<Cmd> q(std::move(p));
+        CHECK(until_beat(h, q, " names=cadera,rodilla"));
+        agmen::Publisher<Cmd> r("/cp2", {.names = {"a", "b"}});
+        (void)h.next("pub");
+        r = std::move(q);                       // asignar por movimiento: el destino cambia de lista y de topic
+        CHECK(r.topic() == "/cp");
+        CHECK(until_beat(h, r, " names=cadera,rodilla"));
+    }
+    // El mismo TopicOptions para un Subscriber y para un Publisher.
+    agmen::Subscriber<Cmd> s("/cp", o);
+    CHECK_EQ(field(h.next("sub"), "names"), "otra,rodilla");
+    // Un Subscriber movido sigue declarándose con su lista.
+    agmen::Subscriber<Cmd> s2(std::move(s));
+    const auto end = std::chrono::steady_clock::now() + 3s;
+    bool vio = false;
+    while (!vio && std::chrono::steady_clock::now() < end) {
+        (void)s2.receive(100ms);
+        const auto line = h.next("sub", 100ms);
+        vio = line.find(" names=otra,rodilla") != std::string::npos;
+    }
+    CHECK(vio);
+}
+
+void test_atacan_dos_publishers_mismo_topic_listas_distintas() {
+    using Cmd = m::JointCommand<2>;
+    FakeHub h;
+    agmen::Publisher<Cmd> a("/mismo", {.names = {"a", "b"}});
+    const auto la = h.next("pub");
+    agmen::Publisher<Cmd> b("/mismo", {.names = {"b", "a"}});
+    const auto lb = h.next("pub");
+    CHECK_EQ(field(la, "names"), "a,b");
+    CHECK_EQ(field(lb, "names"), "b,a");
+    CHECK(field(la, "id") != field(lb, "id"));
+    // Cada uno late con su propia lista (la lista no es global ni se pisa).
+    for (int i = 0; i < 2; ++i) {
+        CHECK(until_beat(h, a, " names=a,b"));
+        CHECK(until_beat(h, b, " names=b,a"));
+    }
+    // Y uno sin lista junto a uno con lista: el de sin lista sigue sin ella.
+    agmen::Publisher<Cmd> c("/mismo");
+    CHECK(h.next("pub").find("names") == std::string::npos);
+    CHECK(until_beat(h, c, std::string(wire::schema_text<Cmd>()).substr(0, 0)));   // late, sin lista
+}
+
+void test_atacan_hilos_creando_publishers_con_lista() {
+    using Cmd = m::JointCommand<2>;
+    FakeHub h;
+    constexpr int kHilos = 8, kPorHilo = 25;
+    std::atomic<int> fallos{0};
+    std::vector<std::thread> hilos;
+    for (int t = 0; t < kHilos; ++t) {
+        hilos.emplace_back([&, t] {
+            try {
+                for (int i = 0; i < kPorHilo; ++i) {
+                    const std::string topic = "/h" + std::to_string(t) + "_" + std::to_string(i);
+                    agmen::Publisher<Cmd> p(topic, {.names = {"a" + std::to_string(t), "b" + std::to_string(i)}});
+                    (void)p.publish(Cmd{});
+                }
+            } catch (...) {
+                ++fallos;
+            }
+        });
+    }
+    // Se leen en este hilo los registros mientras los otros crean (el socket del hub de mentira es de este hilo).
+    std::map<std::string, std::string> vistos;   // topic → names
+    const auto end = std::chrono::steady_clock::now() + 6s;
+    bool vivos = true;
+    while (std::chrono::steady_clock::now() < end && (vivos || true)) {
+        const auto line = h.next("pub", 200ms);
+        if (!line.empty()) vistos[field(line, "topic")] = field(line, "names");
+        if (vistos.size() == static_cast<std::size_t>(kHilos * kPorHilo)) break;
+    }
+    for (auto& t : hilos) t.join();
+    CHECK(fallos == 0);
+    CHECK(vistos.size() == static_cast<std::size_t>(kHilos * kPorHilo));
+    for (int t = 0; t < kHilos; ++t)
+        for (int i = 0; i < kPorHilo; ++i) {
+            const std::string topic = "/h" + std::to_string(t) + "_" + std::to_string(i);
+            CHECK_EQ(vistos[topic], "a" + std::to_string(t) + ",b" + std::to_string(i));   // cada uno, la suya
+        }
+}
+
+void test_atacan_sin_lista_la_linea_es_la_de_siempre_con_nombre_de_nodo_raro() {
+    using Cmd = m::JointCommand<2>;
+    FakeHub h;
+    set_env("AGMEN_NODE", "nodo con espacio y ñ=1,2");
+    {
+        agmen::Publisher<Cmd> p("/raro");
+        CHECK_EQ(h.next("pub"), pub_de_siempre<Cmd>(p.source_id(), "/raro"));
+        agmen::Publisher<Cmd> q("/raro", {.names = {"a", "b"}});
+        CHECK_EQ(h.next("pub"), pub_de_siempre<Cmd>(q.source_id(), "/raro") + " names=a,b");
+    }
+    set_env("AGMEN_NODE", "prueba-nombres");
+}
+
+void test_atacan_fugas_200_publishers_con_lista() {
+    using Cmd = m::JointCommand<2>;
+    FakeHub h;
+    // Un hilo vacía el socket del hub de mentira mientras se crean y destruyen (si no, el buffer del sistema se
+    // llena y se pierden datagramas).
+    std::atomic<bool> fin{false};
+    std::set<std::string> registrados, despedidos;
+    int pubs_total = 0;
+    std::thread lector([&] {
+        while (!fin) {
+            const auto line = h.next("", 50ms);
+            if (line.empty()) continue;
+            if (line.rfind("agmen-hub/1 pub ", 0) == 0) {
+                registrados.insert(field(line, "id"));
+                ++pubs_total;
+                h.reply(hub::line("ok", {{"id", field(line, "id")}}));   // (así el constructor no espera 100 ms)
+            } else if (line.rfind("agmen-hub/1 sub ", 0) == 0) {
+                registrados.insert(field(line, "id"));
+                h.reply(hub::line("ok", {{"id", field(line, "id")}}));
+            } else if (line.rfind("agmen-hub/1 bye ", 0) == 0) {
+                despedidos.insert(field(line, "id"));
+            }
+        }
+    });
+    {   // calienta: el primer Publisher crea recursos globales que no son fugas
+        agmen::Publisher<Cmd> p("/fuga", {.names = {"a", "b"}});
+    }
+    std::this_thread::sleep_for(200ms);
+    const int antes = fds_abiertos();
+    for (int i = 0; i < 200; ++i) {
+        agmen::Publisher<Cmd> p("/fuga" + std::to_string(i % 7), {.names = {"a", "b"}});
+        if (i % 4 == 0) agmen::Subscriber<Cmd> s("/fuga" + std::to_string(i % 7), {.names = {"a", "b"}});
+    }
+    std::this_thread::sleep_for(300ms);
+    const int despues = fds_abiertos();
+    if (antes >= 0) {
+        if (despues > antes) std::fprintf(stderr, "  fds antes=%d despues=%d\n", antes, despues);
+        CHECK(despues <= antes);
+    }
+    fin = true;
+    lector.join();
+    // Cada uno que se registró dice `bye` al irse: ninguno queda en el hub.
+    CHECK(registrados.size() >= 200);
+    if (registrados != despedidos) {
+        std::fprintf(stderr, "  registrados=%zu despedidos=%zu\n", registrados.size(), despedidos.size());
+    }
+    CHECK(registrados == despedidos);
+}
+
 }  // namespace
 
 int main() {
@@ -457,6 +768,15 @@ int main() {
     test_el_rechazo_del_hub_llega_entero();
     test_node_con_names();
     test_el_codigo_de_antes_compila();
+    test_atacan_nombres_con_bytes_raros();
+    test_atacan_topes_de_nombre_y_lista();
+    test_atacan_5453_articulaciones();
+    test_atacan_repetido_al_final_de_una_lista_larga();
+    test_options_copiadas_y_movidas_y_publisher_movido();
+    test_atacan_dos_publishers_mismo_topic_listas_distintas();
+    test_atacan_hilos_creando_publishers_con_lista();
+    test_atacan_sin_lista_la_linea_es_la_de_siempre_con_nombre_de_nodo_raro();
+    test_atacan_fugas_200_publishers_con_lista();
     if (g_failures == 0) std::printf("test_nombres: todo bien\n");
     return g_failures == 0 ? 0 : 1;
 }
