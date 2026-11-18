@@ -604,10 +604,13 @@ def _parse_joints(data: dict, topics: list[TopicConfig]) -> list[JointsConfig]:
     return out
 
 
-def _check_joints_web(joints: list[JointsConfig], web: WebConfig, table: str = "web", note: str = "") -> None:
+def _check_joints_web(joints: list[JointsConfig], web: WebConfig, table: str = "web", note: str = "",
+                      carries: dict | None = None) -> None:
     """Un topic de [[joints]] que el panel usa con otro tipo ([web.teleop] manda MotorCommand; cada
     [[web.command]], el tipo de su layout). Se llama una vez por perfil, con el [web] que usa ese perfil
-    (`table`: "web" o "profile.sim.web") y los [[joints]] que corren en él; `note` dice en qué perfil."""
+    (`table`: "web" o "profile.sim.web") y los [[joints]] que corren en él; `note` dice en qué perfil.
+    `carries` (de inherit_joint_names, del mismo perfil): también las entradas de [[mux]] que heredan la lista,
+    que llevan el tipo del topic de [[joints]] al que escribe el mux."""
     uses = []
     if web.teleop is not None:
         uses.append((f"[{table}.teleop]", web.teleop.target, "MotorCommand"))
@@ -621,6 +624,15 @@ def _check_joints_web(joints: list[JointsConfig], web: WebConfig, table: str = "
                     raise ConfigError(f"[[joints]] '{j.name}': {key} = '{topic}' es un topic de {kind}, pero "
                                       f"{who} manda {type_name} a ese topic{note}. Un topic, un tipo: usa otro "
                                       f"topic en uno de los dos")
+    own = {getattr(j, key) for j in joints for key in _JOINT_KIND}
+    for topic, carry in (carries or {}).items():
+        if topic in own or not carry.kind:
+            continue
+        for who, target, type_name in uses:
+            if target == topic and type_name != carry.kind:
+                raise ConfigError(f"'{topic}' es {carry.origin} y lleva la lista del [[joints]] '{carry.group}' "
+                                  f"(el mux reenvía {carry.kind}), pero {who} manda {type_name} a ese topic{note}. "
+                                  f"Un topic, un tipo: usa otro topic en uno de los dos")
 
 
 @dataclass
@@ -630,6 +642,7 @@ class _Carry:
     group: str
     require: bool
     origin: str
+    kind: str = ""        # el tipo del topic de [[joints]] del que viene: "JointState" o "JointCommand"
 
 
 def _short_names(names: tuple[str, ...]) -> str:
@@ -650,11 +663,14 @@ def inherit_joint_names(muxes: list[MuxConfig],
     from . import hubproto as hp
 
     carries: dict[str, _Carry] = {}
+    states = {j.state: j.name for j in joints if j.state}   # topic → su [[joints]] (lleva JointState)
     for j in joints:
         if j.state:
-            carries[j.state] = _Carry(j.names, j.name, False, f"el state del [[joints]] '{j.name}'")
+            carries[j.state] = _Carry(j.names, j.name, False, f"el state del [[joints]] '{j.name}'",
+                                      _JOINT_KIND["state"])
         if j.command:
-            carries[j.command] = _Carry(j.names, j.name, j.require_names, f"el command del [[joints]] '{j.name}'")
+            carries[j.command] = _Carry(j.names, j.name, j.require_names, f"el command del [[joints]] '{j.name}'",
+                                        _JOINT_KIND["command"])
     inherited: dict[str, InheritedNames] = {}
     changed = True
     while changed:
@@ -667,9 +683,19 @@ def inherit_joint_names(muxes: list[MuxConfig],
                 if not hp.is_topic(listen):
                     continue
                 origin = f"la entrada '{name}' del [[mux]] '{m.name}' (que escribe en '{m.output}')"
+                if out.require and states.get(listen) == out.group and m.output not in states:
+                    # El state lleva JointState y el mux reenvía comandos; y esa entrada se quedaría sin
+                    # require_names (el state no lo lleva): el comando se podría mandar sin lista por ahí. (Sin
+                    # require_names no se rechaza: test_run.TestMuxHeredaLista.test_la_misma_lista_no_es_choque lo
+                    # acepta.)
+                    raise ConfigError(
+                        f"[[mux]] '{m.name}': la entrada '{name}' escucha '{listen}', que es el state del [[joints]] "
+                        f"'{out.group}' (JointState), y la salida '{m.output}' lleva los comandos de ese grupo "
+                        f"({out.origin}): el mux reenvía comandos, no estados. Usa otro topic para esa entrada, "
+                        f"ej. topic = \"/cmd/politica\"")
                 have = carries.get(listen)
                 if have is None:
-                    carries[listen] = _Carry(out.names, out.group, out.require, origin)
+                    carries[listen] = _Carry(out.names, out.group, out.require, origin, out.kind)
                     inherited[listen] = InheritedNames(listen, out.group, out.names, out.require, m.name, name)
                     changed = True
                 elif have.names != out.names:
@@ -714,11 +740,26 @@ def old_hub_text(version: str, subject: str, fix: str) -> str | None:
 
     if not hp.version_at_least(_version.__version__, hp.NAMES_SINCE) or hp.version_at_least(version, hp.NAMES_SINCE):
         return None
-    shown = f"Agmen {version}" if hp.version_key(version) is not None else \
+    # Siempre limpia (sin caracteres de control) y acotada: la versión llega de la red o de otro proceso.
+    shown = f"Agmen {_clip(str(version).strip())}" if hp.version_key(version) is not None else \
         f"una versión de Agmen que no se entiende ({_clip(version) or 'vacía'})"
     return (f"{subject} {shown}, anterior a {hp.NAMES_SINCE}: ese agmen hub no compara los nombres de las "
             f"articulaciones (names=), así que ahí no se revisa que los nodos usen el orden de [[joints]] de "
             f"robot.toml (una lista con el orden cambiado entra sin aviso y require_names no se exige). {fix}")
+
+
+def joint_names_table(config: RobotConfig) -> dict[str, tuple[str, ...]]:
+    """{topic: lista de nombres} de los topics que llevan lista en el perfil activo (RFC 0013 D6 = d): el state y el
+    command de cada [[joints]] y las entradas de [[mux]] que la heredan. Lo que publica agmen run por su cuenta (los
+    mandos del panel, --play) la declara al hub en esos topics, como un nodo. Vacía sin [[joints]]."""
+    table: dict[str, tuple[str, ...]] = {}
+    for j in config.joints:
+        for key in _JOINT_KIND:
+            if getattr(j, key):
+                table[getattr(j, key)] = j.names
+    for e in config.inherited:
+        table.setdefault(e.topic, e.names)
+    return table
 
 
 def _clip(text, limit: int = 40) -> str:
@@ -977,6 +1018,7 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
     active = raw_tables.get(profile, {})
     skipped_nodes = [n for n in nodes if not _runs_in(n.profiles, profile)]
     nodes = [n for n in nodes if _runs_in(n.profiles, profile)]
+    mux_all = mux_configs
     mux_configs = [m for m in mux_configs if _runs_in(m.profiles, profile)]
     topics = [t for t in topics if _runs_in(t.profiles, profile)]
     joints = [j for j in joints_all if _runs_in(j.profiles, profile)]
@@ -998,8 +1040,15 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
         web_x = web if x == profile else (_parse_web(table_x["web"], base_dir, f"[profile.{x}.web]") if own
                                           else top_web)
         note = "" if x == profile else f" (en el perfil '{x}', que se revisa aunque ahora uses '{profile}')"
-        _check_joints_web([j for j in joints_all if _runs_in(j.profiles, x)], web_x,
-                          f"profile.{x}.web" if own else "web", note)
+        joints_x = [j for j in joints_all if _runs_in(j.profiles, x)]
+        if x == profile:
+            carries_x = carries
+        else:
+            try:   # (un choque de listas en otro perfil se dice al usar ese perfil, no aquí)
+                _, carries_x, _ = inherit_joint_names([m for m in mux_all if _runs_in(m.profiles, x)], joints_x)
+            except ConfigError:
+                carries_x = None
+        _check_joints_web(joints_x, web_x, f"profile.{x}.web" if own else "web", note, carries_x)
 
     top_clock = data.get("clock", {})
     if "clock" in active:
@@ -1172,7 +1221,7 @@ def prepare_hub(config: RobotConfig, ping=None) -> tuple[RobotConfig, str]:
         if old is not None:
             from dataclasses import replace
             config = replace(config, warnings=[*config.warnings, old])
-        return config, f"usando el agmen hub {alive} que ya corre en {hub_address()}{note}"
+        return config, f"usando el agmen hub {_clip(alive)} que ya corre en {hub_address()}{note}"
     args = ["-m", "agmen", "hub", "--listen", hub_address(), "--robot", config.name]
     for t in config.topics:
         args += ["--expect", f"{t.name}={t.type}" if t.type else t.name]

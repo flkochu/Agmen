@@ -1901,6 +1901,68 @@ class TestMuxHeredaFormasRaras(unittest.TestCase):
         self.assertIn("entradas de [[mux]]", str(ctx.exception))
 
 
+class TestMuxEntradaEsElState(unittest.TestCase):
+    """Una entrada de [[mux]] que es el state del mismo grupo cuya salida es el command (con require_names): esa
+    entrada se quedaría sin require_names. Es un error de robot.toml, dicho al cargar."""
+
+    load = TestJoints.load
+    assertConfigError = TestJoints.assertConfigError
+
+    def test_entrada_state_y_salida_command_con_require_names_es_error(self):
+        texto = MINIMO + joints(require_names=True) + mux("ruedas", "/patas/cmd", ("eco", "/patas/estado", 1))
+        texto_error = self.assertConfigError(
+            texto, "[[mux]] 'ruedas'", "la entrada 'eco'", "'/patas/estado', que es el state del [[joints]] 'patas'",
+            "el mux reenvía comandos, no estados", "Usa otro topic para esa entrada")
+        self.assertNotIn("Traceback", texto_error)
+
+    def test_tambien_si_la_salida_hereda_el_comando_por_otro_mux(self):
+        texto = (MINIMO + joints(require_names=True) + mux("m1", "/patas/cmd", ("a", "/c/a", 1))
+                 + mux("m2", "/c/a", ("eco", "/patas/estado", 1)))
+        self.assertConfigError(texto, "[[mux]] 'm2'", "la entrada 'eco'", "state del [[joints]] 'patas'")
+
+    def test_sin_require_names_sigue_valiendo(self):
+        # (lo pide test_la_misma_lista_no_es_choque: la misma lista, sin nada que exigir)
+        self.load(MINIMO + joints() + mux("m1", "/patas/cmd", ("e", "/patas/estado", 1)))
+
+    def test_la_salida_es_el_state_no_es_este_error(self):
+        cfg = self.load(MINIMO + joints(require_names=True) + mux("eco", "/patas/estado", ("a", "/eco/a", 1)))
+        self.assertEqual([e.topic for e in cfg.inherited], ["/eco/a"])
+
+
+class TestPanelYEntradasHeredadas(unittest.TestCase):
+    """_check_joints_web también mira las entradas de [[mux]] que heredan la lista (RFC 0013 D6 = d): llevan el tipo
+    del topic de [[joints]] al que escribe el mux. Y joint_names_table, la tabla que agmen run le pasa al panel y a
+    --play."""
+
+    load = TestJoints.load
+    assertConfigError = TestJoints.assertConfigError
+
+    def test_teleop_hacia_una_entrada_heredada_es_error(self):
+        texto = MINIMO + joints() + mux("ruedas", "/patas/cmd", ("ia", "/cmd/ia", 1)) + \
+            '\n[web.teleop]\ntarget = "/cmd/ia"\n'
+        self.assertConfigError(texto, "'/cmd/ia' es la entrada 'ia' del [[mux]] 'ruedas'",
+                               "lleva la lista del [[joints]] 'patas' (el mux reenvía JointCommand)",
+                               "[web.teleop] manda MotorCommand a ese topic", "Un topic, un tipo")
+
+    def test_teleop_hacia_una_entrada_heredada_en_otro_perfil_tambien(self):
+        texto = (MINIMO + joints(profile="sim") + mux("ruedas", "/patas/cmd", ("ia", "/cmd/ia", 1),
+                                                      extra='profile = "sim"\n')
+                 + '\n[web.teleop]\ntarget = "/cmd/ia"\n')
+        self.assertConfigError(texto, "[web.teleop] manda MotorCommand", "en el perfil 'sim'")
+
+    def test_teleop_a_otro_topic_vale(self):
+        self.load(MINIMO + joints() + mux("ruedas", "/patas/cmd", ("ia", "/cmd/ia", 1))
+                  + '\n[web.teleop]\ntarget = "/teleop"\n')
+
+    def test_la_tabla(self):
+        from agmen.run import joint_names_table
+
+        cfg = self.load(MINIMO + joints() + mux("ruedas", "/patas/cmd", ("ia", "/cmd/ia", 1),
+                                                ("t", "127.0.0.1:7510", 2)))
+        self.assertEqual(joint_names_table(cfg), {t: tuple(PATAS) for t in ("/patas/estado", "/patas/cmd", "/cmd/ia")})
+        self.assertEqual(joint_names_table(self.load(MINIMO)), {})
+
+
 def hub_cmd(cfg):
     """[la línea de comandos del agmen hub] (en una lista, para usar next/[0])."""
     from agmen.run import prepare_hub
@@ -2056,11 +2118,11 @@ class TestVersionesRaras(unittest.TestCase):
             hp.version_at_least(v, hp.NAMES_SINCE)
         self.assertLess(time.perf_counter() - t0, 1.0)
 
-    def test_FALLA_REAL_el_texto_del_aviso_no_tiene_caracteres_de_control(self):
+    def test_el_texto_del_aviso_no_tiene_caracteres_de_control(self):
         """FALLA REAL. old_hub_text(version="0.14.0\\n") copia la versión tal cual (version_key hace strip() y la
         entiende, pero el texto usa la original): salen \\n, \\r, \\x0b, \\x1c, \\x85 en el aviso. Esperado: nada
         que no se pueda imprimir, como con las versiones que no se entienden (_clip).
-        Reproducir: python -m unittest test_run.TestVersionesRaras.test_FALLA_REAL_el_texto_del_aviso_no_tiene_"""
+        Reproducir: python -m unittest test_run.TestVersionesRaras.test_el_texto_del_aviso_no_tiene_"""
         "caracteres_de_control"
         from agmen.run import old_hub_text
 
@@ -2075,10 +2137,10 @@ class TestVersionesRaras(unittest.TestCase):
             t = old_hub_text(v, "x tiene", "y")
             self.assertEqual([c for c in t if not c.isprintable()], [], repr(t))
 
-    def test_FALLA_REAL_el_texto_del_aviso_no_crece_sin_tope(self):
+    def test_el_texto_del_aviso_no_crece_sin_tope(self):
         """FALLA REAL. Una versión que sí se entiende pero trae un sufijo de 5000 letras ("0.14.0-aaaa…") se copia
         entera al aviso (5272 caracteres). Las que no se entienden sí se recortan a 40 (_clip). Esperado: tope.
-        Reproducir: python -m unittest test_run.TestVersionesRaras.test_FALLA_REAL_el_texto_del_aviso_no_crece_"""
+        Reproducir: python -m unittest test_run.TestVersionesRaras.test_el_texto_del_aviso_no_crece_"""
         "sin_tope"
         from agmen.run import old_hub_text
 
@@ -2088,10 +2150,10 @@ class TestVersionesRaras(unittest.TestCase):
                 t = old_hub_text(v, "x tiene", "y")
                 self.assertLess(len(t), 1000, f"el aviso mide {len(t)} caracteres con una versión de {len(v)}")
 
-    def test_FALLA_REAL_aviso_en_connect_con_version_enorme_o_con_controles(self):
+    def test_aviso_en_connect_con_version_enorme_o_con_controles(self):
         """FALLA REAL (la misma causa, por el camino de una [[machine]]: cli._connect). Solo falla con "0.14.0-dev\\n";
         con 5000 'x', con escapes y con vacío el aviso sale limpio.
-        Reproducir: python -m unittest test_run.TestVersionesRaras.test_FALLA_REAL_aviso_en_connect_con_version_"""
+        Reproducir: python -m unittest test_run.TestVersionesRaras.test_aviso_en_connect_con_version_"""
         "enorme_o_con_controles"
         from types import SimpleNamespace
         from unittest import mock
@@ -2159,9 +2221,9 @@ class TestVersionesRaras(unittest.TestCase):
             self.assertEqual(len(avisos), esperadas, dicho)
             self.assertEqual(len({a.split(" ")[1] for a in avisos}), esperadas)    # una por nombre de computadora
 
-    def test_FALLA_REAL_hub_local_viejo_con_version_rara_o_enorme(self):
+    def test_hub_local_viejo_con_version_rara_o_enorme(self):
         """FALLA REAL (la misma causa, por el camino del hub local que ya corría: prepare_hub). Solo falla con
-        "0.14.0-dev\\n". Reproducir: python -m unittest test_run.TestVersionesRaras.test_FALLA_REAL_hub_local_viejo_"""
+        "0.14.0-dev\\n". Reproducir: python -m unittest test_run.TestVersionesRaras.test_hub_local_viejo_"""
         "con_version_rara_o_enorme"
         from agmen.run import prepare_hub
 

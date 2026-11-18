@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 
 from . import _mcap, clock, schema, wire
 from . import hubproto as hp
-from .pubsub import ANNOUNCE_EVERY_S, _PurePublisher
+from .pubsub import ANNOUNCE_EVERY_S, _PurePublisher, declared_names
 
 _OFF_CLOCK = 60          # el campo `clock` del sobre (RFC 0001 §3)
 _OFF_T = 40              # t_data (i64) y luego t_pub (i64)
@@ -49,11 +49,12 @@ class _ReplayPublisher(_PurePublisher):
     """Un publicador que manda paquetes ya armados (los de la grabación), con el
     source_id que tenían. Uno por (topic, source_id) grabado."""
 
-    def __init__(self, rtype: _RecordedType, topic: str, source_id: int) -> None:
+    def __init__(self, rtype: _RecordedType, topic: str, source_id: int, names=None) -> None:
         # El source_id va desde el constructor: si se cambiara después, un suscriptor
         # que ya se conectó (en los 0.1 s que se espera al hub) tendría bloques de
         # memoria compartida con otro dueño, y los rechazaría (RFC 0009).
-        super().__init__(rtype, topic, source_id=source_id)
+        # `names`: la lista de [[joints]] del topic (RFC 0013 D6 = d), la que agmen run --play le pasa.
+        super().__init__(rtype, topic, source_id=source_id, names=names)
 
     def send_packet(self, data) -> bool:
         if self._link is not None:
@@ -89,7 +90,10 @@ class Player:
 
     def __init__(self, path: str, topics=None, *, rate: float = 1.0, loop: bool = False,
                  start: float | None = None, end: float | None = None, publish_clock: bool = True,
-                 paused: bool = False, quiet: bool = False, out=None) -> None:
+                 paused: bool = False, quiet: bool = False, out=None, names=None) -> None:
+        """`names`: {topic: lista de [[joints]]} (RFC 0013 D6 = d; agmen run --play la pasa): al reproducir sobre uno
+        de esos topics, el publicador declara la lista al hub, como el nodo que se grabó."""
+        self.names: dict[str, tuple[str, ...]] = dict(names or {})
         if rate <= 0:
             raise ValueError("--rate debe ser mayor que 0 (2 = el doble de rápido)")
         if not os.path.isfile(path):
@@ -199,7 +203,9 @@ class Player:
         pub = self._pubs.get(key)
         if pub is None:
             hp.check_topic(channel.topic)
-            pub = self._pubs[key] = _ReplayPublisher(self._types[channel.id], channel.topic, source_id)
+            rtype = self._types[channel.id]
+            names = declared_names(self.names, channel.topic, rtype.SCHEMA_TEXT)
+            pub = self._pubs[key] = _ReplayPublisher(rtype, channel.topic, source_id, names)
         return pub
 
     def _wait_until(self, target: int) -> bool:

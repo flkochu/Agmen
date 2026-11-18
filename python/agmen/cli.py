@@ -128,7 +128,7 @@ def cmd_run(args) -> int:
 
 def _run(args) -> int:
     from .panel import Panel, Teleop
-    from .run import ConfigError, Launcher, load_config, prepare_hub
+    from .run import ConfigError, Launcher, joint_names_table, load_config, prepare_hub
 
     _ctrl_break_like_ctrl_c()   # mientras lee el archivo: Ctrl+Break como Ctrl+C (luego, _CtrlC)
 
@@ -202,7 +202,8 @@ def _run(args) -> int:
 
             try:
                 with ctrl_c.interruptible():   # una grabación cortada se recorre entera: puede tardar
-                    player = Player(args.play, args.play_topic or None, paused=True)
+                    player = Player(args.play, args.play_topic or None, paused=True,
+                                    names=joint_names_table(config))
             except KeyboardInterrupt:
                 if player is not None:
                     player.stop()
@@ -348,7 +349,8 @@ def _run(args) -> int:
 
             try:
                 with ctrl_c.interruptible():   # una grabación cortada se recorre entera: puede tardar
-                    player = Player(args.play, args.play_topic or None, paused=True, out=out)
+                    player = Player(args.play, args.play_topic or None, paused=True, out=out,
+                                    names=joint_names_table(config))
             except KeyboardInterrupt:
                 return cancel_before_nodes("mientras abría la grabación")
             except (ValueError, OSError) as e:
@@ -862,10 +864,13 @@ def _commands_for(config) -> list:
     from .mux import state_topic
     from .panel.command import Command
     from .panel.server import panel_node_name
+    from .pubsub import declared_names
+    from .run import joint_names_table
 
+    table = joint_names_table(config)   # RFC 0013 D6 = d: hacia un topic con lista, el mando la declara
     out = []
     for cfg in config.web.commands:
-        c = Command(cfg, node=panel_node_name())
+        c = Command(cfg, node=panel_node_name(), names=declared_names(table, cfg.target, cfg.layout.text))
         for m in config.muxes:
             inp = next((i for i in m.inputs if i[1] == cfg.target), None)
             if inp is not None:

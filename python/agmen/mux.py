@@ -60,7 +60,7 @@ from dataclasses import dataclass
 
 from . import hubproto as hp
 from . import schema, wire
-from .pubsub import RawPublisher, RawSubscriber
+from .pubsub import RawPublisher, RawSubscriber, joint_names_for
 
 
 @dataclass
@@ -114,7 +114,8 @@ class Mux:
             if not hp.is_topic(output):
                 raise ValueError(f"--names va con una salida que es un topic (la lista se le declara al hub), y "
                                  f"'{output}' es una dirección. Usa un topic en --out, o no pases --names")
-            names = hp.check_joint_names(names, "--names")
+            # La misma revisión que un Publisher (también rechaza set y dict: no tienen orden fijo).
+            names = joint_names_for(None, output, names, "Mux", "--names")
         self.names: tuple[str, ...] | None = names
         labels = [i.name for i in inputs]
         if len(set(labels)) != len(labels):
@@ -348,7 +349,12 @@ class Mux:
         if who is None or who.name != inp.name:
             self.dropped[inp.name] += 1
             return False
-        self._forward(data, self.out_seq)
+        try:
+            self._forward(data, self.out_seq)
+        except wire.HubRejected as e:   # el hub no dejó registrar la salida: se dice igual que en una entrada
+            self._error(inp, f"{e}. Mientras el hub rechace la salida, nada llega a '{self.output}': pasa --names "
+                             f"con la lista de [[joints]] de robot.toml, en ese orden (agmen run la pone sola)")
+            return False
         self.out_seq += 1
         self.forwarded[inp.name] += 1
         return True
@@ -423,7 +429,9 @@ def main(args) -> int:
             try:
                 names = hp.parse_joint_names(names_arg)
             except hp.ProtocolError as e:
-                raise ValueError(f"--names {names_arg[:80]}{'…' if len(names_arg) > 80 else ''}: {e}") from None
+                # El argumento, acotado y sin caracteres de control (como los demás textos de nombres: '?').
+                shown = "".join(c if c.isprintable() else "?" for c in names_arg[:80])
+                raise ValueError(f"--names {shown}{'…' if len(names_arg) > 80 else ''}: {e}") from None
         mux = Mux(inputs, args.out, args.hold_ms, log, state=getattr(args, "state", None),
                   name=getattr(args, "name", "") or os.environ.get("AGMEN_NODE", ""), names=names)
     except (ValueError, OSError) as e:

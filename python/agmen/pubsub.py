@@ -111,11 +111,12 @@ def node_name() -> str:
     return base if base and base not in ("-", "-c", "-m", "__main__") else f"python-{os.getpid()}"
 
 
-def joint_names_for(msg_type, where: str, names, who: str) -> tuple[str, ...] | None:
+def joint_names_for(msg_type, where: str, names, who: str, what: str = "names") -> tuple[str, ...] | None:
     """names= de un Publisher o Subscriber (RFC 0013 §3.4, D6 = d), revisada al crear: una lista de nombres válidos,
     sin repetir, dentro de los topes (hp.check_joint_names) y, si el esquema dice cuántas articulaciones son
     (`f32[N] position`, como JointState[N] y JointCommand[N]), con N nombres. None si no se pasó. `msg_type` None:
-    sin tipo conocido (RawPublisher, RawSubscriber), el número no se revisa aquí (lo avisa el hub)."""
+    sin tipo conocido (RawPublisher, RawSubscriber, Mux), el número no se revisa aquí (lo avisa el hub). `what`: cómo
+    se llama la lista en los errores ("--names" en el mux)."""
     if names is None:
         return None
     if not hp.is_topic(where):
@@ -123,11 +124,11 @@ def joint_names_for(msg_type, where: str, names, who: str) -> tuple[str, ...] | 
                          f"'{where}' no es un topic. Usa un topic, ej. '/patas/cmd', o no pases names=")
     if isinstance(names, (collections.abc.Set, collections.abc.Mapping)):
         kind = type(names).__name__
-        raise TypeError(f"{who} en '{where}': names debe ser una lista o una tupla, en el orden de los arreglos: un "
-                        f"{kind} no tiene orden fijo y el orden es justo lo que el hub compara. Pasa, por ejemplo, "
-                        f"names=['cadera', 'rodilla']")
+        raise TypeError(f"{who} en '{where}': {what} debe ser una lista o una tupla, en el orden de los arreglos: "
+                        f"un {kind} no tiene orden fijo y el orden es justo lo que el hub compara. Pasa, por "
+                        f"ejemplo, names=['cadera', 'rodilla']")
     try:
-        out = hp.check_joint_names(names)
+        out = hp.check_joint_names(names, what)
     except hp.ProtocolError as e:
         bad_kind = isinstance(names, (str, bytes, bytearray)) or not hasattr(names, "__iter__")
         raise (TypeError if bad_kind else ValueError)(f"{who} en '{where}': {e}") from None
@@ -137,6 +138,18 @@ def joint_names_for(msg_type, where: str, names, who: str) -> tuple[str, ...] | 
                          f"{msg_type.NAME} es de {n} articulaciones (f32[{n}] position): pasa un nombre por "
                          f"articulación, en el orden de los arreglos")
     return out
+
+
+def declared_names(table, topic: str, schema_text: str) -> tuple[str, ...] | None:
+    """La lista que declara al hub quien publica en `topic` por agmen run (el panel, --play): la de `table` ({topic:
+    lista de [[joints]]}, ver run.joint_names_table), o None si el topic no lleva lista. También None si el tipo dice
+    otro número de articulaciones (`f32[N] position`) que la lista: entonces se publica sin lista, como antes, y el
+    hub avisa que el número no coincide (declararla haría fallar al Publisher al crearse)."""
+    names = (table or {}).get(topic)
+    if names is None:
+        return None
+    n = hp.schema_joint_count(schema_text)
+    return None if n is not None and n != len(names) else tuple(names)
 
 
 # El puerto más largo que puede tener un Subscriber en su registro: el tamaño se mide antes de abrir nada, con el
@@ -1309,6 +1322,8 @@ class RawPublisher(_NetSend):
         # Antes de abrir nada: una lista que no sirve no deja sockets abiertos.
         self.names = joint_names_for(None, topic, names, "RawPublisher") if names is not None else None
         self._fit_warned = False    # ¿ya se dijo que el registro no cabe en un datagrama? (una vez)
+        self._fit_key: tuple | None = None          # lo último que se midió (esquema, tipo, nodo)…
+        self._fit_error: ValueError | None = None   # …y si no cabía, por qué
         self.topic = topic
         self.topic_id = wire.topic_id(topic)
         self._init_net(_net_ip())   # antes de abrir nada: si AGMEN_NET_IP no sirve, error claro
@@ -1352,9 +1367,18 @@ class RawPublisher(_NetSend):
         node = node_name()
         # El registro debe caber en un datagrama: si no, el hub nunca lo vería (y el envío fallaría callado). Se
         # dice una vez, claro, y el RawPublisher sigue vivo sin registrarse (el mux sigue arbitrando).
-        try:
-            check_registration_fits("pub", "RawPublisher", self.topic, node, name, text, self.names)
-        except ValueError as e:   # (hp.ProtocolError también es un ValueError)
+        # Se mide una vez por lo que entra en la línea (esquema, tipo, nodo): el mux llama aquí con cada anuncio que
+        # reenvía, y mientras no cabe no hace falta volver a medir lo mismo.
+        key = (text, name, node)
+        if key != self._fit_key:
+            try:
+                check_registration_fits("pub", "RawPublisher", self.topic, node, name, text, self.names)
+                self._fit_error = None
+            except ValueError as e:   # (hp.ProtocolError también es un ValueError)
+                self._fit_error = e
+            self._fit_key = key
+        if self._fit_error is not None:
+            e = self._fit_error
             if not self._fit_warned:
                 self._fit_warned = True
                 print(f"[agmen] ⚠ {e}. Mientras tanto no me registro en el hub: lo que reenvío a '{self.topic}' "
@@ -1405,8 +1429,9 @@ class RawPublisher(_NetSend):
                                 if d not in self.dests and self.schema_text:
                                     self._send_any(self._announcement(), d)   # por el mismo camino que sus datos
                             self.dests = new
-                        elif op == "error":
-                            self._link.error = f.get("msg")
+                            self._link.error = None
+                        elif op == "error":   # como en un Publisher: send() lo levanta como HubRejected
+                            self._link.error = f.get("msg", "error del hub")
             except hp.ProtocolError:
                 pass
 
@@ -1415,7 +1440,9 @@ class RawPublisher(_NetSend):
 
     def send(self, packet: bytes | bytearray) -> bool:
         """Manda un paquete de datos ya armado (topic_id y source_id se reescriben aquí). Devuelve False
-        si no se pudo entregar a nadie (lo que no salió hacia otra computadora se cuenta en unreachable)."""
+        si no se pudo entregar a nadie (lo que no salió hacia otra computadora se cuenta en unreachable).
+        Si el hub rechazó el registro (otra lista de nombres, require_names…), wire.HubRejected con su texto,
+        como publish() de un Publisher: no se manda nada."""
         # Todo el envío va con el candado: close() cierra los sockets con él, así que nunca los cierra
         # debajo de un sendto() en curso (lo vio ThreadSanitizer: close() contra sendto()). Un envío UDP
         # tarda microsegundos; quien llega con el RawPublisher ya cerrado recibe "ya se cerró".
@@ -1426,6 +1453,9 @@ class RawPublisher(_NetSend):
             if self._closed:
                 raise RuntimeError(_RAWPUB_CERRADO)
             self._drain()
+            error = self._link.error if self._link is not None else None
+            if error:
+                raise wire.HubRejected(f"el hub rechazó publicar en '{self.topic}': {error}")
             dests = list(self.dests)
             remote = self._remote
             now = time.monotonic()

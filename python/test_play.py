@@ -1017,5 +1017,151 @@ class TestRelojReplay(unittest.TestCase):
             srv.close()
 
 
+# --- --play sobre un topic de [[joints]] (RFC 0013 D6 = d): la reproducción declara la lista -------------------------
+
+NOMBRES3 = ("cadera", "rodilla", "tobillo")
+
+
+def grabacion_de_patas(path: str, n: int = 40, topic: str = "/patas/cmd") -> None:
+    """Una grabación con JointCommand[3] en `topic`, uno cada 50 ms (como la de una política)."""
+    from agmen.msgs import JointCommand
+
+    T = JointCommand[3]
+    w = _mcap.Writer(path, profile="agmen")
+    ch = w.add_channel(topic, "agmen", w.add_schema("JointCommand", "agmen", T.SCHEMA_TEXT.encode()))
+    for i in range(n):
+        t = T0 + i * STEP
+        m = T()
+        m.position, m.kp, m.kd = [float(i)] * 3, [1.0] * 3, [0.1] * 3
+        w.add_message(ch, t, t, i, wire.encode(m, i, t, t, topic=topic, source_id=0x3333, clock=wire.CLOCK_REAL))
+    w.close()
+
+
+class TestPlayConNombres(unittest.TestCase):
+    """Player(names=...) con un hub que exige la lista (require_names): llega y el hub no se queja."""
+
+    def setUp(self):
+        from agmen.msgs import JointCommand
+
+        self.T = JointCommand[3]
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.dir, ignore_errors=True))
+        self.path = os.path.join(self.dir, "patas.mcap")
+        grabacion_de_patas(self.path)
+        self.log: list[str] = []
+        self.hub = hubmod.Hub("127.0.0.1:0", log=self.log.append,
+                              joints=[hubmod.JointNames("/patas/cmd", NOMBRES3, True)])
+        parar = threading.Event()
+        threading.Thread(target=self.hub.serve, args=(parar,), daemon=True).start()
+        self.addCleanup(parar.set)
+        p = mock.patch.dict(os.environ, {"AGMEN_HUB": f"127.0.0.1:{self.hub.sock.getsockname()[1]}"})
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(clock.configure, clock.REAL)
+
+    def reproducir(self, names) -> int:
+        sub = agmen.Subscriber(self.T, "/patas/cmd")
+        self.addCleanup(sub.close)
+        p = play.Player(self.path, quiet=True, names=names)
+        p.start()
+        got = []
+        until = time.monotonic() + 4
+        while time.monotonic() < until and not p.wait(0):
+            s = sub.receive(0.05)
+            if s is not None:
+                got.append(s)
+        p.stop()
+        return len(got)
+
+    def test_con_la_lista_llega_y_el_hub_no_rechaza_ni_avisa(self):
+        self.assertGreater(self.reproducir({"/patas/cmd": NOMBRES3}), 10, self.log)
+        texto = "\n".join(self.log)
+        self.assertNotIn("rechaz", texto)
+        self.assertNotIn("sin declarar su lista de nombres", texto)
+
+    def test_sin_la_lista_el_hub_la_exige_y_no_llega(self):
+        """(El contraste: sin names, como antes, require_names deja fuera a la reproducción.)"""
+        self.assertEqual(self.reproducir(None), 0, self.log)
+
+    def test_otro_numero_de_articulaciones_va_sin_lista(self):
+        p = play.Player(self.path, quiet=True, names={"/patas/cmd": ("a", "b")})
+        self.addCleanup(p.stop)
+        p.start()
+        self.assertTrue(until_true(lambda: p._pubs, 3))
+        self.assertIsNone(next(iter(p._pubs.values())).names)
+
+
+def until_true(cond, seg):
+    end = time.monotonic() + seg
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.02)
+    return bool(cond())
+
+
+LECTOR_PATAS = """
+import time, agmen
+from agmen.msgs import JointCommand
+sub = agmen.Subscriber(JointCommand[3], "/patas/cmd")
+end = time.monotonic() + 60
+try:
+    while time.monotonic() < end:
+        if sub.receive(0.2) is not None:
+            print("VISTO", flush=True)
+            time.sleep(0.5)
+except KeyboardInterrupt:
+    pass
+"""
+
+
+class TestAgmenRunPlayConNombres(unittest.TestCase):
+    """agmen run --play sobre el command de un [[joints]] con require_names: agmen run le pasa la lista al
+    reproductor, la reproducción llega al nodo y el hub no rechaza ni avisa."""
+
+    def test_llega_y_sin_aviso(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        grabacion_de_patas(os.path.join(d, "patas.mcap"), n=200)
+        with open(os.path.join(d, "lector.py"), "w", encoding="utf-8") as f:
+            f.write(LECTOR_PATAS)
+        toml = os.path.join(d, "robot.toml")
+        with open(toml, "w", encoding="utf-8") as f:
+            f.write('[robot]\nname = "r"\n\n[[node]]\nname = "lector"\ncmd = ["python", "lector.py"]\n\n'
+                    '[[joints]]\nname = "patas"\ncommand = "/patas/cmd"\nnames = ["cadera", "rodilla", "tobillo"]\n'
+                    'require_names = true\n\n[web]\nenabled = false\n')
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("127.0.0.1", 0))
+        hub = f"127.0.0.1:{s.getsockname()[1]}"
+        s.close()
+        env = {**os.environ, "PYTHONPATH": str(ROOT / "python"), "PYTHONIOENCODING": "utf-8", "NO_COLOR": "1",
+               "AGMEN_HUB": hub}
+        kw = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
+        p = subprocess.Popen([sys.executable, "-m", "agmen", "run", toml, "--no-browser", "--play",
+                              os.path.join(d, "patas.mcap")], env=env, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", cwd=d, **kw)
+        lines: list[str] = []
+        reader = threading.Thread(target=lambda: lines.extend(iter(p.stdout.readline, "")), daemon=True)
+        reader.start()
+        end = time.monotonic() + 40
+        while time.monotonic() < end and p.poll() is None and "VISTO" not in "".join(lines):
+            time.sleep(0.1)
+        time.sleep(0.5)
+        if p.poll() is None:
+            p.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
+        try:
+            p.wait(30)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+        reader.join(5)
+        p.stdout.close()
+        out = "".join(lines)
+        self.assertIn("VISTO", out)
+        self.assertNotIn("rechaz", out)
+        self.assertNotIn("sin declarar su lista de nombres", out)
+        self.assertNotIn("Traceback", out)
+
+
 if __name__ == "__main__":
     unittest.main()

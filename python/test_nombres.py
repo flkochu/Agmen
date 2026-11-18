@@ -2826,10 +2826,10 @@ class TestMuxALaMano(unittest.TestCase):
                 self.assertNotIn("\x1b", r.stderr)
                 self.assertLess(len(r.stderr), 600)               # una lista enorme no se copia entera al error
 
-    def test_FALLA_REAL_el_error_no_repite_los_caracteres_de_control_del_argumento(self):
+    def test_el_error_no_repite_los_caracteres_de_control_del_argumento(self):
         """FALLA REAL (menor). `agmen mux --names $'a\\x1b[31m'`: el error repite el argumento tal cual, con el ESC
         crudo (los demás textos de nombres sí los cambian por '?'). Esperado: sin caracteres de control en stderr.
-        Reproducir: python -m unittest test_nombres.TestMuxALaMano.test_FALLA_REAL_el_error_no_repite_los_"""
+        Reproducir: python -m unittest test_nombres.TestMuxALaMano.test_el_error_no_repite_los_"""
         "caracteres_de_control_del_argumento"
         r = self.mux_corto("--out", "/patas/cmd", "--names", "a\x1b[31m")
         self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
@@ -2891,13 +2891,13 @@ class TestMuxALaMano(unittest.TestCase):
         self.assertIn("pasa names= en el orden de [[joints]] de robot.toml", "".join(out))
         self.assertIsNone(p.poll())
 
-    def test_FALLA_REAL_salida_del_mux_rechazada_por_el_hub_no_se_queda_callada(self):
+    def test_salida_del_mux_rechazada_por_el_hub_no_se_queda_callada(self):
         """FALLA REAL (nunca fallar en silencio, VISION §3.1). Un mux a mano con la lista en otro orden que la que el
         hub tiene para su SALIDA (/patas/cmd): el hub rechaza el registro del RawPublisher (la lista de la entrada
         no cuenta aquí), nada llega a /patas/cmd, y el mux solo dice "declaro al hub la lista…" y luego
         "reenviados=N"; RawPublisher guarda el error en _link.error y nadie lo lee. El hub tampoco lo muestra.
         Esperado: el mux (o el hub) dice que el hub rechazó la salida y qué hacer.
-        Reproducir: python -m unittest test_nombres.TestMuxALaMano.test_FALLA_REAL_salida_del_mux_rechazada_por_"""
+        Reproducir: python -m unittest test_nombres.TestMuxALaMano.test_salida_del_mux_rechazada_por_"""
         "el_hub_no_se_queda_callada"
         hub = HubProceso(self, "--names", f"/patas/cmd={','.join(PATAS)}")
         p, out = _mux_a_mano(self, hub.addr, names=",".join(reversed(PATAS)))
@@ -2911,11 +2911,11 @@ class TestMuxALaMano(unittest.TestCase):
         self.assertRegex(todo, r"(?i)rechaz|declara .* y robot.toml dice",
                          f"nadie dijo que el hub rechazó la salida del mux:\n{todo}")
 
-    def test_FALLA_REAL_mux_viejo_sin_names_contra_require_names_no_se_queda_callado(self):
+    def test_mux_viejo_sin_names_contra_require_names_no_se_queda_callado(self):
         """FALLA REAL (nunca fallar en silencio). Un mux sin --names (o de una versión anterior) contra un hub con
         --require-names en su salida: el hub rechaza su RawPublisher, el mux sigue contando "reenviados" y no dice
         nada; el hub tampoco. Esperado: algún texto que diga que el hub exige la lista (require_names) y qué hacer.
-        Reproducir: python -m unittest test_nombres.TestMuxALaMano.test_FALLA_REAL_mux_viejo_sin_names_contra_"""
+        Reproducir: python -m unittest test_nombres.TestMuxALaMano.test_mux_viejo_sin_names_contra_"""
         "require_names_no_se_queda_callado"
         hub = HubProceso(self, "--names", f"/patas/cmd={','.join(PATAS)}", "--require-names", "/patas/cmd")
         p, out = _mux_a_mano(self, hub.addr)
@@ -2932,24 +2932,80 @@ class TestMuxALaMano(unittest.TestCase):
 
 # --- el panel: un [[web.command]] hacia una entrada que hereda la lista -------------------------------------------------
 
+PANEL_ROBOT = """
+[robot]
+name = "n"
+
+[[node]]
+name = "motor"
+cmd = "./build/bin/motor"
+
+[[joints]]
+name = "patas"
+command = "/patas/cmd"
+names = ["a", "b", "c"]
+{require}
+[[mux]]
+name = "ruedas"
+output = "/patas/cmd"
+
+[[mux.input]]
+name = "ia"
+topic = "/cmd/ia"
+priority = 1
+
+[[web.command]]
+name = "Pata"
+target = "{target}"
+type = "JointCommand"
+messages = "m.agmen"
+
+[web.command.default]
+position = [1.0, 1.0, 1.0]
+velocity = [0.0, 0.0, 0.0]
+effort = [0.0, 0.0, 0.0]
+kp = [1.0, 1.0, 1.0]
+kd = [0.1, 0.1, 0.1]
+
+[[web.command.button]]
+label = "quieto"
+"""
+
+M_AGMEN = ("package mio\nmessage JointCommand {{\n    f32[{n}] position\n    f32[{n}] velocity\n    f32[{n}] effort\n"
+           "    f32[{n}] kp\n    f32[{n}] kd\n}}\n")
+
+
 class TestPanelHaciaEntradaHeredada(unittest.TestCase):
-    """OBSERVACIÓN: el panel publica sin lista (un Publisher sin names=). Con require_names en esa entrada, el hub lo
-    rechaza; sin require_names, solo avisa. Qué ve el usuario en el panel y en la terminal."""
+    """El panel de agmen run declara la lista de [[joints]] cuando su target la lleva (el command de un [[joints]]
+    o una entrada de [[mux]] que la hereda), como un nodo (RFC 0013 D6 = d). Con require_names publica y llega;
+    sin require_names, el hub no tiene nada que avisar. El hub, con los mismos --names que le pone agmen run."""
 
-    def _panel(self, target="/cmd/ia"):
-        from agmen.panel.command import Command, parse_command
-        from agmen.panel.server import Panel
-
+    def _robot(self, require: bool, target: str = "/cmd/ia", n: int = 3):
         d = tempfile.mkdtemp()
         self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
-        (Path(d) / "m.agmen").write_text("package mio\nmessage JointCommand {\n    f32[3] position\n    "
-                                         "f32[3] velocity\n    f32[3] effort\n    f32[3] kp\n    f32[3] kd\n}\n",
-                                         encoding="utf-8")
-        cfg = parse_command({"name": "Pata", "target": target, "type": "JointCommand", "messages": "m.agmen",
-                             "button": [{"label": "quieto", "value": {}}],
-                             "default": {"position": [1.0] * 3, "velocity": [0.0] * 3, "effort": [0.0] * 3,
-                                         "kp": [1.0] * 3, "kd": [0.1] * 3}}, 0, Path(d))
-        panel = Panel("127.0.0.1:0", None, "prueba", None, None, topics=False, commands=[Command(cfg, node="panel")])
+        (Path(d) / "m.agmen").write_text(M_AGMEN.format(n=n), encoding="utf-8")
+        texto = PANEL_ROBOT.format(require="require_names = true\n" if require else "", target=target)
+        for v in ("1.0", "0.0", "0.1"):        # los valores por defecto, con n articulaciones
+            texto = texto.replace(f"[{v}, {v}, {v}]", "[" + ", ".join([v] * n) + "]")
+        (Path(d) / "robot.toml").write_text(texto, encoding="utf-8")
+        return load_config(Path(d) / "robot.toml")
+
+    def _hub(self, cfg):
+        """El agmen hub con los --names y --require-names que le pone agmen run (prepare_hub)."""
+        cfg, _ = prepare_hub(cfg, ping=lambda a: None)
+        cmd = next(n for n in cfg.nodes if n.name == "hub").cmd
+        args = []
+        for k, a in enumerate(cmd):
+            if a in ("--names", "--require-names"):
+                args += [a, cmd[k + 1]]
+        return HubProceso(self, *args)
+
+    def _panel(self, cfg):
+        from agmen.cli import _commands_for
+        from agmen.panel.server import Panel
+
+        commands = _commands_for(cfg)
+        panel = Panel("127.0.0.1:0", None, "prueba", None, None, topics=False, commands=commands)
         panel.start()
         self.addCleanup(panel.shutdown)
         return panel
@@ -2966,25 +3022,86 @@ class TestPanelHaciaEntradaHeredada(unittest.TestCase):
         until(lambda: hasta(vistos), 8, every=paso)
         return vistos
 
-    def test_con_require_names_el_panel_devuelve_un_error_con_el_texto_del_hub(self):
-        hub = HubProceso(self, "--names", "/cmd/ia=a,b,c", "--require-names", "/cmd/ia")
-        panel = self._panel()
-        vistos = self._mandar(panel, lambda vistos: bool(vistos))
-        self.assertTrue(vistos, hub.text())
-        e = vistos[0]
-        self.assertIn("no se pudo publicar en /cmd/ia: el hub rechazó publicar en '/cmd/ia'", e)
-        self.assertIn("publica sin declarar su lista de nombres y robot.toml la exige", e)
-        self.assertIn("require_names = true", e)
-        self.assertNotIn("Traceback", e)
+    def _escuchar(self, topic="/cmd/ia", n=3):
+        sub = pubsub._PureSubscriber(JointCommand[n], topic)
+        self.addCleanup(sub.close)
+        return sub
 
-    def test_sin_require_names_publica_y_el_hub_avisa_una_vez(self):
-        hub = HubProceso(self, "--names", "/cmd/ia=a,b,c")
-        panel = self._panel()
-        errores = self._mandar(panel, lambda vistos: "sin declarar su lista de nombres" in hub.text())
+    def test_con_require_names_el_panel_publica_y_llega(self):
+        cfg = self._robot(require=True)
+        hub = self._hub(cfg)
+        panel = self._panel(cfg)
+        self.assertEqual(panel.commands[0].pub.names, ("a", "b", "c"))
+        sub = self._escuchar()
+        llegaron: list = []
+
+        def llego(vistos):
+            got = sub.receive(0.02)
+            if got is not None:
+                llegaron.append(got)
+            return bool(vistos) or bool(llegaron)
+        vistos = self._mandar(panel, llego)
+        self.assertEqual(vistos, [], hub.text())
+        self.assertTrue(llegaron, hub.text())
+        self.assertNotIn("rechaz", hub.text())
+
+    def test_sin_require_names_publica_y_el_hub_no_avisa(self):
+        cfg = self._robot(require=False)
+        hub = self._hub(cfg)
+        panel = self._panel(cfg)
+        sub = self._escuchar()
+        llegaron: list = []
+
+        def llego(vistos):
+            got = sub.receive(0.02)
+            if got is not None:
+                llegaron.append(got)
+            return bool(vistos) or len(llegaron) >= 3
+        errores = self._mandar(panel, llego)
         self.assertEqual(errores, [], errores)                        # el panel no ve ningún error
-        self.assertIn("sin declarar su lista de nombres", hub.text())
+        self.assertGreaterEqual(len(llegaron), 3, hub.text())
         time.sleep(0.3)
-        self.assertEqual(hub.text().count("sin declarar su lista de nombres"), 1, hub.text())
+        self.assertNotIn("sin declarar su lista de nombres", hub.text())
+
+    def test_al_command_del_joints_tambien_la_declara(self):
+        cfg = self._robot(require=True, target="/patas/cmd")
+        hub = self._hub(cfg)
+        panel = self._panel(cfg)
+        self.assertEqual(panel.commands[0].pub.names, ("a", "b", "c"))
+        sub = self._escuchar("/patas/cmd")
+        llegaron: list = []
+
+        def llego(vistos):
+            got = sub.receive(0.02)
+            if got is not None:
+                llegaron.append(got)
+            return bool(vistos) or bool(llegaron)
+        self.assertEqual(self._mandar(panel, llego), [], hub.text())
+        self.assertTrue(llegaron, hub.text())
+
+    def test_otro_numero_de_articulaciones_publica_sin_lista_y_el_hub_lo_avisa(self):
+        """Un mando de 2 articulaciones hacia un topic de 3: no se declara la lista (el Publisher no se podría
+        crear con ella), se publica como antes y el hub dice que el número no coincide."""
+        cfg = self._robot(require=False, n=2)
+        hub = self._hub(cfg)
+        panel = self._panel(cfg)
+        self.assertIsNone(panel.commands[0].pub.names)
+        self._mandar(panel, lambda vistos: bool(vistos) or "trae 2 articulaciones y robot.toml nombra 3" in hub.text())
+        self.assertIn("'/cmd/ia' trae 2 articulaciones y robot.toml nombra 3", hub.text())
+
+    def test_sin_joints_el_mando_no_declara_nada(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        (Path(d) / "m.agmen").write_text(M_AGMEN.format(n=3), encoding="utf-8")
+        texto = PANEL_ROBOT.format(require="", target="/cmd/ia")
+        texto = texto[:texto.index("[[joints]]")] + texto[texto.index("[[mux]]"):]
+        (Path(d) / "robot.toml").write_text(texto, encoding="utf-8")
+        cfg = load_config(Path(d) / "robot.toml")
+        from agmen.cli import _commands_for
+
+        commands = _commands_for(cfg)
+        self.addCleanup(lambda: [c.close() for c in commands])
+        self.assertIsNone(commands[0].pub.names)
 
 
 # --- agmen run de punta a punta con [[mux]]: prioridades y NaN ----------------------------------------------------------

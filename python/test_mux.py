@@ -493,11 +493,11 @@ class TestMuxConNamesBordes(unittest.TestCase):
                 self.assertIn("names", str(ctx.exception))
         self.assertEqual(self._siguiente_fd(), antes)            # sin fuga de sockets
 
-    def test_FALLA_REAL_names_sin_orden_no_vale_en_el_mux(self):
+    def test_names_sin_orden_no_vale_en_el_mux(self):
         """FALLA REAL (menor, solo por la API de Python: por la línea de comandos --names es un texto). Mux(names={"a",
         "b"}) acepta un set y lo vuelve tupla en un orden cualquiera: el orden es justo lo que el hub compara, y
         Publisher/RawPublisher/RawSubscriber ya lo rechazan con TypeError ("no tiene orden fijo"). Esperado: el
-        mismo TypeError. Reproducir: python -m unittest test_mux.TestMuxConNamesBordes.test_FALLA_REAL_names_sin_"""
+        mismo TypeError. Reproducir: python -m unittest test_mux.TestMuxConNamesBordes.test_names_sin_"""
         "orden_no_vale_en_el_mux"
         for names in ({"a", "b"}, frozenset({"a", "b"}), {"a": 1, "b": 2}):
             with self.subTest(names=type(names).__name__):

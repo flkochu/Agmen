@@ -431,7 +431,10 @@ class Command:
     navegador lo pide (~20 por segundo mientras mantienes presionado): si se
     calla, el robot no recibe nada más."""
 
-    def __init__(self, cfg: CommandConfig, publisher=None, node: str | None = None) -> None:
+    def __init__(self, cfg: CommandConfig, publisher=None, node: str | None = None, names=None) -> None:
+        """`names`: la lista de [[joints]] que lleva `target` (RFC 0013 D6 = d; agmen run la pasa cuando el target es
+        un topic de [[joints]] o una entrada de [[mux]] que la hereda): el panel la declara al hub como cualquier
+        Publisher. Sin `names`, el registro de siempre."""
         self.cfg = cfg
         self.cls = packed_type(cfg.layout)
         if publisher is None:
@@ -439,7 +442,7 @@ class Command:
 
             # 20 mensajes chicos por segundo: el Publisher de Python puro alcanza, y deja
             # ponerle nombre ("panel" en agmen node list) sin cambiar el del proceso.
-            publisher = _PurePublisher(self.cls, cfg.target, node=node)
+            publisher = _PurePublisher(self.cls, cfg.target, node=node, names=names)
         self.pub = publisher
         self.lock = threading.Lock()
         self.last_sent = 0.0

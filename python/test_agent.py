@@ -2282,6 +2282,46 @@ class TestSesion(ServerCase):
         self.assertTrue(any("la laptop usa Agmen 0.0.1" in t for t, _ in self.said), self.said)
 
 
+class TestHubAnteriorEnElAgente(ServerCase):
+    """RFC 0013 D6 = d: en la otra computadora ya corre un agmen hub anterior (no compara names=). El agente lo
+    reusa y el aviso llega a la laptop (a la pantalla de quien corrió agmen run), una vez."""
+
+    JOINTS = ('\n[[joints]]\nname = "patas"\nstate = "/patas/estado"\ncommand = "/patas/cmd"\n'
+              'names = ["cadera", "rodilla"]\n')
+
+    def propia(self, version):
+        p = mock.patch("agmen._version.__version__", version)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def avisos(self, version_del_hub: str, extra: str) -> list[str]:
+        self.propia("0.15.0")
+        p = mock.patch("agmen.hub.ping", lambda addr, *a, **k: version_del_hub)
+        p.start()
+        self.addCleanup(p.stop)
+        self.start_server(write=False)
+        self.write_toml(extra, **{"[hub]\nenabled = false\n": ""})
+        cli, fin = self.sesion()
+        self.assertEqual(fin["op"], "sesion_ok", fin)
+        self.assertTrue(cli.wait(lambda ms: any(m["op"] == "log" and "sesión de" in m.get("linea", "") for m in ms)),
+                        cli.msgs)
+        time.sleep(0.3)
+        return [m["linea"] for m in cli.all("log", nodo="agmen") if "anterior a 0.15.0" in m["linea"]]
+
+    def test_el_aviso_llega_a_la_laptop_una_vez(self):
+        avisos = self.avisos("0.14.0", self.JOINTS)
+        self.assertEqual(len(avisos), 1, avisos)
+        self.assertIn("el agmen hub que ya corre en", avisos[0])
+        self.assertIn("no compara los nombres de las articulaciones", avisos[0])
+        self.assertIn("Actualiza Agmen en esta computadora", avisos[0])
+
+    def test_sin_joints_no_hay_aviso(self):
+        self.assertEqual(self.avisos("0.14.0", ""), [])
+
+    def test_hub_al_dia_no_hay_aviso(self):
+        self.assertEqual(self.avisos("0.15.0", self.JOINTS), [])
+
+
 class EspiaPopen:
     """Anota cada subprocess.Popen (y deja que se haga de verdad)."""
 

@@ -766,6 +766,7 @@ class _Plan:
     hub_note: str
     profile: str
     held: tuple[str, ...] = ()   # no_arrancar: los que la laptop arranca después (o nunca: --skip)
+    hub_warnings: tuple[str, ...] = ()   # los avisos de prepare_hub (un hub anterior que no compara los nombres)
 
 
 class _Refused(Exception):
@@ -1349,9 +1350,12 @@ class AgentServer:
             sub, hub_note = prepare_hub(replace(cfg, nodes=mine_nodes))
         except ConfigError as e:
             raise _Refused("config", f"{m}: {e}") from None
+        # Lo que prepare_hub agregó a los avisos (va al final): el hub que ya corría aquí es anterior y no compara
+        # los nombres de [[joints]] (RFC 0013 D6 = d). Lo dice la sesión, para que llegue a la laptop.
+        hub_warnings = tuple(sub.warnings[len(cfg.warnings):])
         if version != __version__:
             self.say(f"⚠ la laptop usa Agmen {version} y esta computadora Agmen {__version__}")
-        return _Plan(sub, {m: Place(True, "agent")}, names, hub_note, profile, tuple(held))
+        return _Plan(sub, {m: Place(True, "agent")}, names, hub_note, profile, tuple(held), hub_warnings)
 
 
 class _Outbox:
@@ -1923,6 +1927,8 @@ class _Session:
         self.say(f"laptop {self.ip} conectada · Agmen {_clean(first.get('agmen'), 40)} · perfil {plan.profile} · "
                  f"nodos de aquí: {shown}", "out")
         launcher.say(f"sesión de {self.ip}: {plan.hub_note}")
+        for w in plan.hub_warnings:   # (una vez por sesión: llega a la laptop como las demás líneas de agmen)
+            launcher.say(f"⚠ {w}")
         if "hub" not in launcher.nodes and plan.config.hub:
             launcher.say(f"⚠ en {self.server.machine} ya corría un agmen hub sin nodos: lo reuso (sus [[topic]] no "
                          f"se revisan). Si no es tuyo, detenlo y vuelve a correr agmen run")

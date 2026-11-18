@@ -212,16 +212,110 @@ def normalizar(texto: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
+_HUB_DE = re.compile(r"\[hub\] \S+ '([^']+)' ")
+
+
+def _quien(linea_normalizada: str) -> str:
+    """De quién es una línea de agmen run, para el orden: la columna ("hub │ …" → "hub"; "" si no la lleva). Las
+    líneas del hub sobre un registro ("hub │ [hub] ▶ 'politica' publica …") van cada una por su lado: el hub las
+    escribe en el orden en que le llegan los registros, y eso depende de qué nodo arranca antes (y, dentro de un
+    nodo, el Subscriber se registra al crearse y el Publisher al publicar su primer mensaje)."""
+    quien, barra, resto = linea_normalizada.partition(" │ ")
+    if not barra or " " in quien:
+        return ""
+    return f"{quien}:{resto}" if _HUB_DE.match(resto) else quien
+
+
 def faltan(esperado: Bloque, salida: str) -> list[tuple[int, str]]:
-    """Las líneas del bloque del capítulo que no aparecen (normalizadas) en la salida."""
-    reales = {normalizar(t) for t in salida.splitlines()}
-    return [(n, t) for n, t in esperado.numeradas() if normalizar(t) not in reales]
+    """Las líneas del bloque del capítulo que no aparecen (normalizadas) en la salida, en orden y sin repetir: cada
+    línea del capítulo se busca después de la anterior del MISMO origen (ver _quien: las de procesos distintos se
+    mezclan según quién escribe primero, y ese orden no se exige), y una línea real sirve para una sola del
+    capítulo (si el capítulo la muestra dos veces, tiene que salir dos veces)."""
+    reales = [normalizar(t) for t in salida.splitlines()]
+    usadas: set[int] = set()
+    desde: dict[str, int] = {}          # por proceso: la línea real siguiente a la última que se encontró
+    malas = []
+    for n, t in esperado.numeradas():
+        e = normalizar(t)
+        quien = _quien(e)
+        k = next((i for i in range(desde.get(quien, 0), len(reales)) if i not in usadas and reales[i] == e), None)
+        if k is None:
+            malas.append((n, t))
+            continue
+        usadas.add(k)
+        desde[quien] = k + 1
+    return malas
+
+
+_VALOR = re.compile(r"[-+\d\[\](){}'\"]|(nan|inf|True|False|None)\b")
+
+
+def impreso_igual(real: str, comentario: str) -> bool:
+    """¿Lo que imprimió `print(...)` es lo que dice su comentario? Completo: el comentario es el valor, y puede
+    seguirle una explicación separada por espacios ("[0.0, 0.0]   por defecto: 0", "80 bytes = 20 × 4"), que empieza
+    con una palabra; si lo que sigue parece más valor ("0.0" contra "# 0.0 1.0"), no es igual."""
+    if real == comentario:
+        return True
+    if not real or not comentario.startswith(real):
+        return False
+    resto = comentario[len(real):]
+    if not resto[:1].isspace():
+        return False
+    resto = resto.strip()
+    return bool(resto) and _VALOR.match(resto) is None
 
 
 def puerto_libre(tipo: int) -> int:
     with socket.socket(socket.AF_INET, tipo) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def matar_arbol(proc: subprocess.Popen, salida: str = "") -> None:
+    """Mata a `proc` y a sus hijos y nietos: su grupo de procesos (lo arrancó correr() en uno propio) y, como en
+    Cap19.agmen_run, los pid que salieron como "▶ iniciado (pid N)" (los nodos de un agmen run)."""
+    pids = re.findall(r"▶ iniciado \(pid (\d+)\)", salida)
+    if os.name == "nt":
+        for pid in [str(proc.pid), *pids]:
+            subprocess.run(["taskkill", "/PID", pid, "/T", "/F"], capture_output=True)
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        for pid in pids:
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except OSError:
+                pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def correr(cmd: list[str], tope: float, **kw) -> tuple[subprocess.CompletedProcess | None, str]:
+    """Como subprocess.run(cmd, capture_output=True, timeout=tope), pero si se cuelga no lanza TimeoutExpired:
+    mata a todo su árbol de procesos y devuelve (None, lo que alcanzó a escribir). Si termina: (resultado, "")."""
+    grupo = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+             else {"start_new_session": True})
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            encoding="utf-8", errors="replace", **grupo, **kw)
+    try:
+        out, err = proc.communicate(timeout=tope)
+    except subprocess.TimeoutExpired as e:
+        # (lo que alcanzó a leer viene en bytes, aunque la tubería sea de texto)
+        parcial = "".join(x.decode("utf-8", "replace") if isinstance(x, bytes) else x
+                          for x in (e.stdout, e.stderr) if x)
+        matar_arbol(proc, parcial)
+        try:
+            out, err = proc.communicate(timeout=10)
+            parcial = (out or "") + (err or "")
+        except subprocess.TimeoutExpired:   # algún nieto que no se dejó matar sigue con la tubería: no se espera más
+            for f in (proc.stdout, proc.stderr):
+                f.close()
+        return None, parcial
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err), ""
 
 
 class Cap19:
@@ -308,13 +402,17 @@ class Cap19:
         # 1. El orden bueno: la salida de la sección 4, y topic info y topic list de la sección 7.
         esperado = self.b["salida-run"]
         vistos: dict[str, str] = {}
+        colgados: list[str] = []
 
         def consulta(env: dict) -> None:
             for clave, args in (("salida-topic-info", ["info", "/patas/estado"]), ("salida-topic-list", ["list"])):
                 fin = time.monotonic() + 10
                 while True:   # hasta que el hub tenga a todos (con tope)
-                    r = subprocess.run([sys.executable, "-m", "agmen", "topic", *args], capture_output=True,
-                                       text=True, encoding="utf-8", errors="replace", env=env, timeout=30)
+                    r, parcial = correr([sys.executable, "-m", "agmen", "topic", *args], 30, env=env)
+                    if r is None:
+                        colgados.append(f"agmen topic {' '.join(args)}")
+                        vistos[clave] = f"(agmen topic {' '.join(args)} se colgó más de 30 s)\n{parcial}"
+                        break
                     vistos[clave] = r.stdout + r.stderr
                     if not faltan(self.b[clave], vistos[clave]) or time.monotonic() > fin:
                         break
@@ -325,6 +423,8 @@ class Cap19:
                                 consulta)
         self.compara(f"agmen run con el orden bueno: la salida de la sección 4 ({time.monotonic() - t0:.1f} s)",
                      esperado, salida)
+        for que in colgados:
+            self.reporta(f"{que} se colgó (más de 30 s) con el robot corriendo; lo maté a él y a sus hijos", False)
         for clave, que in (("salida-topic-info", "agmen topic info /patas/estado"),
                            ("salida-topic-list", "agmen topic list")):
             self.compara(f"{que} con el robot corriendo (sección 7)", self.b[clave], vistos.get(clave, ""))
@@ -366,27 +466,44 @@ class Cap19:
         repetida[2] = repetida[0]
         (d / "robot_error.toml").write_text(
             robot.replace(lista, "[" + ", ".join(f'"{n}"' for n in repetida) + "]", 1), encoding="utf-8")
-        r = subprocess.run([sys.executable, "-m", "agmen", "run", "patas/robot_error.toml", "--no-web"], cwd=d.parent,
-                           capture_output=True, text=True, encoding="utf-8", errors="replace", env=self.env, timeout=60)
+        # Con su propio hub en un puerto libre, como los demás: si por error arrancara, no toca el de nadie.
+        env = {**self.env, "AGMEN_HUB": f"127.0.0.1:{puerto_libre(socket.SOCK_DGRAM)}"}
+        r, parcial = correr([sys.executable, "-m", "agmen", "run", "patas/robot_error.toml", "--no-web"], 60,
+                            cwd=d.parent, env=env)
+        if r is None:
+            self.reporta("un nombre repetido en names: agmen run se colgó (más de 60 s) en vez de salir con el "
+                         "error; lo maté a él y a sus nodos", False, salida=parcial)
+            return
         salida = r.stdout + r.stderr
         self.compara("un nombre repetido en names: agmen run no arranca y lo dice", esperado, salida)
         self.reporta("... y sale con código 2", r.returncode == 2, f"  salió con {r.returncode}")
 
     # -- los fragmentos cortos de Python ------------------------------------------------------
 
-    def python(self, codigo: str) -> subprocess.CompletedProcess:
+    def python(self, que: str, codigo: str) -> subprocess.CompletedProcess | None:
+        """Corre un fragmento. None si se colgó (más de 60 s): ya se reportó FALLA y no quedó ningún proceso."""
         archivo = self.work / "fragmento.py"
         archivo.write_text(codigo, encoding="utf-8")
         env = {**self.env, "AGMEN_HUB": f"127.0.0.1:{puerto_libre(socket.SOCK_DGRAM)}"}
-        return subprocess.run([sys.executable, str(archivo)], cwd=self.work, capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", env=env, timeout=60)
+        r, parcial = correr([sys.executable, str(archivo)], 60, cwd=self.work, env=env)
+        if r is None:
+            self.reporta(f"{que}: el fragmento se colgó (más de 60 s); lo maté a él y a sus hijos", False,
+                         salida=parcial)
+        return r
 
-    def error(self, que: str, codigo: str, esperado: str) -> None:
-        """El fragmento truena y la última línea (la que lee el usuario) es la del capítulo."""
-        r = self.python(codigo)
+    def error(self, que: str, codigo: str, esperado: str, ajuste=None) -> None:
+        """El fragmento truena y la última línea (la que lee el usuario) es la del capítulo. `ajuste(texto)`, si
+        se da, se aplica a las dos (lo esperado y lo real) antes de comparar: para un número que cambia."""
+        r = self.python(que, codigo)
+        if r is None:
+            return
         ultima = (r.stderr.strip().splitlines() or [""])[-1]
-        self.compara(f"{que}: el error del capítulo", self.b[esperado],
-                     ultima if r.returncode != 0 else f"(no tronó)\n{r.stdout}")
+        real = ultima if r.returncode != 0 else f"(no tronó)\n{r.stdout}"
+        bloque = self.b[esperado]
+        if ajuste is not None:
+            bloque = Bloque(bloque.nombre, bloque.linea, [ajuste(t) for t in bloque.lineas])
+            real = ajuste(real)
+        self.compara(f"{que}: el error del capítulo", bloque, real)
 
     def impresos(self, que: str, bloque: Bloque) -> None:
         """Un fragmento con `print(...)  # lo que sale`: cada línea que imprime es el comentario."""
@@ -397,11 +514,12 @@ class Cap19:
                 if comentario is None and k + 1 < len(lineas) and lineas[k + 1][1].startswith("#"):
                     n, comentario = lineas[k + 1][0], lineas[k + 1][1][1:].strip()
                 esperados.append((n, comentario or ""))
-        r = self.python(bloque.texto)
+        r = self.python(que, bloque.texto)
+        if r is None:
+            return
         reales = r.stdout.splitlines()
         malas = [f"  {CAP19_REL}:{n} dice '{c}' y salió '{reales[i] if i < len(reales) else '(nada)'}'"
-                 for i, (n, c) in enumerate(esperados)
-                 if i >= len(reales) or not (c.startswith(reales[i]) and c[len(reales[i]):][:1] in ("", " "))]
+                 for i, (n, c) in enumerate(esperados) if i >= len(reales) or not impreso_igual(reales[i], c)]
         ok = r.returncode == 0 and len(reales) == len(esperados) and not malas
         self.reporta(f"{que}: imprime lo que dicen sus comentarios", ok,
                      "\n".join(malas) or f"  esperaba {len(esperados)} líneas", r.stdout + r.stderr)
@@ -426,9 +544,22 @@ class Cap19:
         m = re.search(r"Publisher en '([^']+)'.*el nombre del nodo, (\d+) bytes; el esquema de (\w+)", texto)
         if self.reporta("el error del registro dice topic, tamaño del nombre y tipo", m is not None, salida=texto):
             topic, largo, tipo = m.groups()
+            # El total depende de cuántos dígitos tiene el pid (la línea de registro lleva pid=): se enmascara en
+            # los dos lados, y aparte se revisa que el número real sí pase el tope de un datagrama.
+            medidas: list[int] = []
+            mide = re.compile(r"mide (\d+) bytes y en un datagrama caben (\d+)")
+
+            def sin_total(texto: str) -> str:
+                for total, tope in mide.findall(texto):
+                    medidas.append(int(total) - int(tope))
+                return mide.sub(r"mide N bytes y en un datagrama caben \2", texto)
             self.error(f"un nombre de nodo de {largo} caracteres",
                        f"from agmen import Node\nfrom agmen.msgs import {tipo}\n\n"
-                       f"nodo = Node('n' * {largo})\nnodo.publisher({tipo}[4], {topic!r})\n", "error-registro")
+                       f"nodo = Node('n' * {largo})\nnodo.publisher({tipo}[4], {topic!r})\n", "error-registro",
+                       sin_total)
+            self.reporta("... y el registro que dice medir pasa el tope de un datagrama",
+                         len(medidas) == 2 and all(x > 0 for x in medidas),
+                         f"  diferencias (medida - tope), capítulo y real: {medidas}")
 
 
 def run_articulaciones() -> bool:
