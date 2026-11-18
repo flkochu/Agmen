@@ -536,6 +536,10 @@ Los objetos de Agmen en Python se pueden usar desde varios hilos a la vez
     el siguiente anuncio, a lo más ~1 s), no reenvía ningún comando: lo avisa una vez
     (`[agmen] ⚠ mux '…': todavía no conozco el tipo de los mensajes; …`) y los cuenta
     en `sin_tipo=`.
+    El tipo lo fija el primer anuncio, no el primer paquete: antes, un dato de otro tipo
+    que llegara primero dejaba al mux rechazando el anuncio bueno (y al actuador sin
+    mando) hasta reiniciarlo. Un tipo distinto se descarta con un aviso por entrada que
+    la nombra (`[agmen] ⚠ mux '…': la entrada '…' manda otro tipo de mensaje …`).
   - El motor del tutorial frena de inmediato ante un valor no finito, no usa ese valor
     y lo dice una vez en stderr.
   - No cambia ningún byte de la red.

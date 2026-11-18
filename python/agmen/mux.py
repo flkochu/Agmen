@@ -151,7 +151,9 @@ class Mux:
         self.out = wire.udp_socket()
         self.source_id = wire.new_source_id()
         self.last_rx: dict[str, float] = {}
-        self.type_id: int | None = None         # schema_id que se aceptó primero
+        self.type_id: int | None = None         # schema_id del primer anuncio aceptado (los datos no lo fijan)
+        self._type_from: str | None = None      # la entrada que trajo ese primer anuncio
+        self._other_type_warned: set[str] = set()
         self.schema_text: str | None = None
         self._announced_at: float | None = None
         self.out_seq = 0
@@ -288,6 +290,19 @@ class Mux:
             print(f"[agmen] ⚠ mux '{self.output}': todavía no conozco el tipo de los mensajes; no reenvío comandos "
                   f"hasta que llegue su anuncio (a lo más ~1 s).", file=sys.stderr, flush=True)
 
+    def _drop_other_type(self, inp: MuxInput, schema_id: int, text: str | None) -> None:
+        what = f" ({text})" if text else ""
+        expected = self.schema_text or f"{self.type_id:#018x}"
+        if inp.name in self._other_type_warned:
+            self._error(inp, f"manda otro tipo de mensaje (schema_id {schema_id:#018x}{what}; se esperaba {expected})")
+            return
+        self._other_type_warned.add(inp.name)       # una vez por entrada, aunque haya otros avisos ese segundo
+        self.errors[inp.name] += 1
+        print(f"[agmen] ⚠ mux '{self.output}': la entrada '{inp.name}' manda otro tipo de mensaje (schema_id "
+              f"{schema_id:#018x}{what}); el mux ya usa {expected}, que anunció primero '{self._type_from}'. "
+              f"Descarto lo de '{inp.name}': revisa ese nodo.", file=sys.stderr, flush=True)
+        self._last_error_log = time.monotonic()     # el siguiente descarte no repite el aviso enseguida por _error
+
     def _forward(self, data: bytes, seq: int | None) -> None:
         out = bytearray(data)
         struct.pack_into("<Q", out, wire.SOURCE_OFFSET, self.source_id)
@@ -311,12 +326,13 @@ class Mux:
         except wire.WireError as e:
             self._error(inp, str(e))
             return False
-        if self.type_id is None:
-            self.type_id = env.schema_id
-        elif env.schema_id != self.type_id:
-            what = f" ({text})" if text else ""
-            self._error(inp, f"manda otro tipo de mensaje (schema_id {env.schema_id:#018x}{what}; "
-                             f"se esperaba {self.schema_text or f'{self.type_id:#018x}'})")
+        if self.type_id is None and text is None:
+            # Un dato antes del primer anuncio no fija el tipo (podría ser de otro tipo y dejar al actuador sin
+            # mando hasta reiniciar el mux): se descarta y se cuenta en sin_tipo.
+            self._drop_untyped(inp)
+            return False
+        if self.type_id is not None and env.schema_id != self.type_id:
+            self._drop_other_type(inp, env.schema_id, text)
             return False
 
         if text is not None:
@@ -326,6 +342,9 @@ class Mux:
                                  f"mux arbitra comandos de actuadores (tipos compact); los mensajes arrow "
                                  f"(RFC 0008) no pasan por él")
                 return False
+            if self.type_id is None:      # el primer anuncio aceptado fija el tipo
+                self.type_id = env.schema_id
+                self._type_from = inp.name
             if self.schema_text != text:
                 self._set_floats(text)
             self.schema_text = text
