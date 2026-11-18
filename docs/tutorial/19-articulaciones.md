@@ -50,6 +50,7 @@ estado.publish(JointState[4](position=[0.10, -0.20, 0.30, 0.00]))
 
 Lo que no pasas, queda en `nan`. Compruébalo:
 
+<!-- tutorial_check: nan-por-defecto -->
 ```python
 from agmen.msgs import JointState
 
@@ -63,6 +64,7 @@ el estado sabe que esa velocidad no existe.
 
 ## 3. El comando en Python
 
+<!-- tutorial_check: comando-por-defecto -->
 ```python
 from agmen.msgs import JointCommand
 
@@ -102,6 +104,7 @@ siguientes.
 
 `robot.toml`:
 
+<!-- tutorial_check: robot.toml -->
 ```toml
 [robot]
 name = "patas"
@@ -125,6 +128,7 @@ names = ["FR_hip", "FR_thigh", "FR_calf", "FL_hip"]   # ESTE es el orden, en tod
 
 `simulador.py`: publica la posición de las cuatro articulaciones a 50 Hz.
 
+<!-- tutorial_check: simulador.py -->
 ```python
 from agmen import Node
 from agmen.msgs import JointState
@@ -151,6 +155,7 @@ nodo.spin()
 
 `politica.py`: lee el estado y manda el comando.
 
+<!-- tutorial_check: politica.py -->
 ```python
 from agmen import Node
 from agmen.msgs import JointCommand, JointState
@@ -191,6 +196,7 @@ agmen run robot.toml
 Al arrancar, `agmen run` revisa lo que escribiste en `[[joints]]` y te muestra una
 línea por grupo. Salida real:
 
+<!-- tutorial_check: salida-run -->
 ```
 agmen     │ Agmen 0.14.0 · robot 'patas' · 3 nodos · agmen hub en 127.0.0.1:7390
 agmen     │ articulaciones 'patas': 4 (FR_hip, FR_thigh, FR_calf, FL_hip) · estado /patas/estado · comando /patas/cmd · kp 20, kd 0.5
@@ -217,6 +223,7 @@ cambian en cada corrida, y las líneas de `estado` salen después de unos segund
 
 - Que cada nombre de articulación sea válido y no esté repetido. Ejemplo real:
 
+  <!-- tutorial_check: salida-robot_error -->
   ```
   error en patas/robot_error.toml: [[joints]] 'patas': 'FR_hip' está dos veces en names (names[0] y names[2]). Cada articulación va una sola vez: quita una o corrige el nombre
   ```
@@ -243,6 +250,7 @@ nodo.on(JointState[4], "/patas/estado", leer, names=NOMBRES)
 es justo lo que el hub compara. Un `set` o un `dict` no tienen orden, y Python se
 niega con un `TypeError`:
 
+<!-- tutorial_check: names-set -->
 ```python
 from agmen import Node
 from agmen.msgs import JointCommand
@@ -251,6 +259,7 @@ nodo = Node("prueba")
 nodo.publisher(JointCommand[4], "/x", names={"FR_hip", "FR_thigh", "FR_calf", "FL_hip"})
 ```
 
+<!-- tutorial_check: error-names-set -->
 ```
 TypeError: Publisher en '/x': names debe ser una lista o una tupla, en el orden de los arreglos: un set no tiene orden fijo y el orden es justo lo que el hub compara. Pasa, por ejemplo, names=['cadera', 'rodilla']
 ```
@@ -258,6 +267,7 @@ TypeError: Publisher en '/x': names debe ser una lista o una tupla, en el orden 
 Tampoco se pasa una lista vacía. En Python, `names=[]` es un error, y "sin lista" es
 **no pasar `names`**:
 
+<!-- tutorial_check: error-names-vacia -->
 ```
 ValueError: Publisher en '/x': names está vacía: pon los nombres de las articulaciones en orden, ej. ["cadera", "rodilla"] (o no la pases)
 ```
@@ -328,6 +338,7 @@ mismo que no poner `.names`. Para exigir la lista en un topic no se usa eso: pon
 Supón que tu política tiene el orden cambiado: `FL_hip` primero. Así se ve el rechazo
 del hub, con el texto real:
 
+<!-- tutorial_check: salida-orden -->
 ```
 politica  │ agmen.wire.HubRejected: el hub rechazó publicar en '/patas/cmd': '/patas/cmd': 'politica' declara FL_hip, FR_hip… y robot.toml dice FR_hip, FR_thigh… (cambian desde la articulación 1 de 4). Las listas deben ser iguales y en el mismo orden: pasa names= en el orden de [[joints]] de robot.toml, o corrige robot.toml si el que está mal es él
 politica  │ ✖ falló (código 1)
@@ -344,6 +355,7 @@ el que se equivoca es uno que escucha, el texto dice `el hub rechazó escuchar`.
 Sigue funcionando, con un aviso. Por ejemplo, un `Publisher` sin `names=` en un
 topic de `[[joints]]`:
 
+<!-- tutorial_check: salida-sin-lista -->
 ```
 hub       │ [hub] ⚠ 'politica' publica en '/patas/cmd', un topic de [[joints]], sin declarar su lista de nombres: no puedo revisar que use el orden de robot.toml (FR_hip, FR_thigh… (4 nombres)). Pasa names=[...] al crear el Publisher, en ese orden
 ```
@@ -352,6 +364,7 @@ Es un aviso, una vez por nodo. Si quieres obligar a declararla, pon
 `require_names = true` en `[[joints]]`. Entonces el hub **rechaza** al que publica
 sin lista:
 
+<!-- tutorial_check: salida-require_names -->
 ```
 politica  │ agmen.wire.HubRejected: el hub rechazó publicar en '/patas/cmd': '/patas/cmd': 'politica' publica sin declarar su lista de nombres y robot.toml la exige (require_names = true en [[joints]]). Pasa names=[...] al crear el Publisher, en el orden de [[joints]]: FR_hip, FR_thigh… (4 nombres)
 ```
@@ -386,6 +399,7 @@ Con el robot corriendo, abre **otra** terminal y pregunta por el topic. Salida r
 agmen topic info /patas/estado
 ```
 
+<!-- tutorial_check: salida-topic-info -->
 ```
 topic:   /patas/estado
 tipo:    JointState  (schema_id b93ac672f616b40b)
@@ -404,6 +418,7 @@ cada corrida.
 
 `agmen topic list` te da la vista corta:
 
+<!-- tutorial_check: salida-topic-list -->
 ```
 topic          tipo          emisores  receptores
 ─────────────  ────────────  ────────  ──────────
@@ -423,11 +438,13 @@ Estos límites vienen de que cada mensaje debe caber en un datagrama UDP (65 507
 Si necesitas más, repártelas en **varios grupos** de `[[joints]]`, cada uno con sus
 topics. Así se ve un error real de Python con un número que no cabe:
 
+<!-- tutorial_check: jointstate-5454 -->
 ```python
 from agmen.msgs import JointState
 JointState[5454]
 ```
 
+<!-- tutorial_check: error-jointstate-5454 -->
 ```
 agmen.schema.SchemaError: JointState[5454]: n va de 1 a 5453 (JointState mide 12·n bytes y en un paquete UDP caben 65443). Con más articulaciones, repártelas en varios grupos (un topic por grupo)
 ```
@@ -442,6 +459,7 @@ Los nombres también tienen topes:
 Y hay una regla de formato para los nombres: letras (sin acentos), dígitos, `_`, `-`,
 `.` o `/`, y empiezan con letra, dígito o `_`. Un nombre con espacio no vale:
 
+<!-- tutorial_check: names-espacio -->
 ```python
 from agmen import Node
 from agmen.msgs import JointCommand
@@ -450,6 +468,7 @@ nodo = Node("prueba")
 nodo.publisher(JointCommand[4], "/x", names=["FR hip", "FR_thigh", "FR_calf", "FL_hip"])
 ```
 
+<!-- tutorial_check: error-names-espacio -->
 ```
 ValueError: Publisher en '/x': names[0] = 'FR hip' no es un nombre de articulación válido (tiene un espacio). Usa letras (sin acentos), dígitos, '_', '-', '.' o '/', y empieza con letra, dígito o '_', como en el modelo (MuJoCo o URDF), ej. "FR_hip" o "brazo/codo.1"
 ```
@@ -457,6 +476,7 @@ ValueError: Publisher en '/x': names[0] = 'FR hip' no es un nombre de articulaci
 Y si la lista no tiene tantos nombres como el tipo, Python lo dice al crear el
 `Publisher`, antes de publicar nada. Con `JointCommand[4]` y tres nombres:
 
+<!-- tutorial_check: error-names-cuantos -->
 ```
 ValueError: Publisher en '/x': names tiene 3 nombres y JointCommand es de 4 articulaciones (f32[4] position): pasa un nombre por articulación, en el orden de los arreglos
 ```
@@ -468,6 +488,7 @@ crear el objeto, antes de abrir nada. Es raro, pero pasa con un nombre de nodo e
 El mensaje dice cuánto mide y qué parte ocupa más. Con un nombre de 65 450 caracteres,
 por ejemplo:
 
+<!-- tutorial_check: error-registro -->
 ```
 ValueError: Publisher en '/y': el registro en el hub mide 65649 bytes y en un datagrama caben 65507 (lo que más ocupa, escrito como va en la línea: el nombre del nodo, 65450 bytes; el esquema de JointState, 93 bytes). Lo más largo es el nombre del nodo: usa un nombre de nodo más corto (AGMEN_NODE, o el name de su [[node]] en robot.toml)
 ```
