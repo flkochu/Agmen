@@ -476,7 +476,7 @@ class TestHubDatosHostiles(HubEnMemoria):
         linea = hp.line("pub", id="h", node="n", pid=1, topic="/patas/cmd", schema=S12, type="JointCommand", text="")
         self.assertEqual(self.manda_bytes(linea.encode() + b" names=a\xff\xfeb"), [])   # ni lo lee ni contesta
         self.assertTrue(self.avisos("no es UTF-8"), self.logs)
-        self.assertEqual(self.manda_bytes(linea.encode() + b" names=a%ZZ"), [])          # '%' mal escrito: igual
+        self.assertIn("'%' mal escrito", self.rechazo(self.manda_bytes(linea.encode() + b" names=a%ZZ")))  # a él
         self.assertNotIn("h", self.hub.endpoints)
         self.entra(self.pub("bien", PATAS))
 

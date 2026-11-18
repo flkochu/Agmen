@@ -1054,5 +1054,239 @@ class TestRechazoMuestraLaForma(unittest.TestCase):
                 self.assertIn("Un topic, un tipo", self.rechazo(self.pub("b", self.ID2, texto)))
 
 
+# --- Una línea mala no tira el datagrama ni queda callada (VISION §3 regla 1) ---------------------------------------
+
+def _boom(*_args, **_kwargs):
+    raise RuntimeError("falla de prueba")
+
+
+_BOOM_LINE = _boom.__code__.co_firstlineno + 1     # la línea del raise: la que debe decir el log
+
+
+class TestLineaPorLinea(unittest.TestCase):
+    """El hub lee cada línea de un datagrama por su cuenta: la que no se puede leer o lo hace fallar recibe su
+    `error` (con su id) y las demás se atienden. Con el Hub en memoria y `now` a mano."""
+
+    SCHEMA = "00000000000000aa"
+
+    def setUp(self):
+        self.logs: list[str] = []
+        self.hub = H.Hub(f"127.0.0.1:{free_port()}", log=self.logs.append, grace_s=0.0)
+        self.addCleanup(self.hub.sock.close)
+        self.sent: list[tuple[bytes, tuple[str, int]]] = []
+        self.hub._send = lambda data, addr: self.sent.append((data, addr))
+
+    def manda(self, data: bytes, now=0.0, src=LOCAL):
+        self.sent.clear()
+        self.hub.handle(data, src, now)
+        return [hp.parse(d)[0] for d, _ in self.sent]
+
+    def linea(self, eid, crudo="", node=None, schema=None, topic="/cmd") -> bytes:
+        base = hp.line("pub", id=eid, node=node or "n_" + eid, pid=1, topic=topic, schema=schema or self.SCHEMA,
+                       type="Cmd", text="Cmd{f32 a}")
+        return (base + (" " + crudo if crudo else "")).encode()
+
+    # (a)
+    def test_el_nodo_recibe_su_error_cada_vez(self):
+        for crudo in ("names=%FF", "node=%FF", "names=a%C3"):
+            campo = crudo.split("=")[0]
+            for vez in range(3):            # las tres seguidas, desde el mismo origen (no solo la primera)
+                with self.subTest(crudo=crudo, vez=vez):
+                    (op, f), = self.manda(self.linea("h", crudo), now=float(vez))
+                    self.assertEqual(op, "error")
+                    self.assertEqual(f["id"], "h")
+                    self.assertIn(f"el campo '{campo}' no es texto UTF-8", f["msg"])
+                    self.assertIn("escribe el valor en UTF-8 y cada byte que no sea letra, dígito o _ . / : , * - "
+                                  "como %XX", f["msg"])
+                    self.assertTrue(f["msg"].startswith("no atendí esta línea: "), f["msg"])
+        self.assertNotIn("h", self.hub.endpoints)
+        self.assertEqual(self.logs, [])     # el que la mandó ya lo sabe
+
+    def test_sin_id_legible_queda_el_aviso_en_el_log(self):
+        for data in (b"agmen-hub/1 pub id=%FF topic=/cmd", b"agmen-hub/1 pub node=%FF",
+                     b"agmen-hub/1 pub id=a%2Db names=%FF", b"agmen-hub/1 pub id=" + b"a" * 65 + b" x=%FF",
+                     b"agmen-hub/1 pub id=a\x1bb x=%FF", b"otra-cosa id=h x=%FF"):
+            with self.subTest(data=data):
+                self.assertEqual(self.manda(data), [])
+        self.assertEqual(len([x for x in self.logs if "mensaje inválido desde 127.0.0.1:50000" in x]), 1)
+
+    def test_el_id_del_puente_tambien_vale(self):
+        (op, f), = self.manda(self.linea("robot.ab_1", "names=%FF"))
+        self.assertEqual((op, f["id"]), ("error", "robot.ab_1"))
+
+    # (b)
+    def test_la_linea_mala_no_tira_las_demas(self):
+        data = b"\n".join([self.linea("a"), self.linea("b", "names=%FF"), self.linea("c")])
+        got = self.manda(data)
+        self.assertEqual([op for op, _ in got], ["subs", "error", "subs"])
+        self.assertEqual(got[1][1]["id"], "b")
+        self.assertEqual(set(self.hub.endpoints), {"a", "c"})
+
+    def test_muchas_lineas_malas_respuestas_chicas_y_con_tope(self):
+        data = b"\n".join(self.linea(f"m{i}", "names=%FF " + "x=%ZZ " * 30) for i in range(40))
+        got = self.manda(data)
+        self.assertEqual(len(got), H.BAD_LINES_ANSWERED)              # no una por cada línea mala
+        for raw, addr in self.sent:
+            self.assertEqual(addr, LOCAL)                             # al remitente del datagrama
+            self.assertLess(len(raw), 2 * H.BAD_LINE_SHOWN)
+        self.assertTrue(any("mensaje inválido desde" in x for x in self.logs))   # las demás, al log
+        (op, f), = self.manda(self.linea("h", "x=" + "%Z" * 30000))
+        self.assertIn("'%' mal escrito en el campo 'x' ('%Z%' en la posición 0)", f["msg"])
+        self.assertLess(len(self.sent[0][0]), 2 * H.BAD_LINE_SHOWN)  # no repite el valor de 60 000 caracteres
+
+    def test_lineas_bien_formadas_contestan_lo_de_siempre(self):
+        ok = self.manda(b"\n".join([self.linea("a"), b"agmen-hub/1 ping", b"agmen-hub/1 nada id=q"]))
+        self.assertEqual([op for op, _ in ok], ["subs", "pong", "error"])
+        self.assertEqual(ok[2][1], {"id": "q", "msg": "operación desconocida 'nada'"})
+
+    # (c)
+    def test_error_inesperado_contesta_y_se_dice_acotado(self):
+        with unittest.mock.patch.object(self.hub, "_register", side_effect=_boom):
+            got = self.manda(self.linea("h") + b"\nagmen-hub/1 ping")
+        self.assertEqual([op for op, _ in got], ["error", "pong"])     # el resto del datagrama se atiende
+        f = got[0][1]
+        self.assertEqual(f["id"], "h")
+        self.assertEqual(f["msg"], f"el hub falló al atender esta línea (RuntimeError en test_hub.py:{_BOOM_LINE}): "
+                                   f"es un error de Agmen, no de lo que mandaste, y no quedó atendida. Vuelve a "
+                                   f"intentarlo; si se repite, avísale a quien mantiene Agmen con lo que dice el log "
+                                   f"del hub")
+        dicho, = self.logs
+        self.assertEqual(dicho, f"⚠ un mensaje desde 127.0.0.1:50000 me hizo fallar (RuntimeError: falla de prueba) "
+                                f"en test_hub.py:{_BOOM_LINE}: lo ignoro y sigo atendiendo. Es un error de Agmen: "
+                                f"avísale a quien lo mantiene con esta línea (si se repite, cada 60 s digo cuántas "
+                                f"veces más)")
+        with unittest.mock.patch.object(self.hub, "_register", side_effect=_boom):
+            for now in (1.0, 2.0):
+                self.assertEqual(self.manda(self.linea("h"), now=now)[0][0], "error")   # siempre contesta
+            self.assertEqual(len(self.logs), 1)                       # la segunda vez no repite la línea
+            self.hub._unexpected_flush(59.0)
+            self.assertEqual(len(self.logs), 1)
+            self.hub._unexpected_flush(H.UNEXPECTED_REPEAT_S)          # pasado el tiempo, cuántas más
+            self.assertEqual(self.logs[1], f"⚠ el error inesperado RuntimeError en test_hub.py:{_BOOM_LINE} pasó 2 "
+                                           f"veces más en los últimos 60 s (el hub sigue atendiendo; el detalle, en "
+                                           f"la primera línea de este error)")
+            self.hub._unexpected_flush(500.0)
+            self.assertEqual(len(self.logs), 2)                        # sin nuevas, nada
+            self.manda(self.linea("h"), now=600.0)                     # una más, mucho después: se dice
+            self.assertIn("pasó 1 vez más en los últimos 540 s", self.logs[2])
+
+    def test_errores_inesperados_con_tope_de_claves_y_sin_silencio(self):
+        for i in range(H.UNEXPECTED_MAX + 5):
+            try:
+                raise type(f"Tipo{i}", (Exception,), {})("x")
+            except Exception as e:
+                self.hub._unexpected_error(e, LOCAL, 0.0)
+        self.assertEqual(len(self.hub._unexpected), H.UNEXPECTED_MAX + 1)    # acotado
+        self.assertEqual(len([x for x in self.logs if "me hizo fallar" in x]), H.UNEXPECTED_MAX)
+        self.assertEqual(len([x for x in self.logs if "ya dije" in x]), 1)
+        self.hub._unexpected_flush(H.UNEXPECTED_REPEAT_S)
+        self.assertIn(f"los errores inesperados de otros tipos (pasado el tope de {H.UNEXPECTED_MAX} distintos) "
+                      f"pasaron 4 veces más en los últimos 60 s", self.logs[-1])
+
+    def test_la_red_de_seguridad_de_serve_sigue(self):
+        stop = threading.Event()
+        with unittest.mock.patch.object(self.hub, "handle", side_effect=_boom):
+            hilo = threading.Thread(target=self.hub.serve, args=(stop,), daemon=True)
+            hilo.start()
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.addCleanup(s.close)
+            s.sendto(b"agmen-hub/1 ping", ("127.0.0.1", int(self.hub.listen.rsplit(":", 1)[1])))
+            fin = time.monotonic() + 5
+            while not self.logs and time.monotonic() < fin:
+                time.sleep(0.01)
+            stop.set()
+            hilo.join(2)
+        self.assertIn(f"me hizo fallar (RuntimeError: falla de prueba) en test_hub.py:{_BOOM_LINE}", self.logs[0])
+
+    # (d)
+    def test_forget_olvida_el_aviso_solo_local(self):
+        sub = hp.encode("sub", id="v", node="viejo", pid=1, topic="/cmd", schema=self.SCHEMA, type="Cmd", port=6000)
+        self.manda(sub, now=10.0)
+        self.manda(hp.encode("red", peers=f"robot@{ROBOT}"), now=10.0)
+        self.manda(hp.encode("red", peers=f"robot@{ROBOT}"), now=14.0)
+        self.manda(sub, now=14.0)
+        self.hub.expire(15.0)
+        self.assertIn(("solo-local", "v"), self.hub._warned)
+        self.manda(hp.encode("bye", id="v"), now=15.0)
+        self.assertNotIn(("solo-local", "v"), self.hub._warned)
+
+    # (e)
+    def test_nombre_de_nodo_con_control_y_largo_queda_acotado(self):
+        raro = "\x1b[2J" + "x" * 296                      # 300 caracteres, con un control
+        visto = "'?[2J" + "x" * 59 + "…'"                  # Hub._who: sin controles, NODE_SHOWN caracteres
+        self.manda(self.linea("a", node=raro))
+        (op, f), = self.manda(self.linea("b", node=raro, schema="00000000000000bb"))
+        self.assertEqual(op, "error")
+        self.assertIn(f"y {visto} quiere usarlo con Cmd (schema_id 00000000000000bb)", f["msg"])
+        self.assertNotIn("\x1b", f["msg"])
+        self.assertNotIn("x" * 60, f["msg"])
+        # Entre computadoras (el otro texto): los dos nombres acotados.
+        self.manda(hp.encode("red", peers=f"robot@{ROBOT}"))
+        self.manda(hp.encode("pub", id="r", node=raro, pid=1, topic="/otro", schema=self.SCHEMA, type="Cmd",
+                             text="", machine="robot"))
+        (op, f), = self.manda(self.linea("c", node=raro, schema="00000000000000bb", topic="/otro"))
+        self.assertIn(f"de {visto} en la computadora 'robot') y {visto} (en esta computadora) quiere", f["msg"])
+        self.assertNotIn("\x1b", f["msg"])
+        self.assertNotIn("x" * 60, f["msg"])
+        # El aviso de un Subscriber que no pasa a la red.
+        self.logs.clear()
+        sub = hp.encode("sub", id="v", node=raro, pid=1, topic="/cmd", schema=self.SCHEMA, type="Cmd", port=6000)
+        self.manda(hp.encode("red", peers=""), now=9.0)
+        self.manda(sub, now=10.0)
+        self.manda(hp.encode("red", peers=f"robot@{ROBOT}"), now=10.0)
+        self.manda(hp.encode("red", peers=f"robot@{ROBOT}"), now=14.0)
+        self.manda(sub, now=14.0)
+        self.hub.expire(15.0)
+        dicho, = [x for x in self.logs if "solo en esta computadora" in x]
+        self.assertEqual(dicho, f"⚠ {visto} escucha /cmd solo en esta computadora: no recibirá de robot. ¿Corre con "
+                                f"un Agmen anterior? Actualízalo")
+
+
+class TestErroresDelHubEnElPuente(unittest.TestCase):
+    """(f) tables.Bridge._drain: el corte del texto se nota y errores distintos del mismo topic se dicen cada uno."""
+
+    TOPIC = "/" + "t" * 255
+
+    def setUp(self):
+        from agmen import tables as T
+        self.T = T
+        self.said: list[str] = []
+        self.bridge = T.Bridge("127.0.0.1:9", lambda text, kind="agmen": self.said.append(text))
+        self.addCleanup(self.bridge.close)
+        self.rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.rx.bind(("127.0.0.1", 0))
+        self.rx.setblocking(False)
+        self.addCleanup(self.rx.close)
+        self.tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(self.tx.close)
+        self.bridge._sock = self.rx
+
+    def error(self, eid, msg) -> list[str]:
+        """Manda un `error` del "hub" al puente y devuelve lo que dijo el puente por él."""
+        before = len(self.said)
+        self.tx.sendto(hp.encode("error", id=eid, msg=msg), self.rx.getsockname())
+        time.sleep(0.02)          # (localhost: llega enseguida)
+        self.bridge._drain()
+        return self.said[before:]
+
+    def test_el_corte_se_nota(self):
+        largo = "x" * (self.T.HUB_ERROR_MAX + 50)
+        dicho, = self.error("robot.a", largo)
+        self.assertTrue(dicho.endswith(" " + "x" * (self.T.HUB_ERROR_MAX - 1) + "…"), dicho[-20:])
+        justo = "y" * self.T.HUB_ERROR_MAX
+        dicho, = self.error("robot.b", justo)
+        self.assertTrue(dicho.endswith(" " + justo), dicho[-20:])
+
+    def test_errores_distintos_del_mismo_topic_se_dicen_cada_uno(self):
+        uno = f"'{self.TOPIC}': 'nodo' declara a, b y robot.toml dice c, d (cambian desde la articulación 1 de 2)"
+        otro = f"'{self.TOPIC}': 'nodo' publica sin declarar su lista de nombres y robot.toml la exige"
+        self.assertEqual(len(self.error("robot.a", uno)), 1)
+        self.assertEqual(len(self.error("robot.a", otro)), 1)        # mismo topic e id, otro motivo: se dice
+        self.assertEqual(self.error("robot.a", uno), [])              # el mismo otra vez (cada latido): no
+        self.assertEqual(len(self.error("robot.b", uno)), 1)          # otro endpoint: se dice
+        self.assertEqual(self.error("robot.b", uno.replace("1 de 2", "7 de 9")), [])   # solo cambian números
+        self.assertEqual(len(self.error("robot.a", f"'/otro': 'nodo' publica sin declarar su lista")), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

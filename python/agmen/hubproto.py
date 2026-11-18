@@ -108,7 +108,12 @@ def unquote(value: str, key: str = "") -> str:
             try:
                 out.append(int(raw[i + 1:i + 3], 16))
             except ValueError:
-                raise ProtocolError(f"'%' mal escrito en '{value}'") from None
+                # Acotado (el valor puede medir casi 64 KiB y este texto vuelve al que lo mandó): el campo y los
+                # tres caracteres del '%' que no se pudo leer.
+                where = f"el campo '{_show_key(key)}'" if key else "un valor"
+                bad = _show_key(raw[i:i + 3].decode(errors="replace"))
+                raise ProtocolError(f"'%' mal escrito en {where} ('{bad}' en la posición {i}): cada '%' va seguido "
+                                    f"de dos dígitos hexadecimales, ej. %2C para una coma") from None
             i += 3
         else:
             out.append(raw[i])
@@ -143,24 +148,28 @@ def parse_line(text: str, repeated: set[str] | None = None) -> tuple[str, dict[s
             continue
         k, sep, v = p.partition("=")
         if not sep:
-            raise ProtocolError(f"campo sin '=': {p!r}")
+            raise ProtocolError(f"campo sin '=': '{_show_key(p)}' (cada campo va como clave=valor)")
         if repeated is not None and k in fields:
             repeated.add(k)
         fields[k] = unquote(v, k)
     return parts[1], fields
 
 
-def parse(data: bytes, repeated: list[frozenset[str]] | None = None) -> list[tuple[str, dict[str, str]]]:
-    """Un datagrama → sus líneas ya leídas. Lanza ProtocolError. Si se pasa `repeated`, por cada línea leída se le
-    añade (en el mismo orden) el conjunto de claves que vinieron repetidas en ella (ver parse_line)."""
+def split_lines(data: bytes) -> list[str]:
+    """Un datagrama → sus líneas sin leer (sin las vacías), para quien las lea una por una (el hub: una línea mala
+    no tira las demás). ProtocolError si el datagrama no es UTF-8."""
     try:
         text = data.decode()
     except UnicodeDecodeError:
         raise ProtocolError("el mensaje de control no es UTF-8") from None
+    return [ln for ln in text.splitlines() if ln.strip()]
+
+
+def parse(data: bytes, repeated: list[frozenset[str]] | None = None) -> list[tuple[str, dict[str, str]]]:
+    """Un datagrama → sus líneas ya leídas. Lanza ProtocolError. Si se pasa `repeated`, por cada línea leída se le
+    añade (en el mismo orden) el conjunto de claves que vinieron repetidas en ella (ver parse_line)."""
     out = []
-    for ln in text.splitlines():
-        if not ln.strip():
-            continue
+    for ln in split_lines(data):
         if repeated is None:
             out.append(parse_line(ln))
         else:
@@ -247,7 +256,9 @@ def check_joint_names(names, what: str = "names") -> tuple[str, ...]:
     seen: dict[str, int] = {}
     for k, n in enumerate(out):
         if not isinstance(n, str):
-            raise ProtocolError(f"{what}[{k}] = {n!r:.80} no es un texto. Cada articulación es un nombre entre "
+            shown = repr(n)
+            shown = shown if len(shown) <= 80 else shown[:79] + "…"
+            raise ProtocolError(f"{what}[{k}] = {shown} no es un texto. Cada articulación es un nombre entre "
                                 f"comillas, ej. \"FR_hip\"")
         why = joint_name_problem(n)
         if why is not None:

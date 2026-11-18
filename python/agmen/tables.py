@@ -280,6 +280,20 @@ def _printable(text: str, limit: int = 64) -> str:
     return "".join(c if c.isprintable() else "?" for c in text[:limit]) + ("…" if len(text) > limit else "")
 
 
+HUB_ERROR_KEY_REASON = 240   # caracteres del motivo en la clave de un `error` del hub (ver _hub_error_key)
+
+
+def _hub_error_key(eid: str, msg: str) -> tuple:
+    """La clave de say_once para un `error` del hub: el topic (si el texto empieza con él, como los rechazos del
+    hub), el id del endpoint y el motivo: el texto sin lo que va entre comillas (topic, nodos) y con los números
+    como '#', HUB_ERROR_KEY_REASON caracteres. Así dos errores distintos del mismo topic se dicen cada uno (con un
+    topic de 256 caracteres, el principio del texto es solo el topic) y el mismo, repetido en cada latido, una vez."""
+    msg = msg[:HUB_ERROR_MAX]
+    head = re.match(r"'(/[A-Za-z0-9_/]*)'", msg)
+    reason = re.sub(r"\d+", "#", re.sub(r"'[^']*'", "''", msg))[:HUB_ERROR_KEY_REASON]
+    return ("hub", head.group(1)[:TOPIC_MAX] if head else "", eid[:160], reason)
+
+
 def local_table(msgs: list[tuple[str, dict[str, str]]], cut: list[str] | None = None,
                 unnamed: list[str] | None = None) -> tuple[list[dict], list[dict]]:
     """Lo LOCAL de la respuesta a `query` (§2.2): todos los Publisher y los Subscriber con net=1, sin
@@ -876,9 +890,11 @@ class Bridge:
                 continue
             for op, f in msgs:
                 if op == "error":
-                    text = f.get("msg", "")[:HUB_ERROR_MAX]
-                    self.say_once(("hub", re.sub(r"\d+", "#", text)[:120]), f"⚠ el agmen hub de esta computadora no aceptó lo que le pasó el "
-                                                 f"puente de topics: {text}", "error")
+                    msg = f.get("msg", "")
+                    text = msg if len(msg) <= HUB_ERROR_MAX else msg[:HUB_ERROR_MAX - 1] + "…"   # que el corte se note
+                    self.say_once(_hub_error_key(f.get("id", ""), msg), f"⚠ el agmen hub de esta computadora no "
+                                                                        f"aceptó lo que le pasó el puente de topics: "
+                                                                        f"{text}", "error")
 
     def _robots(self, peers: list[Peer]) -> None:
         """§4: un topic que se publica en un robot y se escucha en otro no cruza (la laptop no le pasa a un

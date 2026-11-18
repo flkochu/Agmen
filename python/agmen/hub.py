@@ -30,6 +30,7 @@ import socket
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -184,10 +185,37 @@ class JointNames:
     required: bool = False    # require_names: quien publique aquí debe declarar su lista
 
 
-UNEXPECTED_MAX = 20   # tipos distintos de error inesperado que dice serve (luego, una línea y silencio)
+UNEXPECTED_MAX = 20   # errores inesperados distintos (tipo + archivo:línea) que se dicen uno por uno; los demás, juntos
 UNEXPECTED_SHOWN = 200   # caracteres del error inesperado en esa línea
+UNEXPECTED_REPEAT_S = 60.0   # un error inesperado que se repite: "pasó K veces más", como mucho una vez cada esto
+BAD_LINE_SHOWN = 400   # caracteres, como mucho, del `error` que contesta a una línea que no se pudo leer
+BAD_LINES_ANSWERED = 16   # líneas que no se pudieron leer que se contestan por datagrama (las demás, al log)
+# El id de una línea que no se pudo leer, sacado en crudo (sin '%XX'): como el id de un endpoint (tables._ID_RE) o,
+# si lo registró el puente, "<computadora>.<id>". Si no tiene esa forma no se usa (no se contesta).
+_RAW_ID_RE = re.compile(r"^(?:[A-Za-z0-9_-]{1,64}\.)?[A-Za-z0-9_-]{1,64}$")
+_OTHERS = ("", "")     # la clave de _unexpected para los errores inesperados pasado el tope (todos juntos)
 NAMES_SHOWN = 2       # nombres que se muestran de cada lista en un rechazo, desde la primera diferencia
 NODE_SHOWN = 64       # caracteres del nombre de un nodo (y de su computadora) en los textos del hub (Hub._who)
+
+
+def _raw_id(line: str) -> str | None:
+    """El id de una línea que no se pudo leer, tal como vino (sin '%XX': un id normal es ASCII), o None si no trae
+    uno con la forma de un id (_RAW_ID_RE). Con id= repetido, el último (como hp.parse_line). No se fía de él: solo
+    va en el `error` que se le contesta a quien mandó el datagrama."""
+    parts = line.strip().split(" ")
+    if len(parts) < 2 or parts[0] != hp.PREFIX:
+        return None
+    ids = [p[3:] for p in parts[2:] if p.startswith("id=")]
+    return ids[-1] if ids and _RAW_ID_RE.fullmatch(ids[-1]) else None
+
+
+def _unexpected_key(e: BaseException) -> tuple[str, str]:
+    """(tipo, 'archivo.py:línea' del último frame) de un error inesperado: solo el nombre del archivo, sin la ruta."""
+    kind = _cut(_clean(type(e).__name__), 80)
+    tb = traceback.extract_tb(e.__traceback__)
+    if not tb:
+        return kind, "?"
+    return kind, _cut(_clean(f"{os.path.basename(tb[-1].filename)}:{tb[-1].lineno}"), 80)
 
 
 def names_difference(a: tuple[str, ...], b: tuple[str, ...]) -> tuple[int, str, str]:
@@ -252,7 +280,8 @@ class Hub:
         self.grace_s = grace_s
         self.started = time.monotonic()
         self._warned: set = set()
-        self._unexpected: set[str] = set()   # tipos de error inesperado ya dichos en serve (ver _unexpected_error)
+        # Errores inesperados ya dichos (ver _unexpected_error): (tipo, archivo:línea) → [veces sin decir, dicho en].
+        self._unexpected: dict[tuple[str, str], list] = {}
         self._missing: set[str] = set()
         self.lock = threading.Lock()
         # Modo red (RFC 0011 §3.5): vacío = modo local (como siempre).
@@ -372,6 +401,7 @@ class Hub:
         que se cae y vuelve en bucle, con ids nuevos, no hace crecer _warned para siempre."""
         self._warned.discard(("sin-names", e.id))
         self._warned.discard(("n-joints", e.id))
+        self._warned.discard(("solo-local", e.id))
 
     def _drop(self, eps: list[Endpoint], why: str) -> None:
         for e in eps:
@@ -506,26 +536,56 @@ class Hub:
 
     # --- mensajes ---
     def handle(self, data: bytes, addr: tuple[str, int], now: float) -> None:
-        repeated: list[frozenset[str]] = []    # por línea, las claves que vinieron repetidas (names: se rechaza)
+        """Un datagrama, línea por línea: una que no se puede leer o que hace fallar al hub no tira las demás (el
+        puente manda muchas por datagrama), y a quien la mandó se le contesta `error` con su id."""
         try:
-            msgs = hp.parse(data, repeated)
+            lines = hp.split_lines(data)
         except hp.ProtocolError as e:
             self._warn_once(("proto", addr), f"mensaje inválido desde {addr[0]}:{addr[1]}: {e}")
             return
         queried = False
-        for (op, f), rep in zip(msgs, repeated):
+        bad = 0
+        for ln in lines:
+            rep: set[str] = set()    # las claves que vinieron repetidas en la línea (names: se rechaza)
+            try:
+                op, f = hp.parse_line(ln, rep)
+            except hp.ProtocolError as e:
+                bad += 1
+                self._bad_line(ln, e, addr, bad)
+                continue
             if op == "query":   # §10.3: una por datagrama (quien pregunta ya recibe una respuesta)
                 if queried:
                     continue
                 queried = True
             try:
-                self._handle_one(op, f, addr, now, rep)
+                self._handle_one(op, f, addr, now, frozenset(rep))
             except (KeyError, ValueError) as e:   # hp.ProtocolError es un ValueError
                 what = f"falta el campo {e}" if isinstance(e, KeyError) else str(e)
-                if op == "red":    # `red` no lleva id: "error msg=…" (como lo escribe la especificación)
-                    self._send(hp.encode("error", msg=what), addr)
-                else:
-                    self._send(hp.encode("error", id=f.get("id", ""), msg=what), addr)
+                self._reply_error(op, f, what, addr)
+            except Exception as e:   # un error de Agmen: el que la mandó lo sabe, se dice y se sigue con las demás
+                kind, where = _unexpected_key(e)
+                self._reply_error(op, f, f"el hub falló al atender esta línea ({kind} en {where}): es un error de "
+                                         f"Agmen, no de lo que mandaste, y no quedó atendida. Vuelve a intentarlo; si "
+                                         f"se repite, avísale a quien mantiene Agmen con lo que dice el log del hub",
+                                  addr)
+                self._unexpected_error(e, addr, now)
+
+    def _reply_error(self, op: str, f: dict[str, str], what: str, addr: tuple[str, int]) -> None:
+        if op == "red":    # `red` no lleva id: "error msg=…" (como lo escribe la especificación)
+            self._send(hp.encode("error", msg=what), addr)
+        else:
+            self._send(hp.encode("error", id=f.get("id", ""), msg=what), addr)
+
+    def _bad_line(self, ln: str, e: hp.ProtocolError, addr: tuple[str, int], bad: int) -> None:
+        """Una línea que no se pudo leer (hp.parse_line): si trae un id que se lee sin '%XX', se contesta `error` con
+        él a quien mandó el datagrama (como cualquier otro `error`: uno chico por línea, BAD_LINE_SHOWN caracteres
+        como mucho y BAD_LINES_ANSWERED líneas por datagrama). Si no, el aviso queda en el log (como siempre)."""
+        eid = _raw_id(ln)
+        if eid is None or bad > BAD_LINES_ANSWERED:
+            self._warn_once(("proto", addr), f"mensaje inválido desde {addr[0]}:{addr[1]}: {e}")
+            return
+        msg = _cut(_clean(f"no atendí esta línea: {e}"), BAD_LINE_SHOWN)
+        self._send(hp.encode("error", id=eid, msg=msg), addr)
 
     def _query_busy(self, addr: tuple[str, int], parts: int, size: int) -> None:
         """Una consulta que no sale (muchas a la vez, o de un cliente que no lee): quien preguntó lo dice."""
@@ -605,15 +665,16 @@ class Hub:
             if have is not None and have.schema != schema:
                 theirs = f.get("type") or schema
                 shapes = self._shapes(topic, have, f.get("type", ""), f.get("text", ""))
+                who, them = self._who(node), self._who(have.node)   # (los nombres los manda el nodo: acotados)
                 if not machine and not have.machine:     # todo en esta computadora: el texto de siempre
                     raise hp.ProtocolError(f"'{topic}' ya es de tipo {have.type or have.schema} (schema_id "
-                                           f"{have.schema}) y '{node}' quiere usarlo con {theirs} (schema_id "
+                                           f"{have.schema}) y {who} quiere usarlo con {theirs} (schema_id "
                                            f"{schema}){shapes}. Un topic, un tipo: usa otro nombre de topic o el "
                                            f"mismo esquema")
                 donde_have = f"la computadora '{have.machine}'" if have.machine else "esta computadora"
                 donde = f"la computadora '{machine}'" if machine else "esta computadora"
                 raise hp.ProtocolError(f"'{topic}' ya es de tipo {have.type or have.schema} (schema_id "
-                                       f"{have.schema}, de '{have.node}' en {donde_have}) y '{node}' (en "
+                                       f"{have.schema}, de {them} en {donde_have}) y {who} (en "
                                        f"{donde}) quiere usarlo con {theirs} (schema_id {schema}){shapes}. Un topic, "
                                        f"un tipo, también entre computadoras: usa otro nombre de topic o el "
                                        f"mismo esquema")
@@ -813,7 +874,7 @@ class Hub:
             if e.local_since is not None and now - e.local_since >= hp.NET_LOCAL_WARN_S:
                 what = "todos los topics" if e.topic == "*" else e.topic
                 self._warn_once(("solo-local", e.id),
-                                f"'{e.node}' escucha {what} solo en esta computadora: no recibirá de {names}. "
+                                f"{self._who(e.node)} escucha {what} solo en esta computadora: no recibirá de {names}. "
                                 f"¿Corre con un Agmen anterior? Actualízalo")
 
     # --- estado (para agmen topic list / info, node list) ---
@@ -870,21 +931,45 @@ class Hub:
         return "\n".join(lines)
 
     # --- ciclo ---
-    def _unexpected_error(self, e: Exception, addr: tuple[str, int]) -> None:
-        """Un datagrama hizo fallar a handle con algo que no esperaba (un error de Agmen, no del que lo mandó): se
-        dice una vez por tipo de error, acotado y sin controles, y como mucho UNEXPECTED_MAX tipos distintos."""
-        kind = type(e).__name__
-        if kind in self._unexpected or len(self._unexpected) > UNEXPECTED_MAX:
+    def _unexpected_error(self, e: Exception, addr: tuple[str, int], now: float) -> None:
+        """Algo que handle no esperaba (un error de Agmen, no del que lo mandó). Cada error distinto (tipo +
+        archivo:línea) se dice la primera vez, acotado y sin controles; si se repite, _unexpected_flush dice cuántas
+        veces más, como mucho una vez cada UNEXPECTED_REPEAT_S. Pasados UNEXPECTED_MAX distintos, los nuevos se
+        cuentan juntos. `now` es el reloj del hub (el de expire)."""
+        kind, where = _unexpected_key(e)
+        key = (kind, where)
+        if key not in self._unexpected and len(self._unexpected) >= UNEXPECTED_MAX:
+            key = _OTHERS
+        got = self._unexpected.get(key)
+        if got is not None:
+            got[0] += 1
+            self._unexpected_flush(now)
             return
-        self._unexpected.add(kind)
-        if len(self._unexpected) > UNEXPECTED_MAX:
-            self.log(f"⚠ ya dije {UNEXPECTED_MAX} errores inesperados distintos: desde aquí no digo los nuevos "
-                     f"(el hub sigue atendiendo)")
+        self._unexpected[key] = [0, now]
+        if key == _OTHERS:
+            self.log(f"⚠ ya dije {UNEXPECTED_MAX} errores inesperados distintos: los nuevos ya no los digo uno por "
+                     f"uno; cada {UNEXPECTED_REPEAT_S:.0f} s, como mucho, digo cuántos hubo (el hub sigue atendiendo)")
             return
         what = _cut(_clean(f"{kind}: {e}"), UNEXPECTED_SHOWN)
-        self.log(f"⚠ un mensaje desde {addr[0]}:{addr[1]} me hizo fallar ({what}): lo ignoro y sigo atendiendo. "
-                 f"Es un error de Agmen: avísale a quien lo mantiene con esta línea (no la repito para este tipo "
-                 f"de error)")
+        self.log(f"⚠ un mensaje desde {addr[0]}:{addr[1]} me hizo fallar ({what}) en {where}: lo ignoro y sigo "
+                 f"atendiendo. Es un error de Agmen: avísale a quien lo mantiene con esta línea (si se repite, cada "
+                 f"{UNEXPECTED_REPEAT_S:.0f} s digo cuántas veces más)")
+
+    def _unexpected_flush(self, now: float) -> None:
+        """Los errores inesperados que se repitieron desde la última vez que se dijeron: "pasó K veces más", como
+        mucho uno por error cada UNEXPECTED_REPEAT_S. Lo llama serve cada medio segundo (nada queda callado)."""
+        for key, got in self._unexpected.items():
+            if not got[0] or now - got[1] < UNEXPECTED_REPEAT_S:
+                continue
+            k, since = got[0], now - got[1]
+            veces = "vez" if k == 1 else "veces"
+            if key == _OTHERS:
+                self.log(f"⚠ los errores inesperados de otros tipos (pasado el tope de {UNEXPECTED_MAX} distintos) "
+                         f"pasaron {k} {veces} más en los últimos {since:.0f} s (el hub sigue atendiendo)")
+            else:
+                self.log(f"⚠ el error inesperado {key[0]} en {key[1]} pasó {k} {veces} más en los últimos "
+                         f"{since:.0f} s (el hub sigue atendiendo; el detalle, en la primera línea de este error)")
+            got[0], got[1] = 0, now
 
     def serve(self, stop: threading.Event) -> None:
         last_check = 0.0
@@ -900,7 +985,7 @@ class Hub:
                     try:
                         self.handle(data, addr, now)
                     except Exception as e:   # un datagrama no tumba al hub: se dice y se sigue atendiendo
-                        self._unexpected_error(e, addr)
+                        self._unexpected_error(e, addr, now)
             if self._outbox:
                 with self.lock:
                     self.flush()
@@ -908,6 +993,7 @@ class Hub:
                 with self.lock:
                     self.expire(now)
                     self.check_required(now)
+                    self._unexpected_flush(now)
                 last_check = now
         self.sock.close()
 

@@ -555,7 +555,8 @@ def _parse_joints(data: dict, topics: list[TopicConfig]) -> list[JointsConfig]:
                                   f"UDP con hasta {top}. Reparte las articulaciones en varios [[joints]], cada uno "
                                   f"con sus topics")
         # La misma revisión que hace el hub con la lista que declara un nodo (y los mismos topes): textos (no
-        # números ni listas), nombres válidos, sin repetir, de hasta hp.JOINT_NAME_MAX caracteres y hp.JOINT_NAMES_MAX en total.
+        # números ni listas), nombres válidos, sin repetir, de hasta hp.JOINT_NAME_MAX caracteres y
+        # hp.JOINT_NAMES_MAX en total.
         try:
             hp.check_joint_names(names)
         except hp.ProtocolError as e:
