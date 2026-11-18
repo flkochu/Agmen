@@ -196,6 +196,47 @@ class TestFormato(unittest.TestCase):
         port = sub2.listen.rsplit(":", 1)[1]
         self.assertTrue(linea.endswith(f" port={port} tcp= names=hombro,codo,mano.1"), linea)
 
+    def test_raw_sin_names_es_la_linea_de_siempre_byte_a_byte(self):
+        """RawSubscriber y RawPublisher (los del [[mux]]): sin names, la línea de siempre; con names, al final."""
+        falso = FalsoHub(self)
+        rs = self.abrir(pubsub.RawSubscriber, "/patas/cmd")
+        port = rs.listen.rsplit(":", 1)[1]
+        siempre = (f"agmen-hub/1 sub id={rs._link.id} node={hp.quote(pubsub.node_name())} pid={os.getpid()} "
+                   f"topic=/patas/cmd schema=* type= port={port} tcp={rs.tcp_port}")
+        self.assertEqual(falso.registro("sub").decode(), siempre)
+        rs.close()
+        falso.vaciar()
+        rs2 = self.abrir(pubsub.RawSubscriber, "/patas/cmd", names=list(PATAS))
+        port = rs2.listen.rsplit(":", 1)[1]
+        self.assertEqual(falso.registro("sub").decode(),
+                         f"agmen-hub/1 sub id={rs2._link.id} node={hp.quote(pubsub.node_name())} pid={os.getpid()} "
+                         f"topic=/patas/cmd schema=* type= port={port} tcp={rs2.tcp_port} names={','.join(PATAS)}")
+        rs2.close()
+        falso.vaciar()
+        rp = self.abrir(pubsub.RawPublisher, "/patas/cmd")
+        rp.set_schema(T12, "JointCommand", CMD12.SCHEMA_ID)
+        siempre = (f"agmen-hub/1 pub id={rp.source_id:016x} node={hp.quote(pubsub.node_name())} pid={os.getpid()} "
+                   f"topic=/patas/cmd schema={S12} type=JointCommand text={hp.quote(T12)}")
+        self.assertEqual(falso.registro("pub").decode(), siempre)
+        rp.close()
+        falso.vaciar()
+        rp2 = self.abrir(pubsub.RawPublisher, "/patas/cmd", names=list(PATAS))
+        rp2.set_schema(T12, "JointCommand", CMD12.SCHEMA_ID)
+        self.assertEqual(falso.registro("pub").decode(),
+                         siempre.replace(f"id={rp.source_id:016x}", f"id={rp2.source_id:016x}")
+                         + f" names={','.join(PATAS)}")
+        self.assertEqual(rp2.names, PATAS)
+
+    def test_raw_names_se_revisa_al_crear(self):
+        for cls in (pubsub.RawSubscriber, pubsub.RawPublisher):
+            with self.subTest(cls=cls.__name__):
+                with self.assertRaisesRegex(ValueError, f"{cls.__name__} en '/patas/cmd': 'a' está dos veces"):
+                    cls("/patas/cmd", names=["a", "a"])
+                with self.assertRaisesRegex(TypeError, "no tiene orden fijo"):
+                    cls("/patas/cmd", names={"a"})
+        with self.assertRaisesRegex(ValueError, "RawSubscriber: names= va con un topic"):
+            pubsub.RawSubscriber("127.0.0.1:0", names=["a"])
+
     def test_signos_validos_no_se_escapan(self):
         self.assertEqual(hp.encode("pub", names=hp.format_joint_names(["_a", "b/c.d-1", "9"])),
                          b"agmen-hub/1 pub names=_a,b/c.d-1,9")
@@ -1384,12 +1425,16 @@ import agmen
 from agmen.msgs import JointCommand
 names = sys.argv[1].split(",")
 valor = float(sys.argv[2])
-T = JointCommand[len(names)]
-pub = agmen.Publisher(T, "/patas/cmd", names=names)
+topic = sys.argv[3] if len(sys.argv) > 3 else "/patas/cmd"
+n = len(names) if sys.argv[1] != "-" else 3
+T = JointCommand[n]
+pub = agmen.Publisher(T, topic, names=names if sys.argv[1] != "-" else None)   # "-": sin lista
 end = time.monotonic() + 40
 while time.monotonic() < end:
     m = T()
-    m.position = [valor] * len(names)
+    m.position = [valor] * n
+    if len(sys.argv) > 3:   # hacia un [[mux]]: kp y kd finitos (el mux no deja pasar NaN)
+        m.kp, m.kd = [1.0] * n, [0.1] * n
     try:
         pub.publish(m)
     except Exception as e:
@@ -1470,6 +1515,40 @@ class TestAgmenRunLlegaElBueno(unittest.TestCase):
         ok, out = self.correr(robot, lambda t: "VISTO 1.0" in t and "require_names = true" in t)
         self.assertTrue(ok, out)
         self.assertNotIn("VISTO 77.0", out)
+
+    # --- el [[mux]] hereda la lista (RFC 0013 D6 = d): su salida es el command de [[joints]] -----------------------
+    MUX = ('\n[[mux]]\nname = "ruedas"\noutput = "/patas/cmd"\n\n[[mux.input]]\nname = "ia"\ntopic = "/cmd/ia"\n'
+           'priority = 1\n')
+
+    def test_mux_con_require_names_entra_y_compara_a_quien_publica_en_su_entrada(self):
+        robot = ('[robot]\nname = "n"\n\n[[joints]]\nname = "patas"\ncommand = "/patas/cmd"\n'
+                 'names = ["cadera", "rodilla", "tobillo"]\nkp = 1.0\nkd = 0.1\nrequire_names = true\n' + self.MUX)
+        robot += self.nodo("lector", ["python", "lector.py"])
+        robot += self.nodo("bueno", ["python", "politica.py", "cadera,rodilla,tobillo", "1.0", "/cmd/ia"])
+        robot += self.nodo("malo", ["python", "politica.py", "rodilla,cadera,tobillo", "99.0", "/cmd/ia"])
+        robot += self.nodo("sin", ["python", "politica.py", "-", "77.0", "/cmd/ia"])
+        frag_malo = "'/cmd/ia': 'malo' declara rodilla, cadera… y robot.toml dice cadera, rodilla…"
+        frag_sin = ("'/cmd/ia': 'sin' publica sin declarar su lista de nombres y robot.toml la exige "
+                    "(require_names = true en [[joints]])")
+        # "VISTO 1.0": lo que publicó 'bueno' en la entrada pasó por el mux y llegó al suscriptor del comando; con
+        # require_names en /patas/cmd, eso solo pasa si el hub aceptó al mux (declara la lista).
+        ok, out = self.correr(robot, lambda t: "VISTO 1.0" in t and frag_malo in t and frag_sin in t)
+        self.assertTrue(ok, out)
+        self.assertNotIn("VISTO 99.0", out)
+        self.assertNotIn("VISTO 77.0", out)
+        self.assertIn("la lista vale también en la entrada 'ia' del mux 'ruedas' (/cmd/ia)", out)
+
+    def test_mux_sin_require_names_ya_no_da_el_aviso_falso(self):
+        robot = ('[robot]\nname = "n"\n\n[[joints]]\nname = "patas"\ncommand = "/patas/cmd"\n'
+                 'names = ["cadera", "rodilla", "tobillo"]\nkp = 1.0\nkd = 0.1\n' + self.MUX)
+        robot += self.nodo("lector", ["python", "lector.py"])
+        robot += self.nodo("bueno", ["python", "politica.py", "cadera,rodilla,tobillo", "1.0", "/cmd/ia"])
+        robot += self.nodo("sin", ["python", "politica.py", "-", "1.0", "/cmd/ia"])
+        aviso_sin = "'sin' publica en '/cmd/ia', un topic de [[joints]], sin declarar su lista de nombres"
+        ok, out = self.correr(robot, lambda t: "VISTO 1.0" in t and aviso_sin in t)
+        self.assertTrue(ok, out)
+        self.assertNotIn("'ruedas' publica en '/patas/cmd'", out)       # el mux declara su lista
+        self.assertNotIn("sin declarar su lista de nombres", out.replace(aviso_sin, ""))
 
     def test_perfil_distinto_no_manda_names_al_hub(self):
         base = ('[robot]\nname = "n"\n\n[[node]]\nname = "m"\ncmd = "x"\n\n[[joints]]\nname = "patas"\n'

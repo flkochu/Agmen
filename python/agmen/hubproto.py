@@ -335,6 +335,30 @@ def schema_joint_count(text: str) -> int | None:
     return None
 
 
+# La primera versión de Agmen cuyo hub compara los nombres de las articulaciones (RFC 0013 D6 = d). Un hub anterior
+# ignora el campo `names` y entonces no compara nada: agmen run lo avisa (con la versión que ya reporta el hub en su
+# `pong` o el agente en su saludo; no se cambia ningún byte del protocolo).
+NAMES_SINCE = "0.15.0"
+_VERSION_RE = re.compile(r"([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})(?:-([0-9A-Za-z.-]+))?")
+
+
+def version_key(text) -> tuple[int, int, int, int] | None:
+    """'0.15.0' → (0, 15, 0, 1); '0.15.0-dev' → (0, 15, 0, 0): una versión con sufijo es anterior a la misma sin él
+    (como en semver). None si no se entiende ('?', vacío, otro texto)."""
+    if not isinstance(text, str):
+        return None
+    m = _VERSION_RE.fullmatch(text.strip())
+    if m is None:
+        return None
+    return int(m.group(1)), int(m.group(2)), int(m.group(3)), 0 if m.group(4) else 1
+
+
+def version_at_least(version, minimum: str) -> bool:
+    """¿`version` es `minimum` o posterior? Lo que no se entiende cuenta como anterior (False)."""
+    a, b = version_key(version), version_key(minimum)
+    return a is not None and b is not None and a >= b
+
+
 # --- Modo red (RFC 0011 §3.5): el hub y otras computadoras ---------------------
 # Los mismos casos revisa tests/test_wire.cpp (hub_modo_red) contra hubproto.hpp.
 

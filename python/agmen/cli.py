@@ -589,6 +589,13 @@ def _connect(launcher, config, remotes: dict, keys: dict, clock: str, lost: list
             if link.version != mine:
                 launcher.say(f"⚠ {name} tiene Agmen {link.version} y esta computadora Agmen {mine}: se entienden "
                              f"(mismo protocolo), pero conviene la misma versión en las dos (pip install -U agmen)")
+            if getattr(config, "joints", None):   # RFC 0013 D6 = d: un hub anterior allá no compara los nombres
+                from .run import old_hub_text
+
+                old = old_hub_text(link.version, f"{name} ({link.shown}) tiene",
+                                   f"Actualiza Agmen en {name} (pip install -U agmen) y vuelve a correr agmen run")
+                if old is not None:
+                    launcher.say(f"⚠ {old}")
         if net_check and desde is not None and opened and not lost:
             failed = _net_checks(launcher, opened, stop, lost)
             if failed:
@@ -1119,6 +1126,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--state", metavar="TOPIC",
                    help="publicar quién manda (agmen.msgs.MuxEstado) en este topic, ej. /mux/ruedas (RFC 0012)")
     p.add_argument("--name", default="", help="el nombre del mux en su estado (default: el del nodo)")
+    p.add_argument("--names", metavar="NOMBRE,NOMBRE,...",
+                   help="la lista de [[joints]] que lleva la salida (RFC 0013): el mux la declara al hub en la salida "
+                        "y en las entradas que son topics (agmen run la pone sola)")
     p.set_defaults(func=cmd_mux)
 
     p = sub.add_parser("echo", help="muestra cualquier mensaje que llegue a un puerto")

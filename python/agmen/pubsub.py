@@ -114,7 +114,8 @@ def node_name() -> str:
 def joint_names_for(msg_type, where: str, names, who: str) -> tuple[str, ...] | None:
     """names= de un Publisher o Subscriber (RFC 0013 §3.4, D6 = d), revisada al crear: una lista de nombres válidos,
     sin repetir, dentro de los topes (hp.check_joint_names) y, si el esquema dice cuántas articulaciones son
-    (`f32[N] position`, como JointState[N] y JointCommand[N]), con N nombres. None si no se pasó."""
+    (`f32[N] position`, como JointState[N] y JointCommand[N]), con N nombres. None si no se pasó. `msg_type` None:
+    sin tipo conocido (RawPublisher, RawSubscriber), el número no se revisa aquí (lo avisa el hub)."""
     if names is None:
         return None
     if not hp.is_topic(where):
@@ -130,7 +131,7 @@ def joint_names_for(msg_type, where: str, names, who: str) -> tuple[str, ...] | 
     except hp.ProtocolError as e:
         bad_kind = isinstance(names, (str, bytes, bytearray)) or not hasattr(names, "__iter__")
         raise (TypeError if bad_kind else ValueError)(f"{who} en '{where}': {e}") from None
-    n = hp.schema_joint_count(msg_type.SCHEMA_TEXT)
+    n = hp.schema_joint_count(msg_type.SCHEMA_TEXT) if msg_type is not None else None
     if n is not None and len(out) != n:
         raise ValueError(f"{who} en '{where}': names tiene {len(out)} nombre{'' if len(out) == 1 else 's'} y "
                          f"{msg_type.NAME} es de {n} articulaciones (f32[{n}] position): pasa un nombre por "
@@ -1271,13 +1272,17 @@ class RawSubscriber(_Receiver):
     """Recibe paquetes de CUALQUIER tipo (para herramientas: echo, hz, panel, mux).
 
     `where` = un topic, "*" (todos los topics) o una dirección. `node`: su
-    nombre en el hub (si no, el del proceso)."""
+    nombre en el hub (si no, el del proceso). `names`: los nombres de las
+    articulaciones en orden (RFC 0013 D6 = d; el mux, en una entrada que hereda
+    la lista de [[joints]]): va al hub en el registro, como en un Subscriber.
+    Solo con un topic. Sin `names`, la línea de registro de siempre."""
 
     _CERRADO = "el RawSubscriber ya se cerró"
     _NOMBRE = "RawSubscriber"
 
-    def __init__(self, where: str, node: str | None = None) -> None:
-        super().__init__(where, "*", node=node)
+    def __init__(self, where: str, node: str | None = None, *, names=None) -> None:
+        self.names = joint_names_for(None, where, names, "RawSubscriber") if names is not None else None
+        super().__init__(where, "*", node=node, names=self.names)
 
     def receive_raw(self, timeout: float | None = None):
         """(bytes, "ip:puerto") del siguiente paquete Agmen, o None. Las
@@ -1291,12 +1296,19 @@ class RawSubscriber(_Receiver):
 class RawPublisher(_NetSend):
     """Reenvía paquetes ya armados a un topic (para el mux). Se registra con el
     hub cuando conoce el esquema (por el primer anuncio que reenvía). En modo red
-    manda a otra computadora como un Publisher (RFC 0011 §10.1)."""
+    manda a otra computadora como un Publisher (RFC 0011 §10.1).
+
+    `names`: los nombres de las articulaciones en orden (RFC 0013 D6 = d; el mux
+    cuya salida es un topic de [[joints]]): van en su línea `pub`, después de
+    `text`, como en un Publisher. Sin `names`, la línea de siempre."""
 
     _NOMBRE = "RawPublisher"
 
-    def __init__(self, topic: str) -> None:
+    def __init__(self, topic: str, *, names=None) -> None:
         hp.check_topic(topic)
+        # Antes de abrir nada: una lista que no sirve no deja sockets abiertos.
+        self.names = joint_names_for(None, topic, names, "RawPublisher") if names is not None else None
+        self._fit_warned = False    # ¿ya se dijo que el registro no cabe en un datagrama? (una vez)
         self.topic = topic
         self.topic_id = wire.topic_id(topic)
         self._init_net(_net_ip())   # antes de abrir nada: si AGMEN_NET_IP no sirve, error claro
@@ -1337,9 +1349,22 @@ class RawPublisher(_NetSend):
                 raise RuntimeError(_RAWPUB_CERRADO)
             if self._link is not None:
                 return
-        link = _HubLink(self._sock, dict(
-            op="pub", id=f"{self.source_id:016x}", node=node_name(), pid=os.getpid(), topic=self.topic,
-            schema=f"{schema_id:016x}", type=name, text=text), on_tick=self._drain_locked)
+        node = node_name()
+        # El registro debe caber en un datagrama: si no, el hub nunca lo vería (y el envío fallaría callado). Se
+        # dice una vez, claro, y el RawPublisher sigue vivo sin registrarse (el mux sigue arbitrando).
+        try:
+            check_registration_fits("pub", "RawPublisher", self.topic, node, name, text, self.names)
+        except ValueError as e:   # (hp.ProtocolError también es un ValueError)
+            if not self._fit_warned:
+                self._fit_warned = True
+                print(f"[agmen] ⚠ {e}. Mientras tanto no me registro en el hub: lo que reenvío a '{self.topic}' "
+                      f"no le llega a nadie", file=sys.stderr, flush=True)
+            return
+        beat = dict(op="pub", id=f"{self.source_id:016x}", node=node, pid=os.getpid(), topic=self.topic,
+                    schema=f"{schema_id:016x}", type=name, text=text)
+        if self.names is not None:   # al final; sin lista, la línea de siempre (RFC 0013 D6)
+            beat["names"] = hp.format_joint_names(self.names)
+        link = _HubLink(self._sock, beat, on_tick=self._drain_locked)
         with self._lock:
             closed = self._closed
             installed = not closed and self._link is None

@@ -160,6 +160,20 @@ class JointsConfig:
 
 
 @dataclass
+class InheritedNames:
+    """Una entrada (topic) de un [[mux]] que lleva la lista de un [[joints]] (RFC 0013 D6 = d): la salida del mux
+    es un topic del grupo (o la entrada de otro mux que lo es). agmen run le pasa la lista al hub también para esta
+    entrada, y require_names si la hereda del command del grupo: quien publica hacia el mux se compara igual que
+    quien publica en el comando."""
+    topic: str                   # la entrada
+    group: str                   # el [[joints]] del que viene la lista
+    names: tuple[str, ...]
+    require: bool                # require_names del grupo (heredado de su command)
+    mux: str                     # el [[mux]] de esta entrada
+    input: str                   # el name de la entrada
+
+
+@dataclass
 class RobotConfig:
     name: str
     base_dir: Path
@@ -180,6 +194,8 @@ class RobotConfig:
     machines: list[MachineConfig] = field(default_factory=list)   # [[machine]] (RFC 0011 §3.4)
     warnings: list[str] = field(default_factory=list)        # avisos (no errores) de robot.toml, ej. un perfil mal escrito
     joints: list[JointsConfig] = field(default_factory=list)   # [[joints]] del perfil activo (RFC 0013 §3.4)
+    # Las entradas de [[mux]] (del perfil activo) que heredan la lista de un [[joints]] (RFC 0013 D6 = d).
+    inherited: list[InheritedNames] = field(default_factory=list)
 
     def topics_used(self) -> set[str]:
         """Los topics que este robot.toml dice que usa: [[topic]], los de los [[mux]],
@@ -607,6 +623,109 @@ def _check_joints_web(joints: list[JointsConfig], web: WebConfig, table: str = "
                                       f"topic en uno de los dos")
 
 
+@dataclass
+class _Carry:
+    """Lo que lleva un topic: la lista, de qué [[joints]], si se exige y por qué (para los errores)."""
+    names: tuple[str, ...]
+    group: str
+    require: bool
+    origin: str
+
+
+def _short_names(names: tuple[str, ...]) -> str:
+    from .hub import _names_hint
+
+    return _names_hint(names)
+
+
+def inherit_joint_names(muxes: list[MuxConfig],
+                        joints: list[JointsConfig]) -> tuple[list[InheritedNames], dict[str, _Carry], list[str]]:
+    """El [[mux]] hereda la lista de [[joints]] (RFC 0013 D6 = d). Un topic lleva la lista L si es state o command
+    de un [[joints]] con names = L, o si es una entrada (topic) de un [[mux]] cuya salida lleva L. Es transitivo (la
+    entrada de un mux puede ser la salida de otro): se repite hasta que nada cambia. require_names se hereda del
+    command. Solo los [[mux]] y [[joints]] que se pasan (los del perfil activo).
+
+    Devuelve (las entradas heredadas, lo que lleva cada topic, los avisos). ConfigError si un topic heredaría dos
+    listas distintas, o si una entrada por dirección (sin hub) tendría que cumplir require_names."""
+    from . import hubproto as hp
+
+    carries: dict[str, _Carry] = {}
+    for j in joints:
+        if j.state:
+            carries[j.state] = _Carry(j.names, j.name, False, f"el state del [[joints]] '{j.name}'")
+        if j.command:
+            carries[j.command] = _Carry(j.names, j.name, j.require_names, f"el command del [[joints]] '{j.name}'")
+    inherited: dict[str, InheritedNames] = {}
+    changed = True
+    while changed:
+        changed = False
+        for m in muxes:
+            out = carries.get(m.output)
+            if out is None:
+                continue
+            for name, listen, _ in m.inputs:
+                if not hp.is_topic(listen):
+                    continue
+                origin = f"la entrada '{name}' del [[mux]] '{m.name}' (que escribe en '{m.output}')"
+                have = carries.get(listen)
+                if have is None:
+                    carries[listen] = _Carry(out.names, out.group, out.require, origin)
+                    inherited[listen] = InheritedNames(listen, out.group, out.names, out.require, m.name, name)
+                    changed = True
+                elif have.names != out.names:
+                    raise ConfigError(
+                        f"'{listen}' llevaría dos listas de nombres distintas: como {origin} lleva la del [[joints]] "
+                        f"'{out.group}' ({_short_names(out.names)}), y como {have.origin} lleva la del [[joints]] "
+                        f"'{have.group}' ({_short_names(have.names)}). El hub compara cada topic contra una sola "
+                        f"lista: usa otro topic para la entrada '{name}' del [[mux]] '{m.name}'")
+                elif out.require and not have.require and listen in inherited:
+                    have.require = inherited[listen].require = True   # la misma lista, por otro camino que la exige
+                    changed = True
+    warnings: list[str] = []
+    for m in muxes:
+        out = carries.get(m.output)
+        if out is None:
+            continue
+        for name, listen, _ in m.inputs:
+            if hp.is_topic(listen):
+                continue
+            if out.require:
+                raise ConfigError(
+                    f"[[mux]] '{m.name}': la entrada '{name}' escucha en una dirección ({listen}), sin hub, y la "
+                    f"salida '{m.output}' lleva la lista del [[joints]] '{out.group}', que tiene require_names = "
+                    f"true: se exige la lista a quien publique el comando, y en una dirección nadie puede revisarla. "
+                    f"Usa un topic en esa entrada (topic = \"/...\" en lugar de listen), o quita require_names del "
+                    f"[[joints]] '{out.group}'")
+            warnings.append(
+                f"[[mux]] '{m.name}': la entrada '{name}' escucha en una dirección ({listen}), sin hub, y la salida "
+                f"'{m.output}' lleva la lista del [[joints]] '{out.group}': quien mande a esa entrada no declara su "
+                f"lista y nadie revisa que use el orden de robot.toml. Para que se revise, usa un topic en esa "
+                f"entrada (topic = \"/...\" en lugar de listen)")
+    return list(inherited.values()), carries, warnings
+
+
+def old_hub_text(version: str, subject: str, fix: str) -> str | None:
+    """El aviso de un hub anterior a hp.NAMES_SINCE (RFC 0013 D6 = d: un hub anterior ignora `names` y no compara),
+    o None si no hay que darlo. `subject` dice de quién es la versión, con el verbo ("el agmen hub que ya corre en
+    127.0.0.1:7390 es", "robot (192.168.1.20:7391) tiene"); `fix`, qué hacer. Mientras la versión propia sea
+    anterior a hp.NAMES_SINCE no se avisa nada: no hay forma de distinguir un hub viejo de uno como este."""
+    from . import _version
+    from . import hubproto as hp
+
+    if not hp.version_at_least(_version.__version__, hp.NAMES_SINCE) or hp.version_at_least(version, hp.NAMES_SINCE):
+        return None
+    shown = f"Agmen {version}" if hp.version_key(version) is not None else \
+        f"una versión de Agmen que no se entiende ({_clip(version) or 'vacía'})"
+    return (f"{subject} {shown}, anterior a {hp.NAMES_SINCE}: ese agmen hub no compara los nombres de las "
+            f"articulaciones (names=), así que ahí no se revisa que los nodos usen el orden de [[joints]] de "
+            f"robot.toml (una lista con el orden cambiado entra sin aviso y require_names no se exige). {fix}")
+
+
+def _clip(text, limit: int = 40) -> str:
+    text = "".join(c if c.isprintable() else "?" for c in str(text))
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
 def joints_lines(config: RobotConfig) -> list[str]:
     """Una línea por [[joints]] del perfil activo, para el arranque de agmen run (un comando, una pantalla)."""
     def gains(key: str, values: tuple[float, ...] | None) -> str:
@@ -631,6 +750,10 @@ def joints_lines(config: RobotConfig) -> list[str]:
             parts.append(g)
         if j.require_names:
             parts.append("require_names")
+        via = [e for e in config.inherited if e.group == j.name]
+        if via:   # RFC 0013 D6 = d: el [[mux]] hereda la lista
+            parts.append("la lista vale también en " + ", ".join(
+                f"la entrada '{e.input}' del mux '{e.mux}' ({e.topic})" for e in via))
         out.append(" · ".join(parts))
     return out
 
@@ -701,6 +824,7 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
         raise ConfigError("'mux' se declara como [[mux]] (puede haber varios)")
     muxes: list[NodeConfig] = []
     mux_configs: list[MuxConfig] = []
+    mux_nodes: list[tuple[MuxConfig, NodeConfig]] = []   # cada [[mux]] con su nodo (para --names, más abajo)
     for i, raw in enumerate(raw_muxes, start=1):
         where = f"[[mux]] #{i}"
         _check_keys(raw, {"name", "output", "hold_ms", "input", "profile", "machine"}, where)
@@ -765,6 +889,7 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
             machine=machine,
             raw=copy.deepcopy(raw),
         ))
+        mux_nodes.append((mux_configs[-1], muxes[-1]))
     nodes = muxes + nodes   # los mux arrancan primero: ya escuchan cuando llegan comandos
 
     # [[topic]]: los topics que esperas (RFC 0004, D3).
@@ -855,6 +980,12 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
     mux_configs = [m for m in mux_configs if _runs_in(m.profiles, profile)]
     topics = [t for t in topics if _runs_in(t.profiles, profile)]
     joints = [j for j in joints_all if _runs_in(j.profiles, profile)]
+    # El [[mux]] hereda la lista de [[joints]] (RFC 0013 D6 = d), con los del perfil activo. El mux la declara al
+    # hub (--names) en su salida y en sus entradas que son topics.
+    inherited, carries, mux_warnings = inherit_joint_names(mux_configs, joints)
+    for mc, node in mux_nodes:
+        if any(mc is x for x in mux_configs) and mc.output in carries:
+            node.cmd += ["--names", hp.format_joint_names(carries[mc.output].names)]
 
     top_web = web = _parse_web(data.get("web", {}), base_dir)   # con [profile.X] web no se usa, pero se revisa
     if "web" in active:
@@ -895,7 +1026,8 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
                        muxes=mux_configs, profile=profile, profiles=known,
                        skipped=[(n.name, n.profiles) for n in skipped_nodes],
                        local=bool(active.get("local", False)), machines=machines,
-                       warnings=_typo_warnings(mentions, raw_tables, bool(joints_all)), joints=joints)
+                       warnings=_typo_warnings(mentions, raw_tables, bool(joints_all)) + mux_warnings, joints=joints,
+                       inherited=inherited)
 
 
 def _parse_web(web_raw, base_dir: Path, where: str = "[web]") -> WebConfig:
@@ -1033,6 +1165,13 @@ def prepare_hub(config: RobotConfig, ping=None) -> tuple[RobotConfig, str]:
         # Ese hub no conoce este robot.toml: ni sus [[topic]] ni las listas de sus [[joints]] (no compara nombres).
         what = " y ".join(x for x, on in (("[[topic]]", config.topics), ("[[joints]]", config.joints)) if on)
         note = f" (los {what} de este robot.toml no se revisan)" if what else ""
+        # Y si además es anterior a hp.NAMES_SINCE, ni siquiera compara las listas que declaran los nodos (D6 = d).
+        old = old_hub_text(alive, f"el agmen hub que ya corre en {hub_address()} es",
+                           "Actualiza Agmen en esta computadora y detén ese agmen hub (o el agmen run que lo "
+                           "arrancó) para que agmen run arranque uno al día") if config.joints else None
+        if old is not None:
+            from dataclasses import replace
+            config = replace(config, warnings=[*config.warnings, old])
         return config, f"usando el agmen hub {alive} que ya corre en {hub_address()}{note}"
     args = ["-m", "agmen", "hub", "--listen", hub_address(), "--robot", config.name]
     for t in config.topics:
@@ -1057,11 +1196,18 @@ def prepare_hub(config: RobotConfig, ping=None) -> tuple[RobotConfig, str]:
                 args += ["--names", f"{getattr(j, key)}={hp.format_joint_names(j.names)}"]
         if j.require_names and j.command:
             args += ["--require-names", j.command]
+    # Las entradas de [[mux]] que heredan la lista (RFC 0013 D6 = d): el hub compara a quien publica hacia el mux
+    # igual que a quien publica en el comando, y les exige la lista si el grupo tiene require_names.
+    for e in config.inherited:
+        args += ["--names", f"{e.topic}={hp.format_joint_names(e.names)}"]
+        if e.require:
+            args += ["--require-names", e.topic]
     size = sum(len(a) + 1 for a in [sys.executable, *args])
     if size > HUB_CMD_MAX:
-        raise ConfigError(f"los nombres de [[joints]] no caben en la línea de comandos del agmen hub: ocupan {size} "
-                          f"caracteres y el máximo es {HUB_CMD_MAX} (lo que admite Windows, con margen). Usa nombres "
-                          f"más cortos o menos grupos")
+        also = " (y las entradas de [[mux]] que heredan su lista)" if config.inherited else ""
+        raise ConfigError(f"los nombres de [[joints]]{also} no caben en la línea de comandos del agmen hub: ocupan "
+                          f"{size} caracteres y el máximo es {HUB_CMD_MAX} (lo que admite Windows, con margen). Usa "
+                          f"nombres más cortos o menos grupos")
     hub_node = NodeConfig(name="hub", cmd=[sys.executable, *args], restart="always",
                           env={"PYTHONPATH": os.pathsep.join(
                               [str(Path(__file__).resolve().parent.parent),

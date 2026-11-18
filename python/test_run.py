@@ -1596,5 +1596,274 @@ class TestJoints(unittest.TestCase):
                                                     "nombra en su profile, o si tiene su tabla [profile.mesa]"))
 
 
+# --- el [[mux]] hereda la lista de [[joints]] (RFC 0013 D6 = d) ------------------------------------------------------
+
+def mux(name, output, *entradas, extra=""):
+    """Un [[mux]] en TOML; cada entrada es (nombre, topic o dirección, prioridad)."""
+    text = f'\n[[mux]]\nname = "{name}"\noutput = "{output}"\n{extra}'
+    for nombre, donde, prio in entradas:
+        clave = "topic" if donde.startswith("/") else "listen"
+        text += f'\n[[mux.input]]\nname = "{nombre}"\n{clave} = "{donde}"\npriority = {prio}\n'
+    return text
+
+
+def hub_args(cfg):
+    """--names y --require-names que agmen run le pasa al hub: ({topic: lista}, {topics que la exigen})."""
+    from agmen.run import prepare_hub
+
+    cfg, _ = prepare_hub(cfg, ping=lambda a: None)
+    cmd = next(n for n in cfg.nodes if n.name == "hub").cmd
+    names = dict(cmd[i + 1].split("=", 1) for i, a in enumerate(cmd) if a == "--names")
+    return names, {cmd[i + 1] for i, a in enumerate(cmd) if a == "--require-names"}
+
+
+class TestMuxHeredaLista(unittest.TestCase):
+    load = TestJoints.load
+    assertConfigError = TestJoints.assertConfigError
+    LISTA = ",".join(PATAS)
+
+    @staticmethod
+    def mux_cmd(cfg, name):
+        return next(n for n in cfg.nodes if n.name == name).cmd
+
+    def test_una_entrada(self):
+        cfg = self.load(MINIMO + joints(require_names=True) + mux("ruedas", "/patas/cmd", ("ia", "/cmd/ia", 1)))
+        e, = cfg.inherited
+        self.assertEqual((e.topic, e.group, e.names, e.require, e.mux, e.input),
+                         ("/cmd/ia", "patas", tuple(PATAS), True, "ruedas", "ia"))
+        cmd = self.mux_cmd(cfg, "ruedas")
+        self.assertEqual(cmd[cmd.index("--names") + 1], self.LISTA)
+        names, req = hub_args(cfg)
+        self.assertEqual(names, {"/patas/cmd": self.LISTA, "/patas/estado": self.LISTA, "/cmd/ia": self.LISTA})
+        self.assertEqual(req, {"/patas/cmd", "/cmd/ia"})
+        self.assertEqual(cfg.warnings, [])
+
+    def test_varias_entradas_y_sin_require(self):
+        cfg = self.load(MINIMO + joints() + mux("ruedas", "/patas/cmd", ("teleop", "/cmd/teleop", 10),
+                                                ("ia", "/cmd/ia", 1)))
+        self.assertEqual([(e.topic, e.require) for e in cfg.inherited], [("/cmd/teleop", False), ("/cmd/ia", False)])
+        names, req = hub_args(cfg)
+        self.assertEqual(names["/cmd/teleop"], self.LISTA)
+        self.assertEqual(names["/cmd/ia"], self.LISTA)
+        self.assertEqual(req, set())
+
+    def test_transitiva_en_cualquier_orden(self):
+        # El mux de abajo se declara ANTES que el que escribe en el comando: igual se resuelve.
+        texto = (MINIMO + joints(require_names=True) + mux("abajo", "/cmd/ia", ("x", "/cmd/x", 1))
+                 + mux("ruedas", "/patas/cmd", ("ia", "/cmd/ia", 1)))
+        cfg = self.load(texto)
+        self.assertEqual({e.topic: (e.mux, e.require) for e in cfg.inherited},
+                         {"/cmd/ia": ("ruedas", True), "/cmd/x": ("abajo", True)})
+        cmd = self.mux_cmd(cfg, "abajo")
+        self.assertEqual(cmd[cmd.index("--names") + 1], self.LISTA)   # su salida lleva la lista: la declara
+        _, req = hub_args(cfg)
+        self.assertEqual(req, {"/patas/cmd", "/cmd/ia", "/cmd/x"})
+
+    def test_desde_el_state_no_se_exige(self):
+        cfg = self.load(MINIMO + joints(require_names=True) + mux("eco", "/patas/estado", ("a", "/eco/a", 1)))
+        e, = cfg.inherited
+        self.assertFalse(e.require)
+        self.assertNotIn("/eco/a", hub_args(cfg)[1])
+
+    def test_sin_joints_o_salida_ajena_nada_cambia(self):
+        """Quien no usa [[mux]] con [[joints]]: los mismos argumentos al mux y al hub que antes."""
+        for texto in (MINIMO + mux("ruedas", "/otro/cmd", ("ia", "/cmd/ia", 1)),
+                      MINIMO + joints() + mux("ruedas", "/otro/cmd", ("ia", "/cmd/ia", 1)),
+                      MINIMO + joints() + mux("ruedas", "127.0.0.1:7500", ("ia", "/cmd/ia", 1))):
+            with self.subTest(texto=texto[-80:]):
+                cfg = self.load(texto)
+                self.assertEqual(cfg.inherited, [])
+                self.assertNotIn("--names", self.mux_cmd(cfg, "ruedas"))
+                names, _ = hub_args(cfg)
+                self.assertNotIn("/cmd/ia", names)
+
+    def test_solo_el_perfil_activo(self):
+        texto = (MINIMO + joints(profile="sim") + mux("ruedas", "/patas/cmd", ("ia", "/cmd/ia", 1))
+                 + mux("brazo", "/patas/cmd", ("b", "/cmd/b", 1), extra='profile = "real"\n'))
+        sim = self.load(texto, "sim")
+        self.assertEqual([e.topic for e in sim.inherited], ["/cmd/ia"])
+        self.assertIn("--names", self.mux_cmd(sim, "ruedas"))
+        real = self.load(texto, "real")
+        self.assertEqual(real.inherited, [])         # en 'real' no hay [[joints]]
+        self.assertNotIn("--names", self.mux_cmd(real, "brazo"))
+        self.assertNotIn("--names", self.mux_cmd(real, "ruedas"))
+
+    def test_choque_dos_mux_de_grupos_distintos(self):
+        brazo = joints("brazo", names=["hombro", "codo"], kp=None, kd=None)
+        texto = (MINIMO + joints() + brazo + mux("m1", "/patas/cmd", ("ia", "/cmd/ia", 1))
+                 + mux("m2", "/brazo/cmd", ("ia", "/cmd/ia", 1)))
+        msg = self.assertConfigError(texto, "'/cmd/ia' llevaría dos listas de nombres distintas",
+                                     "la entrada 'ia' del [[mux]] 'm2' (que escribe en '/brazo/cmd') lleva la del "
+                                     "[[joints]] 'brazo' (hombro, codo (2 nombres))",
+                                     "la entrada 'ia' del [[mux]] 'm1' (que escribe en '/patas/cmd') lleva la del "
+                                     "[[joints]] 'patas'", "usa otro topic para la entrada 'ia' del [[mux]] 'm2'")
+        self.assertIn("una sola lista", msg)
+
+    def test_choque_con_un_topic_de_otro_joints(self):
+        brazo = joints("brazo", names=["hombro", "codo"], kp=None, kd=None)
+        self.assertConfigError(MINIMO + joints() + brazo + mux("m1", "/patas/cmd", ("b", "/brazo/cmd", 1)),
+                               "'/brazo/cmd' llevaría dos listas de nombres distintas",
+                               "como el command del [[joints]] 'brazo' lleva la del [[joints]] 'brazo'",
+                               "la entrada 'b' del [[mux]] 'm1'")
+
+    def test_la_misma_lista_no_es_choque(self):
+        texto = (MINIMO + joints() + mux("m1", "/patas/cmd", ("ia", "/cmd/ia", 1))
+                 + mux("m2", "/patas/estado", ("ia", "/cmd/ia", 1)))
+        cfg = self.load(texto)
+        self.assertEqual([e.topic for e in cfg.inherited], ["/cmd/ia"])
+        # Por otro camino que sí la exige: se exige.
+        cfg = self.load(MINIMO + joints(require_names=True) + mux("m1", "/patas/estado", ("ia", "/cmd/ia", 1))
+                        + mux("m2", "/patas/cmd", ("ia", "/cmd/ia", 1)))
+        self.assertTrue(cfg.inherited[0].require)
+        # Una entrada que ya es un topic del mismo grupo, con la misma lista: tampoco.
+        self.load(MINIMO + joints() + mux("m1", "/patas/cmd", ("e", "/patas/estado", 1)))
+
+    def test_choque_en_otro_perfil_no_cuenta(self):
+        brazo = joints("brazo", names=["hombro", "codo"], kp=None, kd=None, profile="sim")
+        texto = (MINIMO + joints() + brazo + mux("m1", "/patas/cmd", ("ia", "/cmd/ia", 1))
+                 + mux("m2", "/brazo/cmd", ("ia", "/cmd/ia", 1), extra='profile = "sim"\n'))
+        self.load(texto, "real")
+        self.assertConfigError(texto, "llevaría dos listas de nombres distintas", profile="sim")
+
+    def test_entrada_por_direccion_avisa(self):
+        cfg = self.load(MINIMO + joints() + mux("ruedas", "/patas/cmd", ("teleop", "127.0.0.1:7510", 10),
+                                                ("ia", "/cmd/ia", 1)))
+        aviso, = cfg.warnings
+        self.assertEqual(aviso, "[[mux]] 'ruedas': la entrada 'teleop' escucha en una dirección (127.0.0.1:7510), "
+                                "sin hub, y la salida '/patas/cmd' lleva la lista del [[joints]] 'patas': quien "
+                                "mande a esa entrada no declara su lista y nadie revisa que use el orden de "
+                                "robot.toml. Para que se revise, usa un topic en esa entrada (topic = \"/...\" en "
+                                "lugar de listen)")
+        self.assertEqual([e.topic for e in cfg.inherited], ["/cmd/ia"])
+
+    def test_entrada_por_direccion_con_require_names_no_arranca(self):
+        msg = self.assertConfigError(
+            MINIMO + joints(require_names=True) + mux("ruedas", "/patas/cmd", ("teleop", "127.0.0.1:7510", 10)),
+            "[[mux]] 'ruedas': la entrada 'teleop' escucha en una dirección (127.0.0.1:7510), sin hub",
+            "require_names = true", "Usa un topic en esa entrada", "o quita require_names del [[joints]] 'patas'")
+        self.assertIn("nadie puede revisarla", msg)
+
+    def test_la_linea_del_arranque_dice_donde_vale(self):
+        from agmen.run import joints_lines
+
+        cfg = self.load(MINIMO + joints() + mux("ruedas", "/patas/cmd", ("teleop", "/cmd/teleop", 10),
+                                                ("ia", "/cmd/ia", 1)))
+        self.assertTrue(joints_lines(cfg)[0].endswith(
+            " · la lista vale también en la entrada 'teleop' del mux 'ruedas' (/cmd/teleop), la entrada 'ia' del "
+            "mux 'ruedas' (/cmd/ia)"), joints_lines(cfg))
+        self.assertNotIn("vale también", joints_lines(self.load(MINIMO + joints()))[0])
+
+
+# --- un hub anterior no compara los nombres: agmen run lo avisa (RFC 0013 D6 = d) ----------------------------------
+
+class TestHubAnteriorAviso(unittest.TestCase):
+    load = TestJoints.load
+
+    def propia(self, version):
+        from unittest import mock
+
+        p = mock.patch("agmen._version.__version__", version)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_comparar_versiones(self):
+        from agmen import hubproto as hp
+
+        self.assertEqual(hp.NAMES_SINCE, "0.15.0")
+        si = ["0.15.0", "0.15.1", "0.16.0", "1.0.0", " 0.15.0 ", "0.15.10", "10.0.0"]
+        no = ["0.14.0", "0.14.99", "0.15.0-dev", "0.15.0-rc.1", "?", "", "0.15", "v0.15.0", "abc", None, "0.15.0.1",
+              "0.15.x", "0.15.0-", "1" * 20 + ".0.0"]
+        for v in si:
+            self.assertTrue(hp.version_at_least(v, hp.NAMES_SINCE), v)
+        for v in no:
+            self.assertFalse(hp.version_at_least(v, hp.NAMES_SINCE), v)
+        self.assertTrue(hp.version_at_least("0.15.0", "0.15.0-dev"))
+        self.assertTrue(hp.version_at_least("0.15.0-dev", "0.15.0-dev"))
+        self.assertTrue(hp.version_at_least("0.9.0", "0.10.0") is False)   # números, no texto
+
+    def test_texto(self):
+        from agmen.run import old_hub_text
+
+        self.propia("0.15.0")
+        t = old_hub_text("0.14.0", "robot (192.168.1.20:7391) tiene", "Actualiza Agmen en robot.")
+        self.assertEqual(t, "robot (192.168.1.20:7391) tiene Agmen 0.14.0, anterior a 0.15.0: ese agmen hub no compara "
+                            "los nombres de las articulaciones (names=), así que ahí no se revisa que los nodos usen "
+                            "el orden de [[joints]] de robot.toml (una lista con el orden cambiado entra sin aviso y "
+                            "require_names no se exige). Actualiza Agmen en robot.")
+        self.assertIn("una versión de Agmen que no se entiende (?)", old_hub_text("?", "x tiene", "y"))
+        self.assertIn("que no se entiende (vacía)", old_hub_text("", "x tiene", "y"))
+        self.assertIsNone(old_hub_text("0.15.0", "x tiene", "y"))
+        self.assertIsNone(old_hub_text("0.16.2", "x tiene", "y"))
+        self.propia("0.14.0")          # la propia todavía es anterior: no se distingue un hub viejo de este
+        self.assertIsNone(old_hub_text("0.14.0", "x tiene", "y"))
+        self.assertIsNone(old_hub_text("?", "x tiene", "y"))
+        self.propia("0.15.0-dev")
+        self.assertIsNone(old_hub_text("0.13.0", "x tiene", "y"))
+
+    def test_a_el_hub_local_que_ya_corria(self):
+        from agmen.run import prepare_hub
+
+        con = self.load(MINIMO + joints())
+        sin = self.load(MINIMO)
+        for propia, del_hub, con_joints, avisa in (("0.15.0", "0.14.0", True, True), ("0.15.0", "?", True, True),
+                                                   ("0.16.0", "0.15.0", True, False),
+                                                   ("0.15.0", "0.14.0", False, False),
+                                                   ("0.14.0", "0.13.0", True, False)):
+            with self.subTest(propia=propia, hub=del_hub, joints=con_joints):
+                self.propia(propia)
+                cfg, nota = prepare_hub(con if con_joints else sin, ping=lambda a, v=del_hub: v)
+                avisos = [w for w in cfg.warnings if "anterior a 0.15.0" in w]
+                self.assertEqual(len(avisos), 1 if avisa else 0, cfg.warnings)
+                if avisa:
+                    self.assertTrue(avisos[0].startswith("el agmen hub que ya corre en "), avisos[0])
+                    self.assertIn("Actualiza Agmen en esta computadora y detén ese agmen hub", avisos[0])
+                # La nota de siempre no cambia (sin duplicar: el aviso nuevo dice otra cosa).
+                self.assertEqual("(los [[joints]] de este robot.toml no se revisan)" in nota, con_joints)
+                self.assertNotIn("anterior", nota)
+
+    def test_b_cada_computadora_una_vez(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from agmen import agent, cli
+
+        class Enlace:
+            def __init__(self, name, version):
+                self.name, self.version, self.shown, self.address = name, version, f"10.0.0.{len(name)}:7391", None
+                self.waiting, self.on_lost = False, None
+
+            def watch_clock(self, clock):
+                pass
+
+            def open(self, key, msg, on_key_ok=None, stop=None):
+                pass
+
+            def close(self):
+                pass
+
+        def correr(cfg, versiones):
+            said: list[str] = []
+            launcher = SimpleNamespace(say=lambda t, k="agmen": said.append(t))
+            links = {n: Enlace(n, v) for n, v in versiones.items()}
+            with mock.patch.object(agent, "session_message", lambda *a, **k: {}):
+                err = cli._connect(launcher, cfg, links, {n: ("k", "variable") for n in links}, "real", [],
+                                   threading.Event())
+            self.assertEqual(err, "")
+            return [t for t in said if "anterior a 0.15.0" in t]
+
+        con, sin = self.load(MINIMO + joints()), self.load(MINIMO)
+        self.propia("0.15.0")
+        avisos = correr(con, {"robot": "0.14.0", "brazo": "0.15.0", "base": "?"})
+        self.assertEqual(len(avisos), 2, avisos)
+        self.assertTrue(avisos[0].startswith("⚠ robot (10.0.0.5:7391) tiene Agmen 0.14.0, anterior a 0.15.0"))
+        self.assertTrue(avisos[0].endswith("Actualiza Agmen en robot (pip install -U agmen) y vuelve a correr agmen "
+                                           "run"))
+        self.assertTrue(avisos[1].startswith("⚠ base (10.0.0.4:7391) tiene una versión de Agmen que no se entiende"))
+        self.assertEqual(correr(sin, {"robot": "0.14.0"}), [])        # sin [[joints]]: nada que comparar
+        self.assertEqual(correr(None, {"robot": "0.14.0"}), [])       # (sin config, como en las pruebas de la sonda)
+        self.propia("0.14.0")
+        self.assertEqual(correr(con, {"robot": "0.13.0"}), [])        # la propia todavía es anterior
+
+
 if __name__ == "__main__":
     unittest.main()

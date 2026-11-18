@@ -35,6 +35,12 @@ el mux publica un agmen.msgs.MuxEstado cada vez que cambia el mando y una vez
 por segundo: la entrada que manda, su prioridad, desde cuándo y si la anterior
 se calló. Lo que reenvía no cambia.
 
+Nombres de articulaciones (RFC 0013 D6 = d): si la salida es un topic de
+[[joints]], agmen run pone `--names a,b,c` (la lista de robot.toml) y el mux
+la declara al hub en su salida y en cada entrada que es un topic. Así el hub
+compara contra robot.toml a quien publica en una entrada, igual que a quien
+publica en el comando, y require_names no deja al actuador sin dueño.
+
 Uso directo (agmen run lo arma solo desde [[mux]] en robot.toml):
 
     agmen mux --out 127.0.0.1:7500 --hold-ms 300 \\
@@ -98,11 +104,20 @@ def state_topic(name: str) -> str:
 
 class Mux:
     def __init__(self, inputs: list[MuxInput], output: str, hold_ms: float = 300.0, log=print,
-                 state: str | None = None, name: str = "") -> None:
+                 state: str | None = None, name: str = "", names=None) -> None:
+        """`names`: la lista de [[joints]] que lleva la salida (RFC 0013 D6 = d; agmen run la pasa con --names
+        cuando la salida es el topic de un [[joints]]). El mux la declara al hub en su salida y en cada entrada
+        que es un topic: así el hub compara contra robot.toml a quien publica en una entrada."""
         if not inputs:
             raise ValueError("el mux necesita al menos una entrada")
-        names = [i.name for i in inputs]
-        if len(set(names)) != len(names):
+        if names is not None:
+            if not hp.is_topic(output):
+                raise ValueError(f"--names va con una salida que es un topic (la lista se le declara al hub), y "
+                                 f"'{output}' es una dirección. Usa un topic en --out, o no pases --names")
+            names = hp.check_joint_names(names, "--names")
+        self.names: tuple[str, ...] | None = names
+        labels = [i.name for i in inputs]
+        if len(set(labels)) != len(labels):
             raise ValueError("dos entradas del mux tienen el mismo nombre")
         prios = [i.priority for i in inputs]
         if len(set(prios)) != len(prios):
@@ -115,14 +130,22 @@ class Mux:
         self.rx: dict[str, RawSubscriber] = {}
         for inp in self.inputs:
             try:
-                rx = RawSubscriber(inp.listen)    # un topic ("/cmd/teleop") o una dirección
+                # Un topic ("/cmd/teleop") o una dirección. En un topic, con la lista heredada (si hay).
+                rx = RawSubscriber(inp.listen, names=names if hp.is_topic(inp.listen) else None)
             except OSError as e:
                 self.close()
                 raise OSError(f"no se pudo escuchar la entrada '{inp.name}' en {inp.listen}: {e}") from None
+            except ValueError as e:   # (el registro con la lista no cabe en un datagrama: lo dice el texto)
+                self.close()
+                raise ValueError(f"la entrada '{inp.name}': {e}") from None
             self.sel.register(rx._sock, selectors.EVENT_READ, inp)
             self.rx[inp.name] = rx
         # Salida: a un topic (se registra en el hub al conocer el tipo) o a una dirección.
-        self.pub = RawPublisher(output) if hp.is_topic(output) else None
+        try:
+            self.pub = RawPublisher(output, names=names) if hp.is_topic(output) else None
+        except (OSError, ValueError):
+            self.close()
+            raise
         self.dest = None if self.pub else _addr(output)
         self.out = wire.udp_socket()
         self.source_id = wire.new_source_id()
@@ -333,6 +356,11 @@ class Mux:
     def run(self, stop: threading.Event) -> None:
         names = ", ".join(f"{i.name}={i.listen} (prioridad {i.priority})" for i in self.inputs)
         self.log(f"entradas: {names} → salida {self.output} · soltar el mando tras {self.hold * 1000:.0f} ms")
+        if self.names is not None:
+            n = len(self.names)
+            shown = ", ".join(self.names) if n <= 4 else f"{', '.join(self.names[:2])} … {self.names[-1]}"
+            self.log(f"declaro al hub la lista de robot.toml ({n} articulaciones: {shown}) en la salida y en las "
+                     f"entradas que son topics")
         if self.state_pub is not None:
             self.log(f"quién manda: en {self.state_pub.topic} (agmen.msgs.MuxEstado)")
             self.publish_state(time.monotonic())
@@ -389,8 +417,15 @@ def main(args) -> int:
 
     try:
         inputs = [parse_input(t) for t in args.inputs]
+        names_arg = getattr(args, "names", None)
+        names = None
+        if names_arg is not None:
+            try:
+                names = hp.parse_joint_names(names_arg)
+            except hp.ProtocolError as e:
+                raise ValueError(f"--names {names_arg[:80]}{'…' if len(names_arg) > 80 else ''}: {e}") from None
         mux = Mux(inputs, args.out, args.hold_ms, log, state=getattr(args, "state", None),
-                  name=getattr(args, "name", "") or os.environ.get("AGMEN_NODE", ""))
+                  name=getattr(args, "name", "") or os.environ.get("AGMEN_NODE", ""), names=names)
     except (ValueError, OSError) as e:
         print(f"[mux] error: {e}", file=sys.stderr)
         return 2

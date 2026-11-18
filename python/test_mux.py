@@ -377,6 +377,84 @@ class TestMuxConfig(unittest.TestCase):
                 self.assertIn(msg, str(ctx.exception))
 
 
+class TestMuxConNames(unittest.TestCase):
+    """El mux declara la lista de [[joints]] (RFC 0013 D6 = d) en su salida y en sus entradas que son topics."""
+
+    NAMES = ("cadera", "rodilla", "tobillo")
+
+    def setUp(self):
+        import contextlib
+        import io
+        import os
+        from unittest import mock
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)     # un "hub" que no contesta: nada de la red real
+        s.bind(("127.0.0.1", 0))
+        self.addCleanup(s.close)
+        p = mock.patch.dict(os.environ, {"AGMEN_HUB": f"127.0.0.1:{s.getsockname()[1]}"})
+        p.start()
+        self.addCleanup(p.stop)
+        self.err = io.StringIO()
+        ctx = contextlib.redirect_stderr(self.err)
+        ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+
+    def test_la_lista_va_a_la_salida_y_a_las_entradas_topic(self):
+        mux = Mux([MuxInput("ia", "/cmd/ia", 1), MuxInput("teleop", "127.0.0.1:0", 10)], "/patas/cmd",
+                  log=lambda t: None, names=list(self.NAMES))
+        self.addCleanup(mux.close)
+        self.assertEqual(mux.names, self.NAMES)
+        self.assertEqual(mux.pub.names, self.NAMES)
+        self.assertEqual(mux.rx["ia"].names, self.NAMES)
+        self.assertIsNone(mux.rx["teleop"].names)          # una dirección: sin hub, no se declara nada
+        self.assertTrue(mux.rx["ia"]._link.beat_msg.endswith(b" names=cadera,rodilla,tobillo"))
+
+    def test_sin_names_nada_cambia(self):
+        mux = Mux([MuxInput("ia", "/cmd/ia", 1)], "/patas/cmd", log=lambda t: None)
+        self.addCleanup(mux.close)
+        self.assertIsNone(mux.names)
+        self.assertIsNone(mux.pub.names)
+        self.assertIsNone(mux.rx["ia"].names)
+        self.assertNotIn(b"names", mux.rx["ia"]._link.beat_msg)
+
+    def test_errores(self):
+        with self.assertRaisesRegex(ValueError, "--names va con una salida que es un topic"):
+            Mux([MuxInput("ia", "/cmd/ia", 1)], "127.0.0.1:7500", log=lambda t: None, names=["a"])
+        with self.assertRaisesRegex(ValueError, "está dos veces en --names"):
+            Mux([MuxInput("ia", "/cmd/ia", 1)], "/patas/cmd", log=lambda t: None, names=["a", "a"])
+
+    def test_main_con_names_malo_sale_con_2_y_lo_dice(self):
+        import argparse
+        import contextlib
+        import io
+
+        from agmen.mux import main
+
+        args = argparse.Namespace(inputs=["ia=/cmd/ia@1"], out="/patas/cmd", hold_ms=300.0, state=None, name="",
+                                  names="a,,b")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(args), 2)
+        self.assertIn("[mux] error: --names a,,b: names[1] = '' no es un nombre de articulación válido", err.getvalue())
+
+    def test_registro_que_no_cabe_se_dice_una_vez_y_el_mux_sigue(self):
+        from agmen.pubsub import RawPublisher
+
+        pub = RawPublisher("/patas/cmd", names=list(self.NAMES))
+        self.addCleanup(pub.close)
+        enorme = "Grande{" + ";".join(f"f32 campo_{i:05d}" for i in range(5000)) + "}"
+        for _ in range(3):
+            pub.set_schema(enorme, "Grande", 0x1234)       # no lanza: el mux sigue arbitrando
+        self.assertIsNone(pub._link)
+        texto = self.err.getvalue()
+        self.assertEqual(texto.count("el registro en el hub mide"), 1, texto)
+        self.assertIn("RawPublisher en '/patas/cmd': el registro en el hub mide", texto)
+        self.assertIn("y en un datagrama caben 65507", texto)
+        self.assertIn("Lo más largo es el esquema de Grande: usa un tipo más chico que Grande", texto)
+        self.assertIn("Mientras tanto no me registro en el hub", texto)
+        self.assertFalse(pub.send(bytearray(wire.encode(Cmd(1, 1), 1, 1))))   # nadie a quién mandar, sin error
+
+
 def _motor_bin():
     base = Path(__file__).resolve().parent.parent / "build" / "bin"
     for nombre in ("tutorial_motor", "tutorial_motor.exe", "Release/tutorial_motor.exe"):
