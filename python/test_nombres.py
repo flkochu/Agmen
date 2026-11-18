@@ -3104,6 +3104,53 @@ class TestPanelHaciaEntradaHeredada(unittest.TestCase):
         self.assertIsNone(commands[0].pub.names)
 
 
+class TestPanelHaciaEntradaHeredadaBordes(TestPanelHaciaEntradaHeredada):
+    """Confirmación del bloque 2: lo feo del panel hacia un topic con lista. (Hereda las pruebas de arriba: corren otra
+    vez, que no estorban; las nuevas son las de esta clase.)"""
+
+    def test_con_require_names_y_otro_numero_el_panel_dice_el_rechazo_en_palabras(self):
+        """El mando de 2 articulaciones hacia un topic de 3 con require_names: el panel publica sin lista, el hub
+        rechaza. El panel (api/command) debe devolver un error con qué hacer, no callar ni tronar."""
+        cfg = self._robot(require=True, n=2)
+        hub = self._hub(cfg)
+        panel = self._panel(cfg)
+        self.assertIsNone(panel.commands[0].pub.names)
+        vistos = self._mandar(panel, lambda v: bool(v))
+        self.assertTrue(vistos, f"el panel calló el rechazo del hub:\n{hub.text()}")
+        self.assertNotIn("Traceback", vistos[0])
+        self.assertTrue("rechaz" in vistos[0].lower() or "require" in vistos[0].lower(), vistos)
+
+    def test_dos_mandos_al_mismo_topic_declaran_la_lista_los_dos(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        (Path(d) / "m.agmen").write_text(M_AGMEN.format(n=3), encoding="utf-8")
+        base = PANEL_ROBOT.format(require="require_names = true\n", target="/patas/cmd")
+        ini = base.index("[[web.command]]")
+        bloque = base[ini:]
+        texto = base + "\n" + bloque.replace('name = "Pata"', 'name = "Otra"')
+        (Path(d) / "robot.toml").write_text(texto, encoding="utf-8")
+        cfg = load_config(Path(d) / "robot.toml")
+        hub = self._hub(cfg)
+        panel = self._panel(cfg)
+        self.assertEqual(len(panel.commands), 2)
+        for c in panel.commands:
+            self.assertEqual(c.pub.names, ("a", "b", "c"))
+        sub = self._escuchar("/patas/cmd")
+        errores, llegaron = [], set()
+        fin = time.monotonic() + 8
+        while time.monotonic() < fin and len(llegaron) < 2 and not errores:
+            for k in (0, 1):
+                e = panel.command(k, button=0)
+                if e:
+                    errores.append(e)
+            time.sleep(0.07)
+            while (got := sub.receive(0.01)) is not None:
+                llegaron.add(got.header.source_id if hasattr(got, "header") else id(got))
+        self.assertEqual(errores, [], hub.text())
+        self.assertNotIn("rechaz", hub.text())
+        self.assertNotIn("sin declarar su lista de nombres", hub.text())
+
+
 # --- agmen run de punta a punta con [[mux]]: prioridades y NaN ----------------------------------------------------------
 
 LECTOR_TICK = """

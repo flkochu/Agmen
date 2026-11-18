@@ -6,10 +6,13 @@
 import socket
 import struct
 import tempfile
+import threading
+import time
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
 
+import agmen
 from agmen import wire
 from agmen.mux import Mux, MuxInput, parse_input
 from agmen.run import ConfigError, load_config
@@ -570,6 +573,54 @@ class TestMuxConNames(unittest.TestCase):
             self.assertEqual(main(args), 2)
         self.assertIn("[mux] error: --names a,,b: names[1] = '' no es un nombre de articulación válido", err.getvalue())
 
+    def test_names_con_caracteres_de_control_no_se_repiten_en_el_error(self):
+        """Confirmación bloque 2: --names con ESC, BEL, CR/LF o NUL en un nombre: sale con 2 y el texto del error no
+        trae ningún carácter de control (no pinta ni falsifica líneas en la terminal)."""
+        import argparse
+        import contextlib
+        import io
+
+        from agmen.mux import main
+
+        for malo in ("a\x1b[31m,b", "a\x07,b", "a\r\n[mux] FALSO,b", "a\x00,b", "a\x7f,b", "a\u202e,b", "a\u0085,b"):
+            with self.subTest(names=repr(malo)):
+                args = argparse.Namespace(inputs=["ia=/cmd/ia@1"], out="/patas/cmd", hold_ms=300.0, state=None,
+                                          name="", names=malo)
+                err, out = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                    self.assertEqual(main(args), 2)
+                texto = err.getvalue() + out.getvalue()
+                self.assertTrue(texto.strip(), "salió con 2 sin decir nada")
+                feos = [c for c in texto if (ord(c) < 32 and c not in "\n") or ord(c) == 127 or ord(c) in (0x85, 0x202E)]
+                self.assertEqual(feos, [], repr(texto))
+                self.assertEqual(len([l for l in texto.splitlines() if l.startswith("[mux]")]), 1, repr(texto))
+
+    def test_registro_que_no_cabe_se_mide_una_vez_mientras_nada_cambie(self):
+        """Confirmación bloque 2 (ítem 7): set_schema repetido con lo mismo no vuelve a medir; si cambia el esquema,
+        el tipo o el nombre del nodo, sí."""
+        from unittest import mock
+
+        from agmen import pubsub
+
+        pub = pubsub.RawPublisher("/patas/cmd", names=list(self.NAMES))
+        self.addCleanup(pub.close)
+        enorme = "Grande{" + ";".join(f"f32 campo_{i:05d}" for i in range(5000)) + "}"
+        otro = "Grande{" + ";".join(f"f32 otro_{i:05d}" for i in range(5000)) + "}"
+        real = pubsub.check_registration_fits
+        with mock.patch.object(pubsub, "check_registration_fits", side_effect=real) as medir:
+            for _ in range(20):
+                pub.set_schema(enorme, "Grande", 0x1234)
+            self.assertEqual(medir.call_count, 1)
+            pub.set_schema(otro, "Grande", 0x1234)              # otro esquema: se mide otra vez
+            self.assertEqual(medir.call_count, 2)
+            with mock.patch.object(pubsub, "node_name", return_value="otro_nodo"):
+                pub.set_schema(otro, "Grande", 0x1234)          # otro nombre de nodo: también
+                self.assertEqual(medir.call_count, 3)
+                for _ in range(5):
+                    pub.set_schema(otro, "Grande", 0x1234)
+                self.assertEqual(medir.call_count, 3)
+        self.assertEqual(self.err.getvalue().count("el registro en el hub mide"), 1, self.err.getvalue())
+
     def test_registro_que_no_cabe_se_dice_una_vez_y_el_mux_sigue(self):
         from agmen.pubsub import RawPublisher
 
@@ -771,6 +822,161 @@ class TestMotorDelTutorial(unittest.TestCase):
         self.assertNotIn("nan", out.lower(), out)
         self.assertEqual(err.count("valor no finito"), 2, err)
         self.assertEqual(p.returncode, 0, out + err)
+
+
+class TestMuxContraUnHubReal(unittest.TestCase):
+    """Confirmación RFC 0013 bloque 2: el mux contra un hub de verdad con [[joints]]. El tipo se fija con el
+    anuncio (fusión de main) y la salida rechazada se dice, no se cuenta como reenviada, y el mux se recupera."""
+
+    NAMES = ("cadera", "rodilla", "tobillo")
+    TOPIC = "/patas/cmd"
+
+    def arranca_hub(self, puerto, names, required=False):
+        from agmen import hub as H
+        logs = []
+        joints = [H.JointNames(self.TOPIC, tuple(names), required)]
+        hub = H.Hub(f"127.0.0.1:{puerto}", log=logs.append, grace_s=0.0, joints=joints)
+        stop = threading.Event()
+        th = threading.Thread(target=hub.serve, args=(stop,), daemon=True)
+        th.start()
+
+        def parar():
+            stop.set()
+            th.join(5)
+        return hub, parar
+
+    def setUp(self):
+        import contextlib
+        import io
+        import os
+        from unittest import mock
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("127.0.0.1", 0))
+        self.puerto = s.getsockname()[1]
+        s.close()
+        p = mock.patch.dict(os.environ, {"AGMEN_HUB": f"127.0.0.1:{self.puerto}"})
+        p.start()
+        self.addCleanup(p.stop)
+        self.err = io.StringIO()
+        ctx = contextlib.redirect_stderr(self.err)
+        ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+        self.logs = []
+
+    def mux(self, names, entrada="127.0.0.1:0"):
+        m = Mux([MuxInput("ia", entrada, 1)], self.TOPIC, log=self.logs.append, names=names)
+        self.addCleanup(m.close)
+        return m
+
+    def espera(self, cond, tope=10.0):
+        fin = time.monotonic() + tope
+        while time.monotonic() < fin:
+            if cond():
+                return True
+            time.sleep(0.02)
+        return cond()
+
+    def anuncia_y_manda(self, m, n=3):
+        from agmen.msgs import JointCommand
+        T = JointCommand[n]
+        ia = m.inputs[0]
+        m.handle(ia, wire.encode_announcement(T.SCHEMA_TEXT, "/cmd"), 0.0)
+        msg = T()
+        msg.position, msg.kp, msg.kd = [1.0] * n, [1.0] * n, [0.1] * n
+        return ia, lambda seq, t: m.handle(ia, wire.encode(msg, seq, 1), t)
+
+    def test_lista_buena_llega_y_no_hay_rechazo(self):
+        from agmen.msgs import JointCommand
+        hub, parar = self.arranca_hub(self.puerto, self.NAMES)
+        self.addCleanup(parar)
+        sub = agmen.Subscriber(JointCommand[3], self.TOPIC, names=list(self.NAMES))
+        self.addCleanup(sub.close)
+        m = self.mux(self.NAMES)
+        ia, manda = self.anuncia_y_manda(m)
+        got = []
+        t0 = time.monotonic()
+        seq = 0
+        while time.monotonic() - t0 < 10 and not got:
+            seq += 1
+            manda(seq, 0.0 + seq * 0.01)
+            r = sub.receive(0.05)
+            if r is not None:
+                got.append(r)
+        self.assertTrue(got, "la lista buena no llegó al suscriptor")
+        self.assertEqual(m.errors["ia"], 0, self.logs)
+        self.assertEqual(m.forwarded["ia"], seq)
+
+    def test_lista_distinta_se_dice_y_no_cuenta_como_reenviada(self):
+        hub, parar = self.arranca_hub(self.puerto, self.NAMES)
+        self.addCleanup(parar)
+        m = self.mux(("a", "b", "c"))
+        ia, manda = self.anuncia_y_manda(m)
+        self.assertTrue(self.espera(lambda: (m.pub._drain(), m.pub._link.error)[1]), "el hub no rechazó")
+        self.assertFalse(manda(1, 0.1))
+        self.assertEqual(m.forwarded["ia"], 0)
+        self.assertEqual(m.errors["ia"], 1)
+        texto = "\n".join(self.logs)
+        self.assertIn("rechaz", texto)
+        self.assertIn("--names", texto)             # dice qué hacer
+        self.assertNotIn("Traceback", texto)
+
+    def test_sin_lista_con_require_names_se_dice(self):
+        hub, parar = self.arranca_hub(self.puerto, self.NAMES, required=True)
+        self.addCleanup(parar)
+        m = self.mux(None)
+        ia, manda = self.anuncia_y_manda(m)
+        self.assertTrue(self.espera(lambda: (m.pub._drain(), m.pub._link.error)[1]), "el hub no rechazó")
+        self.assertFalse(manda(1, 0.1))
+        self.assertEqual(m.forwarded["ia"], 0)
+        self.assertIn("require", "\n".join(self.logs).lower() + self.err.getvalue().lower())
+
+    def test_rechazo_tardio_aviso_con_tope_y_recuperacion(self):
+        """El hub se reinicia con otra lista tras haber reenviado un rato; luego vuelve a aceptar."""
+        hub, parar = self.arranca_hub(self.puerto, self.NAMES)
+        m = self.mux(self.NAMES)
+        ia, manda = self.anuncia_y_manda(m)
+        for k in range(1, 4):
+            self.assertTrue(manda(k, 0.01 * k) or True)
+        buenos = m.forwarded["ia"]
+        self.assertEqual(buenos, 3)
+        parar()
+        hub.sock.close()
+        hub2, parar2 = self.arranca_hub(self.puerto, ("x", "y", "z"))      # otra lista
+        self.addCleanup(parar2)
+
+        def rechazado():
+            m.pub._drain()
+            return bool(m.pub._link.error)
+        t0 = time.monotonic()
+        while not rechazado() and time.monotonic() - t0 < 15:
+            m.pub._link.maybe_beat()
+            time.sleep(0.05)
+        self.assertTrue(rechazado(), "el hub nuevo no rechazó al mux")
+        antes = len(self.logs)
+        res = [manda(100 + k, 1.0 + 0.001 * k) for k in range(200)]
+        self.assertFalse(any(res), "algo se contó como reenviado con el hub rechazando")
+        self.assertEqual(m.forwarded["ia"], buenos)
+        avisos = [l for l in self.logs[antes:] if "rechaz" in l]
+        self.assertLessEqual(len(avisos), 1, f"el aviso se repitió {len(avisos)} veces en una ráfaga")
+        self.assertGreaterEqual(m.errors["ia"], 200)
+        # El hub vuelve a aceptar: se reinicia con la lista buena.
+        parar2()
+        hub2.sock.close()
+        hub3, parar3 = self.arranca_hub(self.puerto, self.NAMES)
+        self.addCleanup(parar3)
+        t0 = time.monotonic()
+        seq = 1000
+        ok = False
+        while time.monotonic() - t0 < 20 and not ok:
+            seq += 1
+            ok = manda(seq, 2.0 + (time.monotonic() - t0))
+            time.sleep(0.05)
+        self.assertTrue(ok, "el mux no se recuperó cuando el hub volvió a aceptar")
+        despues = m.forwarded["ia"]
+        self.assertGreater(despues, buenos)
+        self.assertEqual(despues - buenos, 1 + 0, "forwarded cuenta algo que no salió")
+        self.assertEqual(m.summary().count(f"reenviados={despues}"), 1)
 
 
 if __name__ == "__main__":

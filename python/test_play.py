@@ -1163,5 +1163,70 @@ class TestAgmenRunPlayConNombres(unittest.TestCase):
         self.assertNotIn("Traceback", out)
 
 
+class TestPlaySueltoContraRequireNames(unittest.TestCase):
+    """`agmen play` suelto (sin agmen run, sin lista) contra un hub con require_names: nunca fallar en silencio."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.dir, ignore_errors=True))
+        self.path = os.path.join(self.dir, "patas.mcap")
+        grabacion_de_patas(self.path)
+        self.log: list[str] = []
+        self.hub = hubmod.Hub("127.0.0.1:0", log=self.log.append,
+                              joints=[hubmod.JointNames("/patas/cmd", NOMBRES3, True)])
+        parar = threading.Event()
+        threading.Thread(target=self.hub.serve, args=(parar,), daemon=True).start()
+        self.addCleanup(parar.set)
+        self.addr = f"127.0.0.1:{self.hub.sock.getsockname()[1]}"
+
+    def test_FALLA_REAL_play_suelto_dice_el_rechazo_del_hub(self):
+        """Sospecha del orquestador: _ReplayPublisher.send_packet no mira _link.error, así que el hub rechaza el
+        registro (solo le contesta `error` al publicador) y `agmen play` termina 'bien' sin decir nada. Debe decir (en su
+        salida o en el código de salida) que el hub rechazó publicar y qué hacer."""
+        env = {**os.environ, "PYTHONPATH": str(ROOT / "python"), "PYTHONIOENCODING": "utf-8", "NO_COLOR": "1",
+               "AGMEN_HUB": self.addr}
+        p = subprocess.run([sys.executable, "-m", "agmen", "play", self.path], env=env, capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=60, cwd=self.dir)
+        salida = (p.stdout + p.stderr)
+        # (que el hub rechaza lo prueba TestPlayConNombres.test_sin_la_lista_el_hub_la_exige_y_no_llega)
+        dijo = ("rechaz" in salida.lower()) or ("require" in salida.lower()) or p.returncode != 0
+        self.assertTrue(dijo, f"agmen play calló el rechazo del hub (rc={p.returncode}):\n{salida}")
+
+    def test_sin_names_la_linea_pub_es_la_de_siempre_byte_a_byte(self):
+        """Sin [[joints]] (names=None o {}): el registro del reproductor no lleva `names`, ni con una tabla que no
+        nombra ese topic, ni con otro número de articulaciones."""
+        os.environ["AGMEN_HUB"] = self.addr
+        self.addCleanup(os.environ.pop, "AGMEN_HUB", None)
+        self.addCleanup(clock.configure, clock.REAL)
+        for names in (None, {}, {"/otro/topic": NOMBRES3}, {"/patas/cmd": ("a", "b")}):
+            with self.subTest(names=names):
+                p = play.Player(self.path, quiet=True, names=names)
+                p.start()
+                self.assertTrue(until_true(lambda: any(x._link is not None for x in list(p._pubs.values())), 5))
+                pub = next(x for x in list(p._pubs.values()) if x.topic == "/patas/cmd")
+                self.assertIsNone(pub.names)
+                self.assertNotIn(b"names", pub._link.beat_msg)
+                p.stop()
+
+    def test_FALLA_REAL_player_suelto_tampoco_calla(self):
+        os.environ["AGMEN_HUB"] = self.addr
+        self.addCleanup(os.environ.pop, "AGMEN_HUB", None)
+        self.addCleanup(clock.configure, clock.REAL)
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            p = play.Player(self.path, quiet=False)
+            p.start()
+            p.wait(10)
+            try:
+                p.stop()
+            except Exception as e:  # noqa: BLE001
+                err.write(f"{type(e).__name__}: {e}")
+        texto = out.getvalue() + err.getvalue()
+        self.assertTrue("rechaz" in texto.lower() or "require" in texto.lower() or p.error is not None,
+                        f"Player calló el rechazo del hub:\n{texto}")
+
+
 if __name__ == "__main__":
     unittest.main()

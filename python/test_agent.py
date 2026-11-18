@@ -2322,6 +2322,59 @@ class TestHubAnteriorEnElAgente(ServerCase):
         self.assertEqual(self.avisos("0.15.0", self.JOINTS), [])
 
 
+class TestHubAnteriorEnElAgenteBordes(TestHubAnteriorEnElAgente):
+    """Confirmación del bloque 2: el aviso del hub anterior, en sesiones seguidas y con versiones raras. (Hereda y repite
+    las de arriba.)"""
+
+    def lineas(self, cli):
+        return [m["linea"] for m in cli.all("log", nodo="agmen") if "anterior a 0.15.0" in m["linea"]]
+
+    def prepara(self, version_del_hub):
+        self.propia("0.15.0")
+        self.version = [version_del_hub]
+        p = mock.patch("agmen.hub.ping", lambda addr, *a, **k: self.version[0])
+        p.start()
+        self.addCleanup(p.stop)
+        self.start_server(write=False)
+        self.write_toml(self.JOINTS, **{"[hub]\nenabled = false\n": ""})
+
+    def abre(self):
+        cli, fin = self.sesion()
+        self.assertEqual(fin["op"], "sesion_ok", fin)
+        self.assertTrue(cli.wait(lambda ms: any(m["op"] == "log" and "sesión de" in m.get("linea", "") for m in ms)),
+                        cli.msgs)
+        time.sleep(0.3)
+        return cli
+
+    def test_dos_sesiones_seguidas_cada_una_oye_el_aviso_una_sola_vez(self):
+        """El aviso es por sesión (la laptop nueva debe enterarse); dentro de una sesión no se repite."""
+        self.prepara("0.14.0")
+        cli = self.abre()
+        self.assertEqual(len(self.lineas(cli)), 1, self.lineas(cli))
+        cli.send({"op": "adios"})
+        self.assertTrue(self.espera(lambda: self.server.session is None, 30))
+        cli2 = self.abre()
+        self.assertEqual(len(self.lineas(cli2)), 1, self.lineas(cli2))
+        self.assertEqual(len(self.lineas(cli)), 1, "la primera sesión recibió el aviso otra vez")
+
+    def test_versiones_raras_el_aviso_sale_limpio_y_corto(self):
+        raras = {"control": "0.14.0\x1b[31m\x07\r\nFALSO", "gigante": "9" * 5000, "sufijo_gigante": "0.14.0-" + "a" * 5000,
+                 "vacia": "", "pregunta": "?"}
+        for nombre, v in raras.items():
+            with self.subTest(version=nombre):
+                if nombre == "control":
+                    self.prepara(v)
+                self.version[0] = v
+                cli = self.abre()
+                avisos = self.lineas(cli)
+                self.assertEqual(len(avisos), 1, avisos)
+                for a in avisos:
+                    self.assertFalse([c for c in a if ord(c) < 32 or ord(c) == 127], repr(a[:200]))
+                    self.assertLess(len(a), 1500, len(a))
+                cli.send({"op": "adios"})
+                self.assertTrue(self.espera(lambda: self.server.session is None, 30))
+
+
 class EspiaPopen:
     """Anota cada subprocess.Popen (y deja que se haga de verdad)."""
 

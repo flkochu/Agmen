@@ -1950,6 +1950,18 @@ class TestPanelYEntradasHeredadas(unittest.TestCase):
                  + '\n[web.teleop]\ntarget = "/cmd/ia"\n')
         self.assertConfigError(texto, "[web.teleop] manda MotorCommand", "en el perfil 'sim'")
 
+    def test_teleop_hacia_una_entrada_de_un_mux_encadenado_tambien_es_error(self):
+        """Confirmación bloque 2: /cmd/a es salida de un mux y entrada de otro cuya salida es /patas/cmd: la lista
+        se hereda en cadena, y [web.teleop] hacia /cmd/a (o /cmd/ia, dos saltos) es ConfigError, no un registro roto."""
+        texto = (MINIMO + joints() + mux("segundo", "/patas/cmd", ("a", "/cmd/a", 1))
+                 + mux("primero", "/cmd/a", ("ia", "/cmd/ia", 1)) + '\n[web.teleop]\ntarget = "/cmd/ia"\n')
+        self.assertConfigError(texto, "[web.teleop] manda MotorCommand a ese topic")
+        from agmen.run import joint_names_table
+
+        cfg = self.load(MINIMO + joints() + mux("segundo", "/patas/cmd", ("a", "/cmd/a", 1))
+                        + mux("primero", "/cmd/a", ("ia", "/cmd/ia", 1)))
+        self.assertEqual(joint_names_table(cfg)["/cmd/ia"], tuple(PATAS))
+
     def test_teleop_a_otro_topic_vale(self):
         self.load(MINIMO + joints() + mux("ruedas", "/patas/cmd", ("ia", "/cmd/ia", 1))
                   + '\n[web.teleop]\ntarget = "/teleop"\n')
