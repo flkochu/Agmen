@@ -25,6 +25,64 @@ void check_topic_or_throw(const std::string& topic) {
     }
 }
 
+/// TopicOptions::names de un Publisher o Subscriber (RFC 0013 §3.4, D6 = d), revisada al crear y antes de
+/// abrir nada, con los mismos textos que joint_names_for de python/agmen/pubsub.py: una lista de nombres
+/// válidos, sin repetir, dentro de los topes y, si el esquema dice cuántas articulaciones son
+/// (`f32[N] position`), con N nombres. Devuelve el valor del campo `names` ("" = sin lista).
+std::string joint_names_field(const std::string& where, const TypeInfo& type, const std::vector<std::string>& names,
+                              const std::string& who) {
+    if (names.empty()) return {};
+    if (!hub::is_topic(where)) {
+        throw wire::WireError(wire::WireError::Kind::HubRejected,
+                              who + ": names= va con un topic (la lista se le declara al hub, que la compara), y '" +
+                                  where + "' no es un topic. Usa un topic, ej. '/patas/cmd', o no pases names=");
+    }
+    check_topic_or_throw(where);
+    try {
+        hub::check_joint_names(names);
+    } catch (const std::invalid_argument& e) {
+        throw wire::WireError(wire::WireError::Kind::HubRejected, who + " en '" + where + "': " + e.what());
+    }
+    if (const auto n = hub::schema_joint_count(type.schema_text); n && *n != names.size()) {
+        throw wire::WireError(wire::WireError::Kind::HubRejected,
+                              who + " en '" + where + "': names tiene " + std::to_string(names.size()) + " nombre" +
+                                  (names.size() == 1 ? "" : "s") + " y " + type.name + " es de " + std::to_string(*n) +
+                                  " articulaciones (f32[" + std::to_string(*n) +
+                                  "] position): pasa un nombre por articulación, en el orden de los arreglos");
+    }
+    return hub::format_joint_names(names);
+}
+
+/// La línea de registro de un Publisher en el hub. Sin lista (`names` vacío), la de siempre, byte a byte;
+/// con lista, el campo `names` al final (como _PurePublisher en python/agmen/pubsub.py).
+std::string pub_line(const std::string& id, const std::string& topic, const TypeInfo& type, const std::string& names) {
+    std::vector<std::pair<std::string, std::string>> fields{{"id", id},
+                                                           {"node", hub::node_name()},
+                                                           {"pid", hub::process_id()},
+                                                           {"topic", topic},
+                                                           {"schema", hub::hex16(type.schema_id)},
+                                                           {"type", type.name},
+                                                           {"text", type.schema_text}};
+    if (!names.empty()) fields.emplace_back("names", names);
+    return hub::line("pub", fields);
+}
+
+/// names de un Publisher, revisada, y que el registro con la lista quepa en un datagrama (el texto del
+/// esquema también va en él). Antes de abrir nada.
+std::string pub_names_field(const std::string& to, const TypeInfo& type, const TopicOptions& options) {
+    auto names = joint_names_field(to, type, options.names, "Publisher");
+    if (names.empty()) return names;
+    const auto size = pub_line(std::string(16, '0'), to, type, names).size();
+    if (size > hub::kMaxDatagram) {
+        throw wire::WireError(wire::WireError::Kind::HubRejected,
+                              "Publisher en '" + to + "': con names, el registro en el hub mide " +
+                                  std::to_string(size) + " bytes y en un datagrama caben " +
+                                  std::to_string(hub::kMaxDatagram) + " (el esquema de " + type.name +
+                                  " es muy largo): usa nombres más cortos o un tipo más chico");
+    }
+    return names;
+}
+
 const char* clock_name(wire::Clock c) {
     return c == wire::Clock::Sim ? "simulación" : c == wire::Clock::Replay ? "reproducción" : "real";
 }
@@ -1239,7 +1297,7 @@ struct PublisherCore::State {
     std::set<std::string> unreach_warned;
     std::atomic<std::uint64_t> rejected{0};   // control que no vino del hub (RFC 0011 §9.1)
 
-    State(const std::string& to, TypeInfo t, std::string label)
+    State(const std::string& to, TypeInfo t, std::string label, const std::string& names)
         // Por topic todo es local (nivel 2): 127.0.0.1, así Windows no pregunta por el firewall.
         : type(std::move(t)),
           net_ip(hub::is_topic(to) ? net_ip_from_env() : std::string()),   // antes de abrir nada
@@ -1251,13 +1309,7 @@ struct PublisherCore::State {
         if (hub::is_topic(to)) {
             check_topic_or_throw(to);
             const auto id = hub::hex16(source_id);
-            link.emplace(id, hub::line("pub", {{"id", id},
-                                               {"node", hub::node_name()},
-                                               {"pid", hub::process_id()},
-                                               {"topic", topic},
-                                               {"schema", hub::hex16(type.schema_id)},
-                                               {"type", type.name},
-                                               {"text", type.schema_text}}));
+            link.emplace(id, pub_line(id, topic, type, names));
             link->beat(socket);
             // Espera breve a la primera respuesta del hub: si ya hay receptores,
             // el primer mensaje no se pierde por no saber a quién mandarlo.
@@ -1393,8 +1445,10 @@ struct PublisherCore::State {
     }
 };
 
-PublisherCore::PublisherCore(const std::string& to, const TypeInfo& type, std::string topic)
-    : s_(std::make_unique<State>(to, type, std::move(topic))) {}
+PublisherCore::PublisherCore(const std::string& to, const TypeInfo& type, std::string topic,
+                             const TopicOptions& options)
+    // La lista se revisa antes de abrir nada: si no sirve, no queda ningún socket abierto.
+    : s_(std::make_unique<State>(to, type, std::move(topic), pub_names_field(to, type, options))) {}
 PublisherCore::PublisherCore(PublisherCore&&) noexcept = default;
 PublisherCore& PublisherCore::operator=(PublisherCore&&) noexcept = default;
 PublisherCore::~PublisherCore() = default;
@@ -1525,7 +1579,7 @@ struct SubscriberCore::State {
         tcp->forget_idle(now);
     }
 
-    State(const std::string& w, TypeInfo t)
+    State(const std::string& w, TypeInfo t, const std::string& names)
         : type(std::move(t)),
           where(w),
           net_ip(hub::is_topic(w) ? net_ip_from_env() : std::string()),   // antes de abrir nada: error claro
@@ -1548,6 +1602,8 @@ struct SubscriberCore::State {
                                                                     {"type", type.name},
                                                                     {"port", std::to_string(socket.local_port())}};
             if (tcp) beat.emplace_back("tcp", std::to_string(tcp->listener.local_port()));
+            // Al final (y antes de net=1, que go_net() añade después); sin lista, la línea de siempre (RFC 0013 D6).
+            if (!names.empty()) beat.emplace_back("names", names);
             link.emplace(id, hub::line("sub", beat));
             link->beat(socket);
             fields = std::move(beat);
@@ -1870,8 +1926,9 @@ struct SubscriberCore::State {
     }
 };
 
-SubscriberCore::SubscriberCore(const std::string& where, const TypeInfo& type)
-    : s_(std::make_unique<State>(where, type)) {}
+SubscriberCore::SubscriberCore(const std::string& where, const TypeInfo& type, const TopicOptions& options)
+    // La lista se revisa antes de abrir nada: si no sirve, no queda ningún socket abierto.
+    : s_(std::make_unique<State>(where, type, joint_names_field(where, type, options.names, "Subscriber"))) {}
 SubscriberCore::SubscriberCore(SubscriberCore&&) noexcept = default;
 SubscriberCore& SubscriberCore::operator=(SubscriberCore&&) noexcept = default;
 SubscriberCore::~SubscriberCore() = default;

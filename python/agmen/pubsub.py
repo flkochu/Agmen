@@ -132,12 +132,6 @@ def joint_names_for(msg_type, where: str, names, who: str) -> tuple[str, ...] | 
     return out
 
 
-# Con el núcleo de C++ (agmen._core), la lista todavía no llega al hub: el registro lo arma C++ y no lleva el campo.
-NATIVE_NAMES_TEXT = ("names= todavía no funciona con el núcleo de C++ de esta versión (agmen._core): la lista no "
-                     "llegaría al hub y no se compararía. Mientras, corre este nodo con Python puro: "
-                     "AGMEN_BACKEND=pure (en robot.toml, env = { AGMEN_BACKEND = \"pure\" } en su [[node]])")
-
-
 def _preload_numpy(msg_type) -> None:
     """Un tipo arrow importa NumPy al crear su Publisher o Subscriber, en el hilo que
     los crea, y no en la primera decodificación. Un tipo compact no (regla 6)."""
@@ -1414,19 +1408,28 @@ class _NativePublisher:
     def __init__(self, msg_type, to: str, topic: str | None = None, *, names=None) -> None:
         """`to` = topic ("/cmd") o dirección ("127.0.0.1:7500"). Con dirección,
         `topic` es solo una etiqueta (default "/" + nombre del tipo). `names`: ver
-        _PurePublisher (con este núcleo, todavía no: ver NATIVE_NAMES_TEXT)."""
+        _PurePublisher; el núcleo de C++ la lleva al hub en el registro, igual."""
         self.type = msg_type
         self.to = to
         if hp.is_topic(to):
             hp.check_topic(to)
-        if joint_names_for(msg_type, to, names, "Publisher") is not None:   # revisada igual que en Python puro
-            raise NotImplementedError(f"Publisher en '{to}': {NATIVE_NAMES_TEXT}")
-        self.names = None
+        # Revisada aquí igual que en Python puro (los mismos TypeError/ValueError), antes de abrir nada; C++ la
+        # vuelve a revisar con los mismos textos.
+        self.names = joint_names_for(msg_type, to, names, "Publisher")
+        if self.names is not None:
+            size = len(hp.encode("pub", id="0" * 16, node=node_name(), pid=os.getpid(), topic=to,
+                                 schema="0" * 16, type=msg_type.NAME, text=msg_type.SCHEMA_TEXT,
+                                 names=hp.format_joint_names(self.names)))
+            if size > wire.MAX_DATAGRAM:
+                raise ValueError(f"Publisher en '{to}': con names, el registro en el hub mide {size} bytes y en un "
+                                 f"datagrama caben {wire.MAX_DATAGRAM} (el esquema de {msg_type.NAME} es muy largo): "
+                                 f"usa nombres más cortos o un tipo más chico")
         label = "" if hp.is_topic(to) else (topic if topic is not None else "/" + msg_type.NAME)
         layout = msg_type.LAYOUT
         self.arrow = layout.encoding == wire.ENC_ARROW
         self._core = _backend.core.Publisher(to, msg_type.NAME, msg_type.SCHEMA_TEXT, msg_type.SCHEMA_ID,
-                                             layout.size or 0, self.arrow, label)
+                                             layout.size or 0, self.arrow, label,
+                                             None if self.names is None else list(self.names))
         _preload_numpy(msg_type)   # tras validar el tipo y el topic: los errores de siempre, en su orden
         self.topic = self._core.topic
         self.source_id = self._core.source_id
@@ -1514,17 +1517,17 @@ class _NativeSubscriber:
 
     def __init__(self, msg_type, where: str, *, names=None) -> None:
         """`where` = topic ("/cmd") o dirección donde escuchar ("127.0.0.1:7500"). `names`: ver
-        _PureSubscriber (con este núcleo, todavía no: ver NATIVE_NAMES_TEXT)."""
+        _PureSubscriber; el núcleo de C++ la lleva al hub en el registro, igual."""
         self.type = msg_type
         if hp.is_topic(where):
             hp.check_topic(where)
-        if joint_names_for(msg_type, where, names, "Subscriber") is not None:   # revisada igual que en Python puro
-            raise NotImplementedError(f"Subscriber en '{where}': {NATIVE_NAMES_TEXT}")
-        self.names = None
+        # Revisada aquí igual que en Python puro (los mismos TypeError/ValueError), antes de abrir nada.
+        self.names = joint_names_for(msg_type, where, names, "Subscriber")
         self.topic = where if hp.is_topic(where) else ""
         layout = msg_type.LAYOUT
         self._core = _backend.core.Subscriber(where, msg_type.NAME, msg_type.SCHEMA_TEXT, msg_type.SCHEMA_ID,
-                                              layout.size or 0, layout.encoding == wire.ENC_ARROW)
+                                              layout.size or 0, layout.encoding == wire.ENC_ARROW,
+                                              None if self.names is None else list(self.names))
         _preload_numpy(msg_type)   # tras validar el tipo y el topic: los errores de siempre, en su orden
         self._listen = f"127.0.0.1:{self._core.port}" if self.topic else where
         self._lock = threading.Lock()

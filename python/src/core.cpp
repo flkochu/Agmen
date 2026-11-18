@@ -66,6 +66,7 @@ namespace {
 
 PyObject* g_schema_error = nullptr;
 PyObject* g_wire_error = nullptr;
+PyObject* g_hub_rejected = nullptr;   // wire.HubRejected (una WireError): el hub rechazó el registro
 
 [[noreturn]] void raise(PyObject* type, const std::string& msg) {
     PyErr_SetString(type != nullptr ? type : PyExc_ValueError, msg.c_str());
@@ -553,6 +554,12 @@ agmen::TypeInfo type_info(const std::string& name, const std::string& text, std:
     return agmen::TypeInfo{name, text, id, arrow ? 0 : size, arrow};
 }
 
+/// names= de Python (None o una lista de textos, ya revisada por joint_names_for en agmen.pubsub) →
+/// las opciones del núcleo. None = sin lista (la línea de siempre).
+agmen::TopicOptions topic_options(const std::optional<std::vector<std::string>>& names) {
+    return agmen::TopicOptions{names ? *names : std::vector<std::string>{}};
+}
+
 // ---------------------------------------------------------------------------
 // Un payload que vive en la memoria compartida del publicador (RFC 0009, D7).
 // Python lo ve con el protocolo de buffer (memoryview, numpy.frombuffer) sin
@@ -619,12 +626,14 @@ std::vector<PyPublisher*> g_pubs;   // los Publisher vivos (para el fork); se to
 class PyPublisher {
 public:
     PyPublisher(const std::string& to, const std::string& name, const std::string& text, std::uint64_t id,
-                std::size_t size, bool arrow, const std::string& topic)
+                std::size_t size, bool arrow, const std::string& topic,
+                const std::optional<std::vector<std::string>>& names)
         : arrow_(arrow) {
+        const auto options = topic_options(names);
         {
             const NoGil nogil(Inside::Create);
             if (!nogil.released()) throw closing_error("un Publisher");
-            core_ = std::make_shared<agmen::PublisherCore>(to, type_info(name, text, id, size, arrow), topic);
+            core_ = std::make_shared<agmen::PublisherCore>(to, type_info(name, text, id, size, arrow), topic, options);
         }
         g_pubs.push_back(this);   // ya con el GIL
     }
@@ -720,13 +729,14 @@ std::vector<PySubscriber*> g_subs;   // los Subscriber vivos (para el fork); se 
 class PySubscriber {
 public:
     PySubscriber(const std::string& where, const std::string& name, const std::string& text, std::uint64_t id,
-                 std::size_t size, bool arrow) {
+                 std::size_t size, bool arrow, const std::optional<std::vector<std::string>>& names) {
+        const auto options = topic_options(names);
         {
             const NoGil nogil(Inside::Create);
             if (!nogil.released()) throw closing_error("un Subscriber");
             // Con un borrador propio: avisa a close() cuando el núcleo ya se destruyó (ver close()).
             core_ = std::shared_ptr<agmen::SubscriberCore>(
-                new agmen::SubscriberCore(where, type_info(name, text, id, size, arrow)), CoreDeleter{this});
+                new agmen::SubscriberCore(where, type_info(name, text, id, size, arrow), options), CoreDeleter{this});
         }
         g_subs.push_back(this);   // ya con el GIL
     }
@@ -989,7 +999,8 @@ public:
     }
 
     void subscribe(const std::string& where, const std::string& name, const std::string& text, std::uint64_t id,
-                   std::size_t size, bool arrow, nb::handle fn, std::size_t queue, const std::string& group) {
+                   std::size_t size, bool arrow, nb::handle fn, std::size_t queue, const std::string& group,
+                   const std::optional<std::vector<std::string>>& names) {
         auto ref = std::make_shared<PyRef>(fn);
         live().subscribe_raw(
             where, type_info(name, text, id, size, arrow),
@@ -1010,7 +1021,7 @@ public:
                 // Sin el GIL: el Node lo descarta, lo cuenta y lo avisa.
                 if (!invalid.empty()) throw agmen::detail::InvalidPayload(invalid);
             },
-            agmen::SubscribeOptions{.queue = queue, .group = agmen::Group{group}});
+            agmen::SubscribeOptions{.queue = queue, .group = agmen::Group{group}, .names = topic_options(names).names});
     }
 
     void group(const std::string& name) { (void)live().group(name); }
@@ -1230,18 +1241,31 @@ NB_MODULE(_core, m) {
     // cierra; no son fugas, así que no se avisa de ellos al salir.
     nb::set_leak_warnings(false);
     m.attr("VERSION") = std::string(agmen::kVersion);
+    // Los topes de los nombres de las articulaciones (RFC 0013 D6) de C++: python/test_nombres.py revisa que
+    // sean los mismos de agmen.hubproto.
+    m.attr("JOINT_NAME_MAX") = agmen::hub::kJointNameMax;
+    m.attr("JOINT_NAMES_MAX") = agmen::hub::kJointNamesMax;
+    m.attr("MAX_DATAGRAM") = agmen::hub::kMaxDatagram;
 
     m.def("set_errors", [](nb::handle schema_err, nb::handle wire_err) {
         Py_XINCREF(schema_err.ptr());
         Py_XINCREF(wire_err.ptr());
         g_schema_error = schema_err.ptr();
         g_wire_error = wire_err.ptr();
+        // HubRejected vive en el mismo módulo que WireError (agmen.wire, que llama a esto mientras se importa:
+        // se busca en sys.modules). Así el rechazo del hub se ve igual con los dos núcleos (wire.HubRejected).
+        const nb::object module = nb::module_::import_("sys").attr("modules").attr("get")(wire_err.attr("__module__"));
+        const nb::object hub_rejected = module.is_none() ? nb::none() : nb::getattr(module, "HubRejected", nb::none());
+        if (!hub_rejected.is_none()) g_hub_rejected = hub_rejected.inc_ref().ptr();
     });
     nb::register_exception_translator([](const std::exception_ptr& p, void*) {
         try {
             std::rethrow_exception(p);
         } catch (const agmen::wire::WireError& e) {
-            PyErr_SetString(g_wire_error != nullptr ? g_wire_error : PyExc_RuntimeError, e.what());
+            PyObject* type = e.kind() == agmen::wire::WireError::Kind::HubRejected && g_hub_rejected != nullptr
+                                 ? g_hub_rejected
+                                 : g_wire_error;
+            PyErr_SetString(type != nullptr ? type : PyExc_RuntimeError, e.what());
         } catch (const agmen::schema::SchemaError& e) {
             PyErr_SetString(g_schema_error != nullptr ? g_schema_error : PyExc_ValueError, e.what());
         } catch (const agmen::net::NetError& e) {
@@ -1260,8 +1284,8 @@ NB_MODULE(_core, m) {
 
     nb::class_<PyPublisher>(m, "Publisher")
         .def(nb::init<const std::string&, const std::string&, const std::string&, std::uint64_t, std::size_t, bool,
-                      const std::string&>(),
-             "to"_a, "name"_a, "text"_a, "schema_id"_a, "size"_a, "arrow"_a, "topic"_a)
+                      const std::string&, const std::optional<std::vector<std::string>>&>(),
+             "to"_a, "name"_a, "text"_a, "schema_id"_a, "size"_a, "arrow"_a, "topic"_a, "names"_a = nb::none())
         .def("publish", &PyPublisher::publish, "payload"_a, "t_data"_a)
         .def("announce", &PyPublisher::announce)
         .def("heartbeat", &PyPublisher::heartbeat)
@@ -1288,8 +1312,9 @@ NB_MODULE(_core, m) {
         });
 
     nb::class_<PySubscriber>(m, "Subscriber")
-        .def(nb::init<const std::string&, const std::string&, const std::string&, std::uint64_t, std::size_t, bool>(),
-             "where"_a, "name"_a, "text"_a, "schema_id"_a, "size"_a, "arrow"_a)
+        .def(nb::init<const std::string&, const std::string&, const std::string&, std::uint64_t, std::size_t, bool,
+                      const std::optional<std::vector<std::string>>&>(),
+             "where"_a, "name"_a, "text"_a, "schema_id"_a, "size"_a, "arrow"_a, "names"_a = nb::none())
         .def("receive", &PySubscriber::receive, "timeout"_a.none())
         .def("announced", &PySubscriber::announced)
         .def("heartbeat", &PySubscriber::heartbeat)
@@ -1308,7 +1333,7 @@ NB_MODULE(_core, m) {
         .def(nb::init<const std::string&>(), "name"_a)
         .def("every", &PyNode::every, "period_ns"_a, "fn"_a, "group"_a)
         .def("subscribe", &PyNode::subscribe, "where"_a, "name"_a, "text"_a, "schema_id"_a, "size"_a, "arrow"_a,
-             "fn"_a, "queue"_a, "group"_a)
+             "fn"_a, "queue"_a, "group"_a, "names"_a = nb::none())
         .def("group", &PyNode::group, "name"_a)
         .def("spin", &PyNode::spin, "seconds"_a.none())
         .def("stop", &PyNode::stop)

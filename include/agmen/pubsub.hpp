@@ -76,12 +76,26 @@ struct TypeInfo {
     }
 };
 
+/// Opciones de un Publisher o un Subscriber por topic.
+///
+///   agmen::Publisher<agmen::msgs::JointCommand<2>> pub("/patas/cmd", {.names = {"cadera", "rodilla"}});
+struct TopicOptions {
+    /// Los nombres de las articulaciones, en el orden de los arreglos (RFC 0013 §3.4, D6 = d): quien
+    /// trae su propia lista (una política, el puente de un simulador) se la declara al hub, que la
+    /// compara con la de robot.toml y con la de los demás nodos del topic, y rechaza el registro si no
+    /// coinciden. Vacía = no declara lista (como siempre). Solo con un topic, no con dirección fija.
+    /// Si el tipo tiene un campo `f32[N] position` (JointState<N>, JointCommand<N>), van N nombres.
+    /// Una lista que no sirve lanza wire::WireError al crear, antes de abrir nada.
+    std::vector<std::string> names;
+};
+
 /// Publica payloads de un tipo (ya codificados). Seguro entre hilos.
 class PublisherCore {
 public:
     /// `to` = topic ("/cmd") o dirección ("127.0.0.1:7500"); con dirección,
     /// `topic` es la etiqueta que viaja en el sobre ("" = "/" + nombre del tipo).
-    PublisherCore(const std::string& to, const TypeInfo& type, std::string topic = "");
+    PublisherCore(const std::string& to, const TypeInfo& type, std::string topic = "",
+                  const TopicOptions& options = {});
     PublisherCore(PublisherCore&&) noexcept;
     PublisherCore& operator=(PublisherCore&&) noexcept;
     PublisherCore(const PublisherCore&) = delete;
@@ -174,7 +188,7 @@ struct ListenAddress {
 /// hilo que recibe.
 class SubscriberCore {
 public:
-    SubscriberCore(const std::string& where, const TypeInfo& type);
+    SubscriberCore(const std::string& where, const TypeInfo& type, const TopicOptions& options = {});
     SubscriberCore(SubscriberCore&&) noexcept;
     SubscriberCore& operator=(SubscriberCore&&) noexcept;
     SubscriberCore(const SubscriberCore&) = delete;
@@ -228,6 +242,13 @@ public:
     /// dirección, `topic` es solo una etiqueta que viaja en el sobre.
     explicit Publisher(const std::string& to, std::string topic = "/" + std::string(M::kName))
         : core_(to, TypeInfo::of<M>(), std::move(topic)) {
+        AGMEN_CHECK_SCHEMA(M);
+    }
+
+    /// Por topic, con opciones: Publisher<M> pub("/patas/cmd", {.names = {"cadera", "rodilla"}}).
+    /// Lanza wire::WireError si `options.names` no sirve (dice qué pasó y qué hacer).
+    explicit Publisher(const std::string& to, const TopicOptions& options)
+        : core_(to, TypeInfo::of<M>(), "/" + std::string(M::kName), options) {
         AGMEN_CHECK_SCHEMA(M);
     }
 
@@ -296,6 +317,13 @@ class Subscriber {
 public:
     /// `where` = topic ("/cmd") o dirección donde escuchar ("127.0.0.1:7500").
     explicit Subscriber(const std::string& where) : core_(where, TypeInfo::of<M>()) { AGMEN_CHECK_SCHEMA(M); }
+
+    /// Por topic, con opciones: Subscriber<M> sub("/patas/estado", {.names = {"cadera", "rodilla"}}).
+    /// Lanza wire::WireError si `options.names` no sirve (dice qué pasó y qué hacer).
+    explicit Subscriber(const std::string& where, const TopicOptions& options)
+        : core_(where, TypeInfo::of<M>(), options) {
+        AGMEN_CHECK_SCHEMA(M);
+    }
 
     /// Espera hasta `timeout` un mensaje de tipo M. std::nullopt si no llegó.
     /// Lanza wire::WireError si llega algo inválido, de otro tipo, o si el hub

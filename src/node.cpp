@@ -28,7 +28,7 @@ void note_max(std::atomic<std::int64_t>& slot, std::int64_t value) {
 }
 
 RawSub::RawSub(const std::string& w, const TypeInfo& t, Callback cb, const SubscribeOptions& opt)
-    : sub_(w, t), cb_(std::move(cb)) {
+    : sub_(w, t, TopicOptions{opt.names}), cb_(std::move(cb)) {
     where = w;
     type = t.name;
     group = opt.group.name;

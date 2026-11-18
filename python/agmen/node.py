@@ -40,7 +40,6 @@ from dataclasses import dataclass
 from . import _backend, _tcp, clock, wire
 from . import hubproto as hp
 from .pubsub import (
-    NATIVE_NAMES_TEXT,
     Publisher,
     _preload_numpy,
     Sample,
@@ -653,13 +652,12 @@ class _NativeNode:
     def on(self, msg_type, where: str, fn=None, *, queue: int = 1, group: Group | None = None, names=None):
         """Llama a `fn(sample)` cuando llega un `msg_type` por `where` (topic o
         dirección). queue = 1: el más reciente; queue = N: hasta N. `names`: como en
-        publisher() (con este núcleo, todavía no: ver pubsub.NATIVE_NAMES_TEXT)."""
+        publisher()."""
         def add(f):
             self._check_not_running("on")
             if hp.is_topic(where):
                 hp.check_topic(where)
-            if joint_names_for(msg_type, where, names, "Node.on") is not None:   # revisada igual que en Python puro
-                raise NotImplementedError(f"Node.on en '{where}': {NATIVE_NAMES_TEXT}")
+            checked = joint_names_for(msg_type, where, names, "Node.on")   # revisada igual que en Python puro
             decode, envelope = msg_type.decode_payload, wire.Envelope
 
             def deliver(env, payload, sender):
@@ -677,7 +675,7 @@ class _NativeNode:
             layout = msg_type.LAYOUT
             self._core.subscribe(where, msg_type.NAME, msg_type.SCHEMA_TEXT, msg_type.SCHEMA_ID,
                                  layout.size or 0, layout.encoding == wire.ENC_ARROW, deliver, max(1, int(queue)),
-                                 (group or Group()).name)
+                                 (group or Group()).name, None if checked is None else list(checked))
             _preload_numpy(msg_type)   # 8.2, tras validar el tipo y el topic (el nodo puro usa Subscriber)
             return f
 

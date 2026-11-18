@@ -11,6 +11,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -61,6 +62,38 @@ struct Line {
 /// Nombres válidos: "/imu", "/arca9/articulaciones". Lanza std::invalid_argument
 /// con una explicación si no lo es.
 void check_topic(std::string_view topic);
+
+// --- Los nombres de las articulaciones (RFC 0013 §3.4, D6 = d) ----------------
+// Campo opcional `names=a,b,c` al final de las líneas `pub` y `sub` (antes de net=1). Sin lista, la
+// línea de siempre. La definición de referencia es python/agmen/hubproto.py (check_joint_names); los
+// textos de error son los mismos, palabra por palabra.
+//
+//   names  = nombre ("," nombre)*        nombre = [A-Za-z0-9_][A-Za-z0-9_./-]*
+//
+// Todos esos signos van sin "%XX", así que la lista viaja tal cual.
+
+/// Caracteres por nombre. El mismo número que JOINT_NAME_MAX de python/agmen/hubproto.py
+/// (python/test_nombres.py compara los dos a través de agmen._core).
+inline constexpr std::size_t kJointNameMax = 64;
+/// Caracteres del campo entero (los nombres separados por comas). El mismo que JOINT_NAMES_MAX.
+inline constexpr std::size_t kJointNamesMax = 8192;
+/// Lo que cabe en un datagrama UDP (IPv4): el registro con la lista no puede pasar de aquí
+/// (MAX_DATAGRAM de python/agmen/wire.py).
+inline constexpr std::size_t kMaxDatagram = 65507;
+
+/// Por qué un nombre de articulación no vale, en palabras ("tiene un espacio"); "" si vale.
+[[nodiscard]] std::string joint_name_problem(std::string_view name);
+
+/// Una lista de nombres revisada: no vacía, nombres válidos, sin repetir y dentro de los topes.
+/// Lanza std::invalid_argument con el porqué. `what` es cómo se llama la lista en el mensaje.
+void check_joint_names(const std::vector<std::string>& names, std::string_view what = "names");
+
+/// {"FR_hip", "FR_thigh"} → "FR_hip,FR_thigh": el valor del campo `names`.
+[[nodiscard]] std::string format_joint_names(const std::vector<std::string>& names);
+
+/// Cuántas articulaciones dice un esquema: el N de su campo `f32[N] position` de primer nivel
+/// ("agmen/1 JointState{f32[12] position;…}" → 12). Sin valor si no tiene ese campo.
+[[nodiscard]] std::optional<std::size_t> schema_joint_count(std::string_view text);
 
 // --- Modo red (RFC 0011 §3.5) -------------------------------------------------
 // Los mismos casos que python/agmen/hubproto.py (python/test_hub.py, TestModoRedProtocolo).

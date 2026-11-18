@@ -51,6 +51,9 @@ struct SubscribeOptions {
     /// N = guardar hasta N; si se llena, se descarta el más viejo.
     std::size_t queue = 1;
     Group group{};
+    /// Los nombres de las articulaciones, en el orden de los arreglos (RFC 0013 §3.4): como
+    /// TopicOptions::names. Vacía = no declara lista.
+    std::vector<std::string> names{};
 };
 
 /// Cuentas de un temporizador (node.timers()).
@@ -210,9 +213,11 @@ public:
     [[nodiscard]] const std::string& name() const;
 
     /// Un publicador de este nodo. El nodo lo mantiene vivo y late con el hub.
+    /// `options.names`: los nombres de las articulaciones (RFC 0013 §3.4), ej.
+    /// node.publisher<Cmd>("/patas/cmd", {.names = {"cadera", "rodilla"}}).
     template <wire::Message M>
-    [[nodiscard]] NodePublisher<M> publisher(const std::string& to) {
-        auto p = std::make_shared<Publisher<M>>(to);
+    [[nodiscard]] NodePublisher<M> publisher(const std::string& to, const TopicOptions& options = {}) {
+        auto p = std::make_shared<Publisher<M>>(to, options);
         add_heartbeat([p] { p->heartbeat(); });
         return NodePublisher<M>(std::move(p));
     }

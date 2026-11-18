@@ -141,6 +141,212 @@ void check_topic(std::string_view topic) {
     }
 }
 
+// --- Los nombres de las articulaciones (RFC 0013 §3.4, D6 = d): los mismos textos que
+// check_joint_names de python/agmen/hubproto.py ---
+
+namespace {
+
+bool joint_first(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+bool joint_char(unsigned char c) { return joint_first(c) || c == '.' || c == '/' || c == '-'; }
+
+/// Un carácter UTF-8 que empieza en text[i]: su código y cuántos bytes mide; 0 bytes si no es UTF-8
+/// válido (cortado, de más bytes de los necesarios, una mitad de par sustituto o más allá de U+10FFFF).
+std::pair<char32_t, std::size_t> utf8_at(std::string_view text, std::size_t i) {
+    const auto c = static_cast<unsigned char>(text[i]);
+    if (c < 0x80) return {c, 1};
+    std::size_t len = 0;
+    char32_t cp = 0;
+    char32_t min = 0;
+    if (c >= 0xC2 && c <= 0xDF) {
+        len = 2, cp = c & 0x1FU, min = 0x80;
+    } else if (c >= 0xE0 && c <= 0xEF) {
+        len = 3, cp = c & 0x0FU, min = 0x800;
+    } else if (c >= 0xF0 && c <= 0xF4) {
+        len = 4, cp = c & 0x07U, min = 0x10000;
+    } else {
+        return {0, 0};
+    }
+    if (i + len > text.size()) return {0, 0};
+    for (std::size_t k = 1; k < len; ++k) {
+        const auto b = static_cast<unsigned char>(text[i + k]);
+        if ((b & 0xC0U) != 0x80U) return {0, 0};
+        cp = (cp << 6) | (b & 0x3FU);
+    }
+    if (cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return {0, 0};
+    return {cp, len};
+}
+
+/// ¿Python lo da por imprimible (str.isprintable)? Aproximado fuera de los controles: los espacios
+/// raros, los invisibles de formato y los de uso privado más comunes no lo son.
+bool printable(char32_t cp) {
+    if (cp < 0x20 || (cp >= 0x7F && cp <= 0xA0) || cp == 0xAD) return false;
+    if (cp == 0x061C || cp == 0x1680 || cp == 0x180E || cp == 0x3000 || cp == 0xFEFF) return false;
+    if ((cp >= 0x2000 && cp <= 0x200F) || (cp >= 0x2028 && cp <= 0x202F) || (cp >= 0x205F && cp <= 0x206F)) {
+        return false;
+    }
+    if ((cp >= 0xFFF9 && cp <= 0xFFFB) || (cp >= 0xE000 && cp <= 0xF8FF) || cp >= 0xF0000) return false;
+    if (cp >= 0xE0000 && cp <= 0xE0FFF) return false;
+    return true;
+}
+
+std::string hex_text(unsigned value, int width, bool upper) {
+    char buf[16];
+    std::snprintf(buf, sizeof buf, upper ? "%0*X" : "%0*x", width, value);
+    return buf;
+}
+
+/// Un nombre que no vale, para un error: acotado a kJointNameMax caracteres, sin lo que no se ve, y
+/// entre comillas como lo escribe Python (repr).
+std::string show_name(std::string_view name) {
+    std::string text;
+    std::size_t i = 0;
+    std::size_t count = 0;
+    while (i < name.size() && count < kJointNameMax) {
+        const auto [cp, len] = utf8_at(name, i);
+        if (len == 0 || !printable(cp)) {
+            text += '?';
+            i += len == 0 ? 1 : len;
+        } else {
+            text.append(name.substr(i, len));
+            i += len;
+        }
+        ++count;
+    }
+    if (i < name.size()) text += "…";
+    const char q = text.find('\'') != std::string::npos && text.find('"') == std::string::npos ? '"' : '\'';
+    std::string out(1, q);
+    for (char c : text) {
+        if (c == '\\' || c == q) out += '\\';
+        out += c;
+    }
+    out += q;
+    return out;
+}
+
+std::string too_long(std::string_view what, std::size_t size, std::size_t count) {
+    const std::string w(what);
+    return w + " ocupa " + std::to_string(size) + " caracteres (los " + std::to_string(count) +
+           " nombres separados por comas) y el máximo es " + std::to_string(kJointNamesMax) +
+           ": usa nombres más cortos o reparte las articulaciones en varios grupos (un topic por grupo)";
+}
+
+constexpr std::string_view kJointNameHelp =
+    "Usa letras (sin acentos), dígitos, '_', '-', '.' o '/', y empieza con letra, dígito o '_', como en el "
+    "modelo (MuJoCo o URDF), ej. \"FR_hip\" o \"brazo/codo.1\"";
+
+}  // namespace
+
+std::string joint_name_problem(std::string_view name) {
+    bool ok = !name.empty() && joint_first(static_cast<unsigned char>(name.front()));
+    for (char c : name) ok = ok && joint_char(static_cast<unsigned char>(c));
+    if (ok) {
+        if (name.size() > kJointNameMax) {
+            return "mide " + std::to_string(name.size()) + " caracteres y el máximo es " +
+                   std::to_string(kJointNameMax);
+        }
+        return {};
+    }
+    if (name.empty()) return "está vacío";
+    for (std::size_t i = 0; i < name.size();) {
+        const auto [cp, len] = utf8_at(name, i);
+        if (len == 0) {
+            // Python no tiene este caso (un str siempre es texto); en C++ un std::string puede traer cualquier byte.
+            return "tiene un byte que no es UTF-8 (0x" + hex_text(static_cast<unsigned char>(name[i]), 2, false) + ")";
+        }
+        if (len == 1 && joint_char(static_cast<unsigned char>(cp))) {
+            ++i;
+            continue;
+        }
+        if (cp == ' ') return "tiene un espacio";
+        if (cp == ',') return "tiene una coma";
+        if (cp == '=') return "tiene un '='";
+        if (cp < 32 || cp == 127) return "tiene un carácter de control (0x" + hex_text(cp, 2, false) + ")";
+        if (!printable(cp)) return "tiene un carácter que no se ve (U+" + hex_text(cp, 4, true) + ")";
+        return "tiene '" + std::string(name.substr(i, len)) + "'";
+    }
+    return "empieza con '" + std::string(1, name.front()) + "'; el primer carácter es una letra, un dígito o '_'";
+}
+
+void check_joint_names(const std::vector<std::string>& names, std::string_view what) {
+    const std::string w(what);
+    if (names.empty()) {
+        throw std::invalid_argument(w + " está vacía: pon los nombres de las articulaciones en orden, ej. "
+                                        "[\"cadera\", \"rodilla\"] (o no la pases)");
+    }
+    std::map<std::string_view, std::size_t, std::less<>> seen;
+    for (std::size_t k = 0; k < names.size(); ++k) {
+        const std::string& n = names[k];
+        const auto why = joint_name_problem(n);
+        if (!why.empty()) {
+            throw std::invalid_argument(w + "[" + std::to_string(k) + "] = " + show_name(n) +
+                                        " no es un nombre de articulación válido (" + why + "). " +
+                                        std::string(kJointNameHelp));
+        }
+        if (const auto it = seen.find(n); it != seen.end()) {
+            throw std::invalid_argument("'" + n + "' está dos veces en " + w + " (" + w + "[" +
+                                        std::to_string(it->second) + "] y " + w + "[" + std::to_string(k) +
+                                        "]). Cada articulación va una sola vez: quita una o corrige el nombre");
+        }
+        seen.emplace(n, k);
+    }
+    const auto size = format_joint_names(names).size();
+    if (size > kJointNamesMax) throw std::invalid_argument(too_long(what, size, names.size()));
+}
+
+std::string format_joint_names(const std::vector<std::string>& names) {
+    std::string out;
+    for (const auto& n : names) {
+        if (!out.empty()) out += ',';
+        out += n;
+    }
+    return out;
+}
+
+namespace {
+
+/// "f32[N] position" con N de 1 a 9999999 sin ceros a la izquierda (el _POSITION_RE de hubproto.py).
+std::optional<std::size_t> position_field(std::string_view field) {
+    constexpr std::string_view kHead = "f32[";
+    constexpr std::string_view kTail = "] position";
+    if (field.size() <= kHead.size() + kTail.size() || field.substr(0, kHead.size()) != kHead ||
+        field.substr(field.size() - kTail.size()) != kTail) {
+        return std::nullopt;
+    }
+    const auto num = field.substr(kHead.size(), field.size() - kHead.size() - kTail.size());
+    if (num.size() > 7 || num.front() == '0') return std::nullopt;
+    std::size_t n = 0;
+    for (char c : num) {
+        if (c < '0' || c > '9') return std::nullopt;
+        n = n * 10 + static_cast<std::size_t>(c - '0');
+    }
+    return n;
+}
+
+}  // namespace
+
+std::optional<std::size_t> schema_joint_count(std::string_view text) {
+    const auto brace = text.find('{');
+    if (brace == std::string_view::npos || text.back() != '}' || brace + 1 >= text.size()) return std::nullopt;
+    const auto inner = text.substr(brace + 1, text.size() - brace - 2);
+    int depth = 0;
+    std::size_t start = 0;
+    for (std::size_t k = 0; k <= inner.size(); ++k) {
+        const char c = k < inner.size() ? inner[k] : ';';
+        if (c == '{') {
+            ++depth;
+        } else if (c == '}') {
+            --depth;
+        } else if (c == ';' && depth == 0) {
+            if (auto n = position_field(inner.substr(start, k - start))) return n;
+            start = k + 1;
+        }
+    }
+    return std::nullopt;
+}
+
 // --- Modo red (RFC 0011 §3.5): los mismos textos que python/agmen/hubproto.py ---
 
 std::vector<std::string> split_list(std::string_view list) {
