@@ -1247,17 +1247,17 @@ NB_MODULE(_core, m) {
     m.attr("JOINT_NAMES_MAX") = agmen::hub::kJointNamesMax;
     m.attr("MAX_DATAGRAM") = agmen::hub::kMaxDatagram;
 
-    m.def("set_errors", [](nb::handle schema_err, nb::handle wire_err) {
+    // Las tres clases van como argumento (no se buscan en sys.modules mientras agmen.wire se importa: así no
+    // depende del orden de importación). HubRejected (una WireError): el rechazo del hub se ve igual con los dos
+    // núcleos (wire.HubRejected).
+    m.def("set_errors", [](nb::handle schema_err, nb::handle wire_err, nb::handle hub_rejected) {
         Py_XINCREF(schema_err.ptr());
         Py_XINCREF(wire_err.ptr());
+        Py_XINCREF(hub_rejected.ptr());
         g_schema_error = schema_err.ptr();
         g_wire_error = wire_err.ptr();
-        // HubRejected vive en el mismo módulo que WireError (agmen.wire, que llama a esto mientras se importa:
-        // se busca en sys.modules). Así el rechazo del hub se ve igual con los dos núcleos (wire.HubRejected).
-        const nb::object module = nb::module_::import_("sys").attr("modules").attr("get")(wire_err.attr("__module__"));
-        const nb::object hub_rejected = module.is_none() ? nb::none() : nb::getattr(module, "HubRejected", nb::none());
-        if (!hub_rejected.is_none()) g_hub_rejected = hub_rejected.inc_ref().ptr();
-    });
+        g_hub_rejected = hub_rejected.ptr();
+    }, "schema_error"_a, "wire_error"_a, "hub_rejected"_a);
     nb::register_exception_translator([](const std::exception_ptr& p, void*) {
         try {
             std::rethrow_exception(p);

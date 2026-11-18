@@ -22,6 +22,7 @@ topic, de registrarse con el hub y latir cada segundo.
 
 from __future__ import annotations
 
+import collections.abc
 import inspect
 import os
 import select
@@ -119,6 +120,11 @@ def joint_names_for(msg_type, where: str, names, who: str) -> tuple[str, ...] | 
     if not hp.is_topic(where):
         raise ValueError(f"{who}: names= va con un topic (la lista se le declara al hub, que la compara), y "
                          f"'{where}' no es un topic. Usa un topic, ej. '/patas/cmd', o no pases names=")
+    if isinstance(names, (collections.abc.Set, collections.abc.Mapping)):
+        kind = type(names).__name__
+        raise TypeError(f"{who} en '{where}': names debe ser una lista o una tupla, en el orden de los arreglos: un "
+                        f"{kind} no tiene orden fijo y el orden es justo lo que el hub compara. Pasa, por ejemplo, "
+                        f"names=['cadera', 'rodilla']")
     try:
         out = hp.check_joint_names(names)
     except hp.ProtocolError as e:
@@ -130,6 +136,59 @@ def joint_names_for(msg_type, where: str, names, who: str) -> tuple[str, ...] | 
                          f"{msg_type.NAME} es de {n} articulaciones (f32[{n}] position): pasa un nombre por "
                          f"articulación, en el orden de los arreglos")
     return out
+
+
+# El puerto más largo que puede tener un Subscriber en su registro: el tamaño se mide antes de abrir nada, con el
+# peor caso (port y tcp de 5 dígitos, y net=1, que se añade si el hub pasa a modo red), igual en C++ (src/pubsub.cpp).
+_WORST_PORT = 65535
+
+
+def _utf8(text: str) -> bool:
+    """¿Se puede escribir en UTF-8? Con el núcleo de C++, un AGMEN_NODE con bytes que no son UTF-8 lo manda C++ tal
+    cual (como %XX) y el hub contesta que el campo 'node' no es texto UTF-8: ese camino no se toca, así que la
+    revisión de Python del tamaño del registro se salta (la de C++ la hace con los mismos bytes)."""
+    try:
+        text.encode()
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def check_registration_fits(kind: str, who: str, where: str, node: str, type_name: str, schema_text: str,
+                            names: tuple[str, ...] | None) -> None:
+    """La línea de registro de un Publisher (`kind` "pub") o un Subscriber ("sub") de topic debe caber en un
+    datagrama (wire.MAX_DATAGRAM): si no, el registro nunca sale y el usuario solo vería "no hay un agmen hub". Se
+    revisa al crear, antes de abrir nada, con o sin names; ValueError que dice cuánto mide, cuánto ocupa cada parte
+    grande (ya escrita como va en la línea) y qué hacer según cuál es la mayor. El mismo texto que
+    registration_fits_or_throw de src/pubsub.cpp. Un nombre de nodo con bytes que no son UTF-8: el error de
+    hp.quote (dice qué hacer)."""
+    names_field = hp.format_joint_names(names) if names is not None else None
+    if kind == "pub":
+        fields = dict(id="0" * 16, node=node, pid=os.getpid(), topic=where, schema="0" * 16, type=type_name,
+                      text=schema_text)
+    else:
+        fields = dict(id="0" * 16, node=node, pid=os.getpid(), topic=where, schema="0" * 16, type=type_name,
+                      port=_WORST_PORT, tcp=_WORST_PORT)
+    if names_field is not None:
+        fields["names"] = names_field
+    if kind != "pub":
+        fields["net"] = 1
+    size = len(hp.encode(kind, **fields))
+    if size <= wire.MAX_DATAGRAM:
+        return
+    # (nombre de la parte, bytes, qué hacer); en este orden gana la primera si dos miden lo mismo.
+    parts = [("el nombre del nodo", len(hp.quote(node, "node")),
+              "usa un nombre de nodo más corto (AGMEN_NODE, o el name de su [[node]] en robot.toml)")]
+    if kind == "pub":
+        parts.append((f"el esquema de {type_name}", len(hp.quote(schema_text, "text")),
+                      f"usa un tipo más chico que {type_name}"))
+    if names_field is not None:
+        parts.append(("names", len(hp.quote(names_field, "names")), "usa nombres de articulaciones más cortos"))
+    big = max(parts, key=lambda x: x[1])
+    shown = "; ".join(f"{name}, {n} bytes" for name, n, _ in parts)
+    raise ValueError(f"{who} en '{where}': el registro en el hub mide {size} bytes y en un datagrama caben "
+                     f"{wire.MAX_DATAGRAM} (lo que más ocupa, escrito como va en la línea: {shown}). Lo más largo es "
+                     f"{big[0]}: {big[2]}")
 
 
 def _preload_numpy(msg_type) -> None:
@@ -347,19 +406,14 @@ class _PurePublisher(_NetSend):
         el hub (si no, el del proceso). `names`: los nombres de las articulaciones en
         el orden de los arreglos (RFC 0013 §3.4): el hub la compara con robot.toml."""
         _backend.notice_pure_once()
-        self.names = None
-        if names is not None:   # antes de abrir nada (RFC 0013 D6): una lista que no sirve no deja sockets abiertos
-            if hp.is_topic(to):
-                hp.check_topic(to)
-            self.names = joint_names_for(msg_type, to, names, "Publisher")
-            # Con la lista, el registro (que lleva también el texto del esquema) debe seguir cabiendo en un datagrama.
-            size = len(hp.encode("pub", id="0" * 16, node=node or node_name(), pid=os.getpid(), topic=to,
-                                 schema="0" * 16, type=msg_type.NAME, text=msg_type.SCHEMA_TEXT,
-                                 names=hp.format_joint_names(self.names)))
-            if size > wire.MAX_DATAGRAM:
-                raise ValueError(f"Publisher en '{to}': con names, el registro en el hub mide {size} bytes y en un "
-                                 f"datagrama caben {wire.MAX_DATAGRAM} (el esquema de {msg_type.NAME} es muy largo): "
-                                 f"usa nombres más cortos o un tipo más chico")
+        # Antes de abrir nada: una lista que no sirve, o un registro que no cabe en un datagrama, no deja sockets
+        # abiertos (RFC 0013 D6).
+        if hp.is_topic(to):
+            hp.check_topic(to)
+        self.names = joint_names_for(msg_type, to, names, "Publisher") if names is not None else None
+        if hp.is_topic(to):
+            check_registration_fits("pub", "Publisher", to, node or node_name(), msg_type.NAME, msg_type.SCHEMA_TEXT,
+                                    self.names)
         self.type = msg_type
         self.to = to
         # Antes de cualquier hilo: el hub, la conexión TCP y los bloques de memoria
@@ -631,6 +685,9 @@ class _Receiver:
         self._sockets_closed = False
         self._close_warned = False
         by_topic = hp.is_topic(where) or where == "*"
+        if by_topic:   # antes de abrir nada: un registro que no cabe en un datagrama no sale nunca
+            hp.check_topic(where, allow_wildcard=True)
+            check_registration_fits("sub", self._NOMBRE, where, node or node_name(), type_name, "", names)
         # Modo red (RFC 0011 §2): solo por topic, y solo cuando el hub lo dice (un `ok` con peers).
         self._net_ip = _net_ip() if by_topic else None   # antes de abrir nada: si no sirve, error claro
         self._net = False                       # ya escucha en la red
@@ -1416,14 +1473,9 @@ class _NativePublisher:
         # Revisada aquí igual que en Python puro (los mismos TypeError/ValueError), antes de abrir nada; C++ la
         # vuelve a revisar con los mismos textos.
         self.names = joint_names_for(msg_type, to, names, "Publisher")
-        if self.names is not None:
-            size = len(hp.encode("pub", id="0" * 16, node=node_name(), pid=os.getpid(), topic=to,
-                                 schema="0" * 16, type=msg_type.NAME, text=msg_type.SCHEMA_TEXT,
-                                 names=hp.format_joint_names(self.names)))
-            if size > wire.MAX_DATAGRAM:
-                raise ValueError(f"Publisher en '{to}': con names, el registro en el hub mide {size} bytes y en un "
-                                 f"datagrama caben {wire.MAX_DATAGRAM} (el esquema de {msg_type.NAME} es muy largo): "
-                                 f"usa nombres más cortos o un tipo más chico")
+        if hp.is_topic(to) and _utf8(node_name()):   # (C++ lo vuelve a revisar con el mismo texto; ver _utf8)
+            check_registration_fits("pub", "Publisher", to, node_name(), msg_type.NAME, msg_type.SCHEMA_TEXT,
+                                    self.names)
         label = "" if hp.is_topic(to) else (topic if topic is not None else "/" + msg_type.NAME)
         layout = msg_type.LAYOUT
         self.arrow = layout.encoding == wire.ENC_ARROW
@@ -1523,6 +1575,8 @@ class _NativeSubscriber:
             hp.check_topic(where)
         # Revisada aquí igual que en Python puro (los mismos TypeError/ValueError), antes de abrir nada.
         self.names = joint_names_for(msg_type, where, names, "Subscriber")
+        if hp.is_topic(where) and _utf8(node_name()):   # (C++ lo vuelve a revisar con el mismo texto; ver _utf8)
+            check_registration_fits("sub", "Subscriber", where, node_name(), msg_type.NAME, "", self.names)
         self.topic = where if hp.is_topic(where) else ""
         layout = msg_type.LAYOUT
         self._core = _backend.core.Subscriber(where, msg_type.NAME, msg_type.SCHEMA_TEXT, msg_type.SCHEMA_ID,

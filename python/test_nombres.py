@@ -250,6 +250,43 @@ class TestNamesAlCrear(unittest.TestCase):
                         self.assertIn(f"{nombre} en '/patas/estado'", str(ctx.exception))
                         self.assertNotIn("\x1b", str(ctx.exception))
 
+    def test_names_sin_orden_no_vale_y_con_orden_si(self):
+        """Un set, un frozenset o un dict no tienen un orden que sirva, y el orden es justo lo que se compara:
+        TypeError claro, con los dos núcleos y en Node.on. Lista, tupla y otras secuencias con orden siguen valiendo."""
+        class Secuencia:   # una secuencia con orden que no es lista ni tupla
+            def __iter__(self):
+                return iter(["a", "b"])
+
+        T2 = JointState[2]
+        for nucleo, Pub, Sub in self.clases():
+            for nombre, cls in (("Publisher", Pub), ("Subscriber", Sub)):
+                for names in ({"a", "b"}, frozenset({"a", "b"}), {"a": 1, "b": 2}, {"a": 1, "b": 2}.keys()):
+                    with self.subTest(nucleo=nucleo, cls=nombre, names=type(names).__name__):
+                        with self.assertRaises(TypeError) as ctx:
+                            cls(T2, "/patas/estado", names=names)
+                        texto = str(ctx.exception)
+                        self.assertIn(f"{nombre} en '/patas/estado': names debe ser una lista o una tupla, en el "
+                                      f"orden de los arreglos: un {type(names).__name__} no tiene orden fijo y el "
+                                      f"orden es justo lo que el hub compara", texto)
+                with self.subTest(nucleo=nucleo, cls=nombre, names="str"):
+                    with self.assertRaises(TypeError):
+                        cls(T2, "/patas/estado", names="ab")
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    for names in (["a", "b"], ("a", "b"), Secuencia(), iter(["a", "b"])):
+                        with self.subTest(nucleo=nucleo, cls=nombre, ok=type(names).__name__):
+                            o = cls(T2, "/patas/estado", names=names)
+                            self.assertEqual(o.names, ("a", "b"))
+                            o.close()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            node = agmen.Node("n_set")
+        self.addCleanup(node.close)
+        with self.assertRaisesRegex(TypeError, "un set no tiene orden fijo"):
+            node.on(T2, "/patas/estado", lambda s: None, names={"a", "b"})
+        with self.assertRaisesRegex(TypeError, "un set no tiene orden fijo"):
+            node.publisher(T2, "/patas/cmd", names={"a", "b"})
+
     def test_el_numero_del_tipo(self):
         for nucleo, Pub, Sub in self.clases():
             for cls in (Pub, Sub):
@@ -853,10 +890,10 @@ def udp(addr: str, data: bytes, espera: float = 0.6, sock=None) -> list[tuple[st
     """Manda un datagrama a mano al hub y junta las respuestas que lleguen en `espera` s."""
     host, port = addr.rsplit(":", 1)
     s = sock or socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(espera)
-    s.sendto(data, (host, int(port)))
     out = []
-    try:
+    try:   # (el sendto también: si no sale, el socket se cierra igual)
+        s.settimeout(espera)
+        s.sendto(data, (host, int(port)))
         while True:
             got, _ = s.recvfrom(65536)
             out.extend(hp.parse(got))
@@ -2254,6 +2291,112 @@ print("DATAGRAMA" if grande else "NADA: " + err.getvalue().strip().replace("\n",
         for cls in ("Publisher", "Subscriber"):
             with self.subTest(cls=cls):
                 self.assertTrue(self.corre(cls, "nodo_normal").startswith("DATAGRAMA"))
+
+
+class TestRegistroQueNoCabe(unittest.TestCase):
+    """Con o sin names, el registro de un Publisher o un Subscriber de topic debe caber en un datagrama (65507): si
+    no, error claro al crear, con el mismo texto en los dos núcleos (y en C++: tests/test_nombres.cpp)."""
+
+    FIX_NODO = ("Lo más largo es el nombre del nodo: usa un nombre de nodo más corto (AGMEN_NODE, o el name de su "
+                "[[node]] en robot.toml)")
+
+    def setUp(self):
+        self.falso = FalsoHub(self)
+        patch = mock.patch.dict(os.environ, {"AGMEN_NODE": "n" * 70000})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    @staticmethod
+    def esperado(cls_name: str, tipo, names=None) -> str:
+        """El texto, armado aquí a mano (el mismo que arma C++)."""
+        nodo = "n" * 70000
+        if cls_name == "Publisher":
+            linea = hp.encode("pub", id="0" * 16, node=nodo, pid=os.getpid(), topic="/x", schema="0" * 16,
+                              type=tipo.NAME, text=tipo.SCHEMA_TEXT, **({"names": ",".join(names)} if names else {}))
+            partes = f"el nombre del nodo, 70000 bytes; el esquema de {tipo.NAME}, {len(hp.quote(tipo.SCHEMA_TEXT))} bytes"
+        else:
+            linea = hp.encode("sub", id="0" * 16, node=nodo, pid=os.getpid(), topic="/x", schema="0" * 16,
+                              type=tipo.NAME, port=65535, tcp=65535, **({"names": ",".join(names)} if names else {}),
+                              net=1)
+            partes = "el nombre del nodo, 70000 bytes"
+        if names:
+            partes += f"; names, {len(','.join(names))} bytes"
+        return (f"{cls_name} en '/x': el registro en el hub mide {len(linea)} bytes y en un datagrama caben 65507 (lo "
+                f"que más ocupa, escrito como va en la línea: {partes}). " + TestRegistroQueNoCabe.FIX_NODO)
+
+    def clases(self):
+        out = [("puro", pubsub._PurePublisher, pubsub._PureSubscriber)]
+        if _backend.NATIVE:
+            out.append(("nativo", pubsub._NativePublisher, pubsub._NativeSubscriber))
+        return out
+
+    def test_sin_names_con_nombre_de_nodo_enorme_error_claro_en_los_dos_nucleos(self):
+        T2 = JointCommand[2]
+        for nucleo, Pub, Sub in self.clases():
+            for nombre, cls in (("Publisher", Pub), ("Subscriber", Sub)):
+                for names in (None, ["a", "b"]):
+                    with self.subTest(nucleo=nucleo, cls=nombre, names=names):
+                        with self.assertRaises(ValueError) as ctx:
+                            cls(T2, "/x", names=names)
+                        self.assertEqual(str(ctx.exception), self.esperado(nombre, T2, names))
+        # Ningún registro salió (se revisa antes de abrir nada).
+        self.falso.sock.settimeout(0.3)
+        with self.assertRaises((socket.timeout, TimeoutError)):
+            self.falso.sock.recvfrom(65536)
+
+    def test_el_culpable_mas_grande_dice_que_hacer(self):
+        class Grande(wire.Message):
+            SCHEMA = "Grande{" + ";".join(f"f32 campo_{i:05d}" for i in range(2900)) + "}"
+
+        with mock.patch.dict(os.environ, {"AGMEN_NODE": "nodo"}):
+            with self.assertRaises(ValueError) as ctx:
+                pubsub._PurePublisher(Grande, "/x", names=[f"n{i}" for i in range(1500)])
+            self.assertTrue(str(ctx.exception).endswith("Lo más largo es el esquema de Grande: usa un tipo más chico "
+                                                        "que Grande"), str(ctx.exception))
+            self.assertIn("el nombre del nodo, 4 bytes; el esquema de Grande, ", str(ctx.exception))
+        largos = [f"{'j' * 60}{i:04d}" for i in range(125)]   # 125 nombres de 64 caracteres: 8124 bytes
+        with mock.patch.dict(os.environ, {"AGMEN_NODE": "n" * 58000}):
+            with self.assertRaises(ValueError) as ctx:
+                pubsub._PureSubscriber(JointCommand[125], "/x", names=largos)
+            self.assertIn("names, 8124 bytes", str(ctx.exception))
+            self.assertTrue(str(ctx.exception).endswith(self.FIX_NODO))
+
+    @unittest.skipUnless(_backend.NATIVE, "solo con el núcleo de C++")
+    def test_el_mismo_texto_que_cpp(self):
+        """El núcleo de C++ (sin la revisión de Python delante) da el mismo texto, como HubRejected."""
+        T2 = JointCommand[2]
+        core = _backend.core
+        for names in (None, ["a", "b"]):
+            with self.subTest(names=names):
+                with self.assertRaises(wire.HubRejected) as ctx:
+                    core.Publisher("/x", T2.NAME, T2.SCHEMA_TEXT, T2.SCHEMA_ID, T2.LAYOUT.size or 0, False, "", names)
+                self.assertEqual(str(ctx.exception), self.esperado("Publisher", T2, names))
+                with self.assertRaises(wire.HubRejected) as ctx:
+                    core.Subscriber("/x", T2.NAME, T2.SCHEMA_TEXT, T2.SCHEMA_ID, T2.LAYOUT.size or 0, False, names)
+                self.assertEqual(str(ctx.exception), self.esperado("Subscriber", T2, names))
+
+    def test_quien_cabe_registra_la_linea_de_siempre(self):
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"AGMEN_NODE": "n" * 60000}), contextlib.redirect_stderr(err):
+            p = pubsub._PurePublisher(JointCommand[2], "/x")
+            self.addCleanup(p.close)
+            self.assertEqual(self.falso.registro("pub"),
+                             hp.encode("pub", id=f"{p.source_id:016x}", node="n" * 60000, pid=os.getpid(), topic="/x",
+                                       schema=f"{JointCommand[2].SCHEMA_ID:016x}", type="JointCommand",
+                                       text=JointCommand[2].SCHEMA_TEXT))
+
+
+@unittest.skipUnless(_backend.NATIVE, "solo con el núcleo de C++")
+class TestHubRejectedDelNucleo(_HubPlano):
+    def test_el_rechazo_del_hub_con_el_nucleo_es_exactamente_wire_hub_rejected(self):
+        """core.set_errors recibe HubRejected como argumento (no lo busca en sys.modules mientras agmen.wire se
+        importa): el rechazo del hub con el núcleo compilado es exactamente agmen.wire.HubRejected."""
+        bien = self.abrir(agmen.Publisher, JointCommand[2], "/r/cmd")
+        bien.publish(JointCommand[2]())
+        otro = self.abrir(pubsub._NativePublisher, JointState[2], "/r/cmd")
+        e = self.rechazado(lambda: otro.publish(JointState[2]()))
+        self.assertIs(type(e), wire.HubRejected)
+        self.assertIs(type(e), agmen.wire.HubRejected)
 
 
 if __name__ == "__main__":

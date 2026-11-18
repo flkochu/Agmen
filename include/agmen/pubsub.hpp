@@ -84,6 +84,13 @@ struct TypeInfo {
 /// Opciones de un Publisher o un Subscriber por topic.
 ///
 ///   agmen::Publisher<agmen::msgs::JointCommand<2>> pub("/patas/cmd", {.names = {"cadera", "rodilla"}});
+///
+/// Se escribe con el designador `{.names = {...}}`: `Publisher<M>(to, {})` y `Publisher<M>(to, {{"uno"}})`,
+/// sin designador, son ambiguos (también podrían ser la etiqueta `topic`) y no compilan.
+///
+/// A diferencia de Python, una lista vacía quiere decir "no declaro lista" (en Python, `names=[]` es un
+/// error y "sin lista" es no pasar `names`). Para exigir la lista en un topic no se usa esto: se pone
+/// `require_names = true` en su `[[joints]]` de robot.toml, y el hub avisa de quien publica sin declararla.
 struct TopicOptions {
     /// Los nombres de las articulaciones, en el orden de los arreglos (RFC 0013 §3.4, D6 = d): quien
     /// trae su propia lista (una política, el puente de un simulador) se la declara al hub, que la

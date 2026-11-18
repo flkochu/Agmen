@@ -42,8 +42,10 @@ from . import hubproto as hp
 from .pubsub import (
     Publisher,
     _preload_numpy,
+    _utf8,
     Sample,
     Subscriber,
+    check_registration_fits,
     joint_names_for,
     _heredar,
     hub_address,
@@ -658,6 +660,8 @@ class _NativeNode:
             if hp.is_topic(where):
                 hp.check_topic(where)
             checked = joint_names_for(msg_type, where, names, "Node.on")   # revisada igual que en Python puro
+            if hp.is_topic(where) and _utf8(node_name()):   # el registro cabe (como Subscriber; C++ lo repite)
+                check_registration_fits("sub", "Subscriber", where, node_name(), msg_type.NAME, "", checked)
             decode, envelope = msg_type.decode_payload, wire.Envelope
 
             def deliver(env, payload, sender):

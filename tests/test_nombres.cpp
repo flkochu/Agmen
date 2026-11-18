@@ -25,6 +25,12 @@
 #include <thread>
 #include <vector>
 
+// El 65507 de un datagrama está en tres lugares de C++ (hubproto.hpp, joints.hpp y src/net.cpp, que no se
+// incluyen entre sí): los dos que se ven desde aquí no pueden divergir sin que esto deje de compilar.
+static_assert(agmen::hub::kMaxDatagram == agmen::msgs::joints_detail::kMaxPayload + agmen::wire::kEnvelopeLen,
+              "hub::kMaxDatagram (hubproto.hpp) y joints_detail::kMaxPayload + el sobre (joints.hpp) deben ser el "
+              "mismo datagrama: 65507");
+
 namespace {
 
 int g_failures = 0;
@@ -305,13 +311,75 @@ void test_registro_que_no_cabe_en_un_datagrama() {
     const auto e = wire_error([&] { agmen::PublisherCore p("/grande", grande, "", agmen::TopicOptions{nombres}); });
     CHECK(e.has_value());
     if (e) {
-        CHECK(e->rfind("Publisher en '/grande': con names, el registro en el hub mide 6", 0) == 0);
-        CHECK(e->find(" bytes y en un datagrama caben 65507 (el esquema de Grande es muy largo): usa nombres más "
-                      "cortos o un tipo más chico") != std::string::npos);
+        CHECK(e->rfind("Publisher en '/grande': el registro en el hub mide 6", 0) == 0);
+        const auto names_bytes = hub::quote(hub::format_joint_names(nombres)).size();
+        CHECK(e->find(" bytes y en un datagrama caben 65507 (lo que más ocupa, escrito como va en la línea: el nombre "
+                      "del nodo, 14 bytes; el esquema de Grande, " +
+                      std::to_string(hub::quote(text).size()) + " bytes; names, " + std::to_string(names_bytes) +
+                      " bytes). Lo más largo es el esquema de Grande: usa un tipo más chico que Grande") !=
+              std::string::npos);
+        CHECK(e->find("muy largo") == std::string::npos);
     }
     CHECK(!h.any("pub", 50ms));
     agmen::PublisherCore corto("/grande", grande, "", agmen::TopicOptions{{"a"}});   // con una lista corta, sí cabe
     CHECK_EQ(field(h.next("pub"), "names"), "a");
+}
+
+/// Con o sin names, el registro de un Publisher o un Subscriber de topic debe caber en un datagrama: con un
+/// nombre de nodo enorme no se crea (antes, el Subscriber se creaba, su registro nunca salía y el usuario veía
+/// "no hay un agmen hub", que es falso). El texto es el mismo que el de Python (python/test_nombres.py lo compara).
+void test_registro_que_no_cabe_por_el_nombre_del_nodo() {
+    using Cmd = m::JointCommand<2>;
+    FakeHub h;
+    const std::string enorme(70000, 'n');
+    set_env("AGMEN_NODE", enorme.c_str());
+    const std::string fix = "Lo más largo es el nombre del nodo: usa un nombre de nodo más corto (AGMEN_NODE, o el "
+                            "name de su [[node]] en robot.toml)";
+    const auto esquema = std::to_string(hub::quote(wire::schema_text<Cmd>()).size());
+    {
+        const auto e = wire_error([&] { agmen::Publisher<Cmd> p("/x"); });
+        CHECK(e.has_value());
+        if (e) {
+            CHECK(e->rfind("Publisher en '/x': el registro en el hub mide 7", 0) == 0);
+            CHECK(e->find(" bytes y en un datagrama caben 65507 (lo que más ocupa, escrito como va en la línea: el "
+                          "nombre del nodo, 70000 bytes; el esquema de JointCommand, " +
+                          esquema + " bytes). " + fix) != std::string::npos);
+        }
+    }
+    {
+        const auto e = wire_error([&] { agmen::Subscriber<Cmd> s("/x"); });
+        CHECK(e.has_value());
+        if (e) {
+            CHECK(e->rfind("Subscriber en '/x': el registro en el hub mide 7", 0) == 0);
+            CHECK(e->find(" bytes y en un datagrama caben 65507 (lo que más ocupa, escrito como va en la línea: el "
+                          "nombre del nodo, 70000 bytes). " + fix) != std::string::npos);
+        }
+    }
+    {
+        const auto e = wire_error([&] { agmen::Subscriber<Cmd> s("/x", {.names = {"a", "b"}}); });
+        CHECK(e.has_value());
+        if (e) {
+            CHECK(e->find("(lo que más ocupa, escrito como va en la línea: el nombre del nodo, 70000 bytes; names, 3 "
+                          "bytes). " + fix) != std::string::npos);
+        }
+    }
+    {   // Node::subscribe (el mismo SubscriberCore)
+        agmen::Node node("enorme");
+        const auto e = wire_error([&] { node.subscribe<Cmd>("/x", [](const Cmd&) {}); });
+        CHECK(e.has_value());
+    }
+    CHECK(!h.any("pub", 50ms));
+    CHECK(!h.any("sub", 50ms));
+    // Con dirección fija no hay registro: no se revisa.
+    { agmen::Subscriber<Cmd> s("127.0.0.1:0"); }
+    // Un nombre de nodo largo que sí cabe: la línea de siempre, byte a byte.
+    const std::string largo(60000 - 200, 'n');
+    set_env("AGMEN_NODE", largo.c_str());
+    {
+        agmen::Publisher<Cmd> p("/x");
+        CHECK_EQ(h.next("pub"), pub_de_siempre<Cmd>(p.source_id(), "/x"));
+    }
+    set_env("AGMEN_NODE", "prueba-nombres");
 }
 
 /// El siguiente latido de `p` (heartbeat() late cada segundo) termina en `tail`.
@@ -764,6 +832,7 @@ int main() {
     test_listas_que_no_valen();
     test_numero_del_tipo_y_direccion();
     test_registro_que_no_cabe_en_un_datagrama();
+    test_registro_que_no_cabe_por_el_nombre_del_nodo();
     test_la_linea_sin_names_es_la_de_siempre_y_con_names_la_de_python();
     test_el_rechazo_del_hub_llega_entero();
     test_node_con_names();

@@ -212,6 +212,9 @@ UdpSocket UdpSocket::bind(std::string_view address) {
     // too long" (RFC 0008 §1.2). Se pide lo que cabe en un datagrama en todos los
     // sistemas: así un mensaje compact de 64 KB sale igual en Windows, Linux y macOS.
     {
+        // El mismo 65507 que hub::kMaxDatagram (include/agmen/hubproto.hpp) y que joints_detail::kMaxPayload
+        // más el sobre (include/agmen/joints.hpp); aquí no se incluyen para no acoplar cabeceras (esos dos los
+        // compara un static_assert en tests/test_nombres.cpp).
         const int want = 65507;
         int have = 0;
         socklen_t len = sizeof have;

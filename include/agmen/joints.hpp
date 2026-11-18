@@ -46,6 +46,9 @@ namespace joints_detail {
 
 /// Lo que cabe en el payload de un mensaje compact: un datagrama UDP (IPv4,
 /// 65507 bytes) menos el sobre de 64 (el mismo límite que pone `agmen gen`).
+/// El mismo 65507 está en include/agmen/hubproto.hpp (hub::kMaxDatagram) y en src/net.cpp
+/// (SO_SNDBUF); tests/test_nombres.cpp tiene un static_assert que no compila si este y el de
+/// hubproto.hpp dejan de coincidir.
 inline constexpr std::size_t kMaxPayload = 65507 - wire::kEnvelopeLen;
 /// JointState mide 12·N bytes y JointCommand 20·N: el N más grande que cabe.
 inline constexpr std::size_t kMaxStateJoints = kMaxPayload / 12;

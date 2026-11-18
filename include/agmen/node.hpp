@@ -52,7 +52,9 @@ struct SubscribeOptions {
     std::size_t queue = 1;
     Group group{};
     /// Los nombres de las articulaciones, en el orden de los arreglos (RFC 0013 §3.4): como
-    /// TopicOptions::names. Vacía = no declara lista.
+    /// TopicOptions::names. Vacía = no declara lista (en Python, `names=[]` es un error; para exigir
+    /// la lista en un topic, `require_names = true` en su `[[joints]]` de robot.toml). Se escribe con
+    /// el designador: node.subscribe<M>("/patas/estado", fn, {.names = {"cadera", "rodilla"}}).
     std::vector<std::string> names{};
 };
 

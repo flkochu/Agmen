@@ -88,8 +88,24 @@ class ProtocolError(ValueError):
     pass
 
 
-def quote(value: str) -> str:
-    return "".join(chr(b) if b in _SAFE else f"%{b:02X}" for b in value.encode())
+def quote(value: str, key: str = "") -> str:
+    """'a b' → 'a%20b': el valor de un campo como va en la línea. Un texto con bytes que no son UTF-8 (Python los
+    guarda como '\\udcXX', ej. una variable de entorno en otra codificación) no se puede escribir: ProtocolError
+    que dice cuál campo y qué hacer (nunca el UnicodeEncodeError en inglés). `key` es el nombre del campo."""
+    try:
+        raw = value.encode()
+    except UnicodeEncodeError as e:
+        raise ProtocolError(not_utf8_text(key, e.start)) from None
+    return "".join(chr(b) if b in _SAFE else f"%{b:02X}" for b in raw)
+
+
+def not_utf8_text(key: str, pos: int) -> str:
+    """El error de un valor con bytes que no son UTF-8 (ver quote)."""
+    what = "el nombre del nodo" if key == "node" else (f"el campo '{_show_key(key)}'" if key else "un valor")
+    fix = ("pon en AGMEN_NODE (o en el nombre que le das al nodo) un nombre escrito en UTF-8, ej. solo letras, "
+           "dígitos y _" if key == "node" else "escribe ese valor en UTF-8")
+    return (f"{what} trae bytes que no son UTF-8 (desde el carácter {pos}) y no se puede mandar al hub: suele pasar "
+            f"con una variable de entorno o un archivo en otra codificación. Arreglo: {fix}")
 
 
 def _show_key(key: str) -> str:
@@ -128,7 +144,7 @@ def unquote(value: str, key: str = "") -> str:
 
 
 def line(op: str, **fields) -> str:
-    parts = [PREFIX, op] + [f"{k}={quote(str(v))}" for k, v in fields.items()]
+    parts = [PREFIX, op] + [f"{k}={quote(str(v), k)}" for k, v in fields.items()]
     return " ".join(parts)
 
 

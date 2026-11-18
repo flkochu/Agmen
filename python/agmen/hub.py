@@ -553,7 +553,8 @@ class Hub:
     # --- mensajes ---
     def handle(self, data: bytes, addr: tuple[str, int], now: float) -> None:
         """Un datagrama, línea por línea: una que no se puede leer o que hace fallar al hub no tira las demás (el
-        puente manda muchas por datagrama), y a quien la mandó se le contesta `error` con su id."""
+        puente manda muchas por datagrama). A la que no se puede leer (o que se rechaza) se le contesta `error` con
+        su id; un fallo interno del hub (un error de Agmen) no se le contesta al nodo: queda en el log del hub."""
         try:
             lines = hp.split_lines(data)
         except hp.ProtocolError as e:
@@ -840,26 +841,28 @@ class Hub:
                 raise hp.ProtocolError("solo va solo con machine=<computadora> (una entrada de otra computadora, la "
                                        "registra el puente): un endpoint de esta computadora no lo lleva")
             return ""
-        node = f.get("node", "?")
+        # Los nombres los manda el nodo (o el puente): en los textos van acotados y sin lo que no se ve (Hub._who).
+        who = self._who(f.get("node", "?"), machine)
+        m = _cut(_clean(machine), NODE_SHOWN)
         if f.get("net"):
             raise hp.ProtocolError("net=1 es de un Subscriber de esta computadora; uno de otra computadora no lo lleva")
         if kind == "pub" and f.get("addr"):
-            raise hp.ProtocolError(f"un Publisher de otra computadora ('{node}' en '{machine}') no lleva addr: "
+            raise hp.ProtocolError(f"un Publisher de otra computadora ({who}) no lleva addr: "
                                    f"a él le dice a quién mandar el hub de su computadora")
         if not self.net_mode:
-            raise hp.ProtocolError(f"'{node}' es de la computadora '{machine}' pero este hub está en modo local "
+            raise hp.ProtocolError(f"{who} es de otra computadora pero este hub está en modo local "
                                    f"(nadie mandó 'red'): primero enciende el modo red con peers")
         ip = self._peer_ip(machine)
         if ip is None:
             names = ", ".join(n for n, _ in self.peers)
-            raise hp.ProtocolError(f"'{node}' es de la computadora '{machine}', que no está en peers ({names}): "
+            raise hp.ProtocolError(f"{who}: '{m}' no está en peers ({names}): "
                                    f"revisa [[machine]] en robot.toml")
         if kind == "sub":
             if "addr" not in f:
-                raise hp.ProtocolError(f"falta addr=ip:puerto: dónde recibe '{node}' en '{machine}'")
+                raise hp.ProtocolError(f"falta addr=ip:puerto: dónde recibe {who}")
             got = hp.parse_hostport(f["addr"])[0]
             if got != ip:
-                raise hp.ProtocolError(f"'{node}' dice recibir en {got}, pero '{machine}' es {ip} en peers: "
+                raise hp.ProtocolError(f"{who} dice recibir en {got}, pero '{m}' es {ip} en peers: "
                                        f"los datos solo van a la IP de cada computadora")
         return machine
 

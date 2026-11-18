@@ -420,5 +420,5 @@ def envelope_dict(env: Envelope) -> dict:
 _NATIVE_PARSE = None
 if _schema._backend.NATIVE:
     # Lo que lanza el núcleo de C++ llega como estos mismos errores de Python.
-    _schema._backend.core.set_errors(_schema.SchemaError, WireError)
+    _schema._backend.core.set_errors(_schema.SchemaError, WireError, HubRejected)
     _NATIVE_PARSE = _schema._backend.core.parse

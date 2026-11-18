@@ -67,18 +67,80 @@ std::string pub_line(const std::string& id, const std::string& topic, const Type
     return hub::line("pub", fields);
 }
 
-/// names de un Publisher, revisada, y que el registro con la lista quepa en un datagrama (el texto del
-/// esquema también va en él). Antes de abrir nada.
+/// El puerto más largo que puede tener un Subscriber en su registro: el tamaño se mide antes de abrir nada, con el
+/// peor caso (port y tcp de 5 dígitos, y net=1, que se añade si el hub pasa a modo red), igual que
+/// check_registration_fits de python/agmen/pubsub.py.
+constexpr const char* kWorstPort = "65535";
+
+/// La línea de registro de un Publisher (`kind` "pub") o un Subscriber ("sub") de topic debe caber en un
+/// datagrama (hub::kMaxDatagram): si no, el registro nunca sale y el usuario solo vería "no hay un agmen hub". Se
+/// revisa al crear, antes de abrir nada, con o sin names. El error dice cuánto mide, cuánto ocupa cada parte grande
+/// (ya escrita como va en la línea) y qué hacer según cuál es la mayor: el mismo texto que
+/// check_registration_fits de python/agmen/pubsub.py.
+void registration_fits_or_throw(const std::string& kind, const std::string& who, const std::string& where,
+                                const TypeInfo& type, const std::string& names) {
+    const std::string node = hub::node_name();
+    std::vector<std::pair<std::string, std::string>> fields{{"id", std::string(16, '0')},
+                                                           {"node", node},
+                                                           {"pid", hub::process_id()},
+                                                           {"topic", where},
+                                                           {"schema", std::string(16, '0')},
+                                                           {"type", type.name}};
+    const bool pub = kind == "pub";
+    if (pub) {
+        fields.emplace_back("text", type.schema_text);
+    } else {
+        fields.emplace_back("port", kWorstPort);
+        fields.emplace_back("tcp", kWorstPort);
+    }
+    if (!names.empty()) fields.emplace_back("names", names);
+    if (!pub) fields.emplace_back("net", "1");
+    const auto size = hub::line(kind, fields).size();
+    if (size <= hub::kMaxDatagram) return;
+    struct Part {
+        std::string name;
+        std::size_t bytes;
+        std::string fix;
+    };
+    // En este orden gana la primera si dos miden lo mismo.
+    std::vector<Part> parts{{"el nombre del nodo", hub::quote(node).size(),
+                             "usa un nombre de nodo más corto (AGMEN_NODE, o el name de su [[node]] en robot.toml)"}};
+    if (pub) {
+        parts.push_back({"el esquema de " + type.name, hub::quote(type.schema_text).size(),
+                         "usa un tipo más chico que " + type.name});
+    }
+    if (!names.empty()) parts.push_back({"names", hub::quote(names).size(), "usa nombres de articulaciones más cortos"});
+    const Part* big = &parts.front();
+    std::string shown;
+    for (const auto& p : parts) {
+        if (p.bytes > big->bytes) big = &p;
+        if (!shown.empty()) shown += "; ";
+        shown += p.name + ", " + std::to_string(p.bytes) + " bytes";
+    }
+    throw wire::WireError(wire::WireError::Kind::HubRejected,
+                          who + " en '" + where + "': el registro en el hub mide " + std::to_string(size) +
+                              " bytes y en un datagrama caben " + std::to_string(hub::kMaxDatagram) +
+                              " (lo que más ocupa, escrito como va en la línea: " + shown + "). Lo más largo es " +
+                              big->name + ": " + big->fix);
+}
+
+/// names de un Publisher, revisada, y que su registro (con o sin lista; el texto del esquema también va en él)
+/// quepa en un datagrama. Antes de abrir nada.
 std::string pub_names_field(const std::string& to, const TypeInfo& type, const TopicOptions& options) {
     auto names = joint_names_field(to, type, options.names, "Publisher");
-    if (names.empty()) return names;
-    const auto size = pub_line(std::string(16, '0'), to, type, names).size();
-    if (size > hub::kMaxDatagram) {
-        throw wire::WireError(wire::WireError::Kind::HubRejected,
-                              "Publisher en '" + to + "': con names, el registro en el hub mide " +
-                                  std::to_string(size) + " bytes y en un datagrama caben " +
-                                  std::to_string(hub::kMaxDatagram) + " (el esquema de " + type.name +
-                                  " es muy largo): usa nombres más cortos o un tipo más chico");
+    if (hub::is_topic(to)) {
+        check_topic_or_throw(to);
+        registration_fits_or_throw("pub", "Publisher", to, type, names);
+    }
+    return names;
+}
+
+/// Lo mismo para un Subscriber.
+std::string sub_names_field(const std::string& where, const TypeInfo& type, const TopicOptions& options) {
+    auto names = joint_names_field(where, type, options.names, "Subscriber");
+    if (hub::is_topic(where)) {
+        check_topic_or_throw(where);
+        registration_fits_or_throw("sub", "Subscriber", where, type, names);
     }
     return names;
 }
@@ -1928,7 +1990,7 @@ struct SubscriberCore::State {
 
 SubscriberCore::SubscriberCore(const std::string& where, const TypeInfo& type, const TopicOptions& options)
     // La lista se revisa antes de abrir nada: si no sirve, no queda ningún socket abierto.
-    : s_(std::make_unique<State>(where, type, joint_names_field(where, type, options.names, "Subscriber"))) {}
+    : s_(std::make_unique<State>(where, type, sub_names_field(where, type, options))) {}
 SubscriberCore::SubscriberCore(SubscriberCore&&) noexcept = default;
 SubscriberCore& SubscriberCore::operator=(SubscriberCore&&) noexcept = default;
 SubscriberCore::~SubscriberCore() = default;

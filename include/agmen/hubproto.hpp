@@ -77,8 +77,10 @@ void check_topic(std::string_view topic);
 inline constexpr std::size_t kJointNameMax = 64;
 /// Caracteres del campo entero (los nombres separados por comas). El mismo que JOINT_NAMES_MAX.
 inline constexpr std::size_t kJointNamesMax = 8192;
-/// Lo que cabe en un datagrama UDP (IPv4): el registro con la lista no puede pasar de aquí
-/// (MAX_DATAGRAM de python/agmen/wire.py).
+/// Lo que cabe en un datagrama UDP (IPv4): el registro (con o sin lista) no puede pasar de aquí
+/// (MAX_DATAGRAM de python/agmen/wire.py). El mismo 65507 está en include/agmen/joints.hpp
+/// (joints_detail::kMaxPayload, más el sobre) y en src/net.cpp (SO_SNDBUF); tests/test_nombres.cpp tiene un
+/// static_assert que no compila si este y el de joints.hpp dejan de coincidir.
 inline constexpr std::size_t kMaxDatagram = 65507;
 
 /// Por qué un nombre de articulación no vale, en palabras ("tiene un espacio"); "" si vale.

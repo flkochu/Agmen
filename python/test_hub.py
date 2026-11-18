@@ -5,6 +5,7 @@
 
 import dataclasses
 import os
+import select
 import socket
 import threading
 import time
@@ -1061,12 +1062,26 @@ def _boom(*_args, **_kwargs):
     raise RuntimeError("falla de prueba")
 
 
-_BOOM_LINE = _boom.__code__.co_firstlineno + 1     # la línea del raise: la que debe decir el log
+_BOOM_LINE = _boom.__code__.co_firstlineno + 1     # la línea del raise (si en el traceback no hay frames de agmen)
+
+
+def _hub_line(code: str) -> str:
+    """'hub.py:<línea>' de la línea de agmen/hub.py que contiene `code`: con un mock que falla, el último frame de
+    agmen (el que dice el log, ver H._unexpected_key) es el que llama a lo que se cambió por el mock."""
+    with open(H.__file__, encoding="utf-8") as fh:
+        lineas = [k for k, x in enumerate(fh, 1) if code in x]
+    assert len(lineas) == 1, (code, lineas)
+    return f"hub.py:{lineas[0]}"
+
+
+_REGISTER_AT = _hub_line("self._register(op, f, addr, now, repeated)")
+_HANDLE_AT = _hub_line("self.handle(data, addr, now)")
 
 
 class TestLineaPorLinea(unittest.TestCase):
-    """El hub lee cada línea de un datagrama por su cuenta: la que no se puede leer o lo hace fallar recibe su
-    `error` (con su id) y las demás se atienden. Con el Hub en memoria y `now` a mano."""
+    """El hub lee cada línea de un datagrama por su cuenta: la que no se puede leer recibe su `error` (con su id), la
+    que lo hace fallar por dentro queda en el log (al nodo no se le contesta) y las demás se atienden. Con el Hub en
+    memoria y `now` a mano."""
 
     SCHEMA = "00000000000000aa"
 
@@ -1141,35 +1156,93 @@ class TestLineaPorLinea(unittest.TestCase):
         self.assertEqual(ok[2][1], {"id": "q", "msg": "operación desconocida 'nada'"})
 
     # (c)
-    def test_error_inesperado_contesta_y_se_dice_acotado(self):
+    def test_error_inesperado_no_contesta_y_se_dice_acotado(self):
+        """Un fallo interno del hub (un error de Agmen) NO se le contesta al nodo: `error` quiere decir "registro
+        rechazado" y el nodo se detendría con HubRejected. Queda en el log del hub y el resto del datagrama se
+        atiende."""
         with unittest.mock.patch.object(self.hub, "_register", side_effect=_boom):
             got = self.manda(self.linea("h") + b"\nagmen-hub/1 ping")
-        self.assertEqual([op for op, _ in got], ["error", "pong"])     # el resto del datagrama se atiende
-        f = got[0][1]
-        self.assertEqual(f["id"], "h")
-        self.assertEqual(f["msg"], f"el hub falló al atender esta línea (RuntimeError en test_hub.py:{_BOOM_LINE}): "
-                                   f"es un error de Agmen, no de lo que mandaste, y no quedó atendida. Vuelve a "
-                                   f"intentarlo; si se repite, avísale a quien mantiene Agmen con lo que dice el log "
-                                   f"del hub")
+        self.assertEqual([op for op, _ in got], ["pong"])              # nada para "h"; el resto se atiende
         dicho, = self.logs
         self.assertEqual(dicho, f"⚠ un mensaje desde 127.0.0.1:50000 me hizo fallar (RuntimeError: falla de prueba) "
-                                f"en test_hub.py:{_BOOM_LINE}: lo ignoro y sigo atendiendo. Es un error de Agmen: "
+                                f"en {_REGISTER_AT}: lo ignoro y sigo atendiendo. Es un error de Agmen: "
                                 f"avísale a quien lo mantiene con esta línea (si se repite, cada 60 s digo cuántas "
                                 f"veces más)")
         with unittest.mock.patch.object(self.hub, "_register", side_effect=_boom):
             for now in (1.0, 2.0):
-                self.assertEqual(self.manda(self.linea("h"), now=now)[0][0], "error")   # siempre contesta
+                self.assertEqual(self.manda(self.linea("h"), now=now), [])   # nunca le contesta al nodo
             self.assertEqual(len(self.logs), 1)                       # la segunda vez no repite la línea
             self.hub._unexpected_flush(59.0)
             self.assertEqual(len(self.logs), 1)
             self.hub._unexpected_flush(H.UNEXPECTED_REPEAT_S)          # pasado el tiempo, cuántas más
-            self.assertEqual(self.logs[1], f"⚠ el error inesperado RuntimeError en test_hub.py:{_BOOM_LINE} pasó 2 "
+            self.assertEqual(self.logs[1], f"⚠ el error inesperado RuntimeError en {_REGISTER_AT} pasó 2 "
                                            f"veces más en los últimos 60 s (el hub sigue atendiendo; el detalle, en "
                                            f"la primera línea de este error)")
             self.hub._unexpected_flush(500.0)
             self.assertEqual(len(self.logs), 2)                        # sin nuevas, nada
-            self.manda(self.linea("h"), now=600.0)                     # una más, mucho después: se dice
+            self.assertEqual(self.manda(self.linea("h"), now=600.0), [])   # una más, mucho después: se dice
             self.assertIn("pasó 1 vez más en los últimos 540 s", self.logs[2])
+        self.assertEqual(self.manda(self.linea("h"), now=601.0)[0][0], "subs")   # ya sin la falla: lo de siempre
+
+    def test_error_inesperado_en_varias_lineas_no_tira_las_demas(self):
+        reales = self.hub._register
+
+        def falla_solo_b(kind, f, *args, **kwargs):
+            if f.get("id") == "b":
+                _boom()
+            return reales(kind, f, *args, **kwargs)
+
+        with unittest.mock.patch.object(self.hub, "_register", side_effect=falla_solo_b):
+            got = self.manda(b"\n".join([self.linea("a"), self.linea("b"), self.linea("c")]))
+        self.assertEqual([(op, f["id"]) for op, f in got], [("subs", "a"), ("subs", "c")])
+        self.assertEqual(set(self.hub.endpoints), {"a", "c"})
+        self.assertEqual(len([x for x in self.logs if "me hizo fallar" in x]), 1)
+
+    def test_un_nodo_real_sigue_publicando_tras_un_fallo_interno_del_hub(self):
+        """Un Publisher de Python puro contra un hub de verdad cuyo registro falla por dentro (mock): no recibe
+        `error`, así que no se detiene con HubRejected; cuando el hub se recupera, sus datos llegan."""
+        from agmen import pubsub
+        fixture = HubFixture()
+        self.addCleanup(fixture.close)
+        with unittest.mock.patch.object(fixture.hub, "_register", side_effect=_boom):
+            pub = pubsub._PurePublisher(Cmd, "/interno", node="bueno")
+            self.addCleanup(pub.close)
+            fin = time.monotonic() + 1.5 * hp.BEAT_S          # al menos un latido más, con el hub fallando
+            while time.monotonic() < fin:
+                pub.publish(Cmd(1.0, 2.0))                    # no lanza HubRejected
+                time.sleep(0.02)
+        self.assertTrue(any("me hizo fallar (RuntimeError: falla de prueba)" in x for x in fixture.logs),
+                        fixture.logs)
+        sub = pubsub._PureSubscriber(Cmd, "/interno")
+        self.addCleanup(sub.close)
+        got = None
+        fin = time.monotonic() + 5
+        while got is None and time.monotonic() < fin:
+            pub.publish(Cmd(1.0, 2.0))
+            got = sub.receive(0.05)
+        self.assertIsNotNone(got, fixture.logs)
+        self.assertEqual(got.message, Cmd(1.0, 2.0))
+
+    def test_la_clave_del_error_inesperado_es_el_ultimo_frame_de_agmen(self):
+        """Si el error salta dentro de la biblioteca estándar (re, socket), la clave dice dónde estaba Agmen."""
+        import re as re_mod
+        import traceback
+        from agmen import tables as T
+        try:
+            T._hub_error_key(b"x")   # re.match con un patrón de texto sobre bytes: TypeError dentro de re/__init__.py
+        except TypeError as e:
+            error = e
+        frames = traceback.extract_tb(error.__traceback__)
+        self.assertEqual(os.path.dirname(frames[-1].filename), os.path.dirname(re_mod.__file__))   # (el último: re)
+        kind, where = H._unexpected_key(error)
+        linea = next(fr.lineno for fr in reversed(frames) if fr.filename == T.__file__)
+        self.assertEqual((kind, where), ("TypeError", f"tables.py:{linea}"))
+        # Ningún frame de agmen: el último (aquí, el de esta prueba).
+        try:
+            _boom()
+        except RuntimeError as e:
+            self.assertEqual(H._unexpected_key(e), ("RuntimeError", f"test_hub.py:{_BOOM_LINE}"))
+        self.assertEqual(H._unexpected_key(RuntimeError("sin traceback")), ("RuntimeError", "?"))
 
     def test_errores_inesperados_con_tope_de_claves_y_sin_silencio(self):
         for i in range(H.UNEXPECTED_MAX + 5):
@@ -1197,7 +1270,7 @@ class TestLineaPorLinea(unittest.TestCase):
                 time.sleep(0.01)
             stop.set()
             hilo.join(2)
-        self.assertIn(f"me hizo fallar (RuntimeError: falla de prueba) en test_hub.py:{_BOOM_LINE}", self.logs[0])
+        self.assertIn(f"me hizo fallar (RuntimeError: falla de prueba) en {_HANDLE_AT}", self.logs[0])
 
     # (d)
     def test_forget_olvida_el_aviso_solo_local(self):
@@ -1241,6 +1314,33 @@ class TestLineaPorLinea(unittest.TestCase):
         dicho, = [x for x in self.logs if "solo en esta computadora" in x]
         self.assertEqual(dicho, f"⚠ {visto} escucha /cmd solo en esta computadora: no recibirá de robot. ¿Corre con "
                                 f"un Agmen anterior? Actualízalo")
+
+
+    def test_errores_de_modo_red_con_nombre_raro_quedan_acotados(self):
+        """Los textos de _check_machine_fields (modo local, peers, addr) nombran al nodo y a la computadora con
+        Hub._who: sin controles y acotados, aunque el nombre mida 60 000 caracteres."""
+        raro = "\x1b[2J" + "x" * 59996                    # 60 000 caracteres, con un control
+        visto = "'?[2J" + "x" * 59 + "…'"
+        maquina = "robot\x1b]0;" + "m" * 59994
+        base = dict(id="r1", node=raro, pid=7, topic="/cmd", schema=self.SCHEMA, type="Cmd")
+        casos = [("sub", dict(machine="robot", addr=f"{ROBOT}:7600"), False, "es de otra computadora pero este hub "
+                                                                             "está en modo local"),
+                 ("sub", dict(machine=maquina, addr=f"{ROBOT}:7600"), True, "no está en peers (robot)"),
+                 ("pub", dict(machine="robot", addr=f"{ROBOT}:1"), True, "no lleva addr"),
+                 ("sub", dict(machine="robot"), True, "falta addr=ip:puerto: dónde recibe"),
+                 ("sub", dict(machine="robot", addr=f"{LAPTOP}:7600"), True, "pero 'robot' es 192.168.1.20")]
+        for kind, extra, red, frag in casos:
+            with self.subTest(kind=kind, extra=str(extra)[:30]):
+                self.manda(hp.encode("red", peers=f"robot@{ROBOT}" if red else ""))
+                (op, f), = self.manda(hp.encode(kind, **base, **extra))
+                self.assertEqual((op, f["id"]), ("error", "r1"))
+                self.assertIn(frag, f["msg"])
+                self.assertIn(visto, f["msg"])
+                self.assertTrue(f["msg"].isprintable(), repr(f["msg"][:200]))
+                self.assertNotIn("x" * 60, f["msg"])
+                self.assertNotIn("m" * 60, f["msg"])
+                self.assertLess(len(f["msg"]), 400)
+        self.assertEqual(self.hub.endpoints, {})
 
 
 # --- Ataques del tester a la lectura línea por línea ------------------------------------------------------------------
@@ -1570,7 +1670,8 @@ class TestErroresDelHubEnElPuente(unittest.TestCase):
         """Manda un `error` del "hub" al puente y devuelve lo que dijo el puente por él."""
         before = len(self.said)
         self.tx.sendto(hp.encode("error", id=eid, msg=msg), self.rx.getsockname())
-        time.sleep(0.02)          # (localhost: llega enseguida)
+        ready, _, _ = select.select([self.rx], [], [], 5.0)   # espera (con tope) a que el datagrama esté
+        self.assertTrue(ready, "el `error` no llegó al socket del puente en 5 s")
         self.bridge._drain()
         return self.said[before:]
 
@@ -1588,9 +1689,23 @@ class TestErroresDelHubEnElPuente(unittest.TestCase):
         self.assertEqual(len(self.error("robot.a", uno)), 1)
         self.assertEqual(len(self.error("robot.a", otro)), 1)        # mismo topic e id, otro motivo: se dice
         self.assertEqual(self.error("robot.a", uno), [])              # el mismo otra vez (cada latido): no
-        self.assertEqual(len(self.error("robot.b", uno)), 1)          # otro endpoint: se dice
+        self.assertEqual(self.error("robot.b", uno), [])              # el mismo motivo con otro id: no se repite
         self.assertEqual(self.error("robot.b", uno.replace("1 de 2", "7 de 9")), [])   # solo cambian números
         self.assertEqual(len(self.error("robot.a", f"'/otro': 'nodo' publica sin declarar su lista")), 1)
+
+    def test_un_nodo_que_vuelve_con_ids_nuevos_no_llena_las_claves(self):
+        """Un nodo de otra computadora que se cae y vuelve en bucle (id nuevo cada vez) con el mismo rechazo: 5000
+        ids ocupan UNA clave, se dice una vez, y el puente sigue diciendo los avisos nuevos de lo demás."""
+        msg = f"'{self.TOPIC}': 'nodo' publica sin declarar su lista de nombres y robot.toml la exige"
+        self.assertEqual(len(self.error("robot.n0", msg)), 1)
+        for i in range(1, 5000):
+            self.tx.sendto(hp.encode("error", id=f"robot.n{i}", msg=msg), self.rx.getsockname())
+            if i % 100 == 0:
+                self.bridge._drain()
+        self.bridge._drain()
+        self.assertEqual(len(self.said), 1)
+        self.assertEqual(len([k for k in self.bridge._said if k and k[0] == "hub"]), 1)
+        self.assertEqual(len(self.error("robot.z", "'/otro': otro motivo")), 1)   # lo nuevo se sigue diciendo
 
     # --- ataques del tester ---
     def test_10000_errores_distintos_del_hub_no_hacen_crecer_la_memoria_ni_el_ruido(self):
