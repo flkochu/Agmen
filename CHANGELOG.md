@@ -21,6 +21,29 @@ pide el RFC y todavía no está); la salida de `[[mux]]` en el `command` de un
 los nodos (hoy los revisa y los muestra, pero no llegan a ningún nodo).
 
 ### Agregado
+- **El `[[mux]]` hereda la lista de `[[joints]]`** (RFC 0013 D6 = d). Si la salida del
+  mux es el `command` de un `[[joints]]`, el mux declara su lista al hub en la salida y
+  en cada entrada que es un topic. Cadenas de mux también heredan. `agmen run` lo dice al
+  arrancar. Quien publica en una entrada (la política, el teleop) declara la misma lista
+  con `names=[...]`. Con `require_names`, también se exige en esas entradas.
+- **`agmen mux --names a,b,c`** para quien corre el mux a mano: la lista de `[[joints]]`
+  en orden. Va con una salida que es un topic. Lo revisa igual que un `Publisher`.
+- **El panel web y `agmen run --play` declaran la lista solos** cuando su topic la lleva.
+  `[web.teleop]` (que manda `MotorCommand`) hacia un topic con lista es un error al
+  cargar `robot.toml`.
+- **Errores nuevos de `robot.toml`**: una entrada de `[[mux]]` que es el `state` de un
+  grupo con `require_names`; dos listas distintas que llegan al mismo topic por herencia;
+  una entrada por dirección (`listen`) cuando el grupo tiene `require_names`. Cada error
+  dice qué topic es, de qué grupo viene la lista y qué hacer.
+- **Aviso de un hub anterior**: si el hub que ya corre en esta computadora, o el de otra
+  computadora (también el que reusa el agente), es anterior a 0.15.0, `agmen run` avisa
+  que ese hub no revisa los nombres y qué hacer. El aviso sale desde la versión 0.15.0;
+  con 0.14.0 no sale.
+- **`RawPublisher(topic, names=...)` y `RawSubscriber(where, names=...)`** en Python, para
+  herramientas como el mux.
+- **`tutorial_check` vigila el capítulo 19**: los bloques marcados con
+  `<!-- tutorial_check: … -->` se comparan con la salida real de `agmen run`, de
+  `agmen topic` y de los errores de `names=`.
 - **Mensajes estándar chicos** (RFC 0013 §3.2 y §3.3) en `agmen/msgs.agmen`, con
   su código de C++ (`agmen::msgs`) y de Python (`agmen.msgs`): `Vector2`,
   `Vector3`, `Quaternion`, `Pose`, `Transform`, `Twist`, `Odometry`, `Vector3f`,
@@ -141,6 +164,11 @@ los nodos (hoy los revisa y los muestra, pero no llegan a ningún nodo).
   origen.
 
 ### Corregido
+- **El mux ya no calla cuando el hub rechaza su salida.** Antes, el rechazo del hub a la
+  salida (por ejemplo, con una lista distinta a la de `robot.toml`) no pasaba por el aviso
+  del mux: no decía qué hacer y no se contaba como descartado. Ahora el mux avisa una vez
+  por segundo como mucho, dice qué rechazó el hub y qué hacer (pasar `--names` con la
+  lista en ese orden), y cuenta los comandos descartados.
 - **El lector de `.agmen` falla antes, no después**: los valores de arriba
   pasaban el lector y tronaban después, al compilar el C++ o al cargar en Python.
   Ahora el error dice el archivo, la línea, la columna y qué hacer.

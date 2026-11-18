@@ -57,6 +57,12 @@ El archivo **`VERSION`** de la raíz manda. De él salen:
 1. Termina el nivel y asegúrate de que el CI esté en verde.
 2. Cambia el número en `VERSION`, en `python/agmen/_version.py` y en la línea
    **Versión actual** del `README.md`.
+   - **Al publicar 0.15.0** se activa el aviso de hub anterior (RFC 0013, D6 = d): un hub
+     de versión menor que `hubproto.NAMES_SINCE` no compara los nombres de `[[joints]]`, y
+     `agmen run` lo avisa. Comprueba que `NAMES_SINCE` en `python/agmen/hubproto.py` sea
+     igual a la versión que publicas (hoy es `"0.15.0"`). Si cambiara, cambia también el
+     texto de `docs/PROTOCOLO.md` (sección de compatibilidad de `names`) y el de la sección 9
+     del capítulo 19.
 3. En `CHANGELOG.md`, renombra `[Sin publicar]` a `[X.Y.Z] — AAAA-MM-DD` y
    abre una sección `[Sin publicar]` nueva arriba.
 4. Verifica: `python scripts/check_version.py`

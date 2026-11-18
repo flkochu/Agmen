@@ -382,8 +382,20 @@ El hub revisa `names` cada vez que llega un registro, y responde así:
 **Compatibilidad**
 
 - Un **hub anterior** (0.14.0) ignora `names`: entonces **no compara**. Por eso `agmen run`
-  debería avisar cuando el hub de otra computadora es anterior. **Ese aviso todavía no
-  está hecho.**
+  avisa cuando el hub que ya corre en esta computadora, o el de otra computadora, es
+  anterior a `hubproto.NAMES_SINCE` (`"0.15.0"`). Cómo se compara:
+  - La versión la dice el propio hub. El hub local responde `pong version=…` al `ping`.
+    La de otra computadora es la versión de Agmen de su agente, en el saludo.
+  - Cuenta como **anterior** cualquier versión menor que `0.15.0`. Una versión con sufijo
+    (`0.15.0-dev`) es anterior a `0.15.0`, como en semver. Lo que no se entiende (`?`, vacío,
+    un texto) también cuenta como anterior.
+  - **El aviso solo sale si la versión de `agmen run` es 0.15.0 o posterior.** Un `agmen run`
+    de 0.14.0 no puede distinguir un hub viejo de uno nuevo, y calla. Por eso el aviso
+    empieza a salir con la versión 0.15.0.
+  - El aviso solo se da a los robots con `[[joints]]`.
+- Un **mux** que escribe en un topic de `[[joints]]` declara la lista en su salida y en sus
+  entradas que son topics (`agmen mux --names`). Eso no cambia ningún byte: es el mismo
+  campo `names` de la línea `pub` y de la `sub`.
 - Un **nodo anterior** no manda `names`: entra como un endpoint sin lista. El hub nuevo
   solo lo avisa, salvo que el topic tenga `require_names = true`.
 - Los campos nuevos solo se **añaden**. El número de versión del protocolo no cambia: sigue

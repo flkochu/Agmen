@@ -507,6 +507,173 @@ agmen     │ ⚠ ya hay otro robot en esta máquina, 'patas' (su agmen hub est�
 
 Antes de probar tu robot, cierra los demás.
 
+**Y si el hub de otra computadora es anterior a 0.15.0.** Un hub de 0.14.0 no revisa
+`names`: acepta cualquier orden sin decir nada. Desde la versión 0.15.0, `agmen run` lo
+avisa cuando el hub que ya corre en esta computadora, o el de otra computadora, es
+anterior a 0.15.0. El aviso dice así:
+
+```
+Agmen 0.14.0, anterior a 0.15.0: ese agmen hub no compara los nombres de las articulaciones (names=), así que ahí no se revisa que los nodos usen el orden de [[joints]] de robot.toml (…). Actualiza Agmen en esta computadora …
+```
+
+Hoy el proyecto es 0.14.0, así que el aviso todavía no sale. Empieza a salir con la
+versión 0.15.0.
+
+## 10. Con un `[[mux]]`: quién manda sobre las articulaciones
+
+Muchas veces el comando no sale de una sola fuente. Puede venir de una política, de un
+control con el teclado o de una pantalla. El `[[mux]]` del capítulo 6 elige cuál manda.
+Aquí la **salida** del mux es el `command` del grupo de articulaciones.
+
+La lista de nombres se escribe en un solo lugar. El mux **hereda** la lista de
+`[[joints]]`:
+
+- Quien publica en la salida del mux (el `command`) ya tiene la lista en `[[joints]]`.
+- Quien publica en una **entrada** del mux (la política, el teleop) declara la misma lista
+  con `names=`, igual que si publicara directo en el `command`.
+
+En este ejemplo la política ya no escribe en `/patas/cmd`. Escribe en `/cmd/politica`, y el
+mux lo pasa a `/patas/cmd`.
+
+`robot.toml`: es el de la sección 4, con un `[[mux]]` y otra entrada para la política.
+
+```toml
+[robot]
+name = "patas"
+
+[[node]]
+name = "simulador"
+cmd = "python simulador.py"
+
+[[node]]
+name = "politica"
+cmd = "python politica.py"
+
+# La política escribe en /cmd/politica. El mux pasa sus comandos a /patas/cmd.
+[[mux]]
+name = "mando"
+output = "/patas/cmd"
+hold_ms = 300
+
+[[mux.input]]
+name = "politica"
+topic = "/cmd/politica"
+priority = 1
+
+[[joints]]
+name = "patas"
+state = "/patas/estado"              # JointState[4]
+command = "/patas/cmd"               # JointCommand[4]
+kp = 20.0
+kd = 0.5
+names = ["FR_hip", "FR_thigh", "FR_calf", "FL_hip"]   # ESTE es el orden, en todos lados
+```
+
+`simulador.py` es el de la sección 4, sin cambios.
+
+`politica.py`: declara su lista en `/cmd/politica`, que es una entrada del mux.
+
+```python
+from agmen import Node
+from agmen.msgs import JointCommand
+
+# El mismo orden que robot.toml. El mux es quien lo lleva a /patas/cmd.
+NOMBRES = ["FR_hip", "FR_thigh", "FR_calf", "FL_hip"]
+
+Cmd = JointCommand[4]
+nodo = Node("politica")
+comando = nodo.publisher(Cmd, "/cmd/politica", names=NOMBRES)
+
+
+def paso():
+    comando.publish(Cmd(position=[0.0, 0.0, 0.0, 0.0], kp=[20.0] * 4, kd=[0.5] * 4))
+
+
+nodo.every(0.02, paso)   # 50 Hz
+nodo.spin()
+```
+
+Fíjate en `kp=[20.0] * 4` y `kd=[0.5] * 4`. Aquí la política manda números, no `nan`.
+La razón está en "Lo que todavía no está", más abajo.
+
+Corre el robot igual que antes:
+
+```bash
+agmen run robot.toml
+```
+
+Salida real. El orden de las líneas de cada nodo cambia de una corrida a otra, y los pid
+también:
+
+```
+agmen     │ Agmen 0.14.0 · robot 'patas' · 4 nodos · agmen hub en 127.0.0.1:7601
+agmen     │ articulaciones 'patas': 4 (FR_hip, FR_thigh, FR_calf, FL_hip) · estado /patas/estado · comando /patas/cmd · kp 20, kd 0.5 · la lista vale también en la entrada 'politica' del mux 'mando' (/cmd/politica)
+agmen     │ panel web: http://127.0.0.1:8601/
+agmen     │ Foxglove (solo ver): conéctate a ws://127.0.0.1:8601/ws
+hub       │ ▶ iniciado (pid 21674)
+mando     │ ▶ iniciado (pid 21676)
+simulador │ ▶ iniciado (pid 21678)
+politica  │ ▶ iniciado (pid 21680)
+agmen     │ todo arrancado. Ctrl+C para detener todo.
+hub       │ [hub] Agmen 0.14.0 · directorio de topics en 127.0.0.1:7601 · 3 topics con lista de articulaciones · los datos van directo entre nodos
+hub       │ [hub] ▶ 'simulador' publica /patas/estado (JointState)
+hub       │ [hub] ▶ 'mando' escucha /cmd/politica
+hub       │ [hub] ▶ 'mando' publica /mux/mando (MuxEstado)
+mando     │ [mux] entradas: politica=/cmd/politica (prioridad 1) → salida /patas/cmd · soltar el mando tras 300 ms
+mando     │ [mux] declaro al hub la lista de robot.toml (4 articulaciones: FR_hip, FR_thigh, FR_calf, FL_hip) en la salida y en las entradas que son topics
+mando     │ [mux] quién manda: en /mux/mando (agmen.msgs.MuxEstado)
+hub       │ [hub] ▶ 'panel' escucha todos los topics
+hub       │ [hub] ▶ 'politica' publica /cmd/politica (JointCommand)
+hub       │ [hub] ▶ 'mando' publica /patas/cmd (JointCommand)
+mando     │ [mux] manda 'politica' (prioridad 1)
+agmen     │ deteniendo todos los nodos…
+politica  │ ■ detenido
+hub       │ ■ detenido
+mando     │ [mux] resumen · politica: reenviados=371 descartados=0 errores=0 no_finitos=0 sin_tipo=0
+simulador │ ■ detenido
+mando     │ ■ detenido
+agmen     │ listo. ¡Hasta luego!
+```
+
+Dos líneas te dicen que la herencia funcionó. `la lista vale también en la entrada
+'politica' del mux 'mando'` sale al arrancar. `[mux] declaro al hub la lista` dice que el
+mux la mandó al hub, en su salida y en su entrada.
+
+Un mux puede escribir en la entrada de otro mux. La lista sigue igual en toda la cadena.
+
+### ¿Qué pasa si…?
+
+Estos textos salieron de correr el robot de arriba, cambiando una cosa a la vez. Las
+líneas largas están cortadas con `…`.
+
+| Qué pasa | Qué se ve | Qué hacer |
+|---|---|---|
+| La política declara el orden cambiado (`FL_hip` primero) | `politica │ agmen.wire.HubRejected: el hub rechazó publicar en '/cmd/politica': … 'politica' declara FL_hip, FR_hip… y robot.toml dice FR_hip, FR_thigh…`. La política se detiene con `✖ falló` | Pon `names=` en el orden de `[[joints]]` |
+| La política no pone `names=` | `hub │ [hub] ⚠ 'politica' publica en '/cmd/politica', un topic de [[joints]], sin declarar su lista de nombres…` | Pasa `names=NOMBRES` |
+| La política manda `kp` en `nan` | `mando │ [agmen] ⚠ mux '/patas/cmd': descarté un comando de 'politica' con un valor no finito (kp[0]=nan). Revisa ese nodo.`. El resumen cuenta `no_finitos` | Manda `kp` y `kd` con números |
+| Un `agmen mux` a mano declara el orden cambiado (`FL_hip` primero) y el hub rechaza su salida | `[mux] ⚠ 'ia': el hub rechazó publicar en '/patas/cmd': … 'agmen mux' declara FL_hip, FR_hip… Mientras el hub rechace la salida, nada llega a '/patas/cmd': pasa --names con la lista de [[joints]] de robot.toml…`. Sale como máximo una vez por segundo, con el total de descartados | Pasa `--names` con la lista de `[[joints]]`, en ese orden, o usa `agmen run`, que la pone sola |
+| `agmen mux --names` con una salida que es una dirección | `[mux] error: --names va con una salida que es un topic …` (sale con código 2) | Usa un topic en `--out` |
+| `agmen mux --names FR_hip,FR hip` | `[mux] error: --names FR_hip,FR hip: names[1] = 'FR hip' no es un nombre de articulación válido (tiene un espacio)…` | Quita el espacio |
+| Una entrada del mux escucha el `state` del grupo | Error al cargar `robot.toml`: `… escucha '/patas/estado', que es el state del [[joints]] 'patas' (JointState) … el mux reenvía comandos, no estados…` | Usa otro topic, ej. `/cmd/politica` |
+| Dos grupos con distinta lista llegan al mismo topic por el mux | Error al cargar: `'/cmd/ia' llevaría dos listas de nombres distintas…` | Usa otro topic en una de las dos entradas |
+| Una entrada del mux es una dirección (`listen`) y el grupo tiene `require_names = true` | Error al cargar: `… escucha en una dirección (…), sin hub…` | Usa `topic = "/…"` en esa entrada |
+| `[web.teleop]` manda a una entrada del mux que lleva la lista | Error al cargar: `'/cmd/politica' es la entrada 'politica' del [[mux]] 'mando' … pero [web.teleop] manda MotorCommand a ese topic…` | Manda el teleop a otro topic |
+
+El panel web (`[[web.command]]`) y `agmen run --play` declaran la lista solos cuando su
+topic la lleva. No hace falta que escribas nada.
+
+### Con un mux a mano, sin `agmen run`
+
+Si corres el mux tú, pasa la lista con `--names`, en el orden de `[[joints]]`:
+
+```bash
+agmen mux --out /patas/cmd --in politica=/cmd/politica@1 --names FR_hip,FR_thigh,FR_calf,FL_hip
+```
+
+Para tus propias herramientas hay dos llamadas parecidas. `RawPublisher(topic, names=[...])`
+y `RawSubscriber(where, names=[...])` declaran la lista igual que el mux. Son para
+herramientas como el mux. Un nodo normal usa `Publisher` o `Subscriber`.
+
 ## Lo que todavía no está
 
 Este capítulo muestra lo que ya funciona. Estas cosas **todavía no**:
@@ -514,10 +681,12 @@ Este capítulo muestra lo que ya funciona. Estas cosas **todavía no**:
 - **`kp` y `kd` no llegan a los nodos.** `agmen run` los revisa y los muestra en la línea
   de arranque, pero hoy no se los pasa a ningún nodo. Un `nan` en `kp` o `kd` llega tal
   cual a quien recibe el comando, y ese nodo tiene que tener sus propias ganancias.
-- **El aviso de un hub anterior.** Si el hub de otra computadora es de una versión
-  anterior, no compara los nombres, y `agmen run` todavía no te lo dice.
-- **`[[mux]]` con `[[joints]]`.** Cómo se combina la salida de un mux con el `command` de
-  un grupo está por decidir. No lo uses todavía.
+- **El mux descarta cualquier comando con un `nan`, también en `kp`, `kd` o `position`.**
+  Eso choca con la regla de `nan` de este capítulo ("no lo medí" o "no lo mando"). Por el
+  mux, una política que deja `kp` en `nan` no manda nada, y el mux avisa. Por ahora, manda
+  números en los campos que pasan por el mux (sección 10).
+- **El aviso de un hub anterior** ya está escrito, pero solo sale desde la versión 0.15.0
+  (sección 9).
 
 ## Lo que aprendiste
 
@@ -530,6 +699,8 @@ Este capítulo muestra lo que ya funciona. Estas cosas **todavía no**:
   qué posición cambian. Si no declaras lista, hay un aviso, y `require_names = true`
   lo vuelve obligatorio.
 - `agmen topic info` te muestra la lista que declaró cada nodo.
+- Con un `[[mux]]`, la lista se escribe una vez en `[[joints]]`. El mux la hereda, y
+  quien publica en sus entradas la declara con `names=`.
 
 **Siguiente:** los marcos de referencia (el bloque 3 del plan del RFC 0013). Todavía no
 están en Agmen.
