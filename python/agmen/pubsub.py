@@ -194,14 +194,17 @@ class _HubLink:
             print(foreign_control_text(topic, who, f"{self.hub[0]}:{self.hub[1]}"), file=sys.stderr, flush=True)
 
     def _loop(self) -> None:
-        while not self._stop.wait(hp.BEAT_S):
-            self.beat()
-            if self._on_tick is not None:
-                time.sleep(0.05)          # que llegue la respuesta a este latido
-                try:
-                    self._on_tick()       # un Publisher lee aquí sus respuestas aunque no publique
-                except OSError:
-                    pass
+        # Espera hasta `_next_beat` y late solo si ya toca (la regla de maybe_beat): si publish()/receive() ya
+        # latieron en este periodo, no se manda otro. Un latido por periodo, como el núcleo de C++.
+        while not self._stop.wait(max(0.0, self._next_beat - time.monotonic())):
+            if time.monotonic() >= self._next_beat:
+                self.beat()
+                if self._on_tick is not None:
+                    time.sleep(0.05)          # que llegue la respuesta a este latido
+                    try:
+                        self._on_tick()       # un Publisher lee aquí sus respuestas aunque no publique
+                    except OSError:
+                        pass
             if self.last_reply is None and not self._warned and time.monotonic() - self.started > 2.0:
                 self._warned = True
                 self._on_warn(f"no hay un agmen hub en esta máquina ({hub_address()}): corre tu robot con "
