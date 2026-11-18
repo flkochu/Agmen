@@ -1995,6 +1995,213 @@ class TestNombresSinDuplicar(unittest.TestCase):
                                              "máximo es 8192: usa nombres más cortos o reparte las articulaciones "
                                              "en varios grupos (un topic por grupo)")
 
+# --- ataques del tester: el rechazo sigue siendo un WireError, mezclas C++/Python y fugas ---------------------------
+
+class _HubPlano(unittest.TestCase):
+    """Un `agmen hub` de verdad, sin --names ni --require-names (cada topic aprende la lista del primero)."""
+
+    def setUp(self):
+        self.err = io.StringIO()
+        ctx = contextlib.redirect_stderr(self.err)
+        ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+        self.hub = HubProceso(self)
+
+    def abrir(self, cls, *args, **kw):
+        o = cls(*args, **kw)
+        self.addCleanup(o.close)
+        return o
+
+    def rechazado(self, publicar, excepcion=wire.WireError):
+        """Hasta que el nodo ve el rechazo (atrapado como `excepcion`): su texto y la excepción."""
+        got: list[BaseException] = []
+
+        def paso():
+            try:
+                publicar()
+            except excepcion as e:
+                got.append(e)
+            time.sleep(0.02)
+
+        until(lambda: bool(got), every=paso)
+        self.assertTrue(got, self.hub.text())
+        return got[0]
+
+
+class TestRechazoSigueSiendoWireError(_HubPlano):
+    """Quien atrapaba WireError sigue atrapando el rechazo del hub (por tipo y por nombres), con el núcleo que
+    haya; y es HubRejected (más fino)."""
+
+    def test_rechazo_por_tipo_y_por_nombres_son_wire_error_y_hub_rejected(self):
+        bien = self.abrir(agmen.Publisher, JointCommand[2], "/r/cmd", names=["a", "b"])
+        bien.publish(JointCommand[2]())
+        # Por tipo.
+        otro_tipo = self.abrir(agmen.Publisher, JointState[2], "/r/cmd")
+        e_tipo = self.rechazado(lambda: otro_tipo.publish(JointState[2]()))
+        # Por nombres (publicar y escuchar).
+        mal = self.abrir(agmen.Publisher, JointCommand[2], "/r/cmd", names=["b", "a"])
+        e_pub = self.rechazado(lambda: mal.publish(JointCommand[2]()))
+        sub_mal = self.abrir(agmen.Subscriber, JointCommand[2], "/r/cmd", names=["b", "a"])
+        e_sub = self.rechazado(lambda: sub_mal.receive(0.05))
+        for e in (e_tipo, e_pub, e_sub):
+            self.assertIsInstance(e, wire.HubRejected)
+            self.assertIsInstance(e, wire.WireError)
+        self.assertIn("ya es de tipo", str(e_tipo))
+        self.assertRegex(str(e_pub), r"declara b, a y '[^']+', que ya está en el topic, declara a, b \(cambian desde la "
+                                     r"articulación 1 de 2\)")
+        self.assertTrue(str(e_pub).startswith("el hub rechazó publicar en '/r/cmd': "), str(e_pub))
+        self.assertTrue(str(e_sub).startswith("el hub rechazó escuchar '/r/cmd': "), str(e_sub))
+
+    def test_el_mismo_texto_con_el_nucleo_y_con_python_puro(self):
+        bien = self.abrir(agmen.Publisher, JointCommand[2], "/r/cmd", names=["a", "b"])
+        bien.publish(JointCommand[2]())
+        nodo = pubsub.node_name()
+        a = self.abrir(agmen.Publisher, JointState[2], "/r/cmd")
+        b = self.abrir(pubsub._PurePublisher, JointState[2], "/r/cmd", node=nodo)
+        ea = self.rechazado(lambda: a.publish(JointState[2]()))
+        eb = self.rechazado(lambda: b.publish(JointState[2]()))
+        self.assertEqual(str(ea), str(eb))
+        c = self.abrir(agmen.Publisher, JointCommand[2], "/r/cmd", names=["b", "a"])
+        d = self.abrir(pubsub._PurePublisher, JointCommand[2], "/r/cmd", names=["b", "a"], node=nodo)
+        ec = self.rechazado(lambda: c.publish(JointCommand[2]()))
+        ed = self.rechazado(lambda: d.publish(JointCommand[2]()))
+        self.assertEqual(str(ec), str(ed))
+        self.assertEqual(type(ec), type(ed))
+
+    def test_el_rechazo_largo_llega_entero_con_los_dos_nucleos(self):
+        # Los dos con nombres de 64 caracteres: el texto del hub mide más de 1000 caracteres y no se corta.
+        largos = ["j" * 63 + str(i % 10) if i < 10 else "k" * 62 + f"{i:02d}" for i in range(12)]
+        bien = self.abrir(pubsub._PurePublisher, CMD12, "/r/larga", names=largos, node="primero")
+        bien.publish(CMD12())
+        otro = largos[::-1]
+        a = self.abrir(agmen.Publisher, CMD12, "/r/larga", names=otro)
+        b = self.abrir(pubsub._PurePublisher, CMD12, "/r/larga", names=otro, node=pubsub.node_name())
+        ea = str(self.rechazado(lambda: a.publish(CMD12())))
+        eb = str(self.rechazado(lambda: b.publish(CMD12())))
+        self.assertEqual(ea, eb)
+        self.assertGreater(len(ea), 150)
+        self.assertNotIn("…" * 3, ea)
+
+
+@unittest.skipUnless(_backend.NATIVE, "solo con el núcleo de C++")
+class TestNucleoCppMezclasConHubPlano(_HubPlano):
+    def test_cpp_publica_con_lista_y_python_puro_se_suscribe_con_la_misma_y_con_otra(self):
+        T = JointState[3]
+        lista = ["hombro", "codo", "mano.1"]
+        pub = self.abrir(agmen.Publisher, T, "/m/estado", names=lista)
+        sub = self.abrir(pubsub._PureSubscriber, T, "/m/estado", names=lista)
+        self.assertTrue(until(lambda: sub.receive(0.05) is not None, every=lambda: pub.publish(T())), self.hub.text())
+        otra = self.abrir(pubsub._PureSubscriber, T, "/m/estado", names=["codo", "hombro", "mano.1"])
+        e = self.rechazado(lambda: otra.receive(0.05), wire.HubRejected)
+        self.assertRegex(str(e).replace("…", ""), r"declara codo, hombro y '[^']+', que ya está en el topic, "
+                                                    r"declara hombro, codo")
+        # El que declaró bien sigue recibiendo.
+        self.assertTrue(until(lambda: sub.receive(0.05) is not None, every=lambda: pub.publish(T())))
+
+    def test_python_puro_publica_y_cpp_se_suscribe(self):
+        T = JointState[3]
+        lista = ["hombro", "codo", "mano.1"]
+        pub = self.abrir(pubsub._PurePublisher, T, "/m/estado2", names=lista, node="puro")
+        sub = self.abrir(agmen.Subscriber, T, "/m/estado2", names=lista)
+        self.assertTrue(until(lambda: sub.receive(0.05) is not None, every=lambda: pub.publish(T())), self.hub.text())
+
+    def test_sub_nativo_sin_lista_entra_junto_a_los_que_la_traen(self):
+        T = JointState[3]
+        pub = self.abrir(agmen.Publisher, T, "/m/estado3", names=["a", "b", "c"])
+        sub = self.abrir(agmen.Subscriber, T, "/m/estado3")        # sin lista: entra como hoy
+        self.assertTrue(until(lambda: sub.receive(0.05) is not None, every=lambda: pub.publish(T())), self.hub.text())
+
+    def test_200_publishers_nativos_con_lista_no_dejan_sockets_ni_endpoints(self):
+        T = JointState[2]
+        # (calentar: el primer Publisher crea lo global del proceso)
+        self.abrir(agmen.Publisher, T, "/f/x", names=["a", "b"]).close()
+        fds = lambda: len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else -1   # noqa: E731
+        antes = fds()
+        for i in range(200):
+            p = agmen.Publisher(T, f"/f/t{i % 5}", names=["a", "b"])
+            p.publish(T())
+            if i % 3 == 0:
+                s = agmen.Subscriber(T, f"/f/t{i % 5}", names=["a", "b"])
+                s.close()
+            p.close()
+        if antes >= 0:
+            self.assertLessEqual(fds(), antes, "se quedaron sockets abiertos")
+
+        def endpoints():
+            msgs = H.query(self.hub.addr, timeout=2.0, say=None)
+            return [f for op, f in msgs if op == "ep" and f.get("topic", "").startswith("/f/")]
+
+        self.assertTrue(until(lambda: not endpoints()), f"quedaron endpoints en el hub: {endpoints()[:3]}")
+
+    def test_publisher_nativo_se_borra_sin_close_y_deja_el_hub_limpio(self):
+        import gc
+        T = JointState[2]
+        for i in range(20):
+            p = agmen.Publisher(T, f"/g/t{i}", names=["a", "b"])
+            p.publish(T())
+            del p
+        gc.collect()
+
+        def endpoints():
+            msgs = H.query(self.hub.addr, timeout=2.0, say=None)
+            return [f for op, f in msgs if op == "ep" and f.get("topic", "").startswith("/g/")]
+
+        self.assertTrue(until(lambda: not endpoints()), f"quedaron endpoints en el hub: {endpoints()[:3]}")
+
+    def test_el_nombre_de_64_y_65_caracteres_con_el_nucleo(self):
+        T = JointState[1]
+        self.abrir(agmen.Publisher, T, "/n/64", names=["a" * 64])
+        with self.assertRaises(ValueError) as ctx:
+            agmen.Publisher(T, "/n/65", names=["a" * 65])
+        self.assertIn("mide 65 caracteres y el máximo es 64", str(ctx.exception))
+
+    def test_5453_articulaciones_dan_el_error_de_la_lista_con_los_dos_nucleos(self):
+        T = JointState[5453]
+        nombres = [f"n{i}" for i in range(5453)]
+        for cls in (agmen.Publisher, pubsub._PurePublisher):
+            with self.subTest(cls=cls.__name__):
+                with self.assertRaises(ValueError) as ctx:
+                    cls(T, "/n/enorme", names=nombres)
+                self.assertIn("names ocupa 31607 caracteres (los 5453 nombres separados por comas) y el máximo es "
+                              "8192", str(ctx.exception))
+
+    def test_nombres_con_formas_raras_dan_el_mismo_error_en_los_dos_nucleos(self):
+        T = JointState[2]
+        for names in (["\udc80", "b"], [b"a", "b"], ["a\x00b", "c"], ["a\r\nagmen-hub/1 bye id=x", "b"], [None, "b"],
+                      ["é", "b"], ["a", "a"], ["", "b"]):
+            for cls in ("Publisher", "Subscriber"):
+                with self.subTest(names=repr(names), cls=cls):
+                    with self.assertRaises(ValueError) as c_nativo:
+                        getattr(agmen, cls)(T, "/n/raro", names=names)
+                    with self.assertRaises(ValueError) as c_puro:
+                        getattr(pubsub, "_Pure" + cls)(T, "/n/raro", names=names)
+                    self.assertEqual(str(c_nativo.exception), str(c_puro.exception))
+        with self.assertRaises(TypeError):
+            agmen.Publisher(T, "/n/raro", names="ab")
+
+    def test_hilos_creando_publishers_nativos_con_lista_a_la_vez(self):
+        T = JointState[2]
+        fallos: list[BaseException] = []
+
+        def hilo(k):
+            try:
+                for i in range(15):
+                    p = agmen.Publisher(T, f"/hi/t{k}_{i}", names=[f"a{k}", f"b{i}"])
+                    p.publish(T())
+                    p.close()
+            except BaseException as e:   # noqa: BLE001
+                fallos.append(e)
+
+        hilos = [threading.Thread(target=hilo, args=(k,)) for k in range(8)]
+        for h in hilos:
+            h.start()
+        for h in hilos:
+            h.join(60)
+        self.assertEqual(fallos, [])
+        self.assertTrue(until(lambda: not [f for op, f in H.query(self.hub.addr, timeout=2.0, say=None)
+                                           if op == "ep" and f.get("topic", "").startswith("/hi/")]))
+
+
 
 if __name__ == "__main__":
     unittest.main()

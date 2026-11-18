@@ -653,7 +653,8 @@ void test_atacan_dos_publishers_mismo_topic_listas_distintas() {
     // Y uno sin lista junto a uno con lista: el de sin lista sigue sin ella.
     agmen::Publisher<Cmd> c("/mismo");
     CHECK(h.next("pub").find("names") == std::string::npos);
-    CHECK(until_beat(h, c, std::string(wire::schema_text<Cmd>()).substr(0, 0)));   // late, sin lista
+    c.heartbeat();
+    CHECK(h.next("pub", 2000ms).find("names") == std::string::npos);   // late, sin lista
 }
 
 void test_atacan_hilos_creando_publishers_con_lista() {
@@ -678,8 +679,7 @@ void test_atacan_hilos_creando_publishers_con_lista() {
     // Se leen en este hilo los registros mientras los otros crean (el socket del hub de mentira es de este hilo).
     std::map<std::string, std::string> vistos;   // topic → names
     const auto end = std::chrono::steady_clock::now() + 6s;
-    bool vivos = true;
-    while (std::chrono::steady_clock::now() < end && (vivos || true)) {
+    while (std::chrono::steady_clock::now() < end) {
         const auto line = h.next("pub", 200ms);
         if (!line.empty()) vistos[field(line, "topic")] = field(line, "names");
         if (vistos.size() == static_cast<std::size_t>(kHilos * kPorHilo)) break;

@@ -3,6 +3,7 @@
     python -m unittest discover -s python
 """
 
+import dataclasses
 import os
 import socket
 import threading
@@ -1240,6 +1241,310 @@ class TestLineaPorLinea(unittest.TestCase):
         dicho, = [x for x in self.logs if "solo en esta computadora" in x]
         self.assertEqual(dicho, f"⚠ {visto} escucha /cmd solo en esta computadora: no recibirá de robot. ¿Corre con "
                                 f"un Agmen anterior? Actualízalo")
+
+
+# --- Ataques del tester a la lectura línea por línea ------------------------------------------------------------------
+
+class TestLineaPorLineaAtaques(unittest.TestCase):
+    """Más casos feos de la lectura línea por línea (con el Hub en memoria y `now` a mano)."""
+
+    SCHEMA = "00000000000000aa"
+    OTRO = ("127.0.0.1", 50001)
+
+    def setUp(self):
+        self.logs: list[str] = []
+        self.hub = H.Hub(f"127.0.0.1:{free_port()}", log=self.logs.append, grace_s=0.0)
+        self.addCleanup(self.hub.sock.close)
+        self.sent: list[tuple[bytes, tuple[str, int]]] = []
+        self.hub._send = lambda data, addr: self.sent.append((data, addr))
+
+    def manda(self, data: bytes, now=0.0, src=LOCAL):
+        self.sent.clear()
+        self.hub.handle(data, src, now)
+        return [hp.parse(d)[0] for d, _ in self.sent]
+
+    def buena(self, eid, topic="/cmd") -> bytes:
+        return hp.line("pub", id=eid, node="n_" + eid, pid=1, topic=topic, schema=self.SCHEMA, type="Cmd",
+                       text="Cmd{f32 a}").encode()
+
+    def mala(self, eid) -> bytes:
+        return f"{hp.PREFIX} pub id={eid} node=n_{eid} names=%FF".encode()
+
+    def test_buenas_y_malas_en_todas_las_posiciones(self):
+        n = 5
+        for mascara in range(1 << n):
+            hub = H.Hub(f"127.0.0.1:{free_port()}", log=lambda t: None, grace_s=0.0)
+            sent: list[bytes] = []
+            hub._send = lambda data, addr, sent=sent: sent.append(data)
+            lineas, buenas, malas = [], [], []
+            for k in range(n):
+                if mascara >> k & 1:
+                    lineas.append(self.mala(f"m{k}"))
+                    malas.append(f"m{k}")
+                else:
+                    lineas.append(self.buena(f"b{k}", topic=f"/t{k}"))
+                    buenas.append(f"b{k}")
+            hub.handle(b"\n".join(lineas), LOCAL, 0.0)
+            with self.subTest(mascara=f"{mascara:05b}"):
+                self.assertEqual(sorted(hub.endpoints), sorted(buenas))
+                ops = [hp.parse(d)[0] for d in sent]
+                errores = [f["id"] for op, f in ops if op == "error"]
+                self.assertEqual(errores, malas)                    # una respuesta por cada mala, en su orden
+                self.assertEqual(len([1 for op, _ in ops if op == "subs"]), len(buenas))
+            hub.sock.close()
+
+    def test_cien_lineas_malas_16_respuestas_y_chicas(self):
+        minima = b"\n".join(f"{hp.PREFIX} pub id=a{i} names=%FF".encode() for i in range(100))
+        got = self.manda(minima)
+        self.assertEqual(len(got), H.BAD_LINES_ANSWERED)
+        self.assertEqual({f["id"] for _, f in got}, {f"a{i}" for i in range(16)})   # las 16 primeras
+        for raw, addr in self.sent:
+            self.assertEqual(addr, LOCAL)
+            self.assertLess(len(raw), 2 * H.BAD_LINE_SHOWN)
+        # Lo que contesta el hub no pasa de BAD_LINES_ANSWERED respuestas acotadas por datagrama recibido.
+        self.assertLess(sum(len(d) for d, _ in self.sent), H.BAD_LINES_ANSWERED * 2 * H.BAD_LINE_SHOWN)
+        # Las otras 84 no quedan mudas: una sola línea en el log (por origen) las cuenta.
+        self.assertEqual(len([x for x in self.logs if "mensaje inválido desde" in x]), 1)
+
+    def test_cada_error_dice_que_paso_y_que_hacer_aunque_el_texto_del_error_sea_largo(self):
+        # Una línea cuyo error original mide miles de caracteres: la respuesta sigue acotada y empieza igual.
+        (op, f), = self.manda(f"{hp.PREFIX} pub id=h {'k=%ZZ' * 20000}".encode())
+        self.assertEqual(op, "error")
+        self.assertTrue(f["msg"].startswith("no atendí esta línea: "))
+        self.assertLessEqual(len(f["msg"]), H.BAD_LINE_SHOWN)
+        (op, f), = self.manda(f"{hp.PREFIX} pub id=h {'x' * 60000}".encode())    # campo sin '=' enorme
+        self.assertLessEqual(len(f["msg"]), H.BAD_LINE_SHOWN)
+        self.assertLess(len(self.sent[0][0]), 2 * H.BAD_LINE_SHOWN)
+
+    def test_linea_mala_con_el_id_de_otro_endpoint_solo_contesta_al_remitente_y_no_lo_toca(self):
+        dueño = ("127.0.0.1", 40000)
+        self.manda(self.buena("victima"), now=1.0, src=dueño)
+        antes = dataclasses.asdict(self.hub.endpoints["victima"])
+        self.logs.clear()
+        for crudo in ("names=%FF", "node=%FF", "a%ZZ=1", "x"):
+            self.sent.clear()
+            self.hub.handle(f"{hp.PREFIX} pub id=victima {crudo}".encode(), self.OTRO, 99.0)
+            with self.subTest(crudo=crudo):
+                self.assertEqual([a for _, a in self.sent], [self.OTRO])    # solo a quien mandó el datagrama
+                self.assertEqual(hp.parse(self.sent[0][0])[0][0], "error")
+                self.assertEqual(dataclasses.asdict(self.hub.endpoints["victima"]), antes)   # ni dueño ni latido
+        self.assertEqual(list(self.hub.endpoints), ["victima"])
+        # La respuesta no filtra datos del dueño (su nodo, su dirección ni su topic).
+        for raw, _ in self.sent:
+            for dato in (b"n_victima", b"40000", b"/cmd"):
+                self.assertNotIn(dato, raw)
+        # Y el endpoint del dueño no caduca antes de tiempo por el intento del otro (last_seen sigue en 1.0).
+        self.hub.expire(1.0 + 3.0)
+        self.assertIn("victima", self.hub.endpoints)
+        self.hub.expire(1.0 + 3600.0)
+        self.assertNotIn("victima", self.hub.endpoints)
+
+    def test_saltos_de_linea_vacias_y_sin_salto_final(self):
+        casos = {
+            "crlf": (self.mala("a") + b"\r\n" + self.buena("b") + b"\r\n", ["error", "subs"]),
+            "vacias": (b"\n\n" + self.mala("a") + b"\n\n\n" + self.buena("b") + b"\n\n", ["error", "subs"]),
+            "sin_salto_final": (self.buena("b") + b"\n" + self.mala("a"), ["subs", "error"]),
+            "solo_espacios": (b"   \n\t\n" + self.mala("a"), ["error"]),
+            "solo_saltos": (b"\n\r\n\n", []),
+            "vacio": (b"", []),
+            "cr_solo": (self.mala("a") + b"\r" + self.buena("b"), None),    # \r solo: splitlines lo parte
+        }
+        for nombre, (data, esperado) in casos.items():
+            with self.subTest(nombre=nombre):
+                hub = H.Hub(f"127.0.0.1:{free_port()}", log=lambda t: None, grace_s=0.0)
+                sent: list[bytes] = []
+                hub._send = lambda d, a, sent=sent: sent.append(d)
+                hub.handle(data, LOCAL, 0.0)
+                hub.sock.close()
+                ops = [hp.parse(d)[0][0] for d in sent]
+                if esperado is not None:
+                    self.assertEqual(ops, esperado)
+                self.assertTrue(all(op in ("error", "subs") for op in ops), ops)
+
+    def test_prefijo_mal_escrito_no_se_atiende_y_se_dice_al_menos_una_vez(self):
+        for prefijo in ("agmen-hub/2", "Agmen-hub/1", "agmen-hub", "agmen-hub/1x", "agmen_hub/1", "", "ping"):
+            for sep in (" ", "\t"):
+                data = f"{prefijo}{sep}pub id=h names=%FF".encode()
+                with self.subTest(prefijo=prefijo, sep=repr(sep)):
+                    hub = H.Hub(f"127.0.0.1:{free_port()}", log=self.logs.append, grace_s=0.0)
+                    hub._send = lambda d, a: self.fail("no debe contestar a un prefijo que no es el del hub")
+                    self.logs.clear()
+                    hub.handle(data, LOCAL, 0.0)
+                    hub.sock.close()
+                    self.assertNotIn("h", hub.endpoints)
+                    self.assertEqual(len(self.logs), 1, "no atender una línea sin decir nada es fallar en silencio")
+                    self.assertIn("mensaje inválido desde 127.0.0.1:50000", self.logs[0])
+
+    def test_pasaron_k_veces_mas_con_el_reloj_explicito(self):
+        def boom():
+            raise RuntimeError("x")
+
+        def falla(now):
+            try:
+                boom()
+            except RuntimeError as e:
+                self.hub._unexpected_error(e, LOCAL, now)
+
+        falla(0.0)
+        self.assertEqual(len(self.logs), 1)
+        for t in (1.0, 2.0, 3.0):
+            falla(t)
+        self.hub._unexpected_flush(59.999)
+        self.assertEqual(len(self.logs), 1)                             # antes de los 60 s, nada
+        self.hub._unexpected_flush(60.0)
+        self.assertEqual(len(self.logs), 2)
+        self.assertIn("pasó 3 veces más en los últimos 60 s", self.logs[1])
+        self.hub._unexpected_flush(61.0)
+        self.assertEqual(len(self.logs), 2)                             # ya dicho: no se repite
+        falla(70.0)                                                     # una nueva, antes de los 60 s siguientes
+        self.assertEqual(len(self.logs), 2)
+        self.hub._unexpected_flush(119.9)
+        self.assertEqual(len(self.logs), 2)
+        self.hub._unexpected_flush(120.0)
+        self.assertIn("pasó 1 vez más en los últimos 60 s", self.logs[2])
+        # El reloj para atrás (now menor que el de la última vez): nada, y nunca un tiempo negativo.
+        falla(130.0)
+        self.hub._unexpected_flush(10.0)
+        self.assertEqual(len(self.logs), 3)
+        falla(500.0)       # (la llamada de falla() ya mira _unexpected_flush con su `now`)
+        self.assertTrue(all("-" not in x.split("últimos")[-1][:6] for x in self.logs[2:] if "últimos" in x),
+                        self.logs)
+
+    def test_el_log_no_crece_con_10000_lineas_malas_del_mismo_origen(self):
+        for i in range(10_000):
+            self.hub.handle(f"{hp.PREFIX} pub node=%FF names={i}%FF".encode(), LOCAL, float(i))   # sin id legible
+        self.assertEqual(len([x for x in self.logs if "mensaje inválido" in x]), 1)
+        self.assertLess(len(self.logs), 5)
+        self.assertEqual(self.sent, [])
+        self.assertLess(len(self.hub._warned), 5)
+        # Con id legible: responde cada vez (al remitente), pero el hub no guarda nada ni escribe en el log.
+        self.logs.clear()
+        for i in range(2000):
+            self.hub.handle(f"{hp.PREFIX} pub id=a{i} names=%FF".encode(), LOCAL, float(i))
+        self.assertEqual(self.logs, [])
+        self.assertEqual(len(self.sent), 2000)
+        self.assertEqual(self.hub.endpoints, {})
+        self.assertLess(len(self.hub._warned), 5)
+
+    def test_diez_mil_errores_inesperados_distintos_no_hacen_crecer_la_tabla_ni_el_log(self):
+        for i in range(10_000):
+            try:
+                raise type(f"Tipo{i}", (Exception,), {})("x")
+            except Exception as e:
+                self.hub._unexpected_error(e, LOCAL, 0.0)
+        self.assertLessEqual(len(self.hub._unexpected), H.UNEXPECTED_MAX + 1)
+        self.assertLessEqual(len(self.logs), H.UNEXPECTED_MAX + 2)
+
+    def test_el_datagrama_que_no_es_utf8_se_dice_y_no_se_atiende(self):
+        self.assertEqual(self.manda(b"\xff\xfe" + self.buena("b")), [])
+        self.assertTrue(any("no es UTF-8" in x for x in self.logs), self.logs)
+        self.assertEqual(self.hub.endpoints, {})
+
+    def test_una_linea_mala_y_un_query_en_el_mismo_datagrama(self):
+        got = self.manda(self.mala("a") + b"\n" + f"{hp.PREFIX} query".encode())
+        self.assertEqual(got[0][0], "error")
+        self.assertTrue(any(op in ("state", "ok", "end", "ep") or True for op, _ in got[1:]))   # no se cae
+
+    def test_lineas_buenas_dan_los_mismos_bytes_que_antes_de_este_bloque(self):
+        """Con líneas bien formadas el hub contesta byte a byte lo mismo que en 76563e6 (comprobado corriendo el
+        hub de ese commit con la misma tanda de datagramas; aquí quedan fijos los bytes de tres respuestas)."""
+        data = self.buena("a")
+        self.sent.clear()
+        self.hub.handle(data, LOCAL, 0.0)
+        self.assertEqual(self.sent, [(b"agmen-hub/1 subs id=a topic=/cmd to= tcp=", LOCAL)])
+        self.sent.clear()
+        self.hub.handle(f"{hp.PREFIX} nada id=q".encode(), LOCAL, 0.0)
+        self.assertEqual(self.sent, [(hp.encode("error", id="q", msg="operación desconocida 'nada'"), LOCAL)])
+        self.sent.clear()
+        self.hub.handle(f"{hp.PREFIX} pub id=q".encode(), LOCAL, 0.0)       # le falta un campo
+        self.assertEqual(self.sent, [(hp.encode("error", id="q", msg="falta el campo 'topic'"), LOCAL)])
+
+
+class TestNodoConNombreRaro(unittest.TestCase):
+    """Un nodo de verdad (Publisher) cuyo nombre lleva bytes raros: qué ve el usuario."""
+
+    def setUp(self):
+        self.fixture = HubFixture()
+        self.addCleanup(self.fixture.close)
+        self.err = []
+
+    def publicar_hasta_rechazo(self, cls, nodo, tipo=None):
+        pub = cls(tipo or Cmd, "/raro", node=nodo) if cls is not None else None
+        self.addCleanup(pub.close)
+        end = time.monotonic() + 5
+        while time.monotonic() < end:
+            try:
+                pub.publish(Cmd(0.0, 0.0))
+            except wire.HubRejected as e:
+                return str(e)
+            time.sleep(0.03)
+        return None
+
+    def test_nombre_con_controles_y_largo_el_rechazo_sale_limpio_y_acotado(self):
+        from agmen import pubsub
+        bueno = pubsub._PurePublisher(Cmd, "/raro", node="bueno")
+        self.addCleanup(bueno.close)
+
+        @dataclass
+        class Otro(wire.Message):
+            SCHEMA = "Otro{f32 z}"
+            z: float
+
+        for nodo in ("\x1b[2J\x00ñ" + "z" * 300, "a b=c%", "‮RLO", "\r\nagmen-hub/1 bye id=x"):
+            with self.subTest(nodo=repr(nodo)[:20]):
+                pub = pubsub._PurePublisher(Otro, "/raro", node=nodo)
+                self.addCleanup(pub.close)
+                texto = None
+                end = time.monotonic() + 5
+                while time.monotonic() < end and texto is None:
+                    try:
+                        pub.publish(Otro(0.0))
+                    except wire.HubRejected as e:
+                        texto = str(e)
+                    time.sleep(0.03)
+                self.assertIsNotNone(texto, self.fixture.logs)
+                self.assertTrue(texto.isprintable(), repr(texto))        # sin controles ni saltos de línea
+                self.assertLess(len(texto), 700)
+                self.assertIn("Un topic, un tipo", texto)
+        self.assertTrue(all(x.isprintable() for x in self.fixture.logs), self.fixture.logs)
+        self.assertNotIn("bye id=x", " ".join(self.fixture.logs))        # el \r\n no coló otra línea
+
+    @unittest.skipUnless(agmen._backend.NATIVE, "solo con el núcleo de C++")
+    def test_nombre_de_nodo_que_no_es_utf8_con_el_nucleo_el_usuario_ve_el_porque(self):
+        # AGMEN_NODE con bytes que no son UTF-8 (el sistema los deja pasar): C++ los manda como %FF; el hub no
+        # puede leer la línea, pero como el id sí se lee, contesta `error` y el nodo lo dice (antes: silencio).
+        viejo = os.environb.get(b"AGMEN_NODE")
+        os.environb[b"AGMEN_NODE"] = b"nodo\xff\xfe"
+        try:
+            pub = agmen.Publisher(Cmd, "/raro2")
+        finally:
+            if viejo is None:
+                del os.environb[b"AGMEN_NODE"]
+            else:
+                os.environb[b"AGMEN_NODE"] = viejo
+        self.addCleanup(pub.close)
+        texto = None
+        end = time.monotonic() + 5
+        while time.monotonic() < end and texto is None:
+            try:
+                pub.publish(Cmd(0.0, 0.0))
+            except wire.WireError as e:
+                texto = str(e)
+            time.sleep(0.03)
+        self.assertIsNotNone(texto)
+        self.assertIn("'node'", texto)
+        self.assertIn("UTF-8", texto)
+
+    def test_nombre_de_nodo_que_no_es_utf8_en_python_puro_dice_que_hacer(self):
+        """FALLA REAL (anterior a este bloque, de poca gravedad): un AGMEN_NODE con bytes que no son UTF-8 llega a
+        Python como 'nodo\\udcff'; el Publisher de Python puro revienta con un UnicodeEncodeError en inglés
+        ("'utf-8' codec can't encode...") que no dice qué pasó ni qué hacer (VISION §3 regla 1)."""
+        from agmen import pubsub
+        with self.assertRaises(Exception) as ctx:
+            pubsub._PurePublisher(Cmd, "/raro3", node="nodo\udcff\udcfe")
+        texto = str(ctx.exception)
+        self.assertNotIn("codec can't encode", texto)
+        self.assertTrue("AGMEN_NODE" in texto or "nombre del nodo" in texto, texto)
 
 
 class TestErroresDelHubEnElPuente(unittest.TestCase):
