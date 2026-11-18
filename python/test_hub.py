@@ -921,8 +921,10 @@ print("ok")
     def test_arrancar_y_cerrar_veinte_veces_sin_errores(self):
         import subprocess
         import sys
+        # cwd = la carpeta de las pruebas, para que el guion encuentre el paquete `agmen` aunque no haya
+        # PYTHONPATH (el CI corre `unittest discover -s python` sin él).
         r = subprocess.run([sys.executable, "-c", self.GUION], capture_output=True, text=True, timeout=60,
-                           encoding="utf-8", errors="replace")
+                           encoding="utf-8", errors="replace", cwd=os.path.dirname(os.path.abspath(__file__)))
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), "ok", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
