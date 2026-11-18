@@ -772,5 +772,690 @@ class TestEntreComputadoras(unittest.TestCase):
         self.assertIn(",".join(otro), [e.get("names") for e in eps])
 
 
+# =====================================================================================================================
+# Ataques del tester (segunda tanda): lo que la primera no probó.
+# =====================================================================================================================
+
+def cargar_anterior(modulo: str, nombre: str):
+    """El módulo `modulo` de agmen tal como era en 3a33553 (antes de names=); None si este clon no tiene el commit."""
+    try:
+        src = subprocess.run(["git", "-C", str(ROOT), "show", f"3a33553:python/agmen/{modulo}.py"],
+                             capture_output=True, text=True, encoding="utf-8", timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if src.returncode != 0:
+        return None
+    mod = types.ModuleType(f"agmen.{nombre}")
+    mod.__package__ = "agmen"
+    sys.modules[mod.__name__] = mod
+    exec(compile(src.stdout, f"{modulo}_anterior.py", "exec"), mod.__dict__)
+    return mod
+
+
+def udp(addr: str, data: bytes, espera: float = 0.6, sock=None) -> list[tuple[str, dict]]:
+    """Manda un datagrama a mano al hub y junta las respuestas que lleguen en `espera` s."""
+    host, port = addr.rsplit(":", 1)
+    s = sock or socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(espera)
+    s.sendto(data, (host, int(port)))
+    out = []
+    try:
+        while True:
+            got, _ = s.recvfrom(65536)
+            out.extend(hp.parse(got))
+    except (socket.timeout, TimeoutError):
+        pass
+    finally:
+        if sock is None:
+            s.close()
+    return out
+
+
+def linea_pub(eid, topic="/patas/cmd", names=None, crudo=None, text=T12, schema=S12, tipo="JointCommand"):
+    """Una línea `pub` en bytes; `crudo` se pega al final tal cual (para escribir lo que quiera quien ataca)."""
+    base = hp.line("pub", id=eid, node=eid, pid=1, topic=topic, schema=schema, type=tipo, text=text)
+    if names is not None:
+        base += " names=" + (names if isinstance(names, str) else ",".join(names))
+    if crudo:
+        base += " " + crudo
+    return base.encode()
+
+
+class TestLineaDeSiempre(unittest.TestCase):
+    """El formato es el contrato: sin names=, los bytes son los de la versión anterior (3a33553)."""
+
+    def setUp(self):
+        self.err = io.StringIO()
+        ctx = contextlib.redirect_stderr(self.err)
+        ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+        self.anterior = cargar_anterior("pubsub", "_pubsub_anterior")
+        if self.anterior is None:
+            self.skipTest("este clon no tiene el commit 3a33553")
+        self.addCleanup(sys.modules.pop, "agmen._pubsub_anterior", None)
+
+    def registro(self, falso, op):
+        return falso.registro(op).decode()
+
+    def test_pub_igual_que_antes_menos_el_id(self):
+        falso = FalsoHub(self)
+        viejo = self.anterior._PurePublisher(CMD12, "/patas/cmd")
+        self.addCleanup(viejo.close)
+        l_viejo = self.registro(falso, "pub").replace(f"{viejo.source_id:016x}", "ID")
+        nuevo = pubsub._PurePublisher(CMD12, "/patas/cmd")
+        self.addCleanup(nuevo.close)
+        l_nuevo = self.registro(falso, "pub").replace(f"{nuevo.source_id:016x}", "ID")
+        self.assertEqual(l_nuevo, l_viejo)
+        self.assertNotIn("names", l_nuevo)
+
+    def test_sub_igual_que_antes_menos_id_y_puerto(self):
+        falso = FalsoHub(self)
+        viejo = self.anterior._PureSubscriber(CMD12, "/patas/cmd")
+        self.addCleanup(viejo.close)
+        l_viejo = self.registro(falso, "sub").replace(viejo._link.id, "ID").replace(
+            "port=" + viejo.listen.rsplit(":", 1)[1], "port=P")
+        nuevo = pubsub._PureSubscriber(CMD12, "/patas/cmd")
+        self.addCleanup(nuevo.close)
+        l_nuevo = self.registro(falso, "sub").replace(nuevo._link.id, "ID").replace(
+            "port=" + nuevo.listen.rsplit(":", 1)[1], "port=P")
+        self.assertEqual(l_nuevo, l_viejo)
+
+    def test_names_none_es_lo_mismo_que_no_pasarlo(self):
+        falso = FalsoHub(self)
+        a = pubsub._PurePublisher(CMD12, "/patas/cmd", names=None)
+        self.addCleanup(a.close)
+        self.assertNotIn(b" names=", falso.registro("pub"))
+        self.assertIsNone(a.names)
+
+    def test_el_hub_anterior_acepta_la_linea_nueva_con_names(self):
+        """Compatibilidad hacia atrás: el hub de 3a33553 recibe una línea con names= y la acepta sin chistar."""
+        viejo = cargar_anterior("hub", "_hub_anterior_ataque")
+        self.addCleanup(sys.modules.pop, "agmen._hub_anterior_ataque", None)
+        hub = viejo.Hub(f"127.0.0.1:{free_port()}", log=lambda _: None, grace_s=0.0)
+        self.addCleanup(hub.sock.close)
+        enviado = []
+        hub._send = lambda data, addr: enviado.append(data)
+        for raros in ("a,b", "", "a,,b", "x" * 9000):
+            hub.handle(linea_pub("p", crudo=f"names={raros}"), LOCAL, 0.0)
+            ops = [hp.parse(d)[0][0] for d in enviado]
+            self.assertNotIn("error", ops, raros[:20])
+
+
+class TestHubMemoriaAtaques(HubEnMemoria):
+    def setUp(self):
+        self.nuevo_hub(joints_del_rfc())
+
+    def test_mayusculas_distintas_se_rechazan(self):
+        otro = ("fr_hip",) + PATAS[1:]
+        msg = self.rechazo(self.pub("p", otro))
+        self.assertIn("declara fr_hip, FR_thigh… y robot.toml dice FR_hip, FR_thigh…", msg)
+        self.assertIn("cambian desde la articulación 1 de 12", msg)
+
+    def test_lista_mas_larga_y_mas_corta(self):
+        self.rechazo(self.pub("larga", PATAS + ("extra",), text=""))
+        self.rechazo(self.pub("corta", PATAS[:1], text=""))
+        self.rechazo(self.pub("corta2", PATAS[:11], text=""))
+        self.assertEqual(self.hub.endpoints, {})
+
+    def test_un_rechazado_no_deja_su_lista_guardada(self):
+        """Sin [[joints]]: A entra con X, B con Y es rechazado; A se va; C con Y debe entrar (B no dejó nada)."""
+        self.nuevo_hub()
+        t = dict(topic="/otro", text="", schema="00000000000000d1", tipo="Mio")
+        self.entra(self.pub("a", ["x", "y"], **t))
+        self.rechazo(self.pub("b", ["z", "w"], **t))
+        self.assertNotIn("b", self.hub.endpoints)
+        self.manda("bye", id="a")
+        self.entra(self.pub("c", ["z", "w"], **t))
+        self.assertEqual(self.hub.endpoints["c"].names, ("z", "w"))
+        self.rechazo(self.pub("d", ["x", "y"], **t))      # y ahora es X la que choca
+
+    def test_el_que_se_va_y_vuelve_con_otra_lista(self):
+        self.nuevo_hub()
+        t = dict(topic="/otro", text="", schema="00000000000000d1", tipo="Mio")
+        self.entra(self.pub("a", ["x", "y"], **t))
+        self.entra(self.sub("s", ["x", "y"], topic="/otro", schema="00000000000000d1", tipo="Mio"))
+        self.manda("bye", id="a")
+        # El suscriptor todavía tiene X: a no puede volver con Y mientras él esté.
+        self.rechazo(self.pub("a", ["p", "q"], **t))
+        self.manda("bye", id="s")
+        self.entra(self.pub("a", ["p", "q"], **t))
+        self.assertEqual(self.hub.endpoints["a"].names, ("p", "q"))
+
+    def test_mismo_id_cambia_de_lista_solo_si_nadie_mas_la_tiene(self):
+        self.nuevo_hub()
+        t = dict(topic="/otro", text="", schema="00000000000000d1", tipo="Mio")
+        self.entra(self.pub("a", ["x", "y"], **t))
+        self.entra(self.pub("a", ["p", "q"], **t))          # el único: puede cambiar
+        self.entra(self.pub("b", ["p", "q"], **t))
+        msg = self.rechazo(self.pub("a", ["x", "y"], **t))  # ahora b la tiene: no
+        self.assertIn("'a' declara x, y", msg)
+        self.assertEqual(self.hub.endpoints["a"].names, ("p", "q"), "el rechazo no debe cambiar lo guardado")
+
+    def test_registro_rechazado_de_un_endpoint_ya_registrado_no_lo_tumba(self):
+        self.entra(self.pub("p", PATAS))
+        self.rechazo(self.pub("p", PATAS[::-1]))
+        self.assertEqual(self.hub.endpoints["p"].names, PATAS)   # sigue con la buena
+
+    def test_rechazo_no_deja_avisos_ni_endpoint_a_medias(self):
+        self.rechazo(self.pub("x", PATAS[::-1]))
+        self.assertEqual(self.avisos("sin declarar"), [])
+        self.assertEqual(self.hub.endpoints, {})
+
+    def test_reregistro_cada_segundo_no_repite_ningun_aviso(self):
+        t10 = JointState[10]
+        for i in range(30):
+            self.entra(self.pub("sim", topic="/patas/estado", text=t10.SCHEMA_TEXT, schema=f"{t10.SCHEMA_ID:016x}",
+                                tipo="JointState"))
+            self.entra(self.pub("viejo"))
+        avisos = [x for x in self.logs if x.startswith("⚠")]
+        self.assertEqual(len(avisos), 3, avisos)     # sin lista (sim), 10 vs 12 (sim), sin lista (viejo)
+
+    def test_names_dos_veces_en_la_misma_linea_gana_la_ultima(self):
+        """La especificación no dice nada. Hoy: se queda con la última (como todo campo repetido del protocolo)."""
+        self.nuevo_hub()
+        r = self.manda_bytes(linea_pub("p", topic="/x", text="", names="a,b", crudo="names=c,d"))
+        self.entra(r)
+        self.assertEqual(self.hub.endpoints["p"].names, ("c", "d"))
+
+    def test_unicode_y_nul_y_escapes(self):
+        for crudo in ("names=ñandú", "names=a%00b", "names=a%2Cb%2C", "names=%E4%B8%AD", "names=a%09b",
+                      "names=a%0Ab", "names=a%0D%0Aagmen-hub/1%20ping"):
+            with self.subTest(crudo=crudo):
+                r = self.manda_bytes(linea_pub("h") + b" " + crudo.encode())
+                # Nunca se cae y nunca queda guardado el endpoint hostil.
+                self.assertNotIn("h", self.hub.endpoints)
+                if r:
+                    self.assertEqual(r[0][0], "error", crudo)
+                    self.assertTrue(r[0][1]["msg"].isprintable(), repr(r[0][1]["msg"]))
+        self.entra(self.pub("bien", PATAS))
+
+    def test_percent_ff_no_hace_saltar_al_hub(self):
+        """FALLA REAL (ya estaba antes de names=): %FF no es UTF-8 y hp.unquote lanza UnicodeDecodeError, que
+        Hub.handle no atrapa (solo atrapa ProtocolError)."""
+        for crudo in ("names=%FF", "names=a%C3", "node=%FF"):
+            with self.subTest(crudo=crudo):
+                try:
+                    self.manda_bytes(linea_pub("h") + b" " + crudo.encode())
+                except UnicodeDecodeError as e:
+                    self.fail(f"Hub.handle dejó escapar {type(e).__name__}: {e}")
+        self.entra(self.pub("bien", PATAS))
+
+    def test_diez_mil_nombres_de_una_letra(self):
+        crudo = "names=" + ",".join("a" for _ in range(10000))
+        msg = self.rechazo(self.manda_bytes(linea_pub("h") + b" " + crudo.encode()))
+        self.assertIn("el máximo es 8192", msg)
+        self.assertLess(len(msg), 700)
+
+    def test_lista_en_el_tope_justo_si_entra_y_uno_mas_no(self):
+        self.nuevo_hub()
+        # 127 nombres de 63 caracteres + comas = 8191 + ... se arma con nombres de 63: k*63 + (k-1) <= 8192.
+        k = 8193 // 64                     # 128 nombres: 128*63 + 127 = 8191 caracteres
+        justo = [f"{i:03d}" + "x" * 60 for i in range(k)]
+        self.assertEqual(len(",".join(justo)), 8191)
+        self.entra(self.manda_bytes(linea_pub("ok", topic="/x", text="", names=justo)))
+        de_mas = [f"{i:03d}" + "x" * 61 for i in range(k)]       # 128*64 + 127 = 8319
+        self.assertGreater(len(",".join(de_mas)), 8192)
+        self.rechazo(self.manda_bytes(linea_pub("mal", topic="/y", text="", names=de_mas)))
+        self.entra(self.manda_bytes(linea_pub("ok64", topic="/z", text="", names=["n" * 64])))
+        self.rechazo(self.manda_bytes(linea_pub("mal65", topic="/z", text="", names=["n" * 65])))
+        # exactamente 8192 caracteres: 8191 + una coma y un nombre de 0 no existe; 8192 = justo con un nombre de 64
+        igual = justo[:-1] + ["y" * 62 + "zz"]          # 127*63+126 comas... el último mide 64: 8192 en total
+        self.assertEqual(len(",".join(igual)), 8192)
+        self.entra(self.manda_bytes(linea_pub("ok8192", topic="/w", text="", names=igual)))
+
+    def test_require_names_con_lista_buena_entra_y_sub_sin_lista_tambien(self):
+        self.nuevo_hub(joints_del_rfc(require=True))
+        self.rechazo(self.pub("viejo"))
+        self.entra(self.pub("bueno", PATAS))
+        self.entra(self.sub("s"))
+        self.entra(self.sub("s2", PATAS))
+        self.rechazo(self.sub("s3", PATAS[::-1]))
+
+    def test_require_names_tambien_rechaza_a_un_publisher_de_otra_computadora_sin_lista(self):
+        self.nuevo_hub(joints_del_rfc(require=True))
+        # Una entrada de otra computadora (machine=...): el puente la registra con machine=
+        r = self.manda_bytes(hp.encode("pub", id="r.1", node="n", pid=1, topic="/patas/cmd", schema=S12,
+                                       type="JointCommand", text=T12, machine="laptop"))
+        self.assertIn("la computadora 'laptop'", self.rechazo(r))
+
+    def test_names_en_sub_de_comodin_con_topic_concreto_y_schema_comodin(self):
+        # sub de un topic concreto con schema '*' (RawSubscriber): puede declarar lista
+        r = self.manda("sub", id="raw", node="raw", pid=1, topic="/patas/cmd", schema="*", type="", port=6000,
+                       names=",".join(PATAS))
+        self.entra(r)
+        self.rechazo(self.manda("sub", id="raw2", node="raw", pid=1, topic="/patas/cmd", schema="*", type="",
+                                port=6000, names=",".join(PATAS[::-1])))
+
+
+class TestHubVerdaderoPorUdp(unittest.TestCase):
+    """Líneas hostiles a mano, por UDP, a un agmen hub de verdad. No se cae, contesta con el porqué y sigue."""
+
+    def setUp(self):
+        self.hub = HubProceso(self, "--names", f"/patas/cmd={','.join(PATAS)}")
+
+    def vivo(self):
+        self.assertIsNotNone(H.ping(self.hub.addr, timeout=2.0), self.hub.text())
+        self.assertIsNone(self.hub.p.poll(), self.hub.text())
+
+    def test_listas_hostiles(self):
+        casos = [
+            ("names=", "vacío"),
+            ("names=a,,b", "está vacío"),
+            ("names=,a", "names[0]"),
+            ("names=a,", "names[1]"),
+            ("names=a%2Cb%2C", "vacío"),
+            ("names=a%00b", "carácter de control"),
+            ("names=" + "x" * 8193, "ocupa 8193 caracteres"),
+            ("names=" + "n" * 65, "mide 65 caracteres y el máximo es 64"),
+            ("names=" + ",".join(f"n{i:03d}" + "x" * 20 for i in range(400)), "el máximo es 8192"),
+            ("names=" + ",".join("a" for _ in range(10000)), "el máximo es 8192"),
+            ("names=a%20b", "espacio"),
+            ("names=ñ", "ñ"),
+            ("names=%E4%B8%AD", "no es un nombre"),
+            ("names=a,b,a", "dos veces"),
+            ("names=-a", "empieza con"),
+            ("names=FR_hip names=FR_thigh,FR_calf", "robot.toml dice"),   # dos veces: gana la última
+        ]
+        for crudo, frag in casos:
+            with self.subTest(crudo=crudo[:40]):
+                linea = linea_pub("hostil", text="", schema="00000000000000d1", tipo="Mio", topic="/otro") \
+                    + b" " + crudo.encode()
+                if not crudo.startswith("names=FR"):
+                    resp = udp(self.hub.addr, linea)
+                else:
+                    resp = udp(self.hub.addr, linea_pub("hostil", names=PATAS[0], crudo=crudo))
+                self.assertTrue(resp, "el hub no contestó (fallo callado)")
+                self.assertEqual(resp[0][0], "error", resp)
+                msg = resp[0][1]["msg"]
+                self.assertIn(frag, msg)
+                self.assertLess(len(msg), 800)
+                self.vivo()
+        # Nada quedó registrado y un nodo bueno entra.
+        resp = udp(self.hub.addr, linea_pub("bueno", names=PATAS))
+        self.assertNotEqual(resp[0][0], "error", resp)
+        self.assertTrue(any(f.get("id") == "bueno" for op, f in H.query(self.hub.addr) if op == "ep"))
+        self.assertFalse(any(f.get("id") == "hostil" for op, f in H.query(self.hub.addr) if op == "ep"))
+
+    def test_bytes_invalidos_no_tumban_el_hub(self):
+        for data in (linea_pub("h") + b" names=a\xff\xfeb", linea_pub("h") + b" names=a%ZZ",
+                     linea_pub("h") + b" names=%", linea_pub("h") + b" names=a%2", linea_pub("h") + b" names",
+                     linea_pub("h") + b" =a", linea_pub("h") + b" names==", b"agmen-hub/1 pub names=" + b"%" * 70000):
+            with self.subTest(data=data[-20:]):
+                try:
+                    udp(self.hub.addr, data, espera=0.3)
+                except OSError:
+                    pass       # (un datagrama de más de 65507 bytes no sale: eso es del sistema, no del hub)
+                self.vivo()
+
+    def test_percent_ff_no_tumba_el_hilo_del_hub(self):
+        """FALLA REAL (ya estaba antes de names=): un solo datagrama con %FF mata el hilo que atiende al hub."""
+        for crudo in (b"names=%FF", b"names=a%C3", b"node=%FF"):
+            with self.subTest(crudo=crudo):
+                try:
+                    udp(self.hub.addr, linea_pub("h") + b" " + crudo, espera=0.3)
+                except OSError:
+                    pass
+                self.assertIsNotNone(H.ping(self.hub.addr, timeout=2.0), "el hub dejó de contestar: " + self.hub.text())
+                if self.hub.p.poll() is not None or "Traceback" in self.hub.text():
+                    self.fail("el hub tuvo un error sin atrapar:\n" + self.hub.text()[-600:])
+
+    def test_sub_de_comodin_con_names(self):
+        resp = udp(self.hub.addr, hp.line("sub", id="g", node="g", pid=1, topic="*", schema="*", type="",
+                                          port=6000, names="a,b").encode())
+        self.assertEqual(resp[0][0], "error")
+        self.assertIn("escucha todos los topics", resp[0][1]["msg"])
+        self.vivo()
+
+    def test_atiende_a_los_demas_mientras_lo_atacan(self):
+        parar = threading.Event()
+
+        def ataque():
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            host, port = self.hub.addr.rsplit(":", 1)
+            i = 0
+            while not parar.is_set():
+                i += 1
+                s.sendto(linea_pub(f"x{i % 50}", crudo="names=" + ",".join("a" for _ in range(9000))),
+                         (host, int(port)))
+                time.sleep(0.001)
+            s.close()
+        t = threading.Thread(target=ataque, daemon=True)
+        t.start()
+        try:
+            for _ in range(20):
+                self.assertIsNotNone(H.ping(self.hub.addr, timeout=2.0), self.hub.text())
+            resp = udp(self.hub.addr, linea_pub("bueno", names=PATAS), espera=1.0)
+            self.assertTrue(resp and resp[0][0] != "error", resp)
+        finally:
+            parar.set()
+            t.join(5)
+        self.vivo()
+
+    def test_hilos_con_listas_distintas_sin_joints_gana_una_sola(self):
+        self.hub.close()
+        self.hub = HubProceso(self)           # sin --names: el hub compara entre endpoints
+        n = 16
+        barrera = threading.Barrier(n)
+        res: dict[int, str] = {}
+
+        def hilo(i):
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                barrera.wait(10)
+                r = udp(self.hub.addr, linea_pub(f"t{i}", topic="/otro", text="", schema="00000000000000d1",
+                                                 tipo="Mio", names=["x", f"y{i}"]), espera=2.0, sock=s)
+                res[i] = r[0][0] if r else "nada"
+                if r and r[0][0] == "error":
+                    res[i] = "error:" + r[0][1]["msg"]
+            finally:
+                s.close()
+        hilos = [threading.Thread(target=hilo, args=(i,)) for i in range(n)]
+        for h in hilos:
+            h.start()
+        for h in hilos:
+            h.join(20)
+        self.assertEqual(len(res), n, res)
+        ganadores = [i for i, r in res.items() if not r.startswith("error") and r != "nada"]
+        self.assertEqual(len(ganadores), 1, res)
+        perdedores = [r for i, r in res.items() if i not in ganadores]
+        self.assertTrue(all("un topic, una lista" in r for r in perdedores), perdedores)
+        eps = [f for op, f in H.query(self.hub.addr) if op == "ep" and f.get("topic") == "/otro"]
+        self.assertEqual(len(eps), 1, eps)
+        self.vivo()
+
+    def test_hilos_con_la_misma_lista_entran_todos(self):
+        self.hub.close()
+        self.hub = HubProceso(self)
+        n = 16
+        barrera = threading.Barrier(n)
+        res = {}
+
+        def hilo(i):
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                barrera.wait(10)
+                r = udp(self.hub.addr, linea_pub(f"t{i}", names=PATAS), espera=2.0, sock=s)
+                res[i] = r[0][0] if r else "nada"
+            finally:
+                s.close()
+        hilos = [threading.Thread(target=hilo, args=(i,)) for i in range(n)]
+        for h in hilos:
+            h.start()
+        for h in hilos:
+            h.join(20)
+        self.assertNotIn("error", res.values(), res)
+        self.assertNotIn("nada", res.values(), res)
+
+    def test_hilos_contra_lista_de_robot_toml_todos_rechazados_menos_los_buenos(self):
+        n = 12
+        barrera = threading.Barrier(n)
+        res = {}
+
+        def hilo(i):
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                barrera.wait(10)
+                lista = PATAS if i % 3 == 0 else PATAS[::-1]
+                r = udp(self.hub.addr, linea_pub(f"t{i}", names=lista), espera=2.0, sock=s)
+                res[i] = r[0][0] if r else "nada"
+            finally:
+                s.close()
+        hilos = [threading.Thread(target=hilo, args=(i,)) for i in range(n)]
+        for h in hilos:
+            h.start()
+        for h in hilos:
+            h.join(20)
+        for i, r in res.items():
+            self.assertEqual(r == "error", i % 3 != 0, res)
+
+
+class TestHubProcesoRequire(unittest.TestCase):
+    def setUp(self):
+        self.err = io.StringIO()
+        ctx = contextlib.redirect_stderr(self.err)
+        ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+        self.hub = HubProceso(self, "--names", f"/patas/cmd={','.join(PATAS)}", "--require-names", "/patas/cmd")
+
+    def test_publisher_sin_lista_rechazado_con_lista_entra_subscriber_sin_lista_entra(self):
+        viejo = pubsub._PurePublisher(CMD12, "/patas/cmd", node="viejo")
+        self.addCleanup(viejo.close)
+        got = []
+
+        def paso():
+            try:
+                viejo.publish(CMD12())
+            except wire.HubRejected as e:
+                got.append(str(e))
+            time.sleep(0.02)
+        until(lambda: bool(got), every=paso)
+        self.assertTrue(got, self.hub.text())
+        self.assertIn("require_names = true", got[0])
+        sub = pubsub._PureSubscriber(CMD12, "/patas/cmd")     # sin lista: entra
+        self.addCleanup(sub.close)
+        bueno = pubsub._PurePublisher(CMD12, "/patas/cmd", names=list(PATAS), node="bueno")
+        self.addCleanup(bueno.close)
+        self.assertTrue(until(lambda: sub.receive(0.05) is not None, every=lambda: bueno.publish(CMD12())),
+                        self.hub.text())
+        self.assertIsNone(self.hub.p.poll())
+
+    def test_argumentos_malos_del_hub_dicen_que_hacer(self):
+        casos = [(["--names", "/a"], "escríbelo como TOPIC=nombre"),
+                 (["--require-names", "/b"], "ese topic no tiene lista"),
+                 (["--names", "/a=x,,y"], "names[1]"),
+                 (["--names", "/a=x", "--names", "/a=y"], "está dos veces"),
+                 (["--names", "/a=" + "x" * 65], "65")]
+        for args, frag in casos:
+            with self.subTest(args=args):
+                env = dict(os.environ, PYTHONPATH=str(ROOT / "python"), PYTHONIOENCODING="utf-8")
+                r = subprocess.run([sys.executable, "-m", "agmen", "hub", "--listen", f"127.0.0.1:{free_port()}",
+                                    *args], capture_output=True, text=True, encoding="utf-8", env=env, timeout=30)
+                self.assertNotEqual(r.returncode, 0, (r.stdout, r.stderr))
+                self.assertIn(frag, r.stdout + r.stderr)
+                self.assertNotIn("Traceback", r.stdout + r.stderr)
+
+
+# --- agmen run de punta a punta: el que llega es el de buen orden ---------------------------------------------------
+
+POLITICA = '''
+import sys, time
+import agmen
+from agmen.msgs import JointCommand
+names = sys.argv[1].split(",")
+valor = float(sys.argv[2])
+T = JointCommand[len(names)]
+pub = agmen.Publisher(T, "/patas/cmd", names=names)
+end = time.monotonic() + 40
+while time.monotonic() < end:
+    m = T()
+    m.position = [valor] * len(names)
+    try:
+        pub.publish(m)
+    except Exception as e:
+        print("MALA", type(e).__name__, e, flush=True)
+        time.sleep(0.5)
+    time.sleep(0.05)
+'''
+
+LECTOR = '''
+import time
+import agmen
+from agmen.msgs import JointCommand
+T = JointCommand[3]
+sub = agmen.Subscriber(T, "/patas/cmd")
+end = time.monotonic() + 40
+vistos = set()
+while time.monotonic() < end:
+    s = sub.receive(0.1)
+    if s is not None:
+        v = float(s.message.position[0])
+        if v not in vistos:
+            vistos.add(v)
+            print("VISTO", v, flush=True)
+'''
+
+
+class TestAgmenRunLlegaElBueno(unittest.TestCase):
+    def correr(self, robot_extra: str, tiene, tope=40):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "politica.py").write_text(POLITICA, encoding="utf-8")
+            (Path(d) / "lector.py").write_text(LECTOR, encoding="utf-8")
+            (Path(d) / "robot.toml").write_text(robot_extra, encoding="utf-8")
+            env = dict(os.environ, PYTHONPATH=str(ROOT / "python"), PYTHONIOENCODING="utf-8",
+                       AGMEN_HUB=f"127.0.0.1:{free_port()}")
+            kw = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
+            p = subprocess.Popen([sys.executable, "-m", "agmen", "run", str(Path(d) / "robot.toml"), "--no-web"],
+                                 cwd=d, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, text=True,
+                                 encoding="utf-8", **kw)
+            out: list[str] = []
+            threading.Thread(target=lambda: out.extend(iter(p.stdout.readline, "")), daemon=True).start()
+            try:
+                ok = until(lambda: tiene("".join(out)), tope)
+                time.sleep(1.5)       # un rato más, por si el malo alcanzara a colarse
+                return ok, "".join(out)
+            finally:
+                p.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
+                try:
+                    p.wait(15)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait(5)
+                p.stdout.close()
+
+    @staticmethod
+    def nodo(name, cmd):
+        return f'\n[[node]]\nname = "{name}"\ncmd = {json.dumps(cmd)}\nenv = {{ AGMEN_BACKEND = "pure" }}\n'
+
+    def test_orden_malo_no_publica_y_el_bueno_llega(self):
+        robot = ('[robot]\nname = "n"\n\n[[joints]]\nname = "patas"\ncommand = "/patas/cmd"\n'
+                 'names = ["cadera", "rodilla", "tobillo"]\nkp = 1.0\nkd = 0.1\n')
+        robot += self.nodo("lector", ["python", "lector.py"])
+        robot += self.nodo("bueno", ["python", "politica.py", "cadera,rodilla,tobillo", "1.0"])
+        robot += self.nodo("malo", ["python", "politica.py", "rodilla,cadera,tobillo", "99.0"])
+        ok, out = self.correr(robot, lambda t: "VISTO 1.0" in t and "'malo' declara" in t)
+        self.assertTrue(ok, out)
+        self.assertNotIn("VISTO 99.0", out)
+
+    def test_require_names_y_sin_lista_no_publica(self):
+        robot = ('[robot]\nname = "n"\n\n[[joints]]\nname = "patas"\ncommand = "/patas/cmd"\n'
+                 'names = ["cadera", "rodilla", "tobillo"]\nkp = 1.0\nkd = 0.1\nrequire_names = true\n')
+        robot += self.nodo("lector", ["python", "lector.py"])
+        robot += self.nodo("bueno", ["python", "politica.py", "cadera,rodilla,tobillo", "1.0"])
+        # Sin lista: se escribe con python -c, que publica sin names=
+        sin = ("import time,agmen;from agmen.msgs import JointCommand as J;T=J[3];p=agmen.Publisher(T,'/patas/cmd');"
+               "m=T();m.position=[77.0]*3;hecho=False\n"
+               "for _ in range(400):\n try: p.publish(m)\n except Exception as e:\n  if not hecho: print('SIN',e,flush=True); hecho=True\n time.sleep(0.05)")
+        robot += self.nodo("sin", ["python", "-c", sin])
+        ok, out = self.correr(robot, lambda t: "VISTO 1.0" in t and "require_names = true" in t)
+        self.assertTrue(ok, out)
+        self.assertNotIn("VISTO 77.0", out)
+
+    def test_perfil_distinto_no_manda_names_al_hub(self):
+        base = ('[robot]\nname = "n"\n\n[[node]]\nname = "m"\ncmd = "x"\n\n[[joints]]\nname = "patas"\n'
+                'state = "/patas/estado"\ncommand = "/patas/cmd"\nnames = ["a", "b"]\nrequire_names = true\n'
+                'profile = "sim"\n')
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "robot.toml"
+            path.write_text(base, encoding="utf-8")
+            for perfil, con in (("real", False), ("sim", True)):
+                with self.subTest(perfil=perfil):
+                    cfg = load_config(path, profile=perfil) if "profile" in load_config.__code__.co_varnames \
+                        else load_config(path)
+                    cfg, _ = prepare_hub(cfg, ping=lambda a: None)
+                    hubn = next((n for n in cfg.nodes if n.name == "hub"), None)
+                    cmd = hubn.cmd if hubn else []
+                    self.assertEqual("--names" in cmd, con, cmd)
+                    self.assertEqual("--require-names" in cmd, con, cmd)
+
+
+# --- el núcleo de C++: valida primero y después dice qué hacer ----------------------------------------------------
+
+@unittest.skipUnless(_backend.NATIVE, "solo con el núcleo de C++")
+class TestNucleoCppValidaPrimero(unittest.TestCase):
+    def test_lista_mala_da_error_de_lista_no_notimplemented(self):
+        malas = [(["a", "a"], ValueError), ([], ValueError), (["a b"], ValueError), (["x" * 65], ValueError),
+                 ("FR_hip", TypeError), (7, TypeError), ([1, 2], ValueError)]
+        T2 = JointState[2]
+        for names, error in malas:
+            for cls in (agmen.Publisher, agmen.Subscriber):
+                with self.subTest(names=repr(names), cls=cls.__name__):
+                    with self.assertRaises(error) as ctx:
+                        cls(T2, "/x", names=names)
+                    self.assertNotIsInstance(ctx.exception, NotImplementedError)
+        node = agmen.Node("n")
+        self.addCleanup(node.close)
+        with self.assertRaises(ValueError):
+            node.publisher(T2, "/x", names=["a", "a"])
+        with self.assertRaises(TypeError):
+            node.publisher(T2, "/x", names="ab")
+        with self.assertRaises(ValueError):
+            node.publisher(JointState[3], "/x", names=["a", "b"])    # el número no es el del tipo
+
+    def test_lista_buena_da_error_que_dice_que_hacer(self):
+        with self.assertRaises(NotImplementedError) as ctx:
+            agmen.Publisher(JointState[2], "/x", names=["a", "b"])
+        txt = str(ctx.exception)
+        self.assertIn("AGMEN_BACKEND=pure", txt)
+        self.assertNotIn("Traceback", txt)
+
+    def test_sin_names_nada_cambia(self):
+        pub = agmen.Publisher(JointState[2], "/x")
+        sub = agmen.Subscriber(JointState[2], "/x")
+        self.addCleanup(pub.close)
+        self.addCleanup(sub.close)
+        self.assertEqual(pub.type, JointState[2]) if hasattr(pub, "type") else None
+        agmen.Publisher(JointState[2], "/x", names=None).close()
+
+    def test_no_se_abre_ningun_socket_ni_se_registra_al_fallar(self):
+        """names= malo con el núcleo de C++ no debe dejar nada registrado en el hub."""
+        h = HubProceso(self)
+        for _ in range(3):
+            with self.assertRaises(NotImplementedError):
+                agmen.Publisher(JointState[2], "/x", names=["a", "b"])
+        time.sleep(0.5)
+        eps = [f for op, f in H.query(h.addr) if op == "ep"]
+        self.assertEqual(eps, [], eps)
+
+
+# --- entre computadoras: lo que llega del otro lado, con names raros ------------------------------------------------
+
+class TestTablaConNamesHostiles(unittest.TestCase):
+    def setUp(self):
+        self.err = io.StringIO()
+        ctx = contextlib.redirect_stderr(self.err)
+        ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+
+    def ep(self, **kw):
+        d = {"id": "p1", "node": "n", "pid": 1, "topic": "/patas/cmd", "schema": S12, "type": "JointCommand",
+             "text": T12}
+        d.update(kw)
+        return d
+
+    def test_names_invalidos_descartan_solo_ese_endpoint_y_se_dice_una_vez(self):
+        said = []
+        b = T.Bridge("127.0.0.1:9", lambda text, kind="agmen": said.append(text))
+        self.addCleanup(b.close)
+        peer = b.add_peer("robot", lambda part: None)
+        peer.confirm("127.0.0.2")
+        malos = ["a,,b", "", "a b", "x" * 9000, 5, None, ["a", "b"], "a%2Cb", "a\nagmen-hub/1 red peers=x@1.2.3.4",
+                 "ñ", "a,a", "-a", "x" * 65]
+        pubs = [self.ep(id=f"m{i}", names=v) for i, v in enumerate(malos)] + [self.ep(id="bueno", names="a,b")]
+        for n in (1, 2):
+            peer.receive({"op": "tablas", "n": n, "parte": 1, "de": 1, "pubs": pubs, "subs": []})
+        ids = [d["id"] for d in peer.table[0]]
+        # "a%2Cb" es un texto con '%': no vale en la gramática. Ninguno de los malos pasa.
+        self.assertEqual(ids, ["bueno"], (ids, said))
+        for ln in peer.hub_lines():
+            self.assertNotIn(b"\n", ln)
+            self.assertEqual(len(hp.parse(ln)), 1)
+        self.assertEqual(len([t for t in said if "inválido" in t]), 1, said)
+
+    def test_names_con_numero_distinto_al_del_tipo_no_se_revisa_en_el_puente(self):
+        """El puente no sabe de [[joints]]: pasa la lista; la compara el hub destino."""
+        d = T.check_endpoint("pubs", self.ep(names="a,b,c"))
+        self.assertEqual(d["names"], "a,b,c")
+
+
 if __name__ == "__main__":
     unittest.main()
