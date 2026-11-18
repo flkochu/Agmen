@@ -2639,5 +2639,478 @@ class TestHubRejectedDelNucleo(_HubPlano):
         self.assertIs(type(rechazo()), wire.HubRejected)
 
 
+# --- RawPublisher / RawSubscriber con names= (los del [[mux]]): los casos feos -------------------------------------
+
+def _cmd12_finito():
+    """Un JointCommand[12] sin NaN (el mux descarta lo no finito, y un JointCommand() nuevo trae position, kp y kd en
+    NaN)."""
+    m = CMD12()
+    m.position, m.kp, m.kd = [1.0] * 12, [1.0] * 12, [0.1] * 12
+    return m
+
+
+def _fd_libres_detecta_fugas() -> int:
+    """El número que da el sistema al siguiente descriptor: si no cambia tras crear y fallar muchas veces, no hubo
+    fuga (en Windows los sockets no son descriptores de C: la prueba solo no se queja)."""
+    fd = os.dup(0)
+    os.close(fd)
+    return fd
+
+
+class TestRawConNamesBordes(unittest.TestCase):
+    def setUp(self):
+        self.falso = FalsoHub(self)
+        self.err = io.StringIO()
+        ctx = contextlib.redirect_stderr(self.err)
+        ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+
+    def test_names_invalidos_dan_el_mismo_error_que_un_publisher(self):
+        """Los mismos casos que TestNamesAlCrear: mismo tipo de excepción y mismo texto, con el nombre de la clase."""
+        casos = [c for c in TestNamesAlCrear.CASOS if c[1] is not None]
+        for names, error, frag in casos:
+            for cls in (pubsub.RawPublisher, pubsub.RawSubscriber):
+                with self.subTest(cls=cls.__name__, names=repr(names)[:40]):
+                    with self.assertRaises(error) as ctx:
+                        cls("/patas/estado", names=names)
+                    texto = str(ctx.exception)
+                    self.assertIn(frag, texto)
+                    self.assertIn(f"{cls.__name__} en '/patas/estado'", texto)
+                    self.assertNotIn("\x1b", texto)
+        for names in ({"a", "b"}, frozenset({"a"}), {"a": 1}):
+            for cls in (pubsub.RawPublisher, pubsub.RawSubscriber):
+                with self.subTest(cls=cls.__name__, names=type(names).__name__):
+                    with self.assertRaisesRegex(TypeError, "no tiene orden fijo"):
+                        cls("/patas/estado", names=names)
+
+    def test_names_invalidos_no_dejan_sockets_ni_registro(self):
+        antes = _fd_libres_detecta_fugas()
+        for _ in range(30):
+            for cls in (pubsub.RawPublisher, pubsub.RawSubscriber):
+                with self.assertRaises(ValueError):
+                    cls("/patas/estado", names=["a", "a"])
+        self.assertEqual(_fd_libres_detecta_fugas(), antes)
+        self.falso.sock.settimeout(0.3)
+        with self.assertRaises((socket.timeout, TimeoutError)):
+            self.falso.sock.recvfrom(65536)               # ningún registro salió
+
+    def test_names_con_una_direccion_o_con_estrella(self):
+        with self.assertRaisesRegex(ValueError, "RawSubscriber: names= va con un topic"):
+            pubsub.RawSubscriber("127.0.0.1:0", names=["a"])
+        # '*' es "todos los topics": la lista es de un topic. Lo dice quien lo revise (aquí o el hub), no se cae.
+        try:
+            rs = pubsub.RawSubscriber("*", names=["a"])
+        except (ValueError, TypeError) as e:
+            self.assertIn("names", str(e))
+        else:
+            rs.close()
+        with self.assertRaises((ValueError, hp.ProtocolError)):
+            pubsub.RawPublisher("patas/cmd", names=["a"])          # un topic sin '/' inicial
+
+    def test_names_vacio_o_none_es_distinto(self):
+        rp = pubsub.RawPublisher("/patas/cmd", names=None)
+        self.addCleanup(rp.close)
+        self.assertIsNone(rp.names)
+        with self.assertRaisesRegex(ValueError, "names está vacía"):
+            pubsub.RawPublisher("/patas/cmd", names=[])
+        with self.assertRaisesRegex(ValueError, "names está vacía"):
+            pubsub.RawSubscriber("/patas/cmd", names=())
+
+    def test_tupla_y_lista_valen_como_en_un_publisher(self):
+        rp = pubsub.RawPublisher("/patas/cmd", names=tuple(PATAS))
+        self.addCleanup(rp.close)
+        self.assertEqual(rp.names, PATAS)
+        rs = pubsub.RawSubscriber("/patas/cmd", names=list(PATAS))
+        self.addCleanup(rs.close)
+        self.assertEqual(rs.names, PATAS)
+
+    def test_registro_que_no_cabe_se_dice_una_vez_y_se_reintenta_si_luego_cabe(self):
+        rp = pubsub.RawPublisher("/patas/cmd", names=list(PATAS))
+        self.addCleanup(rp.close)
+        enorme = "Grande{" + ";".join(f"f32 campo_{i:05d}" for i in range(5000)) + "}"
+        for _ in range(5):
+            rp.set_schema(enorme, "Grande", 0x1234)
+        self.assertIsNone(rp._link)
+        self.assertEqual(self.err.getvalue().count("el registro en el hub mide"), 1, self.err.getvalue())
+        self.assertFalse(rp.send(bytearray(wire.encode(CMD12(), 1, 1))))          # nadie a quién mandar: sin error
+        self.falso.vaciar()
+        rp.set_schema(T12, "JointCommand", CMD12.SCHEMA_ID)                         # ahora sí cabe: se registra
+        self.assertIsNotNone(rp._link)
+        linea = self.falso.registro("pub").decode()
+        self.assertIn(f"names={','.join(PATAS)}", linea)
+        self.assertEqual(self.err.getvalue().count("el registro en el hub mide"), 1)
+        rp.set_schema(enorme, "Grande", 0x1234)                                      # ya registrado: no cambia nada
+        self.assertEqual(self.err.getvalue().count("el registro en el hub mide"), 1)
+
+    def test_registro_que_no_cabe_por_el_nombre_del_nodo_no_tumba_ni_calla(self):
+        with mock.patch.dict(os.environ, {"AGMEN_NODE": "n" * 70000}):
+            rp = pubsub.RawPublisher("/patas/cmd", names=list(PATAS))
+            self.addCleanup(rp.close)
+            rp.set_schema(T12, "JointCommand", CMD12.SCHEMA_ID)
+            rp.set_schema(T12, "JointCommand", CMD12.SCHEMA_ID)
+        texto = self.err.getvalue()
+        self.assertEqual(texto.count("el registro en el hub mide"), 1, texto)
+        self.assertIn("nombre del nodo", texto)
+        self.assertIn("Mientras tanto no me registro en el hub", texto)
+
+    def test_una_instancia_nueva_vuelve_a_decirlo_porque_es_otra(self):
+        enorme = "Grande{" + ";".join(f"f32 campo_{i:05d}" for i in range(5000)) + "}"
+        for _ in range(2):
+            rp = pubsub.RawPublisher("/patas/cmd", names=list(PATAS))
+            rp.set_schema(enorme, "Grande", 0x1234)
+            rp.close()
+        self.assertEqual(self.err.getvalue().count("el registro en el hub mide"), 2)
+
+    def test_cerrar_y_reabrir_con_la_misma_lista(self):
+        for vuelta in range(3):
+            self.falso.vaciar()
+            rp = pubsub.RawPublisher("/patas/cmd", names=list(PATAS))
+            rp.set_schema(T12, "JointCommand", CMD12.SCHEMA_ID)
+            self.assertIn(f"names={','.join(PATAS)}", self.falso.registro("pub").decode(), vuelta)
+            rp.close()
+            rp.close()                                              # cerrar dos veces no se queja
+            with self.assertRaises(RuntimeError):
+                rp.set_schema(T12, "JointCommand", CMD12.SCHEMA_ID)  # un RawPublisher cerrado no se registra
+            self.falso.vaciar()
+            rs = pubsub.RawSubscriber("/patas/cmd", names=list(PATAS))
+            self.assertIn(f"names={','.join(PATAS)}", self.falso.registro("sub").decode(), vuelta)
+            rs.close()
+            rs.close()
+
+    def test_la_linea_de_un_topic_con_signos_raros_y_lista_larga(self):
+        largos = [("n%03d" % i).ljust(64, "x") for i in range(120)]       # 7800 caracteres de lista
+        rp = pubsub.RawPublisher("/patas/cmd", names=largos)
+        self.addCleanup(rp.close)
+        rp.set_schema(T12, "JointCommand", CMD12.SCHEMA_ID)
+        self.assertTrue(self.falso.registro("pub").endswith(b" names=" + ",".join(largos).encode()))
+
+
+# --- el [[mux]] lanzado a mano contra un hub de verdad ---------------------------------------------------------------
+
+def _mux_a_mano(case, hub_addr, *args, names=None):
+    """Lanza `python -m agmen mux …` (de verdad) contra ese hub; devuelve (proceso, lista de líneas de salida)."""
+    env = dict(os.environ, PYTHONPATH=str(ROOT / "python"), PYTHONIOENCODING="utf-8", AGMEN_HUB=hub_addr)
+    cmd = [sys.executable, "-m", "agmen", "mux", "--in", "ia=/cmd/ia@1", "--out", "/patas/cmd", *args]
+    if names is not None:
+        cmd += ["--names", names]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, text=True, encoding="utf-8")
+    out: list[str] = []
+    threading.Thread(target=lambda: out.extend(iter(p.stdout.readline, "")), daemon=True).start()
+
+    def cerrar():
+        p.kill()
+        p.wait(10)
+        p.stdout.close()
+    case.addCleanup(cerrar)
+    return p, out
+
+
+class TestMuxALaMano(unittest.TestCase):
+    def mux_corto(self, *args, hub="127.0.0.1:1"):
+        env = dict(os.environ, PYTHONPATH=str(ROOT / "python"), PYTHONIOENCODING="utf-8", AGMEN_HUB=hub)
+        return subprocess.run([sys.executable, "-m", "agmen", "mux", "--in", "ia=/cmd/ia@1", *args],
+                              capture_output=True, text=True, encoding="utf-8", env=env, timeout=60)
+
+    def test_lista_mala_sale_con_2_y_dice_que_hacer(self):
+        casos = [("a,,b", "[mux] error: --names a,,b: names[1] = '' no es un nombre de articulación válido"),
+                 ("a,a", "'a' está dos veces"),
+                 ("a b", "tiene un espacio"),
+                 ("x" * 65, "mide 65 caracteres"),
+                 ("", "--names")]
+        for lista, frag in casos:
+            with self.subTest(lista=repr(lista)[:30]):
+                r = self.mux_corto("--out", "/patas/cmd", "--names", lista)
+                self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+                self.assertIn(frag, r.stderr)
+                self.assertNotIn("Traceback", r.stdout + r.stderr)
+                self.assertNotIn("\x1b", r.stderr)
+                self.assertLess(len(r.stderr), 600)               # una lista enorme no se copia entera al error
+
+    def test_FALLA_REAL_el_error_no_repite_los_caracteres_de_control_del_argumento(self):
+        """FALLA REAL (menor). `agmen mux --names $'a\\x1b[31m'`: el error repite el argumento tal cual, con el ESC
+        crudo (los demás textos de nombres sí los cambian por '?'). Esperado: sin caracteres de control en stderr.
+        Reproducir: python -m unittest test_nombres.TestMuxALaMano.test_FALLA_REAL_el_error_no_repite_los_"""
+        "caracteres_de_control_del_argumento"
+        r = self.mux_corto("--out", "/patas/cmd", "--names", "a\x1b[31m")
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("carácter de control", r.stderr)
+        self.assertEqual([c for c in r.stderr if not c.isprintable() and c != "\n"], [], repr(r.stderr[:80]))
+
+    def test_lista_enorme_no_se_copia_entera_al_error(self):
+        lista = ",".join(f"j{i:05d}" for i in range(2000))             # 14 000 caracteres: pasa el tope de 8192
+        r = self.mux_corto("--out", "/patas/cmd", "--names", lista)
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr[:300]))
+        self.assertIn("el máximo es 8192", r.stderr)
+        self.assertLess(len(r.stderr), 600, len(r.stderr))
+
+    def test_names_con_salida_que_es_una_direccion(self):
+        r = self.mux_corto("--out", "127.0.0.1:7500", "--names", "a,b")
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("--names va con una salida que es un topic", r.stderr)
+        self.assertIn("'127.0.0.1:7500' es una dirección", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_names_sin_valor_lo_dice_argparse(self):
+        r = self.mux_corto("--out", "/patas/cmd", "--names")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--names", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_lista_buena_se_declara_y_la_politica_buena_llega(self):
+        hub = HubProceso(self, "--names", f"/patas/cmd={','.join(PATAS)}", "--names", f"/cmd/ia={','.join(PATAS)}",
+                         "--require-names", "/patas/cmd", "--require-names", "/cmd/ia")
+        p, out = _mux_a_mano(self, hub.addr, names=",".join(PATAS))
+        self.assertTrue(until(lambda: "declaro al hub la lista de robot.toml (12 articulaciones: FR_hip, FR_thigh … "
+                                      "RL_calf)" in "".join(out)), "".join(out))
+        sub = pubsub._PureSubscriber(CMD12, "/patas/cmd")
+        self.addCleanup(sub.close)
+        pol = pubsub._PurePublisher(CMD12, "/cmd/ia", names=list(PATAS), node="politica")
+        self.addCleanup(pol.close)
+
+        self.assertTrue(until(lambda: sub.receive(0.05) is not None, every=lambda: pol.publish(_cmd12_finito())),
+                        hub.text() + "".join(out))
+        self.assertIsNone(p.poll())
+
+    def test_numero_de_nombres_que_no_coincide_con_el_tipo_lo_dice_el_hub_y_el_mux_sigue(self):
+        """OBSERVACIÓN: 3 nombres y un tipo de 12 articulaciones. Quien lo dice es el hub (un aviso, no un rechazo);
+        el mux no sabe contar (no conoce el tipo al crearse) y sigue reenviando."""
+        hub = HubProceso(self, "--names", "/patas/cmd=a,b,c")
+        p, out = _mux_a_mano(self, hub.addr, names="a,b,c")
+        pol = pubsub._PurePublisher(CMD12, "/cmd/ia", node="politica")
+        self.addCleanup(pol.close)
+        frag = "'/patas/cmd' trae 12 articulaciones y robot.toml nombra 3"
+        self.assertTrue(until(lambda: frag in hub.text(), every=lambda: pol.publish(_cmd12_finito())), hub.text() + "".join(out))
+        self.assertIsNone(p.poll())
+        self.assertNotIn("Traceback", "".join(out))
+
+    def test_lista_con_orden_cambiado_en_una_entrada_el_mux_lo_dice(self):
+        """El rechazo de la ENTRADA (RawSubscriber) sí llega al usuario: el mux cuenta el error y lo escribe."""
+        hub = HubProceso(self, "--names", f"/patas/cmd={','.join(PATAS)}", "--names", f"/cmd/ia={','.join(PATAS)}")
+        p, out = _mux_a_mano(self, hub.addr, names=",".join(reversed(PATAS)))
+        self.assertTrue(until(lambda: "el hub rechazó escuchar '/cmd/ia'" in "".join(out)), "".join(out) + hub.text())
+        self.assertIn("pasa names= en el orden de [[joints]] de robot.toml", "".join(out))
+        self.assertIsNone(p.poll())
+
+    def test_FALLA_REAL_salida_del_mux_rechazada_por_el_hub_no_se_queda_callada(self):
+        """FALLA REAL (nunca fallar en silencio, VISION §3.1). Un mux a mano con la lista en otro orden que la que el
+        hub tiene para su SALIDA (/patas/cmd): el hub rechaza el registro del RawPublisher (la lista de la entrada
+        no cuenta aquí), nada llega a /patas/cmd, y el mux solo dice "declaro al hub la lista…" y luego
+        "reenviados=N"; RawPublisher guarda el error en _link.error y nadie lo lee. El hub tampoco lo muestra.
+        Esperado: el mux (o el hub) dice que el hub rechazó la salida y qué hacer.
+        Reproducir: python -m unittest test_nombres.TestMuxALaMano.test_FALLA_REAL_salida_del_mux_rechazada_por_"""
+        "el_hub_no_se_queda_callada"
+        hub = HubProceso(self, "--names", f"/patas/cmd={','.join(PATAS)}")
+        p, out = _mux_a_mano(self, hub.addr, names=",".join(reversed(PATAS)))
+        sub = pubsub._PureSubscriber(CMD12, "/patas/cmd")
+        self.addCleanup(sub.close)
+        pol = pubsub._PurePublisher(CMD12, "/cmd/ia", node="politica")
+        self.addCleanup(pol.close)
+        llego = until(lambda: sub.receive(0.05) is not None, 4, every=lambda: pol.publish(_cmd12_finito()))
+        self.assertFalse(llego, "con el orden cambiado no debería llegar nada a /patas/cmd")
+        todo = "".join(out) + hub.text()
+        self.assertRegex(todo, r"(?i)rechaz|declara .* y robot.toml dice",
+                         f"nadie dijo que el hub rechazó la salida del mux:\n{todo}")
+
+    def test_FALLA_REAL_mux_viejo_sin_names_contra_require_names_no_se_queda_callado(self):
+        """FALLA REAL (nunca fallar en silencio). Un mux sin --names (o de una versión anterior) contra un hub con
+        --require-names en su salida: el hub rechaza su RawPublisher, el mux sigue contando "reenviados" y no dice
+        nada; el hub tampoco. Esperado: algún texto que diga que el hub exige la lista (require_names) y qué hacer.
+        Reproducir: python -m unittest test_nombres.TestMuxALaMano.test_FALLA_REAL_mux_viejo_sin_names_contra_"""
+        "require_names_no_se_queda_callado"
+        hub = HubProceso(self, "--names", f"/patas/cmd={','.join(PATAS)}", "--require-names", "/patas/cmd")
+        p, out = _mux_a_mano(self, hub.addr)
+        sub = pubsub._PureSubscriber(CMD12, "/patas/cmd")
+        self.addCleanup(sub.close)
+        pol = pubsub._PurePublisher(CMD12, "/cmd/ia", node="politica")
+        self.addCleanup(pol.close)
+        llego = until(lambda: sub.receive(0.05) is not None, 4, every=lambda: pol.publish(_cmd12_finito()))
+        self.assertFalse(llego, "un mux sin lista no debería poder publicar en un topic con require_names")
+        todo = "".join(out) + hub.text()
+        self.assertRegex(todo, r"(?i)rechaz|require_names|exige",
+                         f"nadie dijo que el hub rechazó al mux viejo:\n{todo}")
+
+
+# --- el panel: un [[web.command]] hacia una entrada que hereda la lista -------------------------------------------------
+
+class TestPanelHaciaEntradaHeredada(unittest.TestCase):
+    """OBSERVACIÓN: el panel publica sin lista (un Publisher sin names=). Con require_names en esa entrada, el hub lo
+    rechaza; sin require_names, solo avisa. Qué ve el usuario en el panel y en la terminal."""
+
+    def _panel(self, target="/cmd/ia"):
+        from agmen.panel.command import Command, parse_command
+        from agmen.panel.server import Panel
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        (Path(d) / "m.agmen").write_text("package mio\nmessage JointCommand {\n    f32[3] position\n    "
+                                         "f32[3] velocity\n    f32[3] effort\n    f32[3] kp\n    f32[3] kd\n}\n",
+                                         encoding="utf-8")
+        cfg = parse_command({"name": "Pata", "target": target, "type": "JointCommand", "messages": "m.agmen",
+                             "button": [{"label": "quieto", "value": {}}],
+                             "default": {"position": [1.0] * 3, "velocity": [0.0] * 3, "effort": [0.0] * 3,
+                                         "kp": [1.0] * 3, "kd": [0.1] * 3}}, 0, Path(d))
+        panel = Panel("127.0.0.1:0", None, "prueba", None, None, topics=False, commands=[Command(cfg, node="panel")])
+        panel.start()
+        self.addCleanup(panel.shutdown)
+        return panel
+
+    def _mandar(self, panel, hasta):
+        """Aprieta el botón hasta que `hasta()` o el tope; los errores que devuelve el panel, sin repetir."""
+        vistos: list[str] = []
+
+        def paso():
+            err = panel.command(0, button=0)
+            if err and err not in vistos:
+                vistos.append(err)
+            time.sleep(0.06)           # (el panel descarta más de ~60 por segundo)
+        until(lambda: hasta(vistos), 8, every=paso)
+        return vistos
+
+    def test_con_require_names_el_panel_devuelve_un_error_con_el_texto_del_hub(self):
+        hub = HubProceso(self, "--names", "/cmd/ia=a,b,c", "--require-names", "/cmd/ia")
+        panel = self._panel()
+        vistos = self._mandar(panel, lambda vistos: bool(vistos))
+        self.assertTrue(vistos, hub.text())
+        e = vistos[0]
+        self.assertIn("no se pudo publicar en /cmd/ia: el hub rechazó publicar en '/cmd/ia'", e)
+        self.assertIn("publica sin declarar su lista de nombres y robot.toml la exige", e)
+        self.assertIn("require_names = true", e)
+        self.assertNotIn("Traceback", e)
+
+    def test_sin_require_names_publica_y_el_hub_avisa_una_vez(self):
+        hub = HubProceso(self, "--names", "/cmd/ia=a,b,c")
+        panel = self._panel()
+        errores = self._mandar(panel, lambda vistos: "sin declarar su lista de nombres" in hub.text())
+        self.assertEqual(errores, [], errores)                        # el panel no ve ningún error
+        self.assertIn("sin declarar su lista de nombres", hub.text())
+        time.sleep(0.3)
+        self.assertEqual(hub.text().count("sin declarar su lista de nombres"), 1, hub.text())
+
+
+# --- agmen run de punta a punta con [[mux]]: prioridades y NaN ----------------------------------------------------------
+
+LECTOR_TICK = """
+import time, agmen
+from agmen.msgs import JointCommand
+sub = agmen.Subscriber(JointCommand[3], "/patas/cmd")
+end = time.monotonic() + 40
+ultimo, t = None, 0.0
+while time.monotonic() < end:
+    s = sub.receive(0.1)
+    if s is not None:
+        ultimo = float(s.message.position[0])
+    if ultimo is not None and time.monotonic() - t > 0.3:
+        t = time.monotonic()
+        print("TICK", ultimo, flush=True)
+"""
+
+POLITICA_NAN = """
+import sys, time, agmen
+from agmen.msgs import JointCommand
+campo, topic = sys.argv[1], sys.argv[2]
+T = JointCommand[3]
+pub = agmen.Publisher(T, topic, names=["cadera", "rodilla", "tobillo"])
+end = time.monotonic() + 40
+while time.monotonic() < end:
+    m = T()
+    m.position, m.kp, m.kd = [5.0] * 3, [1.0] * 3, [0.1] * 3
+    setattr(m, campo, [float("nan")] * 3)
+    try:
+        pub.publish(m)
+    except Exception as e:
+        print("MALA", type(e).__name__, e, flush=True)
+        time.sleep(0.5)
+    time.sleep(0.05)
+"""
+
+
+class TestAgmenRunMuxExtremo(unittest.TestCase):
+    """Con el [[mux]] heredando la lista, de punta a punta. Los nodos usan el núcleo del proceso de prueba (el de C++
+    cuando se corre con él), no el de Python puro fijo."""
+
+    correr = TestAgmenRunLlegaElBueno.correr
+    JOINTS = ('[robot]\nname = "n"\n\n[[joints]]\nname = "patas"\ncommand = "/patas/cmd"\n'
+              'names = ["cadera", "rodilla", "tobillo"]\nkp = 1.0\nkd = 0.1\n')
+
+    @staticmethod
+    def nodo(name, cmd):
+        return f'\n[[node]]\nname = "{name}"\ncmd = {json.dumps(cmd)}\n'
+
+    @staticmethod
+    def mux(*entradas):
+        t = '\n[[mux]]\nname = "ruedas"\noutput = "/patas/cmd"\n'
+        for nombre, topic, prio in entradas:
+            t += f'\n[[mux.input]]\nname = "{nombre}"\ntopic = "{topic}"\npriority = {prio}\n'
+        return t
+
+    @staticmethod
+    def ticks(out):
+        return [float(ln.split()[1]) for ln in out.splitlines() if ln.startswith("TICK ") or " TICK " in ln
+                for ln in [ln[ln.index("TICK"):]]]
+
+    def test_dos_politicas_misma_lista_manda_la_de_mayor_prioridad_y_un_solo_aviso_del_sin_lista(self):
+        for require in (False, True):
+            with self.subTest(require_names=require):
+                robot = self.JOINTS + ("require_names = true\n" if require else "")
+                robot += self.mux(("baja", "/cmd/baja", 1), ("alta", "/cmd/alta", 10))
+                robot += self.nodo("lector", ["python", "-c", LECTOR_TICK])
+                robot += self.nodo("pbaja", ["python", "politica.py", "cadera,rodilla,tobillo", "1.0", "/cmd/baja"])
+                robot += self.nodo("palta", ["python", "politica.py", "cadera,rodilla,tobillo", "2.0", "/cmd/alta"])
+                robot += self.nodo("sin", ["python", "politica.py", "-", "1.0", "/cmd/baja"])
+                aviso = "'sin' publica en '/cmd/baja', un topic de [[joints]], sin declarar su lista de nombres"
+                rechazo = "'/cmd/baja': 'sin' publica sin declarar su lista de nombres y robot.toml la exige"
+                ok, out = self.correr(robot, lambda t: t.count("TICK 2.0") >= 6 and (rechazo if require else aviso) in t)
+                self.assertTrue(ok, out)
+                ticks = self.ticks(out)
+                primero = ticks.index(2.0)
+                self.assertEqual(set(ticks[primero:]), {2.0}, ticks)          # manda la de mayor prioridad, y se queda
+                if require:      # el nodo sin lista vuelve a intentar y vuelve a leer el rechazo (su propio print)
+                    self.assertGreaterEqual(out.count(rechazo), 1, out)
+                else:
+                    self.assertEqual(out.count(aviso), 1, out)               # UN aviso del hub, no uno por mensaje
+                self.assertNotIn("'ruedas' publica en", out)                  # el mux declara su lista: ningún aviso suyo
+                mux_lineas = [ln for ln in out.splitlines() if ln.startswith("ruedas")]
+                self.assertFalse([ln for ln in mux_lineas if "rechaz" in ln], mux_lineas)   # el mux no es rechazado
+
+    def test_OBSERVACION_el_mux_descarta_position_kp_o_kd_en_nan(self):
+        """OBSERVACIÓN (decisión pendiente): hoy el mux descarta cualquier comando con un valor no finito, también
+        position, kp y kd, y dice una vez por entrada cuál campo. La entrada buena (de menor prioridad) manda."""
+        robot = self.JOINTS + "require_names = true\n"
+        robot += self.mux(("bueno", "/cmd/ok", 1), ("nanpos", "/cmd/np", 2), ("nankp", "/cmd/nkp", 3),
+                          ("nankd", "/cmd/nkd", 4))
+        robot += self.nodo("lector", ["python", "-c", LECTOR_TICK])
+        robot += self.nodo("bueno", ["python", "politica.py", "cadera,rodilla,tobillo", "1.0", "/cmd/ok"])
+        for nodo, campo, topic in (("np", "position", "/cmd/np"), ("nkp", "kp", "/cmd/nkp"), ("nkd", "kd", "/cmd/nkd")):
+            robot += self.nodo(nodo, ["python", "-c", POLITICA_NAN, campo, topic])
+        frags = ["descarté un comando de 'nanpos' con un valor no finito (position[0]=nan)",
+                 "descarté un comando de 'nankp' con un valor no finito (kp[0]=nan)",
+                 "descarté un comando de 'nankd' con un valor no finito (kd[0]=nan)"]
+        ok, out = self.correr(robot, lambda t: t.count("TICK 1.0") >= 4 and all(f in t for f in frags))
+        self.assertTrue(ok, out)
+        self.assertEqual(set(self.ticks(out)), {1.0}, out)                   # nunca llegó un comando con NaN
+        for f in frags:
+            self.assertEqual(out.count(f), 1, out)                           # una vez por entrada
+
+
+class TestAgmenRunMuxEnOtroPerfil(unittest.TestCase):
+    correr = TestAgmenRunLlegaElBueno.correr
+    nodo = staticmethod(TestAgmenRunMuxExtremo.nodo)
+
+    def test_mux_de_otro_perfil_no_se_declara_ni_exige(self):
+        """El [[mux]] de otro perfil no corre: el hub del perfil activo no exige la lista a una entrada ajena y una
+        política sin lista que publica ahí no se rechaza (nadie escucha)."""
+        robot = ('[robot]\nname = "n"\n\n[[joints]]\nname = "patas"\ncommand = "/patas/cmd"\n'
+                 'names = ["cadera", "rodilla", "tobillo"]\nkp = 1.0\nkd = 0.1\nrequire_names = true\n'
+                 '\n[[mux]]\nname = "ruedas"\noutput = "/patas/cmd"\nprofile = "otro"\n\n[[mux.input]]\nname = "ia"\n'
+                 'topic = "/cmd/ia"\npriority = 1\n')
+        robot += self.nodo("sin", ["python", "politica.py", "-", "77.0", "/cmd/ia"])
+        robot += self.nodo("lector", ["python", "lector.py"])
+        robot += self.nodo("bueno", ["python", "politica.py", "cadera,rodilla,tobillo", "1.0"])
+        ok, out = self.correr(robot, lambda t: "VISTO 1.0" in t)
+        self.assertTrue(ok, out)
+        self.assertNotIn("la lista vale también", out)
+        self.assertNotIn("VISTO 77.0", out)
+
+
 if __name__ == "__main__":
     unittest.main()

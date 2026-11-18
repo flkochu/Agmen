@@ -455,6 +455,126 @@ class TestMuxConNames(unittest.TestCase):
         self.assertFalse(pub.send(bytearray(wire.encode(Cmd(1, 1), 1, 1))))   # nadie a quién mandar, sin error
 
 
+class TestMuxConNamesBordes(unittest.TestCase):
+    """Formas feas de pasar --names al mux (RFC 0013 D6 = d)."""
+
+    def setUp(self):
+        import contextlib
+        import io
+        import os
+        from unittest import mock
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)     # un "hub" que no contesta
+        s.bind(("127.0.0.1", 0))
+        self.addCleanup(s.close)
+        p = mock.patch.dict(os.environ, {"AGMEN_HUB": f"127.0.0.1:{s.getsockname()[1]}"})
+        p.start()
+        self.addCleanup(p.stop)
+        self.err = io.StringIO()
+        ctx = contextlib.redirect_stderr(self.err)
+        ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+
+    @staticmethod
+    def _siguiente_fd():
+        import os
+
+        fd = os.dup(0)
+        os.close(fd)
+        return fd
+
+    def test_names_malos_no_dejan_sockets_abiertos(self):
+        antes = self._siguiente_fd()
+        for names in ("abc", ["a", "a"], [], [""], ["a b"], ["x" * 65], 7):
+            with self.subTest(names=repr(names)[:20]):
+                with self.assertRaises((ValueError, TypeError)) as ctx:
+                    Mux([MuxInput("ia", "/cmd/ia", 1), MuxInput("t", "127.0.0.1:0", 2)], "/patas/cmd",
+                        log=lambda t: None, names=names)
+                self.assertIn("names", str(ctx.exception))
+        self.assertEqual(self._siguiente_fd(), antes)            # sin fuga de sockets
+
+    def test_FALLA_REAL_names_sin_orden_no_vale_en_el_mux(self):
+        """FALLA REAL (menor, solo por la API de Python: por la línea de comandos --names es un texto). Mux(names={"a",
+        "b"}) acepta un set y lo vuelve tupla en un orden cualquiera: el orden es justo lo que el hub compara, y
+        Publisher/RawPublisher/RawSubscriber ya lo rechazan con TypeError ("no tiene orden fijo"). Esperado: el
+        mismo TypeError. Reproducir: python -m unittest test_mux.TestMuxConNamesBordes.test_FALLA_REAL_names_sin_"""
+        "orden_no_vale_en_el_mux"
+        for names in ({"a", "b"}, frozenset({"a", "b"}), {"a": 1, "b": 2}):
+            with self.subTest(names=type(names).__name__):
+                try:
+                    mux = Mux([MuxInput("ia", "/cmd/ia", 1)], "/patas/cmd", log=lambda t: None, names=names)
+                except TypeError as e:
+                    self.assertIn("no tiene orden fijo", str(e))
+                else:
+                    mux.close()
+                    self.fail(f"Mux aceptó names={type(names).__name__}: quedó con {mux.names} (orden arbitrario)")
+
+    def test_el_aviso_de_arranque_cuenta_y_acorta_la_lista(self):
+        import threading
+
+        for lista, esperado in ((["a", "b"], "(2 articulaciones: a, b)"),
+                                (["a", "b", "c", "d"], "(4 articulaciones: a, b, c, d)"),
+                                ([f"j{i}" for i in range(12)], "(12 articulaciones: j0, j1 … j11)")):
+            with self.subTest(n=len(lista)):
+                logs: list[str] = []
+                mux = Mux([MuxInput("ia", "/cmd/ia", 1)], "/patas/cmd", log=logs.append, names=lista)
+                stop = threading.Event()
+                stop.set()
+                mux.run(stop)
+                mux.close()
+                self.assertTrue(any(esperado in ln for ln in logs), logs)
+
+    def test_solo_direcciones_en_las_entradas_la_salida_igual_lleva_la_lista(self):
+        mux = Mux([MuxInput("a", "127.0.0.1:0", 1), MuxInput("b", "127.0.0.1:0", 2)], "/patas/cmd",
+                  log=lambda t: None, names=["x", "y"])
+        self.addCleanup(mux.close)
+        self.assertEqual(mux.pub.names, ("x", "y"))
+        self.assertTrue(all(rx.names is None for rx in mux.rx.values()))
+
+    def test_con_state_el_estado_no_lleva_la_lista(self):
+        mux = Mux([MuxInput("ia", "/cmd/ia", 1)], "/patas/cmd", log=lambda t: None, names=["x"], state="/mux/ruedas")
+        self.addCleanup(mux.close)
+        self.assertFalse(getattr(mux.state_pub, "names", None))
+
+    def test_close_dos_veces_y_despues_de_names(self):
+        mux = Mux([MuxInput("ia", "/cmd/ia", 1)], "/patas/cmd", log=lambda t: None, names=["x"])
+        mux.close()
+        mux.close()
+
+    def test_OBSERVACION_position_kp_kd_en_nan_se_descartan_como_cualquier_no_finito(self):
+        """OBSERVACIÓN (decisión pendiente): el mux descarta un JointCommand con NaN en CUALQUIER campo f32, también
+        position, kp y kd, y avisa una vez por entrada con el campo. Un JointCommand() recién creado trae position,
+        kp y kd en NaN: quien no los llena no manda nada."""
+        from agmen.msgs import JointCommand
+
+        T = JointCommand[3]
+        rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        rx.bind(("127.0.0.1", 0))
+        rx.settimeout(0.5)
+        self.addCleanup(rx.close)
+        mux = Mux([MuxInput("ia", "127.0.0.1:0", 1)], f"127.0.0.1:{rx.getsockname()[1]}", log=lambda t: None)
+        self.addCleanup(mux.close)
+        ia = mux.inputs[0]
+        self.assertFalse(mux.handle(ia, wire.encode_announcement(T.SCHEMA_TEXT, "/cmd"), 0.0))
+        nan = float("nan")
+        casos = (("position[0]", dict(position=[nan, 1.0, 1.0])), ("kp[2]", dict(kp=[1.0, 1.0, nan])),
+                 ("kd[1]", dict(kd=[0.1, nan, 0.1])))
+        for k, (campo, malos) in enumerate(casos, start=1):
+            m = T()
+            m.position, m.kp, m.kd = [1.0] * 3, [1.0] * 3, [0.1] * 3
+            for nombre, v in malos.items():
+                setattr(m, nombre, v)
+            self.assertFalse(mux.handle(ia, wire.encode(m, k, 1), 0.1 * k), campo)
+            self.assertEqual(mux.nonfinite["ia"], k)
+        self.assertIn("(position[0]=nan)", self.err.getvalue())
+        self.assertEqual(self.err.getvalue().count("descarté un comando de 'ia'"), 1)    # una vez por entrada
+        bueno = T()
+        bueno.position, bueno.kp, bueno.kd = [1.0] * 3, [1.0] * 3, [0.1] * 3
+        self.assertTrue(mux.handle(ia, wire.encode(bueno, 9, 1), 1.0))
+        vacio = T()                                                   # sin llenar: position, kp y kd traen NaN
+        self.assertFalse(mux.handle(ia, wire.encode(vacio, 10, 1), 1.1))
+
+
 def _motor_bin():
     base = Path(__file__).resolve().parent.parent / "build" / "bin"
     for nombre in ("tutorial_motor", "tutorial_motor.exe", "Release/tutorial_motor.exe"):

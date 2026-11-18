@@ -1754,6 +1754,161 @@ class TestMuxHeredaLista(unittest.TestCase):
         self.assertNotIn("vale también", joints_lines(self.load(MINIMO + joints()))[0])
 
 
+class TestMuxHeredaFormasRaras(unittest.TestCase):
+    """La regla de herencia con formas raras (RFC 0013 D6 = d): cadenas, ciclos, repetidos, perfiles y máquinas."""
+
+    load = TestJoints.load
+    assertConfigError = TestJoints.assertConfigError
+    mux_cmd = staticmethod(TestMuxHeredaLista.mux_cmd)
+    LISTA = ",".join(PATAS)
+
+    def load_con_tope(self, text, profile=None, tope=20):
+        """load() en un hilo con tope: un ciclo mal resuelto no debe colgar la prueba (ni agmen run)."""
+        res: list = []
+
+        def hacer():
+            try:
+                res.append(self.load(text, profile))
+            except Exception as e:     # (se devuelve para que la prueba lo vea)
+                res.append(e)
+        t = threading.Thread(target=hacer, daemon=True)
+        t.start()
+        t.join(tope)
+        self.assertFalse(t.is_alive(), "load_config no termina (¿ciclo de [[mux]] sin resolver?)")
+        return res[0]
+
+    def test_cadena_de_tres_mux_en_cualquier_orden(self):
+        import itertools
+
+        piezas = [mux("m1", "/patas/cmd", ("a", "/c/a", 1)), mux("m2", "/c/a", ("b", "/c/b", 1)),
+                  mux("m3", "/c/b", ("c", "/c/c", 1), ("d", "/c/d", 2))]
+        for orden in itertools.permutations(piezas):
+            with self.subTest(orden=[p.split('"')[1] for p in orden]):
+                cfg = self.load(MINIMO + joints(require_names=True) + "".join(orden))
+                self.assertEqual({e.topic for e in cfg.inherited}, {"/c/a", "/c/b", "/c/c", "/c/d"})
+                self.assertTrue(all(e.require and e.group == "patas" for e in cfg.inherited))
+                for m in ("m1", "m2", "m3"):
+                    cmd = self.mux_cmd(cfg, m)
+                    self.assertEqual(cmd.count("--names"), 1, cmd)
+                    self.assertEqual(cmd[cmd.index("--names") + 1], self.LISTA)
+                names, req = hub_args(cfg)
+                self.assertEqual(req, {"/patas/cmd", "/c/a", "/c/b", "/c/c", "/c/d"})
+                self.assertEqual(set(names), {"/patas/cmd", "/patas/estado", "/c/a", "/c/b", "/c/c", "/c/d"})
+
+    def test_ciclo_termina_y_no_repite_topics_en_el_hub(self):
+        # La salida del mux m1 (el comando) es entrada de m2, y la salida de m2 es entrada de m1: un ciclo.
+        texto = (MINIMO + joints(require_names=True) + mux("m1", "/patas/cmd", ("x", "/c/x", 1))
+                 + mux("m2", "/c/x", ("vuelta", "/patas/cmd", 1)))
+        cfg = self.load_con_tope(texto)
+        self.assertNotIsInstance(cfg, Exception, f"un ciclo no debería ser un error de robot.toml: {cfg!r}")
+        self.assertEqual([e.topic for e in cfg.inherited], ["/c/x"])       # /patas/cmd ya llevaba la lista
+        for m in ("m1", "m2"):
+            self.assertEqual(self.mux_cmd(cfg, m).count("--names"), 1)
+        # El hub no recibe un topic dos veces (el hub rechaza --names repetido).
+        cmd = hub_cmd(cfg)[0]
+        topics = [cmd[i + 1].split("=", 1)[0] for i, a in enumerate(cmd) if a == "--names"]
+        self.assertEqual(len(topics), len(set(topics)), topics)
+
+    def test_ciclo_de_tres_y_ciclo_sin_joints(self):
+        ciclo = (mux("m1", "/c/a", ("x", "/c/b", 1)) + mux("m2", "/c/b", ("x", "/c/c", 1))
+                 + mux("m3", "/c/c", ("x", "/c/a", 1)))
+        cfg = self.load_con_tope(MINIMO + joints() + ciclo)             # ningún topic del ciclo es de [[joints]]
+        self.assertEqual(cfg.inherited, [])
+        enganchado = ciclo + mux("m4", "/patas/cmd", ("x", "/c/a", 1))
+        cfg = self.load_con_tope(MINIMO + joints() + enganchado)       # y uno que sí entra al ciclo
+        self.assertEqual({e.topic for e in cfg.inherited}, {"/c/a", "/c/b", "/c/c"})
+
+    def test_ciclo_con_dos_listas_distintas_es_error_y_no_cuelga(self):
+        brazo = joints("brazo", names=["hombro", "codo"], kp=None, kd=None)
+        texto = (MINIMO + joints() + brazo + mux("m1", "/patas/cmd", ("x", "/c/x", 1))
+                 + mux("m2", "/c/x", ("y", "/brazo/cmd", 1)))
+        r = self.load_con_tope(texto)
+        self.assertIsInstance(r, ConfigError)
+        self.assertIn("llevaría dos listas de nombres distintas", str(r))
+
+    def test_la_salida_es_el_state(self):
+        cfg = self.load(MINIMO + joints(require_names=True) + mux("eco", "/patas/estado", ("a", "/eco/a", 1)))
+        cmd = self.mux_cmd(cfg, "eco")
+        self.assertEqual(cmd[cmd.index("--names") + 1], self.LISTA)
+        names, req = hub_args(cfg)
+        self.assertEqual(names["/eco/a"], self.LISTA)
+        self.assertEqual(req, {"/patas/cmd"})                    # ni la salida (state) ni la entrada se exigen
+
+    def test_la_misma_entrada_en_dos_mux_del_mismo_grupo(self):
+        texto = (MINIMO + joints(require_names=True) + mux("m1", "/patas/cmd", ("ia", "/cmd/ia", 1))
+                 + mux("m2", "/patas/cmd", ("ia", "/cmd/ia", 2)))
+        cfg = self.load(texto)
+        for m in ("m1", "m2"):
+            self.assertIn("--names", self.mux_cmd(cfg, m))
+        cmd = hub_cmd(cfg)[0]
+        self.assertEqual([a for a in cmd if a.startswith("/cmd/ia=")], [f"/cmd/ia={self.LISTA}"])
+        self.assertEqual(cmd.count("/cmd/ia"), 1)                # un solo --require-names /cmd/ia
+
+    def test_la_entrada_es_la_propia_salida(self):
+        for salida in ("/patas/cmd", "/patas/estado"):
+            with self.subTest(salida=salida):
+                r = self.load_con_tope(MINIMO + joints(require_names=True) + mux("m", salida, ("rizo", salida, 1)))
+                self.assertIsInstance(r, ConfigError)      # (ya se rechaza antes de heredar nada, y lo dice claro)
+                self.assertIn(f"{salida} se usa dos veces (entradas y salida deben ser puertos distintos)", str(r))
+
+    def test_joints_sin_command(self):
+        sin_cmd = joints(command=None)
+        cfg = self.load(MINIMO + sin_cmd + mux("m", "/patas/cmd", ("ia", "/cmd/ia", 1)))     # salida ajena al grupo
+        self.assertEqual(cfg.inherited, [])
+        self.assertNotIn("--names", self.mux_cmd(cfg, "m"))
+        cfg = self.load(MINIMO + sin_cmd + mux("m", "/patas/estado", ("ia", "/cmd/ia", 1)))  # salida = su state
+        self.assertEqual([e.topic for e in cfg.inherited], ["/cmd/ia"])
+        self.assertFalse(cfg.inherited[0].require)
+        # require_names sin command no es válido (ya lo dice el grupo), con o sin mux
+        self.assertConfigError(MINIMO + joints(command=None, require_names=True)
+                               + mux("m", "/patas/estado", ("ia", "/cmd/ia", 1)), "no tiene command")
+
+    def test_joints_solo_command_y_mux_a_otro_perfil(self):
+        texto = (MINIMO + joints(profile="sim") + mux("m", "/patas/cmd", ("ia", "/cmd/ia", 1), extra='profile = "real"\n')
+                 + mux("n", "/patas/cmd", ("ib", "/cmd/ib", 1)))
+        sim = self.load(texto, "sim")        # el mux 'm' no corre en sim; el 'n' sí
+        self.assertEqual([e.topic for e in sim.inherited], ["/cmd/ib"])
+        real = self.load(texto, "real")      # en real no hay [[joints]]
+        self.assertEqual(real.inherited, [])
+        self.assertTrue(all("--names" not in n.cmd for n in real.nodes))
+
+    def test_mux_en_otra_maquina_lleva_la_lista(self):
+        texto = (MINIMO + maquina("robot", "192.168.1.20") + joints(require_names=True)
+                 + mux("m", "/patas/cmd", ("ia", "/cmd/ia", 1), extra='machine = "robot"\n'))
+        cfg = self.load(texto)
+        self.assertEqual([e.topic for e in cfg.inherited], ["/cmd/ia"])
+        m = next(n for n in cfg.nodes if n.name == "m")
+        self.assertEqual(m.machine, "robot")
+        self.assertEqual(m.cmd[m.cmd.index("--names") + 1], self.LISTA)
+
+    def test_nombres_con_signos_raros_viajan_enteros_al_mux(self):
+        raros = ["_a", "b/c.d-1", "9", "x.y"]
+        cfg = self.load(MINIMO + joints(names=raros, kp=None, kd=None) + mux("m", "/patas/cmd", ("ia", "/cmd/ia", 1)))
+        cmd = self.mux_cmd(cfg, "m")
+        self.assertEqual(cmd[cmd.index("--names") + 1].split(","), raros)
+        names, _ = hub_args(cfg)
+        self.assertEqual(names["/cmd/ia"], ",".join(raros))
+
+    def test_la_linea_de_comandos_enorme_es_un_error_claro(self):
+        # 120 nombres de 64 caracteres (cabe en un grupo): con las entradas heredadas, el hub no cabe y lo dice.
+        largos = [("n%03d" % i).ljust(64, "x") for i in range(120)]
+        base = MINIMO + joints(names=largos, kp=None, kd=None, require_names=True)
+        hub_args(self.load(base))                             # sin mux, el hub cabe
+        texto = base + mux("m", "/patas/cmd", *[(f"e{k}", f"/entrada/{k}", k + 1) for k in range(6)])
+        with self.assertRaises(ConfigError) as ctx:
+            hub_args(self.load(texto))
+        self.assertIn("no caben en la línea de comandos del agmen hub", str(ctx.exception))
+        self.assertIn("entradas de [[mux]]", str(ctx.exception))
+
+
+def hub_cmd(cfg):
+    """[la línea de comandos del agmen hub] (en una lista, para usar next/[0])."""
+    from agmen.run import prepare_hub
+
+    cfg, _ = prepare_hub(cfg, ping=lambda a: None)
+    return [next(n for n in cfg.nodes if n.name == "hub").cmd]
+
+
 # --- un hub anterior no compara los nombres: agmen run lo avisa (RFC 0013 D6 = d) ----------------------------------
 
 class TestHubAnteriorAviso(unittest.TestCase):
@@ -1863,6 +2018,174 @@ class TestHubAnteriorAviso(unittest.TestCase):
         self.assertEqual(correr(None, {"robot": "0.14.0"}), [])       # (sin config, como en las pruebas de la sonda)
         self.propia("0.14.0")
         self.assertEqual(correr(con, {"robot": "0.13.0"}), [])        # la propia todavía es anterior
+
+
+class TestVersionesRaras(unittest.TestCase):
+    """version_key / version_at_least / old_hub_text con versiones raras (RFC 0013 D6 = d, aviso de hub anterior)."""
+
+    load = TestJoints.load
+    propia = TestHubAnteriorAviso.propia
+
+    def test_version_key_nunca_lanza_y_lo_raro_es_anterior(self):
+        from agmen import hubproto as hp
+
+        raras = ["0.15.0rc1", "0.15", "v0.15.0", "", "?", "x" * 5000, "0.15.0\x00", "0.15.0\x1b[31m", "\x00" * 10,
+                 "٠.١٥.٠", "0.15.0+build5", "0.15.0-é", "1" * 5000 + ".0.0", "9" * 10 + ".0.0", "0.15.0-" + "a" * 5000,
+                 b"0.15.0", 15, 0.15, [], {}, object()]
+        for v in raras:
+            with self.subTest(v=repr(v)[:40]):
+                key = hp.version_key(v)
+                at_least = hp.version_at_least(v, hp.NAMES_SINCE)
+                if key is None:
+                    self.assertFalse(at_least)                       # lo que no se entiende cuenta como anterior
+        for v in ("0.15.0rc1", "0.15", "v0.15.0", "", "?", "x" * 5000, "0.15.0\x00", b"0.15.0", 15, None):
+            self.assertFalse(hp.version_at_least(v, hp.NAMES_SINCE), repr(v)[:30])
+        self.assertTrue(hp.version_at_least("0.15.0", "0.15.0"))
+        self.assertTrue(hp.version_at_least("1.0.0", "0.15.0"))
+        self.assertFalse(hp.version_at_least("0.9.99", "0.15.0"))
+        self.assertFalse(hp.version_at_least("0.15.0-dev", "0.15.0"))
+        self.assertTrue(hp.version_at_least("0.15.1-dev", "0.15.0"))
+        self.assertEqual(hp.version_key("0.15.0"), (0, 15, 0, 1))
+
+    def test_version_de_5000_caracteres_es_rapida(self):
+        from agmen import hubproto as hp
+
+        t0 = time.perf_counter()
+        for v in ("1" * 5000, "0.15.0-" + "-" * 5000, "x" * 5000, "1." * 2500):
+            hp.version_key(v)
+            hp.version_at_least(v, hp.NAMES_SINCE)
+        self.assertLess(time.perf_counter() - t0, 1.0)
+
+    def test_FALLA_REAL_el_texto_del_aviso_no_tiene_caracteres_de_control(self):
+        """FALLA REAL. old_hub_text(version="0.14.0\\n") copia la versión tal cual (version_key hace strip() y la
+        entiende, pero el texto usa la original): salen \\n, \\r, \\x0b, \\x1c, \\x85 en el aviso. Esperado: nada
+        que no se pueda imprimir, como con las versiones que no se entienden (_clip).
+        Reproducir: python -m unittest test_run.TestVersionesRaras.test_FALLA_REAL_el_texto_del_aviso_no_tiene_"""
+        "caracteres_de_control"
+        from agmen.run import old_hub_text
+
+        self.propia("0.15.0")
+        # Se entienden después de quitar espacios (str.strip), y entonces el aviso las copia tal cual.
+        for v in ("0.14.0\n", "0.14.0\r\n", "\x0b0.14.0", "0.14.0\x1c", "0.14.0-dev\n", "0.14.0\x85"):
+            with self.subTest(v=repr(v)):
+                t = old_hub_text(v, "x tiene", "y")
+                self.assertIsNotNone(t)
+                self.assertEqual([c for c in t if not c.isprintable()], [], repr(t))
+        for v in ("0.14.0\x1b[2J", "\x00", "a\nb", "0.15.0\x00"):         # y las que no se entienden
+            t = old_hub_text(v, "x tiene", "y")
+            self.assertEqual([c for c in t if not c.isprintable()], [], repr(t))
+
+    def test_FALLA_REAL_el_texto_del_aviso_no_crece_sin_tope(self):
+        """FALLA REAL. Una versión que sí se entiende pero trae un sufijo de 5000 letras ("0.14.0-aaaa…") se copia
+        entera al aviso (5272 caracteres). Las que no se entienden sí se recortan a 40 (_clip). Esperado: tope.
+        Reproducir: python -m unittest test_run.TestVersionesRaras.test_FALLA_REAL_el_texto_del_aviso_no_crece_"""
+        "sin_tope"
+        from agmen.run import old_hub_text
+
+        self.propia("0.15.0")
+        for v in ("x" * 5000, "0.14.0-" + "a" * 5000, "0.14." + "9" * 5000, "?" * 100_000):
+            with self.subTest(v=v[:20]):
+                t = old_hub_text(v, "x tiene", "y")
+                self.assertLess(len(t), 1000, f"el aviso mide {len(t)} caracteres con una versión de {len(v)}")
+
+    def test_FALLA_REAL_aviso_en_connect_con_version_enorme_o_con_controles(self):
+        """FALLA REAL (la misma causa, por el camino de una [[machine]]: cli._connect). Solo falla con "0.14.0-dev\\n";
+        con 5000 'x', con escapes y con vacío el aviso sale limpio.
+        Reproducir: python -m unittest test_run.TestVersionesRaras.test_FALLA_REAL_aviso_en_connect_con_version_"""
+        "enorme_o_con_controles"
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from agmen import agent, cli
+
+        class Enlace:
+            def __init__(self, name, version):
+                self.name, self.version, self.shown, self.address = name, version, "10.0.0.5:7391", None
+                self.waiting, self.on_lost = False, None
+
+            def watch_clock(self, clock):
+                pass
+
+            def open(self, key, msg, on_key_ok=None, stop=None):
+                pass
+
+            def close(self):
+                pass
+
+        self.propia("0.15.0")
+        con = self.load(MINIMO + joints())
+        for version in ("0.14.0-dev\n", "x" * 5000, "0.14.0\x1b[2J", ""):
+            with self.subTest(version=repr(version)[:30]):
+                dicho: list[str] = []
+                launcher = SimpleNamespace(say=lambda t, k="agmen": dicho.append(t))
+                with mock.patch.object(agent, "session_message", lambda *a, **k: {}):
+                    cli._connect(launcher, con, {"robot": Enlace("robot", version)}, {"robot": ("k", "variable")},
+                                 "real", [], threading.Event())
+                avisos = [t for t in dicho if "anterior a 0.15.0" in t]
+                self.assertEqual(len(avisos), 1, dicho)
+                self.assertEqual([c for c in avisos[0] if not c.isprintable()], [], repr(avisos[0][:120]))
+                self.assertLess(len(avisos[0]), 1000, len(avisos[0]))
+
+    def test_una_vez_por_computadora_y_ni_una_sin_joints(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from agmen import agent, cli
+
+        class Enlace:
+            def __init__(self, name, version):
+                self.name, self.version, self.shown, self.address = name, version, "10.0.0.5:7391", None
+                self.waiting, self.on_lost = False, None
+
+            def watch_clock(self, clock):
+                pass
+
+            def open(self, key, msg, on_key_ok=None, stop=None):
+                pass
+
+            def close(self):
+                pass
+
+        self.propia("0.15.0")
+        con, sin = self.load(MINIMO + joints()), self.load(MINIMO)
+        for cfg, esperadas in ((con, 3), (sin, 0)):
+            dicho: list[str] = []
+            launcher = SimpleNamespace(say=lambda t, k="agmen": dicho.append(t))
+            links = {n: Enlace(n, "0.14.0") for n in ("a", "b", "c")}
+            with mock.patch.object(agent, "session_message", lambda *a, **k: {}):
+                cli._connect(launcher, cfg, links, {n: ("k", "variable") for n in links}, "real", [],
+                             threading.Event())
+            avisos = [t for t in dicho if "anterior a 0.15.0" in t]
+            self.assertEqual(len(avisos), esperadas, dicho)
+            self.assertEqual(len({a.split(" ")[1] for a in avisos}), esperadas)    # una por nombre de computadora
+
+    def test_FALLA_REAL_hub_local_viejo_con_version_rara_o_enorme(self):
+        """FALLA REAL (la misma causa, por el camino del hub local que ya corría: prepare_hub). Solo falla con
+        "0.14.0-dev\\n". Reproducir: python -m unittest test_run.TestVersionesRaras.test_FALLA_REAL_hub_local_viejo_"""
+        "con_version_rara_o_enorme"
+        from agmen.run import prepare_hub
+
+        self.propia("0.15.0")
+        con = self.load(MINIMO + joints())
+        for v in ("", "?", "x" * 5000, "0.14.0\x1b[2J", "0.14.0-dev\n"):
+            with self.subTest(v=repr(v)[:30]):
+                cfg, nota = prepare_hub(con, ping=lambda a, v=v: v)
+                avisos = [w for w in cfg.warnings if "anterior a 0.15.0" in w]
+                self.assertEqual(len(avisos), 1)
+                self.assertEqual([c for c in avisos[0] if not c.isprintable()], [], repr(avisos[0][:120]))
+                self.assertLess(len(avisos[0]), 1000, len(avisos[0]))
+
+    def test_la_version_propia_en_0_15_0_con_hub_en_0_14_0_avisa_y_al_reves_no(self):
+        from agmen.run import old_hub_text
+
+        self.propia("0.15.0")
+        self.assertIsNotNone(old_hub_text("0.14.0", "x tiene", "y"))
+        self.assertIsNone(old_hub_text("0.15.0", "x tiene", "y"))
+        self.propia("0.14.0")
+        self.assertIsNone(old_hub_text("0.15.0", "x tiene", "y"))          # al revés: nada
+        self.assertIsNone(old_hub_text("0.14.0", "x tiene", "y"))
+        self.propia("garbage")
+        self.assertIsNone(old_hub_text("0.1.0", "x tiene", "y"))           # la propia no se entiende: no se avisa
 
 
 if __name__ == "__main__":
