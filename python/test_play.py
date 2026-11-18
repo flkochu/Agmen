@@ -1376,6 +1376,14 @@ class TestPlaySinRespuestaDelHub(unittest.TestCase):
                 path = os.path.join(self.dir, f"patas{n}.mcap")
                 grabacion_de_patas(path, n=n)
                 senal = self._senal_al_mandar(n) if espera is None else None
+                if senal is not None:
+                    # El hub arranca cuando ya se mandó todo y contesta en la espera del final: se le da más
+                    # margen que los 0.2-0.3 s de verdad (la del principio queda igual, 0.7 s), para que una
+                    # máquina lenta no cambie el caso. La espera del final termina en cuanto el hub contesta.
+                    for nombre, valor in (("_ESPERA_HUB", 3.7), ("_ESPERA_FINAL", 3.0)):
+                        parche = mock.patch.object(play, nombre, valor)
+                        parche.start()
+                        self.addCleanup(parche.stop)
                 self._hub_tarde(espera, senal)
                 out = io.StringIO()
                 p = play.Player(path, out=out)

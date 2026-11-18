@@ -435,7 +435,10 @@ class Cap19:
     def traduce(self, texto: str) -> str:
         """Lo que sale de agmen run (o de un comando con él corriendo), con el [web] listen libre que se le puso
         traducido de vuelta al del capítulo: lo que se compara es lo que vería quien corre el capítulo."""
-        return texto.replace(self.listen, _LISTEN_CAPITULO) if self.listen != _LISTEN_CAPITULO else texto
+        if self.listen == _LISTEN_CAPITULO:
+            return texto
+        # (?!\d): el puerto entero, no el principio de otro más largo (127.0.0.1:5432 dentro de …:54321).
+        return re.sub(re.escape(self.listen) + r"(?!\d)", _LISTEN_CAPITULO, texto)
 
     def reporta(self, nombre: str, ok: bool, detalle: str = "", salida: str = "") -> bool:
         print(f"{'OK  ' if ok else 'FALLA'} capítulo 19: {nombre}" + ("" if ok or not detalle else f"\n{detalle}"))
