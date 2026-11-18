@@ -35,7 +35,7 @@ from agmen import _backend, pubsub, wire
 from agmen import hub as H
 from agmen import hubproto as hp
 from agmen import tables as T
-from agmen.msgs import JointCommand, JointState
+from agmen.msgs import Imagen, JointCommand, JointState
 from agmen.run import ConfigError, load_config, prepare_hub
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -133,10 +133,14 @@ class FalsoHub:
         patch.start()
         case.addCleanup(patch.stop)
 
-    def registro(self, op: str) -> bytes:
+    def registro(self, op: str, node: str | None = None) -> bytes:
+        """La siguiente línea `op` que llegue; con `node`, la siguiente de ese nodo (las de otro nodo se saltan: el
+        latido de un Subscriber de antes que alcanzó a salir antes de cerrarse)."""
         while True:
             data, _ = self.sock.recvfrom(65536)
-            if data.startswith(f"{hp.PREFIX} {op} ".encode()):
+            if not data.startswith(f"{hp.PREFIX} {op} ".encode()):
+                continue
+            if node is None or hp.parse(data)[0][1].get("node") == node:
                 return data
 
 
@@ -2037,7 +2041,9 @@ class TestNombresSinDuplicar(unittest.TestCase):
 # ValueError (y en un subproceso, env= con ese valor tampoco sirve). Con '%', que en la línea del hub va como "%25"
 # (3 bytes por carácter, y es ASCII: mide lo mismo leído por Python y por el núcleo de C++ en cualquier página de
 # códigos), el registro pasa de 65507 bytes con menos de 25 000 caracteres: la MISMA prueba corre en Linux y Windows.
-MAX_ENV = 32766
+# El tope de Windows es para todo `NOMBRE=valor` (con el '\0'), no solo para el valor: las pruebas no pasan de 32 000
+# caracteres en el valor, que deja lugar de sobra para el nombre de la variable y el '='.
+MAX_ENV = 32000
 
 
 def nodo_que_mide(n: int) -> str:
@@ -2323,11 +2329,14 @@ class TestRegistroQueNoCabe(unittest.TestCase):
         self.addCleanup(patch.stop)
 
     @staticmethod
-    def peor_sub(nucleo: str, nodo: str, tipo, names=None) -> bytes:
-        """La línea `sub` más larga que puede mandar un Subscriber no arrow de ese núcleo: puertos de 5 dígitos y
-        net=1; `tcp=` vacío en Python puro, sin el campo en C++ (como la línea de verdad de cada uno)."""
-        tcp = {"tcp": ""} if nucleo == "puro" else {}
-        return hp.encode("sub", id="0" * 16, node=nodo, pid=os.getpid(), topic="/x", schema="0" * 16, type=tipo.NAME,
+    def peor_sub(nucleo: str, nodo: str, tipo, names=None, *, arrow: bool = False, schema: str = "0" * 16) -> bytes:
+        """La línea `sub` más larga que puede mandar un Subscriber de ese núcleo: puertos de 5 dígitos y net=1. Con
+        un tipo arrow, `tcp=` con su puerto; sin arrow, `tcp=` vacío en Python puro y sin el campo en C++ (como la
+        línea de verdad de cada uno). `tipo`: la clase del mensaje o el texto de `type=`; `schema`: "*" en
+        RawSubscriber."""
+        tcp = {"tcp": 65535} if arrow else {"tcp": ""} if nucleo == "puro" else {}
+        type_name = tipo if isinstance(tipo, str) else tipo.NAME
+        return hp.encode("sub", id="0" * 16, node=nodo, pid=os.getpid(), topic="/x", schema=schema, type=type_name,
                          port=65535, **tcp, **({"names": ",".join(names)} if names else {}), net=1)
 
     @staticmethod
@@ -2366,7 +2375,7 @@ class TestRegistroQueNoCabe(unittest.TestCase):
         with self.assertRaises((socket.timeout, TimeoutError)):
             self.falso.sock.recvfrom(65536)
 
-    def test_nombre_enorme_sin_agmen_node_el_de_agmen_node(self):
+    def test_nombre_enorme_de_set_default_node_name_sin_variable_de_entorno_da_error_claro(self):
         """Sin AGMEN_NODE, el nombre que se le dio al nodo (set_default_node_name, lo llama agmen.Node): no viaja por
         el entorno, así que puede medir 70 000 caracteres en cualquier sistema. El mismo texto en los dos núcleos."""
         T2 = JointCommand[2]
@@ -2418,36 +2427,76 @@ class TestRegistroQueNoCabe(unittest.TestCase):
                     core.Subscriber("/x", T2.NAME, T2.SCHEMA_TEXT, T2.SCHEMA_ID, T2.LAYOUT.size or 0, False, names)
                 self.assertEqual(str(ctx.exception), self.esperado("Subscriber", T2, names, "nativo"))
 
+    def borde(self, nucleo: str, crear, quien: str, tipo, names=None, *, arrow: bool = False,
+              schema: str = "0" * 16, por_entorno: bool = True):
+        """Un Subscriber (o RawSubscriber, o Node.on) cuya línea más larga mide justo 65507: se crea y manda su
+        registro, y la línea que llega más lo que le falta (puertos de 5 dígitos y net=1) mide exactamente 65507;
+        con un byte más, el error de Python (ValueError, antes de abrir nada) con el tamaño exacto. `crear(nodo)`
+        crea el endpoint (con `por_entorno`, el nombre va en AGMEN_NODE) y devuelve lo que hay que cerrar."""
+        base = len(self.peor_sub(nucleo, "", tipo, names, arrow=arrow, schema=schema))
+        k = 65507 - base                                   # los bytes que debe medir el nombre en la línea
+        nodo = "%" * (k // 3) + "n" * (k % 3)
+        self.assertEqual(len(self.peor_sub(nucleo, nodo, tipo, names, arrow=arrow, schema=schema)), 65507)
+        self.assertLessEqual(len(nodo), MAX_ENV)
+
+        def entorno(n):
+            return mock.patch.dict(os.environ, {"AGMEN_NODE": n} if por_entorno else {})
+
+        with self.subTest(nucleo=nucleo, quien=quien, arrow=arrow, names=names, borde="cabe"):
+            err = io.StringIO()
+            with entorno(nodo), contextlib.redirect_stderr(err):
+                o = crear(nodo)
+                self.addCleanup(o.close)
+                linea = self.falso.registro("sub", node=nodo)
+            (op, f), = hp.parse(linea)
+            self.assertEqual((op, f["node"], f["topic"]), ("sub", nodo, "/x"))
+            self.assertEqual(len(f["schema"]), len(schema))           # 16 dígitos hex, o "*"
+            if schema == "*":
+                self.assertEqual(f["schema"], "*")
+            self.assertNotIn("net", f)
+            self.assertEqual("tcp" in f, arrow or nucleo == "puro")   # la línea de verdad de cada núcleo
+            falta = 5 - len(f["port"]) + len(" net=1") + (5 - len(f["tcp"]) if f.get("tcp") else 0)
+            self.assertEqual(len(linea) + falta, 65507)
+            o.close()
+        with self.subTest(nucleo=nucleo, quien=quien, arrow=arrow, names=names, borde="un byte más"):
+            with entorno(nodo + "n"), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(ValueError) as ctx:
+                    crear(nodo + "n")
+            self.assertTrue(str(ctx.exception).startswith(f"{quien} en '/x': el registro en el hub mide 65508 bytes "
+                                                          f"y en un datagrama caben 65507 "),
+                            str(ctx.exception)[:200])
+
     def test_subscriber_justo_en_el_borde(self):
         """La medida es la de la línea más larga que ese Subscriber puede mandar de verdad (no la de otro núcleo ni
         con un tcp que no manda): con 65507 bytes se crea y manda su registro; con uno más, el error con el tamaño
-        exacto."""
-        T2 = JointCommand[2]
-        for nucleo, _, Sub in self.clases():
+        exacto. Con un tipo que no es arrow y con uno arrow (que manda tcp en los dos núcleos), con y sin names."""
+        for tipo, arrow in ((JointCommand[2], False), (Imagen, True)):
+            for nucleo, _, Sub in self.clases():
+                for names in (None, ["a", "b"]):
+                    self.borde(nucleo, lambda _n, Sub=Sub, tipo=tipo, names=names: Sub(tipo, "/x", names=names),
+                               "Subscriber", tipo, names, arrow=arrow)
+
+    def test_raw_subscriber_justo_en_el_borde(self):
+        """RawSubscriber (y la grabadora) manda schema=* (1 carácter, no 16) y type= vacío: se mide con eso."""
+        self.borde("puro", lambda n: pubsub.RawSubscriber("/x", node=n), "RawSubscriber", "", arrow=True,
+                   schema="*", por_entorno=False)
+
+    def test_node_on_justo_en_el_borde(self):
+        """agmen.Node(...).on(...) mide como el Subscriber de su núcleo (con el núcleo de C++, Python revisa antes
+        con la línea de C++; en Python puro, Node.on crea un Subscriber). Con un tipo arrow y con uno que no."""
+        nucleo = "nativo" if _backend.NATIVE else "puro"
+        self.addCleanup(pubsub.set_default_node_name, pubsub._default_name)
+        for tipo, arrow in ((JointCommand[2], False), (Imagen, True)):
             for names in (None, ["a", "b"]):
-                base = len(self.peor_sub(nucleo, "", T2, names))
-                k = 65507 - base                                   # los bytes que debe medir el nombre en la línea
-                nodo = "%" * (k // 3) + "n" * (k % 3)
-                self.assertEqual(len(self.peor_sub(nucleo, nodo, T2, names)), 65507)
-                self.assertLessEqual(len(nodo), MAX_ENV)
-                with self.subTest(nucleo=nucleo, names=names, borde="cabe"):
-                    err = io.StringIO()
-                    with mock.patch.dict(os.environ, {"AGMEN_NODE": nodo}), contextlib.redirect_stderr(err):
-                        s = Sub(T2, "/x", names=names)
-                        self.addCleanup(s.close)
-                        linea = self.falso.registro("sub")
-                    (op, f), = hp.parse(linea)
-                    self.assertEqual((op, f["node"], f["topic"]), ("sub", nodo, "/x"))
-                    self.assertLessEqual(len(linea), 65507)
-                    self.assertEqual("tcp" in f, nucleo == "puro")   # la línea de verdad de cada núcleo
-                    s.close()
-                with self.subTest(nucleo=nucleo, names=names, borde="un byte más"):
-                    with mock.patch.dict(os.environ, {"AGMEN_NODE": nodo + "n"}):
-                        with self.assertRaises(ValueError) as ctx:
-                            Sub(T2, "/x", names=names)
-                    self.assertTrue(str(ctx.exception).startswith("Subscriber en '/x': el registro en el hub mide "
-                                                                  "65508 bytes y en un datagrama caben 65507 "),
-                                    str(ctx.exception)[:200])
+                def crear(_n, tipo=tipo, names=names):
+                    nodo = agmen.Node("borde")
+                    try:
+                        nodo.on(tipo, "/x", lambda s: None, names=names)
+                    except BaseException:
+                        nodo.close()
+                        raise
+                    return nodo
+                self.borde(nucleo, crear, "Subscriber", tipo, names, arrow=arrow)
 
     def test_quien_cabe_registra_la_linea_de_siempre(self):
         err = io.StringIO()

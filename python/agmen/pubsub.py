@@ -139,7 +139,8 @@ def joint_names_for(msg_type, where: str, names, who: str) -> tuple[str, ...] | 
 
 
 # El puerto más largo que puede tener un Subscriber en su registro: el tamaño se mide antes de abrir nada, con el
-# peor caso (port y tcp de 5 dígitos, y net=1, que se añade si el hub pasa a modo red), igual en C++ (src/pubsub.cpp).
+# peor caso: `port` de 5 dígitos, `tcp` como lo manda cada núcleo (ver sub_tcp_field; si va, también de 5 dígitos) y
+# net=1, que se añade si el hub pasa a modo red. Igual en C++ (src/pubsub.cpp).
 _WORST_PORT = 65535
 
 # El campo tcp del registro de un Subscriber, como lo manda de verdad cada núcleo (sub_tcp de
@@ -170,7 +171,7 @@ def _utf8(text: str) -> bool:
 
 
 def check_registration_fits(kind: str, who: str, where: str, node: str, type_name: str, schema_text: str,
-                            names: tuple[str, ...] | None, sub_tcp=_SIN_DAR) -> None:
+                            names: tuple[str, ...] | None, sub_tcp=_SIN_DAR, *, schema: str = "0" * 16) -> None:
     """La línea de registro de un Publisher (`kind` "pub") o un Subscriber ("sub") de topic debe caber en un
     datagrama (wire.MAX_DATAGRAM): si no, el registro nunca sale y el usuario solo vería "no hay un agmen hub". Se
     revisa al crear, antes de abrir nada, con o sin names; ValueError que dice cuánto mide, cuánto ocupa cada parte
@@ -180,22 +181,23 @@ def check_registration_fits(kind: str, who: str, where: str, node: str, type_nam
 
     Se mide la línea más larga que ese endpoint puede llegar a mandar de verdad: la de su núcleo, con puertos de 5
     dígitos y, en un Subscriber, net=1. `sub_tcp` (obligatorio con "sub", ver sub_tcp_field): el valor de `tcp=`
-    como lo manda ese núcleo, o TCP_SIN_CAMPO si no lo manda."""
+    como lo manda ese núcleo, o TCP_SIN_CAMPO si no lo manda. `schema`: el valor de `schema=` como va en la línea
+    (16 dígitos hex, o "*" en RawSubscriber y la grabadora)."""
     if kind != "pub" and sub_tcp is _SIN_DAR:
         raise TypeError("check_registration_fits('sub', ...): falta sub_tcp (usa sub_tcp_field)")
     try:
-        _check_registration_fits(kind, who, where, node, type_name, schema_text, names, sub_tcp)
+        _check_registration_fits(kind, who, where, node, type_name, schema_text, names, sub_tcp, schema)
     except hp.ProtocolError as e:   # un nombre de nodo que no es UTF-8: el texto de hp.quote, con quién y dónde
         raise hp.ProtocolError(f"{who} en '{where}': {e}") from None
 
 
-def _check_registration_fits(kind, who, where, node, type_name, schema_text, names, sub_tcp) -> None:
+def _check_registration_fits(kind, who, where, node, type_name, schema_text, names, sub_tcp, schema) -> None:
     names_field = hp.format_joint_names(names) if names is not None else None
     if kind == "pub":
-        fields = dict(id="0" * 16, node=node, pid=os.getpid(), topic=where, schema="0" * 16, type=type_name,
+        fields = dict(id="0" * 16, node=node, pid=os.getpid(), topic=where, schema=schema, type=type_name,
                       text=schema_text)
     else:
-        fields = dict(id="0" * 16, node=node, pid=os.getpid(), topic=where, schema="0" * 16, type=type_name,
+        fields = dict(id="0" * 16, node=node, pid=os.getpid(), topic=where, schema=schema, type=type_name,
                       port=_WORST_PORT)
         if sub_tcp is not TCP_SIN_CAMPO:
             fields["tcp"] = sub_tcp
@@ -718,7 +720,7 @@ class _Receiver:
         if by_topic:   # antes de abrir nada: un registro que no cabe en un datagrama no sale nunca
             hp.check_topic(where, allow_wildcard=True)
             check_registration_fits("sub", self._NOMBRE, where, node or node_name(), type_name, "", names,
-                                    sub_tcp_field(tcp, native=False))
+                                    sub_tcp_field(tcp, native=False), schema=schema)
         # Modo red (RFC 0011 §2): solo por topic, y solo cuando el hub lo dice (un `ok` con peers).
         self._net_ip = _net_ip() if by_topic else None   # antes de abrir nada: si no sirve, error claro
         self._net = False                       # ya escucha en la red

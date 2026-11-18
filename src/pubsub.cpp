@@ -76,8 +76,9 @@ std::string pub_line(const std::string& id, const std::string& topic, const Type
 }
 
 /// El puerto más largo que puede tener un Subscriber en su registro: el tamaño se mide antes de abrir nada, con el
-/// peor caso (port y tcp de 5 dígitos, y net=1, que se añade si el hub pasa a modo red), igual que
-/// check_registration_fits de python/agmen/pubsub.py.
+/// peor caso: `port` de 5 dígitos, `tcp` solo con un tipo arrow (como lo manda el Subscriber de C++; también de 5
+/// dígitos) y net=1, que se añade si el hub pasa a modo red. Igual que check_registration_fits de
+/// python/agmen/pubsub.py.
 constexpr const char* kWorstPort = "65535";
 
 /// La línea de registro de un Publisher (`kind` "pub") o un Subscriber ("sub") de topic debe caber en un

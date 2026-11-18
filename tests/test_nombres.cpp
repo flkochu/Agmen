@@ -59,11 +59,12 @@ namespace wire = agmen::wire;
 namespace m = agmen::msgs;
 using wire::ByteView;
 
-/// En Windows una variable de entorno mide como mucho 32 767 caracteres (con el '\0'): con un valor más largo,
-/// _putenv_s no devuelve un error, sino que llama al manejador de "parámetro inválido" de la CRT, que en Release
-/// termina el proceso sin decir nada (0xc0000409). Las pruebas no deben pasar de este tope, en ningún sistema:
-/// así la misma prueba corre igual en Linux y en Windows.
-constexpr std::size_t kMaxEnvValue = 32766;
+/// En Windows una variable de entorno mide como mucho 32 767 caracteres, y el tope es para todo `NOMBRE=valor`
+/// (con el '\0'), no solo para el valor: con algo más largo, _putenv_s no devuelve un error, sino que llama al
+/// manejador de "parámetro inválido" de la CRT, que en Release termina el proceso sin decir nada (0xc0000409). Las
+/// pruebas no pasan de 32 000 caracteres en el valor, en ningún sistema: deja lugar de sobra para el nombre de la
+/// variable y el '=', y así la misma prueba corre igual en Linux y en Windows.
+constexpr std::size_t kMaxEnvValue = 32000;
 
 void set_env(const char* name, const char* value) {
     const std::size_t len = std::strlen(value);
@@ -446,6 +447,17 @@ std::string peor_sub(const std::string& nodo, const agmen::TypeInfo& type, const
     return hub::line("sub", f);
 }
 
+/// La siguiente línea `sub` de este nodo (las de otro nodo se saltan: un latido que alcanzó a mandar el Subscriber
+/// de una vuelta anterior antes de cerrarse); "" si no llega a tiempo.
+std::string sub_de(FakeHub& h, const std::string& nodo) {
+    const auto end = std::chrono::steady_clock::now() + 3s;
+    while (std::chrono::steady_clock::now() < end) {
+        const auto line = h.next("sub", 100ms);
+        if (!line.empty() && field(line, "node") == nodo) return line;
+    }
+    return {};
+}
+
 /// La medida es la de la línea más larga que el Subscriber puede mandar de verdad: con 65507 bytes se crea y manda
 /// su registro; con uno más, el error con el tamaño exacto. Con un tipo arrow (que sí manda tcp) y sin arrow.
 void test_subscriber_justo_en_el_borde() {
@@ -466,10 +478,17 @@ void test_subscriber_justo_en_el_borde() {
                     std::fprintf(stderr, "  (arrow=%d) no se creó en el borde: %.200s\n", arrow ? 1 : 0, e.what());
                 }
                 CHECK(sub.has_value());
-                const auto line = h.next("sub");
+                const auto line = sub_de(h, nodo);
                 CHECK(field(line, "node") == nodo);
-                CHECK(!line.empty() && line.size() <= hub::kMaxDatagram);
                 CHECK((line.find(" tcp=") != std::string::npos) == arrow);   // la línea de verdad
+                // La línea que llegó, con lo que le falta para ser la más larga (puertos de 5 dígitos y net=1),
+                // mide exactamente 65507: lo medido es esa línea, ni más ni menos.
+                if (!line.empty()) {
+                    std::size_t falta = 5 - field(line, "port").size() + std::string(" net=1").size();
+                    if (arrow) falta += 5 - field(line, "tcp").size();
+                    CHECK(line.find(" net=") == std::string::npos);
+                    CHECK(line.size() + falta == hub::kMaxDatagram);
+                }
             }
             const std::string mas = nodo + "n";
             set_env("AGMEN_NODE", mas.c_str());
@@ -922,7 +941,20 @@ void test_atacan_fugas_200_publishers_con_lista() {
     {   // calienta: el primer Publisher crea recursos globales que no son fugas
         agmen::Publisher<Cmd> p("/fuga", {.names = {"a", "b"}});
     }
-    std::this_thread::sleep_for(200ms);
+    // Se espera, con tope, a que el de calentamiento se haya registrado y despedido (su `bye`), no un tiempo fijo.
+    const auto calentado = std::chrono::steady_clock::now() + 3s;
+    for (;;) {
+        {
+            std::lock_guard lock(mu);
+            if (!registrados.empty() && registrados == despedidos) break;
+        }
+        if (std::chrono::steady_clock::now() >= calentado) {
+            std::fprintf(stderr, "  el Publisher de calentamiento no se despidió en 3 s\n");
+            CHECK(false);
+            break;
+        }
+        std::this_thread::sleep_for(10ms);
+    }
     const int antes = fds_abiertos();
     for (int i = 0; i < 200; ++i) {
         agmen::Publisher<Cmd> p("/fuga" + std::to_string(i % 7), {.names = {"a", "b"}});
@@ -970,8 +1002,10 @@ void correr(const char* nombre, void (*prueba)()) {
         std::fprintf(stderr, "  FALLA %s: lanzó algo que no es std::exception\n", nombre);
         ++g_failures;
     }
-    // Si la prueba se cortó a la mitad, el nombre del nodo puede haber quedado cambiado: las demás empiezan igual.
+    // Si la prueba se cortó a la mitad, el nombre del nodo puede haber quedado cambiado (el de AGMEN_NODE o el de
+    // set_default_node_name): las demás empiezan igual.
     set_env("AGMEN_NODE", "prueba-nombres");
+    hub::set_default_node_name("");
     std::fflush(stderr);
 }
 
