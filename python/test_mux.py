@@ -57,12 +57,14 @@ class TestMux(unittest.TestCase):
         return self.mux.handle(inp, wire.encode(Cmd(left, right), seq, 123), t)
 
     def test_una_sola_fuente_pasa_y_se_renumera(self):
+        self.anuncia(self.cerebro, 0.0)             # sin el anuncio del tipo el mux no reenvía comandos
         self.assertTrue(self.send(self.cerebro, 0.6, 0.6, 0.0, seq=500))
         self.assertTrue(self.send(self.cerebro, 0.6, 0.6, 0.05, seq=501))
         self.assertEqual(self.recv(), (0, (0.6, 0.6)))
         self.assertEqual(self.recv(), (1, (0.6, 0.6)))
 
     def test_teleop_le_gana_al_cerebro_y_luego_lo_suelta(self):
+        self.anuncia(self.cerebro, 0.0)             # sin el anuncio del tipo el mux no reenvía comandos
         self.assertTrue(self.send(self.cerebro, 0.6, 0.6, 0.00))
         self.assertTrue(self.send(self.teleop, 0.8, 0.3, 0.05))        # entra el humano
         self.assertFalse(self.send(self.cerebro, 0.6, 0.6, 0.10))      # el cerebro se descarta
@@ -77,6 +79,7 @@ class TestMux(unittest.TestCase):
         self.assertEqual(self.logs.count("manda 'cerebro' (prioridad 1)"), 2)
 
     def test_nadie_habla_no_inventa_nada(self):
+        self.anuncia(self.cerebro, 0.0)             # sin el anuncio del tipo el mux no reenvía comandos
         self.send(self.cerebro, 0.6, 0.6, 0.0)
         self.recv()
         self.mux._update_active(1.0)
@@ -86,6 +89,7 @@ class TestMux(unittest.TestCase):
             self.rx.recv(65536)
 
     def test_otro_tipo_de_mensaje_se_rechaza(self):
+        self.anuncia(self.cerebro, 0.0)             # sin el anuncio del tipo el mux no reenvía comandos
         self.send(self.cerebro, 0.6, 0.6, 0.0)
         imu = wire.encode(wire.ImuSample((1, 2, 3), (4, 5, 6)), 0, 0)
         self.assertFalse(self.mux.handle(self.teleop, imu, 0.01))
@@ -99,6 +103,7 @@ class TestMux(unittest.TestCase):
         self.assertIsNone(self.mux.active)
 
     def test_un_anuncio_no_roba_el_mando(self):
+        self.anuncia(self.cerebro, 0.0)             # sin el anuncio del tipo el mux no reenvía comandos
         self.assertTrue(self.send(self.cerebro, 0.6, 0.6, 0.00))
         ann = wire.encode_announcement(Cmd.SCHEMA_TEXT, "/cmd")
         self.assertFalse(self.mux.handle(self.teleop, ann, 0.05))   # el panel solo anunció
@@ -107,6 +112,7 @@ class TestMux(unittest.TestCase):
         self.assertEqual(self.mux.schema_text, Cmd.SCHEMA_TEXT)
 
     def test_la_salida_es_una_sola_fuente(self):
+        self.anuncia(self.cerebro, 0.0)             # sin el anuncio del tipo el mux no reenvía comandos
         self.send(self.cerebro, 0.6, 0.6, 0.0)
         self.send(self.teleop, 0.8, 0.3, 0.05)
         e1, _ = wire.decode(Cmd, self.rx.recv(65536))
@@ -148,6 +154,39 @@ class TestMux(unittest.TestCase):
         # Un comando bueno después sí pasa.
         self.assertTrue(self.send(self.cerebro, 0.2, 0.2, 0.40))
         self.assertEqual(self.recv(), (1, (0.2, 0.2)))
+
+    def test_sin_tipo_no_reenvia_nada_y_avisa_una_vez(self):
+        """Si el mux arranca (o se reinicia) después que el publicador, no sabe qué bytes son números hasta el
+        siguiente anuncio: mientras tanto no reenvía ningún comando, ni bueno ni con NaN."""
+        import contextlib
+        import io
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertFalse(self.send(self.teleop, float("nan"), 0.5, 0.00))
+            self.assertFalse(self.send(self.teleop, 0.5, 0.5, 0.05))
+            self.assertFalse(self.send(self.cerebro, 0.2, 0.2, 0.10))
+        self.assertEqual(self.mux.untyped, {"teleop": 2, "cerebro": 1})
+        self.assertEqual(self.mux.nonfinite, {"teleop": 0, "cerebro": 0})
+        self.assertIsNone(self.mux.active)                       # no toman el mando
+        self.assertNotIn("teleop", self.mux.last_rx)             # ni lo sostienen
+        self.assertEqual(err.getvalue().splitlines(), [
+            f"[agmen] ⚠ mux '{self.mux.output}': todavía no conozco el tipo de los mensajes; no reenvío comandos "
+            "hasta que llegue su anuncio (a lo más ~1 s)."])
+        self.assertIn("teleop: reenviados=0 descartados=0 errores=0 no_finitos=0 sin_tipo=2", self.mux.summary())
+        # Llega el anuncio (se reenvía): pasan los buenos y se descartan los no finitos.
+        self.anuncia(self.cerebro, 0.20)
+        with contextlib.redirect_stderr(err):
+            self.assertFalse(self.send(self.teleop, float("nan"), 0.5, 0.25))
+            self.assertTrue(self.send(self.teleop, 0.5, 0.5, 0.30))
+            self.assertTrue(self.send(self.teleop, 0.7, 0.7, 0.32, seq=8))
+        self.assertEqual(self.recv(), (0, (0.5, 0.5)))
+        self.assertEqual(self.recv(), (1, (0.7, 0.7)))
+        with self.assertRaises(socket.timeout):
+            self.rx.recv(65536)
+        self.assertEqual(self.mux.untyped, {"teleop": 2, "cerebro": 1})
+        self.assertEqual(self.mux.nonfinite["teleop"], 1)
+        self.assertEqual(err.getvalue().count("todavía no conozco el tipo"), 1)
 
     def test_no_finito_en_cualquier_tipo_y_en_arreglos(self):
         import contextlib
@@ -212,6 +251,10 @@ class TestQuienManda(unittest.TestCase):
                        f"127.0.0.1:{self.rx.getsockname()[1]}", hold_ms=300, log=self.logs.append, name="ruedas")
         self.teleop = next(i for i in self.mux.inputs if i.name == "teleop")
         self.cerebro = next(i for i in self.mux.inputs if i.name == "cerebro")
+        # Sin el anuncio del tipo el mux no reenvía comandos; el anuncio no cambia quién manda.
+        self.mux.handle(self.cerebro, wire.encode_announcement(Cmd.SCHEMA_TEXT, "/cmd"), 0.0)
+        self.rx.settimeout(0.5)
+        self.rx.recv(65536)                              # el anuncio reenviado a la salida
 
     def tearDown(self):
         self.mux.close()
@@ -280,6 +323,7 @@ class TestQuienMandaPorTopic(unittest.TestCase):
         sub = Subscriber(MuxEstado, "/mux/mando")
         try:
             panel = next(i for i in mux.inputs if i.name == "panel")
+            mux.handle(panel, wire.encode_announcement(Cmd.SCHEMA_TEXT, "/cmd"), time.monotonic())   # el tipo primero
             mux.handle(panel, wire.encode(Cmd(1, 1), 1, 123, source_id=0xAB), time.monotonic())
             got, end = None, time.monotonic() + 5
             while got is None and time.monotonic() < end:

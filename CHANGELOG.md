@@ -404,6 +404,10 @@ Los objetos de Agmen en Python se pueden usar desde varios hilos a la vez
     de '…' con un valor no finito (campo=valor). Revisa ese nodo.`) y cuenta los
     descartes en `no_finitos=` de su resumen. Para el actuador, ese origen es como si
     no hubiera mandado: si era el dueño, el freno por silencio actúa.
+    Mientras no conoce el tipo (arrancó o se reinició después que el publicador, hasta
+    el siguiente anuncio, a lo más ~1 s), no reenvía ningún comando: lo avisa una vez
+    (`[agmen] ⚠ mux '…': todavía no conozco el tipo de los mensajes; …`) y los cuenta
+    en `sin_tipo=`.
   - El motor del tutorial frena de inmediato ante un valor no finito, no usa ese valor
     y lo dice una vez en stderr.
   - No cambia ningún byte de la red.

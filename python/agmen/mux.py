@@ -25,6 +25,10 @@ Reglas de seguridad:
   - Un comando con un número no finito (NaN, +inf, −inf) se descarta y no
     cuenta como hablar: si era del que manda, el freno por silencio del
     receptor actúa como siempre. Se avisa una vez por entrada y se cuenta.
+  - Mientras no llega el anuncio del tipo (el mux arrancó o se reinició
+    después que el publicador), no se sabe qué bytes son números: no se
+    reenvía ningún comando (tampoco cuenta como hablar). Se avisa una vez y se
+    cuenta en sin_tipo; con el anuncio (a lo más ~1 s), todo sigue igual.
 
 Quién manda (RFC 0012): con `--state /mux/<nombre>` (agmen run lo pone solo),
 el mux publica un agmen.msgs.MuxEstado cada vez que cambia el mando y una vez
@@ -133,6 +137,8 @@ class Mux:
         self.errors = {i.name: 0 for i in self.inputs}
         self.nonfinite = {i.name: 0 for i in self.inputs}   # comandos con NaN o infinito, descartados
         self._nonfinite_warned: set[str] = set()
+        self.untyped = {i.name: 0 for i in self.inputs}     # comandos antes del anuncio del tipo, descartados
+        self._untyped_warned = False
         self._floats: tuple[struct.Struct, list[tuple[int, str]]] | None = None   # (formato, [(índice, campo)])
         self._last_error_log = 0.0
         # Quién manda (RFC 0012): agmen.msgs.MuxEstado en `state` (ej. /mux/ruedas).
@@ -251,6 +257,13 @@ class Mux:
             print(f"[agmen] ⚠ mux '{self.output}': descarté un comando de '{inp.name}' con un valor no finito "
                   f"({field}={value}). Revisa ese nodo.", file=sys.stderr, flush=True)
 
+    def _drop_untyped(self, inp: MuxInput) -> None:
+        self.untyped[inp.name] += 1
+        if not self._untyped_warned:
+            self._untyped_warned = True
+            print(f"[agmen] ⚠ mux '{self.output}': todavía no conozco el tipo de los mensajes; no reenvío comandos "
+                  f"hasta que llegue su anuncio (a lo más ~1 s).", file=sys.stderr, flush=True)
+
     def _forward(self, data: bytes, seq: int | None) -> None:
         out = bytearray(data)
         struct.pack_into("<Q", out, wire.SOURCE_OFFSET, self.source_id)
@@ -299,6 +312,9 @@ class Mux:
                 self._announced_at = now
             return False
 
+        if self.schema_text is None:  # sin el tipo no se ve si trae NaN: no toma ni sostiene el mando, no sale
+            self._drop_untyped(inp)
+            return False
         bad = self._non_finite(payload)
         if bad is not None:          # como si esa entrada no hubiera hablado: no toma ni sostiene el mando
             self._drop_non_finite(inp, *bad)
@@ -342,7 +358,8 @@ class Mux:
 
     def summary(self) -> str:
         parts = [f"{i.name}: reenviados={self.forwarded[i.name]} descartados={self.dropped[i.name]} "
-                 f"errores={self.errors[i.name]} no_finitos={self.nonfinite[i.name]}" for i in self.inputs]
+                 f"errores={self.errors[i.name]} no_finitos={self.nonfinite[i.name]} "
+                 f"sin_tipo={self.untyped[i.name]}" for i in self.inputs]
         return "resumen · " + " · ".join(parts)
 
     def close(self) -> None:
