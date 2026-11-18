@@ -1373,6 +1373,81 @@ class TestJoints(unittest.TestCase):
         self.assertConfigError(MINIMO + joints(profile="sí"), "no es un nombre de perfil válido")
         self.assertConfigError(MINIMO + joints(), "el perfil 'mesa' no existe", "[[joints]]", profile="mesa")
 
+    # --- ataques de la prueba independiente (RFC 0013 §3.4) ---
+    def test_nombres_que_se_parecen_pero_no_valen(self):
+        """Un nombre viaja luego en una línea de texto del hub: nada que se vea igual pero no lo sea."""
+        casos = {"FR_hіp": "tiene 'і'",            # i cirílica
+                 "FR_hip ": "tiene un espacio",     # espacio al final
+                 "FR_hip\n": "carácter de control",
+                 "a１": "tiene '１'",               # dígito de ancho completo
+                 "a\x00b": "carácter de control",
+                 "FR\u200bhip": "tiene"}             # espacio de ancho cero
+        for nombre, por_que in casos.items():
+            with self.subTest(nombre=nombre):
+                self.assertConfigError(MINIMO + joints(names=["ok", nombre], kp=1, kd=1),
+                                       "[[joints]] 'patas': names[1] =", por_que)
+
+    def test_mayusculas_distintas_son_nombres_distintos(self):
+        j = self.load(MINIMO + joints(names=["FR_hip", "fr_hip", "FR_HIP"], kp=1, kd=1)).joints[0]
+        self.assertEqual(j.names, ("FR_hip", "fr_hip", "FR_HIP"))
+
+    def test_names_como_texto_o_anidada(self):
+        self.assertConfigError(MINIMO + joints(names="FR_hip"), "names es una lista no vacía")
+        self.assertConfigError(MINIMO + joints(names=[["a", "b"]], kp=1, kd=1),
+                               "names[0] = ['a', 'b'] no es un texto", 'ej. "FR_hip"')
+
+    def test_ganancias_que_no_son_numeros_de_toml(self):
+        for valor, frag in (("1979-05-27", "no es un número"), ("{ a = 1 }", "no es un número"),
+                            ("[[1], [2]]", "no es un número"), ("[1, true]", "kp[1] = True no es un número"),
+                            ("1e999", "no es un número finito")):
+            with self.subTest(valor=valor):
+                self.assertConfigError(MINIMO + joints(names=["a", "b"], kp=None) + f"kp = {valor}\n",
+                                       "[[joints]] 'patas': kp", frag)
+        self.assertEqual(self.load(MINIMO + joints(names=["a"], kp=0, kd=0)).joints[0].kp, (0.0,))   # cero vale
+
+    def test_miles_de_articulaciones_y_nombres_largos_cargan_rapido(self):
+        t0 = time.monotonic()
+        j = self.load(MINIMO + joints(names=[f"j{i}" for i in range(3000)], kp=1, kd=1)).joints[0]
+        self.assertEqual(len(j.names), 3000)
+        self.assertEqual(self.load(MINIMO + joints(names=["a" * 20000], kp=1, kd=1)).joints[0].names, ("a" * 20000,))
+        self.assertLess(time.monotonic() - t0, 5)
+
+    def test_el_mux_puede_publicar_en_el_command_del_grupo(self):
+        """El mux es quien manda al actuador: su salida (o una entrada) puede ser el command del grupo."""
+        def mux(salida, entradas):
+            ins = "".join(f'\n[[mux.input]]\nname = "i{k}"\ntopic = "{t}"\npriority = {k + 1}\n'
+                          for k, t in enumerate(entradas))
+            return f'\n[[mux]]\nname = "m"\noutput = "{salida}"\n{ins}'
+        self.load(MINIMO + mux("/patas/cmd", ["/a", "/b"]) + joints())
+        self.load(MINIMO + mux("/o", ["/patas/cmd", "/b"]) + joints())
+        self.load(MINIMO + mux("/patas/estado", ["/a", "/b"]) + joints())
+
+    def test_el_panel_de_otro_perfil_no_choca_pero_el_activo_si(self):
+        panel = '\n[profile.sim.web]\nhttp = "127.0.0.1:8080"\n[profile.sim.web.teleop]\ntarget = "/patas/cmd"\n'
+        self.load(MINIMO + panel + joints())                                   # perfil real: ese panel no se usa
+        self.assertConfigError(MINIMO + panel + joints(), "[web.teleop] manda MotorCommand", profile="sim")
+        self.load(MINIMO + panel + joints(profile="real"), "sim")              # en sim el grupo no corre
+
+    def test_un_topic_con_perfil_que_se_cruza_choca_y_uno_que_no_se_cruza_no(self):
+        topic = '\n[[topic]]\nname = "/patas/estado"\ntype = "Imu"\nprofile = "real"\n'
+        self.assertConfigError(MINIMO + topic + joints(), "los dos se usan en el perfil 'real'")
+        self.load(MINIMO + topic + joints(profile="sim"), "sim")
+
+    def test_un_archivo_sin_joints_dice_lo_mismo_que_en_el_tutorial(self):
+        """docs/tutorial/05: ni el aviso ni el error de perfil cambian si el archivo no tiene [[joints]]."""
+        base = MINIMO.replace('name = "motor"', 'name = "motor"\nprofile = "rael"')
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "perfiles.toml"
+            path.write_text(base, encoding="utf-8")
+            aviso, = load_config(path).warnings
+            with self.assertRaises(ConfigError) as ctx:
+                load_config(path, "mesa")
+        self.assertEqual(aviso, '[[node]] \'motor\': profile = "rael" y ningún otro [[node]], [[mux]] o [[topic]] '
+                                'nombra ese perfil. ¿Quisiste decir \'real\'? Así, \'motor\' solo corre con --profile '
+                                'rael. Si el perfil es a propósito, declara [profile.rael] y este aviso se quita')
+        self.assertTrue(str(ctx.exception).endswith("Un perfil existe si algún [[node]], [[mux]] o [[topic]] lo "
+                                                    "nombra en su profile, o si tiene su tabla [profile.mesa]"))
+
 
 if __name__ == "__main__":
     unittest.main()

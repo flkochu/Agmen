@@ -932,5 +932,93 @@ class TestDiferenciaDeEsquemas(unittest.TestCase):
         self.assertEqual(H.schema_difference("", ""), ("", ""))
 
 
+class TestRechazoMuestraLaForma(unittest.TestCase):
+    """RFC 0013 §3.4: el rechazo del hub dice en qué cambia un tipo del mismo nombre. Solo cambia el texto
+    del aviso: lo que se rechaza y lo que no sigue igual. Con el Hub en memoria (sin red)."""
+
+    S12 = "agmen/1 JointState{f32[12] position;f32[12] velocity;f32[12] effort}"
+    S2 = "agmen/1 JointState{f32[2] position;f32[2] velocity;f32[2] effort}"
+    ID12, ID2 = "00000000000000c1", "00000000000000c2"
+
+    def setUp(self):
+        self.hub = H.Hub(f"127.0.0.1:{free_port()}", log=lambda _: None, grace_s=0.0)
+        self.sent: list[bytes] = []
+        self.hub._send = lambda data, addr: self.sent.append(data)
+
+    def tearDown(self):
+        self.hub.sock.close()
+
+    def manda(self, op, **fields):
+        self.sent.clear()
+        self.hub.handle(hp.encode(op, **fields), LOCAL, 0.0)
+        return [hp.parse(d)[0] for d in self.sent]
+
+    def pub(self, eid, schema, text, tipo="JointState", topic="/patas/estado"):
+        return self.manda("pub", id=eid, node="n_" + eid, pid=1, topic=topic, schema=schema, type=tipo, text=text)
+
+    def sub(self, eid, schema, tipo="JointState", topic="/patas/estado"):
+        return self.manda("sub", id=eid, node="n_" + eid, pid=1, topic=topic, schema=schema, type=tipo, port=6000)
+
+    def rechazo(self, respuestas) -> str:
+        (op, f), = respuestas
+        self.assertEqual(op, "error", respuestas)
+        return f["msg"]
+
+    def test_publicador_contra_publicador_en_los_dos_ordenes(self):
+        self.assertEqual(self.pub("a", self.ID12, self.S12)[0][0], "subs")
+        msg = self.rechazo(self.pub("b", self.ID2, self.S2))
+        self.assertIn("se llaman igual pero no tienen la misma forma, JointState{f32[12] position;…} contra "
+                      "JointState{f32[2] position;…}", msg)
+        self.tearDown()
+        self.setUp()
+        self.pub("a", self.ID2, self.S2)
+        self.assertIn("JointState{f32[2] position;…} contra JointState{f32[12] position;…}",
+                      self.rechazo(self.pub("b", self.ID12, self.S12)))
+
+    def test_suscriptor_primero_o_despues_solo_se_conoce_un_lado(self):
+        self.sub("s", self.ID12)
+        msg = self.rechazo(self.pub("p", self.ID2, self.S2))
+        self.assertIn("(el que llega es JointState{f32[2] position;…})", msg)
+        self.tearDown()
+        self.setUp()
+        self.pub("p", self.ID12, self.S12)
+        msg = self.rechazo(self.sub("s", self.ID2))
+        self.assertIn("(el que ya está es JointState{f32[12] position;…})", msg)
+
+    def test_dos_suscriptores_no_saben_la_forma_y_el_aviso_no_inventa(self):
+        self.sub("s1", self.ID12)
+        msg = self.rechazo(self.sub("s2", self.ID2))
+        self.assertNotIn("misma forma", msg)
+        self.assertIn("Un topic, un tipo: usa otro nombre de topic o el mismo esquema", msg)
+
+    def test_tipos_con_otro_nombre_no_inflan_el_aviso(self):
+        self.pub("a", self.ID12, self.S12)
+        msg = self.rechazo(self.pub("b", "00000000000000d1", "agmen/1 JointCommand{f32[12] position}",
+                                    tipo="JointCommand"))
+        self.assertNotIn("misma forma", msg)
+        self.assertLess(len(msg), 300)
+
+    def test_un_esquema_enorme_deja_el_aviso_acotado(self):
+        self.pub("a", self.ID12, self.S12)
+        for texto in ("agmen/1 JointState{f32[2] " + "x" * 50000 + "}", "z" * 50000, "}" * 50000,
+                      "agmen/1 JointState{" + ";".join(["f32 a"] * 8000) + "}"):
+            with self.subTest(largo=len(texto)):
+                msg = self.rechazo(self.pub("b", self.ID2, texto))
+                self.assertLess(len(msg), 500)
+                self.assertIn("Un topic, un tipo", msg)
+        self.assertEqual(self.hub.endpoints.keys(), {"a"})          # nada se coló
+
+    def test_el_mismo_esquema_sigue_aceptado(self):
+        self.pub("a", self.ID12, self.S12)
+        self.assertEqual(self.pub("b", self.ID12, self.S12)[0][0], "subs")
+        self.assertNotEqual(self.sub("s", self.ID12)[0][0], "error")
+
+    def test_texto_raro_del_otro_lado_no_rompe_al_hub(self):
+        self.pub("a", self.ID12, self.S12)
+        for texto in ("", "{", "}", "{}", ";;;", "agmen/1 ", "agmen/1 X{", "A{f32 x}}", "ñ字…{é;}", "\\n{a}"):
+            with self.subTest(texto=texto):
+                self.assertIn("Un topic, un tipo", self.rechazo(self.pub("b", self.ID2, texto)))
+
+
 if __name__ == "__main__":
     unittest.main()
