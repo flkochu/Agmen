@@ -45,10 +45,15 @@ private:
 /// En Linux/macOS no hace nada; en Windows cambia la página de códigos.
 void init_console();
 
-/// El valor de la variable de entorno `name`, o "" si no existe.
+/// El valor de la variable de entorno `name`, en UTF-8, o "" si no existe.
 ///
-/// Por qué existe: MSVC marca std::getenv como inseguro (C4996, que el CI
-/// trata como error) y pide _dupenv_s. Todo el núcleo lee el entorno aquí.
+/// Por qué existe: todo el núcleo lee el entorno aquí. En Windows el entorno
+/// es UTF-16 y std::getenv/_dupenv_s lo devuelven en la página de códigos
+/// ANSI (además, MSVC marca std::getenv como inseguro, C4996): aquí se lee en
+/// ancho (GetEnvironmentVariableW) y se pasa a UTF-8, así un nombre de nodo
+/// como "brazo_ñ" llega igual que desde Python. Si el valor no es UTF-16
+/// válido (un sustituto suelto), devuelve "" y avisa una vez por variable.
+/// En Linux y macOS devuelve los bytes tal cual.
 std::string env(const char* name);
 
 }  // namespace agmen::platform
