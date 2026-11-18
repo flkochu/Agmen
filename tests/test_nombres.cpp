@@ -19,6 +19,8 @@
 #include <set>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <exception>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -60,12 +62,36 @@ namespace wire = agmen::wire;
 namespace m = agmen::msgs;
 using wire::ByteView;
 
+/// En Windows una variable de entorno mide como mucho 32 767 caracteres (con el '\0'): con un valor más largo,
+/// _putenv_s no devuelve un error, sino que llama al manejador de "parámetro inválido" de la CRT, que en Release
+/// termina el proceso sin decir nada (0xc0000409). Las pruebas no deben pasar de este tope, en ningún sistema:
+/// así la misma prueba corre igual en Linux y en Windows.
+constexpr std::size_t kMaxEnvValue = 32766;
+
 void set_env(const char* name, const char* value) {
+    const std::size_t len = std::strlen(value);
+    if (len > kMaxEnvValue) {
+        throw std::length_error("set_env(" + std::string(name) + "): el valor mide " + std::to_string(len) +
+                                " caracteres y en Windows una variable de entorno mide como mucho " +
+                                std::to_string(kMaxEnvValue) + ": usa un valor más corto en la prueba");
+    }
 #ifdef _WIN32
-    _putenv_s(name, value);
+    const int rc = _putenv_s(name, value);
 #else
-    setenv(name, value, 1);
+    const int rc = setenv(name, value, 1);
 #endif
+    if (rc != 0) throw std::runtime_error("set_env(" + std::string(name) + ") falló (código " + std::to_string(rc) + ")");
+}
+
+/// Un nombre de nodo que, escrito como va en la línea del hub (hub::quote), mide `bytes` bytes, sin pasar del tope
+/// de una variable de entorno de Windows: "nodo" y luego '%', que va como "%25" (3 bytes por carácter).
+/// `bytes` - 4 debe ser múltiplo de 3.
+std::string nodo_que_mide(std::size_t bytes) {
+    const std::string nodo = "nodo" + std::string((bytes - 4) / 3, '%');
+    if (hub::quote(nodo).size() != bytes || nodo.size() > kMaxEnvValue) {
+        throw std::logic_error("nodo_que_mide(" + std::to_string(bytes) + "): no se puede armar ese nombre");
+    }
+    return nodo;
 }
 
 const std::vector<std::string> kPatas = {"FR_hip", "FR_thigh", "FR_calf", "FL_hip", "FL_thigh", "FL_calf",
@@ -331,7 +357,8 @@ void test_registro_que_no_cabe_en_un_datagrama() {
 void test_registro_que_no_cabe_por_el_nombre_del_nodo() {
     using Cmd = m::JointCommand<2>;
     FakeHub h;
-    const std::string enorme(70000, 'n');
+    // 70000 bytes en la línea con 23 336 caracteres: cabe en una variable de entorno de Windows (70 000 'n' no).
+    const std::string enorme = nodo_que_mide(70000);
     set_env("AGMEN_NODE", enorme.c_str());
     const std::string fix = "Lo más largo es el nombre del nodo: usa un nombre de nodo más corto (AGMEN_NODE, o el "
                             "name de su [[node]] en robot.toml)";
@@ -372,8 +399,8 @@ void test_registro_que_no_cabe_por_el_nombre_del_nodo() {
     CHECK(!h.any("sub", 50ms));
     // Con dirección fija no hay registro: no se revisa.
     { agmen::Subscriber<Cmd> s("127.0.0.1:0"); }
-    // Un nombre de nodo largo que sí cabe: la línea de siempre, byte a byte.
-    const std::string largo(60000 - 200, 'n');
+    // Un nombre de nodo largo que sí cabe: la línea de siempre, byte a byte (59800 bytes en la línea).
+    const std::string largo = nodo_que_mide(60000 - 200);
     set_env("AGMEN_NODE", largo.c_str());
     {
         agmen::Publisher<Cmd> p("/x");
@@ -824,28 +851,58 @@ void test_atacan_fugas_200_publishers_con_lista() {
     CHECK(registrados == despedidos);
 }
 
+/// Corre una prueba: dice su nombre antes de empezar (con la salida vaciada: si el proceso muere, el log del CI
+/// muestra en cuál fue) y, si lanza algo que no atrapó, dice cuál fue y con qué texto, y sigue con las demás.
+void correr(const char* nombre, void (*prueba)()) {
+    std::printf("-- %s\n", nombre);
+    std::fflush(stdout);
+    try {
+        prueba();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "  FALLA %s: lanzó una excepción que nadie atrapó: %s\n", nombre, e.what());
+        ++g_failures;
+    } catch (...) {
+        std::fprintf(stderr, "  FALLA %s: lanzó algo que no es std::exception\n", nombre);
+        ++g_failures;
+    }
+    std::fflush(stderr);
+}
+
 }  // namespace
 
+#define CORRER(prueba) correr(#prueba, prueba)
+
 int main() {
-    set_env("AGMEN_NODE", "prueba-nombres");
-    test_constantes_y_formato();
-    test_listas_que_no_valen();
-    test_numero_del_tipo_y_direccion();
-    test_registro_que_no_cabe_en_un_datagrama();
-    test_registro_que_no_cabe_por_el_nombre_del_nodo();
-    test_la_linea_sin_names_es_la_de_siempre_y_con_names_la_de_python();
-    test_el_rechazo_del_hub_llega_entero();
-    test_node_con_names();
-    test_el_codigo_de_antes_compila();
-    test_atacan_nombres_con_bytes_raros();
-    test_atacan_topes_de_nombre_y_lista();
-    test_atacan_5453_articulaciones();
-    test_atacan_repetido_al_final_de_una_lista_larga();
-    test_options_copiadas_y_movidas_y_publisher_movido();
-    test_atacan_dos_publishers_mismo_topic_listas_distintas();
-    test_atacan_hilos_creando_publishers_con_lista();
-    test_atacan_sin_lista_la_linea_es_la_de_siempre_con_nombre_de_nodo_raro();
-    test_atacan_fugas_200_publishers_con_lista();
-    if (g_failures == 0) std::printf("test_nombres: todo bien\n");
-    return g_failures == 0 ? 0 : 1;
+    agmen::platform::init_console();
+    std::printf("test_nombres\n");
+    try {
+        set_env("AGMEN_NODE", "prueba-nombres");
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "test_nombres: no pude poner AGMEN_NODE: %s\n", e.what());
+        return 1;
+    }
+    CORRER(test_constantes_y_formato);
+    CORRER(test_listas_que_no_valen);
+    CORRER(test_numero_del_tipo_y_direccion);
+    CORRER(test_registro_que_no_cabe_en_un_datagrama);
+    CORRER(test_registro_que_no_cabe_por_el_nombre_del_nodo);
+    CORRER(test_la_linea_sin_names_es_la_de_siempre_y_con_names_la_de_python);
+    CORRER(test_el_rechazo_del_hub_llega_entero);
+    CORRER(test_node_con_names);
+    CORRER(test_el_codigo_de_antes_compila);
+    CORRER(test_atacan_nombres_con_bytes_raros);
+    CORRER(test_atacan_topes_de_nombre_y_lista);
+    CORRER(test_atacan_5453_articulaciones);
+    CORRER(test_atacan_repetido_al_final_de_una_lista_larga);
+    CORRER(test_options_copiadas_y_movidas_y_publisher_movido);
+    CORRER(test_atacan_dos_publishers_mismo_topic_listas_distintas);
+    CORRER(test_atacan_hilos_creando_publishers_con_lista);
+    CORRER(test_atacan_sin_lista_la_linea_es_la_de_siempre_con_nombre_de_nodo_raro);
+    CORRER(test_atacan_fugas_200_publishers_con_lista);
+    if (g_failures == 0) {
+        std::printf("test_nombres: todo bien\n");
+        return 0;
+    }
+    std::fprintf(stderr, "test_nombres: %d fallas\n", g_failures);
+    return 1;
 }
