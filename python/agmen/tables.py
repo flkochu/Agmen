@@ -190,10 +190,13 @@ class Lineage:
         while pid in self._parents and pid not in seen and len(seen) < 64:
             seen.add(pid)
             parent, born = self._parents[pid]
+            # Un padre que nació después que el hijo es otro proceso con el pid reusado: la cadena se corta. Va antes
+            # de mirar `roots`: un ancestro muerto cuyo pid le tocó luego a un nodo no hace al nodo dueño del hijo.
+            if parent in self._parents and self._parents[parent][1] > born:
+                return False
             if parent in self.roots:
                 return True
-            # Un padre que nació después que el hijo es otro proceso con el pid reusado: la cadena se corta.
-            if parent not in self._parents or self._parents[parent][1] > born:
+            if parent not in self._parents:
                 return False
             pid = parent
         return False
