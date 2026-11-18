@@ -16,6 +16,7 @@ import functools
 import io
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -839,10 +840,10 @@ class TestLineaDeSiempre(unittest.TestCase):
 
     def test_pub_igual_que_antes_menos_el_id(self):
         falso = FalsoHub(self)
-        viejo = self.anterior._PurePublisher(CMD12, "/patas/cmd")
+        viejo = self.anterior._PurePublisher(CMD12, "/patas/cmd", node="n")
         self.addCleanup(viejo.close)
         l_viejo = self.registro(falso, "pub").replace(f"{viejo.source_id:016x}", "ID")
-        nuevo = pubsub._PurePublisher(CMD12, "/patas/cmd")
+        nuevo = pubsub._PurePublisher(CMD12, "/patas/cmd", node="n")
         self.addCleanup(nuevo.close)
         l_nuevo = self.registro(falso, "pub").replace(f"{nuevo.source_id:016x}", "ID")
         self.assertEqual(l_nuevo, l_viejo)
@@ -852,12 +853,12 @@ class TestLineaDeSiempre(unittest.TestCase):
         falso = FalsoHub(self)
         viejo = self.anterior._PureSubscriber(CMD12, "/patas/cmd")
         self.addCleanup(viejo.close)
-        l_viejo = self.registro(falso, "sub").replace(viejo._link.id, "ID").replace(
-            "port=" + viejo.listen.rsplit(":", 1)[1], "port=P")
+        l_viejo = re.sub(r" node=\S+", " node=N", self.registro(falso, "sub").replace(viejo._link.id, "ID").replace(
+            "port=" + viejo.listen.rsplit(":", 1)[1], "port=P"))
         nuevo = pubsub._PureSubscriber(CMD12, "/patas/cmd")
         self.addCleanup(nuevo.close)
-        l_nuevo = self.registro(falso, "sub").replace(nuevo._link.id, "ID").replace(
-            "port=" + nuevo.listen.rsplit(":", 1)[1], "port=P")
+        l_nuevo = re.sub(r" node=\S+", " node=N", self.registro(falso, "sub").replace(nuevo._link.id, "ID").replace(
+            "port=" + nuevo.listen.rsplit(":", 1)[1], "port=P"))
         self.assertEqual(l_nuevo, l_viejo)
 
     def test_names_none_es_lo_mismo_que_no_pasarlo(self):
