@@ -13,12 +13,12 @@ sin adivinar y los vectores de prueba). El mapeo de los mensajes chicos a
 Foxglove pasa del bloque 1 al bloque 3 (con los marcos): lo decidió el consejo
 (2 votos contra 1) la noche del 2026-11-16, por delegación de Adán, que puede
 revertirlo. Del bloque 2 están hechas las plantillas de articulaciones,
-`[[joints]]` en `robot.toml` y los nombres declarados al hub (con el capítulo 19
-del tutorial). Faltan los bloques 3 a 7 del plan del RFC. Pendiente dentro del
-bloque 2: el aviso de `agmen run` cuando el hub de otra computadora es anterior (lo
-pide el RFC y todavía no está); la salida de `[[mux]]` en el `command` de un
-`[[joints]]` (está por decidir, no se documenta); y que `agmen run` pase `kp` y `kd` a
-los nodos (hoy los revisa y los muestra, pero no llegan a ningún nodo).
+`[[joints]]` en `robot.toml`, los nombres declarados al hub, la herencia de la
+lista por el `[[mux]]`, el aviso de hub anterior (con el capítulo 19 del tutorial).
+Faltan los bloques 3 a 7 del plan del RFC. Pendiente dentro del bloque 2, por
+decidir: que `agmen run` pase `kp` y `kd` a los nodos (hoy los revisa y los
+muestra, pero no llegan a ningún nodo); y que un `JointCommand` con `nan` por
+defecto no pasa por un `[[mux]]`, porque el mux descarta lo que no es finito.
 
 ### Agregado
 - **El `[[mux]]` hereda la lista de `[[joints]]`** (RFC 0013 D6 = d). Si la salida del
@@ -37,8 +37,17 @@ los nodos (hoy los revisa y los muestra, pero no llegan a ningún nodo).
   dice qué topic es, de qué grupo viene la lista y qué hacer.
 - **Aviso de un hub anterior**: si el hub que ya corre en esta computadora, o el de otra
   computadora (también el que reusa el agente), es anterior a 0.15.0, `agmen run` avisa
-  que ese hub no revisa los nombres y qué hacer. El aviso sale desde la versión 0.15.0;
-  con 0.14.0 no sale.
+  que ese hub no revisa los nombres y qué hacer. Si está en otra computadora, el aviso
+  la nombra (`en 'robot'`) y dice dónde actualizar. El aviso sale desde la versión
+  0.15.0; con 0.14.0 no sale.
+- **`agmen run robot.toml --play` dice qué lista usa**: una vez por topic, `declaro en
+  '<topic>' la lista de robot.toml; la grabación no guarda la suya, así que no se revisa
+  que coincida con la de cuando se grabó`. El formato de la grabación no cambia.
+- **Un mando con otro número de articulaciones que su topic**: si un `[[web.command]]`
+  (o una entrada de `[[mux]]` que hereda la lista) manda, por ejemplo,
+  `JointCommand[3]` a un topic de `[[joints]]` con 4 nombres, `agmen run` avisa al cargar
+  `robot.toml`. Con `require_names = true` es un error al cargar, porque el hub
+  rechazaría siempre ese mando.
 - **`RawPublisher(topic, names=...)` y `RawSubscriber(where, names=...)`** en Python, para
   herramientas como el mux.
 - **`tutorial_check` vigila el capítulo 19**: los bloques marcados con
@@ -167,8 +176,16 @@ los nodos (hoy los revisa y los muestra, pero no llegan a ningún nodo).
 - **El mux ya no calla cuando el hub rechaza su salida.** Antes, el rechazo del hub a la
   salida (por ejemplo, con una lista distinta a la de `robot.toml`) no pasaba por el aviso
   del mux: no decía qué hacer y no se contaba como descartado. Ahora el mux avisa una vez
-  por segundo como mucho, dice qué rechazó el hub y qué hacer (pasar `--names` con la
-  lista en ese orden), y cuenta los comandos descartados.
+  por segundo como mucho, con el texto del hub sin caracteres de control; dice qué hacer
+  según quién lo lanzó (`agmen mux` a mano: pasar `--names` con la lista en ese orden;
+  `agmen run`: si el hub que ya corría es de otro `robot.toml`, reiniciar el robot), y
+  cuenta los comandos descartados.
+- **`agmen play` ya no calla cuando el hub rechaza un topic.** Antes, si el hub
+  rechazaba un topic (por ejemplo, `agmen play` sin lista a un topic con `require_names`),
+  los mensajes se contaban como reproducidos y no se decía nada. Ahora lo dice una vez
+  por topic, con qué hacer; no cuenta esos mensajes como reproducidos y sale con código
+  1 si de algún topic no salió nada. Vale para cualquier rechazo del hub, no solo para
+  `[[joints]]`.
 - **El lector de `.agmen` falla antes, no después**: los valores de arriba
   pasaban el lector y tronaban después, al compilar el C++ o al cargar en Python.
   Ahora el error dice el archivo, la línea, la columna y qué hacer.
