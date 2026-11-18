@@ -296,10 +296,15 @@ datagrama entero y quien lo mandó no se enteraba. Ahora:
   contestan como mucho 16 líneas malas por datagrama.
 - Si la línea no trae un `id` legible, no hay a quién contestar: el aviso queda en el
   log del hub, como antes.
-- **Un error de Agmen al atender una línea** no mata al hub. Quien la mandó recibe
-  `error` con su `id` y un `msg` que dice que la línea no quedó atendida (y que se
-  avise a quien mantiene Agmen si se repite). Las demás líneas del datagrama sí se
-  atienden. Antes, un error así detenía el hilo del hub.
+- **Un error de Agmen al atender una línea** no mata al hub, y **no se le contesta al
+  nodo**. El hub lo escribe en su log (el archivo y la línea de Agmen donde falló, la
+  primera vez; si se repite, "pasó K veces más", como mucho una vez cada 60 s). Las demás
+  líneas del datagrama sí se atienden, y el nodo sigue: su latido vuelve en un segundo.
+  Antes, un error así detenía el hilo del hub.
+- `error` sigue queriendo decir solo una cosa: **"esta línea o este registro no se
+  aceptó"** (la línea que no se puede leer, o un registro que el hub rechaza). Un fallo
+  interno del hub no usa `error`: por eso el nodo no se detiene por un error de Agmen
+  que no es suyo.
 
 Ejemplo: un datagrama con tres líneas, la del medio con un valor que no es UTF-8.
 La primera y la tercera se registran; a la de en medio le llega su `error`.
@@ -400,7 +405,7 @@ El hub arranca en **modo local**: como hoy, todo se queda en esta computadora.
 | herramienta → hub | `ping` | — | ¿Hay hub? Contesta `pong` |
 | hub → Publisher | `subs` | `id topic to=ip:puerto,… [tcp=…]` | A quién mandarle los datos. `to` son los puertos UDP y `tcp` los TCP. Se repite en cada latido |
 | hub → Subscriber | `ok` | `id` | Latido recibido |
-| hub → nodo | `error` | `id msg` | Registro rechazado (nombre inválido, un topic con dos tipos) |
+| hub → nodo | `error` | `id msg` | Registro o línea no aceptados (nombre inválido, un topic con dos tipos, una línea que no se puede leer). Un fallo interno del hub no se contesta: va a su log |
 | hub → herramienta | `pong` | `version` | Respuesta a `ping` |
 
 Ejemplos (generados con `hubproto.encode`):

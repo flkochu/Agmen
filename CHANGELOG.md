@@ -71,7 +71,9 @@ los nodos (hoy los revisa y los muestra, pero no llegan a ningún nodo).
 - **`names=` en Python y C++**: `Publisher`, `Subscriber`, `node.publisher` y
   `node.on` (Python) aceptan `names=[...]`; en C++, `{.names = {...}}` en
   `Publisher`, `Subscriber`, `node.publisher` y `node.subscribe`. Quien trae su
-  propia lista la declara al hub, que la compara.
+  propia lista la declara al hub, que la compara. En C++, una lista vacía quiere
+  decir "no declaro lista"; en Python, `names=[]` es un error (sin lista es no
+  pasar `names`). Para exigir la lista en un topic, `require_names = true`.
 - **Campo `names` del hub (`agmen-hub/1`)**: opcional, en `pub`, `sub` y en la
   línea `ep` de `state`, y clave `"names"` en las tablas entre computadoras. El hub
   rechaza la lista que no es igual a la de `robot.toml` o a la de otro endpoint del
@@ -176,8 +178,26 @@ los nodos (hoy los revisa y los muestra, pero no llegan a ningún nodo).
 - **Una línea mala del hub ya no tira el datagrama entero**, y el nodo ya no se
   queda sin saberlo: el hub lee cada línea por su cuenta, y si trae un `id=`
   legible, le contesta `error` a quien la mandó. Ver `docs/PROTOCOLO.md`.
-- **Un error inesperado al atender una línea ya no mata el hilo del hub**: quien la
-  mandó recibe `error`, y el hub sigue atendiendo.
+- **Un error inesperado al atender una línea ya no mata el hilo del hub**, y ya no se
+  le contesta `error` al nodo (eso lo detenía con `HubRejected` por un error de Agmen
+  que no era suyo). El hub lo dice en su log, con el archivo y la línea de Agmen, la
+  primera vez y luego "pasó K veces más" como mucho cada 60 s; las demás líneas del
+  datagrama se atienden y el nodo sigue. Ver `docs/PROTOCOLO.md`.
+- **Un registro que no cabe en un datagrama ya da un error claro al crearlo**: un
+  `Publisher` o `Subscriber` de topic, con o sin `names`, revisa antes de abrir nada que
+  su línea de registro quepa en 65 507 bytes. Si no cabe, dice cuánto mide, qué parte
+  ocupa más (el nombre del nodo, el esquema o `names`) y qué hacer. Antes, el registro
+  no salía y se veía "no hay un agmen hub en esta máquina". Python y C++ dicen lo
+  mismo.
+- **`names=` con un `set`, `frozenset` o `dict` da `TypeError`** en lugar de aceptar un
+  orden que no existe: el orden es lo que el hub compara. Lista y tupla valen.
+- **Un nombre de nodo con bytes que no son UTF-8, en Python puro**, da un error claro
+  en español que dice qué campo es y cómo arreglarlo (por ejemplo, `AGMEN_NODE` con
+  una codificación que no es UTF-8), en lugar de un `UnicodeEncodeError` en inglés.
+- **El puente entre computadoras dice una vez cada motivo de rechazo por topic**, y
+  ya no una vez por id de endpoint. Antes, un nodo de otra computadora que se cae y
+  vuelve en bucle (con un id nuevo cada vez) llenaba la lista de avisos ya dichos, y
+  el puente dejaba de decir cualquier aviso nuevo.
 
 ## [0.14.0] — 2026-11-16
 

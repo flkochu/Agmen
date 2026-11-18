@@ -239,6 +239,29 @@ estado = nodo.publisher(JointState[4], "/patas/estado", names=NOMBRES)
 nodo.on(JointState[4], "/patas/estado", leer, names=NOMBRES)
 ```
 
+`names` tiene que ser una **lista** (`[...]`) o una **tupla** (`(...)`), porque el orden
+es justo lo que el hub compara. Un `set` o un `dict` no tienen orden, y Python se
+niega con un `TypeError`:
+
+```python
+from agmen import Node
+from agmen.msgs import JointCommand
+
+nodo = Node("prueba")
+nodo.publisher(JointCommand[4], "/x", names={"FR_hip", "FR_thigh", "FR_calf", "FL_hip"})
+```
+
+```
+TypeError: Publisher en '/x': names debe ser una lista o una tupla, en el orden de los arreglos: un set no tiene orden fijo y el orden es justo lo que el hub compara. Pasa, por ejemplo, names=['cadera', 'rodilla']
+```
+
+Tampoco se pasa una lista vacía. En Python, `names=[]` es un error, y "sin lista" es
+**no pasar `names`**:
+
+```
+ValueError: Publisher en '/x': names está vacía: pon los nombres de las articulaciones en orden, ej. ["cadera", "rodilla"] (o no la pases)
+```
+
 En C++, va como opción del mismo nombre, `{.names = ...}`:
 
 ```cpp
@@ -295,6 +318,10 @@ cmd = "./build/politica"
 
 Al correrlo, la política de C++ lee el mismo estado que la de Python (se ve la línea
 `estado: cadera FR = …` en lugar de `estado 100: …`).
+
+En C++, una lista vacía (`{.names = {}}`) quiere decir **"no declaro lista"**: es lo
+mismo que no poner `.names`. Para exigir la lista en un topic no se usa eso: pon
+`require_names = true` en su `[[joints]]` de `robot.toml` (sección 4).
 
 ### ¿Qué pasa si el orden no coincide?
 
@@ -432,6 +459,17 @@ Y si la lista no tiene tantos nombres como el tipo, Python lo dice al crear el
 
 ```
 ValueError: Publisher en '/x': names tiene 3 nombres y JointCommand es de 4 articulaciones (f32[4] position): pasa un nombre por articulación, en el orden de los arreglos
+```
+
+**El registro también tiene que caber en un datagrama.** Cada `Publisher` y cada
+`Subscriber` de un topic manda una línea de registro al hub, con el nombre del nodo, el
+esquema y `names`. Si esa línea pasa de 65 507 bytes, Agmen no la manda y lo dice al
+crear el objeto, antes de abrir nada. Es raro, pero pasa con un nombre de nodo enorme.
+El mensaje dice cuánto mide y qué parte ocupa más. Con un nombre de 65 450 caracteres,
+por ejemplo:
+
+```
+ValueError: Publisher en '/y': el registro en el hub mide 65649 bytes y en un datagrama caben 65507 (lo que más ocupa, escrito como va en la línea: el nombre del nodo, 65450 bytes; el esquema de JointState, 93 bytes). Lo más largo es el nombre del nodo: usa un nombre de nodo más corto (AGMEN_NODE, o el name de su [[node]] en robot.toml)
 ```
 
 ## 9. Si ya hay un robot corriendo
