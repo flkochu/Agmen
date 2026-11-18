@@ -210,12 +210,28 @@ def _raw_id(line: str) -> str | None:
 
 
 def _unexpected_key(e: BaseException) -> tuple[str, str]:
-    """(tipo, 'archivo.py:línea' del último frame) de un error inesperado: solo el nombre del archivo, sin la ruta."""
+    """(tipo, 'archivo.py:línea') de un error inesperado: solo el nombre del archivo, sin la ruta. El frame es el
+    último que está dentro del paquete agmen (el último del traceback puede caer en la biblioteca estándar, como
+    re/__init__.py o socket.py, y no diría dónde está el error de Agmen); si ninguno es de agmen, el último."""
     kind = _cut(_clean(type(e).__name__), 80)
     tb = traceback.extract_tb(e.__traceback__)
     if not tb:
         return kind, "?"
-    return kind, _cut(_clean(f"{os.path.basename(tb[-1].filename)}:{tb[-1].lineno}"), 80)
+    ours = [fr for fr in tb if _in_agmen(fr.filename)]
+    fr = ours[-1] if ours else tb[-1]
+    return kind, _cut(_clean(f"{os.path.basename(fr.filename)}:{fr.lineno}"), 80)
+
+
+_AGMEN_DIR = os.path.normcase(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _in_agmen(filename: str) -> bool:
+    """¿El archivo es del paquete agmen (este directorio o uno de adentro)?"""
+    try:
+        path = os.path.normcase(os.path.abspath(filename))
+    except (TypeError, ValueError):
+        return False
+    return path == _AGMEN_DIR or path.startswith(_AGMEN_DIR + os.sep)
 
 
 def names_difference(a: tuple[str, ...], b: tuple[str, ...]) -> tuple[int, str, str]:
@@ -562,12 +578,9 @@ class Hub:
             except (KeyError, ValueError) as e:   # hp.ProtocolError es un ValueError
                 what = f"falta el campo {e}" if isinstance(e, KeyError) else str(e)
                 self._reply_error(op, f, what, addr)
-            except Exception as e:   # un error de Agmen: el que la mandó lo sabe, se dice y se sigue con las demás
-                kind, where = _unexpected_key(e)
-                self._reply_error(op, f, f"el hub falló al atender esta línea ({kind} en {where}): es un error de "
-                                         f"Agmen, no de lo que mandaste, y no quedó atendida. Vuelve a intentarlo; si "
-                                         f"se repite, avísale a quien mantiene Agmen con lo que dice el log del hub",
-                                  addr)
+            except Exception as e:   # un error de Agmen dentro del hub: se dice en el log y se sigue con las demás
+                # Al nodo NO se le contesta: `error` quiere decir "tu registro se rechaza" y el nodo se detiene con
+                # HubRejected; un error de Agmen no debe tumbar a un nodo que está bien (su latido vuelve en ~1 s).
                 self._unexpected_error(e, addr, now)
 
     def _reply_error(self, op: str, f: dict[str, str], what: str, addr: tuple[str, int]) -> None:

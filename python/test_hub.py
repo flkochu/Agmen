@@ -1592,6 +1592,35 @@ class TestErroresDelHubEnElPuente(unittest.TestCase):
         self.assertEqual(self.error("robot.b", uno.replace("1 de 2", "7 de 9")), [])   # solo cambian números
         self.assertEqual(len(self.error("robot.a", f"'/otro': 'nodo' publica sin declarar su lista")), 1)
 
+    # --- ataques del tester ---
+    def test_10000_errores_distintos_del_hub_no_hacen_crecer_la_memoria_ni_el_ruido(self):
+        for i in range(self.T.SAID_MAX * 3):
+            self.tx.sendto(hp.encode("error", id=f"robot.e{i}", msg=f"'/t{i}': algo distinto {chr(97 + i % 26)}x"),
+                           self.rx.getsockname())
+            if i % 50 == 0:
+                time.sleep(0.01)
+                self.bridge._drain()
+        time.sleep(0.05)
+        self.bridge._drain()
+        self.assertLessEqual(len(self.said), self.T.SAID_MAX + 1)          # el tope + el aviso de "demasiados"
+        self.assertLessEqual(len(self.bridge._said), self.T.SAID_MAX + 1)
+
+    def test_errores_raros_del_hub_no_tumban_al_puente(self):
+        casos = [("", ""), ("robot.a", ""), ("", "x" * 5000), ("robot.a", "'" * 3000), ("a" * 5000, "'/t' x"),
+                 ("robot.a", "\x1b[2J\x00 control"), ("robot.a", "ñ" * 2000), ("robot.a", "'/" + "t" * 300 + "' otro"),
+                 ("robot.a", "1" * 3000), ("robot.a", "%ZZ %")]
+        for eid, msg in casos:
+            with self.subTest(eid=eid[:10], msg=msg[:10]):
+                try:
+                    self.error(eid, msg)
+                except Exception as e:      # noqa: BLE001
+                    self.fail(f"el puente se cayó con un error del hub raro: {type(e).__name__}: {e}")
+
+    def test_el_texto_que_se_dice_cabe_en_la_tanda(self):
+        for msg in ("x" * 3000, "ñ" * 3000):
+            dicho, = self.error("robot." + str(len(msg)) + msg[0], msg)
+            self.assertLess(len(dicho), self.T.HUB_ERROR_MAX + 200)
+
 
 if __name__ == "__main__":
     unittest.main()

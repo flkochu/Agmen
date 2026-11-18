@@ -2203,5 +2203,58 @@ class TestNucleoCppMezclasConHubPlano(_HubPlano):
 
 
 
+class TestRegistroGrandeDeUnSubscriber(unittest.TestCase):
+    """El registro (`pub` o `sub`) con names debe caber en un datagrama (65507). El Publisher lo revisa al crear; el
+    Subscriber tiene que hacer lo mismo o decir algo: no quedarse sin registrar y sin decir por qué."""
+
+    SCRIPT = r"""
+import os, socket, sys, io, contextlib, time
+hub = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); hub.bind(("127.0.0.1", 0)); hub.settimeout(0.3)
+os.environ["AGMEN_HUB"] = f"127.0.0.1:{hub.getsockname()[1]}"
+import agmen
+from agmen.msgs import JointState
+T = JointState[100]
+names = [("j%060d" % i)[:64] for i in range(100)]
+err = io.StringIO()
+with contextlib.redirect_stderr(err):
+    try:
+        o = getattr(agmen, sys.argv[1])(T, "/x", names=names)
+    except Exception as e:
+        print("ERROR:", e); sys.exit(0)
+    grande = False
+    end = time.time() + 2.0
+    while time.time() < end:
+        try:
+            d, _ = hub.recvfrom(70000)
+            grande = grande or len(d) > 1000
+        except socket.timeout:
+            pass
+    o.close()
+print("DATAGRAMA" if grande else "NADA: " + err.getvalue().strip().replace("\n", " | ")[:300])
+"""
+
+    def corre(self, cls, nodo):
+        env = dict(os.environ, PYTHONPATH=str(ROOT / "python"), AGMEN_NODE=nodo, PYTHONIOENCODING="utf-8")
+        r = subprocess.run([sys.executable, "-c", self.SCRIPT, cls], env=dict(env, PYTHONPATH=str(ROOT / "python")),
+                           capture_output=True, text=True, encoding="utf-8", timeout=60, cwd=str(ROOT / "python"))
+        return (r.stdout + r.stderr).strip()
+
+    def test_publisher_y_subscriber_con_nombre_de_nodo_enorme_no_se_quedan_callados(self):
+        for cls in ("Publisher", "Subscriber"):
+            with self.subTest(cls=cls):
+                out = self.corre(cls, "n" * 60000)
+                self.assertTrue(out.startswith("ERROR:") or out.startswith("DATAGRAMA"),
+                                f"{cls} con names y un AGMEN_NODE de 60000 caracteres no registra nada y no lo dice "
+                                f"claro (el registro mide más de 65507 bytes): {out}")
+                if out.startswith("ERROR:"):
+                    self.assertIn("65507", out)
+                    self.assertNotIn("el esquema de JointState es muy largo", out)   # el culpable es el nombre del nodo
+
+    def test_con_nombre_de_nodo_normal_los_dos_registran(self):
+        for cls in ("Publisher", "Subscriber"):
+            with self.subTest(cls=cls):
+                self.assertTrue(self.corre(cls, "nodo_normal").startswith("DATAGRAMA"))
+
+
 if __name__ == "__main__":
     unittest.main()
