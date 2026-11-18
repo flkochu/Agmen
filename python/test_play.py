@@ -1285,9 +1285,9 @@ def puerto_sin_hub() -> str:
 
 
 class TestPlaySinRespuestaDelHub(unittest.TestCase):
-    """Un mensaje mandado antes de que el hub conteste queda pendiente: sin hub no se espera por cada publicador (una
-    sola espera, al final, de a lo más 1 s) y cuenta como reproducido; con un hub que rechaza tarde, cuenta como
-    rechazado."""
+    """La espera a la primera respuesta del hub es un solo presupuesto (~1 s) para toda la reproducción: sin hub no
+    se espera por cada publicador, y lo mandado sin respuesta cuenta como reproducido; con un hub que acepta tarde,
+    llega todo; con uno que rechaza tarde, lo mandado antes de su respuesta cuenta como rechazado."""
 
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -1313,7 +1313,8 @@ class TestPlaySinRespuestaDelHub(unittest.TestCase):
             s = p.stop()
             dura = time.monotonic() - t0
         self.assertEqual(publicadores, 3)
-        # Antes: 1 s más por cada publicador nuevo (3 × 1.1 s). Ahora: 0.1 s por publicador y una espera al final.
+        # Antes: 1 s más por cada publicador nuevo (3 × 1.1 s). Ahora: 0.1 s por publicador y un solo presupuesto de
+        # ~1 s entre la espera del principio y la del final.
         self.assertLess(dura, 2.5, out.getvalue())
         self.assertEqual(s.messages, 15, out.getvalue())   # sin hub, cuentan como reproducidos (como siempre)
         self.assertEqual(s.topics, {"/a": 5, "/b": 5, "/c": 5})
@@ -1322,33 +1323,102 @@ class TestPlaySinRespuestaDelHub(unittest.TestCase):
                       out.getvalue())
         self.assertNotIn("rechaz", out.getvalue())
 
-    def _hub_tarde(self, espera: float):
-        """Un hub con require_names en /patas/cmd que empieza a contestar `espera` s después (los registros
-        esperan en su socket)."""
-        hub = hubmod.Hub("127.0.0.1:0", log=lambda t: None, joints=[hubmod.JointNames("/patas/cmd", NOMBRES3, True)])
+    def _hub_tarde(self, espera: float | None = None, senal: threading.Event | None = None, joints=True):
+        """Un hub (con require_names en /patas/cmd si `joints`) que empieza a contestar `espera` s después, o cuando
+        se ponga `senal` (los registros esperan en su socket). Al terminar la prueba se cancela y se cierra."""
+        req = [hubmod.JointNames("/patas/cmd", NOMBRES3, True)] if joints else None
+        hub = hubmod.Hub("127.0.0.1:0", log=lambda t: None, joints=req)
         parar = threading.Event()
+
+        def servir():
+            if senal is not None and not senal.wait(20):
+                return
+            threading.Thread(target=hub.serve, args=(parar,), daemon=True).start()
+
+        if senal is not None:
+            arranque = threading.Thread(target=servir, daemon=True)
+            self.addCleanup(senal.set)           # (que el hilo que espera la señal no se quede colgado)
+        else:
+            arranque = threading.Timer(espera, servir)
+            self.addCleanup(arranque.cancel)
+        # addCleanup corre al revés: primero se cancela el arranque, luego se para y se cierra el hub (su socket).
+        self.addCleanup(hub.close)
         self.addCleanup(parar.set)
-        threading.Timer(espera, lambda: threading.Thread(target=hub.serve, args=(parar,), daemon=True).start()).start()
+        arranque.start()
         self._env(f"127.0.0.1:{hub.sock.getsockname()[1]}")
+        return hub
+
+    def _senal_al_mandar(self, n: int) -> threading.Event:
+        """Un Event que se pone cuando el reproductor ya mandó (send_packet) `n` paquetes."""
+        senal = threading.Event()
+        original = play._ReplayPublisher.send_packet
+        mandados = [0]
+
+        def contar(pub, data):
+            try:
+                return original(pub, data)
+            finally:
+                mandados[0] += 1
+                if mandados[0] >= n:
+                    senal.set()
+
+        parche = mock.patch.object(play._ReplayPublisher, "send_packet", contar)
+        parche.start()
+        self.addCleanup(parche.stop)
+        return senal
 
     def test_hub_que_rechaza_tarde_los_conteos_no_cambian(self):
-        """El hub contesta (rechaza) a media reproducción, o ya terminada la grabación (en la espera del final): lo
-        mandado antes de su respuesta cuenta como rechazado, no como reproducido."""
-        for n, espera in ((40, 0.5), (4, 0.4)):
+        """El hub contesta (rechaza) pronto (dentro de la espera común del principio), a media reproducción (vencida
+        esa espera), o cuando la reproducción ya mandó todo (en la espera del final): lo mandado antes de su
+        respuesta cuenta como rechazado, no como reproducido."""
+        for n, espera in ((40, 0.5), (40, 1.2), (4, None)):
             with self.subTest(n=n, espera=espera):
                 path = os.path.join(self.dir, f"patas{n}.mcap")
                 grabacion_de_patas(path, n=n)
-                self._hub_tarde(espera)
+                senal = self._senal_al_mandar(n) if espera is None else None
+                self._hub_tarde(espera, senal)
                 out = io.StringIO()
                 p = play.Player(path, out=out)
                 p.start()
                 self.assertTrue(p.wait(20), out.getvalue())
                 s = p.stop()
+                if senal is not None:
+                    self.assertTrue(senal.is_set(), out.getvalue())   # sí se mandó todo antes de que contestara
                 self.assertEqual(s.messages, 0, out.getvalue())
                 self.assertEqual(s.rejected, {"/patas/cmd": n}, out.getvalue())
                 self.assertEqual(out.getvalue().count("el hub rechazó publicar en '/patas/cmd'"), 1, out.getvalue())
                 self.assertIn(f"⏹ terminó patas{n}.mcap: 0 mensajes ({n} rechazados por el hub en /patas/cmd)",
                               out.getvalue())
+
+    def test_hub_que_acepta_tarde_llega_todo(self):
+        """El hub empieza a contestar (y acepta) a los 0.3–0.6 s, con un suscriptor: lo que se mandó llega, y lo
+        reproducido es lo que llegó (antes, lo mandado antes de la respuesta del hub salía sin destino)."""
+        from agmen.msgs import JointCommand
+
+        for espera in (0.3, 0.6):
+            with self.subTest(espera=espera):
+                path = os.path.join(self.dir, f"acepta{espera}.mcap")
+                grabacion_de_patas(path, n=40)
+                self._hub_tarde(espera, joints=False)
+                sub = agmen.Subscriber(JointCommand[3], "/patas/cmd")   # antes que el reproductor
+                self.addCleanup(sub.close)
+                out = io.StringIO()
+                p = play.Player(path, out=out)
+                p.start()
+                got = []
+                until = time.monotonic() + 20
+                while time.monotonic() < until and len(got) < 40:
+                    s = sub.receive(0.05)
+                    if s is not None:
+                        got.append(s)
+                    elif p.wait(0):      # terminó: un segundo más para lo que venga en camino, y ya
+                        until = min(until, time.monotonic() + 1.0)
+                self.assertTrue(p.wait(20), out.getvalue())
+                s = p.stop()
+                self.assertEqual(s.rejected, {}, out.getvalue())
+                self.assertEqual(s.messages, 40, out.getvalue())
+                self.assertEqual(len(got), 40, out.getvalue())
+                self.assertEqual([x.message.position[0] for x in got], [float(i) for i in range(40)])
 
 
 class TestPlayRechazoPorTipo(unittest.TestCase):

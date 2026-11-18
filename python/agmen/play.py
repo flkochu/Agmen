@@ -34,6 +34,14 @@ from .pubsub import ANNOUNCE_EVERY_S, _PurePublisher, declared_names
 _OFF_CLOCK = 60          # el campo `clock` del sobre (RFC 0001 §3)
 _OFF_T = 40              # t_data (i64) y luego t_pub (i64)
 
+# Espera a la primera respuesta del hub: un solo presupuesto para toda la reproducción, no uno por publicador (sin
+# hub, cada publicador sumaría su espera). Al principio, cada publicador nuevo espera la respuesta hasta un plazo
+# común (_ESPERA_HUB - _ESPERA_FINAL después de crear el primero); lo que quede del presupuesto (al menos
+# _ESPERA_FINAL) es para la espera del final (Player._settle). Sin hub, en total: _ESPERA_HUB, además de los 0.1 s de
+# siempre de cada publicador.
+_ESPERA_HUB = 1.0
+_ESPERA_FINAL = 0.2
+
 
 class _RecordedType:
     """Lo que un Publisher necesita saber de un tipo, sacado del esquema grabado."""
@@ -183,6 +191,8 @@ class Player:
         self._last_status = 0.0
         self._rejected_told: set[str] = set()   # topics cuyo rechazo del hub ya se dijo (una vez por topic)
         self._pending: list[_ReplayPublisher] = []   # publicadores con mensajes mandados antes de que el hub conteste
+        self._hub_deadline: float | None = None      # plazo común de la espera del principio (ver _ESPERA_HUB)
+        self._waited = 0.0                           # lo que ya se gastó del presupuesto al principio
 
     # --- controles (como el reloj de simulación; el panel los usa) ---
     def pause(self) -> None:
@@ -249,8 +259,22 @@ class Player:
             hp.check_topic(channel.topic)
             rtype = self._types[channel.id]
             names = declared_names(self.names, channel.topic, rtype.SCHEMA_TEXT)
+            if self._hub_deadline is None:   # el plazo común empieza con el primer publicador
+                self._hub_deadline = time.monotonic() + (_ESPERA_HUB - _ESPERA_FINAL)
             pub = self._pubs[key] = _ReplayPublisher(rtype, channel.topic, source_id, names)
+            self._await_hub(pub)
         return pub
+
+    def _await_hub(self, pub: _ReplayPublisher) -> None:
+        """Un publicador nuevo espera la primera respuesta del hub (además de sus 0.1 s), pero solo hasta el plazo
+        común: sin respuesta no se sabe a quién mandar ni si el hub rechazó el registro, y lo primero que se mande no
+        llegaría a nadie. Vencido el plazo, no espera más; lo que mande queda pendiente (ver _resolve y _settle)."""
+        t = time.monotonic()
+        while not pub.answered() and time.monotonic() < self._hub_deadline and not self._stop.is_set():
+            time.sleep(0.005)
+            with pub._lock:   # con el candado: el hilo de latido también lee las respuestas del hub
+                pub._drain()
+        self._waited += time.monotonic() - t
 
     def _wait_until(self, target: int) -> bool:
         """Espera a que el reloj de la grabación llegue a `target`. False si hay que parar."""
@@ -346,9 +370,10 @@ class Player:
                 self._count(pub.topic, n)
 
     def _settle(self) -> None:
-        """Al final: si quedan mensajes pendientes, se espera una sola vez, en total, hasta 1 s a que el hub conteste
-        (no una vez por publicador: sin hub, la reproducción no se alarga más que eso)."""
-        end = time.monotonic() + 1.0
+        """Al final: si quedan mensajes pendientes, se espera una sola vez a que el hub conteste, con lo que quede del
+        presupuesto (_ESPERA_HUB menos lo que se esperó al principio; al menos _ESPERA_FINAL): sin hub, la
+        reproducción no se alarga más que el presupuesto, ni una vez por publicador."""
+        end = time.monotonic() + max(0.0, _ESPERA_HUB - self._waited)
         while True:
             self._resolve(drain=True)
             if not self._pending or time.monotonic() >= end:
