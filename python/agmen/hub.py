@@ -685,8 +685,11 @@ class Hub:
                                            f"{have.schema}) y {who} quiere usarlo con {theirs} (schema_id "
                                            f"{schema}){shapes}. Un topic, un tipo: usa otro nombre de topic o el "
                                            f"mismo esquema")
-                donde_have = f"la computadora '{have.machine}'" if have.machine else "esta computadora"
-                donde = f"la computadora '{machine}'" if machine else "esta computadora"
+                # (los nombres de computadora también los manda el nodo: limpios y acotados, como en
+                # _check_machine_fields)
+                donde_have = (f"la computadora '{_cut(_clean(have.machine), NODE_SHOWN)}'" if have.machine
+                              else "esta computadora")
+                donde = f"la computadora '{_cut(_clean(machine), NODE_SHOWN)}'" if machine else "esta computadora"
                 raise hp.ProtocolError(f"'{topic}' ya es de tipo {have.type or have.schema} (schema_id "
                                        f"{have.schema}, de {them} en {donde_have}) y {who} (en "
                                        f"{donde}) quiere usarlo con {theirs} (schema_id {schema}){shapes}. Un topic, "

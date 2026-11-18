@@ -9,9 +9,17 @@
 #include <thread>
 
 #include "agmen/clock.hpp"
+#include "agmen/joints.hpp"
 #include "agmen/log.hpp"
 #include "agmen/platform.hpp"
 #include "agmen/shm.hpp"
+
+// El 65507 de un datagrama está en tres lugares de C++: hub::kMaxDatagram (hubproto.hpp), joints_detail::kMaxPayload
+// más el sobre (joints.hpp) y el SO_SNDBUF de src/net.cpp (que usa hub::kMaxDatagram). Aquí se ven los dos primeros:
+// no pueden divergir sin que la biblioteca deje de compilar.
+static_assert(agmen::hub::kMaxDatagram == agmen::msgs::joints_detail::kMaxPayload + agmen::wire::kEnvelopeLen,
+              "hub::kMaxDatagram (hubproto.hpp) y joints_detail::kMaxPayload + el sobre (joints.hpp) deben ser el "
+              "mismo datagrama: 65507");
 
 namespace agmen {
 
@@ -91,7 +99,9 @@ void registration_fits_or_throw(const std::string& kind, const std::string& who,
         fields.emplace_back("text", type.schema_text);
     } else {
         fields.emplace_back("port", kWorstPort);
-        fields.emplace_back("tcp", kWorstPort);
+        // tcp como lo manda de verdad el Subscriber de C++: solo con un tipo arrow (sin arrow no va el campo; Python
+        // puro manda `tcp=` vacío y lo mide así en sub_tcp_field de python/agmen/pubsub.py).
+        if (type.arrow) fields.emplace_back("tcp", kWorstPort);
     }
     if (!names.empty()) fields.emplace_back("names", names);
     if (!pub) fields.emplace_back("net", "1");

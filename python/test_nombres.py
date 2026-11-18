@@ -2274,8 +2274,8 @@ with contextlib.redirect_stderr(err):
     except Exception as e:
         print("ERROR:", e); sys.exit(0)
     grande = False
-    end = time.time() + 2.0
-    while time.time() < end:
+    end = time.monotonic() + 2.0
+    while time.monotonic() < end:
         try:
             d, _ = hub.recvfrom(70000)
             grande = grande or len(d) > 1000
@@ -2323,7 +2323,15 @@ class TestRegistroQueNoCabe(unittest.TestCase):
         self.addCleanup(patch.stop)
 
     @staticmethod
-    def esperado(cls_name: str, tipo, names=None) -> str:
+    def peor_sub(nucleo: str, nodo: str, tipo, names=None) -> bytes:
+        """La línea `sub` más larga que puede mandar un Subscriber no arrow de ese núcleo: puertos de 5 dígitos y
+        net=1; `tcp=` vacío en Python puro, sin el campo en C++ (como la línea de verdad de cada uno)."""
+        tcp = {"tcp": ""} if nucleo == "puro" else {}
+        return hp.encode("sub", id="0" * 16, node=nodo, pid=os.getpid(), topic="/x", schema="0" * 16, type=tipo.NAME,
+                         port=65535, **tcp, **({"names": ",".join(names)} if names else {}), net=1)
+
+    @staticmethod
+    def esperado(cls_name: str, tipo, names=None, nucleo="puro") -> str:
         """El texto, armado aquí a mano (el mismo que arma C++)."""
         nodo = TestRegistroQueNoCabe.NODO
         if cls_name == "Publisher":
@@ -2331,9 +2339,7 @@ class TestRegistroQueNoCabe(unittest.TestCase):
                               type=tipo.NAME, text=tipo.SCHEMA_TEXT, **({"names": ",".join(names)} if names else {}))
             partes = f"el nombre del nodo, 70000 bytes; el esquema de {tipo.NAME}, {len(hp.quote(tipo.SCHEMA_TEXT))} bytes"
         else:
-            linea = hp.encode("sub", id="0" * 16, node=nodo, pid=os.getpid(), topic="/x", schema="0" * 16,
-                              type=tipo.NAME, port=65535, tcp=65535, **({"names": ",".join(names)} if names else {}),
-                              net=1)
+            linea = TestRegistroQueNoCabe.peor_sub(nucleo, nodo, tipo, names)
             partes = "el nombre del nodo, 70000 bytes"
         if names:
             partes += f"; names, {len(','.join(names))} bytes"
@@ -2354,11 +2360,32 @@ class TestRegistroQueNoCabe(unittest.TestCase):
                     with self.subTest(nucleo=nucleo, cls=nombre, names=names):
                         with self.assertRaises(ValueError) as ctx:
                             cls(T2, "/x", names=names)
-                        self.assertEqual(str(ctx.exception), self.esperado(nombre, T2, names))
+                        self.assertEqual(str(ctx.exception), self.esperado(nombre, T2, names, nucleo))
         # Ningún registro salió (se revisa antes de abrir nada).
         self.falso.sock.settimeout(0.3)
         with self.assertRaises((socket.timeout, TimeoutError)):
             self.falso.sock.recvfrom(65536)
+
+    def test_nombre_enorme_sin_agmen_node_el_de_agmen_node(self):
+        """Sin AGMEN_NODE, el nombre que se le dio al nodo (set_default_node_name, lo llama agmen.Node): no viaja por
+        el entorno, así que puede medir 70 000 caracteres en cualquier sistema. El mismo texto en los dos núcleos."""
+        T2 = JointCommand[2]
+        viejo = pubsub._default_name
+        self.addCleanup(pubsub.set_default_node_name, viejo)
+        nodo = "n" * 70000
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AGMEN_NODE", None)
+            pubsub.set_default_node_name(nodo)
+            for nucleo, Pub, Sub in self.clases():
+                for nombre, cls in (("Publisher", Pub), ("Subscriber", Sub)):
+                    with self.subTest(nucleo=nucleo, cls=nombre):
+                        with self.assertRaises(ValueError) as ctx:
+                            cls(T2, "/x")
+                        texto = str(ctx.exception)
+                        self.assertTrue(texto.startswith(f"{nombre} en '/x': el registro en el hub mide "), texto[:100])
+                        self.assertIn("(lo que más ocupa, escrito como va en la línea: el nombre del nodo, 70000 bytes",
+                                      texto)
+                        self.assertTrue(texto.endswith(self.FIX_NODO), texto[-100:])
 
     def test_el_culpable_mas_grande_dice_que_hacer(self):
         class Grande(wire.Message):
@@ -2389,7 +2416,38 @@ class TestRegistroQueNoCabe(unittest.TestCase):
                 self.assertEqual(str(ctx.exception), self.esperado("Publisher", T2, names))
                 with self.assertRaises(wire.HubRejected) as ctx:
                     core.Subscriber("/x", T2.NAME, T2.SCHEMA_TEXT, T2.SCHEMA_ID, T2.LAYOUT.size or 0, False, names)
-                self.assertEqual(str(ctx.exception), self.esperado("Subscriber", T2, names))
+                self.assertEqual(str(ctx.exception), self.esperado("Subscriber", T2, names, "nativo"))
+
+    def test_subscriber_justo_en_el_borde(self):
+        """La medida es la de la línea más larga que ese Subscriber puede mandar de verdad (no la de otro núcleo ni
+        con un tcp que no manda): con 65507 bytes se crea y manda su registro; con uno más, el error con el tamaño
+        exacto."""
+        T2 = JointCommand[2]
+        for nucleo, _, Sub in self.clases():
+            for names in (None, ["a", "b"]):
+                base = len(self.peor_sub(nucleo, "", T2, names))
+                k = 65507 - base                                   # los bytes que debe medir el nombre en la línea
+                nodo = "%" * (k // 3) + "n" * (k % 3)
+                self.assertEqual(len(self.peor_sub(nucleo, nodo, T2, names)), 65507)
+                self.assertLessEqual(len(nodo), MAX_ENV)
+                with self.subTest(nucleo=nucleo, names=names, borde="cabe"):
+                    err = io.StringIO()
+                    with mock.patch.dict(os.environ, {"AGMEN_NODE": nodo}), contextlib.redirect_stderr(err):
+                        s = Sub(T2, "/x", names=names)
+                        self.addCleanup(s.close)
+                        linea = self.falso.registro("sub")
+                    (op, f), = hp.parse(linea)
+                    self.assertEqual((op, f["node"], f["topic"]), ("sub", nodo, "/x"))
+                    self.assertLessEqual(len(linea), 65507)
+                    self.assertEqual("tcp" in f, nucleo == "puro")   # la línea de verdad de cada núcleo
+                    s.close()
+                with self.subTest(nucleo=nucleo, names=names, borde="un byte más"):
+                    with mock.patch.dict(os.environ, {"AGMEN_NODE": nodo + "n"}):
+                        with self.assertRaises(ValueError) as ctx:
+                            Sub(T2, "/x", names=names)
+                    self.assertTrue(str(ctx.exception).startswith("Subscriber en '/x': el registro en el hub mide "
+                                                                  "65508 bytes y en un datagrama caben 65507 "),
+                                    str(ctx.exception)[:200])
 
     def test_quien_cabe_registra_la_linea_de_siempre(self):
         err = io.StringIO()
@@ -2414,6 +2472,30 @@ class TestHubRejectedDelNucleo(_HubPlano):
         e = self.rechazado(lambda: otro.publish(JointState[2]()))
         self.assertIs(type(e), wire.HubRejected)
         self.assertIs(type(e), agmen.wire.HubRejected)
+
+    def test_la_clase_del_rechazo_es_la_que_llega_por_argumento(self):
+        """Lo de arriba también pasaría si el núcleo buscara HubRejected por su nombre: aquí se le pasa a set_errors
+        otra clase (una subclase nueva de WireError) y el rechazo del núcleo debe salir como ESA clase; luego, con
+        la de siempre, como wire.HubRejected. (Un rechazo que lanza el núcleo al crear, sin hub: una lista repetida.)"""
+        core = _backend.core
+        T2 = JointCommand[2]
+
+        class OtraHubRejected(wire.WireError):
+            pass
+
+        def rechazo():
+            with self.assertRaises(wire.WireError) as ctx:
+                core.Publisher("/x", T2.NAME, T2.SCHEMA_TEXT, T2.SCHEMA_ID, T2.LAYOUT.size or 0, False, "", ["a", "a"])
+            return ctx.exception
+
+        try:
+            core.set_errors(wire._schema.SchemaError, wire.WireError, OtraHubRejected)
+            e = rechazo()
+            self.assertIs(type(e), OtraHubRejected)
+            self.assertIn("'a' está dos veces en names", str(e))
+        finally:
+            core.set_errors(wire._schema.SchemaError, wire.WireError, wire.HubRejected)
+        self.assertIs(type(rechazo()), wire.HubRejected)
 
 
 if __name__ == "__main__":

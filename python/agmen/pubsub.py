@@ -142,6 +142,21 @@ def joint_names_for(msg_type, where: str, names, who: str) -> tuple[str, ...] | 
 # peor caso (port y tcp de 5 dígitos, y net=1, que se añade si el hub pasa a modo red), igual en C++ (src/pubsub.cpp).
 _WORST_PORT = 65535
 
+# El campo tcp del registro de un Subscriber, como lo manda de verdad cada núcleo (sub_tcp de
+# check_registration_fits): con un tipo arrow, un puerto (el peor caso, 5 dígitos); sin arrow, Python puro manda
+# `tcp=` vacío y C++ no manda el campo.
+TCP_SIN_CAMPO = None
+
+
+def sub_tcp_field(arrow: bool, native: bool) -> str | None:
+    """Lo que va en `tcp=` en el registro más largo que puede mandar un Subscriber (ver check_registration_fits)."""
+    if arrow:
+        return str(_WORST_PORT)
+    return TCP_SIN_CAMPO if native else ""
+
+
+_SIN_DAR = object()
+
 
 def _utf8(text: str) -> bool:
     """¿Se puede escribir en UTF-8? Con el núcleo de C++, un AGMEN_NODE con bytes que no son UTF-8 lo manda C++ tal
@@ -155,20 +170,35 @@ def _utf8(text: str) -> bool:
 
 
 def check_registration_fits(kind: str, who: str, where: str, node: str, type_name: str, schema_text: str,
-                            names: tuple[str, ...] | None) -> None:
+                            names: tuple[str, ...] | None, sub_tcp=_SIN_DAR) -> None:
     """La línea de registro de un Publisher (`kind` "pub") o un Subscriber ("sub") de topic debe caber en un
     datagrama (wire.MAX_DATAGRAM): si no, el registro nunca sale y el usuario solo vería "no hay un agmen hub". Se
     revisa al crear, antes de abrir nada, con o sin names; ValueError que dice cuánto mide, cuánto ocupa cada parte
     grande (ya escrita como va en la línea) y qué hacer según cuál es la mayor. El mismo texto que
     registration_fits_or_throw de src/pubsub.cpp. Un nombre de nodo con bytes que no son UTF-8: el error de
-    hp.quote (dice qué hacer)."""
+    hp.quote (dice qué hacer), con quién y dónde delante.
+
+    Se mide la línea más larga que ese endpoint puede llegar a mandar de verdad: la de su núcleo, con puertos de 5
+    dígitos y, en un Subscriber, net=1. `sub_tcp` (obligatorio con "sub", ver sub_tcp_field): el valor de `tcp=`
+    como lo manda ese núcleo, o TCP_SIN_CAMPO si no lo manda."""
+    if kind != "pub" and sub_tcp is _SIN_DAR:
+        raise TypeError("check_registration_fits('sub', ...): falta sub_tcp (usa sub_tcp_field)")
+    try:
+        _check_registration_fits(kind, who, where, node, type_name, schema_text, names, sub_tcp)
+    except hp.ProtocolError as e:   # un nombre de nodo que no es UTF-8: el texto de hp.quote, con quién y dónde
+        raise hp.ProtocolError(f"{who} en '{where}': {e}") from None
+
+
+def _check_registration_fits(kind, who, where, node, type_name, schema_text, names, sub_tcp) -> None:
     names_field = hp.format_joint_names(names) if names is not None else None
     if kind == "pub":
         fields = dict(id="0" * 16, node=node, pid=os.getpid(), topic=where, schema="0" * 16, type=type_name,
                       text=schema_text)
     else:
         fields = dict(id="0" * 16, node=node, pid=os.getpid(), topic=where, schema="0" * 16, type=type_name,
-                      port=_WORST_PORT, tcp=_WORST_PORT)
+                      port=_WORST_PORT)
+        if sub_tcp is not TCP_SIN_CAMPO:
+            fields["tcp"] = sub_tcp
     if names_field is not None:
         fields["names"] = names_field
     if kind != "pub":
@@ -687,7 +717,8 @@ class _Receiver:
         by_topic = hp.is_topic(where) or where == "*"
         if by_topic:   # antes de abrir nada: un registro que no cabe en un datagrama no sale nunca
             hp.check_topic(where, allow_wildcard=True)
-            check_registration_fits("sub", self._NOMBRE, where, node or node_name(), type_name, "", names)
+            check_registration_fits("sub", self._NOMBRE, where, node or node_name(), type_name, "", names,
+                                    sub_tcp_field(tcp, native=False))
         # Modo red (RFC 0011 §2): solo por topic, y solo cuando el hub lo dice (un `ok` con peers).
         self._net_ip = _net_ip() if by_topic else None   # antes de abrir nada: si no sirve, error claro
         self._net = False                       # ya escucha en la red
@@ -1576,7 +1607,8 @@ class _NativeSubscriber:
         # Revisada aquí igual que en Python puro (los mismos TypeError/ValueError), antes de abrir nada.
         self.names = joint_names_for(msg_type, where, names, "Subscriber")
         if hp.is_topic(where) and _utf8(node_name()):   # (C++ lo vuelve a revisar con el mismo texto; ver _utf8)
-            check_registration_fits("sub", "Subscriber", where, node_name(), msg_type.NAME, "", self.names)
+            check_registration_fits("sub", "Subscriber", where, node_name(), msg_type.NAME, "", self.names,
+                                    sub_tcp_field(msg_type.LAYOUT.encoding == wire.ENC_ARROW, native=True))
         self.topic = where if hp.is_topic(where) else ""
         layout = msg_type.LAYOUT
         self._core = _backend.core.Subscriber(where, msg_type.NAME, msg_type.SCHEMA_TEXT, msg_type.SCHEMA_ID,

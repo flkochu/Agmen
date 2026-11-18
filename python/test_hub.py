@@ -1316,6 +1316,31 @@ class TestLineaPorLinea(unittest.TestCase):
                                 f"un Agmen anterior? Actualízalo")
 
 
+    def test_tipo_distinto_entre_computadoras_con_nombre_de_computadora_largo_queda_acotado(self):
+        """'la computadora ...' del error de tipo entre computadoras pasa por lo mismo que los demás textos: limpio
+        y acotado a NODE_SHOWN, sea la del que ya está en el topic o la del que llega."""
+        largo = "m" * 5000                          # un nombre de computadora válido (MACHINE_RE), pero enorme
+        self.manda(hp.encode("red", peers=f"{largo}@{ROBOT}"))
+        visto = f"la computadora '{'m' * (H.NODE_SHOWN - 1)}…'"
+        # El que ya está es de la otra computadora; llega uno de esta con otro tipo.
+        self.assertEqual(self.manda(hp.encode("pub", id="r1", node="remoto", pid=7, topic="/cmd", schema=self.SCHEMA,
+                                              type="Cmd", machine=largo))[0][0], "ok")
+        (op, f), = self.manda(hp.encode("pub", id="l1", node="local", pid=8, topic="/cmd", schema="00000000000000bb",
+                                        type="Otro"))
+        self.assertEqual(op, "error")
+        self.assertIn(f"de 'remoto' en {visto}", f["msg"])
+        self.assertNotIn("m" * H.NODE_SHOWN, f["msg"])
+        self.assertLess(len(f["msg"]), 600)
+        # Y al revés: el que llega es de la otra computadora.
+        self.manda(hp.encode("bye", id="r1"))
+        self.manda(hp.encode("pub", id="l2", node="local", pid=8, topic="/cmd2", schema=self.SCHEMA, type="Cmd"))
+        (op, f), = self.manda(hp.encode("pub", id="r2", node="remoto", pid=7, topic="/cmd2",
+                                        schema="00000000000000bb", type="Otro", machine=largo))
+        self.assertEqual(op, "error")
+        self.assertIn(f"'remoto' (en {visto})", f["msg"])
+        self.assertNotIn("m" * H.NODE_SHOWN, f["msg"])
+        self.assertLess(len(f["msg"]), 600)
+
     def test_errores_de_modo_red_con_nombre_raro_quedan_acotados(self):
         """Los textos de _check_machine_fields (modo local, peers, addr) nombran al nodo y a la computadora con
         Hub._who: sin controles y acotados, aunque el nombre mida 60 000 caracteres."""
@@ -1643,11 +1668,18 @@ class TestNodoConNombreRaro(unittest.TestCase):
         Python como 'nodo\\udcff'; el Publisher de Python puro revienta con un UnicodeEncodeError en inglés
         ("'utf-8' codec can't encode...") que no dice qué pasó ni qué hacer (VISION §3 regla 1)."""
         from agmen import pubsub
+        cola = hp.not_utf8_text("node", 4)       # el texto de hp.quote, entero
         with self.assertRaises(Exception) as ctx:
             pubsub._PurePublisher(Cmd, "/raro3", node="nodo\udcff\udcfe")
         texto = str(ctx.exception)
         self.assertNotIn("codec can't encode", texto)
         self.assertTrue("AGMEN_NODE" in texto or "nombre del nodo" in texto, texto)
+        # Con quién y dónde delante, como los demás errores al crear.
+        self.assertEqual(texto, "Publisher en '/raro3': " + cola)
+        with unittest.mock.patch.object(pubsub, "node_name", return_value="nodo\udcff\udcfe"):
+            with self.assertRaises(hp.ProtocolError) as ctx:
+                pubsub._PureSubscriber(Cmd, "/raro3")
+        self.assertEqual(str(ctx.exception), "Subscriber en '/raro3': " + cola)
 
 
 class TestErroresDelHubEnElPuente(unittest.TestCase):

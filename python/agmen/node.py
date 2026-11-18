@@ -46,6 +46,7 @@ from .pubsub import (
     Sample,
     Subscriber,
     check_registration_fits,
+    sub_tcp_field,
     joint_names_for,
     _heredar,
     hub_address,
@@ -661,7 +662,8 @@ class _NativeNode:
                 hp.check_topic(where)
             checked = joint_names_for(msg_type, where, names, "Node.on")   # revisada igual que en Python puro
             if hp.is_topic(where) and _utf8(node_name()):   # el registro cabe (como Subscriber; C++ lo repite)
-                check_registration_fits("sub", "Subscriber", where, node_name(), msg_type.NAME, "", checked)
+                check_registration_fits("sub", "Subscriber", where, node_name(), msg_type.NAME, "", checked,
+                                        sub_tcp_field(msg_type.LAYOUT.encoding == wire.ENC_ARROW, native=True))
             decode, envelope = msg_type.decode_payload, wire.Envelope
 
             def deliver(env, payload, sender):

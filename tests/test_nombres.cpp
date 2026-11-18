@@ -16,6 +16,7 @@
 #include <chrono>
 #include <filesystem>
 #include <map>
+#include <mutex>
 #include <set>
 #include <cstdio>
 #include <cstdlib>
@@ -27,11 +28,7 @@
 #include <thread>
 #include <vector>
 
-// El 65507 de un datagrama está en tres lugares de C++ (hubproto.hpp, joints.hpp y src/net.cpp, que no se
-// incluyen entre sí): los dos que se ven desde aquí no pueden divergir sin que esto deje de compilar.
-static_assert(agmen::hub::kMaxDatagram == agmen::msgs::joints_detail::kMaxPayload + agmen::wire::kEnvelopeLen,
-              "hub::kMaxDatagram (hubproto.hpp) y joints_detail::kMaxPayload + el sobre (joints.hpp) deben ser el "
-              "mismo datagrama: 65507");
+// (El static_assert de que el 65507 de hubproto.hpp y el de joints.hpp son el mismo vive en src/pubsub.cpp.)
 
 namespace {
 
@@ -397,6 +394,33 @@ void test_registro_que_no_cabe_por_el_nombre_del_nodo() {
     }
     CHECK(!h.any("pub", 50ms));
     CHECK(!h.any("sub", 50ms));
+    {   // Sin AGMEN_NODE (vacía = no está), el nombre de agmen::Node: no viaja por el entorno, así que puede medir
+        // 70 000 caracteres en cualquier sistema.
+        set_env("AGMEN_NODE", "");
+        const std::string n70000(70000, 'n');
+        hub::set_default_node_name(n70000);
+        const auto e = wire_error([&] { agmen::Publisher<Cmd> p("/x"); });
+        CHECK(e.has_value());
+        if (e) {
+            CHECK(e->rfind("Publisher en '/x': el registro en el hub mide 7", 0) == 0);
+            CHECK(e->find("(lo que más ocupa, escrito como va en la línea: el nombre del nodo, 70000 bytes; el "
+                          "esquema de JointCommand, " + esquema + " bytes). " + fix) != std::string::npos);
+        }
+        hub::set_default_node_name("");
+        {
+            agmen::Node node(n70000);   // el nombre del Node (set_default_node_name por dentro)
+            const auto e2 = wire_error([&] { node.subscribe<Cmd>("/x", [](const Cmd&) {}); });
+            CHECK(e2.has_value());
+            if (e2) {
+                CHECK(e2->find("(lo que más ocupa, escrito como va en la línea: el nombre del nodo, 70000 bytes). " +
+                               fix) != std::string::npos);
+            }
+        }
+        hub::set_default_node_name("");
+        set_env("AGMEN_NODE", enorme.c_str());
+        CHECK(!h.any("pub", 50ms));
+        CHECK(!h.any("sub", 50ms));
+    }
     // Con dirección fija no hay registro: no se revisa.
     { agmen::Subscriber<Cmd> s("127.0.0.1:0"); }
     // Un nombre de nodo largo que sí cabe: la línea de siempre, byte a byte (59800 bytes en la línea).
@@ -405,6 +429,58 @@ void test_registro_que_no_cabe_por_el_nombre_del_nodo() {
     {
         agmen::Publisher<Cmd> p("/x");
         CHECK_EQ(h.next("pub"), pub_de_siempre<Cmd>(p.source_id(), "/x"));
+    }
+    set_env("AGMEN_NODE", "prueba-nombres");
+}
+
+/// La línea `sub` más larga que puede mandar un SubscriberCore de C++: puertos de 5 dígitos, net=1 y tcp solo si
+/// el tipo es arrow (sin arrow, el Subscriber de C++ no manda el campo).
+std::string peor_sub(const std::string& nodo, const agmen::TypeInfo& type, const std::string& names) {
+    std::vector<std::pair<std::string, std::string>> f{{"id", std::string(16, '0')}, {"node", nodo},
+                                                      {"pid", hub::process_id()}, {"topic", "/x"},
+                                                      {"schema", std::string(16, '0')}, {"type", type.name},
+                                                      {"port", "65535"}};
+    if (type.arrow) f.emplace_back("tcp", "65535");
+    if (!names.empty()) f.emplace_back("names", names);
+    f.emplace_back("net", "1");
+    return hub::line("sub", f);
+}
+
+/// La medida es la de la línea más larga que el Subscriber puede mandar de verdad: con 65507 bytes se crea y manda
+/// su registro; con uno más, el error con el tamaño exacto. Con un tipo arrow (que sí manda tcp) y sin arrow.
+void test_subscriber_justo_en_el_borde() {
+    FakeHub h;
+    for (const bool arrow : {false, true}) {
+        for (const std::vector<std::string>& names : {std::vector<std::string>{}, std::vector<std::string>{"a", "b"}}) {
+            const agmen::TypeInfo type{"X", "agmen/1 X{u8 a}", 1, arrow ? 0u : 1u, arrow};
+            const auto names_field = names.empty() ? std::string() : hub::format_joint_names(names);
+            const std::size_t k = hub::kMaxDatagram - peor_sub("", type, names_field).size();
+            const std::string nodo = std::string(k / 3, '%') + std::string(k % 3, 'n');
+            CHECK(peor_sub(nodo, type, names_field).size() == hub::kMaxDatagram);
+            set_env("AGMEN_NODE", nodo.c_str());
+            {
+                std::optional<agmen::SubscriberCore> sub;
+                try {
+                    sub.emplace("/x", type, agmen::TopicOptions{names});
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "  (arrow=%d) no se creó en el borde: %.200s\n", arrow ? 1 : 0, e.what());
+                }
+                CHECK(sub.has_value());
+                const auto line = h.next("sub");
+                CHECK(field(line, "node") == nodo);
+                CHECK(!line.empty() && line.size() <= hub::kMaxDatagram);
+                CHECK((line.find(" tcp=") != std::string::npos) == arrow);   // la línea de verdad
+            }
+            const std::string mas = nodo + "n";
+            set_env("AGMEN_NODE", mas.c_str());
+            const auto e = wire_error([&] { agmen::SubscriberCore s("/x", type, agmen::TopicOptions{names}); });
+            CHECK(e.has_value());
+            if (e) {
+                CHECK(e->rfind("Subscriber en '/x': el registro en el hub mide 65508 bytes y en un datagrama caben "
+                               "65507 ",
+                               0) == 0);
+            }
+        }
     }
     set_env("AGMEN_NODE", "prueba-nombres");
 }
@@ -601,7 +677,11 @@ void test_atacan_nombres_con_bytes_raros() {
                 CHECK(pub->find('\0') == std::string::npos);                 // el error no lleva el byte 0
                 CHECK(pub->find('\x1b') == std::string::npos);
                 CHECK(pub->size() < 1000);                                    // acotado
-                for (char c : *pub) CHECK(c == '\n' ? false : (static_cast<unsigned char>(c) >= 0x20 || static_cast<unsigned char>(c) >= 0x80));
+                // Sin caracteres de control (ni saltos de línea ni 0x7f); los bytes de 0x80 en adelante son UTF-8.
+                for (char c : *pub) {
+                    const auto uc = static_cast<unsigned char>(c);
+                    CHECK(uc >= 0x20 && uc != 0x7f);
+                }
             }
         }
     }
@@ -773,12 +853,17 @@ void test_atacan_hilos_creando_publishers_con_lista() {
             }
         });
     }
-    // Se leen en este hilo los registros mientras los otros crean (el socket del hub de mentira es de este hilo).
+    // Se leen en este hilo los registros mientras los otros crean (el socket del hub de mentira es de este hilo), y
+    // se contesta `ok` a cada uno: así el constructor no espera sus 100 ms al hub (con 25 por hilo, en una máquina
+    // lenta de CI eso solo ya se comería el tope). El tope es amplio y se sale en cuanto están todos.
     std::map<std::string, std::string> vistos;   // topic → names
-    const auto end = std::chrono::steady_clock::now() + 6s;
+    const auto end = std::chrono::steady_clock::now() + 30s;
     while (std::chrono::steady_clock::now() < end) {
         const auto line = h.next("pub", 200ms);
-        if (!line.empty()) vistos[field(line, "topic")] = field(line, "names");
+        if (!line.empty()) {
+            vistos[field(line, "topic")] = field(line, "names");
+            h.reply(hub::line("ok", {{"id", field(line, "id")}}));
+        }
         if (vistos.size() == static_cast<std::size_t>(kHilos * kPorHilo)) break;
     }
     for (auto& t : hilos) t.join();
@@ -809,6 +894,7 @@ void test_atacan_fugas_200_publishers_con_lista() {
     FakeHub h;
     // Un hilo vacía el socket del hub de mentira mientras se crean y destruyen (si no, el buffer del sistema se
     // llena y se pierden datagramas).
+    std::mutex mu;   // registrados y despedidos: los escribe el lector y los lee este hilo
     std::set<std::string> registrados, despedidos;
     std::string error_del_lector;   // lo que lanzó el lector (un hilo no puede dejar escapar una excepción)
     // jthread: si algo lanza en este hilo antes del join, al destruirse pide parar y espera (un std::thread sin
@@ -818,13 +904,14 @@ void test_atacan_fugas_200_publishers_con_lista() {
             while (!parar.stop_requested()) {
                 const auto line = h.next("", 50ms);
                 if (line.empty()) continue;
-                if (line.rfind("agmen-hub/1 pub ", 0) == 0) {
-                    registrados.insert(field(line, "id"));
+                if (line.rfind("agmen-hub/1 pub ", 0) == 0 || line.rfind("agmen-hub/1 sub ", 0) == 0) {
+                    {
+                        std::lock_guard lock(mu);
+                        registrados.insert(field(line, "id"));
+                    }
                     h.reply(hub::line("ok", {{"id", field(line, "id")}}));   // (así el constructor no espera 100 ms)
-                } else if (line.rfind("agmen-hub/1 sub ", 0) == 0) {
-                    registrados.insert(field(line, "id"));
-                    h.reply(hub::line("ok", {{"id", field(line, "id")}}));
                 } else if (line.rfind("agmen-hub/1 bye ", 0) == 0) {
+                    std::lock_guard lock(mu);
                     despedidos.insert(field(line, "id"));
                 }
             }
@@ -841,7 +928,17 @@ void test_atacan_fugas_200_publishers_con_lista() {
         agmen::Publisher<Cmd> p("/fuga" + std::to_string(i % 7), {.names = {"a", "b"}});
         if (i % 4 == 0) agmen::Subscriber<Cmd> s("/fuga" + std::to_string(i % 7), {.names = {"a", "b"}});
     }
-    std::this_thread::sleep_for(300ms);
+    // Se espera, con tope, a que cada uno que se registró se haya despedido (no una espera fija: en una máquina
+    // lenta los `bye` pueden tardar más que en la de uno).
+    const auto tope = std::chrono::steady_clock::now() + 10s;
+    for (;;) {
+        {
+            std::lock_guard lock(mu);
+            if (registrados.size() >= 200 && registrados == despedidos) break;
+        }
+        if (std::chrono::steady_clock::now() >= tope) break;
+        std::this_thread::sleep_for(50ms);
+    }
     const int despues = fds_abiertos();
     if (antes >= 0) {
         if (despues > antes) std::fprintf(stderr, "  fds antes=%d despues=%d\n", antes, despues);
@@ -896,6 +993,7 @@ int main() {
     CORRER(test_numero_del_tipo_y_direccion);
     CORRER(test_registro_que_no_cabe_en_un_datagrama);
     CORRER(test_registro_que_no_cabe_por_el_nombre_del_nodo);
+    CORRER(test_subscriber_justo_en_el_borde);
     CORRER(test_la_linea_sin_names_es_la_de_siempre_y_con_names_la_de_python);
     CORRER(test_el_rechazo_del_hub_llega_entero);
     CORRER(test_node_con_names);
