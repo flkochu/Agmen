@@ -50,6 +50,7 @@ class HubFixture:
 
     def close(self):
         self.stop.set()
+        self.hub.close()
         self.thread.join(2)
 
 
@@ -617,7 +618,7 @@ class TestListaEnPartes(unittest.TestCase):
 
     def hub(self, topics=0, text_len=300, eps_per_topic=1):
         h = H.Hub(f"127.0.0.1:{free_port()}", log=lambda t: None)
-        self.addCleanup(h.sock.close)
+        self.addCleanup(h.close)
         texto = ("Largo{" + ", ".join(f"f32 campo{i}" for i in range(text_len)))[:text_len - 1] + "}"
         for i in range(topics):
             for j in range(eps_per_topic):
@@ -848,7 +849,7 @@ class TestNetIp(unittest.TestCase):
             if not net_ip:
                 os.environ.pop("AGMEN_NET_IP", None)
             h = H.Hub(f"127.0.0.1:{free_port()}", log=lambda t: None, grace_s=0.0)
-        self.addCleanup(h.sock.close)
+        self.addCleanup(h.close)
         sent = []
         h._send = lambda data, addr: sent.append((hp.parse(data)[0], addr))
         return h, sent
@@ -1770,6 +1771,50 @@ class TestErroresDelHubEnElPuente(unittest.TestCase):
         for msg in ("x" * 3000, "ñ" * 3000):
             dicho, = self.error("robot." + str(len(msg)) + msg[0], msg)
             self.assertLess(len(dicho), self.T.HUB_ERROR_MAX + 200)
+
+
+class TestCerrar(unittest.TestCase):
+    """El socket del hub lo cierra el hilo que lee (serve); close() marca el cierre y lo despierta. Antes, cerrarlo
+    desde otro hilo mientras serve estaba en recvfrom daba `OSError: [WinError 10038]` en Windows."""
+
+    GUION = r"""
+import socket, sys, threading, time
+from agmen import hub as H
+from agmen import hubproto as hp
+for i in range(20):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]; s.close()
+    h = H.Hub(f"127.0.0.1:{port}", log=lambda t: None)
+    stop = threading.Event()
+    hilo = threading.Thread(target=h.serve, args=(stop,), daemon=True)
+    hilo.start()
+    if i % 2:
+        assert H.ping(h.listen, timeout=1.0) is not None, "el hub no contesta"
+    if i % 3 == 0:
+        stop.set()            # como las pruebas: primero se para y luego se cierra, con serve aún en recvfrom
+    t0 = time.monotonic()
+    h.close()
+    assert not hilo.is_alive() or (hilo.join(1), not hilo.is_alive())[1], "serve no terminó"
+    assert h.sock.fileno() == -1, "el socket sigue abierto"
+    assert time.monotonic() - t0 < 1.0, "close tardó"
+h = H.Hub("127.0.0.1:0", log=lambda t: None)   # sin serve: close lo cierra aquí
+h.close(); h.close()
+assert h.sock.fileno() == -1
+print("ok")
+"""
+
+    def test_arrancar_y_cerrar_veinte_veces_sin_errores(self):
+        import subprocess
+        import sys
+        # cwd = la carpeta de las pruebas, para que el guion encuentre el paquete `agmen` aunque no haya
+        # PYTHONPATH (el CI corre `unittest discover -s python` sin él).
+        r = subprocess.run([sys.executable, "-c", self.GUION], capture_output=True, text=True, timeout=60,
+                           encoding="utf-8", errors="replace", cwd=os.path.dirname(os.path.abspath(__file__)))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "ok", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertNotIn("OSError", r.stderr)
+        self.assertEqual(r.stderr.strip(), "")
 
 
 if __name__ == "__main__":

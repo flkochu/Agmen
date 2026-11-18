@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -41,7 +42,8 @@ int main(int argc, char** argv) {
 
     MotorCommand current{};  // empieza detenido
     bool stopped = true;
-    long received = 0, errors = 0;
+    long received = 0, errors = 0, non_finite = 0;
+    bool non_finite_said = false;
     std::string last_error;
     const auto start = steady_clock::now();
     auto last_cmd = start;
@@ -54,15 +56,31 @@ int main(int argc, char** argv) {
         try {
             if (auto sample = sub.receive(milliseconds(50))) {
                 MotorCommand cmd = sample->message;
-                // Nunca confíes ciegamente en un comando: recórtalo al rango válido.
-                cmd.left = std::clamp(cmd.left, -1.0f, 1.0f);
-                cmd.right = std::clamp(cmd.right, -1.0f, 1.0f);
-                current = cmd;
-                last_cmd = steady_clock::now();
-                ++received;
-                if (stopped) {
-                    std::puts("[motor] ✅ recibiendo comandos, ruedas activas");
-                    stopped = false;
+                if (!std::isfinite(cmd.left) || !std::isfinite(cmd.right)) {
+                    // NaN o infinito: std::clamp no lo arregla (con NaN devuelve NaN). No se usa: alto ya.
+                    ++non_finite;
+                    current = MotorCommand{};
+                    stopped = true;
+                    if (!non_finite_said) {
+                        non_finite_said = true;
+                        std::fprintf(stderr,
+                                     "[motor] ⛔ ALTO: llegó un comando con un valor no finito (izq=%f der=%f) "
+                                     "desde %s; no lo uso. Revisa ese nodo.\n",
+                                     static_cast<double>(cmd.left), static_cast<double>(cmd.right),
+                                     sub.last_from().c_str());
+                    }
+                } else {
+                    non_finite_said = false;   // el aviso es por episodio: si vuelve un no finito, se dice otra vez
+                    // Nunca confíes ciegamente en un comando: recórtalo al rango válido.
+                    cmd.left = std::clamp(cmd.left, -1.0f, 1.0f);
+                    cmd.right = std::clamp(cmd.right, -1.0f, 1.0f);
+                    current = cmd;
+                    last_cmd = steady_clock::now();
+                    ++received;
+                    if (stopped) {
+                        std::puts("[motor] ✅ recibiendo comandos, ruedas activas");
+                        stopped = false;
+                    }
                 }
             }
         } catch (const wire::WireError& e) {
@@ -89,6 +107,6 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
     }
 
-    std::printf("[motor] resumen: recibidos=%ld errores=%ld\n", received, errors);
+    std::printf("[motor] resumen: recibidos=%ld errores=%ld no_finitos=%ld\n", received, errors, non_finite);
     return errors == 0 ? 0 : 1;
 }

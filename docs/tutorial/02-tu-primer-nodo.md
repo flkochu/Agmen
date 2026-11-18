@@ -117,7 +117,9 @@ if (!stopped && steady_clock::now() - last_cmd > kSafetyTimeout) {  // 5. freno 
    otro tipo, lanza `WireError` con una explicación clara. En
    `sample->envelope` tienes el sobre: `seq`, `t_data`, `t_pub`, `source_id`.
 4. **Recortar** los valores a un rango válido. Un bug en otro nodo no debe
-   poder mandar tu motor al 300 %.
+   poder mandar tu motor al 300 %. Un NaN o un infinito no se puede recortar
+   (`std::clamp` con NaN devuelve NaN), así que el motor del tutorial frena de
+   inmediato, no lo usa y lo dice en la terminal.
 5. **Freno de seguridad** (*deadman*): si pasan 0.5 s sin órdenes, alto
    total. Es la regla más importante de cualquier robot que se mueve.
 

@@ -786,7 +786,10 @@ class TestExecutorSaltos(unittest.TestCase):
                 node.stop()
                 th.join(5)
                 node.close()
-                self.assertLessEqual(st.skipped, 2, st)               # sin el arreglo: ~9 por paso
+                # Tolera 8 saltados: con el código actual y un reloj de 15.6 ms de paso (el de Windows) da 0, y en el
+                # CI de Windows se vieron 3 de ruido; con el defecto que esta prueba vigila (antes de 75563d2) da 32
+                # (y 90 ms de atraso). El techo de atraso no cambia.
+                self.assertLessEqual(st.skipped, 8, st)               # sin el arreglo: ~32
                 self.assertLess(st.worst_late_ns, 80 * _MS, st)       # sin el arreglo: ~100 ms
 
     def test_reloj_real_nada_cambia(self):

@@ -91,10 +91,15 @@ agmen run examples/tutorial/robot.toml
    ```
 4. Al terminar (Ctrl+C), el mux dice cuánto pasó de cada uno:
    ```
-   ruedas  │ [mux] resumen · teleop: reenviados=26 descartados=0 errores=0 · cerebro: reenviados=104 descartados=35 errores=0
+   ruedas  │ [mux] resumen · teleop: reenviados=26 descartados=0 errores=0 no_finitos=0 sin_tipo=0 · cerebro: reenviados=104 descartados=35 errores=0 no_finitos=0 sin_tipo=0
    ```
    Esos 35 `descartados` son los comandos del cerebro que **no** llegaron al
-   motor mientras tú manejabas.
+   motor mientras tú manejabas. El mux también descarta los comandos con NaN o
+   infinito (cuentan en `no_finitos=`) y avisa la primera vez por cada entrada:
+   un valor así nunca llega al motor. Y si el mux arranca o se reinicia después
+   que el cerebro, hasta que llega el anuncio del tipo (a lo más ~1 s) no sabe
+   qué bytes son números: no reenvía ningún comando, lo avisa una vez y los
+   cuenta en `sin_tipo=`.
 
 ## 4. ¿Quién tiene el mando? Pregúntale al mux
 

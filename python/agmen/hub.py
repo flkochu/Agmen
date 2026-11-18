@@ -286,6 +286,12 @@ class Hub:
         except OSError:
             pass   # (lo que el sistema dé)
         self.sock.settimeout(0.25)
+        # El socket lo cierra el hilo que lee (serve): quien pide cerrar marca el cierre y lo despierta (close).
+        # Cerrarlo desde otro hilo mientras está en recvfrom da `OSError: [WinError 10038]` en Windows.
+        self._close_lock = threading.Lock()
+        self._closing = False     # alguien pidió cerrar
+        self._serving = False     # serve está corriendo (es quien cierra el socket)
+        self._closed = threading.Event()
         self.log = log
         self.endpoints: dict[str, Endpoint] = {}
         self.stats: dict[tuple[str, str, str, str], tuple[dict[str, str], float]] = {}
@@ -991,13 +997,29 @@ class Hub:
             got[0], got[1] = 0, now
 
     def serve(self, stop: threading.Event) -> None:
+        """Atiende hasta `stop` o close(). Este hilo es el único que cierra el socket mientras sirve."""
+        with self._close_lock:
+            if self._closing:
+                return
+            self._serving = True
+        try:
+            self._serve(stop)
+        finally:
+            with self._close_lock:
+                self._serving = False
+                self.sock.close()
+            self._closed.set()
+
+    def _serve(self, stop: threading.Event) -> None:
         last_check = 0.0
-        while not stop.is_set():
+        while not stop.is_set() and not self._closing:
             self.sock.settimeout(BURST_S if self._outbox else 0.25)
             try:
                 data, addr = self.sock.recvfrom(65536)
             except (socket.timeout, ConnectionResetError):
                 data = None
+            if self._closing or stop.is_set():
+                break             # (lo despertó close o se acabó: lo que llegó ya no se atiende)
             now = time.monotonic()
             if data is not None:
                 with self.lock:
@@ -1014,7 +1036,24 @@ class Hub:
                     self.check_required(now)
                     self._unexpected_flush(now)
                 last_check = now
-        self.sock.close()
+
+    def close(self, wait_s: float = 2.0) -> None:
+        """Cierra el hub. Si serve está corriendo, marca el cierre y lo despierta con un datagrama vacío a su propio
+        puerto: el que cierra el socket es su hilo (y aquí se espera hasta `wait_s` a que lo haga). Sin serve, lo
+        cierra aquí. Se puede llamar más de una vez."""
+        with self._close_lock:
+            self._closing = True
+            if not self._serving:
+                self.sock.close()
+                return
+            try:
+                host, port = self.sock.getsockname()[:2]
+                if host in ("0.0.0.0", ""):
+                    host = "127.0.0.1"
+                self.sock.sendto(b"", (host, port))
+            except OSError:
+                pass   # (si no se pudo despertar, serve sale solo a su siguiente vuelta: 0.25 s como mucho)
+        self._closed.wait(wait_s)
 
 
 def ping(hub: str = hp.DEFAULT_HUB, timeout: float = 0.3) -> str | None:
@@ -1243,5 +1282,6 @@ def main(args) -> int:
         _wait_for_ctrl_c(stop)
     finally:
         stop.set()
+        hub.close(1)
         worker.join(1)
     return 0

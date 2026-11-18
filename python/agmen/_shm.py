@@ -29,6 +29,7 @@ mismos nombres y los mismos bytes.
 
 from __future__ import annotations
 
+import atexit
 import itertools
 import mmap
 import os
@@ -356,6 +357,41 @@ def sweep() -> None:
 _swept = False
 _sweep_lock = threading.Lock()
 
+# Los Pool abiertos (de este proceso o heredados de un fork): al terminar el programa (salida normal, sys.exit o
+# una excepción) se borran los nombres de los bloques y el registro de los que son de ESTE proceso, como el núcleo
+# de C++. El hijo de un fork no toca los del padre (cada Pool guarda su pid) y os._exit no corre nada (el que
+# arranque después los barre con sweep()). Sin candado: add/discard/list de un set no sueltan el GIL, y un candado
+# que un hilo del padre dejó tomado colgaría al hijo al salir. Aquí no vive el Pool, solo su _Rastro (pid, nombres
+# y registro): un Publisher soltado sin close() se libera como cualquier objeto, y al salir igual se borra lo suyo.
+_open_pools: set = set()
+_exit_hook = False
+
+
+class _Rastro:
+    """Lo mínimo de un Pool para limpiarlo al salir, sin mantenerlo vivo."""
+    __slots__ = ("pid", "names", "registry")
+
+    def __init__(self, pid: int) -> None:
+        self.pid, self.names, self.registry = pid, set(), ""
+
+    def unlink_all(self) -> None:
+        """Borra los nombres de los bloques y el registro (sin desmapear: algún hilo daemon puede seguir
+        escribiendo). Solo en el proceso que los creó."""
+        if self.pid != os.getpid():
+            return
+        for n in list(self.names):
+            unlink(n)
+        if self.registry:
+            try:
+                os.remove(self.registry)
+            except OSError:
+                pass
+
+
+def _clean_at_exit() -> None:
+    for r in list(_open_pools):
+        r.unlink_all()
+
 
 # ---------------------------------------------------------------------------
 # Lado del publicador: el pool de bloques (§3.4)
@@ -408,6 +444,13 @@ class Pool:
                 self.registry = os.path.join(d, f"{os.getpid()}-{owner:016x}.txt")
             except OSError:
                 self.registry = ""
+        global _exit_hook
+        self._rastro = _Rastro(self.pid)
+        self._rastro.registry = self.registry
+        _open_pools.add(self._rastro)
+        if not _exit_hook:
+            _exit_hook = True
+            atexit.register(_clean_at_exit)
 
     def _name(self) -> str:
         # "/agm" + pid + 8 hex del publicador + contador = 24 caracteres (macOS acepta 31).
@@ -432,6 +475,7 @@ class Pool:
                         fh.write(name + "\n")
                 except OSError:
                     pass
+            self._rastro.names.add(name)
             return _Block(name, mm, size)
         raise ShmError("no se pudo crear la memoria compartida")   # pragma: no cover
 
@@ -475,7 +519,7 @@ class Pool:
             if small is not None:
                 old = self.blocks[small]
                 if old is not None:
-                    old.close()
+                    self._forget(old)
                 self.blocks[small] = block
                 pick = small
             else:
@@ -510,6 +554,11 @@ class Pool:
                 if b.holders == 0:
                     self._touch(b)
 
+    def _forget(self, b: _Block) -> None:
+        """Cierra un bloque y lo saca del rastro de limpieza al salir."""
+        b.close()
+        self._rastro.names.discard(b.name)
+
     def _touch(self, b: _Block) -> None:
         self._tick += 1
         b.used, b.order = time.monotonic(), self._tick
@@ -525,11 +574,11 @@ class Pool:
         for i, b in enumerate(self.blocks):
             if b is not None and b.holders == 0 and now - b.used >= IDLE_FREE:
                 freed += b.size
-                b.close()
+                self._forget(b)
                 self.blocks[i] = None
         if self._probe is not None and now - self._probe.used >= IDLE_FREE:
             freed += self._probe.size
-            self._probe.close()
+            self._forget(self._probe)
             self._probe = None             # se vuelve a crear si llega otro suscriptor
         while self.blocks and self.blocks[-1] is None:
             self.blocks.pop()              # las ranuras vacías del final: nadie las nombra
@@ -554,9 +603,16 @@ class Pool:
         except OSError:
             pass   # el registro es para limpiar si el proceso muere: nunca tumba al nodo
 
+    def unlink_all(self) -> None:
+        """Al terminar el programa: borra los nombres de sus bloques y su registro, sin desmapear (algún hilo
+        daemon puede seguir escribiendo en ellos). Si después se crea otro bloque, el registro vuelve a escribirse y
+        sweep() lo borra cuando este proceso ya no esté."""
+        self._rastro.unlink_all()
+
     def close(self) -> None:
         if self.pid != os.getpid():
             return   # heredado de un fork: los bloques y el registro son del padre
+        _open_pools.discard(self._rastro)
         for b in self.blocks:
             if b is not None:
                 b.close()

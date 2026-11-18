@@ -57,12 +57,14 @@ class TestMux(unittest.TestCase):
         return self.mux.handle(inp, wire.encode(Cmd(left, right), seq, 123), t)
 
     def test_una_sola_fuente_pasa_y_se_renumera(self):
+        self.anuncia(self.cerebro, 0.0)             # sin el anuncio del tipo el mux no reenvía comandos
         self.assertTrue(self.send(self.cerebro, 0.6, 0.6, 0.0, seq=500))
         self.assertTrue(self.send(self.cerebro, 0.6, 0.6, 0.05, seq=501))
         self.assertEqual(self.recv(), (0, (0.6, 0.6)))
         self.assertEqual(self.recv(), (1, (0.6, 0.6)))
 
     def test_teleop_le_gana_al_cerebro_y_luego_lo_suelta(self):
+        self.anuncia(self.cerebro, 0.0)             # sin el anuncio del tipo el mux no reenvía comandos
         self.assertTrue(self.send(self.cerebro, 0.6, 0.6, 0.00))
         self.assertTrue(self.send(self.teleop, 0.8, 0.3, 0.05))        # entra el humano
         self.assertFalse(self.send(self.cerebro, 0.6, 0.6, 0.10))      # el cerebro se descarta
@@ -77,6 +79,7 @@ class TestMux(unittest.TestCase):
         self.assertEqual(self.logs.count("manda 'cerebro' (prioridad 1)"), 2)
 
     def test_nadie_habla_no_inventa_nada(self):
+        self.anuncia(self.cerebro, 0.0)             # sin el anuncio del tipo el mux no reenvía comandos
         self.send(self.cerebro, 0.6, 0.6, 0.0)
         self.recv()
         self.mux._update_active(1.0)
@@ -86,6 +89,7 @@ class TestMux(unittest.TestCase):
             self.rx.recv(65536)
 
     def test_otro_tipo_de_mensaje_se_rechaza(self):
+        self.anuncia(self.cerebro, 0.0)             # sin el anuncio del tipo el mux no reenvía comandos
         self.send(self.cerebro, 0.6, 0.6, 0.0)
         imu = wire.encode(wire.ImuSample((1, 2, 3), (4, 5, 6)), 0, 0)
         self.assertFalse(self.mux.handle(self.teleop, imu, 0.01))
@@ -99,6 +103,7 @@ class TestMux(unittest.TestCase):
         self.assertIsNone(self.mux.active)
 
     def test_un_anuncio_no_roba_el_mando(self):
+        self.anuncia(self.cerebro, 0.0)             # sin el anuncio del tipo el mux no reenvía comandos
         self.assertTrue(self.send(self.cerebro, 0.6, 0.6, 0.00))
         ann = wire.encode_announcement(Cmd.SCHEMA_TEXT, "/cmd")
         self.assertFalse(self.mux.handle(self.teleop, ann, 0.05))   # el panel solo anunció
@@ -107,12 +112,105 @@ class TestMux(unittest.TestCase):
         self.assertEqual(self.mux.schema_text, Cmd.SCHEMA_TEXT)
 
     def test_la_salida_es_una_sola_fuente(self):
+        self.anuncia(self.cerebro, 0.0)             # sin el anuncio del tipo el mux no reenvía comandos
         self.send(self.cerebro, 0.6, 0.6, 0.0)
         self.send(self.teleop, 0.8, 0.3, 0.05)
         e1, _ = wire.decode(Cmd, self.rx.recv(65536))
         e2, _ = wire.decode(Cmd, self.rx.recv(65536))
         self.assertEqual(e1.source_id, self.mux.source_id)
         self.assertEqual(e2.source_id, self.mux.source_id)
+
+    def anuncia(self, inp, t):
+        self.assertFalse(self.mux.handle(inp, wire.encode_announcement(Cmd.SCHEMA_TEXT, "/cmd"), t))
+        env, _ = wire.parse(self.rx.recv(65536))                 # el mux reenvía el anuncio a la salida
+        self.assertEqual(env.encoding, wire.ENC_SCHEMA)
+
+    def test_no_finito_se_descarta_avisa_una_vez_y_el_freno_actua(self):
+        import contextlib
+        import io
+
+        self.anuncia(self.teleop, 0.0)
+        self.assertTrue(self.send(self.teleop, 0.5, 0.5, 0.00))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertFalse(self.send(self.teleop, float("nan"), 0.5, 0.10))
+            self.assertFalse(self.send(self.teleop, 0.5, float("inf"), 0.20))
+            self.assertFalse(self.send(self.teleop, float("-inf"), 0.0, 0.30))
+            self.assertFalse(self.send(self.cerebro, 0.1, float("nan"), 0.35))
+        self.assertEqual(self.mux.nonfinite, {"teleop": 3, "cerebro": 1})
+        avisos = err.getvalue().splitlines()
+        self.assertEqual(avisos, [
+            f"[agmen] ⚠ mux '{self.mux.output}': descarté un comando de 'teleop' con un valor no finito "
+            "(left=nan). Revisa ese nodo.",
+            f"[agmen] ⚠ mux '{self.mux.output}': descarté un comando de 'cerebro' con un valor no finito "
+            "(right=nan). Revisa ese nodo."])
+        # Los descartados no sostienen el mando: a los 300 ms del último bueno, nadie manda y el receptor frena.
+        self.mux._update_active(0.31)
+        self.assertIsNone(self.mux.active)
+        self.assertEqual(self.recv(), (0, (0.5, 0.5)))           # solo salió el bueno
+        with self.assertRaises(socket.timeout):
+            self.rx.recv(65536)
+        self.assertIn("no_finitos=3", self.mux.summary())
+        # Un comando bueno después sí pasa.
+        self.assertTrue(self.send(self.cerebro, 0.2, 0.2, 0.40))
+        self.assertEqual(self.recv(), (1, (0.2, 0.2)))
+
+    def test_sin_tipo_no_reenvia_nada_y_avisa_una_vez(self):
+        """Si el mux arranca (o se reinicia) después que el publicador, no sabe qué bytes son números hasta el
+        siguiente anuncio: mientras tanto no reenvía ningún comando, ni bueno ni con NaN."""
+        import contextlib
+        import io
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertFalse(self.send(self.teleop, float("nan"), 0.5, 0.00))
+            self.assertFalse(self.send(self.teleop, 0.5, 0.5, 0.05))
+            self.assertFalse(self.send(self.cerebro, 0.2, 0.2, 0.10))
+        self.assertEqual(self.mux.untyped, {"teleop": 2, "cerebro": 1})
+        self.assertEqual(self.mux.nonfinite, {"teleop": 0, "cerebro": 0})
+        self.assertIsNone(self.mux.active)                       # no toman el mando
+        self.assertNotIn("teleop", self.mux.last_rx)             # ni lo sostienen
+        self.assertEqual(err.getvalue().splitlines(), [
+            f"[agmen] ⚠ mux '{self.mux.output}': todavía no conozco el tipo de los mensajes; no reenvío comandos "
+            "hasta que llegue su anuncio (a lo más ~1 s)."])
+        self.assertIn("teleop: reenviados=0 descartados=0 errores=0 no_finitos=0 sin_tipo=2", self.mux.summary())
+        # Llega el anuncio (se reenvía): pasan los buenos y se descartan los no finitos.
+        self.anuncia(self.cerebro, 0.20)
+        with contextlib.redirect_stderr(err):
+            self.assertFalse(self.send(self.teleop, float("nan"), 0.5, 0.25))
+            self.assertTrue(self.send(self.teleop, 0.5, 0.5, 0.30))
+            self.assertTrue(self.send(self.teleop, 0.7, 0.7, 0.32, seq=8))
+        self.assertEqual(self.recv(), (0, (0.5, 0.5)))
+        self.assertEqual(self.recv(), (1, (0.7, 0.7)))
+        with self.assertRaises(socket.timeout):
+            self.rx.recv(65536)
+        self.assertEqual(self.mux.untyped, {"teleop": 2, "cerebro": 1})
+        self.assertEqual(self.mux.nonfinite["teleop"], 1)
+        self.assertEqual(err.getvalue().count("todavía no conozco el tipo"), 1)
+
+    def test_no_finito_en_cualquier_tipo_y_en_arreglos(self):
+        import contextlib
+        import io
+
+        @dataclass
+        class Pose(wire.Message):
+            SCHEMA = "PoseMux{u32 n; f64[3] p; Q{f32 w} q}"
+            n: int
+            p: list
+            q: dict
+
+        self.assertFalse(self.mux.handle(self.cerebro, wire.encode_announcement(Pose.SCHEMA_TEXT, "/p"), 0.0))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            ok = self.mux.handle(self.cerebro, wire.encode(Pose(1, [1.0, 2.0, 3.0], {"w": 1.0}), 0, 1), 0.01)
+            nan_p = self.mux.handle(self.cerebro, wire.encode(Pose(1, [1.0, float("nan"), 3.0], {"w": 1.0}), 0, 1),
+                                    0.02)
+            inf_q = self.mux.handle(self.cerebro, wire.encode(Pose(1, [1.0, 2.0, 3.0], {"w": float("-inf")}), 0, 1),
+                                    0.03)
+        self.assertEqual((ok, nan_p, inf_q), (True, False, False))
+        self.assertEqual(self.mux.nonfinite["cerebro"], 2)
+        self.assertIn("(p[1]=nan)", err.getvalue())
+        self.assertEqual(err.getvalue().count("\n"), 1)        # una vez por entrada
 
     def test_prioridades_repetidas(self):
         with self.assertRaises(ValueError):
@@ -153,6 +251,10 @@ class TestQuienManda(unittest.TestCase):
                        f"127.0.0.1:{self.rx.getsockname()[1]}", hold_ms=300, log=self.logs.append, name="ruedas")
         self.teleop = next(i for i in self.mux.inputs if i.name == "teleop")
         self.cerebro = next(i for i in self.mux.inputs if i.name == "cerebro")
+        # Sin el anuncio del tipo el mux no reenvía comandos; el anuncio no cambia quién manda.
+        self.mux.handle(self.cerebro, wire.encode_announcement(Cmd.SCHEMA_TEXT, "/cmd"), 0.0)
+        self.rx.settimeout(0.5)
+        self.rx.recv(65536)                              # el anuncio reenviado a la salida
 
     def tearDown(self):
         self.mux.close()
@@ -221,6 +323,7 @@ class TestQuienMandaPorTopic(unittest.TestCase):
         sub = Subscriber(MuxEstado, "/mux/mando")
         try:
             panel = next(i for i in mux.inputs if i.name == "panel")
+            mux.handle(panel, wire.encode_announcement(Cmd.SCHEMA_TEXT, "/cmd"), time.monotonic())   # el tipo primero
             mux.handle(panel, wire.encode(Cmd(1, 1), 1, 123, source_id=0xAB), time.monotonic())
             got, end = None, time.monotonic() + 5
             while got is None and time.monotonic() < end:
@@ -272,6 +375,71 @@ class TestMuxConfig(unittest.TestCase):
                 with self.assertRaises(ConfigError) as ctx:
                     self.load(BASE + text)
                 self.assertIn(msg, str(ctx.exception))
+
+
+def _motor_bin():
+    base = Path(__file__).resolve().parent.parent / "build" / "bin"
+    for nombre in ("tutorial_motor", "tutorial_motor.exe", "Release/tutorial_motor.exe"):
+        if (base / nombre).is_file():
+            return base / nombre
+    return None
+
+
+@unittest.skipIf(_motor_bin() is None, "sin build/bin/tutorial_motor (compila con cmake)")
+class TestMotorDelTutorial(unittest.TestCase):
+    """examples/tutorial/motor.cpp: un comando con NaN o infinito no se usa; el motor frena de inmediato y lo dice
+    una vez por episodio (antes, std::clamp devolvía NaN y el freno de 0.5 s no actuaba mientras siguieran llegando).
+    Un episodio termina cuando vuelve a llegar un comando bueno."""
+
+    def arranca(self):
+        import subprocess
+        import time
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        p = subprocess.Popen([str(_motor_bin()), "--escuchar", f"127.0.0.1:{port}", "2.5"], stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+        self.addCleanup(lambda: p.poll() is None and p.kill())
+        tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(tx.close)
+        seq = 0
+
+        def manda(left, right, durante):
+            nonlocal seq
+            fin = time.monotonic() + durante
+            while time.monotonic() < fin:
+                tx.sendto(wire.encode(Cmd(left, right), seq, 77), ("127.0.0.1", port))
+                seq += 1
+                time.sleep(0.02)
+
+        time.sleep(0.3)                                   # que el motor ya escuche
+        return p, manda
+
+    def test_no_finito_frena_ya_y_lo_dice_una_vez(self):
+        p, manda = self.arranca()
+        manda(0.5, 0.5, 0.4)
+        manda(float("nan"), 0.5, 0.4)                     # siguen llegando (más seguido que el freno de 0.5 s)
+        manda(0.5, float("inf"), 0.3)
+        out, err = p.communicate(timeout=15)
+        self.assertNotIn("nan", out.lower(), out)          # nunca movió las ruedas con NaN
+        self.assertNotIn("inf", out.lower(), out)
+        self.assertEqual(err.count("valor no finito"), 1, err)
+        self.assertIn("[motor] ⛔ ALTO: llegó un comando con un valor no finito", err)
+        self.assertRegex(out, r"no_finitos=(\d{2,})")
+        self.assertEqual(p.returncode, 0, out + err)
+
+    def test_cada_episodio_avisa_otra_vez(self):
+        # NaN -> bueno -> NaN: dos episodios, dos avisos (cada ráfaga, uno).
+        p, manda = self.arranca()
+        manda(float("nan"), 0.5, 0.3)
+        manda(0.5, 0.5, 0.3)
+        manda(float("nan"), 0.5, 0.3)
+        out, err = p.communicate(timeout=15)
+        self.assertNotIn("nan", out.lower(), out)
+        self.assertEqual(err.count("valor no finito"), 2, err)
+        self.assertEqual(p.returncode, 0, out + err)
 
 
 if __name__ == "__main__":

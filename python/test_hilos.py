@@ -1438,5 +1438,107 @@ if TSAN:   # con TSan solo tiene sentido el núcleo nativo (el puro no tiene có
     del globals()["TestHilosPuro"]
 
 
+def _cuenta():
+    from dataclasses import dataclass
+
+    from agmen import wire
+
+    @dataclass
+    class Cuenta(wire.Message):
+        SCHEMA = "LatidoCuenta{u32 n}"
+        n: int
+    return Cuenta
+
+
+Cuenta = _cuenta()
+
+
+class TestLatidoDesdeElTrabajo(unittest.TestCase):
+    """Núcleo puro: publish() y receive() laten también (como `maybe_beat` del núcleo de C++). Con el hilo de latido
+    sin turno (dos hilos moviendo imágenes grandes lo dejaron 3.25 s sin correr) el hub daba de baja al objeto
+    ("no latió en 3 s"). Aquí el hilo de latido se detiene a propósito y otro hilo publica y recibe."""
+
+    def arma(self, topic, latidos=None):
+        """Un hub de prueba y un pub y un sub puros en `topic`. Con `latidos` (dict), cuenta los latidos por tipo."""
+        from agmen import hubproto as hp
+        from agmen import pubsub
+
+        hub = H.Hub(f"127.0.0.1:{puerto_libre()}", [], log=lambda _t: None)
+        if latidos is not None:
+            original = hub.handle
+
+            def handle(data, addr, now):
+                for op, _f in hp.parse(data):
+                    if op in ("pub", "sub"):
+                        latidos[op] = latidos.get(op, 0) + 1
+                return original(data, addr, now)
+            hub.handle = handle
+        stop = threading.Event()
+        hilo = threading.Thread(target=hub.serve, args=(stop,), daemon=True)
+        hilo.start()
+        self.addCleanup(hilo.join, 2)
+        self.addCleanup(hub.close)
+        self.addCleanup(stop.set)
+        viejo = os.environ.get("AGMEN_HUB")
+        os.environ["AGMEN_HUB"] = hub.listen
+        self.addCleanup(lambda: os.environ.__setitem__("AGMEN_HUB", viejo) if viejo is not None
+                        else os.environ.pop("AGMEN_HUB", None))
+        sub = pubsub._PureSubscriber(Cuenta, topic)
+        self.addCleanup(sub.close)
+        pub = pubsub._PurePublisher(Cuenta, topic)
+        self.addCleanup(pub.close)
+        return hub, pub, sub
+
+    def test_un_latido_por_periodo_entre_el_hilo_y_el_trabajo(self):
+        # El hilo de latido espera a `_next_beat`: si publish()/receive() ya latieron, no late otra vez. Antes
+        # salían ~2 por periodo (11 en 6 s); ahora ~1 (el del arranque + 6).
+        from agmen import hubproto as hp
+        latidos: dict = {}
+        _hub, pub, sub = self.arma("/latido/periodo", latidos)
+        segundos = 6
+        fin = time.monotonic() + segundos * hp.BEAT_S
+        n = 0
+        while time.monotonic() < fin:
+            pub.publish(Cuenta(n))
+            n += 1
+            sub.receive(0.005)
+        for op in ("pub", "sub"):
+            self.assertGreaterEqual(latidos.get(op, 0), segundos - 1, latidos)
+            self.assertLessEqual(latidos.get(op, 0), segundos + 2, latidos)
+
+    def test_con_el_hilo_de_latido_detenido_el_hub_sigue_viendo_latidos(self):
+        from agmen import hubproto as hp
+
+        hub, pub, sub = self.arma("/latido/trabajo")
+        for o in (pub, sub):                      # el hilo de latido, detenido a propósito (como sin turno)
+            o._link._stop.set()
+            o._link._thread.join(2)
+            self.assertFalse(o._link._thread.is_alive())
+        ids = {pub._link.id, sub._link.id}
+        recibidos = []
+
+        def trabajo():
+            fin = time.monotonic() + hp.EXPIRE_S + 1.5
+            n = 0
+            while time.monotonic() < fin:
+                pub.publish(Cuenta(n))
+                n += 1
+                if sub.receive(0.02) is not None:
+                    recibidos.append(n)
+
+        t = threading.Thread(target=trabajo)
+        t.start()
+        t.join(30)
+        with hub.lock:
+            hub.expire(time.monotonic())
+            vivos = {e.id for e in hub.endpoints.values()}
+            vistos = {e.id: time.monotonic() - e.last_seen for e in hub.endpoints.values()}
+        self.assertTrue(recibidos, "no llegó ningún mensaje")
+        self.assertEqual(ids - vivos, set(), f"el hub dio de baja a {ids - vivos} (vistos hace: {vistos})")
+        for i in ids:
+            # Margen de 1.5 s para un runner cargado: sigue muy lejos de los ~4.5 s que daba el defecto.
+            self.assertLess(vistos[i], hp.BEAT_S + 1.5, vistos)
+
+
 if __name__ == "__main__":
     unittest.main()

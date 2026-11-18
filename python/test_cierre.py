@@ -1013,16 +1013,23 @@ class TestFormasDeSalir(_ConHub):
     @unittest.skipUnless(POSIX, "Ctrl+C como señal SIGINT: solo POSIX (en Windows requiere un grupo de procesos)")
     def test_ctrl_c(self):
         cmd = [*dos_nucleos(), sys.executable, "-c", FORMAS_DE_SALIR, str(ROOT), "sigint"]
-        p = subprocess.Popen(cmd, env=entorno(self.addr), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        env = {**entorno(self.addr), "PYTHONFAULTHANDLER": "1"}   # con SIGABRT dice dónde está cada hilo
+        p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             self.assertEqual(p.stdout.readline().strip(), "listo")
             p.send_signal(signal.SIGINT)
             try:
                 out, err = p.communicate(timeout=15)
             except subprocess.TimeoutExpired:
-                p.kill()
-                out, err = p.communicate()
-                self.fail(f"Ctrl+C no terminó el programa en 15 s (colgado): {err}")
+                # Pasó con la máquina cargada y no supimos dónde se quedó: que vuelque las pilas de todos sus hilos.
+                p.send_signal(signal.SIGABRT)
+                try:
+                    out, err = p.communicate(timeout=15)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    out, err = p.communicate()
+                self.fail("Ctrl+C no terminó el programa en 15 s (colgado). Lo que dijo y dónde estaba cada hilo:\n"
+                          f"{out}{err}")
         finally:
             if p.poll() is None:
                 p.kill()
