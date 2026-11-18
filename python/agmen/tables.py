@@ -45,6 +45,12 @@ QUERY_TIMEOUT = 1.0
 PING_TIMEOUT = 0.3          # si `query` no contesta nada: ¿está vivo el hub? (el hub está en esta computadora)
 INCOMPLETE_KEEP = 3         # §10.4: consultas incompletas seguidas en las que se sigue mandando la última tabla buena
 TOO_BIG_SAY_S = 30.0        # §10.4: los avisos "no cabe" / "ya cabe", como mucho uno cada esto
+# El texto de un `error` del hub que se repite en un aviso del puente, como mucho (caracteres). Cabe entero el más
+# largo que arma el hub con lo que le pasa el puente (el rechazo de una lista de nombres contra la de otro endpoint,
+# RFC 0013 D6: topic de TOPIC_MAX, dos nodos y dos computadoras acotados a hub.NODE_SHOWN y nombres de
+# hp.JOINT_NAME_MAX: unos 1 100), para que no se pierda el "qué hacer" del final. Ver test_nombres,
+# TestErrorLargoPorElPuente.
+HUB_ERROR_MAX = 1200
 SAID_MAX = 1000             # avisos distintos que se recuerdan (para decir cada uno una vez)
 _WORST_NAME = "x" * 64      # para medir, al mandar, la línea más larga que el otro lado puede armar
 _WORST_IP = "255.255.255.255"
@@ -269,21 +275,36 @@ class _Problems:
             self.add(kind, example, n)
 
 
-def local_table(msgs: list[tuple[str, dict[str, str]]], cut: list[str] | None = None) -> tuple[list[dict], list[dict]]:
+def _printable(text: str, limit: int = 64) -> str:
+    """Un texto que llegó del hub, para un aviso: acotado y sin lo que no se ve."""
+    return "".join(c if c.isprintable() else "?" for c in text[:limit]) + ("…" if len(text) > limit else "")
+
+
+def local_table(msgs: list[tuple[str, dict[str, str]]], cut: list[str] | None = None,
+                unnamed: list[str] | None = None) -> tuple[list[dict], list[dict]]:
     """Lo LOCAL de la respuesta a `query` (§2.2): todos los Publisher y los Subscriber con net=1, sin
     nada que haya venido de otra computadora (no hay bucles). `ep` no trae schema ni text: son los de su
     topic (un topic, un tipo). Un Publisher de un topic cuyo esquema llegó recortado (`cortado=1`, §9.1) no se
-    pasa (el otro lado leería mal sus mensajes): va a `cut` ("'nodo' en /topic") para decirlo."""
+    pasa (el otro lado leería mal sus mensajes): va a `cut` ("'nodo' en /topic") para decirlo.
+    La lista de nombres (RFC 0013 D6) de una línea `ep` recortada (`cortado=1`: la lista podría venir cortada, otro
+    orden) o que trae `names` más de una vez (si `msgs` lo sabe: hub.Respuesta.repetidas) no se copia: el endpoint
+    pasa sin lista y va a `unnamed` ("'nodo' en /topic") para decirlo."""
     topics = {f.get("name", ""): f for op, f in msgs if op == "topic"}
+    repeated = getattr(msgs, "repetidas", None)
     pubs, subs = [], []
-    for op, f in msgs:
+    for i, (op, f) in enumerate(msgs):
         if op != "ep" or f.get("machine"):
             continue
         topic = f.get("topic", "")
         t = topics.get(topic, {})
         base = {"id": f.get("id", ""), "node": f.get("node", ""), "pid": f.get("pid", ""), "topic": topic}
         if "names" in f:   # RFC 0013 D6: la lista que declaró (la línea `ep` la trae al final)
-            base["names"] = f["names"]
+            twice = repeated is not None and i < len(repeated) and "names" in repeated[i]
+            if f.get("cortado") == "1" or twice:
+                if unnamed is not None:
+                    unnamed.append(f"'{_printable(f.get('node', '?'))}' en {_printable(topic)}")
+            else:
+                base["names"] = f["names"]
         if f.get("kind") == "pub":
             if not t.get("schema"):
                 continue
@@ -725,10 +746,17 @@ class Bridge:
         self._incomplete, self._too_big = 0, False
         self._tell_too_big(now, names, None)
         cut: list[str] = []
-        table = local_table(msgs, cut)
+        unnamed: list[str] = []
+        table = local_table(msgs, cut, unnamed)
         if cut:
             self.say_once(("local-cortado",), f"⚠ no paso a las otras computadoras {len(cut)} Publisher(s) cuyo esquema "
                                               f"es tan largo que mi hub lo manda recortado (p. ej. {cut[0]})", "error")
+        if unnamed:
+            self.say_once(("local-sin-names",), f"⚠ no paso a las otras computadoras la lista de nombres de "
+                                                f"{len(unnamed)} endpoint(s) (p. ej. {unnamed[0]}): mi hub la mandó "
+                                                f"recortada o con names repetido, y una lista a medias sería otro "
+                                                f"orden. Pasan sin lista: del otro lado se ven como nodos que no "
+                                                f"declaran la suya", "error")
         if self.owned is not None:
             if not names:
                 # §10.7: sin nadie confirmado no se calcula qué pids son del agente (en Windows es una foto de todos
@@ -848,7 +876,7 @@ class Bridge:
                 continue
             for op, f in msgs:
                 if op == "error":
-                    text = f.get("msg", "")[:500]
+                    text = f.get("msg", "")[:HUB_ERROR_MAX]
                     self.say_once(("hub", re.sub(r"\d+", "#", text)[:120]), f"⚠ el agmen hub de esta computadora no aceptó lo que le pasó el "
                                                  f"puente de topics: {text}", "error")
 

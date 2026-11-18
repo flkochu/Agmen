@@ -547,10 +547,6 @@ def _parse_joints(data: dict, topics: list[TopicConfig]) -> list[JointsConfig]:
         if not isinstance(names, list) or not names:
             raise ConfigError(f"{where}: names es una lista no vacía de nombres de articulación, en orden, "
                               f"ej. names = [\"cadera\", \"rodilla\"]")
-        for k, n in enumerate(names):
-            if not isinstance(n, str):
-                raise ConfigError(f"{where}: names[{k}] = {n!r} no es un texto. Cada articulación es un nombre "
-                                  f"entre comillas, ej. \"FR_hip\"")
         for key in found:
             kind = _JOINT_KIND[key]
             top = max_joints(kind)
@@ -558,8 +554,8 @@ def _parse_joints(data: dict, topics: list[TopicConfig]) -> list[JointsConfig]:
                 raise ConfigError(f"{where}: names tiene {len(names)} articulaciones y un {kind} cabe en un paquete "
                                   f"UDP con hasta {top}. Reparte las articulaciones en varios [[joints]], cada uno "
                                   f"con sus topics")
-        # La misma revisión que hace el hub con la lista que declara un nodo (y los mismos topes): nombres
-        # válidos, sin repetir, de hasta hp.JOINT_NAME_MAX caracteres y hp.JOINT_NAMES_MAX en total.
+        # La misma revisión que hace el hub con la lista que declara un nodo (y los mismos topes): textos (no
+        # números ni listas), nombres válidos, sin repetir, de hasta hp.JOINT_NAME_MAX caracteres y hp.JOINT_NAMES_MAX en total.
         try:
             hp.check_joint_names(names)
         except hp.ProtocolError as e:

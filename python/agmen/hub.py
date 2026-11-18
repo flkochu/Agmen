@@ -184,8 +184,10 @@ class JointNames:
     required: bool = False    # require_names: quien publique aquí debe declarar su lista
 
 
+UNEXPECTED_MAX = 20   # tipos distintos de error inesperado que dice serve (luego, una línea y silencio)
+UNEXPECTED_SHOWN = 200   # caracteres del error inesperado en esa línea
 NAMES_SHOWN = 2       # nombres que se muestran de cada lista en un rechazo, desde la primera diferencia
-NODE_SHOWN = 64       # caracteres del nombre de un nodo en los textos nuevos de D6
+NODE_SHOWN = 64       # caracteres del nombre de un nodo (y de su computadora) en los textos del hub (Hub._who)
 
 
 def names_difference(a: tuple[str, ...], b: tuple[str, ...]) -> tuple[int, str, str]:
@@ -206,11 +208,13 @@ def names_difference(a: tuple[str, ...], b: tuple[str, ...]) -> tuple[int, str, 
     return k, show(a), show(b)
 
 
-def _where_differ(k: int, a: tuple[str, ...], b: tuple[str, ...], who_a: str, who_b: str) -> str:
-    """'cambian desde la articulación 3 de 12', o con largos distintos, cuántos declara cada uno."""
+def _where_differ(k: int, a: tuple[str, ...], b: tuple[str, ...]) -> str:
+    """'cambian desde la articulación 3 de 12', o con largos distintos, cuántos trae cada lista en el orden de la
+    frase (primero la del que llega): 'cambian desde la articulación 12; 11 nombres contra 12'. Sin repetir quién es
+    cada uno (ya lo dice la frase): así el texto cabe entero en el error que pasa el puente entre computadoras."""
     if len(a) == len(b):
         return f"cambian desde la articulación {k + 1} de {len(a)}"
-    return f"cambian desde la articulación {k + 1}; {who_a} declara {len(a)} nombres y {who_b} {len(b)}"
+    return f"cambian desde la articulación {k + 1}; {len(a)} nombres contra {len(b)}"
 
 
 def _names_hint(names: tuple[str, ...]) -> str:
@@ -248,6 +252,7 @@ class Hub:
         self.grace_s = grace_s
         self.started = time.monotonic()
         self._warned: set = set()
+        self._unexpected: set[str] = set()   # tipos de error inesperado ya dichos en serve (ver _unexpected_error)
         self._missing: set[str] = set()
         self.lock = threading.Lock()
         # Modo red (RFC 0011 §3.5): vacío = modo local (como siempre).
@@ -276,9 +281,11 @@ class Hub:
         return self._peer_ips.get(machine)
 
     @staticmethod
-    def _who(e: Endpoint) -> str:
-        """'nodo' (de esta computadora: el texto de siempre) o 'nodo' (de la computadora 'robot')."""
-        return f"'{e.node}' (de la computadora '{e.machine}')" if e.machine else f"'{e.node}'"
+    def _who(node: str, machine: str = "") -> str:
+        """'nodo' (de esta computadora: el texto de siempre) o 'nodo' (de la computadora 'robot'). Los nombres los
+        manda el nodo (o el puente): cada uno acotado a NODE_SHOWN y sin lo que no se ve."""
+        name = _cut(_clean(node), NODE_SHOWN)
+        return f"'{name}' (de la computadora '{_cut(_clean(machine), NODE_SHOWN)}')" if machine else f"'{name}'"
 
     # "Desde esta computadora" es exactamente 127.0.0.1 (no todo 127.0.0.0/8) y, solo con la variable de
     # pruebas AGMEN_NET_IP, también esa IP: un Subscriber en modo red late desde su socket atado a ella (§7).
@@ -360,10 +367,17 @@ class Hub:
             e.local_since = None
         self._drop([e for e in self.endpoints.values() if e.machine], "el hub volvió a modo local")
 
+    def _forget(self, e: Endpoint) -> None:
+        """Un endpoint que se va (bye, caducó o se quitó): se olvidan sus avisos de D6, que van por id. Así un nodo
+        que se cae y vuelve en bucle, con ids nuevos, no hace crecer _warned para siempre."""
+        self._warned.discard(("sin-names", e.id))
+        self._warned.discard(("n-joints", e.id))
+
     def _drop(self, eps: list[Endpoint], why: str) -> None:
         for e in eps:
             del self.endpoints[e.id]
-            self.log(f"✖ {self._who(e)} se quita de {e.topic}: {why}")
+            self._forget(e)
+            self.log(f"✖ {self._who(e.node, e.machine)} se quita de {e.topic}: {why}")
         for t in {e.topic for e in eps if e.kind == "sub"}:
             self._push_topic(t)
 
@@ -459,10 +473,11 @@ class Hub:
         if not self.expected or e.topic == "*":
             return
         builtin = builtin_type(e.topic)
+        who = self._who(e.node, e.machine)
         if builtin is not None:
             if e.type and e.type != builtin:
                 self._warn_once(("tipo", e.topic, e.type),
-                                f"'{e.topic}' es de Agmen y es de tipo {builtin}; {self._who(e)} usa {e.type}")
+                                f"'{e.topic}' es de Agmen y es de tipo {builtin}; {who} usa {e.type}")
             return
         exp = self.expected.get(e.topic)
         if exp is None:
@@ -470,10 +485,10 @@ class Hub:
             hint = f" ¿Quisiste decir '{close[0]}'?" if close else ""
             verb = "publica" if e.kind == "pub" else "escucha"
             self._warn_once(("inesperado", e.topic, e.node),
-                            f"{self._who(e)} {verb} '{e.topic}', que no está declarado en robot.toml.{hint}")
+                            f"{who} {verb} '{e.topic}', que no está declarado en robot.toml.{hint}")
         elif exp.type and e.type and e.type != exp.type:
             self._warn_once(("tipo", e.topic, e.type),
-                            f"'{e.topic}' debería ser {exp.type} (robot.toml) y {self._who(e)} usa {e.type}")
+                            f"'{e.topic}' debería ser {exp.type} (robot.toml) y {who} usa {e.type}")
 
     def check_required(self, now: float) -> None:
         if now - self.started < self.grace_s:
@@ -491,19 +506,20 @@ class Hub:
 
     # --- mensajes ---
     def handle(self, data: bytes, addr: tuple[str, int], now: float) -> None:
+        repeated: list[frozenset[str]] = []    # por línea, las claves que vinieron repetidas (names: se rechaza)
         try:
-            msgs = hp.parse(data)
+            msgs = hp.parse(data, repeated)
         except hp.ProtocolError as e:
             self._warn_once(("proto", addr), f"mensaje inválido desde {addr[0]}:{addr[1]}: {e}")
             return
         queried = False
-        for op, f in msgs:
+        for (op, f), rep in zip(msgs, repeated):
             if op == "query":   # §10.3: una por datagrama (quien pregunta ya recibe una respuesta)
                 if queried:
                     continue
                 queried = True
             try:
-                self._handle_one(op, f, addr, now)
+                self._handle_one(op, f, addr, now, rep)
             except (KeyError, ValueError) as e:   # hp.ProtocolError es un ValueError
                 what = f"falta el campo {e}" if isinstance(e, KeyError) else str(e)
                 if op == "red":    # `red` no lleva id: "error msg=…" (como lo escribe la especificación)
@@ -519,7 +535,8 @@ class Hub:
                                       f"{addr[0]}:{addr[1]}), así que no contesto esta consulta. Pregunta menos "
                                       f"seguido")
 
-    def _handle_one(self, op: str, f: dict[str, str], addr: tuple[str, int], now: float) -> None:
+    def _handle_one(self, op: str, f: dict[str, str], addr: tuple[str, int], now: float,
+                    repeated: frozenset[str] = frozenset()) -> None:
         if op == "ping":
             if self.net_mode:
                 self._send(hp.encode("pong", version=__version__, red=1), addr)
@@ -561,11 +578,12 @@ class Hub:
         elif op == "bye":
             e = self.endpoints.pop(f["id"], None)
             if e is not None:
-                self.log(f"■ {self._who(e)} dejó {e.topic}")
+                self._forget(e)
+                self.log(f"■ {self._who(e.node, e.machine)} dejó {e.topic}")
                 if e.kind == "sub":
                     self._push_topic(e.topic)
         elif op in ("pub", "sub"):
-            self._register(op, f, addr, now)
+            self._register(op, f, addr, now, repeated)
         elif op == "stat":
             # Cuentas de un agmen.Node (RFC 0006): temporizadores y colas.
             key = (f["node"], f.get("pid", ""), f["kind"], f["name"])
@@ -573,7 +591,8 @@ class Hub:
         else:
             raise hp.ProtocolError(f"operación desconocida '{op}'")
 
-    def _register(self, kind: str, f: dict[str, str], addr: tuple[str, int], now: float) -> None:
+    def _register(self, kind: str, f: dict[str, str], addr: tuple[str, int], now: float,
+                  repeated: frozenset[str] = frozenset()) -> None:
         topic, schema, eid = f["topic"], f["schema"], f["id"]
         hp.check_topic(topic, allow_wildcard=(kind == "sub"))
         if kind == "pub" and schema == "*":
@@ -598,7 +617,7 @@ class Hub:
                                        f"{donde}) quiere usarlo con {theirs} (schema_id {schema}){shapes}. Un topic, "
                                        f"un tipo, también entre computadoras: usa otro nombre de topic o el "
                                        f"mismo esquema")
-        names = self._check_names(kind, f, topic, eid, node, machine)
+        names = self._check_names(kind, f, topic, eid, node, machine, repeated)
         src = addr
         tcp = 0
         if kind == "sub":
@@ -620,7 +639,7 @@ class Hub:
             self.endpoints[eid] = e
             what = "todos los topics" if topic == "*" else topic
             tipo = f" ({e.type})" if e.type else ""
-            self.log(f"▶ {self._who(e)} {'publica' if kind == 'pub' else 'escucha'} {what}{tipo}")
+            self.log(f"▶ {self._who(e.node, e.machine)} {'publica' if kind == 'pub' else 'escucha'} {what}{tipo}")
             self._check_expected(e)
         else:
             e.addr, e.topic, e.schema, e.tcp = addr, topic, schema, tcp
@@ -651,18 +670,13 @@ class Hub:
                 self._push_topic(topic)
 
     # --- los nombres de las articulaciones (RFC 0013 §3.4, D6 = d) ---
-    @staticmethod
-    def _who_text(node: str, machine: str) -> str:
-        """Como _who, para los textos de D6: el nombre del nodo acotado y sin lo que no se ve (lo manda el nodo)."""
-        name = _cut(_clean(node), NODE_SHOWN)
-        return f"'{name}' (de la computadora '{machine}')" if machine else f"'{name}'"
-
     def _check_names(self, kind: str, f: dict[str, str], topic: str, eid: str, node: str,
-                     machine: str) -> tuple[str, ...] | None:
+                     machine: str, repeated: frozenset[str] = frozenset()) -> tuple[str, ...] | None:
         """El campo `names` de un pub/sub: la lista revisada, o None si no la trae. Rechaza (ProtocolError, que
-        llega al nodo como `error`) una lista mal escrita, una distinta de la de robot.toml o de la de otro endpoint
-        del mismo topic, y un Publisher sin lista en un topic con require_names. Lo demás son avisos (más abajo)."""
-        who = self._who_text(node, machine)
+        llega al nodo como `error`) una lista mal escrita o repetida en la línea, una distinta de la de robot.toml o
+        de la de otro endpoint del mismo topic, y un Publisher sin lista en un topic con require_names. Lo demás son
+        avisos (más abajo)."""
+        who = self._who(node, machine)
         exp = self.joints.get(topic)
         if "names" not in f:
             if kind == "pub" and exp is not None and exp.required:
@@ -670,6 +684,10 @@ class Hub:
                                        f"exige (require_names = true en [[joints]]). Pasa names=[...] al crear el "
                                        f"Publisher, en el orden de [[joints]]: {_names_hint(exp.names)}")
             return None
+        if "names" in repeated:
+            # Gana la última sería callar un error (y otro lector podría quedarse con la primera): no se adivina.
+            raise hp.ProtocolError(f"'{topic}': {who} manda el campo names más de una vez en la misma línea y no sé "
+                                   f"cuál de las listas vale. Manda names= una sola vez, con la lista en orden")
         try:
             names = hp.parse_joint_names(f["names"])
         except hp.ProtocolError as e:
@@ -681,16 +699,16 @@ class Hub:
         if exp is not None and names != exp.names:
             k, mine, theirs = names_difference(names, exp.names)
             raise hp.ProtocolError(f"'{topic}': {who} declara {mine} y robot.toml dice {theirs} "
-                                   f"({_where_differ(k, names, exp.names, who, 'robot.toml')}). {steps}: pasa names= "
+                                   f"({_where_differ(k, names, exp.names)}). {steps}: pasa names= "
                                    f"en el orden de [[joints]] de robot.toml, o corrige robot.toml si el que está mal "
                                    f"es él")
         other = next((e for e in self.endpoints.values()
                       if e.id != eid and e.topic == topic and e.names is not None and e.names != names), None)
         if other is not None:
             k, mine, theirs = names_difference(names, other.names)
-            them = self._who_text(other.node, other.machine)
+            them = self._who(other.node, other.machine)
             raise hp.ProtocolError(f"'{topic}': {who} declara {mine} y {them}, que ya está en el topic, declara "
-                                   f"{theirs} ({_where_differ(k, names, other.names, who, them)}). {steps}: un "
+                                   f"{theirs} ({_where_differ(k, names, other.names)}). {steps}: un "
                                    f"topic, una lista. Corrige la de uno de los dos (o declara el orden en [[joints]] "
                                    f"de robot.toml)")
         return names
@@ -701,7 +719,7 @@ class Hub:
         exp = self.joints.get(e.topic)
         if exp is None or e.kind != "pub":
             return
-        who = self._who_text(e.node, e.machine)
+        who = self._who(e.node, e.machine)
         if e.names is None:
             self._warn_once(("sin-names", e.id),
                             f"{who} publica en '{e.topic}', un topic de [[joints]], sin declarar su lista de "
@@ -777,7 +795,8 @@ class Hub:
         dead = [e for e in self.endpoints.values() if now - e.last_seen > hp.EXPIRE_S]
         for e in dead:
             del self.endpoints[e.id]
-            self.log(f"✖ {self._who(e)} no latió en {hp.EXPIRE_S:.0f} s: se quita de {e.topic}")
+            self._forget(e)
+            self.log(f"✖ {self._who(e.node, e.machine)} no latió en {hp.EXPIRE_S:.0f} s: se quita de {e.topic}")
         for t in {e.topic for e in dead if e.kind == "sub"}:
             self._push_topic(t)
         self._check_net(now)
@@ -851,6 +870,22 @@ class Hub:
         return "\n".join(lines)
 
     # --- ciclo ---
+    def _unexpected_error(self, e: Exception, addr: tuple[str, int]) -> None:
+        """Un datagrama hizo fallar a handle con algo que no esperaba (un error de Agmen, no del que lo mandó): se
+        dice una vez por tipo de error, acotado y sin controles, y como mucho UNEXPECTED_MAX tipos distintos."""
+        kind = type(e).__name__
+        if kind in self._unexpected or len(self._unexpected) > UNEXPECTED_MAX:
+            return
+        self._unexpected.add(kind)
+        if len(self._unexpected) > UNEXPECTED_MAX:
+            self.log(f"⚠ ya dije {UNEXPECTED_MAX} errores inesperados distintos: desde aquí no digo los nuevos "
+                     f"(el hub sigue atendiendo)")
+            return
+        what = _cut(_clean(f"{kind}: {e}"), UNEXPECTED_SHOWN)
+        self.log(f"⚠ un mensaje desde {addr[0]}:{addr[1]} me hizo fallar ({what}): lo ignoro y sigo atendiendo. "
+                 f"Es un error de Agmen: avísale a quien lo mantiene con esta línea (no la repito para este tipo "
+                 f"de error)")
+
     def serve(self, stop: threading.Event) -> None:
         last_check = 0.0
         while not stop.is_set():
@@ -862,7 +897,10 @@ class Hub:
             now = time.monotonic()
             if data is not None:
                 with self.lock:
-                    self.handle(data, addr, now)
+                    try:
+                        self.handle(data, addr, now)
+                    except Exception as e:   # un datagrama no tumba al hub: se dice y se sigue atendiendo
+                        self._unexpected_error(e, addr)
             if self._outbox:
                 with self.lock:
                     self.flush()
@@ -937,8 +975,10 @@ def split_state(text: str, n: int, part_bytes: int = PART_BYTES) -> list[bytes]:
 
 class Respuesta(list):
     """La lista del hub (como siempre: [(op, campos), …]). `incompleta`: None, o (k, m) si de una respuesta en
-    partes solo llegaron k de m."""
+    partes solo llegaron k de m. `repetidas`: por cada línea, en el mismo orden, las claves que vinieron más de una
+    vez en ella (hp.parse); None si no se sabe."""
     incompleta: tuple[int, int] | None = None
+    repetidas: list[frozenset[str]] | None = None
 
 
 _PART_B = (hp.PREFIX + " parte ").encode()
@@ -948,13 +988,17 @@ def _join(group: dict[int, bytes], m: int) -> Respuesta:
     """Las partes que llegaron, en orden, ya leídas (una inválida no tumba a las demás). §10.6: si faltan partes o
     alguna no se puede leer, la respuesta queda `incompleta` = (las que sí se leyeron, m)."""
     out = Respuesta()
+    out.repetidas = []
     ok = 0
     for k in sorted(group):
         try:
-            out.extend(hp.parse(group[k]))
-            ok += 1
+            rep: list[frozenset[str]] = []
+            lines = hp.parse(group[k], rep)
         except hp.ProtocolError:
-            pass   # (no pasa con un hub de Agmen; si pasa, la lista se ve con menos líneas y se dice incompleta)
+            continue   # (no pasa con un hub de Agmen; si pasa, la lista se ve con menos líneas y se dice incompleta)
+        out.extend(lines)
+        out.repetidas.extend(rep)
+        ok += 1
     if ok < m:
         out.incompleta = (ok, m)
     return out
@@ -997,7 +1041,10 @@ def query(hub: str = hp.DEFAULT_HUB, timeout: float = 1.0, say=_say_incomplete) 
                 # Cabe en un datagrama: como siempre (inválido: ProtocolError). §10.6: aunque antes hayan llegado
                 # partes (de otra consulta, viejas), gana esta: es la respuesta a la consulta actual.
                 _told_incomplete.discard(hub)
-                return Respuesta(hp.parse(data))
+                rep: list[frozenset[str]] = []
+                out = Respuesta(hp.parse(data, rep))
+                out.repetidas = rep
+                return out
             # Solo la primera línea ahora (para leer rápido y que no se llene el búfer); el resto, al final.
             head, _, body = data.partition(b"\n")
             try:
@@ -1040,7 +1087,7 @@ def parse_expected(expect: list[str], require: list[str]) -> list[Expected]:
     return list(out.values())
 
 
-def parse_joint_names(names: list[str], require: list[str]) -> list[JointNames]:
+def parse_names_args(names: list[str], require: list[str]) -> list[JointNames]:
     """--names TOPIC=a,b,c (una vez por topic) y --require-names TOPIC → la lista para Hub(joints=...)."""
     out: dict[str, JointNames] = {}
     for item in names:
@@ -1075,8 +1122,8 @@ def main(args) -> int:
     try:
         hub = Hub(args.listen, parse_expected(args.expect or [], args.require or []), log,
                   robot=getattr(args, "robot", "") or "",
-                  joints=parse_joint_names(getattr(args, "names", None) or [], getattr(args, "require_names", None)
-                                           or []))
+                  joints=parse_names_args(getattr(args, "names", None) or [], getattr(args, "require_names", None)
+                                          or []))
     except (OSError, hp.ProtocolError) as e:
         print(f"[hub] error: {e}", file=sys.stderr)
         return 2

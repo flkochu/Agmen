@@ -70,7 +70,7 @@ def free_port() -> int:
 def joints_del_rfc(require=False, extra=()):
     """Lo que agmen run le pasa al hub para el [[joints]] del RFC."""
     names = [f"/patas/cmd={','.join(PATAS)}", f"/patas/estado={','.join(PATAS)}", *extra]
-    return H.parse_joint_names(names, ["/patas/cmd"] if require else [])
+    return H.parse_names_args(names, ["/patas/cmd"] if require else [])
 
 
 class HubEnMemoria(unittest.TestCase):
@@ -349,7 +349,8 @@ class TestHubCompara(HubEnMemoria):
         corta = PATAS[:11]
         msg = self.rechazo(self.pub("p", corta, text=""))
         self.assertIn("declara … (ahí termina) y robot.toml dice …, RL_calf", msg)
-        self.assertIn("'p' declara 11 nombres y robot.toml 12", msg)
+        self.assertIn("(cambian desde la articulación 12; 11 nombres contra 12)", msg)
+        self.assertEqual(msg.count("'p'"), 1, msg)     # el nombre del nodo no se repite en el paréntesis
 
     def test_otra_lista_de_otro_nodo_se_rechaza_nombrando_al_otro(self):
         self.nuevo_hub()   # sin robot.toml: el hub compara entre endpoints
@@ -438,7 +439,9 @@ class TestHubDatosHostiles(HubEnMemoria):
             "a%1B%5B31m": "carácter de control",
             "a%E2%80%AEb": "no se ve",
             "a%25b": "tiene '%'",
-            ",".join(["a"] * 5000): "names ocupa 9999 caracteres y el máximo es 8192",
+            ",".join(["a"] * 5000): "names ocupa 9999 caracteres (los 5000 nombres separados por comas) y el "
+                                    "máximo es 8192: usa nombres más cortos o reparte las articulaciones en varios "
+                                    "grupos (un topic por grupo)",
             ",".join(f"j{i}" for i in range(5000)): "el máximo es 8192",
             "x" * 65: "mide 65 caracteres y el máximo es 64",
             "a,b,a": "'a' está dos veces",
@@ -479,11 +482,11 @@ class TestHubDatosHostiles(HubEnMemoria):
         for args, frag in ((["/a"], "escríbelo como TOPIC=nombre"), (["/a=x", "/a=y"], "está dos veces"),
                            (["/a=x,,y"], "--names /a: names[1] = ''"), (["a=x"], "nombre de topic inválido")):
             with self.subTest(args=args), self.assertRaises(hp.ProtocolError) as ctx:
-                H.parse_joint_names(args, [])
+                H.parse_names_args(args, [])
             self.assertIn(frag, str(ctx.exception))
         with self.assertRaisesRegex(hp.ProtocolError, "--require-names /b: ese topic no tiene lista"):
-            H.parse_joint_names(["/a=x"], ["/b"])
-        j, = H.parse_joint_names(["/a=x,y"], ["/a"])
+            H.parse_names_args(["/a=x"], ["/b"])
+        j, = H.parse_names_args(["/a=x,y"], ["/a"])
         self.assertEqual((j.topic, j.names, j.required), ("/a", ("x", "y"), True))
 
 
@@ -515,15 +518,58 @@ class TestHubAnterior(HubEnMemoria):
         self.comprobar()
 
     def test_simulado(self):
-        class Anterior(H.Hub):
-            def _check_names(self, *a):
-                return None
+        """Sin el commit 3a33553 (clon superficial): un hub mínimo como los de antes, que lee cada línea con el
+        parse_line de siempre, usa solo los campos que conoce (id, topic, port) e ignora los demás. Un Publisher y un
+        Subscriber de Python puro con names= se registran contra él y los datos llegan: el campo nuevo no estorba."""
+        err = io.StringIO()
+        ctx = contextlib.redirect_stderr(err)
+        ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.settimeout(0.05)
+        self.addCleanup(sock.close)
+        patch = mock.patch.dict(os.environ, {"AGMEN_HUB": f"127.0.0.1:{sock.getsockname()[1]}"})
+        patch.start()
+        self.addCleanup(patch.stop)
+        stop = threading.Event()
+        subs: dict[str, list[str]] = {}       # topic → "ip:puerto" de sus Subscriber
+        vistos: list[dict] = []               # los campos de cada registro, como los leyó
 
-            def _names_warnings(self, e):
-                pass
+        def hub_anterior():
+            while not stop.is_set():
+                try:
+                    data, addr = sock.recvfrom(65536)
+                except (socket.timeout, OSError):
+                    continue
+                for ln in data.decode().splitlines():
+                    op, f = hp.parse_line(ln)
+                    if op not in ("pub", "sub"):
+                        continue
+                    vistos.append(f)
+                    if op == "sub":
+                        to = f"127.0.0.1:{f['port']}"
+                        if to not in subs.setdefault(f["topic"], []):
+                            subs[f["topic"]].append(to)
+                        sock.sendto(hp.encode("ok", id=f["id"]), addr)
+                    else:
+                        sock.sendto(hp.encode("subs", id=f["id"], topic=f["topic"],
+                                              to=",".join(subs.get(f["topic"], [])), tcp=""), addr)
 
-        self.nuevo_hub(cls=Anterior)
-        self.comprobar()
+        hilo = threading.Thread(target=hub_anterior, daemon=True)
+        hilo.start()
+        self.addCleanup(hilo.join, 2)
+        self.addCleanup(stop.set)
+        sub = pubsub._PureSubscriber(CMD12, "/patas/cmd", names=list(PATAS))
+        self.addCleanup(sub.close)
+        pub = pubsub._PurePublisher(CMD12, "/patas/cmd", names=list(PATAS[::-1]), node="politica")  # no compara
+        self.addCleanup(pub.close)
+        self.assertTrue(until(lambda: pub.subscribers == 1, every=lambda: (pub.publish(CMD12()), time.sleep(0.02))),
+                        err.getvalue())
+        self.assertTrue(until(lambda: sub.receive(0.05) is not None, every=lambda: pub.publish(CMD12())))
+        # Sí le llegó el campo (y lo ignoró): no es que el nodo no lo mandara.
+        self.assertEqual({f.get("names") for f in vistos}, {",".join(PATAS), ",".join(PATAS[::-1])})
+        self.assertNotIn("rechaz", err.getvalue())
 
 
 # --- un hub de verdad, en otro proceso (agmen hub --names ... --require-names ...) ----------------------------------
@@ -677,7 +723,7 @@ class TestAgmenRun(unittest.TestCase):
             self.assertIn("/patas/cmd=a,b", cmd)
             self.assertEqual(cmd[cmd.index("--require-names") + 1], "/patas/cmd")
             self.assertNotIn("--expect", cmd)           # sin [[topic]]: el aviso de "no declarado" sigue apagado
-            j = H.parse_joint_names([cmd[i + 1] for i, a in enumerate(cmd) if a == "--names"],
+            j = H.parse_names_args([cmd[i + 1] for i, a in enumerate(cmd) if a == "--names"],
                                     [cmd[i + 1] for i, a in enumerate(cmd) if a == "--require-names"])
             self.assertEqual({x.topic: (x.names, x.required) for x in j},
                              {"/patas/estado": (("a", "b"), False), "/patas/cmd": (("a", "b"), True)})
@@ -951,12 +997,23 @@ class TestHubMemoriaAtaques(HubEnMemoria):
         avisos = [x for x in self.logs if x.startswith("⚠")]
         self.assertEqual(len(avisos), 3, avisos)     # sin lista (sim), 10 vs 12 (sim), sin lista (viejo)
 
-    def test_names_dos_veces_en_la_misma_linea_gana_la_ultima(self):
-        """La especificación no dice nada. Hoy: se queda con la última (como todo campo repetido del protocolo)."""
-        self.nuevo_hub()
-        r = self.manda_bytes(linea_pub("p", topic="/x", text="", names="a,b", crudo="names=c,d"))
-        self.entra(r)
-        self.assertEqual(self.hub.endpoints["p"].names, ("c", "d"))
+    def test_names_dos_veces_en_la_misma_linea_se_rechaza(self):
+        """Un registro con names repetido no se adivina (ni la primera ni la última): se rechaza y se dice qué hacer.
+        Da igual el orden de la lista buena y la mala, y aunque las dos sean iguales."""
+        bien, mal = ",".join(PATAS), ",".join(PATAS[::-1])
+        for eid, primero, segundo in (("malo-primero", mal, bien), ("bueno-primero", bien, mal), ("iguales", bien, bien)):
+            with self.subTest(eid=eid):
+                msg = self.rechazo(self.manda_bytes(linea_pub(eid, names=primero, crudo=f"names={segundo}")))
+                self.assertIn(f"'/patas/cmd': '{eid}' manda el campo names más de una vez en la misma línea y no sé "
+                              f"cuál de las listas vale. Manda names= una sola vez, con la lista en orden", msg)
+                self.assertNotIn(eid, self.hub.endpoints)
+        # Ya registrado con su lista: un latido con names repetido no cambia lo guardado.
+        self.entra(self.pub("p", PATAS))
+        self.rechazo(self.manda_bytes(linea_pub("p", names=bien, crudo=f"names={mal}")))
+        self.assertEqual(self.hub.endpoints["p"].names, PATAS)
+        # Otras claves repetidas siguen como siempre (gana la última): esto es solo de names.
+        self.entra(self.manda_bytes(linea_pub("q", names=bien, crudo="pid=2")))
+        self.assertEqual(self.hub.endpoints["q"].pid, "2")
 
     def test_unicode_y_nul_y_escapes(self):
         for crudo in ("names=ñandú", "names=a%00b", "names=a%2Cb%2C", "names=%E4%B8%AD", "names=a%09b",
@@ -1055,7 +1112,7 @@ class TestHubVerdaderoPorUdp(unittest.TestCase):
             ("names=%E4%B8%AD", "no es un nombre"),
             ("names=a,b,a", "dos veces"),
             ("names=-a", "empieza con"),
-            ("names=FR_hip names=FR_thigh,FR_calf", "robot.toml dice"),   # dos veces: gana la última
+            ("names=FR_hip names=FR_thigh,FR_calf", "más de una vez en la misma línea"),   # repetido: se rechaza
         ]
         for crudo, frag in casos:
             with self.subTest(crudo=crudo[:40]):
@@ -1456,6 +1513,283 @@ class TestTablaConNamesHostiles(unittest.TestCase):
         """El puente no sabe de [[joints]]: pasa la lista; la compara el hub destino."""
         d = T.check_endpoint("pubs", self.ep(names="a,b,c"))
         self.assertEqual(d["names"], "a,b,c")
+
+
+# --- correcciones de la revisión (UTF-8 inválido, names repetido, textos largos, memoria de avisos) ----------------
+
+class TestUtf8Invalido(unittest.TestCase):
+    """'%FF' deja bytes que no son UTF-8: siempre ProtocolError (que todos los lectores atrapan), nunca otra cosa."""
+
+    def test_unquote_y_parse_dan_protocol_error(self):
+        for value in ("%FF", "a%C3", "%E4%B8"):
+            with self.subTest(value=value), self.assertRaises(hp.ProtocolError) as ctx:
+                hp.unquote(value, "names")
+            self.assertIn("el campo 'names' no es texto UTF-8 después de leer sus '%XX'", str(ctx.exception))
+            self.assertIn("escribe el valor en UTF-8", str(ctx.exception))
+        with self.assertRaisesRegex(hp.ProtocolError, "el campo 'node' no es texto UTF-8"):
+            hp.parse(linea_pub("h") + b" node=%FF")
+        with self.assertRaisesRegex(hp.ProtocolError, "el campo 'a\\?b' no es texto UTF-8"):   # clave sin controles
+            hp.parse_line(f"{hp.PREFIX} ping a\x1bb=%FF")
+        self.assertEqual(hp.unquote("%C3%B1"), "ñ")    # UTF-8 bueno: como siempre
+
+    def test_el_nodo_tampoco_se_cae(self):
+        """Un Publisher puro lee las respuestas del hub con hp.parse: un datagrama con %FF del hub no lo tumba."""
+        falso = FalsoHub(self)
+        pub = pubsub._PurePublisher(CMD12, "/patas/cmd", names=list(PATAS))
+        self.addCleanup(pub.close)
+        data, addr = falso.sock.recvfrom(65536)
+        falso.sock.sendto(hp.encode("subs", id=pub._link.id, topic="/patas/cmd", to="") + b" x=%FF", addr)
+        time.sleep(0.05)
+        pub.publish(CMD12())       # lee la respuesta: no debe lanzar
+
+
+class TestServeNoSeCae(unittest.TestCase):
+    """Un datagrama que hace fallar a handle con algo inesperado: el hilo sigue, y se dice una vez por tipo."""
+
+    def test_error_inesperado_se_dice_una_vez_y_sigue(self):
+        logs: list[str] = []
+
+        class Fragil(H.Hub):
+            def handle(self, data, addr, now):
+                if data.startswith(b"boom"):
+                    kind = data.split(b" ")[1].decode()
+                    raise type(kind, (Exception,), {})(f"falla \x1b[2J\u202e {'x' * 500}")
+                return super().handle(data, addr, now)
+
+        hub = Fragil(f"127.0.0.1:{free_port()}", log=logs.append, grace_s=0.0)
+        stop = threading.Event()
+        hilo = threading.Thread(target=hub.serve, args=(stop,), daemon=True)
+        hilo.start()
+        self.addCleanup(hilo.join, 2)
+        self.addCleanup(stop.set)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(s.close)
+        for _ in range(5):
+            s.sendto(b"boom Raro", ("127.0.0.1", int(hub.listen.rsplit(":", 1)[1])))
+        for i in range(H.UNEXPECTED_MAX + 10):
+            s.sendto(f"boom Tipo{i}".encode(), ("127.0.0.1", int(hub.listen.rsplit(":", 1)[1])))
+        self.assertTrue(until(lambda: any("ya dije" in x for x in logs)), logs)
+        self.assertIsNotNone(H.ping(hub.listen, timeout=2.0), logs)     # sigue atendiendo
+        self.assertTrue(hilo.is_alive())
+        raro = [x for x in logs if "(Raro:" in x]
+        self.assertEqual(len(raro), 1, logs)                       # una vez por tipo
+        self.assertTrue(raro[0].isprintable(), repr(raro[0]))      # sin controles
+        self.assertIn("me hizo fallar (Raro: falla ?[2J? xxx", raro[0])
+        self.assertIn("lo ignoro y sigo atendiendo. Es un error de Agmen", raro[0])
+        self.assertLess(len(raro[0]), H.UNEXPECTED_SHOWN + 250)    # acotada
+        fallas = [x for x in logs if "me hizo fallar" in x]
+        self.assertEqual(len(fallas), H.UNEXPECTED_MAX, logs)      # con tope
+        self.assertEqual(len([x for x in logs if "ya dije" in x]), 1)
+
+
+class TestErrorLargoPorElPuente(unittest.TestCase):
+    """El rechazo más largo de D6 (topic de 256, nodos y computadoras largos, nombres de 64, largos distintos) llega
+    entero, con su "qué hacer", al aviso del puente (tables.Bridge._drain lo corta en HUB_ERROR_MAX)."""
+
+    TOPIC = "/" + "t" * (T.TOPIC_MAX - 1)
+
+    def rechazo_peor(self, contra_toml: bool) -> str:
+        a = tuple(f"{i:04d}" + "a" * 60 for i in range(100))
+        b = a[:50] + tuple(f"{i:04d}" + "b" * 60 for i in range(50, 120))
+        joints = [H.JointNames(self.TOPIC, b)] if contra_toml else None
+        hub = H.Hub(f"127.0.0.1:{free_port()}", log=lambda _: None, joints=joints)
+        self.addCleanup(hub.sock.close)
+        sent: list[bytes] = []
+        hub._send = lambda data, addr: sent.append(data)
+        m1, m2 = "M" * 64, "N" * 64
+        hub.handle(hp.encode("red", peers=f"{m1}@192.168.1.20,{m2}@192.168.1.21"), LOCAL, 0.0)
+        if not contra_toml:
+            hub.handle(hp.encode("pub", id="x", node="o" * T.NODE_MAX, pid=1, topic=self.TOPIC, schema=S12,
+                                 type="T", text="", machine=m2, names=",".join(b)), LOCAL, 0.0)
+        sent.clear()
+        hub.handle(hp.encode("pub", id="y", node="n" * T.NODE_MAX, pid=1, topic=self.TOPIC, schema=S12, type="T",
+                             text="", machine=m1, names=",".join(a)), LOCAL, 0.0)
+        (op, f), = hp.parse(sent[-1])
+        self.assertEqual(op, "error")
+        return sent[-1]
+
+    def por_el_puente(self, data: bytes) -> str:
+        said: list[str] = []
+        bridge = T.Bridge("127.0.0.1:9", lambda text, kind="agmen": said.append(text))
+        self.addCleanup(bridge.close)
+        rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        rx.bind(("127.0.0.1", 0))
+        rx.setblocking(False)
+        self.addCleanup(rx.close)
+        tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(tx.close)
+        tx.sendto(data, rx.getsockname())
+        bridge._sock = rx
+        self.assertTrue(until(lambda: (bridge._drain(), said)[1]), "el puente no dijo nada")
+        return said[0]
+
+    def test_el_peor_caso_conserva_el_que_hacer(self):
+        for contra_toml, final in ((True, "o corrige robot.toml si el que está mal es él"),
+                                   (False, "Corrige la de uno de los dos (o declara el orden en [[joints]] de "
+                                           "robot.toml)")):
+            with self.subTest(contra_toml=contra_toml):
+                data = self.rechazo_peor(contra_toml)
+                msg = hp.parse(data)[0][1]["msg"]
+                self.assertLessEqual(len(msg), T.HUB_ERROR_MAX)
+                self.assertTrue(msg.endswith(final), msg[-200:])
+                self.assertIn("(cambian desde la articulación 51; 100 nombres contra 120)", msg)
+                self.assertEqual(msg.count("n" * 60), 1, "el nombre del nodo se repite")
+                aviso = self.por_el_puente(data)
+                self.assertTrue(aviso.endswith(final), aviso[-200:])
+                self.assertIn(msg, aviso)
+
+    def test_el_principio_sigue_siendo_el_del_rfc(self):
+        hub = H.Hub(f"127.0.0.1:{free_port()}", log=lambda _: None, joints=joints_del_rfc())
+        self.addCleanup(hub.sock.close)
+        sent: list[bytes] = []
+        hub._send = lambda data, addr: sent.append(data)
+        otro = ("FL_hip", "FL_thigh", "FL_calf", "FR_hip", "FR_thigh", "FR_calf") + PATAS[6:]
+        hub.handle(hp.encode("pub", id="p", node="politica", pid=1, topic="/patas/cmd", schema=S12,
+                             type="JointCommand", text=T12, names=",".join(PATAS)), LOCAL, 0.0)
+        hub.joints = {}       # sin robot.toml: contra la de otro nodo, como en el RFC
+        sent.clear()
+        hub.handle(hp.encode("pub", id="q", node="politica2", pid=1, topic="/patas/cmd", schema=S12,
+                             type="JointCommand", text=T12, names=",".join(otro)), LOCAL, 0.0)
+        msg = hp.parse(sent[-1])[0][1]["msg"]
+        self.assertTrue(msg.startswith("'/patas/cmd': 'politica2' declara FL_hip, FL_thigh… y 'politica', que ya "
+                                       "está en el topic, declara FR_hip, FR_thigh… (cambian desde la articulación 1 "
+                                       "de 12)"), msg)
+
+
+class TestAvisosNoCrecen(HubEnMemoria):
+    """Los avisos de D6 van por id de endpoint: al irse el endpoint se olvidan (un nodo que vuelve en bucle con ids
+    nuevos no suma memoria para siempre)."""
+
+    def setUp(self):
+        self.nuevo_hub(joints_del_rfc())
+
+    def test_bye_y_caducar_olvidan_los_avisos(self):
+        t10 = JointState[10]
+        for i in range(300):
+            eid = f"bucle{i}"
+            self.entra(self.pub(eid, topic="/patas/estado", text=t10.SCHEMA_TEXT, schema=f"{t10.SCHEMA_ID:016x}",
+                                tipo="JointState"))       # dos avisos: sin lista y 10 contra 12
+            if i % 2:
+                self.manda("bye", id=eid)
+            else:
+                self.hub.expire(self.hub.endpoints[eid].last_seen + hp.EXPIRE_S + 1)
+        self.assertEqual(self.hub.endpoints, {})
+        self.assertEqual({k for k in self.hub._warned if k[0] in ("sin-names", "n-joints")}, set())
+        self.assertEqual(len(self.avisos("sin declarar su lista")), 300)   # cada aparición se dijo una vez
+
+    def test_quitado_por_salir_de_peers_tambien(self):
+        self.manda("red", peers="laptop@192.168.1.20")
+        self.entra(self.pub("r.1", machine="laptop"))
+        self.assertIn(("sin-names", "r.1"), self.hub._warned)
+        self.manda("red", peers="")
+        self.assertNotIn("r.1", self.hub.endpoints)
+        self.assertNotIn(("sin-names", "r.1"), self.hub._warned)
+
+    def pub(self, eid, names=None, machine=None, **kw):
+        if machine is None:
+            return super().pub(eid, names, **kw)
+        return self.manda("pub", id=eid, node=eid, pid=1, topic="/patas/cmd", schema=S12, type="JointCommand",
+                          text=T12, machine=machine)
+
+
+class TestReregistroSinLista(HubEnMemoria):
+    """Un endpoint que declaró su lista y luego late sin names: queda sin lista (como un Publisher que no la trae),
+    así que sale el aviso (una vez) y require_names lo rechaza."""
+
+    def test_sin_require_avisa_una_vez(self):
+        self.nuevo_hub(joints_del_rfc())
+        self.entra(self.pub("p", PATAS))
+        self.assertEqual(self.avisos("sin declarar su lista"), [])
+        for _ in range(3):
+            self.entra(self.pub("p"))
+        self.assertIsNone(self.hub.endpoints["p"].names)
+        avisos = self.avisos("sin declarar su lista")
+        self.assertEqual(len(avisos), 1, self.logs)
+        self.assertIn("'p' publica en '/patas/cmd', un topic de [[joints]], sin declarar su lista de nombres", avisos[0])
+
+    def test_con_require_se_rechaza_y_conserva_su_lista(self):
+        self.nuevo_hub(joints_del_rfc(require=True))
+        self.entra(self.pub("p", PATAS))
+        msg = self.rechazo(self.pub("p"))
+        self.assertIn("'/patas/cmd': 'p' publica sin declarar su lista de nombres y robot.toml la exige", msg)
+        self.assertEqual(self.hub.endpoints["p"].names, PATAS)
+
+
+class TestTablaLocalSinNamesDudosos(unittest.TestCase):
+    """tables.local_table no copia names de una línea `ep` recortada (cortado=1) ni de una que lo trae dos veces;
+    el endpoint pasa sin lista y se dice."""
+
+    def respuesta(self, *lineas: str):
+        repetidas: list = []
+        msgs = H.Respuesta(hp.parse("\n".join(lineas).encode(), repetidas))
+        msgs.repetidas = repetidas
+        return msgs
+
+    TOPIC = hp.line("topic", name="/patas/cmd", type="JointCommand", schema=S12, text=T12, pubs=1, subs=0,
+                    expected="no")
+
+    def ep(self, eid, **extra):
+        return hp.line("ep", id=eid, kind="pub", node=eid, pid=1, topic="/patas/cmd", type="JointCommand",
+                       addr="127.0.0.1:1", tcp="", age="0.1", **extra)
+
+    def test_cortado_y_repetido(self):
+        msgs = self.respuesta(self.TOPIC, self.ep("bien", names=",".join(PATAS)),
+                              self.ep("cortado", names="FR_hip,FR_th", cortado=1),
+                              self.ep("doble", names=",".join(PATAS)) + " names=" + ",".join(PATAS[::-1]))
+        unnamed: list[str] = []
+        pubs, _ = T.local_table(msgs, [], unnamed)
+        by = {p["id"]: p for p in pubs}
+        self.assertEqual(by["bien"]["names"], ",".join(PATAS))
+        self.assertNotIn("names", by["cortado"])
+        self.assertNotIn("names", by["doble"])
+        self.assertEqual(unnamed, ["'cortado' en /patas/cmd", "'doble' en /patas/cmd"])
+        # Sin saber las repetidas (una lista sin .repetidas): como siempre, la última; la recortada, nunca.
+        plain = [hp.parse_line(ln) for ln in (self.TOPIC, self.ep("cortado", names="a", cortado=1))]
+        self.assertNotIn("names", T.local_table(plain)[0][0])
+
+    def test_query_sabe_las_repetidas(self):
+        """hub.query deja en la Respuesta qué claves vinieron repetidas en cada línea (en uno y en varios datagramas)."""
+        srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.settimeout(TOPE_S)
+        self.addCleanup(srv.close)
+        texto = "\n".join([hp.line("state", version="x", hub="h", robot=""), self.TOPIC,
+                           self.ep("doble", names="a") + " names=b"])
+        largo = max(len(ln.encode()) for ln in texto.split("\n"))
+        partes = H.split_state(texto, 1, part_bytes=largo + 100)    # una línea por parte, ninguna recortada
+        self.assertGreater(len(partes), 1)
+        for respuesta in ([texto.encode()], partes):
+            with self.subTest(partes=len(respuesta)):
+                def contesta():
+                    _, addr = srv.recvfrom(65536)
+                    for d in respuesta:
+                        srv.sendto(d, addr)
+                hilo = threading.Thread(target=contesta)
+                hilo.start()
+                msgs = H.query(f"127.0.0.1:{srv.getsockname()[1]}", timeout=2.0, say=None)
+                hilo.join()
+                self.assertEqual(len(msgs.repetidas), len(msgs))
+                i = next(k for k, (op, f) in enumerate(msgs) if op == "ep")
+                self.assertEqual(msgs.repetidas[i], frozenset({"names"}))
+                unnamed: list[str] = []
+                pubs, _ = T.local_table(msgs, [], unnamed)
+                self.assertNotIn("names", pubs[0])
+                self.assertEqual(unnamed, ["'doble' en /patas/cmd"])
+
+
+class TestNombresSinDuplicar(unittest.TestCase):
+    def test_un_solo_nombre_para_cada_cosa(self):
+        self.assertFalse(hasattr(H, "parse_joint_names"), "el de los argumentos se llama parse_names_args")
+        self.assertFalse(hasattr(H.Hub, "_who_text"), "_who es el único")
+        self.assertEqual(H.Hub._who("n\x1b" + "x" * 100, "laptop"),
+                         "'n?" + "x" * 61 + "…' (de la computadora 'laptop')")
+
+    def test_el_tope_de_la_red_dice_que_hacer(self):
+        with self.assertRaises(hp.ProtocolError) as ctx:
+            hp.parse_joint_names(",".join(["a"] * 5000))
+        self.assertEqual(str(ctx.exception), "names ocupa 9999 caracteres (los 5000 nombres separados por comas) y el "
+                                             "máximo es 8192: usa nombres más cortos o reparte las articulaciones "
+                                             "en varios grupos (un topic por grupo)")
 
 
 if __name__ == "__main__":

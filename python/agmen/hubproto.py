@@ -18,9 +18,13 @@ Nodo → hub
                                                `machine` (un nombre de `peers`) y recibe en addr=ip:puerto
     pub   … machine                            un Publisher de OTRA computadora (modo red; sin `subs`)
     pub/sub … [names=a,b,c]                    (RFC 0013 §3.4, D6 = d) los nombres de las articulaciones, en
-                                               orden, de quien trae su propia lista (una política, un puente);
-                                               va al final de la línea. Sin él, la línea de siempre. Ver
-                                               check_joint_names. Un hub anterior lo ignora (y no compara)
+                                               orden, de quien trae su propia lista (una política, un puente).
+                                               Opcional: va después de los campos de siempre, y otros campos
+                                               opcionales (net=1, machine, solo…) pueden ir después; quien lee
+                                               no depende del orden de las claves. Una sola vez por línea (el
+                                               hub rechaza el registro que lo trae repetido). Sin él, la línea
+                                               de siempre. Ver check_joint_names. Un hub anterior lo ignora (y
+                                               no compara)
           [solo=id,id | solo=-]                (RFC 0011 §9.2, sesión de simulación) solo con machine: a qué
                                                Publisher de aquí se da como destino un sub de fuera (- = ninguno)
     red   peers=nombre@ip,nombre@ip            modo red (RFC 0011): las otras computadoras y la IP con
@@ -88,7 +92,14 @@ def quote(value: str) -> str:
     return "".join(chr(b) if b in _SAFE else f"%{b:02X}" for b in value.encode())
 
 
-def unquote(value: str) -> str:
+def _show_key(key: str) -> str:
+    """Una clave que llegó de la red, para un error: acotada y sin lo que no se ve."""
+    return "".join(c if c.isprintable() else "?" for c in key[:40]) + ("…" if len(key) > 40 else "")
+
+
+def unquote(value: str, key: str = "") -> str:
+    """'a%2Cb' → 'a,b'. ProtocolError si un '%' está mal escrito o si los bytes que quedan no son UTF-8 (ej. '%FF'):
+    nunca otra excepción. `key` es el nombre del campo, para el mensaje."""
     out = bytearray()
     i = 0
     raw = value.encode()
@@ -102,7 +113,13 @@ def unquote(value: str) -> str:
         else:
             out.append(raw[i])
             i += 1
-    return out.decode()
+    try:
+        return out.decode()
+    except UnicodeDecodeError as e:
+        where = f"el campo '{_show_key(key)}'" if key else "un valor"
+        raise ProtocolError(f"{where} no es texto UTF-8 después de leer sus '%XX' (el byte {out[e.start]:#04x} en la "
+                            f"posición {e.start} no vale ahí): escribe el valor en UTF-8 y cada byte que no sea "
+                            f"letra, dígito o _ . / : , * - como %XX") from None
 
 
 def line(op: str, **fields) -> str:
@@ -114,7 +131,9 @@ def encode(op: str, **fields) -> bytes:
     return line(op, **fields).encode()
 
 
-def parse_line(text: str) -> tuple[str, dict[str, str]]:
+def parse_line(text: str, repeated: set[str] | None = None) -> tuple[str, dict[str, str]]:
+    """Una línea → (op, campos). Una clave repetida: gana la última (como siempre). Si se pasa `repeated`, ahí se
+    añaden las claves que vinieron más de una vez (para quien deba rechazarlas: el hub, con `names`)."""
     parts = text.strip().split(" ")
     if len(parts) < 2 or parts[0] != PREFIX:
         raise ProtocolError(f"no es un mensaje {PREFIX}: {text[:60]!r}")
@@ -125,17 +144,30 @@ def parse_line(text: str) -> tuple[str, dict[str, str]]:
         k, sep, v = p.partition("=")
         if not sep:
             raise ProtocolError(f"campo sin '=': {p!r}")
-        fields[k] = unquote(v)
+        if repeated is not None and k in fields:
+            repeated.add(k)
+        fields[k] = unquote(v, k)
     return parts[1], fields
 
 
-def parse(data: bytes) -> list[tuple[str, dict[str, str]]]:
-    """Un datagrama → sus líneas ya leídas. Lanza ProtocolError."""
+def parse(data: bytes, repeated: list[frozenset[str]] | None = None) -> list[tuple[str, dict[str, str]]]:
+    """Un datagrama → sus líneas ya leídas. Lanza ProtocolError. Si se pasa `repeated`, por cada línea leída se le
+    añade (en el mismo orden) el conjunto de claves que vinieron repetidas en ella (ver parse_line)."""
     try:
         text = data.decode()
     except UnicodeDecodeError:
         raise ProtocolError("el mensaje de control no es UTF-8") from None
-    return [parse_line(ln) for ln in text.splitlines() if ln.strip()]
+    out = []
+    for ln in text.splitlines():
+        if not ln.strip():
+            continue
+        if repeated is None:
+            out.append(parse_line(ln))
+        else:
+            rep: set[str] = set()
+            out.append(parse_line(ln, rep))
+            repeated.append(frozenset(rep))
+    return out
 
 
 def is_control(data: bytes) -> bool:
@@ -215,7 +247,8 @@ def check_joint_names(names, what: str = "names") -> tuple[str, ...]:
     seen: dict[str, int] = {}
     for k, n in enumerate(out):
         if not isinstance(n, str):
-            raise ProtocolError(f"{what}[{k}] = {n!r:.80} no es un texto. Cada articulación es un nombre, ej. \"FR_hip\"")
+            raise ProtocolError(f"{what}[{k}] = {n!r:.80} no es un texto. Cada articulación es un nombre entre "
+                                f"comillas, ej. \"FR_hip\"")
         why = joint_name_problem(n)
         if why is not None:
             raise ProtocolError(f"{what}[{k}] = {_show_name(n)} no es un nombre de articulación válido ({why}). "
@@ -226,10 +259,15 @@ def check_joint_names(names, what: str = "names") -> tuple[str, ...]:
         seen[n] = k
     size = len(format_joint_names(out))
     if size > JOINT_NAMES_MAX:
-        raise ProtocolError(f"{what} ocupa {size} caracteres (los {len(out)} nombres separados por comas) y el "
-                            f"máximo es {JOINT_NAMES_MAX}: usa nombres más cortos o reparte las articulaciones en "
-                            f"varios grupos (un topic por grupo)")
+        raise ProtocolError(_too_long(what, size, len(out)))
     return out
+
+
+def _too_long(what: str, size: int, count: int) -> str:
+    """El error de una lista de nombres que no cabe en el campo (el mismo en robot.toml, names= y la red)."""
+    return (f"{what} ocupa {size} caracteres (los {count} nombres separados por comas) y el máximo es "
+            f"{JOINT_NAMES_MAX}: usa nombres más cortos o reparte las articulaciones en varios grupos (un topic "
+            f"por grupo)")
 
 
 def format_joint_names(names) -> str:
@@ -241,7 +279,7 @@ def parse_joint_names(text: str) -> tuple[str, ...]:
     """El campo `names` como llegó (ya sin '%XX') → la tupla, revisada como check_joint_names. Una coma de más
     ('a,,b', 'a,' o ',a') es un nombre vacío y no vale: aquí no se saltan los huecos (no es split_list)."""
     if len(text) > JOINT_NAMES_MAX:
-        raise ProtocolError(f"names ocupa {len(text)} caracteres y el máximo es {JOINT_NAMES_MAX}")
+        raise ProtocolError(_too_long("names", len(text), text.count(",") + 1))
     if not text:
         raise ProtocolError("names= vacío no vale: sin lista de nombres, no pongas el campo")
     return check_joint_names(text.split(","))
