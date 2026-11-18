@@ -1292,7 +1292,7 @@ class AgentServer:
         compara con lo que dice el robot.toml de aquí. _Refused si no se puede."""
         from .machines import Place
         from .pubsub import hub_address
-        from .run import ConfigError, load_config, prepare_hub
+        from .run import ConfigError, load_config, prepare_hub_apart
 
         m = self.machine
         profile, clock, version = msg.get("perfil"), msg.get("reloj"), msg.get("agmen")
@@ -1347,12 +1347,12 @@ class AgentServer:
         if why:
             raise _Refused("nodos_ajenos", why)
         try:
-            sub, hub_note = prepare_hub(replace(cfg, nodes=mine_nodes))
+            # Los avisos del hub aparte (el que ya corría aquí es anterior y no compara los nombres de [[joints]],
+            # RFC 0013 D6 = d): los dice la sesión, para que lleguen a la laptop, con el nombre de esta computadora.
+            sub, hub_note, hub_warnings = prepare_hub_apart(replace(cfg, nodes=mine_nodes), machine=m)
         except ConfigError as e:
             raise _Refused("config", f"{m}: {e}") from None
-        # Lo que prepare_hub agregó a los avisos (va al final): el hub que ya corría aquí es anterior y no compara
-        # los nombres de [[joints]] (RFC 0013 D6 = d). Lo dice la sesión, para que llegue a la laptop.
-        hub_warnings = tuple(sub.warnings[len(cfg.warnings):])
+        hub_warnings = tuple(hub_warnings)
         if version != __version__:
             self.say(f"⚠ la laptop usa Agmen {version} y esta computadora Agmen {__version__}")
         return _Plan(sub, {m: Place(True, "agent")}, names, hub_note, profile, tuple(held), hub_warnings)

@@ -12,6 +12,7 @@ import contextlib
 import io
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -106,6 +107,9 @@ class PlayCase(unittest.TestCase):
         self.stop_hub = threading.Event()
         threading.Thread(target=self.hub.serve, args=(self.stop_hub,), daemon=True).start()
         self.dir = tempfile.mkdtemp()
+        # addCleanup corre después de tearDown: los suscriptores y reproductores ya cerraron sus archivos (en
+        # Windows no se puede borrar un archivo abierto). ignore_errors: lo que quede no tumba la prueba.
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
         self.path = os.path.join(self.dir, "vuelta.mcap")
         self.packets = make_recording(self.path)
         self.closers = []
@@ -1083,6 +1087,21 @@ class TestPlayConNombres(unittest.TestCase):
         """(El contraste: sin names, como antes, require_names deja fuera a la reproducción.)"""
         self.assertEqual(self.reproducir(None), 0, self.log)
 
+    def test_dice_una_vez_que_declara_la_lista_de_hoy(self):
+        """La grabación no guarda la lista con que se grabó: al empezar, se dice una vez por topic con lista que se
+        declara la de robot.toml y que no se revisa contra la de cuando se grabó. Sin lista (o con otro número de
+        articulaciones), no se dice nada."""
+        aviso = ("[agmen] declaro en '/patas/cmd' la lista de robot.toml; la grabación no guarda la suya, así que no "
+                 "se revisa que coincida con la de cuando se grabó")
+        for names, veces in (({"/patas/cmd": NOMBRES3}, 1), (None, 0), ({"/patas/cmd": ("a", "b")}, 0)):
+            with self.subTest(names=names):
+                out = io.StringIO()
+                p = play.Player(self.path, quiet=True, names=names, out=out)
+                p.start()
+                self.assertTrue(p.wait(10))
+                p.stop()
+                self.assertEqual(out.getvalue().count(aviso), veces, out.getvalue())
+
     def test_otro_numero_de_articulaciones_va_sin_lista(self):
         p = play.Player(self.path, quiet=True, names={"/patas/cmd": ("a", "b")})
         self.addCleanup(p.stop)
@@ -1158,6 +1177,8 @@ class TestAgmenRunPlayConNombres(unittest.TestCase):
         p.stdout.close()
         out = "".join(lines)
         self.assertIn("VISTO", out)
+        self.assertEqual(out.count("declaro en '/patas/cmd' la lista de robot.toml; la grabación no guarda la suya"),
+                         1, out)
         self.assertNotIn("rechaz", out)
         self.assertNotIn("sin declarar su lista de nombres", out)
         self.assertNotIn("Traceback", out)
@@ -1179,10 +1200,9 @@ class TestPlaySueltoContraRequireNames(unittest.TestCase):
         self.addCleanup(parar.set)
         self.addr = f"127.0.0.1:{self.hub.sock.getsockname()[1]}"
 
-    def test_FALLA_REAL_play_suelto_dice_el_rechazo_del_hub(self):
-        """Sospecha del orquestador: _ReplayPublisher.send_packet no mira _link.error, así que el hub rechaza el
-        registro (solo le contesta `error` al publicador) y `agmen play` termina 'bien' sin decir nada. Debe decir (en su
-        salida o en el código de salida) que el hub rechazó publicar y qué hacer."""
+    def test_play_suelto_dice_el_rechazo_del_hub(self):
+        """`agmen play` suelto contra un hub con require_names: dice (una vez, sin traceback) que el hub rechazó
+        publicar en el topic y qué hacer (agmen run --play), no cuenta como reproducido lo rechazado y sale con 1."""
         env = {**os.environ, "PYTHONPATH": str(ROOT / "python"), "PYTHONIOENCODING": "utf-8", "NO_COLOR": "1",
                "AGMEN_HUB": self.addr}
         p = subprocess.run([sys.executable, "-m", "agmen", "play", self.path], env=env, capture_output=True,
@@ -1191,6 +1211,13 @@ class TestPlaySueltoContraRequireNames(unittest.TestCase):
         # (que el hub rechaza lo prueba TestPlayConNombres.test_sin_la_lista_el_hub_la_exige_y_no_llega)
         dijo = ("rechaz" in salida.lower()) or ("require" in salida.lower()) or p.returncode != 0
         self.assertTrue(dijo, f"agmen play calló el rechazo del hub (rc={p.returncode}):\n{salida}")
+        self.assertEqual(p.returncode, 1, salida)
+        self.assertEqual(salida.count("el hub rechazó publicar en '/patas/cmd'"), 1, salida)
+        self.assertIn("reproduce con agmen run robot.toml --play patas.mcap", salida)
+        self.assertIn("⏹ 0 mensajes en", salida)
+        self.assertIn("(40 rechazados por el hub en /patas/cmd)", salida)
+        self.assertIn("no se reprodujo nada de /patas/cmd", salida)
+        self.assertNotIn("Traceback", salida)
 
     def test_sin_names_la_linea_pub_es_la_de_siempre_byte_a_byte(self):
         """Sin [[joints]] (names=None o {}): el registro del reproductor no lleva `names`, ni con una tabla que no
@@ -1208,7 +1235,9 @@ class TestPlaySueltoContraRequireNames(unittest.TestCase):
                 self.assertNotIn(b"names", pub._link.beat_msg)
                 p.stop()
 
-    def test_FALLA_REAL_player_suelto_tampoco_calla(self):
+    def test_player_suelto_tampoco_calla(self):
+        """El Player desde Python (sin lista) contra require_names: dice el rechazo del hub una vez, sin error en
+        stop(), y el resumen final no cuenta lo rechazado como reproducido."""
         os.environ["AGMEN_HUB"] = self.addr
         self.addCleanup(os.environ.pop, "AGMEN_HUB", None)
         self.addCleanup(clock.configure, clock.REAL)
@@ -1226,6 +1255,11 @@ class TestPlaySueltoContraRequireNames(unittest.TestCase):
         texto = out.getvalue() + err.getvalue()
         self.assertTrue("rechaz" in texto.lower() or "require" in texto.lower() or p.error is not None,
                         f"Player calló el rechazo del hub:\n{texto}")
+        self.assertEqual(texto.count("el hub rechazó publicar en '/patas/cmd'"), 1, texto)
+        self.assertEqual(p.stats.messages, 0, texto)
+        self.assertEqual(p.stats.rejected, {"/patas/cmd": 40}, texto)
+        self.assertIn("⏹ terminó patas.mcap: 0 mensajes (40 rechazados por el hub en /patas/cmd)", texto)
+        self.assertNotIn("Traceback", texto)
 
 
 if __name__ == "__main__":

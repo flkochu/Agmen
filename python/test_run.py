@@ -2131,11 +2131,9 @@ class TestVersionesRaras(unittest.TestCase):
         self.assertLess(time.perf_counter() - t0, 1.0)
 
     def test_el_texto_del_aviso_no_tiene_caracteres_de_control(self):
-        """FALLA REAL. old_hub_text(version="0.14.0\\n") copia la versión tal cual (version_key hace strip() y la
-        entiende, pero el texto usa la original): salen \\n, \\r, \\x0b, \\x1c, \\x85 en el aviso. Esperado: nada
-        que no se pueda imprimir, como con las versiones que no se entienden (_clip).
-        Reproducir: python -m unittest test_run.TestVersionesRaras.test_el_texto_del_aviso_no_tiene_"""
-        "caracteres_de_control"
+        """old_hub_text con una versión que se entiende tras quitar espacios ("0.14.0\\n", "\\x0b0.14.0"…) o que
+        no se entiende: el aviso no copia ningún carácter que no se pueda imprimir (\\n, \\r, \\x0b, \\x1c,
+        \\x85, ESC…)."""
         from agmen.run import old_hub_text
 
         self.propia("0.15.0")
@@ -2150,10 +2148,8 @@ class TestVersionesRaras(unittest.TestCase):
             self.assertEqual([c for c in t if not c.isprintable()], [], repr(t))
 
     def test_el_texto_del_aviso_no_crece_sin_tope(self):
-        """FALLA REAL. Una versión que sí se entiende pero trae un sufijo de 5000 letras ("0.14.0-aaaa…") se copia
-        entera al aviso (5272 caracteres). Las que no se entienden sí se recortan a 40 (_clip). Esperado: tope.
-        Reproducir: python -m unittest test_run.TestVersionesRaras.test_el_texto_del_aviso_no_crece_"""
-        "sin_tope"
+        """Una versión enorme, se entienda ("0.14.0-aaaa…") o no: el aviso tiene tope (menos de 1000 caracteres),
+        no copia la versión entera."""
         from agmen.run import old_hub_text
 
         self.propia("0.15.0")
@@ -2163,10 +2159,8 @@ class TestVersionesRaras(unittest.TestCase):
                 self.assertLess(len(t), 1000, f"el aviso mide {len(t)} caracteres con una versión de {len(v)}")
 
     def test_aviso_en_connect_con_version_enorme_o_con_controles(self):
-        """FALLA REAL (la misma causa, por el camino de una [[machine]]: cli._connect). Solo falla con "0.14.0-dev\\n";
-        con 5000 'x', con escapes y con vacío el aviso sale limpio.
-        Reproducir: python -m unittest test_run.TestVersionesRaras.test_aviso_en_connect_con_version_"""
-        "enorme_o_con_controles"
+        """El aviso de hub anterior por el camino de una [[machine]] (cli._connect), con versiones raras o enormes
+        ("0.14.0-dev\\n", 5000 'x', escapes, vacía): sale limpio y con tope, una vez por computadora."""
         from types import SimpleNamespace
         from unittest import mock
 
@@ -2234,9 +2228,8 @@ class TestVersionesRaras(unittest.TestCase):
             self.assertEqual(len({a.split(" ")[1] for a in avisos}), esperadas)    # una por nombre de computadora
 
     def test_hub_local_viejo_con_version_rara_o_enorme(self):
-        """FALLA REAL (la misma causa, por el camino del hub local que ya corría: prepare_hub). Solo falla con
-        "0.14.0-dev\\n". Reproducir: python -m unittest test_run.TestVersionesRaras.test_hub_local_viejo_"""
-        "con_version_rara_o_enorme"
+        """El aviso de hub anterior por el camino del hub local que ya corría (prepare_hub), con versiones raras o
+        enormes ("0.14.0-dev\\n", 5000 'x', escapes, vacía): sale limpio y con tope."""
         from agmen.run import prepare_hub
 
         self.propia("0.15.0")

@@ -55,6 +55,14 @@ class _ReplayPublisher(_PurePublisher):
         # memoria compartida con otro dueño, y los rechazaría (RFC 0009).
         # `names`: la lista de [[joints]] del topic (RFC 0013 D6 = d), la que agmen run --play le pasa.
         super().__init__(rtype, topic, source_id=source_id, names=names)
+        # El Publisher espera 0.1 s la primera respuesta del hub; con un hub ocupado, se espera un poco más (una
+        # vez): sin respuesta no se sabe a quién mandar ni si el hub rechazó el registro, y el primer mensaje se
+        # contaría como reproducido sin haber llegado a nadie.
+        end = time.monotonic() + 1.0
+        while self._link is not None and self._link.last_reply is None and time.monotonic() < end:
+            time.sleep(0.005)
+            with self._lock:
+                self._drain()
 
     def send_packet(self, data) -> bool:
         """Manda un paquete grabado. Si el hub rechazó el registro (require_names, otra lista…), wire.HubRejected

@@ -49,6 +49,7 @@ Uso directo (agmen run lo arma solo desde [[mux]] en robot.toml):
 
 from __future__ import annotations
 
+import collections.abc
 import math
 import os
 import selectors
@@ -114,8 +115,10 @@ class Mux:
             if not hp.is_topic(output):
                 raise ValueError(f"--names va con una salida que es un topic (la lista se le declara al hub), y "
                                  f"'{output}' es una dirección. Usa un topic en --out, o no pases --names")
-            # La misma revisión que un Publisher (también rechaza set y dict: no tienen orden fijo).
-            names = joint_names_for(None, output, names, "Mux", "--names")
+            # La misma revisión que un Publisher (también rechaza set y dict: no tienen orden fijo). Un set o un dict
+            # solo llega desde Python (por la consola --names es un texto): ese error habla de `names`.
+            unordered = isinstance(names, (collections.abc.Set, collections.abc.Mapping))
+            names = joint_names_for(None, output, names, "Mux", "names" if unordered else "--names")
         self.names: tuple[str, ...] | None = names
         labels = [i.name for i in inputs]
         if len(set(labels)) != len(labels):
@@ -371,8 +374,11 @@ class Mux:
         try:
             self._forward(data, self.out_seq)
         except wire.HubRejected as e:   # el hub no dejó registrar la salida: se dice igual que en una entrada
-            self._error(inp, f"{e}. Mientras el hub rechace la salida, nada llega a '{self.output}': pasa --names "
-                             f"con la lista de [[joints]] de robot.toml, en ese orden (agmen run la pone sola)")
+            # El texto del hub, sin caracteres de control y sin su punto final (el de aquí no se duplica).
+            said = "".join(c if c.isprintable() else "?" for c in str(e)).rstrip(" .")
+            self._error(inp, f"{said}. Mientras el hub rechace la salida, nada llega a '{self.output}'. Si corres "
+                             f"agmen mux a mano, pasa --names con la lista de [[joints]] de robot.toml, en ese orden; "
+                             f"si lo lanzó agmen run, el hub que ya corría es de otro robot.toml: reinicia el robot")
             return False
         self.out_seq += 1
         self.forwarded[inp.name] += 1
@@ -403,7 +409,7 @@ class Mux:
                         break
                     self.handle(inp, got[0], time.monotonic())
             if self.pub is not None:
-                self.pub._drain()                     # receptores nuevos de la salida
+                self.pub._drain_locked()              # receptores nuevos de la salida (con el candado, como el latido)
             now = time.monotonic()
             self._update_active(now)                  # detecta cuando la fuente activa se calla
             if self.state_pub is not None and (self._state_at is None or now - self._state_at >= STATE_EVERY_S):

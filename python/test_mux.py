@@ -678,17 +678,16 @@ class TestMuxConNamesBordes(unittest.TestCase):
         self.assertEqual(self._siguiente_fd(), antes)            # sin fuga de sockets
 
     def test_names_sin_orden_no_vale_en_el_mux(self):
-        """FALLA REAL (menor, solo por la API de Python: por la línea de comandos --names es un texto). Mux(names={"a",
-        "b"}) acepta un set y lo vuelve tupla en un orden cualquiera: el orden es justo lo que el hub compara, y
-        Publisher/RawPublisher/RawSubscriber ya lo rechazan con TypeError ("no tiene orden fijo"). Esperado: el
-        mismo TypeError. Reproducir: python -m unittest test_mux.TestMuxConNamesBordes.test_names_sin_"""
-        "orden_no_vale_en_el_mux"
+        """Mux(names=...) desde Python con un set, frozenset o dict: TypeError "no tiene orden fijo", como
+        Publisher, RawPublisher y RawSubscriber (el orden es justo lo que el hub compara)."""
         for names in ({"a", "b"}, frozenset({"a", "b"}), {"a": 1, "b": 2}):
             with self.subTest(names=type(names).__name__):
                 try:
                     mux = Mux([MuxInput("ia", "/cmd/ia", 1)], "/patas/cmd", log=lambda t: None, names=names)
                 except TypeError as e:
                     self.assertIn("no tiene orden fijo", str(e))
+                    self.assertIn("names debe ser una lista", str(e))
+                    self.assertNotIn("--names", str(e))       # desde Python se llama names (--names es la consola)
                 else:
                     mux.close()
                     self.fail(f"Mux aceptó names={type(names).__name__}: quedó con {mux.names} (orden arbitrario)")
@@ -977,6 +976,49 @@ class TestMuxContraUnHubReal(unittest.TestCase):
         self.assertGreater(despues, buenos)
         self.assertEqual(despues - buenos, 1 + 0, "forwarded cuenta algo que no salió")
         self.assertEqual(m.summary().count(f"reenviados={despues}"), 1)
+
+
+class TestMuxSalidaRechazadaSinRed(unittest.TestCase):
+    """handle() con una salida falsa cuyo send() lanza wire.HubRejected (sin hub ni red): el reenvío no se cuenta,
+    sube errors, y el aviso dice el texto del hub sin '..' y qué hacer en los dos casos (a mano y con agmen run)."""
+
+    class _PubQueRechaza:
+        def __init__(self, texto):
+            self.texto = texto
+            self.enviados = 0
+
+        def set_schema(self, text, name, schema_id):
+            pass
+
+        def send(self, packet):
+            self.enviados += 1
+            raise wire.HubRejected(f"el hub rechazó publicar en '/patas/cmd': {self.texto}")
+
+        def close(self):
+            pass
+
+    def test_no_cuenta_el_reenvio_y_sube_errors(self):
+        for texto in ("la lista no coincide.", "la lista no coincide", "con\x1bcontrol."):
+            with self.subTest(texto=texto):
+                logs = []
+                m = Mux([MuxInput("ia", "127.0.0.1:0", 1)], "127.0.0.1:9", log=logs.append)
+                self.addCleanup(m.close)
+                m.pub = self._PubQueRechaza(texto)
+                m.output = "/patas/cmd"
+                ia = m.inputs[0]
+                m.handle(ia, wire.encode_announcement(Cmd.SCHEMA_TEXT, "/cmd"), 0.0)
+                self.assertFalse(m.handle(ia, wire.encode(Cmd(1.0, 1.0), 1, 1), 0.01))
+                self.assertEqual(m.pub.enviados, 1)
+                self.assertEqual(m.forwarded["ia"], 0)
+                self.assertEqual(m.errors["ia"], 1)
+                self.assertEqual(m.out_seq, 0)
+                aviso = next(l for l in logs if "rechaz" in l)
+                self.assertIn("el hub rechazó publicar en '/patas/cmd'", aviso)
+                self.assertNotIn("..", aviso)
+                self.assertNotIn("\x1b", aviso)
+                self.assertIn("Si corres agmen mux a mano, pasa --names con la lista de [[joints]] de robot.toml, "
+                              "en ese orden; si lo lanzó agmen run, el hub que ya corría es de otro robot.toml: "
+                              "reinicia el robot", aviso)
 
 
 if __name__ == "__main__":

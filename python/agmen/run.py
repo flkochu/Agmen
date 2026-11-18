@@ -605,12 +605,16 @@ def _parse_joints(data: dict, topics: list[TopicConfig]) -> list[JointsConfig]:
 
 
 def _check_joints_web(joints: list[JointsConfig], web: WebConfig, table: str = "web", note: str = "",
-                      carries: dict | None = None) -> None:
+                      carries: dict | None = None) -> list[str]:
     """Un topic de [[joints]] que el panel usa con otro tipo ([web.teleop] manda MotorCommand; cada
     [[web.command]], el tipo de su layout). Se llama una vez por perfil, con el [web] que usa ese perfil
     (`table`: "web" o "profile.sim.web") y los [[joints]] que corren en él; `note` dice en qué perfil.
     `carries` (de inherit_joint_names, del mismo perfil): también las entradas de [[mux]] que heredan la lista,
-    que llevan el tipo del topic de [[joints]] al que escribe el mux."""
+    que llevan el tipo del topic de [[joints]] al que escribe el mux.
+
+    También el número de articulaciones (RFC 0013 D6 = d): un [[web.command]] cuyo tipo dice N (`f32[N] position`,
+    como JointCommand[N]) hacia un topic con una lista de otro largo se publica sin lista (pubsub.declared_names).
+    Devuelve ese aviso; si el topic exige la lista (require_names), ConfigError: el hub lo rechazaría siempre."""
     uses = []
     if web.teleop is not None:
         uses.append((f"[{table}.teleop]", web.teleop.target, "MotorCommand"))
@@ -633,6 +637,35 @@ def _check_joints_web(joints: list[JointsConfig], web: WebConfig, table: str = "
                 raise ConfigError(f"'{topic}' es {carry.origin} y lleva la lista del [[joints]] '{carry.group}' "
                                   f"(el mux reenvía {carry.kind}), pero {who} manda {type_name} a ese topic{note}. "
                                   f"Un topic, un tipo: usa otro topic en uno de los dos")
+    from . import hubproto as hp
+
+    # Lo que lleva cada topic: (lista, de qué [[joints]], si se exige). Los [[joints]] primero; luego lo heredado.
+    lists: dict[str, tuple[tuple[str, ...], str, bool]] = {}
+    for j in joints:
+        if j.state:
+            lists.setdefault(j.state, (j.names, j.name, False))
+        if j.command:
+            lists[j.command] = (j.names, j.name, j.require_names)
+    for topic, carry in (carries or {}).items():
+        lists.setdefault(topic, (carry.names, carry.group, carry.require))
+    warnings = []
+    for c in web.commands:
+        found = lists.get(c.target)
+        n = hp.schema_joint_count(c.layout.text) if found is not None else None
+        if n is None or n == len(found[0]):
+            continue
+        names, group, required = found
+        what = (f"[[{table}.command]] '{c.name}' manda {c.layout.name} de {n} articulaciones a '{c.target}', y "
+                f"[[joints]] '{group}' nombra {_short_names(names)}{note}")
+        if required:
+            raise ConfigError(f"{what}: el panel no puede declarar esa lista y '{c.target}' la exige "
+                              f"(require_names = true), así que el hub rechazaría siempre ese mando. Usa un tipo de "
+                              f"{len(names)} articulaciones (ej. JointCommand[{len(names)}]) o corrige names de "
+                              f"[[joints]] '{group}'")
+        warnings.append(f"{what}: el panel publica ese mando sin la lista y el hub no puede revisar el orden (avisa "
+                        f"que el número no coincide). Usa un tipo de {len(names)} articulaciones (ej. "
+                        f"JointCommand[{len(names)}]) o corrige names de [[joints]] '{group}'")
+    return warnings
 
 
 @dataclass
@@ -1048,7 +1081,9 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
                 _, carries_x, _ = inherit_joint_names([m for m in mux_all if _runs_in(m.profiles, x)], joints_x)
             except ConfigError:
                 carries_x = None
-        _check_joints_web(joints_x, web_x, f"profile.{x}.web" if own else "web", note, carries_x)
+        joints_web_x = _check_joints_web(joints_x, web_x, f"profile.{x}.web" if own else "web", note, carries_x)
+        if x == profile:   # los avisos, del perfil que corre (los errores, de todos)
+            joints_web_warnings = joints_web_x
 
     top_clock = data.get("clock", {})
     if "clock" in active:
@@ -1075,7 +1110,8 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
                        muxes=mux_configs, profile=profile, profiles=known,
                        skipped=[(n.name, n.profiles) for n in skipped_nodes],
                        local=bool(active.get("local", False)), machines=machines,
-                       warnings=_typo_warnings(mentions, raw_tables, bool(joints_all)) + mux_warnings, joints=joints,
+                       warnings=_typo_warnings(mentions, raw_tables, bool(joints_all)) + mux_warnings
+                       + joints_web_warnings, joints=joints,
                        inherited=inherited)
 
 
@@ -1203,9 +1239,21 @@ HUB_CMD_MAX = 30000
 
 def prepare_hub(config: RobotConfig, ping=None) -> tuple[RobotConfig, str]:
     """Agrega el nodo 'hub' al robot, salvo que ya haya un agmen hub vivo en
-    esta máquina (entonces se reutiliza). Devuelve la config y qué se hizo."""
+    esta máquina (entonces se reutiliza). Devuelve la config y qué se hizo. Los avisos (un hub anterior que no
+    compara los nombres de [[joints]]) van al final de `warnings` de la config."""
+    config, note, warnings = prepare_hub_apart(config, ping)
+    if warnings:
+        from dataclasses import replace
+        config = replace(config, warnings=[*config.warnings, *warnings])
+    return config, note
+
+
+def prepare_hub_apart(config: RobotConfig, ping=None, machine: str | None = None) -> tuple[RobotConfig, str, list[str]]:
+    """Como prepare_hub, pero los avisos van aparte (la config no los lleva): (config, qué se hizo, avisos).
+    `machine`: el nombre de esta computadora cuando el aviso se lee en otra (agmen agent: llega a la laptop); así
+    dice en cuál corre ese hub y dónde actualizar. Sin `machine`, habla de "esta computadora"."""
     if not config.hub:
-        return config, "sin agmen hub ([hub] enabled = false): los topics no funcionarán"
+        return config, "sin agmen hub ([hub] enabled = false): los topics no funcionarán", []
     if ping is None:
         from .hub import ping
     from .pubsub import hub_address
@@ -1215,13 +1263,13 @@ def prepare_hub(config: RobotConfig, ping=None) -> tuple[RobotConfig, str]:
         what = " y ".join(x for x, on in (("[[topic]]", config.topics), ("[[joints]]", config.joints)) if on)
         note = f" (los {what} de este robot.toml no se revisan)" if what else ""
         # Y si además es anterior a hp.NAMES_SINCE, ni siquiera compara las listas que declaran los nodos (D6 = d).
-        old = old_hub_text(alive, f"el agmen hub que ya corre en {hub_address()} es",
-                           "Actualiza Agmen en esta computadora y detén ese agmen hub (o el agmen run que lo "
-                           "arrancó) para que agmen run arranque uno al día") if config.joints else None
-        if old is not None:
-            from dataclasses import replace
-            config = replace(config, warnings=[*config.warnings, old])
-        return config, f"usando el agmen hub {_clip(alive)} que ya corre en {hub_address()}{note}"
+        where = f" en '{_clip(machine, 64)}'" if machine is not None else ""
+        here = f"en '{_clip(machine, 64)}'" if machine is not None else "en esta computadora"
+        old = old_hub_text(alive, f"el agmen hub que ya corre en {hub_address()}{where} es",
+                           f"Actualiza Agmen {here} y detén ese agmen hub (o el agmen run que lo "
+                           f"arrancó) para que agmen run arranque uno al día") if config.joints else None
+        return config, f"usando el agmen hub {_clip(alive)} que ya corre en {hub_address()}{note}", \
+            [old] if old is not None else []
     args = ["-m", "agmen", "hub", "--listen", hub_address(), "--robot", config.name]
     for t in config.topics:
         args += ["--expect", f"{t.name}={t.type}" if t.type else t.name]
@@ -1264,7 +1312,7 @@ def prepare_hub(config: RobotConfig, ping=None) -> tuple[RobotConfig, str]:
     if any(n.name == "hub" for n in config.nodes):
         raise ConfigError("hay un nodo llamado 'hub': ese nombre lo usa Agmen para el directorio de topics")
     from dataclasses import replace
-    return replace(config, nodes=[hub_node, *config.nodes]), f"agmen hub en {hub_address()}"
+    return replace(config, nodes=[hub_node, *config.nodes]), f"agmen hub en {hub_address()}", []
 
 
 def other_robot(config: RobotConfig, query=None) -> list[str]:

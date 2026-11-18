@@ -74,7 +74,7 @@ print(c.position)   # [0.5, 0.0, -0.3, 0.1]
 print(c.velocity)   # [0.0, 0.0, 0.0, 0.0]   por defecto: 0
 print(c.effort)     # [0.0, 0.0, 0.0, 0.0]   por defecto: 0
 print(c.kp)         # [nan, nan, nan, nan]   por defecto: nan
-print(len(c.encode_payload()))   # 80 bytes = 20 × 4
+print(len(c.encode_payload()))   # 80   bytes = 20 × 4
 ```
 
 Los valores por defecto no son los mismos en todos los campos, y tienen un motivo:

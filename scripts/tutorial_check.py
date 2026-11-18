@@ -25,17 +25,31 @@ BIN = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "build" / "bi
 ENV = {**os.environ, "PYTHONPATH": str(ROOT / "python"), "PYTHONIOENCODING": "utf-8"}
 
 
-def run_case(name, sender_cmd, expected):
-    motor = subprocess.Popen([str(BIN / f"tutorial_motor{EXE}"), "4"], stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+def run_case(name, sender_cmd, expected, motor_args=()):
+    """El motor C++ escucha 4 s; el emisor le manda `expected` comandos. Los dos por correr(): si alguno se cuelga,
+    se dice y se mata su árbol, sin traceback."""
+    env = {**ENV, "AGMEN_HUB": f"127.0.0.1:{puerto_libre(socket.SOCK_DGRAM)}"}   # (si algo buscara un hub: el suyo)
+    motor: dict = {}
+    hilo = threading.Thread(target=lambda: motor.update(r=correr([str(BIN / f"tutorial_motor{EXE}"), "4",
+                                                                  *motor_args], 30, env=env)), daemon=True)
+    hilo.start()
     time.sleep(0.8)
-    subprocess.run(sender_cmd, check=True, stdout=subprocess.DEVNULL, env=ENV)
-    out, _ = motor.communicate(timeout=15)
+    emisor, parcial_emisor = correr(sender_cmd, 30, env=env)
+    hilo.join(45)
+    r, parcial = motor.get("r", (None, "(el motor no terminó)"))
+    out = (r.stdout + r.stderr) if r is not None else parcial
     m = re.search(r"recibidos=(\d+) errores=(\d+)", out)
-    ok = (m is not None and int(m.group(1)) == expected and m.group(2) == "0"
+    ok = (r is not None and emisor is not None and emisor.returncode == 0
+          and m is not None and int(m.group(1)) == expected and m.group(2) == "0"
           and "ALTO" in out)  # al terminar el emisor, el motor debe frenar solo
     print(f"{'OK  ' if ok else 'FALLA'} {name}: {m.group(0) if m else 'sin resumen'}, "
           f"freno de seguridad {'sí' if 'ALTO' in out else 'NO'}")
+    if emisor is None:
+        print(f"     el emisor se colgó (más de 30 s); lo maté a él y a sus hijos\n{parcial_emisor}")
+    elif emisor.returncode != 0:
+        print(f"     el emisor salió con {emisor.returncode}\n{emisor.stdout}{emisor.stderr}")
+    if r is None:
+        print("     el motor se colgó (más de 30 s); lo maté a él y a sus hijos")
     if not ok:
         print(out)
     return ok
@@ -61,11 +75,13 @@ def run_vision() -> bool:
     # puede saber cuánto tarda la cámara en arrancar (una webcam real en
     # Windows tarda 1-5 s en abrir, y una máquina cargada, más).
     group = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
+    if os.name != "nt":
+        group = {"start_new_session": True}   # su propio grupo: si se cuelga, matar_arbol mata también a sus hijos
     contador = subprocess.Popen([str(BIN / f"vision_contador{EXE}"), "60"], stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", env=env,
                                 **group)
     ia = subprocess.Popen([sys.executable, str(vision / "ia.py")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                          text=True, encoding="utf-8", errors="replace", env=env)
+                          text=True, encoding="utf-8", errors="replace", env=env, **group)
 
     def subs_of(topic: str) -> int:
         try:
@@ -76,14 +92,17 @@ def run_vision() -> bool:
     deadline = time.monotonic() + 20
     while subs_of("/camara") < 2 and time.monotonic() < deadline:   # los dos ya escuchan
         time.sleep(0.05)
-    cam = subprocess.run([sys.executable, str(vision / "camara.py"), "--seconds", "3"], capture_output=True,
-                         text=True, encoding="utf-8", errors="replace", env=env)
+    cam, cam_parcial = correr([sys.executable, str(vision / "camara.py"), "--seconds", "3"], 60, env=env)
     time.sleep(0.3)                   # que lleguen las últimas imágenes
     contador.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
-    out, _ = contador.communicate(timeout=20)
+    out, contador_ok = esperar(contador, 20)
     ia.terminate()
-    ia_out, _ = ia.communicate(timeout=10)
+    ia_out, ia_ok = esperar(ia, 10)
     stop.set()
+    colgados = [que for que, bien in (("la cámara (60 s)", cam is not None), ("el contador (20 s tras Ctrl+C)",
+                                      contador_ok), ("la IA (10 s tras terminate)", ia_ok)) if not bien]
+    if cam is None:
+        cam = subprocess.CompletedProcess([], -1, cam_parcial, "")
     m = re.search(r"RESULTADO vistas=(\d+) compartidas=(\d+)", out)
     vistas = int(m.group(1)) if m else 0
     compartidas = int(m.group(2)) if m else 0
@@ -100,11 +119,13 @@ def run_vision() -> bool:
     # prueba va y viene, pueden llegar por TCP).
     ok = (publicadas >= 30 and vistas >= 0.8 * publicadas and verdes and int(verdes[-1]) == 3600
           and ia_vistas >= 0.5 * publicadas and "confianza 1.00" in ia_out and cam.returncode == 0
-          and compartidas >= 0.8 * vistas and ia_compartidas >= 0.8 * ia_vistas)
+          and compartidas >= 0.8 * vistas and ia_compartidas >= 0.8 * ia_vistas and not colgados)
     print(f"{'OK  ' if ok else 'FALLA'} capítulos 14 y 15: cámara Python -> contador C++ e IA Python: la cámara "
           f"publicó {publicadas}, C++ vio {vistas} ({compartidas} por memoria compartida, "
           f"{verdes[-1] if verdes else '?'} píxeles verdes), la IA miró {ia_vistas} ({ia_compartidas} por memoria "
           f"compartida)")
+    for que in colgados:
+        print(f"     se colgó {que}; lo maté a él y a sus hijos")
     if not ok:
         print(out, ia_out, cam.stdout, cam.stderr)
     return ok
@@ -121,19 +142,25 @@ def run_dataset() -> bool:
     stop = threading.Event()
     threading.Thread(target=h.serve, args=(stop,), daemon=True).start()
     work = Path(tempfile.mkdtemp(prefix="agmen-cap16-"))
+    grupo = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+             else {"start_new_session": True})
     rec = subprocess.Popen([sys.executable, "-m", "agmen", "record", "-o", str(work / "vuelta1.mcap"), "--duration", "6s",
                             "/imu"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-                           errors="replace", env=env)
+                           errors="replace", env=env, **grupo)
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline and not any(e.kind == "sub" and e.topic == "/imu"
                                                   for e in list(h.endpoints.values())):
         time.sleep(0.05)
-    subprocess.run([str(BIN / f"publisher{EXE}"), "--rate", "100", "--to", "/imu", "--count", "200"],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, timeout=30)
-    rec_out, _ = rec.communicate(timeout=30)
+    pub, pub_parcial = correr([str(BIN / f"publisher{EXE}"), "--rate", "100", "--to", "/imu", "--count", "200"], 30,
+                              env=env)
+    rec_out, rec_ok = esperar(rec, 30)
     stop.set()
-    r = subprocess.run([sys.executable, str(ROOT / "examples" / "tutorial" / "dataset.py"), "vuelta1.mcap"], cwd=work,
-                       capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, timeout=60)
+    r, parcial = correr([sys.executable, str(ROOT / "examples" / "tutorial" / "dataset.py"), "vuelta1.mcap"], 60,
+                        cwd=work, env=env)
+    colgados = [que for que, bien in (("el publisher de la IMU (30 s)", pub is not None),
+                                      ("agmen record (30 s)", rec_ok), ("dataset.py (60 s)", r is not None)) if not bien]
+    if r is None:
+        r = subprocess.CompletedProcess([], -1, parcial, "")
     out = r.stdout + r.stderr
     m = re.search(r"/imu: (\d+) mensajes de ImuSample", out)
     n = int(m.group(1)) if m else 0
@@ -142,11 +169,14 @@ def run_dataset() -> bool:
         tables = "huecos en seq: 0" in out and (work / "dataset" / "imu.parquet").is_file()
     except ImportError:
         tables = "pip install agmen[datasets]" in out
-    ok = r.returncode == 0 and rec.returncode == 0 and n >= 180 and "az promedio 9.81" in out and tables
+    ok = (r.returncode == 0 and rec.returncode == 0 and n >= 180 and "az promedio 9.81" in out and tables
+          and not colgados)
     print(f"{'OK  ' if ok else 'FALLA'} capítulo 16: IMU C++ -> agmen record -> dataset.py: {n} mensajes de 200, "
           f"{'tabla y Parquet' if tables else 'SIN tabla'}")
+    for que in colgados:
+        print(f"     se colgó {que}; lo maté a él y a sus hijos")
     if not ok:
-        print(rec_out, out)
+        print(rec_out, pub_parcial, out)
     return ok
 
 
@@ -226,25 +256,40 @@ def _quien(linea_normalizada: str) -> str:
     return f"{quien}:{resto}" if _HUB_DE.match(resto) else quien
 
 
-def faltan(esperado: Bloque, salida: str) -> list[tuple[int, str]]:
-    """Las líneas del bloque del capítulo que no aparecen (normalizadas) en la salida, en orden y sin repetir: cada
-    línea del capítulo se busca después de la anterior del MISMO origen (ver _quien: las de procesos distintos se
-    mezclan según quién escribe primero, y ese orden no se exige), y una línea real sirve para una sola del
-    capítulo (si el capítulo la muestra dos veces, tiene que salir dos veces)."""
+def faltan(esperado: Bloque, salida: str) -> list[tuple[int, str, str]]:
+    """Las líneas del bloque del capítulo que no salen así (normalizadas) en la salida: (línea del .md, texto, qué
+    pasó). Dos casos:
+
+    - Falta: cada línea del capítulo se busca después de la anterior del MISMO origen (ver _quien: las de procesos
+      distintos se mezclan según quién escribe primero, y ese orden no se exige), y una línea real sirve para una
+      sola del capítulo (si el capítulo la muestra dos veces, tiene que salir dos veces).
+    - Sale de más: una línea del capítulo que en la salida real sale más veces que en el capítulo (un aviso que
+      debía salir una vez y salió dos). Se cuentan sus copias en toda la salida."""
     reales = [normalizar(t) for t in salida.splitlines()]
     usadas: set[int] = set()
     desde: dict[str, int] = {}          # por proceso: la línea real siguiente a la última que se encontró
     malas = []
-    for n, t in esperado.numeradas():
-        e = normalizar(t)
+    lineas = [(n, t, normalizar(t)) for n, t in esperado.numeradas()]
+    en_capitulo: dict[str, int] = {}
+    for _, _, e in lineas:
+        en_capitulo[e] = en_capitulo.get(e, 0) + 1
+    for n, t, e in lineas:
         quien = _quien(e)
         k = next((i for i in range(desde.get(quien, 0), len(reales)) if i not in usadas and reales[i] == e), None)
         if k is None:
-            malas.append((n, t))
+            malas.append((n, t, "no salió así"))
             continue
         usadas.add(k)
         desde[quien] = k + 1
-    return malas
+    dichas: set[str] = set()
+    for n, t, e in lineas:
+        if e in dichas:
+            continue
+        dichas.add(e)
+        veces = reales.count(e)
+        if veces > en_capitulo[e]:
+            malas.append((n, t, f"salió {veces} veces y el capítulo la muestra {en_capitulo[e]}"))
+    return sorted(malas)
 
 
 _VALOR = re.compile(r"[-+\d\[\](){}'\"]|(nan|inf|True|False|None)\b")
@@ -252,14 +297,15 @@ _VALOR = re.compile(r"[-+\d\[\](){}'\"]|(nan|inf|True|False|None)\b")
 
 def impreso_igual(real: str, comentario: str) -> bool:
     """¿Lo que imprimió `print(...)` es lo que dice su comentario? Completo: el comentario es el valor, y puede
-    seguirle una explicación separada por espacios ("[0.0, 0.0]   por defecto: 0", "80 bytes = 20 × 4"), que empieza
-    con una palabra; si lo que sigue parece más valor ("0.0" contra "# 0.0 1.0"), no es igual."""
+    seguirle una explicación separada por DOS o más espacios ("[0.0, 0.0]   por defecto: 0"), que no parece más valor.
+    Con un solo espacio no: "JointState[4]" no es igual a "# JointState[4] position=[…]" (lo que sigue podría ser
+    parte de lo que debía imprimirse), ni "0.0" a "# 0.0 1.0"."""
     if real == comentario:
         return True
     if not real or not comentario.startswith(real):
         return False
     resto = comentario[len(real):]
-    if not resto[:1].isspace():
+    if not resto.startswith("  "):
         return False
     resto = resto.strip()
     return bool(resto) and _VALOR.match(resto) is None
@@ -294,6 +340,32 @@ def matar_arbol(proc: subprocess.Popen, salida: str = "") -> None:
         pass
 
 
+def esperar(proc: subprocess.Popen, tope: float) -> tuple[str, bool]:
+    """Espera a que `proc` termine (hasta `tope` s) y devuelve (su salida, True). Si se cuelga no lanza
+    TimeoutExpired: mata a todo su árbol de procesos (matar_arbol) y devuelve (lo que alcanzó a escribir, False).
+    Nunca deja a `proc` sin wait(). Para un proceso con stdout (y stderr, si va aparte) en tubería."""
+    try:
+        out, err = proc.communicate(timeout=tope)
+        return (out or "") + (err or ""), True
+    except subprocess.TimeoutExpired as e:
+        # (lo que alcanzó a leer viene en bytes, aunque la tubería sea de texto)
+        parcial = "".join(x.decode("utf-8", "replace") if isinstance(x, bytes) else x
+                          for x in (e.stdout, e.stderr) if x)
+    matar_arbol(proc, parcial)
+    try:
+        out, err = proc.communicate(timeout=10)
+        parcial = (out or "") + (err or "")
+    except subprocess.TimeoutExpired:   # algún nieto que no se dejó matar sigue con la tubería: no se espera más
+        for f in (proc.stdout, proc.stderr):
+            if f is not None:
+                f.close()
+        try:
+            proc.wait(timeout=10)       # el proceso mismo ya recibió SIGKILL: que no quede sin recoger
+        except subprocess.TimeoutExpired:
+            parcial += f"\n(el proceso {proc.pid} no terminó ni con SIGKILL en 10 s)"
+    return parcial, False
+
+
 def correr(cmd: list[str], tope: float, **kw) -> tuple[subprocess.CompletedProcess | None, str]:
     """Como subprocess.run(cmd, capture_output=True, timeout=tope), pero si se cuelga no lanza TimeoutExpired:
     mata a todo su árbol de procesos y devuelve (None, lo que alcanzó a escribir). Si termina: (resultado, "")."""
@@ -303,18 +375,11 @@ def correr(cmd: list[str], tope: float, **kw) -> tuple[subprocess.CompletedProce
                             encoding="utf-8", errors="replace", **grupo, **kw)
     try:
         out, err = proc.communicate(timeout=tope)
-    except subprocess.TimeoutExpired as e:
-        # (lo que alcanzó a leer viene en bytes, aunque la tubería sea de texto)
-        parcial = "".join(x.decode("utf-8", "replace") if isinstance(x, bytes) else x
-                          for x in (e.stdout, e.stderr) if x)
-        matar_arbol(proc, parcial)
-        try:
-            out, err = proc.communicate(timeout=10)
-            parcial = (out or "") + (err or "")
-        except subprocess.TimeoutExpired:   # algún nieto que no se dejó matar sigue con la tubería: no se espera más
-            for f in (proc.stdout, proc.stderr):
-                f.close()
-        return None, parcial
+    except subprocess.TimeoutExpired:
+        parcial, termino = esperar(proc, 0)    # (vence enseguida: mata el árbol y recoge lo que haya)
+        if not termino:
+            return None, parcial
+        out, err = parcial, ""                  # (terminó justo entre las dos esperas)
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err), ""
 
 
@@ -323,7 +388,9 @@ class Cap19:
         self.work, self.ok, self.b = work, True, bloques_marcados(CAP19)
         # El capítulo corre "python simulador.py": primero el Python de esta prueba.
         path = os.pathsep.join([str(Path(sys.executable).parent), os.environ.get("PATH", "")])
-        self.env = {**ENV, "PATH": path, "NO_COLOR": "1"}
+        # PYTHONUNBUFFERED: lo que un nodo imprime sin flush no se queda atrás de lo que escribe en stderr (agmen run
+        # ya se lo pone a sus nodos; aquí también a agmen run y a los fragmentos), así el orden por columna es real.
+        self.env = {**ENV, "PATH": path, "NO_COLOR": "1", "PYTHONUNBUFFERED": "1"}
 
     def reporta(self, nombre: str, ok: bool, detalle: str = "", salida: str = "") -> bool:
         print(f"{'OK  ' if ok else 'FALLA'} capítulo 19: {nombre}" + ("" if ok or not detalle else f"\n{detalle}"))
@@ -334,7 +401,7 @@ class Cap19:
 
     def compara(self, nombre: str, esperado: Bloque, salida: str) -> bool:
         malas = faltan(esperado, salida)
-        detalle = "\n".join(f"  {CAP19_REL}:{n} dice esto y no salió así:\n    {t.strip()}" for n, t in malas)
+        detalle = "\n".join(f"  {CAP19_REL}:{n} dice esto y {que}:\n    {t.strip()}" for n, t, que in malas)
         return self.reporta(nombre, not malas, detalle, salida)
 
     # -- el robot de la sección 4, con agmen run de verdad --------------------------------------
@@ -366,6 +433,9 @@ class Cap19:
             fin = time.monotonic() + tope
             while time.monotonic() < fin and proc.poll() is None and not listo("".join(lineas)):
                 time.sleep(0.1)
+            # Un poco más con el robot vivo: una línea que sale de más (un aviso repetido) suele salir justo
+            # después de la primera, y faltan() la cuenta solo si alcanzó a salir.
+            time.sleep(1.5)
             if mientras is not None and proc.poll() is None:
                 mientras(env)
         finally:
@@ -596,13 +666,20 @@ def run_articulaciones() -> bool:
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _cap3():
+    destino = f"127.0.0.1:{puerto_libre(socket.SOCK_DGRAM)}"
+    return ([sys.executable, str(ROOT / "examples" / "tutorial" / "cerebro.py"), "40", "--destino", destino], 40,
+            ("--escuchar", destino))
+
+
 def main():
     sys.path.insert(0, str(ROOT / "python"))
     results = [
         run_case("capítulo 2: controlador C++ -> motor C++",
                  [str(BIN / f"tutorial_controlador{EXE}"), "100"], 100),
-        run_case("capítulo 3: cerebro Python -> motor C++",
-                 [sys.executable, str(ROOT / "examples" / "tutorial" / "cerebro.py"), "40"], 40),
+        # El capítulo 2 usa la dirección fija del ejemplo (127.0.0.1:7500: tutorial_controlador no deja
+        # cambiarla); el 3, una libre (cerebro.py --destino y tutorial_motor --escuchar).
+        run_case("capítulo 3: cerebro Python -> motor C++", *_cap3()),
         run_vision(),
         run_dataset(),
         run_articulaciones(),
