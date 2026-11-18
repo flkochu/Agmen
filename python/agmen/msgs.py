@@ -1,11 +1,17 @@
 """agmen.msgs — los mensajes estándar de Agmen: `Imagen` e `ImagenComprimida`,
-con los mismos campos que los tipos de Foxglove (RFC 0008, D4), y `MuxEstado`,
-quién tiene el mando de un `[[mux]]` (RFC 0012).
+con los mismos campos que los tipos de Foxglove (RFC 0008, D4), `MuxEstado`,
+quién tiene el mando de un `[[mux]]` (RFC 0012), y los mensajes chicos de
+geometría, velocidad, odometría e IMU (RFC 0013): `Vector2`, `Vector3`,
+`Quaternion`, `Pose`, `Transform`, `Twist`, `Odometry`, `Vector3f`,
+`Quaternionf` e `Imu`.
 
-    from agmen.msgs import Imagen, ImagenComprimida, MuxEstado
+    from agmen.msgs import Imagen, ImagenComprimida, MuxEstado, Pose, Quaternion
 
     img = Imagen.from_array(frame, encoding="bgr8")     # desde OpenCV / NumPy
     arr = img.as_array()                                 # (alto, ancho, 3) sin copiar
+
+    q = Quaternion.from_wxyz(data.qpos[3:7])             # MuJoCo pone w primero
+    w, x, y, z = q.wxyz()
 
 Los tipos salen de `msgs.agmen` (el mismo archivo que importa tu `.agmen` con
 `import "agmen/msgs.agmen"` y que genera `agmen::msgs::Imagen` en C++).
@@ -91,6 +97,33 @@ def _from_array(cls, array, encoding: str | None = None, *, timestamp: int | Non
                width=w, height=h, encoding=encoding, step=w * bpp, data=data.reshape(-1).view("u1"))
 
 
+def _wxyz(self) -> tuple:
+    """La rotación como (w, x, y, z): w primero, como MuJoCo. Los campos del
+    mensaje van x, y, z, w (RFC 0013 §3.2): así el orden nunca se adivina."""
+    return (self.w, self.x, self.y, self.z)
+
+
+def _from_wxyz(cls, *wxyz):
+    """Arma la rotación a partir de (w, x, y, z), w primero, como MuJoCo:
+    from_wxyz(w, x, y, z) o from_wxyz(arreglo_de_4) (una lista, una tupla o un
+    numpy.ndarray, ej. data.qpos[3:7]). Solo cambia el orden: no normaliza."""
+    values = wxyz[0] if len(wxyz) == 1 else wxyz
+    text = (str, bytes, bytearray)      # float("1") y list(b"1234") "funcionan": un texto no es un cuaternión
+    # Sin orden fijo (set, dict) o bytes crudos (memoryview): no son (w, x, y, z), aunque se puedan recorrer.
+    not_ordered = (*text, set, frozenset, dict, memoryview)
+    try:
+        if isinstance(values, not_ordered):
+            raise TypeError
+        values = list(values)               # una vez: también si es un iterador
+        if any(isinstance(v, text) for v in values):
+            raise TypeError
+        w, x, y, z = (float(v) for v in values)
+    except (TypeError, ValueError):
+        raise wire.WireError(f"{cls.__name__}.from_wxyz: se esperaban 4 números (w, x, y, z), w primero; llegó "
+                             f"{wxyz!r}") from None
+    return cls(x=x, y=y, z=z, w=w)
+
+
 _cache: dict[bool, object] = {}
 
 
@@ -101,6 +134,9 @@ def types(numpy: bool = False):
         mod = gen.load(PATH, numpy=numpy)
         mod.Imagen.as_array = _as_array
         mod.Imagen.from_array = classmethod(_from_array)
+        for q in (mod.Quaternion, mod.Quaternionf):
+            q.wxyz = _wxyz
+            q.from_wxyz = classmethod(_from_wxyz)
         _cache[numpy] = mod
     return mod
 
@@ -109,9 +145,21 @@ _mod = types()
 Imagen = _mod.Imagen
 ImagenComprimida = _mod.ImagenComprimida
 MuxEstado = _mod.MuxEstado
+Vector2 = _mod.Vector2
+Vector3 = _mod.Vector3
+Quaternion = _mod.Quaternion
+Pose = _mod.Pose
+Transform = _mod.Transform
+Twist = _mod.Twist
+Odometry = _mod.Odometry
+Vector3f = _mod.Vector3f
+Quaternionf = _mod.Quaternionf
+Imu = _mod.Imu
 # Que se llamen agmen.msgs.Imagen (en repr y en pickle) y no agmen_msgs.msgs.Imagen:
 # así otro proceso los encuentra con solo importar agmen.
-for _cls in (Imagen, ImagenComprimida, MuxEstado):
+for _cls in (Imagen, ImagenComprimida, MuxEstado, Vector2, Vector3, Quaternion, Pose, Transform, Twist, Odometry,
+             Vector3f, Quaternionf, Imu):
     _cls.__module__ = __name__
 
-__all__ = ["ENCODINGS", "Imagen", "ImagenComprimida", "MuxEstado", "PATH", "types"]
+__all__ = ["ENCODINGS", "Imagen", "ImagenComprimida", "Imu", "MuxEstado", "Odometry", "PATH", "Pose", "Quaternion",
+           "Quaternionf", "Transform", "Twist", "Vector2", "Vector3", "Vector3f", "types"]
