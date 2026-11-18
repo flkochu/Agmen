@@ -31,6 +31,7 @@ de C++ **o** de Python. No necesitas saber de redes ni de ROS.
 | 16 | [Grabar y reproducir: tu robot como dataset](16-grabar-y-reproducir.md) | Grabas el robot en un `.mcap` sin frenar a nadie, lo reproduces con su tiempo original en vez de los sensores, lo ves en el panel (con barra de tiempo) y en Foxglove, y lo conviertes en tablas Parquet para entrenar | 0.12.0 |
 | 17 | [El mismo robot en simulación y en el mundo real](17-simulacion-y-real.md) | El robot del tutorial con física (MuJoCo): `agmen run --sim`, el panel en simulación, pausa y velocidad del mundo, la cámara simulada, y la clase `Mundo` para usarla en tu propio código | 0.14.0 |
 | 18 | [Un robot, varias computadoras](18-un-robot-varias-computadoras.md) | El robot del tutorial en dos computadoras: `[[machine]]` y `machine`, la clave del agente, `agmen agent` como servicio de systemd, el panel con una línea por computadora, y qué pasa cuando se cae el WiFi (la gracia de 10 s y la reconexión sola) | 0.14.0 |
+| 19 | [Articulaciones: el estado y el comando de tu robot](19-articulaciones.md) | `JointState[N]` y `JointCommand[N]` en Python y C++; `[[joints]]` en `robot.toml`; la lista de nombres `names=` que el hub compara y rechaza si no coincide | 0.15.0 (en curso) |
 
 ## Convenciones
 

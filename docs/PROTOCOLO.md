@@ -256,6 +256,10 @@ Los bytes exactos de este y otros ejemplos están en los vectores de prueba.
 > (parte 4c) está en [La prueba de red](#la-prueba-de-red-sonda-desde-0140). Lo que se ve
 > en herramientas y panel no cambia el protocolo: usa `machine=`, que ya existe en las
 > entradas de otra computadora.
+>
+> **Desde 0.15.0 (en curso, RFC 0013 bloque 2):** el campo opcional `names` (la lista de
+> articulaciones de un topic) y la lectura del hub línea por línea. El número de versión
+> del protocolo **no cambia**: sigue siendo `agmen-hub/1`. Un hub anterior ignora `names`.
 
 Es el protocolo de control entre los nodos y su **hub** (`agmen hub`, o el que
 arranca `agmen run`). Los datos no pasan por aquí: el hub solo dice a quién
@@ -277,6 +281,112 @@ agmen-hub/1 <operación> clave=valor clave=valor ...
 - El hub escucha en `127.0.0.1:7390` (o en `AGMEN_HUB`).
 - Cada endpoint late cada 1 s (`BEAT_S`). Sin latir 3 s (`EXPIRE_S`), el hub lo
   da por muerto.
+- Un valor que no es UTF-8 después de leer sus `%XX` es un error. Por ejemplo, `%FF`
+  (el byte 0xFF nunca va en UTF-8). Antes de 0.15.0, un datagrama así dejaba sordo al hub.
+
+### Lectura línea por línea (desde 0.15.0)
+
+El hub lee cada línea de un datagrama por su cuenta. Antes, una línea mala tiraba el
+datagrama entero y quien lo mandó no se enteraba. Ahora:
+
+- **Una línea que no se puede leer no tira las demás.** Si trae un `id=` con la forma de
+  un id de endpoint (hasta 64 letras, dígitos, `_` o `-`; el de un puente lleva
+  `<computadora>.` delante), quien mandó la línea recibe `error id=<ese id> msg=…`. El
+  `msg` empieza con `no atendí esta línea: `, mide como mucho 400 caracteres, y se
+  contestan como mucho 16 líneas malas por datagrama.
+- Si la línea no trae un `id` legible, no hay a quién contestar: el aviso queda en el
+  log del hub, como antes.
+- **Un error de Agmen al atender una línea** no mata al hub. Quien la mandó recibe
+  `error` con su `id` y un `msg` que dice que la línea no quedó atendida (y que se
+  avise a quien mantiene Agmen si se repite). Las demás líneas del datagrama sí se
+  atienden. Antes, un error así detenía el hilo del hub.
+
+Ejemplo: un datagrama con tres líneas, la del medio con un valor que no es UTF-8.
+La primera y la tercera se registran; a la de en medio le llega su `error`.
+
+```
+agmen-hub/1 pub id=a node=cam pid=7 topic=/imu schema=00000000000000aa type=Imu text=Imu%7Bf32%20a%7D
+agmen-hub/1 pub id=b node=cam pid=7 topic=/imu schema=00000000000000aa type=Imu names=%FF
+agmen-hub/1 pub id=c node=cam pid=7 topic=/otro schema=00000000000000aa type=Imu text=Imu%7Bf32%20a%7D
+```
+
+Respuesta del hub a `b` (la línea mala): `agmen-hub/1 error id=b msg=…` con el texto
+de por qué `%FF` no es UTF-8.
+
+### Nombres de las articulaciones: `names` (desde 0.15.0)
+
+> **Estado:** en curso (RFC 0013 bloque 2, decisión D6 = d). Los topes son provisionales.
+
+Quien trae su propio orden de articulaciones (una política, el puente de un simulador,
+el agente de un microcontrolador) lo **declara una vez** al registrar su Publisher o su
+Subscriber, con el campo opcional `names`. Así el orden no viaja en cada mensaje: el
+registro ya se manda cada segundo.
+
+```
+agmen-hub/1 pub id=a1b2c3 node=politica pid=4242 topic=/patas/cmd schema=9e3956f7082f9343 type=JointCommand text=JointCommand%7Bf32%5B4%5D%20position%3Bf32%5B4%5D%20velocity%3Bf32%5B4%5D%20effort%3Bf32%5B4%5D%20kp%3Bf32%5B4%5D%20kd%7D names=FR_hip,FR_thigh,FR_calf,FL_hip
+agmen-hub/1 sub id=d4e5f6 node=panel pid=4243 topic=/patas/estado schema=b93ac672f616b40b type=JointState port=6000 names=FR_hip,FR_thigh,FR_calf,FL_hip
+```
+
+**Gramática**
+
+- Una lista de nombres separados por comas, en orden: `names=FR_hip,FR_thigh,FR_calf`.
+  Sin espacios.
+- Cada nombre cumple `[A-Za-z0-9_][A-Za-z0-9_./-]*`: letras ASCII, dígitos, `_`, `.`, `/`
+  y `-`, y empieza con letra, dígito o `_`. Ejemplos válidos: `FR_hip`, `brazo/codo.1`.
+  No puede llevar espacios, comas, `=`, controles ni acentos.
+- Un nombre no se repite dentro de la lista.
+- **Topes provisionales** (por decidir): **64 caracteres por nombre** (`JOINT_NAME_MAX`) y
+  **8192 caracteres en todo el campo**, contando las comas (`JOINT_NAMES_MAX`).
+- Al escribir, `names` no lleva `%XX`: todos sus caracteres son seguros. Al leer, se
+  aceptan `%XX` como en cualquier valor.
+
+**Dónde va**
+
+- En `pub` y en `sub`, al final de la línea de registro.
+- En la línea `ep` de `state`, al final (`names=…`), para que el puente la pase a otra
+  computadora.
+- En las tablas entre computadoras, como la clave opcional `"names"` de cada endpoint
+  de `pubs` y de `subs` (ver [El mensaje `tablas`](#el-mensaje-tablas)).
+- Un `sub` a `topic=*` no puede llevar `names`: la lista es de un topic.
+
+**Orden y repetidos**
+
+- `names` va **después de los campos de siempre**. Quien lee no depende del orden de las
+  claves. Otros campos opcionales (`net=1`, `machine=`, `solo=`) pueden ir antes o después.
+- Va **una sola vez por línea**. Si una línea trae `names` dos veces, el hub la rechaza:
+  no adivina cuál lista vale. Las demás claves repetidas siguen valiendo la última, como
+  siempre.
+- **Sin `names`, la línea es byte a byte la de antes.** Un nodo que no declara lista se
+  comporta igual que en 0.14.0.
+
+**Qué revisa el hub**
+
+El hub revisa `names` cada vez que llega un registro, y responde así:
+
+| Caso | Qué hace el hub |
+|---|---|
+| `names` mal escrito (un nombre inválido, vacío o con espacio; más de los topes) | **Rechaza**: `error` a quien registró |
+| `names` repetido en la misma línea | **Rechaza** |
+| La lista no es igual a la de `[[joints]]` del topic (lo que `agmen run` le pasa con `--names`) | **Rechaza**: dice qué declaró el nodo y qué dice `robot.toml`, y desde qué posición cambian |
+| La lista no es igual a la de otro endpoint del mismo topic | **Rechaza**: un topic, una lista |
+| Un Publisher sin `names` en un topic con `require_names = true` | **Rechaza** |
+| Un Publisher sin `names` en un topic de `[[joints]]` | **Avisa** en el log, una vez por endpoint |
+| El número de articulaciones del esquema (`f32[N] position`) no es el de la lista de `[[joints]]` | **Avisa** en el log, una vez por endpoint |
+| Un Subscriber sin `names` | Nada (un `echo` o la grabadora entran como siempre) |
+
+**Compatibilidad**
+
+- Un **hub anterior** (0.14.0) ignora `names`: entonces **no compara**. Por eso `agmen run`
+  debería avisar cuando el hub de otra computadora es anterior. **Ese aviso todavía no
+  está hecho.**
+- Un **nodo anterior** no manda `names`: entra como un endpoint sin lista. El hub nuevo
+  solo lo avisa, salvo que el topic tenga `require_names = true`.
+- Los campos nuevos solo se **añaden**. El número de versión del protocolo no cambia: sigue
+  siendo `agmen-hub/1`.
+
+### Modo red (desde 0.14.0)
+
+El hub arranca en **modo local**: como hoy, todo se queda en esta computadora.
 
 ### Operaciones de siempre (desde 0.5.0)
 
@@ -935,6 +1045,10 @@ del mensaje es el de la tabla.)
   ser `*`), `schema` (16 hexadecimales o `*`), `type`, `port` (1 a 65535) y `tcp` (0 a
   65535). Los puertos son enteros. Los `id` van de 1 a 64 letras, dígitos, `_` o `-`
   (sin punto: el punto lo pone quien recibe, en `<computadora>.<id>`).
+- Desde 0.15.0, un endpoint puede traer `"names"` (opcional, texto): su lista de
+  articulaciones, con la misma regla que el hub (ver
+  [Nombres de las articulaciones](#nombres-de-las-articulaciones-names-desde-0150)). Si
+  `names` no vale, el endpoint se descarta, como cualquier otro dato malo.
 
 **Quien recibe** valida cada endpoint como lo haría el hub. Lo inválido se descarta, y
 si un `id` se repite en la tabla, se queda el primero. La **IP** la pone quien recibe:

@@ -12,9 +12,13 @@ Hecho: el bloque 1 del plan (mensajes chicos, `nan` por defecto, el cuaternión
 sin adivinar y los vectores de prueba). El mapeo de los mensajes chicos a
 Foxglove pasa del bloque 1 al bloque 3 (con los marcos): lo decidió el consejo
 (2 votos contra 1) la noche del 2026-11-16, por delegación de Adán, que puede
-revertirlo. Del bloque 2 está hecha solo la parte de las plantillas de
-articulaciones (ver Agregado); faltan el resto del bloque 2 (`[[joints]]` y los
-nombres declarados al hub) y los bloques 3 a 7 del plan del RFC.
+revertirlo. Del bloque 2 están hechas las plantillas de articulaciones,
+`[[joints]]` en `robot.toml` y los nombres declarados al hub (con el capítulo 19
+del tutorial). Faltan los bloques 3 a 7 del plan del RFC. Pendiente dentro del
+bloque 2: el aviso de `agmen run` cuando el hub de otra computadora es anterior (lo
+pide el RFC y todavía no está); la salida de `[[mux]]` en el `command` de un
+`[[joints]]` (está por decidir, no se documenta); y que `agmen run` pase `kp` y `kd` a
+los nodos (hoy los revisa y los muestra, pero no llegan a ningún nodo).
 
 ### Agregado
 - **Mensajes estándar chicos** (RFC 0013 §3.2 y §3.3) en `agmen/msgs.agmen`, con
@@ -58,10 +62,39 @@ nombres declarados al hub) y los bloques 3 a 7 del plan del RFC.
   el mismo `schema_id`. `JointState` mide 12·N bytes (posición, velocidad y
   par) y `JointCommand` 20·N (esos tres más `kp` y `kd`). Como los demás
   mensajes con NaN, no se comparan con `==`. Las adelantó el consejo (3 votos a
-  0), por delegación de Adán. Todavía no tienen capítulo en el tutorial: se
-  escribe al cerrar el bloque 2. El resto del bloque 2 no está hecho.
+  0), por delegación de Adán. Tienen capítulo en el tutorial (el 19).
+- **`[[joints]]` en `robot.toml`** (RFC 0013 §3.4, D6): un grupo de articulaciones
+  con `state` (JointState), `command` (JointCommand), `kp` y `kd` (un número, o una
+  lista con uno por articulación), `names` (el orden, una vez) y `require_names`. Con
+  `profile` se usa igual que `[[node]]`. `agmen run` lo revisa antes de arrancar
+  (nombres repetidos, topics que chocan, ganancias) y muestra una línea por grupo.
+- **`names=` en Python y C++**: `Publisher`, `Subscriber`, `node.publisher` y
+  `node.on` (Python) aceptan `names=[...]`; en C++, `{.names = {...}}` en
+  `Publisher`, `Subscriber`, `node.publisher` y `node.subscribe`. Quien trae su
+  propia lista la declara al hub, que la compara.
+- **Campo `names` del hub (`agmen-hub/1`)**: opcional, en `pub`, `sub` y en la
+  línea `ep` de `state`, y clave `"names"` en las tablas entre computadoras. El hub
+  rechaza la lista que no es igual a la de `robot.toml` o a la de otro endpoint del
+  mismo topic, y rechaza un Publisher sin lista si el topic tiene `require_names`.
+  Sin lista, la línea es la de siempre. El número de versión del protocolo no cambia.
+  Los topes son provisionales: 64 caracteres por nombre y 8192 en el campo.
+- **`agmen hub --names TOPIC=a,b,…` y `--require-names TOPIC`**: la lista de cada
+  `[[joints]]` y la exigencia de declararla. Los pasa `agmen run`.
+- **`agmen topic info`** muestra `articulaciones (N): …` cuando el nodo declaró su
+  lista (con más de seis nombres, los tres primeros y el último).
 
 ### Cambiado
+- **El rechazo del hub por tipo dice en qué cambia la forma**: en vez de solo los
+  dos `schema_id`, muestra los dos esquemas alrededor del campo que cambia, por
+  ejemplo `JointState{f32[4] position;…}` contra `JointState{f32[2] position;…}`.
+- **Un rechazo del hub llega a Python como `wire.HubRejected`** cuando el núcleo de
+  C++ está compilado. Antes llegaba como `WireError` a secas. `HubRejected` es una
+  subclase de `WireError`: quien atrapa `WireError` sigue funcionando.
+- **Los textos del hub que nombran un nodo o una computadora** quitan los caracteres
+  de control y se cortan a 64 caracteres.
+- **En C++, `Publisher<M>(to, {})` con llaves vacías ya no compila**: el `{}` es
+  ambiguo entre el texto de `topic` y las opciones (`TopicOptions`). Si no pasas
+  opciones, omite el argumento.
 - **Un `.agmen` no puede definir otro `Pose`, `Transform`, `Twist`, `Odometry`,
   `Imu`, `Vector2`, `Vector3`, `Vector3f`, `Quaternion` o `Quaternionf`** si
   importa `agmen/msgs.agmen`: ahora da error con dos salidas. Usa el estándar
@@ -138,6 +171,13 @@ nombres declarados al hub) y los bloques 3 a 7 del plan del RFC.
 - **`agmen info --reparar`** ya no deja el archivo a medio escribir si falla a
   medias: lo borra. Y se niega si la salida es la misma grabación que la entrada
   (la sobrescribiría mientras la lee): da otra ruta de salida.
+- **Un datagrama con bytes que no son UTF-8 tras leer sus `%XX`** (por ejemplo,
+  `%FF`) dejaba sordo al hub. Ahora es un error de esa línea, y el resto se atiende.
+- **Una línea mala del hub ya no tira el datagrama entero**, y el nodo ya no se
+  queda sin saberlo: el hub lee cada línea por su cuenta, y si trae un `id=`
+  legible, le contesta `error` a quien la mandó. Ver `docs/PROTOCOLO.md`.
+- **Un error inesperado al atender una línea ya no mata el hilo del hub**: quien la
+  mandó recibe `error`, y el hub sigue atendiendo.
 
 ## [0.14.0] — 2026-11-16
 
