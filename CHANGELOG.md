@@ -186,7 +186,7 @@ defecto no pasa por un `[[mux]]`, porque el mux descarta lo que no es finito.
   los mensajes se contaban como reproducidos y no se decía nada. Ahora lo dice una vez
   por topic, con qué hacer; no cuenta esos mensajes como reproducidos y sale con código
   1 si de algún topic no salió nada. Vale para cualquier rechazo del hub, no solo para
-  `[[joints]]`. Sin hub, espera como mucho 1 s de más en total, no por cada topic.
+  `[[joints]]`. Si el hub no contesta, espera como mucho 1 s de más en total, no por cada topic.
 - **El lector de `.agmen` falla antes, no después**: los valores de arriba
   pasaban el lector y tronaban después, al compilar el C++ o al cargar en Python.
   Ahora el error dice el archivo, la línea, la columna y qué hacer.
