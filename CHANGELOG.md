@@ -177,15 +177,16 @@ defecto no pasa por un `[[mux]]`, porque el mux descarta lo que no es finito.
   salida (por ejemplo, con una lista distinta a la de `robot.toml`) no pasaba por el aviso
   del mux: no decía qué hacer y no se contaba como descartado. Ahora el mux avisa una vez
   por segundo como mucho, con el texto del hub sin caracteres de control; dice qué hacer
-  según quién lo lanzó (`agmen mux` a mano: pasar `--names` con la lista en ese orden;
-  `agmen run`: si el hub que ya corría es de otro `robot.toml`, reiniciar el robot), y
-  cuenta los comandos descartados.
+  como posibilidades (`agmen mux` a mano: pasar `--names` con la lista en ese orden; si lo
+  lanzó `agmen run`: si el hub que ya corría es de otro `robot.toml`, reiniciar el robot; si
+  otro nodo del topic declara otra lista o usa otro tipo, corregir ese nodo), y cuenta los
+  comandos descartados.
 - **`agmen play` ya no calla cuando el hub rechaza un topic.** Antes, si el hub
   rechazaba un topic (por ejemplo, `agmen play` sin lista a un topic con `require_names`),
   los mensajes se contaban como reproducidos y no se decía nada. Ahora lo dice una vez
   por topic, con qué hacer; no cuenta esos mensajes como reproducidos y sale con código
   1 si de algún topic no salió nada. Vale para cualquier rechazo del hub, no solo para
-  `[[joints]]`.
+  `[[joints]]`. Sin hub, espera como mucho 1 s de más en total, no por cada topic.
 - **El lector de `.agmen` falla antes, no después**: los valores de arriba
   pasaban el lector y tronaban después, al compilar el C++ o al cargar en Python.
   Ahora el error dice el archivo, la línea, la columna y qué hacer.

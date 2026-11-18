@@ -515,7 +515,7 @@ dice cuál es. Así sabes en qué máquina actualizar. Con el hub de una computa
 llamada `robot`, el aviso dice así:
 
 ```
-el agmen hub que ya corre en 127.0.0.1:7390 en 'robot' es Agmen 0.14.0, anterior a 0.15.0: ese agmen hub no compara los nombres de las articulaciones (names=), así que ahí no se revisa que los nodos usen el orden de [[joints]] de robot.toml (…). Actualiza Agmen en 'robot' y detén ese agmen hub (o el agmen run que lo arrancó) para que agmen run arranque uno al día
+el agmen hub de 'robot' que ya corre en 127.0.0.1:7390 es Agmen 0.14.0, anterior a 0.15.0: ese agmen hub no compara los nombres de las articulaciones (names=), así que ahí no se revisa que los nodos usen el orden de [[joints]] de robot.toml (…). Actualiza Agmen en 'robot' y detén ese agmen hub (o el agmen run que lo arrancó) para que agmen agent arranque uno al día
 ```
 
 Si el hub corre en esta misma computadora, el aviso no nombra otra máquina: dice
@@ -656,8 +656,8 @@ cosa a la vez. Las líneas largas están cortadas con `…`.
 | La política declara el orden cambiado (`FL_hip` primero) | `politica │ agmen.wire.HubRejected: el hub rechazó publicar en '/cmd/politica': … 'politica' declara FL_hip, FR_hip… y robot.toml dice FR_hip, FR_thigh…`. La política se detiene con `✖ falló` | Pon `names=` en el orden de `[[joints]]` |
 | La política no pone `names=` | `hub │ [hub] ⚠ 'politica' publica en '/cmd/politica', un topic de [[joints]], sin declarar su lista de nombres…` | Pasa `names=NOMBRES` |
 | La política manda `kp` en `nan` | `mando │ [agmen] ⚠ mux '/patas/cmd': descarté un comando de 'politica' con un valor no finito (kp[0]=nan). Revisa ese nodo.`. El resumen cuenta `no_finitos` | Manda `kp` y `kd` con números |
-| Un `agmen mux` a mano no declara la lista (sin `--names`) y el hub la exige, o la declara en otro orden | `[mux] ⚠ 'ia': el hub rechazó publicar en '/patas/cmd': '/patas/cmd': 'agmen mux' publica sin declarar su lista de nombres y robot.toml la exige (require_names = true en [[joints]]). Pasa names=[...] al crear el Publisher, en el orden de [[joints]]: FR_hip, FR_thigh… (4 nombres). Mientras el hub rechace la salida, nada llega a '/patas/cmd'. Si corres agmen mux a mano, pasa --names con la lista de [[joints]] de robot.toml, en ese orden; si lo lanzó agmen run, el hub que ya corría es de otro robot.toml: reinicia el robot (descartado; 1 en total)`. Sale como máximo una vez por segundo, con el total de descartados | Pasa `--names` con la lista de `[[joints]]`, en ese orden |
-| Un `[[mux]]` de otro `robot.toml` escribe en el topic de este robot, y el hub que ya corre es de ese robot (sin su lista) | El mismo texto, con `'mando' publica sin declarar…` en lugar de `'agmen mux'`. Y la última parte dice `si lo lanzó agmen run, el hub que ya corría es de otro robot.toml: reinicia el robot` | Detén el robot que corre (Ctrl+C) y arranca de nuevo el que quieras |
+| Un `agmen mux` a mano no declara la lista (sin `--names`) y el hub la exige, o la declara en otro orden | `[mux] ⚠ 'ia': el hub rechazó publicar en '/patas/cmd': '/patas/cmd': 'agmen mux' publica sin declarar su lista de nombres y robot.toml la exige (require_names = true en [[joints]]). Pasa names=[...] al crear el Publisher, en el orden de [[joints]]: FR_hip, FR_thigh… (4 nombres). Mientras el hub rechace la salida, nada llega a '/patas/cmd'. Si corres agmen mux a mano, pasa --names con la lista de [[joints]] de robot.toml, en ese orden. Si lo lanzó agmen run: si el hub ya corría, puede ser de otro robot.toml (reinicia el robot); si otro nodo del topic declara otra lista o usa otro tipo, corrige ese nodo (descartado; 1 en total)`. Sale como máximo una vez por segundo, con el total de descartados | Pasa `--names` con la lista de `[[joints]]`, en ese orden |
+| Un `[[mux]]` de otro `robot.toml` escribe en el topic de este robot, y el hub que ya corre es de ese robot (sin su lista) | El mismo texto, con `'mando' publica sin declarar…` en lugar de `'agmen mux'`. Y la última parte dice `Si lo lanzó agmen run: si el hub ya corría, puede ser de otro robot.toml (reinicia el robot); si otro nodo del topic declara otra lista o usa otro tipo, corrige ese nodo` | Si el hub que corre es de otro robot.toml, detén el robot que corre (Ctrl+C) y arranca de nuevo el que quieras; si otro nodo declara otra lista, corrige ese nodo |
 | `[[web.command]]` manda `JointCommand[3]` a `/patas/cmd`, y `[[joints]]` nombra 4 articulaciones | Si `[[joints]]` no pone `require_names`: un aviso al cargar `[[web.command]] 'Mando' manda JointCommand de 3 articulaciones a '/patas/cmd', y [[joints]] 'patas' nombra FR_hip, FR_thigh… (4 nombres): el panel publica ese mando sin la lista…`. Con `require_names = true` en `[[joints]]`, un error al cargar: `… el panel no puede declarar esa lista y '/patas/cmd' la exige (require_names = true), así que el hub rechazaría siempre ese mando…` | Usa un tipo de 4 articulaciones (`JointCommand[4]`), o corrige `names` |
 | `agmen mux --names` con una salida que es una dirección | `[mux] error: --names va con una salida que es un topic …` (sale con código 2) | Usa un topic en `--out` |
 | `agmen mux --names FR_hip,FR hip` | `[mux] error: --names FR_hip,FR hip: names[1] = 'FR hip' no es un nombre de articulación válido (tiene un espacio)…` | Quita el espacio |
@@ -698,11 +698,11 @@ la lista la pone quien reproduce. Hay dos maneras:
   usa el orden nuevo.
 
 - **`agmen play grabacion.mcap /patas/cmd`** (suelto, sin `robot.toml`) no declara ninguna
-  lista. Si el hub exige la lista de ese topic, lo rechaza. Ahora `agmen play` lo dice, no
+  lista. Si el hub exige la lista de ese topic, lo rechaza. `agmen play` lo dice, no
   cuenta esos mensajes como reproducidos y sale con código 1:
 
   ```
-  [agmen] ✗ el hub rechazó publicar en '/patas/cmd': '/patas/cmd': 'agmen play' publica sin declarar su lista de nombres y robot.toml la exige (require_names = true en [[joints]]). … No reproduzco '/patas/cmd' mientras el hub lo rechace. Si es el topic de un [[joints]], reproduce con agmen run robot.toml --play cmd.mcap: declara la lista de robot.toml
+  [agmen] ✗ el hub rechazó publicar en '/patas/cmd': '/patas/cmd': 'agmen play' publica sin declarar su lista de nombres y robot.toml la exige (require_names = true en [[joints]]). … No reproduzco '/patas/cmd' mientras el hub lo rechace. Si el rechazo es por la lista de nombres de un [[joints]], reproduce con agmen run robot.toml --play cmd.mcap: declara la lista de robot.toml
   [agmen] ⏹ terminó cmd.mcap: 0 mensajes (20 rechazados por el hub en /patas/cmd); el tiempo quedó en pausa al final de la grabación
   [agmen] ⏹ 0 mensajes en 0.2 s (20 rechazados por el hub en /patas/cmd)
   [agmen] ✗ no se reprodujo nada de /patas/cmd: el hub lo rechazó (ver arriba)
