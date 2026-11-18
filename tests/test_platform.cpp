@@ -80,18 +80,42 @@ void test_la_que_no_existe_da_vacio() {
     CHECK(agmen::platform::env("AGMEN_PRUEBA_ENV_NO_EXISTE").empty());
 }
 
+// Un nombre nulo no es una variable: "" y sin aviso.
+void test_nombre_nulo_da_vacio_sin_avisar() {
+    std::vector<std::string> avisos;
+    agmen::log::set_sink([&avisos](std::string_view line) { avisos.emplace_back(line); });
+    CHECK(agmen::platform::env(nullptr).empty());
+    CHECK(avisos.empty());
+    agmen::log::set_sink(nullptr);
+}
+
+// Un nombre más largo que el búfer de la pila del nombre (64 en Windows).
+void test_nombre_largo() {
+    const std::string nombre = "AGMEN_PRUEBA_ENV_" + std::string(70, 'L');
+    set_env(nombre.c_str(), "largo");
+    check_bytes(agmen::platform::env(nombre.c_str()), "largo", "nombre de 87 letras");
+    unset_env(nombre.c_str());
+    CHECK(agmen::platform::env(nombre.c_str()).empty());
+}
+
 #ifdef _WIN32
 
-// Windows: se pone en ancho (UTF-16) en el entorno del proceso, el mismo que lee
-// platform::env con GetEnvironmentVariableW, y debe llegar en UTF-8.
+// Windows: se pone en ancho (UTF-16) con SetEnvironmentVariableW, en el entorno
+// del proceso (el que lee platform::env con GetEnvironmentVariableW y el que
+// heredan los hijos), y debe llegar en UTF-8, byte por byte.
+//
+// Lo que esto detecta: (1) leer de otro lado que no sea el entorno del proceso:
+// volver a _dupenv_s o std::getenv falla porque leen la copia del CRT, que
+// SetEnvironmentVariableW no cambia; (2) convertir a algo que no sea UTF-8: con
+// la página ANSI occidental (1252) la ñ saldría F1, y "中" y el robot, "?".
+// Lo que no detecta: una lectura ANSI del entorno del proceso
+// (GetEnvironmentVariableA) en una máquina con la página ANSI en UTF-8 pasaría.
 void test_windows_llega_en_utf8() {
-    // "brazo_ñ": la ñ sí está en la página ANSI occidental (1252), por eso solo
-    // con ella una lectura ANSI daría F1 en lugar de C3 B1.
     CHECK(SetEnvironmentVariableW(L"AGMEN_PRUEBA_ENV", L"brazo_\x00F1") != 0);
     check_bytes(agmen::platform::env("AGMEN_PRUEBA_ENV"), "brazo_\xC3\xB1", "brazo_enie");
 
     // "中" (U+4E2D) no está en la 1252 y el robot (U+1F916) va en un par de
-    // sustitutos: con cualquier lectura ANSI saldrían como "?".
+    // sustitutos (cuatro bytes en UTF-8).
     CHECK(SetEnvironmentVariableW(L"AGMEN_PRUEBA_ENV",
                                   L"brazo_\x00F1"
                                   L"\x4E2D"
@@ -102,7 +126,19 @@ void test_windows_llega_en_utf8() {
                 "\xF0\x9F\xA4\x96",
                 "brazo_enie + U+4E2D + U+1F916");
 
-    // Un valor largo (más de lo que cabe en la primera lectura).
+    // Justo en el borde del búfer de la pila (256 con el nulo): 255 caracteres
+    // caben en la pila; 256 ya van al heap. El último es "中" para comprobar
+    // que se convierte entero.
+    for (const std::size_t largo_borde : {std::size_t{255}, std::size_t{256}}) {
+        std::wstring borde(largo_borde - 1, L'x');
+        borde += L'\x4E2D';
+        CHECK(SetEnvironmentVariableW(L"AGMEN_PRUEBA_ENV", borde.c_str()) != 0);
+        const std::string esperado_borde = std::string(largo_borde - 1, 'x') + "\xE4\xB8\xAD";
+        check_bytes(agmen::platform::env("AGMEN_PRUEBA_ENV"), esperado_borde,
+                    largo_borde == 255 ? "255 caracteres" : "256 caracteres");
+    }
+
+    // Un valor largo (camino del heap).
     std::wstring largo(1000, L'\x00F1');
     CHECK(SetEnvironmentVariableW(L"AGMEN_PRUEBA_ENV", largo.c_str()) != 0);
     std::string esperado;
@@ -126,10 +162,35 @@ void test_windows_sustituto_suelto_da_vacio_y_avisa_una_vez() {
     CHECK(agmen::platform::env("AGMEN_PRUEBA_ENV_MALA").empty());
     CHECK(agmen::platform::env("AGMEN_PRUEBA_ENV_MALA").empty());
     CHECK(avisos.size() == 1);
-    CHECK(!avisos.empty() && avisos[0].find("AGMEN_PRUEBA_ENV_MALA") != std::string::npos);
+    if (!avisos.empty()) {
+        const std::string& aviso = avisos[0];
+        CHECK(aviso.rfind("[agmen] \xE2\x9A\xA0 ", 0) == 0);   // "[agmen] ⚠ "
+        CHECK(aviso.find("AGMEN_PRUEBA_ENV_MALA") != std::string::npos);
+        CHECK(aviso.find("no es texto v\xC3\xA1lido") != std::string::npos);
+        CHECK(aviso.find("vuelve a ponerla") != std::string::npos);
+    }
 
     agmen::log::set_sink(nullptr);
     CHECK(SetEnvironmentVariableW(L"AGMEN_PRUEBA_ENV_MALA", nullptr) != 0);
+}
+
+// Un nombre que no es UTF-8 es un error de quien llama: "", y un aviso que lo dice
+// (con el byte malo escrito como \xFF, no crudo).
+void test_windows_nombre_que_no_es_utf8() {
+    std::vector<std::string> avisos;
+    agmen::log::set_sink([&avisos](std::string_view line) { avisos.emplace_back(line); });
+
+    CHECK(agmen::platform::env("AGMEN_PRUEBA_\xFF").empty());
+    CHECK(agmen::platform::env("AGMEN_PRUEBA_\xFF").empty());
+    CHECK(avisos.size() == 1);
+    if (!avisos.empty()) {
+        const std::string& aviso = avisos[0];
+        CHECK(aviso.rfind("[agmen] \xE2\x9A\xA0 ", 0) == 0);
+        CHECK(aviso.find("AGMEN_PRUEBA_\\xFF") != std::string::npos);
+        CHECK(aviso.find("error del programa") != std::string::npos);
+    }
+
+    agmen::log::set_sink(nullptr);
 }
 
 #else
@@ -152,9 +213,12 @@ void test_posix_utf8_tal_cual() {
 int main() {
     test_ascii_se_lee_igual();
     test_la_que_no_existe_da_vacio();
+    test_nombre_nulo_da_vacio_sin_avisar();
+    test_nombre_largo();
 #ifdef _WIN32
     test_windows_llega_en_utf8();
     test_windows_sustituto_suelto_da_vacio_y_avisa_una_vez();
+    test_windows_nombre_que_no_es_utf8();
 #else
     test_posix_utf8_tal_cual();
 #endif

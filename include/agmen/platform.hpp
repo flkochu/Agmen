@@ -53,7 +53,8 @@ void init_console();
 /// ancho (GetEnvironmentVariableW) y se pasa a UTF-8, así un nombre de nodo
 /// como "brazo_ñ" llega igual que desde Python. Si el valor no es UTF-16
 /// válido (un sustituto suelto), devuelve "" y avisa una vez por variable.
-/// En Linux y macOS devuelve los bytes tal cual.
+/// En Linux y macOS devuelve los bytes tal cual. Con `name` nulo devuelve "".
+/// No reserva memoria si la variable no existe (se lee por cada mensaje).
 std::string env(const char* name);
 
 }  // namespace agmen::platform

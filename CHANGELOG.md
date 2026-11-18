@@ -129,7 +129,8 @@ revertirlo. Faltan los bloques 2 a 7 del plan del RFC.
 - **En Windows, el núcleo de C++ lee el entorno en UTF-8.** Un nodo con acentos
   en `AGMEN_NODE` (por ejemplo `brazo_ñ`) llegaba al hub en la página de códigos
   del sistema y el hub lo rechazaba; ahora llega igual que desde Python. Si una
-  variable no es texto válido, Agmen la toma como vacía y avisa una vez cuál es.
+  variable no es texto válido, Agmen la toma como vacía y avisa una vez cuál es
+  y qué hacer. Leer una variable que no existe no reserva memoria.
 
 ## [0.14.0] — 2026-11-16
 
