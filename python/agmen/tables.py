@@ -192,7 +192,8 @@ class Lineage:
             parent, born = self._parents[pid]
             # Un padre que nació después que el hijo es otro proceso con el pid reusado: la cadena se corta. Va antes
             # de mirar `roots`: un ancestro muerto cuyo pid le tocó luego a un nodo no hace al nodo dueño del hijo.
-            if parent in self._parents and self._parents[parent][1] > born:
+            # Solo si se conocen los dos nacimientos (0 = no se pudo leer): sin el del hijo no hay con qué comparar.
+            if born != 0 and parent in self._parents and self._parents[parent][1] > born:
                 return False
             if parent in self.roots:
                 return True

@@ -901,6 +901,24 @@ class TestLimpiezaAlSalir(unittest.TestCase):
         self.assertGreater(bloques, 0, "el hijo borró los bloques del padre")
         self.assertEqual(reg, 1, "el hijo borró el registro del padre")
 
+    def test_un_pool_sin_close_no_queda_vivo(self):
+        # Lo que se guarda para limpiar al salir es el rastro (pid, nombres, registro), no el Pool: un Publisher
+        # soltado sin close() se libera, y aun así sus nombres se borran al salir.
+        import weakref
+        pool = _shm.Pool(0xA6E70009)
+        self.assertIsInstance(pool.write(1, BIG), _shm.Descriptor)
+        rastro, nombres = pool._rastro, set(pool._rastro.names)
+        self.assertTrue(nombres)
+        ref = weakref.ref(pool)
+        del pool
+        gc.collect()
+        self.assertIsNone(ref(), "el Pool sigue vivo sin close()")
+        self.assertIn(rastro, _shm._open_pools)
+        rastro.unlink_all()                              # lo que hace _clean_at_exit al salir
+        _shm._open_pools.discard(rastro)
+        for n in nombres:
+            self.assertFalse(os.path.exists("/dev/shm" + n), n)
+
 
 if __name__ == "__main__":
     unittest.main()

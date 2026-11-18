@@ -1480,6 +1480,12 @@ class TestLinajeWindows(unittest.TestCase):
         self.assertIs(self.owns(parents, [100], 300), False)
         self.assertIsNone(self.owns(parents, [100], 999))
 
+    def test_sin_el_nacimiento_del_hijo_no_corta_la_cadena(self):
+        # born = 0: no se pudo leer cuándo nació el hijo; la guarda no aplica (como antes del arreglo).
+        parents = {100: (1, 500), 110: (100, 0), 120: (110, 0)}
+        self.assertIs(self.owns(parents, [100], 120), True)
+        self.assertIs(self.owns(parents, [100], 110), True)
+
 
 if __name__ == "__main__":
     unittest.main()

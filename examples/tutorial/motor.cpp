@@ -70,6 +70,7 @@ int main(int argc, char** argv) {
                                      sub.last_from().c_str());
                     }
                 } else {
+                    non_finite_said = false;   // el aviso es por episodio: si vuelve un no finito, se dice otra vez
                     // Nunca confíes ciegamente en un comando: recórtalo al rango válido.
                     cmd.left = std::clamp(cmd.left, -1.0f, 1.0f);
                     cmd.right = std::clamp(cmd.right, -1.0f, 1.0f);

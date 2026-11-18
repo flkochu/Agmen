@@ -344,9 +344,10 @@ def _motor_bin():
 @unittest.skipIf(_motor_bin() is None, "sin build/bin/tutorial_motor (compila con cmake)")
 class TestMotorDelTutorial(unittest.TestCase):
     """examples/tutorial/motor.cpp: un comando con NaN o infinito no se usa; el motor frena de inmediato y lo dice
-    una vez (antes, std::clamp devolvía NaN y el freno de 0.5 s no actuaba mientras siguieran llegando)."""
+    una vez por episodio (antes, std::clamp devolvía NaN y el freno de 0.5 s no actuaba mientras siguieran llegando).
+    Un episodio termina cuando vuelve a llegar un comando bueno."""
 
-    def test_no_finito_frena_ya_y_lo_dice_una_vez(self):
+    def arranca(self):
         import subprocess
         import time
 
@@ -370,6 +371,10 @@ class TestMotorDelTutorial(unittest.TestCase):
                 time.sleep(0.02)
 
         time.sleep(0.3)                                   # que el motor ya escuche
+        return p, manda
+
+    def test_no_finito_frena_ya_y_lo_dice_una_vez(self):
+        p, manda = self.arranca()
         manda(0.5, 0.5, 0.4)
         manda(float("nan"), 0.5, 0.4)                     # siguen llegando (más seguido que el freno de 0.5 s)
         manda(0.5, float("inf"), 0.3)
@@ -379,6 +384,17 @@ class TestMotorDelTutorial(unittest.TestCase):
         self.assertEqual(err.count("valor no finito"), 1, err)
         self.assertIn("[motor] ⛔ ALTO: llegó un comando con un valor no finito", err)
         self.assertRegex(out, r"no_finitos=(\d{2,})")
+        self.assertEqual(p.returncode, 0, out + err)
+
+    def test_cada_episodio_avisa_otra_vez(self):
+        # NaN -> bueno -> NaN: dos episodios, dos avisos (cada ráfaga, uno).
+        p, manda = self.arranca()
+        manda(float("nan"), 0.5, 0.3)
+        manda(0.5, 0.5, 0.3)
+        manda(float("nan"), 0.5, 0.3)
+        out, err = p.communicate(timeout=15)
+        self.assertNotIn("nan", out.lower(), out)
+        self.assertEqual(err.count("valor no finito"), 2, err)
         self.assertEqual(p.returncode, 0, out + err)
 
 
