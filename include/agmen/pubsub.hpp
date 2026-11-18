@@ -6,6 +6,11 @@
 //   agmen::Publisher<MotorCommand> pub("/cmd");
 //   agmen::Subscriber<MotorCommand> sub("/cmd");     // cuantos quieras
 //
+// Con los nombres de las articulaciones en el orden de los arreglos (RFC 0013 §3.4): el hub
+// los compara con robot.toml y con los demás nodos del topic, y rechaza la lista que no coincide.
+//
+//   agmen::Publisher<agmen::msgs::JointCommand<2>> pub("/brazo/cmd", {.names = {"hombro", "codo"}});
+//
 // Por dirección fija (como en 0.4; sin hub, para microcontroladores y puentes):
 //
 //   agmen::Publisher<MotorCommand> pub("127.0.0.1:7500", "/cmd");

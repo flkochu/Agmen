@@ -354,6 +354,12 @@ if(AGMEN_BUILD_TESTS)
     agmen_set_warnings(test_joints)
     add_test(NAME joints COMMAND test_joints)
 
+    # Los nombres de las articulaciones declarados al hub desde C++ (RFC 0013 §3.4, D6 = d).
+    add_executable(test_nombres tests/test_nombres.cpp)
+    target_link_libraries(test_nombres PRIVATE agmen::core)
+    agmen_set_warnings(test_nombres)
+    add_test(NAME nombres COMMAND test_nombres)
+
     add_executable(joints_peer tests/joints_peer.cpp)
     target_link_libraries(joints_peer PRIVATE agmen::core)
     agmen_set_warnings(joints_peer)

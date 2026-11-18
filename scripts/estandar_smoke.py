@@ -12,7 +12,9 @@
    `JointCommand<12>` de <agmen/joints.hpp>, tests/joints_peer.cpp) y `JointState[12]` /
    `JointCommand[12]` de Python, en los dos sentidos y con los dos núcleos: bytes, t_data y NaN
    intactos. Y el número es parte del tipo: C++ con `JointState<2>` en un topic que ya es de
-   `JointState[12]` es rechazado por el hub, y el aviso muestra `f32[2]`.
+   `JointState[12]` es rechazado por el hub, y el aviso muestra `f32[2]`. Y los nombres declarados al
+   hub (RFC 0013 D6, `names=`): C++ y Python con la misma lista se entienden en los dos sentidos, y el
+   segundo con la lista en otro orden es rechazado (con el texto del hub).
 
     python scripts/estandar_smoke.py              # requiere haber compilado antes (build/bin/estandar_peer y joints_peer)
     python scripts/estandar_smoke.py --required   # en el CI: sin núcleo de C++, Node o pyarrow, falla
@@ -80,20 +82,41 @@ def make_joint(kind: str, n: int, i: int):
 
 
 def worker_joints() -> int:
-    """`--pyj pub|sub state|command N /topic K`: el lado de Python de las articulaciones."""
+    """`--pyj pub|sub|rechazo state|command N /topic K [--names a,b,...]`: el lado de Python de las
+    articulaciones. Con --names declara esa lista al hub. `rechazo` publica hasta que el hub lo rechace
+    (máx. 15 s) e imprime "RECHAZADO <motivo>"; si nunca lo rechaza, termina con 3."""
     import agmen
+    from agmen import wire
     from agmen.msgs import JointCommand, JointState
 
-    mode, kind, n, topic, k = sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5], int(sys.argv[6])
+    args = sys.argv[2:]
+    names = None
+    if len(args) >= 2 and args[-2] == "--names":
+        names, args = args[-1].split(","), args[:-2]
+    mode, kind, n, topic, k = args[0], args[1], int(args[2]), args[3], int(args[4])
     cls = (JointState if kind == "state" else JointCommand)[n]
+    if mode == "rechazo":
+        pub = agmen.Publisher(cls, topic, names=names)
+        end = time.monotonic() + 15
+        try:
+            while time.monotonic() < end:
+                pub.publish(cls())
+                time.sleep(0.02)
+        except wire.HubRejected as e:
+            print(f"RECHAZADO {e}", flush=True)
+            return 0
+        finally:
+            pub.close()
+        print("NO LO RECHAZÓ en 15 s", flush=True)
+        return 3
     if mode == "pub":
-        pub = agmen.Publisher(cls, topic)
+        pub = agmen.Publisher(cls, topic, names=names)
         for i in range(k):
             pub.publish(make_joint(kind, n, i), t_data=T0 + 1000 * i)
             time.sleep(0.01)
         pub.close()
         return 0
-    sub = agmen.Subscriber(cls, topic)
+    sub = agmen.Subscriber(cls, topic, names=names)
     print("LISTO", flush=True)
     got, end = 0, time.monotonic() + 20
     while got < k and time.monotonic() < end:
@@ -457,6 +480,62 @@ def joints_smoke(py, env0, backends, hub_addr, procs) -> None:
               ready and rej.returncode == 0 and "RECHAZADO" in rej.stdout and "ya es de tipo JointState" in rej.stdout
               and "el que llega es JointState{f32[2] position;" in rej.stdout,
               f"código {rej.returncode}\n{rej.stdout}{rej.stderr}")
+        joints_names_smoke(py, env, backend, jpeer, hub_addr, procs)
+
+
+def rx_lines_quiet(proc: "Proc") -> list[str]:
+    """Las líneas RX que lleva `proc` (sin revisar nada)."""
+    return [ln for ln in proc.text().splitlines() if ln.startswith("RX ")]
+
+
+PATAS = ("FR_hip", "FR_thigh", "FR_calf", "FL_hip", "FL_thigh", "FL_calf",
+         "RR_hip", "RR_thigh", "RR_calf", "RL_hip", "RL_thigh", "RL_calf")
+PATAS_OTRO_ORDEN = PATAS[3:6] + PATAS[:3] + PATAS[6:]
+
+
+def joints_names_smoke(py, env, backend, jpeer, hub_addr, procs) -> None:
+    """5b) Los nombres declarados al hub (RFC 0013 §3.4, D6 = d) entre C++ y Python: con la misma lista los datos
+    llegan; el segundo que declara la lista en otro orden es rechazado por el hub (con el texto del hub)."""
+    n, k = 12, 20
+    sigue = str(10 * k)   # el receptor sigue registrado (con su lista) mientras llega el del otro orden
+    bien, mal = ["--names", ",".join(PATAS)], ["--names", ",".join(PATAS_OTRO_ORDEN)]
+    me = [str(Path(__file__)), "--pyj"]
+    # C++ publica con la lista -> Python (backend) escucha con la misma; luego C++ con otro orden: rechazado.
+    topic = f"/joints_nombres_{backend}"
+    sub = Proc("receptor de Python con names", py + me + ["sub", "command", str(n), topic, sigue] + bien, env)
+    procs.append(sub)
+    ready = sub.wait_line("LISTO") and wait_for(lambda: hub_has_sub(hub_addr, topic, sub), 15, 0.1)
+    cpp = run([jpeer, "pub", "command", str(n), topic, str(k)] + bien, env)
+    wait_for(lambda: len(rx_lines_quiet(sub)) >= k, 15, 0.1)
+    rej = run([jpeer, "rechazo", "command", str(n), topic] + mal, env)
+    sub.stop()
+    rows = rx_lines(sub, f"C++ -> Python con names ({backend})")
+    bad = check_bytes_joints(rows, "command", n, k)
+    check(f"names: C++ publica JointCommand<12> con la lista -> Python ({backend}) con la misma: llegan "
+          f"({len(rows)}/{k})", ready and cpp.returncode == 0 and len(rows) >= k // 2 and not bad,
+          f"{bad[:3]}\npeer: {cpp.stdout}{cpp.stderr}\npython: {sub.everything()}")
+    check(f"names: C++ con la lista en otro orden es rechazado por el hub ({backend}), con el texto del hub",
+          rej.returncode == 0 and f"RECHAZADO el hub rechazó publicar en '{topic}': '{topic}': " in rej.stdout
+          and "declara FL_hip, FL_thigh…" in rej.stdout and "FR_hip, FR_thigh…" in rej.stdout,
+          f"código {rej.returncode}\n{rej.stdout}{rej.stderr}")
+    # Al revés: C++ escucha con la lista -> Python (backend) publica con la misma; luego Python con otro orden.
+    topic2 = topic + "_rev"
+    cpp_sub = Proc("receptor de C++ con names", [jpeer, "sub", "command", str(n), topic2, sigue] + bien, env)
+    procs.append(cpp_sub)
+    ready = cpp_sub.wait_line("LISTO") and wait_for(lambda: hub_has_sub(hub_addr, topic2, cpp_sub), 15, 0.1)
+    pyp = run(py + me + ["pub", "command", str(n), topic2, str(k)] + bien, env)
+    wait_for(lambda: len(rx_lines_quiet(cpp_sub)) >= k, 15, 0.1)
+    pyr = run(py + me + ["rechazo", "command", str(n), topic2, "0"] + mal, env)
+    cpp_sub.stop()
+    rows = rx_lines(cpp_sub, f"Python -> C++ con names ({backend})")
+    bad = check_bytes_joints(rows, "command", n, k)
+    check(f"names: Python ({backend}) publica JointCommand[12] con la lista -> C++ con la misma: llegan "
+          f"({len(rows)}/{k})", ready and pyp.returncode == 0 and len(rows) >= k // 2 and not bad,
+          f"{bad[:3]}\npython: {pyp.stdout}{pyp.stderr}\ncpp: {cpp_sub.everything()}")
+    check(f"names: Python ({backend}) con la lista en otro orden es rechazado por el hub, con el texto del hub",
+          pyr.returncode == 0 and f"RECHAZADO el hub rechazó publicar en '{topic2}': '{topic2}': " in pyr.stdout
+          and "declara FL_hip, FL_thigh…" in pyr.stdout and "FR_hip, FR_thigh…" in pyr.stdout,
+          f"código {pyr.returncode}\n{pyr.stdout}{pyr.stderr}")
 
 
 def main() -> int:

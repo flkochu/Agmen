@@ -6,9 +6,10 @@ Quien trae su propia lista (una política, un puente) la pasa con names=[...] al
 va al hub en el campo `names` de la línea de registro (`pub`/`sub`), y el hub la compara con la de
 [[joints]] de robot.toml (que le pasa agmen run con --names) y con la de los demás endpoints del topic.
 
-Con el núcleo de C++ (agmen._core) names= todavía da un error claro (el registro lo arma C++): las pruebas
-del camino de Python puro usan pubsub._PurePublisher y _PureSubscriber directo, así corren con los dos
-núcleos. Nada espera un tiempo fijo: se espera cada condición, con tope.
+Con el núcleo de C++ (agmen._core) la lista llega igual: el registro lo arma C++ con el mismo campo (las pruebas
+del núcleo de C++ están en TestNucleoCppValidaPrimero y TestNucleoCpp). Las pruebas del camino de Python puro
+usan pubsub._PurePublisher y _PureSubscriber directo, así corren con los dos núcleos. Nada espera un tiempo fijo:
+se espera cada condición, con tope.
 """
 
 import contextlib
@@ -303,19 +304,24 @@ class TestNamesAlCrear(unittest.TestCase):
                 self.assertIn("[[joints]] 'g'", str(ctx.exception))
 
     @unittest.skipUnless(_backend.NATIVE, "solo con el núcleo de C++")
-    def test_con_el_nucleo_de_cpp_todavia_no(self):
-        for cls in (agmen.Publisher, agmen.Subscriber):
+    def test_con_el_nucleo_de_cpp_tambien(self):
+        """Con el núcleo de C++, names= ya funciona (antes daba NotImplementedError): la lista llega al hub."""
+        falso = FalsoHub(self)
+        for cls, op in ((agmen.Publisher, "pub"), (agmen.Subscriber, "sub")):
             with self.subTest(cls=cls):
-                with self.assertRaises(NotImplementedError) as ctx:
-                    cls(CMD12, "/patas/cmd", names=list(PATAS))
-                self.assertIn("todavía no funciona con el núcleo de C++", str(ctx.exception))
-                self.assertIn("AGMEN_BACKEND=pure", str(ctx.exception))
-        node = agmen.Node("n")
+                o = cls(CMD12, "/patas/cmd", names=list(PATAS))
+                self.addCleanup(o.close)
+                self.assertEqual(o.names, PATAS)
+                self.assertTrue(falso.registro(op).endswith(b" names=" + ",".join(PATAS).encode()))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            node = agmen.Node("n")
         self.addCleanup(node.close)
-        with self.assertRaises(NotImplementedError):
-            node.publisher(CMD12, "/patas/cmd", names=list(PATAS))
-        with self.assertRaises(NotImplementedError):
-            node.on(CMD12, "/patas/cmd", lambda s: None, names=list(PATAS))
+        p = node.publisher(CMD12, "/patas/cmd", names=list(PATAS))
+        self.assertEqual(p.names, PATAS)
+        self.assertTrue(falso.registro("pub").endswith(b" names=" + ",".join(PATAS).encode()))
+        node.on(CMD12, "/patas/cmd", lambda s: None, names=list(PATAS))
+        self.assertTrue(falso.registro("sub").endswith(b" names=" + ",".join(PATAS).encode()))
         with self.assertRaisesRegex(ValueError, "está dos veces"):   # revisada antes, igual que en Python puro
             node.on(JointState[2], "/x", lambda s: None, names=["a", "a"])
 
@@ -602,7 +608,9 @@ class HubProceso:
         self.p.stdout.close()
 
 
-class TestHubDeVerdad(unittest.TestCase):
+class _HubDeVerdad(unittest.TestCase):
+    """Un `agmen hub` de verdad con las listas del RFC (como lo arranca agmen run) y require_names en /patas/cmd."""
+
     def setUp(self):
         self.err = io.StringIO()
         ctx = contextlib.redirect_stderr(self.err)
@@ -633,6 +641,8 @@ class TestHubDeVerdad(unittest.TestCase):
         self.assertTrue(got, self.hub.text())
         return got[0]
 
+
+class TestHubDeVerdad(_HubDeVerdad):
     def test_bien_entra_y_el_orden_cambiado_no(self):
         bien = self.abrir(pubsub._PurePublisher, CMD12, "/patas/cmd", names=list(PATAS), node="politica")
         sub = self.abrir(pubsub._PureSubscriber, CMD12, "/patas/cmd")
@@ -1449,12 +1459,13 @@ class TestNucleoCppValidaPrimero(unittest.TestCase):
         with self.assertRaises(ValueError):
             node.publisher(JointState[3], "/x", names=["a", "b"])    # el número no es el del tipo
 
-    def test_lista_buena_da_error_que_dice_que_hacer(self):
-        with self.assertRaises(NotImplementedError) as ctx:
-            agmen.Publisher(JointState[2], "/x", names=["a", "b"])
-        txt = str(ctx.exception)
-        self.assertIn("AGMEN_BACKEND=pure", txt)
-        self.assertNotIn("Traceback", txt)
+    def test_lista_buena_entra_y_va_en_el_registro(self):
+        """Antes: NotImplementedError. Ahora la lista buena entra y va al hub, como en Python puro."""
+        falso = FalsoHub(self)
+        p = agmen.Publisher(JointState[2], "/x", names=["a", "b"])
+        self.addCleanup(p.close)
+        self.assertEqual(p.names, ("a", "b"))
+        self.assertTrue(falso.registro("pub").endswith(b" names=a,b"))
 
     def test_sin_names_nada_cambia(self):
         pub = agmen.Publisher(JointState[2], "/x")
@@ -1462,17 +1473,210 @@ class TestNucleoCppValidaPrimero(unittest.TestCase):
         self.addCleanup(pub.close)
         self.addCleanup(sub.close)
         self.assertEqual(pub.type, JointState[2]) if hasattr(pub, "type") else None
+        self.assertIsNone(pub.names)
+        self.assertIsNone(sub.names)
         agmen.Publisher(JointState[2], "/x", names=None).close()
 
     def test_no_se_abre_ningun_socket_ni_se_registra_al_fallar(self):
-        """names= malo con el núcleo de C++ no debe dejar nada registrado en el hub."""
+        """names= malo con el núcleo de C++ no debe dejar nada registrado en el hub (ni revisado en Python, ni
+        pasado directo al núcleo, que lo revisa otra vez antes de abrir nada)."""
         h = HubProceso(self)
+        core, T2 = _backend.core, JointState[2]
         for _ in range(3):
-            with self.assertRaises(NotImplementedError):
-                agmen.Publisher(JointState[2], "/x", names=["a", "b"])
+            with self.assertRaises(ValueError):
+                agmen.Publisher(T2, "/x", names=["a", "a"])
+            with self.assertRaises(ValueError):
+                agmen.Subscriber(T2, "/x", names=["a"])
+            with self.assertRaises(wire.WireError):
+                core.Publisher("/x", T2.NAME, T2.SCHEMA_TEXT, T2.SCHEMA_ID, T2.LAYOUT.size, False, "", ["a", "a"])
+            with self.assertRaises(wire.WireError):
+                core.Subscriber("/x", T2.NAME, T2.SCHEMA_TEXT, T2.SCHEMA_ID, T2.LAYOUT.size, False, ["a"])
         time.sleep(0.5)
         eps = [f for op, f in H.query(h.addr) if op == "ep"]
         self.assertEqual(eps, [], eps)
+
+
+@unittest.skipUnless(_backend.NATIVE, "solo con el núcleo de C++")
+class TestNucleoCpp(unittest.TestCase):
+    """names= con el núcleo de C++: los mismos topes, los mismos textos, la misma línea y el mismo rechazo que en
+    Python puro (C++: include/agmen/hubproto.hpp y src/pubsub.cpp; tests/test_nombres.cpp)."""
+
+    def setUp(self):
+        self.err = io.StringIO()
+        ctx = contextlib.redirect_stderr(self.err)
+        ctx.__enter__()
+        self.addCleanup(ctx.__exit__, None, None, None)
+
+    def test_los_topes_son_los_mismos(self):
+        self.assertEqual(_backend.core.JOINT_NAME_MAX, hp.JOINT_NAME_MAX)
+        self.assertEqual(_backend.core.JOINT_NAMES_MAX, hp.JOINT_NAMES_MAX)
+        self.assertEqual(_backend.core.MAX_DATAGRAM, wire.MAX_DATAGRAM)
+
+    def nucleo(self, cls, tipo, where, names):
+        """El núcleo de C++ directo (sin la revisión de Python): el texto de su error."""
+        core = _backend.core
+        size = tipo.LAYOUT.size or 0
+        arrow = tipo.LAYOUT.encoding == wire.ENC_ARROW
+        with self.assertRaises(wire.WireError) as ctx:
+            if cls == "Publisher":
+                core.Publisher(where, tipo.NAME, tipo.SCHEMA_TEXT, tipo.SCHEMA_ID, size, arrow, "", names).close()
+            else:
+                core.Subscriber(where, tipo.NAME, tipo.SCHEMA_TEXT, tipo.SCHEMA_ID, size, arrow, names).close()
+        return str(ctx.exception)
+
+    def python(self, cls, tipo, where, names):
+        with self.assertRaises(ValueError) as ctx:
+            pubsub.joint_names_for(tipo, where, names, cls)
+        return str(ctx.exception)
+
+    def test_los_mismos_textos_de_error_que_python(self):
+        casos = [n for n, _, _ in TestNamesAlCrear.CASOS if isinstance(n, list) and n and isinstance(n[0], str)]
+        casos += [["a=b"], ["x​y"], ["a'b"], ["a\\b"], ["b" * 70 + " "], ["a\x00"], ["é" * 70], ["a\x85"],
+                  ["a b"], ["\U0001F916"], [".a"], ["/"], ["a" * 64 + "é"], ["ok", "a b"], ["a", "b", "c", "b"]]
+        for names in casos:
+            for cls in ("Publisher", "Subscriber"):
+                with self.subTest(names=repr(names)[:50], cls=cls):
+                    tipo = JointState[len(names)]
+                    self.assertEqual(self.nucleo(cls, tipo, "/patas/estado", names),
+                                     self.python(cls, tipo, "/patas/estado", names))
+
+    def test_el_numero_la_direccion_y_el_datagrama(self):
+        for cls in ("Publisher", "Subscriber"):
+            with self.subTest(cls=cls):
+                self.assertEqual(self.nucleo(cls, CMD12, "/patas/cmd", list(PATAS[:10])),
+                                 self.python(cls, CMD12, "/patas/cmd", list(PATAS[:10])))
+                self.assertEqual(self.nucleo(cls, JointState[1], "127.0.0.1:7999", ["a"]),
+                                 self.python(cls, JointState[1], "127.0.0.1:7999", ["a"]))
+
+        class Grande(wire.Message):
+            SCHEMA = "Grande{" + ";".join(f"f32 campo_{i:05d}" for i in range(2900)) + "}"
+
+        nombres = [f"n{i}" for i in range(1500)]
+        with self.assertRaises(ValueError) as ctx:
+            pubsub._PurePublisher(Grande, "/grande", names=nombres)
+        with self.assertRaises(ValueError) as ctx_nativo:   # el mismo texto, revisado en Python antes del núcleo
+            agmen.Publisher(Grande, "/grande", names=nombres)
+        self.assertEqual(str(ctx_nativo.exception), str(ctx.exception))
+        self.assertEqual(self.nucleo("Publisher", Grande, "/grande", nombres), str(ctx.exception))
+
+    def test_la_linea_con_names_es_la_de_python_puro(self):
+        falso = FalsoHub(self)
+        nativo = agmen.Publisher(CMD12, "/patas/cmd", names=list(PATAS))
+        self.addCleanup(nativo.close)
+        l_nativo = falso.registro("pub").replace(f"{nativo.source_id:016x}".encode(), b"ID")
+        puro = pubsub._PurePublisher(CMD12, "/patas/cmd", names=list(PATAS))
+        self.addCleanup(puro.close)
+        l_puro = falso.registro("pub").replace(f"{puro.source_id:016x}".encode(), b"ID")
+        self.assertEqual(l_nativo, l_puro)
+        self.assertTrue(l_nativo.endswith(b" names=" + ",".join(PATAS).encode()))
+        # sub: la de siempre del núcleo de C++ (un tipo compact no lleva tcp=) + names al final.
+        sin = agmen.Subscriber(JointState[3], "/brazo/estado")
+        self.addCleanup(sin.close)
+        l_sin = falso.registro("sub").decode()
+        con = agmen.Subscriber(JointState[3], "/brazo/estado", names=["hombro", "codo", "mano.1"])
+        self.addCleanup(con.close)
+        l_con = falso.registro("sub").decode()
+
+        def sin_id_ni_puerto(line, s):
+            return re.sub(r" id=\S+", " id=ID", line).replace(f" port={s.port}", " port=P")
+
+        self.assertEqual(sin_id_ni_puerto(l_con, con), sin_id_ni_puerto(l_sin, sin) + " names=hombro,codo,mano.1")
+        self.assertNotIn("names", l_sin)
+
+
+@unittest.skipUnless(_backend.NATIVE, "solo con el núcleo de C++")
+class TestNucleoCppHubDeVerdad(_HubDeVerdad):
+    """Contra un `agmen hub` de verdad (con --names y --require-names como agmen run), con el núcleo de C++."""
+
+    def test_bien_entra_los_datos_llegan_y_el_orden_cambiado_no(self):
+        bien = self.abrir(agmen.Publisher, CMD12, "/patas/cmd", names=list(PATAS))
+        sub = self.abrir(agmen.Subscriber, CMD12, "/patas/cmd", names=list(PATAS))
+        self.assertTrue(until(lambda: sub.receive(0.05) is not None, every=lambda: bien.publish(CMD12())),
+                        self.hub.text())
+        otro = list(PATAS[3:6] + PATAS[:3] + PATAS[6:])
+        mal = self.abrir(agmen.Publisher, CMD12, "/patas/cmd", names=otro)
+        msg = self.rechazado(lambda: mal.publish(CMD12()))
+        self.assertIn(f"el hub rechazó publicar en '/patas/cmd': '/patas/cmd': '{pubsub.node_name()}' declara FL_hip, "
+                      f"FL_thigh… y robot.toml dice FR_hip, FR_thigh…", msg)
+        sub_mal = self.abrir(agmen.Subscriber, JointState[12], "/patas/estado", names=otro)
+        self.assertIn("el hub rechazó escuchar '/patas/estado': '/patas/estado': ",
+                      self.rechazado(lambda: sub_mal.receive(0.05)))
+        bien.publish(CMD12())                     # el que declaró bien sigue
+
+    def test_el_texto_del_rechazo_llega_entero(self):
+        """El texto del hub con listas largas mide ~1100 caracteres: llega entero, igual que en Python puro."""
+        largos = [f"articulacion_muy_larga_numero_{i:02d}" for i in range(12)]
+        nativo = self.abrir(agmen.Publisher, CMD12, "/patas/cmd", names=largos)
+        msg_nativo = self.rechazado(lambda: nativo.publish(CMD12()))
+        nativo.close()
+        puro = self.abrir(pubsub._PurePublisher, CMD12, "/patas/cmd", names=largos, node=pubsub.node_name())
+        msg_puro = self.rechazado(lambda: puro.publish(CMD12()))
+        self.assertGreater(len(msg_nativo), 300)
+        self.assertEqual(msg_nativo, msg_puro)
+
+    def test_require_names_rechaza_al_nativo_sin_lista(self):
+        viejo = self.abrir(agmen.Publisher, CMD12, "/patas/cmd")
+        self.assertIn("robot.toml la exige (require_names = true en [[joints]])",
+                      self.rechazado(lambda: viejo.publish(CMD12())))
+
+    def test_node_nativo_con_names(self):
+        node = agmen.Node("politica_nativa")
+        self.addCleanup(node.close)
+        got = []
+        p = node.publisher(CMD12, "/patas/cmd", names=list(PATAS))
+        node.on(CMD12, "/patas/cmd", got.append, names=list(PATAS))
+        node.every(0.02, lambda: p.publish(CMD12()))
+        self.assertTrue(until(lambda: bool(got), every=lambda: node.spin_for(0.05)), self.hub.text())
+        # Con otro orden, Node.on detiene el nodo con el rechazo del hub (como cualquier rechazo).
+        node2 = agmen.Node("otro_nativo")
+        self.addCleanup(node2.close)
+        node2.on(JointState[12], "/patas/estado", lambda s: None, names=list(PATAS[::-1]))
+        got2 = []
+
+        def paso():
+            try:
+                node2.spin_for(0.05)
+            except wire.HubRejected as e:
+                got2.append(str(e))
+
+        self.assertTrue(until(lambda: bool(got2), every=paso), self.hub.text())
+        self.assertIn("el hub rechazó escuchar '/patas/estado'", got2[0])
+        self.assertIn("declara RL_calf, RL_thigh…", got2[0])
+
+    def test_cpp_y_python_puro_se_entienden_y_el_segundo_con_otra_lista_no(self):
+        otro = list(PATAS[::-1])
+        for orden in ("C++ primero", "Python puro primero"):
+            with self.subTest(orden=orden):
+                topic = "/brazo/" + ("a" if orden == "C++ primero" else "b")
+                T12 = JointState[12]
+                if orden == "C++ primero":
+                    pub = self.abrir(agmen.Publisher, T12, topic, names=list(PATAS))
+                    sub = self.abrir(pubsub._PureSubscriber, T12, topic, names=list(PATAS))
+                    mal = self.abrir(pubsub._PurePublisher, T12, topic, names=otro)
+                else:
+                    pub = self.abrir(pubsub._PurePublisher, T12, topic, names=list(PATAS))
+                    sub = self.abrir(agmen.Subscriber, T12, topic, names=list(PATAS))
+                    mal = self.abrir(agmen.Publisher, T12, topic, names=otro)
+                self.assertTrue(until(lambda: sub.receive(0.05) is not None, every=lambda: pub.publish(T12())),
+                                self.hub.text())
+                msg = self.rechazado(lambda: mal.publish(T12()))
+                self.assertIn(f"el hub rechazó publicar en '{topic}': '{topic}': ", msg)
+                self.assertIn("declara RL_calf, RL_thigh…", msg)
+
+    def test_topic_info_muestra_la_lista_de_un_nodo_nativo(self):
+        p = self.abrir(agmen.Publisher, CMD12, "/patas/cmd", names=list(PATAS))
+        p.publish(CMD12())
+        env = dict(os.environ, PYTHONPATH=str(ROOT / "python"), PYTHONIOENCODING="utf-8")
+        out = ""
+        for _ in range(50):
+            r = subprocess.run([sys.executable, "-m", "agmen", "topic", "info", "/patas/cmd"], env=env,
+                               capture_output=True, text=True, encoding="utf-8", timeout=60)
+            out = r.stdout + r.stderr
+            if "articulaciones (12)" in out:
+                break
+            p.publish(CMD12())
+            time.sleep(0.1)
+        self.assertIn("articulaciones (12): FR_hip, FR_thigh, FR_calf … RL_calf", out)
 
 
 # --- entre computadoras: lo que llega del otro lado, con names raros ------------------------------------------------

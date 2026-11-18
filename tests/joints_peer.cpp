@@ -4,6 +4,8 @@
 //   joints_peer sub state|command N /topic K       recibe K mensajes y por cada uno imprime "RX t_data payload_hex"
 //   joints_peer rechazo state|command N /topic     publica hasta que el hub lo rechace (máx. 15 s) e imprime
 //                                                  "RECHAZADO <motivo>"; si nunca lo rechaza, termina con 3
+// Con `--names a,b,...` al final, el Publisher o el Subscriber declara esa lista al hub (RFC 0013 §3.4,
+// D6 = d; agmen::TopicOptions::names). En `rechazo`, el motivo es entonces el de la lista.
 // N es 2 o 12. Los valores del mensaje i salen de i (los mismos que arma el script en Python), con NaN
 // en varios lugares para ver que llegan intactos.
 #include <agmen/agmen.hpp>
@@ -16,6 +18,7 @@
 #include <limits>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 namespace m = agmen::msgs;
@@ -59,9 +62,23 @@ m::JointCommand<N> command(int i) {
     return c;
 }
 
+/// "a,b,c" → {"a", "b", "c"} (sin saltar huecos: "a,,b" lleva un nombre vacío, que el núcleo rechaza).
+std::vector<std::string> split(const std::string& text) {
+    std::vector<std::string> out;
+    std::size_t p = 0;
+    while (true) {
+        const auto c = text.find(',', p);
+        out.push_back(text.substr(p, c == std::string::npos ? std::string::npos : c - p));
+        if (c == std::string::npos) return out;
+        p = c + 1;
+    }
+}
+
+agmen::TopicOptions g_options;   // --names
+
 template <class M, class F>
 int pub(const std::string& topic, int k, F make) {
-    agmen::Publisher<M> p(topic);
+    agmen::Publisher<M> p(topic, g_options);
     for (int i = 0; i < k; ++i) {
         (void)p.publish(make(i), 5'000'000'000LL + 1000LL * i);
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -71,7 +88,7 @@ int pub(const std::string& topic, int k, F make) {
 
 template <class M>
 int sub(const std::string& topic, int k) {
-    agmen::Subscriber<M> s(topic);
+    agmen::Subscriber<M> s(topic, g_options);
     std::printf("LISTO\n");
     std::fflush(stdout);
     int got = 0;
@@ -92,7 +109,7 @@ template <class M>
 int rechazo(const std::string& topic) {
     const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(15);
     try {
-        agmen::Publisher<M> p(topic);
+        agmen::Publisher<M> p(topic, g_options);
         while (std::chrono::steady_clock::now() < limit) {
             (void)p.publish(M{});
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -119,11 +136,15 @@ int run(const std::string& mode, const std::string& kind, const std::string& top
 }  // namespace
 
 int main(int argc, char** argv) try {
+    if (argc >= 3 && std::string(argv[argc - 2]) == "--names") {
+        g_options.names = split(argv[argc - 1]);
+        argc -= 2;
+    }
     const std::string mode = argc > 1 ? argv[1] : "", kind = argc > 2 ? argv[2] : "", n = argc > 3 ? argv[3] : "";
     const bool ok = (argc == 6 && (mode == "pub" || mode == "sub")) || (argc == 5 && mode == "rechazo");
     if (!ok || (kind != "state" && kind != "command") || (n != "2" && n != "12")) {
-        std::fprintf(stderr, "uso: joints_peer pub|sub state|command 2|12 /topic K\n"
-                             "     joints_peer rechazo state|command 2|12 /topic\n");
+        std::fprintf(stderr, "uso: joints_peer pub|sub state|command 2|12 /topic K [--names a,b,...]\n"
+                             "     joints_peer rechazo state|command 2|12 /topic [--names a,b,...]\n");
         return 64;
     }
     const std::string topic = argv[4];

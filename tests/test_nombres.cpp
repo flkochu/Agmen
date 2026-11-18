@@ -18,6 +18,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -74,7 +75,7 @@ public:
         set_env("AGMEN_HUB", addr.c_str());
     }
 
-    /// La siguiente línea `op` que llegue (las demás se saltan); "" si no llega ninguna a tiempo.
+    /// La siguiente línea `op` que llegue (las demás se saltan; op "" = cualquiera); "" si no llega ninguna a tiempo.
     std::string next(const std::string& op, std::chrono::milliseconds tope = 3000ms) {
         std::vector<std::uint8_t> buf(65536);
         const auto end = std::chrono::steady_clock::now() + tope;
@@ -82,7 +83,7 @@ public:
             const auto rx = sock_.recv_from(buf, 50ms);
             if (!rx) continue;
             std::string text(reinterpret_cast<const char*>(buf.data()), rx->size);
-            if (text.rfind(std::string(hub::kPrefix) + " " + op + " ", 0) == 0) {
+            if (text.rfind(std::string(hub::kPrefix) + " " + op + (op.empty() ? "" : " "), 0) == 0) {
                 last_from = rx->from;
                 return text;
             }
@@ -198,13 +199,12 @@ void test_listas_que_no_valen() {
         // hub::check_joint_names: el texto de Python (sin "Publisher en ...").
         try {
             hub::check_joint_names(c.names);
-            CHECK(!"check_joint_names no lanzó");
+            CHECK(false);   // check_joint_names no lanzó
         } catch (const std::invalid_argument& e) {
             CHECK_EQ(e.what(), c.texto);
         }
         // Publisher y Subscriber: con quién y dónde delante, como joint_names_for de Python.
         FakeHub h;
-        const auto n = c.names.size();
         const auto pub = wire_error([&] {
             agmen::PublisherCore p("/patas/estado", agmen::TypeInfo{"X", "agmen/1 X{u8 a}", 1, 1, false}, "",
                                    agmen::TopicOptions{c.names});
@@ -218,12 +218,11 @@ void test_listas_que_no_valen() {
         CHECK(sub.has_value());
         if (sub) CHECK_EQ(*sub, "Subscriber en '/patas/estado': " + c.texto);
         CHECK(!h.any("pub", 50ms));   // nada se registró
-        (void)n;
     }
     // Vacía en hub::check_joint_names es un error; en TopicOptions, vacía = sin lista.
     try {
         hub::check_joint_names({});
-        CHECK(!"check_joint_names({}) no lanzó");
+        CHECK(false);   // check_joint_names({}) no lanzó
     } catch (const std::invalid_argument& e) {
         CHECK_EQ(e.what(), "names está vacía: pon los nombres de las articulaciones en orden, ej. "
                            "[\"cadera\", \"rodilla\"] (o no la pases)");
@@ -311,6 +310,18 @@ void test_registro_que_no_cabe_en_un_datagrama() {
     CHECK_EQ(field(h.next("pub"), "names"), "a");
 }
 
+/// El siguiente latido de `p` (heartbeat() late cada segundo) termina en `tail`.
+template <class M>
+bool until_beat(FakeHub& h, agmen::Publisher<M>& p, const std::string& tail) {
+    const auto end = std::chrono::steady_clock::now() + 3s;
+    while (std::chrono::steady_clock::now() < end) {
+        p.heartbeat();
+        const auto line = h.next("pub", 100ms);
+        if (!line.empty()) return line.size() >= tail.size() && line.substr(line.size() - tail.size()) == tail;
+    }
+    return false;
+}
+
 void test_la_linea_sin_names_es_la_de_siempre_y_con_names_la_de_python() {
     using Cmd = m::JointCommand<12>;
     using Est = m::JointState<3>;
@@ -342,7 +353,110 @@ void test_la_linea_sin_names_es_la_de_siempre_y_con_names_la_de_python() {
     }
 }
 
+/// Un texto de rechazo como los del hub con listas largas (~1100 caracteres, con acentos y signos que van
+/// con %XX): debe llegar entero.
+std::string rechazo_largo() {
+    std::string msg = "'/patas/cmd': 'política' declara ";
+    for (int i = 0; i < 40; ++i) msg += "articulación_larga_" + std::to_string(i) + ", ";
+    msg += "… y robot.toml dice otra cosa: pasa names= en el orden de [[joints]] de robot.toml (fin)";
+    return msg;
+}
+
+void test_el_rechazo_del_hub_llega_entero() {
+    using Cmd = m::JointCommand<12>;
+    const auto msg = rechazo_largo();
+    CHECK(msg.size() > 1000);
+    FakeHub h;
+    {
+        agmen::Publisher<Cmd> p("/patas/cmd", {.names = kPatas});
+        const auto line = h.next("pub");
+        h.reply(hub::line("error", {{"id", field(line, "id")}, {"msg", msg}}));
+        std::optional<std::string> e;
+        const auto end = std::chrono::steady_clock::now() + 3s;
+        while (!e && std::chrono::steady_clock::now() < end) {
+            e = wire_error([&] { (void)p.publish(Cmd{}); });
+            std::this_thread::sleep_for(10ms);
+        }
+        CHECK(e.has_value());
+        if (e) CHECK_EQ(*e, "el hub rechazó publicar en '/patas/cmd': " + msg);
+    }
+    {
+        agmen::Subscriber<Cmd> s("/patas/cmd", {.names = kPatas});
+        const auto line = h.next("sub");
+        h.reply(hub::line("error", {{"id", field(line, "id")}, {"msg", msg}}));
+        std::optional<std::string> e;
+        const auto end = std::chrono::steady_clock::now() + 3s;
+        while (!e && std::chrono::steady_clock::now() < end) e = wire_error([&] { (void)s.receive(50ms); });
+        CHECK(e.has_value());
+        if (e) CHECK_EQ(*e, "el hub rechazó escuchar '/patas/cmd': " + msg);
+    }
+}
+
+void test_node_con_names() {
+    using Cmd = m::JointCommand<2>;
+    FakeHub h;
+    agmen::Node node("nombres");
+    auto p = node.publisher<Cmd>("/n/cmd", {.names = {"cadera", "rodilla"}});
+    CHECK_EQ(h.next("pub"), pub_de_siempre<Cmd>(p.raw().source_id(), "/n/cmd") + " names=cadera,rodilla");
+    node.subscribe<Cmd>("/n/cmd", [](const Cmd&) {}, {.names = {"cadera", "rodilla"}});
+    CHECK_EQ(field(h.next("sub"), "names"), "cadera,rodilla");
+    node.subscribe<Cmd>("/n/cmd", [](const Cmd&) {}, {.queue = 3});   // sin lista: la de siempre
+    CHECK(h.next("sub").find("names") == std::string::npos);
+    auto e = wire_error([&] { node.subscribe<Cmd>("/n/cmd", [](const Cmd&) {}, {.names = {"a", "a"}}); });
+    CHECK(e.has_value() && e->find("'a' está dos veces en names") != std::string::npos);
+    e = wire_error([&] { (void)node.publisher<Cmd>("/n/cmd", {.names = {"a"}}); });
+    CHECK(e.has_value() && e->find("names tiene 1 nombre y JointCommand es de 2") != std::string::npos);
+}
+
+/// El código de usuario de antes compila y se porta igual: sin TopicOptions nada cambia.
+void test_el_codigo_de_antes_compila() {
+    using Cmd = m::JointCommand<2>;
+    FakeHub h;
+    agmen::Publisher<Cmd> a("/antes");
+    CHECK(a.topic() == "/antes");
+    agmen::Publisher<Cmd> b("127.0.0.1:7999", "/etiqueta");   // dirección + etiqueta (const char*)
+    CHECK(b.topic() == "/etiqueta");
+    agmen::Publisher<Cmd> c("127.0.0.1:7999", std::string("/otra"));
+    CHECK(c.topic() == "/otra");
+    agmen::Publisher<Cmd> d("127.0.0.1:7999");
+    CHECK(d.topic() == "/JointCommand");
+    agmen::Subscriber<Cmd> s("/antes");
+    agmen::Subscriber<Cmd> t("127.0.0.1:0");
+    agmen::Node node;
+    auto np = node.publisher<Cmd>("/antes");
+    auto nd = node.publisher<Cmd>("127.0.0.1:7999");
+    CHECK(nd.raw().topic() == "/JointCommand");
+    node.subscribe<Cmd>("/antes", [](const agmen::Sample<Cmd>&) {});
+    node.subscribe<Cmd>("/antes", [](const Cmd&) {}, {.queue = 5});
+    node.subscribe<Cmd>("/antes", [](const Cmd&) {}, {.queue = 5, .group = agmen::Group{}});
+    node.subscribe<Cmd>("/antes", [](const Cmd&) {}, agmen::SubscribeOptions{2, {}});
+    agmen::SubscribeOptions opt;
+    opt.queue = 4;
+    node.subscribe<Cmd>("/antes", [](const Cmd&) {}, opt);
+    agmen::PublisherCore pc("/antes", agmen::TypeInfo::of<Cmd>());
+    agmen::SubscriberCore sc("/antes", agmen::TypeInfo::of<Cmd>());
+    int registros = 0;   // los de arriba por topic (3 pub y 6 sub, más sus latidos), ninguno con names
+    for (std::string line = h.next("", 500ms); !line.empty(); line = h.next("", 300ms)) {
+        const auto op = line.substr(hub::kPrefix.size() + 1, 4);
+        if (op != "pub " && op != "sub ") continue;
+        CHECK(line.find("names") == std::string::npos);
+        ++registros;
+    }
+    CHECK(registros >= 9);
+}
+
 }  // namespace
 
-// (fuera del namespace anónimo para poder declararla antes de usarla arriba)
-bool until_beat(FakeHub& h, agmen::Publisher<m::JointCommand<12>>& p, const std::string& tail);
+int main() {
+    set_env("AGMEN_NODE", "prueba-nombres");
+    test_constantes_y_formato();
+    test_listas_que_no_valen();
+    test_numero_del_tipo_y_direccion();
+    test_registro_que_no_cabe_en_un_datagrama();
+    test_la_linea_sin_names_es_la_de_siempre_y_con_names_la_de_python();
+    test_el_rechazo_del_hub_llega_entero();
+    test_node_con_names();
+    test_el_codigo_de_antes_compila();
+    if (g_failures == 0) std::printf("test_nombres: todo bien\n");
+    return g_failures == 0 ? 0 : 1;
+}
