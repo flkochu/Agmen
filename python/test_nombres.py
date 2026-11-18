@@ -133,6 +133,18 @@ class FalsoHub:
         patch.start()
         case.addCleanup(patch.stop)
 
+    def vaciar(self) -> None:
+        """Tira lo que ya llegó y nadie leyó (el registro o el latido de un endpoint de antes, que puede llamarse
+        igual que el siguiente): lo que se lea después es de quien se cree después."""
+        self.sock.setblocking(False)
+        try:
+            while True:
+                self.sock.recvfrom(65536)
+        except (BlockingIOError, ConnectionResetError):
+            pass
+        finally:
+            self.sock.settimeout(TOPE_S)
+
     def registro(self, op: str, node: str | None = None) -> bytes:
         """La siguiente línea `op` que llegue; con `node`, la siguiente de ese nodo (las de otro nodo se saltan: el
         latido de un Subscriber de antes que alcanzó a salir antes de cerrarse)."""
@@ -2445,6 +2457,7 @@ class TestRegistroQueNoCabe(unittest.TestCase):
         with self.subTest(nucleo=nucleo, quien=quien, arrow=arrow, names=names, borde="cabe"):
             err = io.StringIO()
             with entorno(nodo), contextlib.redirect_stderr(err):
+                self.falso.vaciar()           # (el de la vuelta anterior puede llamarse igual: su línea no cuenta)
                 o = crear(nodo)
                 self.addCleanup(o.close)
                 linea = self.falso.registro("sub", node=nodo)
