@@ -144,6 +144,7 @@ def run_dataset() -> bool:
     stop = threading.Event()
     threading.Thread(target=h.serve, args=(stop,), daemon=True).start()
     work = Path(tempfile.mkdtemp(prefix="agmen-cap16-"))
+    rec = None
     try:
         grupo = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
                  else {"start_new_session": True})
@@ -184,6 +185,14 @@ def run_dataset() -> bool:
         return ok
     finally:   # su directorio, también si falló o se colgó algo
         stop.set()
+        if rec is not None and rec.poll() is None:
+            # Sigue vivo (algo tronó antes de esperarlo): en Windows tendría abierto el .mcap y el directorio no se
+            # podría borrar. Se mata con sus hijos y se recoge.
+            matar_arbol(rec)
+            try:
+                rec.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                print(f"     agmen record (pid {rec.pid}) no terminó ni con SIGKILL en 10 s")
         shutil.rmtree(work, ignore_errors=True)
 
 
@@ -248,6 +257,10 @@ def normalizar(texto: str) -> str:
     t = re.sub(r"cadera FR = -?\d+\.\d+ rad", "cadera FR = X rad", t)
     return re.sub(r"\s+", " ", t).strip()
 
+
+# El [web] listen del panel cuando robot.toml no lo dice (el robot.toml del capítulo no lo dice). Al correr agmen run,
+# Cap19 le pone uno libre (otro programa puede tener este) y, en lo que sale, lo traduce de vuelta a este.
+_LISTEN_CAPITULO = "127.0.0.1:7400"
 
 _HUB_DE = re.compile(r"\[hub\] \S+ '([^']+)' ")
 
@@ -417,6 +430,12 @@ class Cap19:
         # PYTHONUNBUFFERED: lo que un nodo imprime sin flush no se queda atrás de lo que escribe en stderr (agmen run
         # ya se lo pone a sus nodos; aquí también a agmen run y a los fragmentos), así el orden por columna es real.
         self.env = {**ENV, "PATH": path, "NO_COLOR": "1", "PYTHONUNBUFFERED": "1"}
+        self.listen = _LISTEN_CAPITULO   # el [web] listen del agmen run en curso (ver agmen_run)
+
+    def traduce(self, texto: str) -> str:
+        """Lo que sale de agmen run (o de un comando con él corriendo), con el [web] listen libre que se le puso
+        traducido de vuelta al del capítulo: lo que se compara es lo que vería quien corre el capítulo."""
+        return texto.replace(self.listen, _LISTEN_CAPITULO) if self.listen != _LISTEN_CAPITULO else texto
 
     def reporta(self, nombre: str, ok: bool, detalle: str = "", salida: str = "") -> bool:
         print(f"{'OK  ' if ok else 'FALLA'} capítulo 19: {nombre}" + ("" if ok or not detalle else f"\n{detalle}"))
@@ -442,9 +461,19 @@ class Cap19:
 
     def agmen_run(self, carpeta: Path, listo, tope: float, mientras=None) -> str:
         """Corre `agmen run robot.toml` en la carpeta hasta que `listo(salida)` (o el tope), y lo
-        detiene como Ctrl+C. Con su propio hub y panel en puertos libres. `mientras(env)` corre
-        con el robot vivo. Nunca deja procesos: si agmen run no se detiene, se matan él y sus nodos."""
+        detiene como Ctrl+C. Con su propio hub y panel en puertos libres (también el [web] listen del
+        panel: se le agrega al robot.toml de la carpeta, y en la salida se traduce de vuelta al del
+        capítulo). `mientras(env)` corre con el robot vivo. Nunca deja procesos: si agmen run no se
+        detiene, se matan él y sus nodos."""
         env = {**self.env, "AGMEN_HUB": f"127.0.0.1:{puerto_libre(socket.SOCK_DGRAM)}"}
+        toml = carpeta / "robot.toml"
+        texto = toml.read_text(encoding="utf-8")
+        if re.search(r"^\s*\[web\]", texto, re.M):
+            self.reporta("el robot.toml del capítulo ya trae [web]: tutorial_check no sabe darle al panel un "
+                         "[web] listen libre (ajusta Cap19.agmen_run)", False, salida=texto)
+            return ""
+        self.listen = f"127.0.0.1:{puerto_libre(socket.SOCK_DGRAM)}"
+        toml.write_text(f'{texto.rstrip()}\n\n[web]\nlisten = "{self.listen}"\n', encoding="utf-8")
         http = f"127.0.0.1:{puerto_libre(socket.SOCK_STREAM)}"
         grupo = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
         proc = subprocess.Popen([sys.executable, "-m", "agmen", "run", "robot.toml", "--no-browser", "--http", http],
@@ -457,7 +486,7 @@ class Cap19:
         lector.start()
         try:
             fin = time.monotonic() + tope
-            while time.monotonic() < fin and proc.poll() is None and not listo("".join(lineas)):
+            while time.monotonic() < fin and proc.poll() is None and not listo(self.traduce("".join(lineas))):
                 time.sleep(0.1)
             # Un poco más con el robot vivo: una línea que sale de más (un aviso repetido) suele salir justo
             # después de la primera, y faltan() la cuenta solo si alcanzó a salir.
@@ -483,7 +512,7 @@ class Cap19:
                             pass
                 lineas.append("\n(agmen run no se detuvo en 20 s con Ctrl+C: lo maté a él y a sus nodos)\n")
             lector.join(10)
-        return "".join(lineas)
+        return self.traduce("".join(lineas))
 
     def robot(self) -> None:
         robot, politica = self.b["robot.toml"].texto, self.b["politica.py"].texto
@@ -509,7 +538,7 @@ class Cap19:
                         colgados.append(f"agmen topic {' '.join(args)}")
                         vistos[clave] = f"(agmen topic {' '.join(args)} se colgó más de 30 s)\n{parcial}"
                         break
-                    vistos[clave] = r.stdout + r.stderr
+                    vistos[clave] = self.traduce(r.stdout + r.stderr)
                     if not faltan(self.b[clave], vistos[clave]) or time.monotonic() > fin:
                         break
                     time.sleep(0.3)
