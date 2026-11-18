@@ -1209,7 +1209,7 @@ class TestPlaySueltoContraRequireNames(unittest.TestCase):
                            text=True, encoding="utf-8", errors="replace", timeout=60, cwd=self.dir)
         salida = (p.stdout + p.stderr)
         # (que el hub rechaza lo prueba TestPlayConNombres.test_sin_la_lista_el_hub_la_exige_y_no_llega)
-        dijo = ("rechaz" in salida.lower()) or ("require" in salida.lower()) or p.returncode != 0
+        dijo = ("rechaz" in salida.lower()) or ("require" in salida.lower())
         self.assertTrue(dijo, f"agmen play calló el rechazo del hub (rc={p.returncode}):\n{salida}")
         self.assertEqual(p.returncode, 1, salida)
         self.assertEqual(salida.count("el hub rechazó publicar en '/patas/cmd'"), 1, salida)
@@ -1253,13 +1253,176 @@ class TestPlaySueltoContraRequireNames(unittest.TestCase):
             except Exception as e:  # noqa: BLE001
                 err.write(f"{type(e).__name__}: {e}")
         texto = out.getvalue() + err.getvalue()
-        self.assertTrue("rechaz" in texto.lower() or "require" in texto.lower() or p.error is not None,
+        self.assertIsNone(p.error, texto)
+        self.assertTrue("rechaz" in texto.lower() or "require" in texto.lower(),
                         f"Player calló el rechazo del hub:\n{texto}")
         self.assertEqual(texto.count("el hub rechazó publicar en '/patas/cmd'"), 1, texto)
         self.assertEqual(p.stats.messages, 0, texto)
         self.assertEqual(p.stats.rejected, {"/patas/cmd": 40}, texto)
         self.assertIn("⏹ terminó patas.mcap: 0 mensajes (40 rechazados por el hub en /patas/cmd)", texto)
         self.assertNotIn("Traceback", texto)
+
+
+def grabacion_de_tres(path: str, n: int = 5) -> None:
+    """Tres topics de ImuSample (/a, /b, /c), cada uno con su source_id: tres publicadores al reproducir."""
+    w = _mcap.Writer(path, profile="agmen")
+    sc = w.add_schema("ImuSample", "agmen", wire.ImuSample.SCHEMA_TEXT.encode())
+    chs = [(w.add_channel(t, "agmen", sc), t, 0x4400 + k) for k, t in enumerate(("/a", "/b", "/c"))]
+    for i in range(n):
+        for k, (ch, topic, src) in enumerate(chs):
+            t = T0 + i * STEP + k
+            w.add_message(ch, t, t, i, wire.encode(imu(i), i, t, t, topic=topic, source_id=src, clock=wire.CLOCK_REAL))
+    w.close()
+
+
+def puerto_sin_hub() -> str:
+    """Un puerto UDP de 127.0.0.1 donde no escucha nadie (para correr sin hub)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0))
+    addr = f"127.0.0.1:{s.getsockname()[1]}"
+    s.close()
+    return addr
+
+
+class TestPlaySinRespuestaDelHub(unittest.TestCase):
+    """Un mensaje mandado antes de que el hub conteste queda pendiente: sin hub no se espera por cada publicador (una
+    sola espera, al final, de a lo más 1 s) y cuenta como reproducido; con un hub que rechaza tarde, cuenta como
+    rechazado."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.dir, ignore_errors=True))
+        self.addCleanup(clock.configure, clock.REAL)
+
+    def _env(self, addr):
+        p = mock.patch.dict(os.environ, {"AGMEN_HUB": addr})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_sin_hub_tres_publicadores_no_suman_la_espera(self):
+        path = os.path.join(self.dir, "tres.mcap")
+        grabacion_de_tres(path)
+        self._env(puerto_sin_hub())
+        out = io.StringIO()
+        with contextlib.redirect_stderr(io.StringIO()):     # (el aviso de "no hay un agmen hub", si alcanza a salir)
+            t0 = time.monotonic()
+            p = play.Player(path, out=out)
+            p.start()
+            self.assertTrue(p.wait(20), out.getvalue())
+            publicadores = len(p._pubs)
+            s = p.stop()
+            dura = time.monotonic() - t0
+        self.assertEqual(publicadores, 3)
+        # Antes: 1 s más por cada publicador nuevo (3 × 1.1 s). Ahora: 0.1 s por publicador y una espera al final.
+        self.assertLess(dura, 2.5, out.getvalue())
+        self.assertEqual(s.messages, 15, out.getvalue())   # sin hub, cuentan como reproducidos (como siempre)
+        self.assertEqual(s.topics, {"/a": 5, "/b": 5, "/c": 5})
+        self.assertEqual(s.rejected, {})
+        self.assertIn("⏹ terminó tres.mcap: 15 mensajes; el tiempo quedó en pausa al final de la grabación",
+                      out.getvalue())
+        self.assertNotIn("rechaz", out.getvalue())
+
+    def _hub_tarde(self, espera: float):
+        """Un hub con require_names en /patas/cmd que empieza a contestar `espera` s después (los registros
+        esperan en su socket)."""
+        hub = hubmod.Hub("127.0.0.1:0", log=lambda t: None, joints=[hubmod.JointNames("/patas/cmd", NOMBRES3, True)])
+        parar = threading.Event()
+        self.addCleanup(parar.set)
+        threading.Timer(espera, lambda: threading.Thread(target=hub.serve, args=(parar,), daemon=True).start()).start()
+        self._env(f"127.0.0.1:{hub.sock.getsockname()[1]}")
+
+    def test_hub_que_rechaza_tarde_los_conteos_no_cambian(self):
+        """El hub contesta (rechaza) a media reproducción, o ya terminada la grabación (en la espera del final): lo
+        mandado antes de su respuesta cuenta como rechazado, no como reproducido."""
+        for n, espera in ((40, 0.5), (4, 0.4)):
+            with self.subTest(n=n, espera=espera):
+                path = os.path.join(self.dir, f"patas{n}.mcap")
+                grabacion_de_patas(path, n=n)
+                self._hub_tarde(espera)
+                out = io.StringIO()
+                p = play.Player(path, out=out)
+                p.start()
+                self.assertTrue(p.wait(20), out.getvalue())
+                s = p.stop()
+                self.assertEqual(s.messages, 0, out.getvalue())
+                self.assertEqual(s.rejected, {"/patas/cmd": n}, out.getvalue())
+                self.assertEqual(out.getvalue().count("el hub rechazó publicar en '/patas/cmd'"), 1, out.getvalue())
+                self.assertIn(f"⏹ terminó patas{n}.mcap: 0 mensajes ({n} rechazados por el hub en /patas/cmd)",
+                              out.getvalue())
+
+
+class TestPlayRechazoPorTipo(unittest.TestCase):
+    """El hub rechaza por el tipo (otro nodo ya usa el topic con otro tipo): el qué hacer de agmen play no afirma que
+    sea por la lista de nombres, y con la marca de agmen run no sugiere agmen run --play."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.dir, ignore_errors=True))
+        self.path = os.path.join(self.dir, "patas.mcap")
+        grabacion_de_patas(self.path)
+        self.hub = hubmod.Hub("127.0.0.1:0", log=lambda t: None)
+        parar = threading.Event()
+        threading.Thread(target=self.hub.serve, args=(parar,), daemon=True).start()
+        self.addCleanup(parar.set)
+        p = mock.patch.dict(os.environ, {"AGMEN_HUB": f"127.0.0.1:{self.hub.sock.getsockname()[1]}"})
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(clock.configure, clock.REAL)
+        otro = agmen.Publisher(wire.ImuSample, "/patas/cmd")   # el topic ya es de tipo ImuSample
+        self.addCleanup(otro.close)
+
+    def reproducir(self, **kw) -> tuple[str, play.PlayStats]:
+        out = io.StringIO()
+        p = play.Player(self.path, out=out, **kw)
+        p.start()
+        self.assertTrue(p.wait(20), out.getvalue())
+        s = p.stop()
+        return out.getvalue(), s
+
+    def linea(self, texto: str) -> str:
+        lineas = [x for x in texto.splitlines() if "el hub rechazó publicar en '/patas/cmd'" in x]
+        self.assertEqual(len(lineas), 1, texto)
+        return lineas[0]
+
+    def test_suelto(self):
+        texto, s = self.reproducir()
+        linea = self.linea(texto)
+        self.assertIn("'/patas/cmd' ya es de tipo ImuSample", linea)
+        self.assertIn("Un topic, un tipo", linea)                # el qué hacer del hub, entero
+        self.assertIn("No reproduzco '/patas/cmd' mientras el hub lo rechace. Si el rechazo es por la lista de "
+                      "nombres de un [[joints]], reproduce con agmen run robot.toml --play patas.mcap: declara la "
+                      "lista de robot.toml", linea)
+        self.assertNotIn("Si es el topic de un [[joints]]", linea)
+        self.assertNotIn("Declaré", linea)
+        self.assertEqual((s.messages, s.rejected), (0, {"/patas/cmd": 40}))
+
+    def test_desde_agmen_run_sin_lista(self):
+        texto, s = self.reproducir(from_run=True)
+        linea = self.linea(texto)
+        self.assertIn("'/patas/cmd' ya es de tipo ImuSample", linea)
+        self.assertTrue(linea.endswith("No reproduzco '/patas/cmd' mientras el hub lo rechace."), linea)
+        self.assertNotIn("agmen run robot.toml --play", texto)
+        self.assertNotIn("[[joints]]", linea)
+        self.assertEqual((s.messages, s.rejected), (0, {"/patas/cmd": 40}))
+
+    def test_desde_agmen_run_con_lista(self):
+        texto, s = self.reproducir(from_run=True, names={"/patas/cmd": NOMBRES3})
+        linea = self.linea(texto)
+        self.assertIn("'/patas/cmd' ya es de tipo ImuSample", linea)
+        self.assertIn("No reproduzco '/patas/cmd' mientras el hub lo rechace. Si el rechazo es por la lista de "
+                      "nombres de un [[joints]]: declaré la de robot.toml; corrígela ahí o, si el hub ya corría, "
+                      "reinicia el robot (ese hub puede ser de otro robot.toml)", linea)
+        self.assertNotIn("agmen run robot.toml --play", texto)
+        self.assertNotIn("Declaré", linea)
+
+    def test_desde_agmen_run_con_otro_numero(self):
+        texto, s = self.reproducir(from_run=True, names={"/patas/cmd": ("a", "b")})
+        linea = self.linea(texto)
+        self.assertIn("No reproduzco '/patas/cmd' mientras el hub lo rechace. Si el rechazo es por la lista de "
+                      "nombres de un [[joints]]: la grabación trae JointCommand de 3 articulaciones y [[joints]] "
+                      "nombra 2, así que no declaré la lista; corrige [[joints]] en robot.toml o usa una grabación "
+                      "con ese número de articulaciones", linea)
+        self.assertNotIn("agmen run robot.toml --play", texto)
 
 
 if __name__ == "__main__":

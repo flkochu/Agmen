@@ -376,9 +376,12 @@ class Mux:
         except wire.HubRejected as e:   # el hub no dejó registrar la salida: se dice igual que en una entrada
             # El texto del hub, sin caracteres de control y sin su punto final (el de aquí no se duplica).
             said = "".join(c if c.isprintable() else "?" for c in str(e)).rstrip(" .")
+            # El qué hacer, como posibilidades: el hub también rechaza si otro nodo del topic declaró otra lista o
+            # usa otro tipo, y ahí reiniciar no arregla nada.
             self._error(inp, f"{said}. Mientras el hub rechace la salida, nada llega a '{self.output}'. Si corres "
-                             f"agmen mux a mano, pasa --names con la lista de [[joints]] de robot.toml, en ese orden; "
-                             f"si lo lanzó agmen run, el hub que ya corría es de otro robot.toml: reinicia el robot")
+                             f"agmen mux a mano, pasa --names con la lista de [[joints]] de robot.toml, en ese orden. "
+                             f"Si lo lanzó agmen run: si el hub ya corría, puede ser de otro robot.toml (reinicia el "
+                             f"robot); si otro nodo del topic declara otra lista o usa otro tipo, corrige ese nodo")
             return False
         self.out_seq += 1
         self.forwarded[inp.name] += 1

@@ -1263,11 +1263,16 @@ def prepare_hub_apart(config: RobotConfig, ping=None, machine: str | None = None
         what = " y ".join(x for x, on in (("[[topic]]", config.topics), ("[[joints]]", config.joints)) if on)
         note = f" (los {what} de este robot.toml no se revisan)" if what else ""
         # Y si además es anterior a hp.NAMES_SINCE, ni siquiera compara las listas que declaran los nodos (D6 = d).
-        where = f" en '{_clip(machine, 64)}'" if machine is not None else ""
-        here = f"en '{_clip(machine, 64)}'" if machine is not None else "en esta computadora"
-        old = old_hub_text(alive, f"el agmen hub que ya corre en {hub_address()}{where} es",
-                           f"Actualiza Agmen {here} y detén ese agmen hub (o el agmen run que lo "
-                           f"arrancó) para que agmen run arranque uno al día") if config.joints else None
+        if machine is None:
+            subject = f"el agmen hub que ya corre en {hub_address()} es"
+            fix = ("Actualiza Agmen en esta computadora y detén ese agmen hub (o el agmen run que lo arrancó) para "
+                   "que agmen run arranque uno al día")
+        else:   # visto desde otra computadora: ahí el hub nuevo lo arranca agmen agent
+            where = _clip(machine, 64)
+            subject = f"el agmen hub de '{where}' que ya corre en {hub_address()} es"
+            fix = (f"Actualiza Agmen en '{where}' y detén ese agmen hub (o el agmen run que lo arrancó) para que "
+                   f"agmen agent arranque uno al día")
+        old = old_hub_text(alive, subject, fix) if config.joints else None
         return config, f"usando el agmen hub {_clip(alive)} que ya corre en {hub_address()}{note}", \
             [old] if old is not None else []
     args = ["-m", "agmen", "hub", "--listen", hub_address(), "--robot", config.name]

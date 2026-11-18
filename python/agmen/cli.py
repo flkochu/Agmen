@@ -202,7 +202,7 @@ def _run(args) -> int:
 
             try:
                 with ctrl_c.interruptible():   # una grabación cortada se recorre entera: puede tardar
-                    player = Player(args.play, args.play_topic or None, paused=True,
+                    player = Player(args.play, args.play_topic or None, paused=True, from_run=True,
                                     names=joint_names_table(config))
             except KeyboardInterrupt:
                 if player is not None:
@@ -349,7 +349,7 @@ def _run(args) -> int:
 
             try:
                 with ctrl_c.interruptible():   # una grabación cortada se recorre entera: puede tardar
-                    player = Player(args.play, args.play_topic or None, paused=True, out=out,
+                    player = Player(args.play, args.play_topic or None, paused=True, out=out, from_run=True,
                                     names=joint_names_table(config))
             except KeyboardInterrupt:
                 return cancel_before_nodes("mientras abría la grabación")

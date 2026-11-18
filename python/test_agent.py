@@ -2311,12 +2311,15 @@ class TestHubAnteriorEnElAgente(ServerCase):
     def test_el_aviso_llega_a_la_laptop_una_vez(self):
         avisos = self.avisos("0.14.0", self.JOINTS)
         self.assertEqual(len(avisos), 1, avisos)
-        self.assertIn("el agmen hub que ya corre en", avisos[0])
-        # El aviso se lee en la laptop: nombra la computadora donde corre ese hub, no "esta computadora".
-        self.assertRegex(avisos[0], r"el agmen hub que ya corre en \S+ en 'robot' es Agmen 0\.14\.0")
+        # El aviso se lee en la laptop: nombra la computadora donde corre ese hub, no "esta computadora", y dice que
+        # ahí el hub nuevo lo arranca agmen agent.
+        self.assertRegex(avisos[0], r"el agmen hub de 'robot' que ya corre en \S+ es Agmen 0\.14\.0, anterior a "
+                                    r"0\.15\.0: ")
         self.assertIn("no compara los nombres de las articulaciones", avisos[0])
-        self.assertIn("Actualiza Agmen en 'robot' y detén ese agmen hub", avisos[0])
+        self.assertTrue(avisos[0].endswith("Actualiza Agmen en 'robot' y detén ese agmen hub (o el agmen run que lo "
+                                           "arrancó) para que agmen agent arranque uno al día"), avisos[0])
         self.assertNotIn("esta computadora", avisos[0])
+        self.assertNotIn("agmen run arranque", avisos[0])
 
     def test_sin_joints_no_hay_aviso(self):
         self.assertEqual(self.avisos("0.14.0", ""), [])

@@ -935,8 +935,8 @@ class TestMuxContraUnHubReal(unittest.TestCase):
         hub, parar = self.arranca_hub(self.puerto, self.NAMES)
         m = self.mux(self.NAMES)
         ia, manda = self.anuncia_y_manda(m)
-        for k in range(1, 4):
-            self.assertTrue(manda(k, 0.01 * k) or True)
+        for k in range(1, 4):   # con el hub aceptando, cada uno se reenvía (handle devuelve True)
+            self.assertTrue(manda(k, 0.01 * k), f"el mensaje {k} no se reenvió: {self.logs}")
         buenos = m.forwarded["ia"]
         self.assertEqual(buenos, 3)
         parar()
@@ -1016,9 +1016,10 @@ class TestMuxSalidaRechazadaSinRed(unittest.TestCase):
                 self.assertIn("el hub rechazó publicar en '/patas/cmd'", aviso)
                 self.assertNotIn("..", aviso)
                 self.assertNotIn("\x1b", aviso)
-                self.assertIn("Si corres agmen mux a mano, pasa --names con la lista de [[joints]] de robot.toml, "
-                              "en ese orden; si lo lanzó agmen run, el hub que ya corría es de otro robot.toml: "
-                              "reinicia el robot", aviso)
+                self.assertIn("Mientras el hub rechace la salida, nada llega a '/patas/cmd'. Si corres agmen mux a "
+                              "mano, pasa --names con la lista de [[joints]] de robot.toml, en ese orden. Si lo lanzó "
+                              "agmen run: si el hub ya corría, puede ser de otro robot.toml (reinicia el robot); si "
+                              "otro nodo del topic declara otra lista o usa otro tipo, corrige ese nodo", aviso)
 
 
 if __name__ == "__main__":

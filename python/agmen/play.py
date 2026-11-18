@@ -55,14 +55,19 @@ class _ReplayPublisher(_PurePublisher):
         # memoria compartida con otro dueño, y los rechazaría (RFC 0009).
         # `names`: la lista de [[joints]] del topic (RFC 0013 D6 = d), la que agmen run --play le pasa.
         super().__init__(rtype, topic, source_id=source_id, names=names)
-        # El Publisher espera 0.1 s la primera respuesta del hub; con un hub ocupado, se espera un poco más (una
-        # vez): sin respuesta no se sabe a quién mandar ni si el hub rechazó el registro, y el primer mensaje se
-        # contaría como reproducido sin haber llegado a nadie.
-        end = time.monotonic() + 1.0
-        while self._link is not None and self._link.last_reply is None and time.monotonic() < end:
-            time.sleep(0.005)
-            with self._lock:
-                self._drain()
+        # Mensajes mandados antes de la primera respuesta del hub: todavía no se sabe si llegaron a alguien o si el
+        # hub rechazó el registro. El Player los cuenta cuando el hub contesta (o al final; ver Player._settle).
+        self.pending = 0
+
+    def answered(self) -> bool:
+        """¿Ya contestó el hub (aceptó o rechazó)? Sin hub (dirección fija), siempre."""
+        return self._link is None or self._link.last_reply is not None
+
+    def hub_error(self) -> str | None:
+        return self._link.error if self._link is not None else None
+
+    def rejected_error(self) -> wire.HubRejected:
+        return wire.HubRejected(f"el hub rechazó publicar en '{self.topic}': {self.hub_error()}")
 
     def send_packet(self, data) -> bool:
         """Manda un paquete grabado. Si el hub rechazó el registro (require_names, otra lista…), wire.HubRejected
@@ -71,8 +76,11 @@ class _ReplayPublisher(_PurePublisher):
             with self._lock:
                 self._drain()
                 dests = list(self.dests)
+                waiting = self._link.last_reply is None
             if self._link.error:
-                raise wire.HubRejected(f"el hub rechazó publicar en '{self.topic}': {self._link.error}")
+                raise self.rejected_error()
+            if waiting:   # el hub todavía no contesta: este mensaje queda pendiente (lo cuenta el Player)
+                self.pending += 1
         else:
             dests = self.dests
         with self._pub_lock:
@@ -114,10 +122,12 @@ class Player:
 
     def __init__(self, path: str, topics=None, *, rate: float = 1.0, loop: bool = False,
                  start: float | None = None, end: float | None = None, publish_clock: bool = True,
-                 paused: bool = False, quiet: bool = False, out=None, names=None) -> None:
+                 paused: bool = False, quiet: bool = False, out=None, names=None, from_run: bool = False) -> None:
         """`names`: {topic: lista de [[joints]]} (RFC 0013 D6 = d; agmen run --play la pasa): al reproducir sobre uno
-        de esos topics, el publicador declara la lista al hub, como el nodo que se grabó."""
+        de esos topics, el publicador declara la lista al hub, como el nodo que se grabó. `from_run`: lo lanzó
+        agmen run --play (entonces, si el hub rechaza un topic, no sugiere reproducir con agmen run --play)."""
         self.names: dict[str, tuple[str, ...]] = dict(names or {})
+        self.from_run = bool(from_run)
         if rate <= 0:
             raise ValueError("--rate debe ser mayor que 0 (2 = el doble de rápido)")
         if not os.path.isfile(path):
@@ -172,6 +182,7 @@ class Player:
         self.error: BaseException | None = None
         self._last_status = 0.0
         self._rejected_told: set[str] = set()   # topics cuyo rechazo del hub ya se dijo (una vez por topic)
+        self._pending: list[_ReplayPublisher] = []   # publicadores con mensajes mandados antes de que el hub conteste
 
     # --- controles (como el reloj de simulación; el panel los usa) ---
     def pause(self) -> None:
@@ -271,13 +282,19 @@ class Player:
                         t_data, t_pub = struct.unpack_from("<qq", data, _OFF_T)
                         struct.pack_into("<qq", data, _OFF_T, t_data + shift, t_pub + shift)
                     pub = self._publisher(m.channel, data)
+                    before = pub.pending
                     try:
                         pub.send_packet(data)
                     except wire.HubRejected as e:   # no salió: no cuenta como reproducido, y se dice
                         self._hub_rejected(pub, e)
+                        self._resolve()
                         continue
-                    self.stats.messages += 1
-                    self.stats.topics[m.channel.topic] = self.stats.topics.get(m.channel.topic, 0) + 1
+                    if pub.pending > before:        # el hub no ha contestado: ni reproducido ni rechazado, aún
+                        if pub not in self._pending:
+                            self._pending.append(pub)
+                    else:
+                        self._count(m.channel.topic, 1)
+                    self._resolve()
                     self._status(shift)
                 self.stats.passes += 1
                 if not self.loop or self._stop.is_set():
@@ -293,6 +310,11 @@ class Player:
             self.error = e
         finally:
             m = None                 # la vista del último mensaje: que no la conserve este marco
+            if self.error is None:
+                try:
+                    self._settle()
+                except BaseException as e:   # noqa: BLE001 — se relanza en stop(), como un error de arriba
+                    self.error = e
             self.stats.seconds = time.monotonic() - t0
             if not self._stop.is_set() and self.error is None and not self.quiet:
                 print(f"[agmen] ⏹ terminó {os.path.basename(self.path)}: {self.stats.messages} mensajes"
@@ -300,27 +322,66 @@ class Player:
                       f"el tiempo quedó en pausa al final de la grabación", file=self.out, flush=True)
             self._done.set()
 
-    def _hub_rejected(self, pub: _ReplayPublisher, e: wire.HubRejected) -> None:
-        """El hub no dejó publicar en el topic de `pub`: se cuenta y se dice una vez por topic (también con quiet:
-        nunca fallar en silencio), sin traceback y sin los caracteres de control que traiga el texto del hub."""
+    def _count(self, topic: str, n: int) -> None:
+        """`n` mensajes de `topic` cuentan como reproducidos."""
+        self.stats.messages += n
+        self.stats.topics[topic] = self.stats.topics.get(topic, 0) + n
+
+    def _resolve(self, drain: bool = False, final: bool = False) -> None:
+        """Los mensajes pendientes de los publicadores a los que el hub ya contestó: si rechazó, son rechazados (y
+        se dice); si no, reproducidos. Con `drain`, se leen antes las respuestas que esperan en el socket. Con
+        `final`, lo que siga sin respuesta cuenta como reproducido (sin hub, como siempre)."""
+        for pub in list(self._pending):
+            with pub._lock:   # con el candado: el hilo de latido también lee las respuestas del hub
+                if drain:
+                    pub._drain()
+                answered, error = pub.answered(), pub.hub_error()
+            if not answered and not final:
+                continue
+            self._pending.remove(pub)
+            n, pub.pending = pub.pending, 0
+            if answered and error:
+                self._hub_rejected(pub, pub.rejected_error(), n)
+            else:
+                self._count(pub.topic, n)
+
+    def _settle(self) -> None:
+        """Al final: si quedan mensajes pendientes, se espera una sola vez, en total, hasta 1 s a que el hub conteste
+        (no una vez por publicador: sin hub, la reproducción no se alarga más que eso)."""
+        end = time.monotonic() + 1.0
+        while True:
+            self._resolve(drain=True)
+            if not self._pending or time.monotonic() >= end:
+                break
+            time.sleep(0.01)
+        self._resolve(final=True)
+
+    def _hub_rejected(self, pub: _ReplayPublisher, e: wire.HubRejected, n: int = 1) -> None:
+        """El hub no dejó publicar en el topic de `pub`: se cuentan `n` mensajes y se dice una vez por topic (también
+        con quiet: nunca fallar en silencio), sin traceback y sin los caracteres de control del texto del hub."""
         topic = pub.topic
-        self.stats.rejected[topic] = self.stats.rejected.get(topic, 0) + 1
+        self.stats.rejected[topic] = self.stats.rejected.get(topic, 0) + n
         if topic in self._rejected_told:
             return
         self._rejected_told.add(topic)
+        # El texto del hub va primero y entero (ya trae su qué hacer). Lo de aquí no afirma la causa: el rechazo puede
+        # ser por la lista de nombres, por el tipo u otra cosa.
         text = "".join(c if c.isprintable() else "?" for c in str(e)).rstrip(" .")
+        why = "Si el rechazo es por la lista de nombres de un [[joints]]"
         if pub.names is not None:      # agmen run --play ya declaró la de robot.toml
-            todo = ("Declaré la lista de [[joints]] de robot.toml: corrígela ahí o, si el hub ya corría, reinicia "
-                    "el robot (ese hub puede ser de otro robot.toml)")
+            todo = (f" {why}: declaré la de robot.toml; corrígela ahí o, si el hub ya corría, reinicia el robot (ese "
+                    f"hub puede ser de otro robot.toml)")
         elif topic in self.names:      # agmen run --play, pero el tipo grabado no tiene ese número de articulaciones
-            n = hp.schema_joint_count(pub.type.SCHEMA_TEXT)
-            todo = (f"La grabación trae {pub.type.NAME} de {n} articulaciones y [[joints]] nombra "
-                    f"{len(self.names[topic])}, así que no declaré la lista: corrige [[joints]] en robot.toml o "
-                    f"usa una grabación con ese número de articulaciones")
+            k = hp.schema_joint_count(pub.type.SCHEMA_TEXT)
+            todo = (f" {why}: la grabación trae {pub.type.NAME} de {k} articulaciones y [[joints]] nombra "
+                    f"{len(self.names[topic])}, así que no declaré la lista; corrige [[joints]] en robot.toml o usa "
+                    f"una grabación con ese número de articulaciones")
+        elif self.from_run:            # agmen run --play y el topic no tiene lista: basta el texto del hub
+            todo = ""
         else:
-            todo = (f"Si es el topic de un [[joints]], reproduce con agmen run robot.toml --play "
-                    f"{os.path.basename(self.path)}: declara la lista de robot.toml")
-        print(f"[agmen] ✗ {text}. No reproduzco '{topic}' mientras el hub lo rechace. {todo}", file=self.out,
+            todo = (f" {why}, reproduce con agmen run robot.toml --play {os.path.basename(self.path)}: declara la "
+                    f"lista de robot.toml")
+        print(f"[agmen] ✗ {text}. No reproduzco '{topic}' mientras el hub lo rechace.{todo}", file=self.out,
               flush=True)
 
     def _status(self, shift: int) -> None:
@@ -334,7 +395,8 @@ class Player:
         info = self.clock.info()
         state = "en pausa" if info["paused"] else f"×{info['speed']:g}"
         print(f"[agmen] ▶ {os.path.basename(self.path)}: {pos:.1f} s de {self.duration / 1e9:.1f} s ({state})"
-              f" · {self.stats.messages} mensajes", file=self.out, flush=True)
+              f" · {self.stats.messages + sum(p.pending for p in self._pending)} mensajes",   # (con los pendientes)
+              file=self.out, flush=True)
 
 
 def cmd_play(args) -> int:

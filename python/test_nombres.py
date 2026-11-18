@@ -2814,8 +2814,9 @@ def _mux_a_mano(case, hub_addr, *args, names=None):
     return p, out
 
 
-QUE_HACER_MUX = ("Si corres agmen mux a mano, pasa --names con la lista de [[joints]] de robot.toml, en ese orden; si "
-                 "lo lanzó agmen run, el hub que ya corría es de otro robot.toml: reinicia el robot")
+QUE_HACER_MUX = ("Si corres agmen mux a mano, pasa --names con la lista de [[joints]] de robot.toml, en ese orden. Si "
+                 "lo lanzó agmen run: si el hub ya corría, puede ser de otro robot.toml (reinicia el robot); si otro "
+                 "nodo del topic declara otra lista o usa otro tipo, corrige ese nodo")
 
 
 class TestMuxALaMano(unittest.TestCase):
@@ -3133,6 +3134,8 @@ class TestPanelHaciaEntradaHeredadaBordes(TestPanelHaciaEntradaHeredada):
         self.assertTrue(vistos, f"el panel calló el rechazo del hub:\n{hub.text()}")
         self.assertNotIn("Traceback", vistos[0])
         self.assertTrue("rechaz" in vistos[0].lower() or "require" in vistos[0].lower(), vistos)
+        # El qué hacer (lo trae el texto del hub): declarar la lista en el orden de [[joints]].
+        self.assertIn("Pasa names=[...] al crear el Publisher, en el orden de [[joints]]: a, b… (3 nombres)", vistos[0])
 
     def test_require_names_y_otro_numero_no_carga(self):
         """Un [[web.command]] de 2 articulaciones hacia un topic de 3 con require_names: el panel no puede declarar la
@@ -3159,6 +3162,38 @@ class TestPanelHaciaEntradaHeredadaBordes(TestPanelHaciaEntradaHeredada):
             "[[joints]] 'patas'"])
         self.assertEqual([w for w in self._robot(require=False, n=3).warnings if "articulaciones" in w], [])
         self.assertEqual([w for w in self._robot(require=True, n=3).warnings if "articulaciones" in w], [])
+
+    def _robot_con_mando_en_sim(self, require: bool, n: int = 2):
+        """Como _robot, pero el [[web.command]] va en [profile.sim.web] (el perfil 'real' usa el [web] de arriba, sin
+        mandos). Se carga con el perfil 'real'."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        (Path(d) / "m.agmen").write_text(M_AGMEN.format(n=n), encoding="utf-8")
+        texto = PANEL_ROBOT.format(require="require_names = true\n" if require else "", target="/cmd/ia")
+        for v in ("1.0", "0.0", "0.1"):
+            texto = texto.replace(f"[{v}, {v}, {v}]", "[" + ", ".join([v] * n) + "]")
+        texto = (texto.replace("[[web.command]]", "[profile.sim.web]\n\n[[profile.sim.web.command]]")
+                 .replace("[web.command.default]", "[profile.sim.web.command.default]")
+                 .replace("[[web.command.button]]", "[[profile.sim.web.command.button]]"))
+        (Path(d) / "robot.toml").write_text(texto, encoding="utf-8")
+        return load_config(Path(d) / "robot.toml", "real")
+
+    def test_otro_numero_en_otro_perfil_carga_sin_aviso(self):
+        """El mando de 2 articulaciones va en [profile.sim.web] y corre el perfil 'real': carga, y sin el aviso (los
+        avisos son del perfil que corre)."""
+        cfg = self._robot_con_mando_en_sim(require=False)
+        self.assertEqual(cfg.profile, "real")
+        self.assertEqual([w for w in cfg.warnings if "articulaciones" in w], [])
+
+    def test_require_names_y_otro_numero_en_otro_perfil_no_carga(self):
+        """Lo mismo con require_names = true: ConfigError aunque corra 'real' (los errores, de todos los perfiles),
+        y dice en qué perfil está."""
+        with self.assertRaises(ConfigError) as ctx:
+            self._robot_con_mando_en_sim(require=True)
+        self.assertIn("[[profile.sim.web.command]] 'Pata' manda JointCommand de 2 articulaciones a '/cmd/ia'",
+                      str(ctx.exception))
+        self.assertIn("en el perfil 'sim'", str(ctx.exception))
+        self.assertIn("la exige (require_names = true)", str(ctx.exception))
 
     def test_dos_mandos_al_mismo_topic_declaran_la_lista_los_dos(self):
         d = tempfile.mkdtemp()

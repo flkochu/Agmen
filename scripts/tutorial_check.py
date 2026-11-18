@@ -7,6 +7,7 @@ Corre en el CI: si un cambio rompe el tutorial, el CI falla.
 
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -30,12 +31,13 @@ def run_case(name, sender_cmd, expected, motor_args=()):
     se dice y se mata su árbol, sin traceback."""
     env = {**ENV, "AGMEN_HUB": f"127.0.0.1:{puerto_libre(socket.SOCK_DGRAM)}"}   # (si algo buscara un hub: el suyo)
     motor: dict = {}
+    tope = 30
     hilo = threading.Thread(target=lambda: motor.update(r=correr([str(BIN / f"tutorial_motor{EXE}"), "4",
-                                                                  *motor_args], 30, env=env)), daemon=True)
+                                                                  *motor_args], tope, env=env)), daemon=True)
     hilo.start()
     time.sleep(0.8)
-    emisor, parcial_emisor = correr(sender_cmd, 30, env=env)
-    hilo.join(45)
+    emisor, parcial_emisor = correr(sender_cmd, tope, env=env)
+    hilo.join(correr_peor(tope))   # lo más que tarda correr() del motor, aun si se cuelga y hay que matarlo
     r, parcial = motor.get("r", (None, "(el motor no terminó)"))
     out = (r.stdout + r.stderr) if r is not None else parcial
     m = re.search(r"recibidos=(\d+) errores=(\d+)", out)
@@ -142,42 +144,47 @@ def run_dataset() -> bool:
     stop = threading.Event()
     threading.Thread(target=h.serve, args=(stop,), daemon=True).start()
     work = Path(tempfile.mkdtemp(prefix="agmen-cap16-"))
-    grupo = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
-             else {"start_new_session": True})
-    rec = subprocess.Popen([sys.executable, "-m", "agmen", "record", "-o", str(work / "vuelta1.mcap"), "--duration", "6s",
-                            "/imu"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-                           errors="replace", env=env, **grupo)
-    deadline = time.monotonic() + 20
-    while time.monotonic() < deadline and not any(e.kind == "sub" and e.topic == "/imu"
-                                                  for e in list(h.endpoints.values())):
-        time.sleep(0.05)
-    pub, pub_parcial = correr([str(BIN / f"publisher{EXE}"), "--rate", "100", "--to", "/imu", "--count", "200"], 30,
-                              env=env)
-    rec_out, rec_ok = esperar(rec, 30)
-    stop.set()
-    r, parcial = correr([sys.executable, str(ROOT / "examples" / "tutorial" / "dataset.py"), "vuelta1.mcap"], 60,
-                        cwd=work, env=env)
-    colgados = [que for que, bien in (("el publisher de la IMU (30 s)", pub is not None),
-                                      ("agmen record (30 s)", rec_ok), ("dataset.py (60 s)", r is not None)) if not bien]
-    if r is None:
-        r = subprocess.CompletedProcess([], -1, parcial, "")
-    out = r.stdout + r.stderr
-    m = re.search(r"/imu: (\d+) mensajes de ImuSample", out)
-    n = int(m.group(1)) if m else 0
     try:
-        import pyarrow  # noqa: F401
-        tables = "huecos en seq: 0" in out and (work / "dataset" / "imu.parquet").is_file()
-    except ImportError:
-        tables = "pip install agmen[datasets]" in out
-    ok = (r.returncode == 0 and rec.returncode == 0 and n >= 180 and "az promedio 9.81" in out and tables
-          and not colgados)
-    print(f"{'OK  ' if ok else 'FALLA'} capítulo 16: IMU C++ -> agmen record -> dataset.py: {n} mensajes de 200, "
-          f"{'tabla y Parquet' if tables else 'SIN tabla'}")
-    for que in colgados:
-        print(f"     se colgó {que}; lo maté a él y a sus hijos")
-    if not ok:
-        print(rec_out, pub_parcial, out)
-    return ok
+        grupo = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+                 else {"start_new_session": True})
+        rec = subprocess.Popen([sys.executable, "-m", "agmen", "record", "-o", str(work / "vuelta1.mcap"),
+                                "--duration", "6s", "/imu"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                               errors="replace", env=env, **grupo)
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and not any(e.kind == "sub" and e.topic == "/imu"
+                                                      for e in list(h.endpoints.values())):
+            time.sleep(0.05)
+        pub, pub_parcial = correr([str(BIN / f"publisher{EXE}"), "--rate", "100", "--to", "/imu", "--count", "200"], 30,
+                                  env=env)
+        rec_out, rec_ok = esperar(rec, 30)
+        stop.set()
+        r, parcial = correr([sys.executable, str(ROOT / "examples" / "tutorial" / "dataset.py"), "vuelta1.mcap"], 60,
+                            cwd=work, env=env)
+        colgados = [que for que, bien in (("el publisher de la IMU (30 s)", pub is not None),
+                                          ("agmen record (30 s)", rec_ok), ("dataset.py (60 s)", r is not None))
+                    if not bien]
+        if r is None:
+            r = subprocess.CompletedProcess([], -1, parcial, "")
+        out = r.stdout + r.stderr
+        m = re.search(r"/imu: (\d+) mensajes de ImuSample", out)
+        n = int(m.group(1)) if m else 0
+        try:
+            import pyarrow  # noqa: F401
+            tables = "huecos en seq: 0" in out and (work / "dataset" / "imu.parquet").is_file()
+        except ImportError:
+            tables = "pip install agmen[datasets]" in out
+        ok = (r.returncode == 0 and rec.returncode == 0 and n >= 180 and "az promedio 9.81" in out and tables
+              and not colgados)
+        print(f"{'OK  ' if ok else 'FALLA'} capítulo 16: IMU C++ -> agmen record -> dataset.py: {n} mensajes de 200, "
+              f"{'tabla y Parquet' if tables else 'SIN tabla'}")
+        for que in colgados:
+            print(f"     se colgó {que}; lo maté a él y a sus hijos")
+        if not ok:
+            print(rec_out, pub_parcial, out)
+        return ok
+    finally:   # su directorio, también si falló o se colgó algo
+        stop.set()
+        shutil.rmtree(work, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -264,8 +271,12 @@ def faltan(esperado: Bloque, salida: str) -> list[tuple[int, str, str]]:
       distintos se mezclan según quién escribe primero, y ese orden no se exige), y una línea real sirve para una
       sola del capítulo (si el capítulo la muestra dos veces, tiene que salir dos veces).
     - Sale de más: una línea del capítulo que en la salida real sale más veces que en el capítulo (un aviso que
-      debía salir una vez y salió dos). Se cuentan sus copias en toda la salida."""
-    reales = [normalizar(t) for t in salida.splitlines()]
+      debía salir una vez y salió dos). Se cuentan sus copias en toda la salida.
+    - Salió y el capítulo no la muestra: un aviso (⚠) o error (✗) real de agmen run o del hub (columnas `agmen │`
+      y `hub │`) que no sirvió para ninguna línea del bloque. Esas se reportan con la línea donde empieza el bloque
+      y el texto real."""
+    crudas = salida.splitlines()
+    reales = [normalizar(t) for t in crudas]
     usadas: set[int] = set()
     desde: dict[str, int] = {}          # por proceso: la línea real siguiente a la última que se encontró
     malas = []
@@ -277,7 +288,7 @@ def faltan(esperado: Bloque, salida: str) -> list[tuple[int, str, str]]:
         quien = _quien(e)
         k = next((i for i in range(desde.get(quien, 0), len(reales)) if i not in usadas and reales[i] == e), None)
         if k is None:
-            malas.append((n, t, "no salió así"))
+            malas.append((n, t, "dice esto y no salió así"))
             continue
         usadas.add(k)
         desde[quien] = k + 1
@@ -288,7 +299,13 @@ def faltan(esperado: Bloque, salida: str) -> list[tuple[int, str, str]]:
         dichas.add(e)
         veces = reales.count(e)
         if veces > en_capitulo[e]:
-            malas.append((n, t, f"salió {veces} veces y el capítulo la muestra {en_capitulo[e]}"))
+            malas.append((n, t, f"dice esto y salió {veces} veces y el capítulo la muestra {en_capitulo[e]}"))
+    for i, r in enumerate(reales):
+        if i in usadas or not ("⚠" in r or "✗" in r):
+            continue
+        if _quien(r).split(":", 1)[0] in ("agmen", "hub"):
+            malas.append((esperado.linea, crudas[i], "es el bloque, y esta línea real salió y el capítulo no la "
+                                                      "muestra"))
     return sorted(malas)
 
 
@@ -366,6 +383,15 @@ def esperar(proc: subprocess.Popen, tope: float) -> tuple[str, bool]:
     return parcial, False
 
 
+# Lo más que esperar() tarda de más tras matar un árbol colgado: communicate(10) y luego wait(10).
+_ESPERA_AL_MATAR = 10 + 10
+
+
+def correr_peor(tope: float) -> float:
+    """Lo más que puede tardar correr(cmd, tope): el tope y, si se colgó, lo que espera al matarlo."""
+    return tope + _ESPERA_AL_MATAR
+
+
 def correr(cmd: list[str], tope: float, **kw) -> tuple[subprocess.CompletedProcess | None, str]:
     """Como subprocess.run(cmd, capture_output=True, timeout=tope), pero si se cuelga no lanza TimeoutExpired:
     mata a todo su árbol de procesos y devuelve (None, lo que alcanzó a escribir). Si termina: (resultado, "")."""
@@ -401,7 +427,7 @@ class Cap19:
 
     def compara(self, nombre: str, esperado: Bloque, salida: str) -> bool:
         malas = faltan(esperado, salida)
-        detalle = "\n".join(f"  {CAP19_REL}:{n} dice esto y {que}:\n    {t.strip()}" for n, t, que in malas)
+        detalle = "\n".join(f"  {CAP19_REL}:{n} {que}:\n    {t.strip()}" for n, t, que in malas)
         return self.reporta(nombre, not malas, detalle, salida)
 
     # -- el robot de la sección 4, con agmen run de verdad --------------------------------------
