@@ -22,6 +22,9 @@ Reglas de seguridad:
     renumera seq, así el receptor sigue pudiendo medir pérdidas.
   - Los anuncios de esquema no cuentan como "hablar" (no roban el mando); el
     mux reenvía uno por segundo para que el receptor siga sabiendo el tipo.
+  - Un comando con un número no finito (NaN, +inf, −inf) se descarta y no
+    cuenta como hablar: si era del que manda, el freno por silencio del
+    receptor actúa como siempre. Se avisa una vez por entrada y se cuenta.
 
 Quién manda (RFC 0012): con `--state /mux/<nombre>` (agmen run lo pone solo),
 el mux publica un agmen.msgs.MuxEstado cada vez que cambia el mando y una vez
@@ -36,6 +39,7 @@ Uso directo (agmen run lo arma solo desde [[mux]] en robot.toml):
 
 from __future__ import annotations
 
+import math
 import os
 import selectors
 import struct
@@ -127,6 +131,9 @@ class Mux:
         self.forwarded = {i.name: 0 for i in self.inputs}
         self.dropped = {i.name: 0 for i in self.inputs}
         self.errors = {i.name: 0 for i in self.inputs}
+        self.nonfinite = {i.name: 0 for i in self.inputs}   # comandos con NaN o infinito, descartados
+        self._nonfinite_warned: set[str] = set()
+        self._floats: tuple[struct.Struct, list[tuple[int, str]]] | None = None   # (formato, [(índice, campo)])
         self._last_error_log = 0.0
         # Quién manda (RFC 0012): agmen.msgs.MuxEstado en `state` (ej. /mux/ruedas).
         self.name = name or "mux"
@@ -203,6 +210,47 @@ class Mux:
             self.log(f"⚠ '{inp.name}': {text} (descartado; {self.errors[inp.name]} en total)")
             self._last_error_log = now
 
+    def _set_floats(self, text: str) -> None:
+        """Con el esquema ya conocido: dónde están sus números de punto flotante (los únicos que pueden ser NaN o
+        infinito), en el orden en que los da el struct.Struct del tipo."""
+        layout = schema.Layout(text)
+        paths: list[str | None] = []
+
+        def walk(t, where: str) -> None:
+            if isinstance(t, schema.Prim):
+                paths.append(where if t.name in ("f32", "f64") else None)
+            elif isinstance(t, schema.Array):
+                for k in range(t.n):
+                    walk(t.elem, f"{where}[{k}]")
+            else:
+                for f in t.fields:
+                    walk(f.type, f"{where}.{f.name}" if where else f.name)
+
+        walk(layout.root, "")
+        floats = [(k, p) for k, p in enumerate(paths) if p is not None]
+        self._floats = (layout._struct, floats) if floats else None
+
+    def _non_finite(self, payload) -> tuple[str, float] | None:
+        """El primer campo no finito del comando (campo, valor), o None. Sin esquema conocido no se puede ver."""
+        if self._floats is None:
+            return None
+        fmt, floats = self._floats
+        try:
+            vals = fmt.unpack_from(payload)
+        except struct.error:
+            return None        # (tamaño equivocado: lo dice quien lo decodifique)
+        for k, name in floats:
+            if not math.isfinite(vals[k]):
+                return name, vals[k]
+        return None
+
+    def _drop_non_finite(self, inp: MuxInput, field: str, value: float) -> None:
+        self.nonfinite[inp.name] += 1
+        if inp.name not in self._nonfinite_warned:
+            self._nonfinite_warned.add(inp.name)
+            print(f"[agmen] ⚠ mux '{self.output}': descarté un comando de '{inp.name}' con un valor no finito "
+                  f"({field}={value}). Revisa ese nodo.", file=sys.stderr, flush=True)
+
     def _forward(self, data: bytes, seq: int | None) -> None:
         out = bytearray(data)
         struct.pack_into("<Q", out, wire.SOURCE_OFFSET, self.source_id)
@@ -241,6 +289,8 @@ class Mux:
                                  f"mux arbitra comandos de actuadores (tipos compact); los mensajes arrow "
                                  f"(RFC 0008) no pasan por él")
                 return False
+            if self.schema_text != text:
+                self._set_floats(text)
             self.schema_text = text
             if self.pub is not None:      # con topic, el RawPublisher anuncia por su cuenta
                 self.pub.set_schema(text, schema.parse(text).name, env.schema_id)
@@ -249,6 +299,10 @@ class Mux:
                 self._announced_at = now
             return False
 
+        bad = self._non_finite(payload)
+        if bad is not None:          # como si esa entrada no hubiera hablado: no toma ni sostiene el mando
+            self._drop_non_finite(inp, *bad)
+            return False
         self.last_rx[inp.name] = now
         self.last_source[inp.name] = env.source_id
         who = self._update_active(now)
@@ -288,7 +342,7 @@ class Mux:
 
     def summary(self) -> str:
         parts = [f"{i.name}: reenviados={self.forwarded[i.name]} descartados={self.dropped[i.name]} "
-                 f"errores={self.errors[i.name]}" for i in self.inputs]
+                 f"errores={self.errors[i.name]} no_finitos={self.nonfinite[i.name]}" for i in self.inputs]
         return "resumen · " + " · ".join(parts)
 
     def close(self) -> None:

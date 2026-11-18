@@ -114,6 +114,65 @@ class TestMux(unittest.TestCase):
         self.assertEqual(e1.source_id, self.mux.source_id)
         self.assertEqual(e2.source_id, self.mux.source_id)
 
+    def anuncia(self, inp, t):
+        self.assertFalse(self.mux.handle(inp, wire.encode_announcement(Cmd.SCHEMA_TEXT, "/cmd"), t))
+        env, _ = wire.parse(self.rx.recv(65536))                 # el mux reenvía el anuncio a la salida
+        self.assertEqual(env.encoding, wire.ENC_SCHEMA)
+
+    def test_no_finito_se_descarta_avisa_una_vez_y_el_freno_actua(self):
+        import contextlib
+        import io
+
+        self.anuncia(self.teleop, 0.0)
+        self.assertTrue(self.send(self.teleop, 0.5, 0.5, 0.00))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertFalse(self.send(self.teleop, float("nan"), 0.5, 0.10))
+            self.assertFalse(self.send(self.teleop, 0.5, float("inf"), 0.20))
+            self.assertFalse(self.send(self.teleop, float("-inf"), 0.0, 0.30))
+            self.assertFalse(self.send(self.cerebro, 0.1, float("nan"), 0.35))
+        self.assertEqual(self.mux.nonfinite, {"teleop": 3, "cerebro": 1})
+        avisos = err.getvalue().splitlines()
+        self.assertEqual(avisos, [
+            f"[agmen] ⚠ mux '{self.mux.output}': descarté un comando de 'teleop' con un valor no finito "
+            "(left=nan). Revisa ese nodo.",
+            f"[agmen] ⚠ mux '{self.mux.output}': descarté un comando de 'cerebro' con un valor no finito "
+            "(right=nan). Revisa ese nodo."])
+        # Los descartados no sostienen el mando: a los 300 ms del último bueno, nadie manda y el receptor frena.
+        self.mux._update_active(0.31)
+        self.assertIsNone(self.mux.active)
+        self.assertEqual(self.recv(), (0, (0.5, 0.5)))           # solo salió el bueno
+        with self.assertRaises(socket.timeout):
+            self.rx.recv(65536)
+        self.assertIn("no_finitos=3", self.mux.summary())
+        # Un comando bueno después sí pasa.
+        self.assertTrue(self.send(self.cerebro, 0.2, 0.2, 0.40))
+        self.assertEqual(self.recv(), (1, (0.2, 0.2)))
+
+    def test_no_finito_en_cualquier_tipo_y_en_arreglos(self):
+        import contextlib
+        import io
+
+        @dataclass
+        class Pose(wire.Message):
+            SCHEMA = "PoseMux{u32 n; f64[3] p; Q{f32 w} q}"
+            n: int
+            p: list
+            q: dict
+
+        self.assertFalse(self.mux.handle(self.cerebro, wire.encode_announcement(Pose.SCHEMA_TEXT, "/p"), 0.0))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            ok = self.mux.handle(self.cerebro, wire.encode(Pose(1, [1.0, 2.0, 3.0], {"w": 1.0}), 0, 1), 0.01)
+            nan_p = self.mux.handle(self.cerebro, wire.encode(Pose(1, [1.0, float("nan"), 3.0], {"w": 1.0}), 0, 1),
+                                    0.02)
+            inf_q = self.mux.handle(self.cerebro, wire.encode(Pose(1, [1.0, 2.0, 3.0], {"w": float("-inf")}), 0, 1),
+                                    0.03)
+        self.assertEqual((ok, nan_p, inf_q), (True, False, False))
+        self.assertEqual(self.mux.nonfinite["cerebro"], 2)
+        self.assertIn("(p[1]=nan)", err.getvalue())
+        self.assertEqual(err.getvalue().count("\n"), 1)        # una vez por entrada
+
     def test_prioridades_repetidas(self):
         with self.assertRaises(ValueError):
             Mux([MuxInput("a", "127.0.0.1:0", 1), MuxInput("b", "127.0.0.1:0", 1)], "127.0.0.1:9")
@@ -272,6 +331,55 @@ class TestMuxConfig(unittest.TestCase):
                 with self.assertRaises(ConfigError) as ctx:
                     self.load(BASE + text)
                 self.assertIn(msg, str(ctx.exception))
+
+
+def _motor_bin():
+    base = Path(__file__).resolve().parent.parent / "build" / "bin"
+    for nombre in ("tutorial_motor", "tutorial_motor.exe", "Release/tutorial_motor.exe"):
+        if (base / nombre).is_file():
+            return base / nombre
+    return None
+
+
+@unittest.skipIf(_motor_bin() is None, "sin build/bin/tutorial_motor (compila con cmake)")
+class TestMotorDelTutorial(unittest.TestCase):
+    """examples/tutorial/motor.cpp: un comando con NaN o infinito no se usa; el motor frena de inmediato y lo dice
+    una vez (antes, std::clamp devolvía NaN y el freno de 0.5 s no actuaba mientras siguieran llegando)."""
+
+    def test_no_finito_frena_ya_y_lo_dice_una_vez(self):
+        import subprocess
+        import time
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        p = subprocess.Popen([str(_motor_bin()), "--escuchar", f"127.0.0.1:{port}", "2.5"], stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+        self.addCleanup(lambda: p.poll() is None and p.kill())
+        tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(tx.close)
+        seq = 0
+
+        def manda(left, right, durante):
+            nonlocal seq
+            fin = time.monotonic() + durante
+            while time.monotonic() < fin:
+                tx.sendto(wire.encode(Cmd(left, right), seq, 77), ("127.0.0.1", port))
+                seq += 1
+                time.sleep(0.02)
+
+        time.sleep(0.3)                                   # que el motor ya escuche
+        manda(0.5, 0.5, 0.4)
+        manda(float("nan"), 0.5, 0.4)                     # siguen llegando (más seguido que el freno de 0.5 s)
+        manda(0.5, float("inf"), 0.3)
+        out, err = p.communicate(timeout=15)
+        self.assertNotIn("nan", out.lower(), out)          # nunca movió las ruedas con NaN
+        self.assertNotIn("inf", out.lower(), out)
+        self.assertEqual(err.count("valor no finito"), 1, err)
+        self.assertIn("[motor] ⛔ ALTO: llegó un comando con un valor no finito", err)
+        self.assertRegex(out, r"no_finitos=(\d{2,})")
+        self.assertEqual(p.returncode, 0, out + err)
 
 
 if __name__ == "__main__":
