@@ -159,8 +159,8 @@ void warn_once(const char* name, EnvProblem problem) {
             break;
         case EnvProblem::changed_while_reading:
             line += "la variable de entorno " + shown +
-                    " cambió mientras se leía: Agmen la trató como vacía esta vez. No cambies el entorno "
-                    "desde otro hilo mientras arrancan los nodos.";
+                    " cambió mientras se leía: Agmen la trató como vacía. No cambies el entorno desde "
+                    "otro hilo mientras arrancan los nodos (este aviso sale una sola vez).";
             break;
         case EnvProblem::invalid_name:
             line += "el nombre de variable de entorno " + shown +

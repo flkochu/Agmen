@@ -30,13 +30,13 @@ int g_failures = 0;
         }                                                                           \
     } while (0)
 
-// Pone la variable con la API estrecha de cada sistema (la misma que usan las
-// demás pruebas: en Windows, _putenv_s, que también cambia el entorno del proceso).
+// Pone la variable con la API estrecha de cada sistema (en Windows, _putenv_s,
+// que también cambia el entorno del proceso). Si no se pudo poner, lo dice aquí.
 void set_env(const char* name, const char* value) {
 #ifdef _WIN32
-    _putenv_s(name, value);
+    CHECK(_putenv_s(name, value) == 0);
 #else
-    setenv(name, value, 1);
+    CHECK(setenv(name, value, 1) == 0);
 #endif
 }
 
