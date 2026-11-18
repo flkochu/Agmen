@@ -277,6 +277,7 @@ class Mux:
         print(f"[agmen] ⚠ mux '{self.output}': la entrada '{inp.name}' manda otro tipo de mensaje (schema_id "
               f"{schema_id:#018x}{what}); el mux ya usa {expected}, que anunció primero '{self._type_from}'. "
               f"Descarto lo de '{inp.name}': revisa ese nodo.", file=sys.stderr, flush=True)
+        self._last_error_log = time.monotonic()     # el siguiente descarte no repite el aviso enseguida por _error
 
     def _forward(self, data: bytes, seq: int | None) -> None:
         out = bytearray(data)

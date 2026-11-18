@@ -311,6 +311,37 @@ class TestPuertosLibres(unittest.TestCase):
                 u.bind(("127.0.0.1", p))
                 t.bind(("127.0.0.1", p + 1))
 
+    def test_si_no_encuentra_el_error_dice_cuantos_intentos_y_que_puertos_fallaron(self):
+        """Sin depender del sistema: un simulacro de socket da TCP 40001, 40002, ... y el UDP de al lado siempre
+        falla con 'Address already in use'."""
+        import socket
+
+        tcp = iter(range(40001, 40100))
+        abiertos = []
+
+        def falso(familia, tipo):
+            s = mock.MagicMock()
+            if tipo == socket.SOCK_STREAM:
+                s.getsockname.return_value = ("127.0.0.1", next(tcp))
+            else:
+                s.bind.side_effect = OSError(98, "Address already in use")
+            abiertos.append(s)
+            return s
+
+        with mock.patch.object(socket, "socket", side_effect=falso):
+            with self.assertRaises(RuntimeError) as ctx:
+                _puertos_libres(intentos=12)
+        msg = str(ctx.exception)
+        self.assertIn("tras 12 intentos", msg)
+        self.assertIn("Los últimos 10:", msg)
+        self.assertNotIn("UDP 40000 ", msg)                      # los dos primeros ya no caben en la lista
+        self.assertNotIn("UDP 40001 ", msg)
+        self.assertIn("UDP 40002 (TCP 40003): errno 98: Address already in use", msg)
+        self.assertIn("UDP 40011 (TCP 40012): errno 98: Address already in use", msg)
+        self.assertEqual(msg.count("errno 98"), 10)
+        self.assertEqual(len(abiertos), 24)
+        self.assertTrue(all(s.close.called for s in abiertos))  # no deja sockets abiertos
+
 
 class TestNodo(unittest.TestCase):
     def test_paquetes_malos_no_detienen_al_nodo_en_un_hilo_de_1_MB(self):

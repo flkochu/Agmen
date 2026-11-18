@@ -134,6 +134,101 @@ class TestMux(unittest.TestCase):
         self.assertTrue(self.send(self.cerebro, 0.6, 0.6, 0.10))  # el bueno sigue pasando
         self.assertEqual(self.recv(), (0, (0.6, 0.6)))
 
+    def test_otro_tipo_no_sostiene_el_mando_y_el_freno_actua(self):
+        """La que manda deja de mandar comandos buenos y solo manda otro tipo (anuncio y datos) más tiempo que el
+        hold: es como si se hubiera callado. Nadie manda, no sale nada y el receptor frena."""
+        import contextlib
+        import io
+
+        self.anuncia(self.teleop, 0.0)
+        self.assertTrue(self.send(self.teleop, 0.5, 0.5, 0.00))   # teleop toma el mando
+        imu_ann = wire.encode_announcement(wire.ImuSample.SCHEMA_TEXT, "/cmd")
+        imu = wire.encode(wire.ImuSample((1, 2, 3), (4, 5, 6)), 0, 0)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for k in range(1, 9):                                 # de 0.05 a 0.40 s: más que los 300 ms del hold
+                self.assertFalse(self.mux.handle(self.teleop, imu_ann if k % 2 else imu, k * 0.05))
+        self.assertEqual(self.mux.errors["teleop"], 8)
+        self.assertEqual(self.mux.last_rx["teleop"], 0.00)       # lo de otro tipo no cuenta como hablar
+        self.mux._update_active(0.35)                            # 350 ms sin comandos buenos
+        self.assertIsNone(self.mux.active)
+        self.assertTrue(any("nadie manda" in line for line in self.logs))
+        self.assertEqual(self.recv(), (0, (0.5, 0.5)))           # solo salió el bueno
+        with self.assertRaises(socket.timeout):
+            self.rx.recv(65536)
+        self.assertTrue(self.send(self.cerebro, 0.2, 0.2, 0.41))  # el mando lo toma el de menos prioridad
+        self.assertEqual(self.recv(), (1, (0.2, 0.2)))
+
+    def test_otro_tipo_de_mayor_prioridad_no_le_quita_el_mando_a_la_que_lo_tiene(self):
+        import contextlib
+        import io
+
+        self.anuncia(self.cerebro, 0.0)
+        self.assertTrue(self.send(self.cerebro, 0.6, 0.6, 0.00))  # cerebro (prioridad 1) manda
+        self.assertEqual(self.recv(), (0, (0.6, 0.6)))
+        imu_ann = wire.encode_announcement(wire.ImuSample.SCHEMA_TEXT, "/cmd")
+        imu = wire.encode(wire.ImuSample((1, 2, 3), (4, 5, 6)), 0, 0)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):                     # teleop (prioridad 10) manda otro tipo
+            self.assertFalse(self.mux.handle(self.teleop, imu_ann, 0.05))
+            self.assertFalse(self.mux.handle(self.teleop, imu, 0.10))
+        self.assertEqual(self.mux.active, "cerebro")
+        self.assertNotIn("teleop", self.mux.last_rx)
+        self.assertTrue(self.send(self.cerebro, 0.6, 0.6, 0.15))  # el cerebro sigue mandando
+        self.assertEqual(self.recv(), (1, (0.6, 0.6)))
+        self.assertEqual((self.mux.dropped["cerebro"], self.mux.changes), (0, 1))
+        self.assertNotIn("manda 'teleop' (prioridad 10)", self.logs)
+
+    def _rechazado_no_fija_el_tipo(self, malo: bytes) -> None:
+        """Un anuncio que el mux no acepta llega primero: el tipo sigue sin fijarse y el bueno, después, sí lo fija."""
+        import contextlib
+        import io
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertFalse(self.mux.handle(self.teleop, malo, 0.0))
+        self.assertEqual(self.mux.errors["teleop"], 1)
+        self.assertIsNone(self.mux.type_id)
+        self.assertIsNone(self.mux.schema_text)
+        self.anuncia(self.cerebro, 0.05)                         # el bueno fija el tipo (y se reenvía)
+        self.assertEqual(self.mux.schema_text, Cmd.SCHEMA_TEXT)
+        self.assertTrue(self.send(self.cerebro, 0.6, 0.6, 0.10))
+        self.assertEqual(self.recv(), (0, (0.6, 0.6)))
+        self.assertNotIn("otro tipo", err.getvalue())
+
+    def test_un_anuncio_arrow_antes_del_bueno_no_fija_el_tipo(self):
+        self._rechazado_no_fija_el_tipo(wire.encode_announcement("TextoMux{string s}", "/cmd"))
+        self.assertTrue(any("campos de tamaño variable" in line for line in self.logs), self.logs)
+
+    def test_un_anuncio_mal_formado_antes_del_bueno_no_fija_el_tipo(self):
+        # El schema_id dice ImuSample pero el texto ya no coincide con él (un campo cambiado de nombre).
+        malo = wire.encode_announcement(wire.ImuSample.SCHEMA_TEXT, "/cmd").replace(b"f32 gz", b"f32 gw")
+        self._rechazado_no_fija_el_tipo(malo)
+        self.assertTrue(any("no coincide con su schema_id" in line for line in self.logs), self.logs)
+
+    def test_el_aviso_de_otro_tipo_sale_una_vez_por_entrada(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        self.anuncia(self.cerebro, 0.0)
+        imu_ann = wire.encode_announcement(wire.ImuSample.SCHEMA_TEXT, "/cmd")
+        imu = wire.encode(wire.ImuSample((1, 2, 3), (4, 5, 6)), 0, 0)
+        err = io.StringIO()
+        # El reloj de los avisos quieto: todos los descartes caen en el mismo segundo.
+        with contextlib.redirect_stderr(err), mock.patch("agmen.mux.time") as reloj:
+            reloj.monotonic.return_value = 100.0
+            for k, (inp, data) in enumerate([(self.teleop, imu_ann), (self.teleop, imu), (self.cerebro, imu),
+                                             (self.teleop, imu), (self.cerebro, imu_ann), (self.cerebro, imu)]):
+                self.assertFalse(self.mux.handle(inp, data, 0.01 * (k + 1)))
+        self.assertEqual(self.mux.errors, {"teleop": 3, "cerebro": 3})
+        avisos = err.getvalue().splitlines()
+        self.assertEqual(len(avisos), 2, avisos)                 # uno por cada entrada
+        self.assertIn("la entrada 'teleop' manda otro tipo de mensaje", avisos[0])
+        self.assertIn("la entrada 'cerebro' manda otro tipo de mensaje", avisos[1])
+        # Tras el aviso, los descartes de ese mismo segundo no escriben otra línea por el log.
+        self.assertFalse([line for line in self.logs if "otro tipo" in line], self.logs)
+
     def test_basura_se_rechaza(self):
         self.assertFalse(self.mux.handle(self.teleop, b"hola", 0.0))
         self.assertFalse(self.mux.handle(self.teleop, b"XYZ" + bytes(29), 0.0))
