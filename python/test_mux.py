@@ -96,6 +96,44 @@ class TestMux(unittest.TestCase):
         self.assertEqual(self.mux.errors["teleop"], 1)
         self.assertEqual(self.mux.active, "cerebro")   # un paquete erróneo no roba el mando
 
+    def test_un_dato_de_otro_tipo_antes_del_anuncio_no_fija_el_tipo(self):
+        """Antes, el primer paquete fijaba el tipo aunque se descartara: un ImuSample que llegara primero dejaba
+        al mux rechazando el anuncio bueno y al actuador sin mando hasta reiniciarlo."""
+        import contextlib
+        import io
+
+        imu = wire.encode(wire.ImuSample((1, 2, 3), (4, 5, 6)), 0, 0)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertFalse(self.mux.handle(self.teleop, imu, 0.0))
+        self.assertEqual(self.mux.untyped["teleop"], 1)          # se descarta como sin tipo
+        self.assertIsNone(self.mux.type_id)                      # y no fija nada
+        self.anuncia(self.cerebro, 0.05)
+        self.assertTrue(self.send(self.cerebro, 0.6, 0.6, 0.10))
+        self.assertEqual(self.recv(), (0, (0.6, 0.6)))
+        self.assertEqual(self.mux.errors, {"teleop": 0, "cerebro": 0})
+
+    def test_anuncios_de_tipos_distintos_gana_el_primero_y_nombra_la_entrada(self):
+        import contextlib
+        import io
+
+        self.anuncia(self.cerebro, 0.0)
+        imu_ann = wire.encode_announcement(wire.ImuSample.SCHEMA_TEXT, "/cmd")
+        imu = wire.encode(wire.ImuSample((1, 2, 3), (4, 5, 6)), 0, 0)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertFalse(self.mux.handle(self.teleop, imu_ann, 0.01))
+            self.assertFalse(self.mux.handle(self.teleop, imu_ann, 0.02))
+            self.assertFalse(self.mux.handle(self.teleop, imu, 0.03))
+        self.assertEqual(self.mux.schema_text, Cmd.SCHEMA_TEXT)  # gana el primero
+        self.assertEqual(self.mux.errors["teleop"], 3)
+        avisos = err.getvalue().splitlines()
+        self.assertEqual(len(avisos), 1, avisos)                 # una vez por entrada
+        self.assertIn("la entrada 'teleop' manda otro tipo de mensaje", avisos[0])
+        self.assertIn("que anunció primero 'cerebro'", avisos[0])
+        self.assertTrue(self.send(self.cerebro, 0.6, 0.6, 0.10))  # el bueno sigue pasando
+        self.assertEqual(self.recv(), (0, (0.6, 0.6)))
+
     def test_basura_se_rechaza(self):
         self.assertFalse(self.mux.handle(self.teleop, b"hola", 0.0))
         self.assertFalse(self.mux.handle(self.teleop, b"XYZ" + bytes(29), 0.0))
