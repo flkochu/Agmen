@@ -294,6 +294,12 @@ if(AGMEN_BUILD_TESTS)
     agmen_set_warnings(test_shm)
     add_test(NAME shm COMMAND test_shm)
 
+    # platform::env: el entorno siempre en UTF-8 (en Windows se lee en ancho).
+    add_executable(test_platform tests/test_platform.cpp)
+    target_link_libraries(test_platform PRIVATE agmen::core)
+    agmen_set_warnings(test_platform)
+    add_test(NAME platform COMMAND test_platform)
+
     # Node y el reloj de Agmen (RFC 0006).
     add_executable(test_node tests/test_node.cpp)
     target_link_libraries(test_node PRIVATE agmen::core)

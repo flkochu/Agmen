@@ -226,6 +226,11 @@ los nodos (hoy los revisa y los muestra, pero no llegan a ningún nodo).
   ya no una vez por id de endpoint. Antes, un nodo de otra computadora que se cae y
   vuelve en bucle (con un id nuevo cada vez) llenaba la lista de avisos ya dichos, y
   el puente dejaba de decir cualquier aviso nuevo.
+- **En Windows, el núcleo de C++ lee el entorno en UTF-8.** Un nodo con acentos
+  en `AGMEN_NODE` (por ejemplo `brazo_ñ`) llegaba al hub en la página de códigos
+  del sistema y el hub lo rechazaba; ahora llega igual que desde Python. Si una
+  variable no es texto válido, Agmen la toma como vacía y avisa una vez cuál es
+  y qué hacer. Leer una variable que no existe no reserva memoria.
 
 ## [0.14.0] — 2026-11-16
 
