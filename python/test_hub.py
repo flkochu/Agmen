@@ -927,6 +927,22 @@ class TestDiferenciaDeEsquemas(unittest.TestCase):
         raro = "z" * 500   # sin la forma de siempre: se recorta tal cual
         self.assertEqual(len(H.schema_difference(raro, largo)[0]), H.SHAPE_MAX)
 
+    def test_un_campo_en_singular(self):
+        self.assertEqual(H.schema_difference("agmen/1 A{f32 x}", "agmen/1 A{f32 x;f32 y}"),
+                         ("A{…} (1 campo)", "A{…;f32 y} (2 campos)"))
+
+    def test_lo_que_no_se_ve_sale_como_signo(self):
+        """El texto lo manda un nodo y se imprime en la terminal de otro: ni ANSI, ni saltos, ni bidi."""
+        for raro in ("\x1b[31m", "\n", "\x9b", "\u202e", "\r", "\x00", "\x7f", "\u2066"):
+            with self.subTest(raro=repr(raro)):
+                a, b = H.schema_difference(f"agmen/1 A{{f32 x{raro}y}}", f"agmen/1 A{{f64 z{raro}}}")
+                for lado in (a, b):
+                    self.assertNotIn(raro[0], lado)             # el carácter de control (el resto, si hay, se ve)
+                    self.assertIn("?", lado)
+                c, d = H.schema_difference(f"x{raro}" * 3, "")          # sin la forma de siempre, igual
+                self.assertNotIn(raro[0], c)
+        self.assertEqual(H.schema_difference("agmen/1 A{f32 a\x1b[31m}", "agmen/1 A{f32 b}")[0], "A{f32 a?[31m}")
+
     def test_un_lado_sin_texto(self):
         self.assertEqual(H.schema_difference("", "agmen/1 A{f32 x;f32 y}"), ("", "A{f32 x;…}"))
         self.assertEqual(H.schema_difference("", ""), ("", ""))
@@ -1007,6 +1023,24 @@ class TestRechazoMuestraLaForma(unittest.TestCase):
                 self.assertLess(len(msg), 500)
                 self.assertIn("Un topic, un tipo", msg)
         self.assertEqual(self.hub.endpoints.keys(), {"a"})          # nada se coló
+
+    def test_el_que_llega_sin_type_tambien_muestra_la_forma(self):
+        """Sin `type`, el nombre se toma del texto del esquema: si se llaman igual, se muestra la forma."""
+        self.pub("a", self.ID12, self.S12)
+        msg = self.rechazo(self.manda("pub", id="b", node="n_b", pid=1, topic="/patas/estado", schema=self.ID2,
+                                      text=self.S2))
+        self.assertIn("JointState{f32[12] position;…} contra JointState{f32[2] position;…}", msg)
+        otro = self.rechazo(self.manda("pub", id="c", node="n_c", pid=1, topic="/patas/estado",
+                                       schema="00000000000000d1", text="agmen/1 Imu{f32 x}"))
+        self.assertNotIn("misma forma", otro)       # otro nombre: los nombres ya dicen la diferencia
+
+    def test_el_aviso_no_lleva_controles_del_otro_nodo(self):
+        self.pub("a", self.ID12, self.S12)
+        for raro in ("\x1b[31m", "\x9b", "\u202e"):
+            with self.subTest(raro=repr(raro)):
+                msg = self.rechazo(self.pub("b", self.ID2, f"agmen/1 JointState{{f32[2] pos{raro}ition;f32 v}}"))
+                self.assertIn("misma forma", msg)
+                self.assertNotIn(raro[0], msg)
 
     def test_el_mismo_esquema_sigue_aceptado(self):
         self.pub("a", self.ID12, self.S12)

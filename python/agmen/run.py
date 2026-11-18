@@ -411,12 +411,15 @@ def _parse_machine(raw: dict, where: str, machines: list[MachineConfig]) -> str:
 
 # [[joints]] (RFC 0013 §3.4, D6). Un nombre de articulación viaja después en una línea de texto del hub
 # (la tarea de D6 = d): por eso solo letras ASCII, dígitos y los signos que usan MuJoCo y URDF en la
-# práctica. Sin espacios, comas, '=' ni caracteres de control.
+# práctica. Sin espacios, comas, '=' ni caracteres de control. Empieza con letra, dígito o '_' (no con
+# un signo: "/", "." o "-" solos no nombran nada, y un "-" al principio parece una opción de línea de comandos).
 JOINTS_KEYS = {"name", "state", "command", "kp", "kd", "names", "require_names", "profile"}
-_JOINT_NAME = re.compile(r"[A-Za-z0-9_./-]+")
-_JOINT_NAME_HELP = ("Usa letras (sin acentos), dígitos, '_', '-', '.' o '/', como en el modelo (MuJoCo o URDF), "
-                    "ej. \"FR_hip\" o \"brazo/codo.1\"")
+_JOINT_CHAR = re.compile(r"[A-Za-z0-9_./-]")
+_JOINT_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
+_JOINT_NAME_HELP = ("Usa letras (sin acentos), dígitos, '_', '-', '.' o '/', y empieza con letra, dígito o '_', "
+                    "como en el modelo (MuJoCo o URDF), ej. \"FR_hip\" o \"brazo/codo.1\"")
 _JOINT_KIND = {"state": "JointState", "command": "JointCommand"}
+_F32_MAX = 3.4028234663852886e38   # el f32 finito más grande
 _GAIN_HELP = {"kp": "de posición (N·m/rad)", "kd": "de velocidad (N·m·s/rad)"}
 
 
@@ -425,7 +428,7 @@ def _bad_char(name: str) -> str:
     if not name:
         return "está vacío"
     for c in name:
-        if not _JOINT_NAME.fullmatch(c):
+        if not _JOINT_CHAR.fullmatch(c):
             if c == " ":
                 return "tiene un espacio"
             if c == ",":
@@ -435,7 +438,7 @@ def _bad_char(name: str) -> str:
             if ord(c) < 32 or ord(c) == 127:
                 return f"tiene un carácter de control ({ord(c):#04x})"
             return f"tiene '{c}'"
-    return "no es válido"
+    return f"empieza con '{name[0]}'; el primer carácter es una letra, un dígito o '_'"
 
 
 def _parse_gains(raw: dict, key: str, n: int, where: str) -> tuple[float, ...] | None:
@@ -450,11 +453,19 @@ def _parse_gains(raw: dict, key: str, n: int, where: str) -> tuple[float, ...] |
     def number(v, label: str) -> float:
         if isinstance(v, bool) or not isinstance(v, (int, float)):
             raise ConfigError(f"{rule}. {label} = {v!r} no es un número")
-        if not math.isfinite(v):
+        try:
+            x = float(v)            # TOML admite enteros de cualquier tamaño: 10**400 no cabe ni en f64
+        except OverflowError:
+            shown = str(v) if len(str(v)) <= 20 else f"{str(v)[:12]}… ({len(str(v))} dígitos)"
+            raise ConfigError(f"{rule}. {label} = {shown} no es un número finito (es demasiado grande)") from None
+        if not math.isfinite(x):
             raise ConfigError(f"{rule}. {label} = {v} no es un número finito (ni nan ni inf)")
-        if v < 0:
+        if x < 0:
             raise ConfigError(f"{rule}. {label} = {v} es negativo")
-        return float(v)
+        if x > _F32_MAX:            # el comando lleva las ganancias en f32 (RFC 0013 §3.4): sería inf en el driver
+            raise ConfigError(f"{rule}. {label} = {v:g} no cabe en el f32 del comando (máximo {_F32_MAX:g}); "
+                              f"en el driver sería inf")
+        return x + 0.0              # -0.0 se guarda como 0.0
 
     if isinstance(value, list):
         if len(value) != n:
@@ -463,8 +474,7 @@ def _parse_gains(raw: dict, key: str, n: int, where: str) -> tuple[float, ...] |
     return (number(value, key),) * n
 
 
-def _parse_joints(data: dict, topics: list[TopicConfig], mux_names: list[tuple[str, tuple[str, ...]]],
-                  hub_enabled: bool) -> list[JointsConfig]:
+def _parse_joints(data: dict, topics: list[TopicConfig]) -> list[JointsConfig]:
     """Los [[joints]] de todo el archivo (de todos los perfiles), revisados ANTES de arrancar
     (RFC 0013 §3.4): nombres repetidos, topics que chocan, ganancias y límites del tipo. Lo que
     solo se sabe al correr (el N del tipo que se anuncia) lo revisa el hub."""
@@ -478,7 +488,6 @@ def _parse_joints(data: dict, topics: list[TopicConfig], mux_names: list[tuple[s
     from . import hubproto as hp
     from .hub import builtin_type
     from .joints import max_joints
-    from .mux import state_topic
 
     out: list[JointsConfig] = []
     for i, raw in enumerate(raw_groups, start=1):
@@ -533,11 +542,6 @@ def _parse_joints(data: dict, topics: list[TopicConfig], mux_names: list[tuple[s
             if fixed is not None:
                 raise ConfigError(f"{where}: {key} = '{topic}' es un topic de Agmen (de tipo {fixed}). Usa otro "
                                   f"topic para {kind}, ej. \"/{name}/{'estado' if key == 'state' else 'cmd'}\"")
-            if hub_enabled:
-                mux = next((m for m, mp in mux_names if state_topic(m) == topic and _shared(profiles, mp)), None)
-                if mux is not None:
-                    raise ConfigError(f"{where}: {key} = '{topic}' es donde el [[mux]] '{mux}' dice quién manda "
-                                      f"(tipo MuxEstado). Usa otro topic para {kind}")
             for other in out:
                 shared = _shared(profiles, other.profiles)
                 if shared is None:
@@ -613,22 +617,23 @@ def _parse_joints(data: dict, topics: list[TopicConfig], mux_names: list[tuple[s
     return out
 
 
-def _check_joints_web(joints: list[JointsConfig], web: WebConfig) -> None:
+def _check_joints_web(joints: list[JointsConfig], web: WebConfig, table: str = "web", note: str = "") -> None:
     """Un topic de [[joints]] que el panel usa con otro tipo ([web.teleop] manda MotorCommand; cada
-    [[web.command]], el tipo de su layout). Solo el perfil activo: su [web] es el que se usa."""
+    [[web.command]], el tipo de su layout). Se llama una vez por perfil, con el [web] que usa ese perfil
+    (`table`: "web" o "profile.sim.web") y los [[joints]] que corren en él; `note` dice en qué perfil."""
     uses = []
     if web.teleop is not None:
-        uses.append(("[web.teleop]", web.teleop.target, "MotorCommand"))
+        uses.append((f"[{table}.teleop]", web.teleop.target, "MotorCommand"))
     for c in web.commands:
-        uses.append((f"[[web.command]] '{c.name}'", c.target, c.layout.name))
+        uses.append((f"[[{table}.command]] '{c.name}'", c.target, c.layout.name))
     for j in joints:
         for key, kind in _JOINT_KIND.items():
             topic = getattr(j, key)
             for who, target, type_name in uses:
                 if topic and target == topic and type_name != kind:
                     raise ConfigError(f"[[joints]] '{j.name}': {key} = '{topic}' es un topic de {kind}, pero "
-                                      f"{who} manda {type_name} a ese topic. Un topic, un tipo: usa otro topic "
-                                      f"en uno de los dos")
+                                      f"{who} manda {type_name} a ese topic{note}. Un topic, un tipo: usa otro "
+                                      f"topic en uno de los dos")
 
 
 def joints_lines(config: RobotConfig) -> list[str]:
@@ -825,7 +830,7 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
                                   float(gap) if gap is not None else None, profiles))
 
     # [[joints]]: los nombres y el orden de las articulaciones (RFC 0013 §3.4), de todos los perfiles.
-    joints_all = _parse_joints(data, topics, [(m.name, m.profiles) for m in mux_configs], hub_enabled)
+    joints_all = _parse_joints(data, topics)   # el estado de un [[mux]] (/mux/…) ya es de Agmen: builtin_type
     for j in joints_all:
         mentions.append((f"[[joints]] '{j.name}'", j.name, j.profiles))
 
@@ -880,10 +885,19 @@ def load_config(path: str | Path, profile: str | None = None) -> RobotConfig:
     topics = [t for t in topics if _runs_in(t.profiles, profile)]
     joints = [j for j in joints_all if _runs_in(j.profiles, profile)]
 
-    web = _parse_web(data.get("web", {}), base_dir)   # con [profile.X] web no se usa, pero se revisa
+    top_web = web = _parse_web(data.get("web", {}), base_dir)   # con [profile.X] web no se usa, pero se revisa
     if "web" in active:
         web = _parse_web(active["web"], base_dir, f"[profile.{profile}.web]")
-    _check_joints_web(joints, web)
+    # El panel contra [[joints]], en cada perfil (como las tablas [profile.X]: un choque en 'sim' no espera
+    # a que corras --sim). Primero el activo.
+    for x in (profile, *(k for k in known if k != profile)):
+        table_x = raw_tables.get(x, {})
+        own = "web" in table_x
+        web_x = web if x == profile else (_parse_web(table_x["web"], base_dir, f"[profile.{x}.web]") if own
+                                          else top_web)
+        note = "" if x == profile else f" (en el perfil '{x}', que se revisa aunque ahora uses '{profile}')"
+        _check_joints_web([j for j in joints_all if _runs_in(j.profiles, x)], web_x,
+                          f"profile.{x}.web" if own else "web", note)
 
     top_clock = data.get("clock", {})
     if "clock" in active:
@@ -1040,13 +1054,21 @@ def prepare_hub(config: RobotConfig, ping=None) -> tuple[RobotConfig, str]:
     from .pubsub import hub_address
     alive = ping(hub_address())
     if alive is not None:
-        note = " (los [[topic]] de este robot.toml no se revisan)" if config.topics else ""
+        note = " (los [[topic]] de este robot.toml no se revisan)" if config.topics else ""   # ni sus [[joints]]
         return config, f"usando el agmen hub {alive} que ya corre en {hub_address()}{note}"
     args = ["-m", "agmen", "hub", "--listen", hub_address(), "--robot", config.name]
     for t in config.topics:
         args += ["--expect", f"{t.name}={t.type}" if t.type else t.name]
         if t.required:
             args += ["--require", t.name]
+    if config.topics:
+        # Los topics de [[joints]] también están declarados (RFC 0013 §3.4), con su tipo. El hub compara el
+        # NOMBRE del tipo, y es "JointState" o "JointCommand" para cualquier N. Solo si hay [[topic]]: sin
+        # ellos el hub no revisa nombres (no avisa de los topics que no se declararon), y así sigue.
+        for j in config.joints:
+            for key, kind in _JOINT_KIND.items():
+                if getattr(j, key):
+                    args += ["--expect", f"{getattr(j, key)}={kind}"]
     hub_node = NodeConfig(name="hub", cmd=[sys.executable, *args], restart="always",
                           env={"PYTHONPATH": os.pathsep.join(
                               [str(Path(__file__).resolve().parent.parent),

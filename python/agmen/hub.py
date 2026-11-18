@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import difflib
 import os
+import re
 import socket
 import sys
 import threading
@@ -70,6 +71,16 @@ def _schema_parts(text: str) -> tuple[str, list[str]] | None:
     return name, fields
 
 
+# Lo que no se imprime tal cual en la terminal de OTRO nodo: controles C0 y C1 (ESC de las secuencias ANSI,
+# saltos de línea, CSI = U+009B) y los que cambian la dirección del texto (U+202E y compañía).
+_UNSAFE = re.compile(r"[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def _clean(text: str) -> str:
+    """El texto de un esquema lo manda un nodo: antes de ponerlo en un aviso, lo que no se ve se cambia por '?'."""
+    return _UNSAFE.sub("?", text)
+
+
 def _cut(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
@@ -77,7 +88,9 @@ def _cut(text: str, limit: int) -> str:
 def schema_difference(a: str, b: str, limit: int = SHAPE_MAX) -> tuple[str, str]:
     """Cada esquema acotado alrededor del primer campo en que cambian, para un aviso:
     ("JointState{f32[12] position;…}", "JointState{f32[2] position;…}"). Un texto vacío (no se
-    conoce) queda vacío; si no se conoce el otro, se muestra el primer campo."""
+    conoce) queda vacío; si no se conoce el otro, se muestra el primer campo. Los caracteres de control
+    y de dirección del texto salen como '?'."""
+    a, b = _clean(a), _clean(b)
     pa, pb = (_schema_parts(a) if a else None), (_schema_parts(b) if b else None)
     fa, fb = (pa[1] if pa else []), (pb[1] if pb else [])
     k = 0
@@ -93,7 +106,8 @@ def schema_difference(a: str, b: str, limit: int = SHAPE_MAX) -> tuple[str, str]
         if parts is None:
             return _cut(text, limit)
         name = parts[0]
-        count = f" ({len(fields)} campos)" if pa and pb and len(fa) != len(fb) else ""
+        count = (f" ({len(fields)} campo{'' if len(fields) == 1 else 's'})" if pa and pb and len(fa) != len(fb)
+                 else "")
         if k >= len(fields):
             return _cut(f"{name}{{{'…' if fields else ''}}}{count}", limit)
         before = "…;" if k > 0 else ""
@@ -343,11 +357,18 @@ class Hub:
     def _shapes(self, topic: str, have: Endpoint, theirs: str, text: str) -> str:
         """Cuando los dos tipos se llaman igual (JointState con 12 y con 2 articulaciones), los dos números
         no dicen nada: se muestra en qué cambia el texto del esquema que ya mandan los Publisher (RFC 0013
-        §3.4). Solo es el texto del aviso: no cambia el protocolo. "" si no hay nada útil que decir."""
-        if have.type and theirs and have.type != theirs:
-            return ""        # los nombres ya dicen la diferencia
+        §3.4). Solo es el texto del aviso: no cambia el protocolo. "" si no hay nada útil que decir.
+        `theirs` es el `type` que mandó el que llega ("" si no lo mandó: entonces vale el nombre que trae
+        el texto de su esquema, si lo trae)."""
         mine = have.text or next((e.text for e in self.endpoints.values()
                                   if e.topic == topic and e.schema == have.schema and e.text), "")
+
+        def named(type_name: str, schema_text: str) -> str:
+            parts = _schema_parts(schema_text) if schema_text else None
+            return type_name or (parts[0] if parts else "")
+
+        if named(have.type, mine) and named(theirs, text) and named(have.type, mine) != named(theirs, text):
+            return ""        # los nombres ya dicen la diferencia
         a, b = schema_difference(mine, text)
         if a and b:
             return f": se llaman igual pero no tienen la misma forma, {a} contra {b}"
@@ -509,7 +530,7 @@ class Hub:
             have = self._typed_endpoint(topic, exclude=eid)
             if have is not None and have.schema != schema:
                 theirs = f.get("type") or schema
-                shapes = self._shapes(topic, have, theirs, f.get("text", ""))
+                shapes = self._shapes(topic, have, f.get("type", ""), f.get("text", ""))
                 if not machine and not have.machine:     # todo en esta computadora: el texto de siempre
                     raise hp.ProtocolError(f"'{topic}' ya es de tipo {have.type or have.schema} (schema_id "
                                            f"{have.schema}) y '{node}' quiere usarlo con {theirs} (schema_id "

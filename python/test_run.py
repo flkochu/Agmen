@@ -1281,7 +1281,10 @@ class TestJoints(unittest.TestCase):
                   + joints(profile="real"))
 
     def test_topic_de_agmen_o_del_mux(self):
+        """El estado de un [[mux]] (/mux/<nombre>) es un topic de Agmen: lo rechaza la misma regla que /clock,
+        haya o no un [[mux]] con ese nombre."""
         self.assertConfigError(MINIMO + joints(state="/clock"), "state = '/clock' es un topic de Agmen (de tipo Clock)")
+        self.assertConfigError(MINIMO + joints(state="/mux/nadie"), "es un topic de Agmen (de tipo MuxEstado)")
         mux = ('\n[[mux]]\nname = "ruedas"\noutput = "127.0.0.1:7500"\n[[mux.input]]\nname = "a"\n'
                'listen = "127.0.0.1:7510"\npriority = 1\n')
         self.assertConfigError(MINIMO + mux + joints(command="/mux/ruedas"), "es un topic de Agmen (de tipo MuxEstado)")
@@ -1422,11 +1425,147 @@ class TestJoints(unittest.TestCase):
         self.load(MINIMO + mux("/o", ["/patas/cmd", "/b"]) + joints())
         self.load(MINIMO + mux("/patas/estado", ["/a", "/b"]) + joints())
 
-    def test_el_panel_de_otro_perfil_no_choca_pero_el_activo_si(self):
+    def test_el_panel_de_cualquier_perfil_choca_antes_de_arrancar(self):
+        """Como las tablas [profile.X]: un choque en el panel de 'sim' no espera a que corras --sim."""
         panel = '\n[profile.sim.web]\nhttp = "127.0.0.1:8080"\n[profile.sim.web.teleop]\ntarget = "/patas/cmd"\n'
-        self.load(MINIMO + panel + joints())                                   # perfil real: ese panel no se usa
-        self.assertConfigError(MINIMO + panel + joints(), "[web.teleop] manda MotorCommand", profile="sim")
-        self.load(MINIMO + panel + joints(profile="real"), "sim")              # en sim el grupo no corre
+        msg = self.assertConfigError(MINIMO + panel + joints(), "[[joints]] 'patas': command = '/patas/cmd'",
+                                     "[profile.sim.web.teleop] manda MotorCommand a ese topic (en el perfil 'sim', "
+                                     "que se revisa aunque ahora uses 'real')", "usa otro topic")
+        self.assertNotIn("(en el perfil", self.assertConfigError(MINIMO + panel + joints(), "[profile.sim.web.teleop]",
+                                                                 profile="sim"))   # el activo: sin la nota
+        self.assertIn("Un topic, un tipo", msg)
+        self.load(MINIMO + panel + joints(profile="real"), "sim")    # el grupo no corre en sim: no choca
+        self.load(MINIMO + panel + joints(profile="real"))
+        # El [web] de arriba lo usa un perfil sin [profile.X.web]: un grupo solo de 'sim' choca con él.
+        arriba = '\n[web.teleop]\ntarget = "/patas/cmd"\n'
+        self.assertConfigError(MINIMO + arriba + joints(profile="sim"), "[web.teleop] manda MotorCommand",
+                               "(en el perfil 'sim'")
+        self.load(MINIMO + arriba + '\n[profile.sim.web]\nhttp = "127.0.0.1:8080"\n' + joints(profile="sim"))
+
+    def test_entero_enorme_en_las_ganancias(self):
+        """TOML admite enteros de cualquier tamaño: no revienta, dice que no es un número finito."""
+        import contextlib
+
+        from agmen import cli
+
+        enorme = "9" * 400
+        for kp in (enorme, "[" + ", ".join(["1"] * 11) + f", {enorme}]"):
+            with self.subTest(kp=kp[:20]):
+                self.assertConfigError(MINIMO + joints(kp=None) + f"kp = {kp}\n", "kp es la ganancia de posición",
+                                       "no es un número finito (es demasiado grande)", "(400 dígitos)")
+                with tempfile.TemporaryDirectory() as d:
+                    path = Path(d) / "robot.toml"
+                    path.write_text(MINIMO + joints(kd=None) + f"kd = {kp}\n", encoding="utf-8")
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err):
+                        code = cli.main(["run", str(path), "--no-web"])
+                self.assertEqual(code, 2)
+                self.assertIn(f"error en {path}: [[joints]] 'patas': kd es la ganancia de velocidad", err.getvalue())
+                self.assertIn("no es un número finito", err.getvalue())
+                self.assertNotIn("Traceback", err.getvalue())
+
+    def test_ganancia_que_no_cabe_en_f32(self):
+        self.assertConfigError(MINIMO + joints(kp=None) + "kp = 1e39\n",
+                               "kp = 1e+39 no cabe en el f32 del comando (máximo 3.40282e+38); en el driver sería inf")
+        self.assertConfigError(MINIMO + joints(kd=None) + "kd = [" + ", ".join(["1"] * 11) + ", 4e38]\n",
+                               "kd[11] = 4e+38 no cabe en el f32 del comando")
+        self.assertConfigError(MINIMO + joints(kp=None) + f"kp = {10 ** 39}\n", "no cabe en el f32")
+        self.assertEqual(self.load(MINIMO + joints(names=["a"], kp=3.4028234663852886e38, kd=0)).joints[0].kp,
+                         (3.4028234663852886e38,))   # el máximo de f32 sí cabe
+
+    def test_menos_cero_es_cero(self):
+        import math
+
+        from agmen.run import joints_lines
+
+        cfg = self.load(MINIMO + joints(names=["a", "b"], kp=-0.0, kd=[0.0, -0.0]))
+        j = cfg.joints[0]
+        self.assertEqual([math.copysign(1, v) for v in j.kp + j.kd], [1.0] * 4)
+        self.assertIn("kp 0, kd 0", joints_lines(cfg)[0])
+
+    def test_el_nombre_empieza_con_letra_digito_o_guion_bajo(self):
+        for nombre in ("/", ".", "-", "-a", ".a", "/a", "--", "./x"):
+            with self.subTest(nombre=nombre):
+                self.assertConfigError(MINIMO + joints(names=["ok", nombre], kp=1, kd=1),
+                                       "[[joints]] 'patas': names[1] =", "no es un nombre de articulación válido",
+                                       f"empieza con '{nombre[0]}'; el primer carácter es una letra, un dígito o '_'",
+                                       "empieza con letra, dígito o '_'")
+        nombres = ["_a", "1", "a-", "b/", "c.", "_"]
+        self.assertEqual(self.load(MINIMO + joints(names=nombres, kp=1, kd=1)).joints[0].names, tuple(nombres))
+
+    def test_los_topics_de_joints_llegan_al_hub_con_su_tipo(self):
+        from agmen.run import prepare_hub
+
+        topic = '\n[[topic]]\nname = "/imu"\ntype = "Imu"\n'
+        cfg, _ = prepare_hub(self.load(MINIMO + topic + joints() + joints("cabeza", command=None, names=["cuello"],
+                                                                         kp=None, kd=None)), ping=lambda a: None)
+        cmd = next(n for n in cfg.nodes if n.name == "hub").cmd
+        for esperado in ("/imu=Imu", "/patas/estado=JointState", "/patas/cmd=JointCommand",
+                         "/cabeza/estado=JointState"):
+            self.assertIn(esperado, cmd)
+        self.assertNotIn("/cabeza/cmd", " ".join(cmd))
+        # Sin [[topic]] el hub no revisa nombres (no avisa de los no declarados): [[joints]] no lo cambia.
+        cfg, _ = prepare_hub(self.load(MINIMO + joints()), ping=lambda a: None)
+        self.assertNotIn("--expect", next(n for n in cfg.nodes if n.name == "hub").cmd)
+        # Un [[topic]] sin type con el mismo nombre: el hub recibe el tipo de [[joints]].
+        sin_tipo = '\n[[topic]]\nname = "/patas/estado"\nrequired = true\n'
+        cfg, _ = prepare_hub(self.load(MINIMO + sin_tipo + joints()), ping=lambda a: None)
+        cmd = next(n for n in cfg.nodes if n.name == "hub").cmd
+        from agmen import hub as H
+
+        esperados = H.parse_expected([cmd[i + 1] for i, a in enumerate(cmd) if a == "--expect"],
+                                     [cmd[i + 1] for i, a in enumerate(cmd) if a == "--require"])
+        estado = next(e for e in esperados if e.topic == "/patas/estado")
+        self.assertEqual((estado.type, estado.required), ("JointState", True))
+
+    def test_hub_de_verdad_con_joints(self):
+        """De punta a punta: un hub con lo que le pasa agmen run. JointState[12] en el state del grupo no
+        es "no declarado"; Imu en el command avisa como un [[topic]] con type."""
+        import socket
+
+        import agmen
+        from agmen import hub as H
+        from agmen.msgs import Imu, JointState
+        from agmen.run import prepare_hub
+
+        topic = '\n[[topic]]\nname = "/imu"\ntype = "Imu"\n'
+        cfg, _ = prepare_hub(self.load(MINIMO + topic + joints()), ping=lambda a: None)
+        cmd = next(n for n in cfg.nodes if n.name == "hub").cmd
+        esperados = H.parse_expected([cmd[i + 1] for i, a in enumerate(cmd) if a == "--expect"],
+                                     [cmd[i + 1] for i, a in enumerate(cmd) if a == "--require"])
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("127.0.0.1", 0))
+        addr = f"127.0.0.1:{s.getsockname()[1]}"
+        s.close()
+        logs: list[str] = []
+        hub = H.Hub(addr, esperados, log=logs.append, grace_s=0.0)
+        stop = threading.Event()
+        hilo = threading.Thread(target=hub.serve, args=(stop,), daemon=True)
+        hilo.start()
+        antes = os.environ.get("AGMEN_HUB")
+        os.environ["AGMEN_HUB"] = addr
+        try:
+            p1 = agmen.Publisher(JointState[12], "/patas/estado")
+            p2 = agmen.Publisher(Imu, "/patas/cmd")
+            p3 = agmen.Publisher(Imu, "/otro")
+            fin = time.monotonic() + 5
+            while time.monotonic() < fin and not any("'/otro'" in x for x in logs):
+                time.sleep(0.05)
+            texto = "\n".join(logs)
+            self.assertNotIn("'/patas/estado', que no está declarado", texto)
+            self.assertNotIn("'/patas/estado' debería ser", texto)
+            self.assertIn("'/patas/cmd' debería ser JointCommand (robot.toml)", texto)
+            self.assertIn("usa Imu", texto)
+            self.assertIn("'/otro', que no está declarado en robot.toml", texto)   # el hub sí revisa
+            for p in (p1, p2, p3):
+                p.close()
+        finally:
+            stop.set()
+            hilo.join(2)
+            if antes is None:
+                os.environ.pop("AGMEN_HUB", None)
+            else:
+                os.environ["AGMEN_HUB"] = antes
 
     def test_un_topic_con_perfil_que_se_cruza_choca_y_uno_que_no_se_cruza_no(self):
         topic = '\n[[topic]]\nname = "/patas/estado"\ntype = "Imu"\nprofile = "real"\n'
