@@ -1438,5 +1438,65 @@ if TSAN:   # con TSan solo tiene sentido el núcleo nativo (el puro no tiene có
     del globals()["TestHilosPuro"]
 
 
+class TestLatidoDesdeElTrabajo(unittest.TestCase):
+    """Núcleo puro: publish() y receive() laten también (como `maybe_beat` del núcleo de C++). Con el hilo de latido
+    sin turno (dos hilos moviendo imágenes grandes lo dejaron 3.25 s sin correr) el hub daba de baja al objeto
+    ("no latió en 3 s"). Aquí el hilo de latido se detiene a propósito y otro hilo publica y recibe."""
+
+    def test_con_el_hilo_de_latido_detenido_el_hub_sigue_viendo_latidos(self):
+        from dataclasses import dataclass
+
+        from agmen import hubproto as hp
+        from agmen import pubsub, wire
+
+        @dataclass
+        class Cuenta(wire.Message):
+            SCHEMA = "LatidoCuenta{u32 n}"
+            n: int
+
+        hub = H.Hub(f"127.0.0.1:{puerto_libre()}", [], log=lambda _t: None)
+        stop = threading.Event()
+        hilo = threading.Thread(target=hub.serve, args=(stop,), daemon=True)
+        hilo.start()
+        self.addCleanup(hilo.join, 2)
+        self.addCleanup(hub.close)
+        self.addCleanup(stop.set)
+        viejo = os.environ.get("AGMEN_HUB")
+        os.environ["AGMEN_HUB"] = hub.listen
+        self.addCleanup(lambda: os.environ.__setitem__("AGMEN_HUB", viejo) if viejo is not None
+                        else os.environ.pop("AGMEN_HUB", None))
+        sub = pubsub._PureSubscriber(Cuenta, "/latido/trabajo")
+        self.addCleanup(sub.close)
+        pub = pubsub._PurePublisher(Cuenta, "/latido/trabajo")
+        self.addCleanup(pub.close)
+        for o in (pub, sub):                      # el hilo de latido, detenido a propósito (como sin turno)
+            o._link._stop.set()
+            o._link._thread.join(2)
+            self.assertFalse(o._link._thread.is_alive())
+        ids = {pub._link.id, sub._link.id}
+        recibidos = []
+
+        def trabajo():
+            fin = time.monotonic() + hp.EXPIRE_S + 1.5
+            n = 0
+            while time.monotonic() < fin:
+                pub.publish(Cuenta(n))
+                n += 1
+                if sub.receive(0.02) is not None:
+                    recibidos.append(n)
+
+        t = threading.Thread(target=trabajo)
+        t.start()
+        t.join(30)
+        with hub.lock:
+            hub.expire(time.monotonic())
+            vivos = {e.id for e in hub.endpoints.values()}
+            vistos = {e.id: time.monotonic() - e.last_seen for e in hub.endpoints.values()}
+        self.assertTrue(recibidos, "no llegó ningún mensaje")
+        self.assertEqual(ids - vivos, set(), f"el hub dio de baja a {ids - vivos} (vistos hace: {vistos})")
+        for i in ids:
+            self.assertLess(vistos[i], hp.BEAT_S + 0.5, vistos)
+
+
 if __name__ == "__main__":
     unittest.main()
