@@ -150,6 +150,7 @@ class _HubLink:
         self._beat_lock = threading.Lock()
         self._closed = False
         self._foreign_warned: set = set()   # remitentes de control que no son el hub, ya avisados
+        self._next_beat = 0.0   # (monotonic) antes de esto no hace falta otro latido: lo usa maybe_beat()
         self.beat()
         self._thread = threading.Thread(target=self._loop, name=f"agmen-latido-{self.id[:6]}", daemon=True)
         self._thread.start()
@@ -159,10 +160,18 @@ class _HubLink:
             if self._closed:
                 return
             sock, msg = self._out
+            self._next_beat = time.monotonic() + hp.BEAT_S
             try:
                 sock.sendto(msg, self.hub)
             except OSError:
                 pass
+
+    def maybe_beat(self) -> None:
+        """Late si ya pasó el periodo desde el último latido (como `maybe_beat` del núcleo de C++). Lo llaman
+        publish()/send() y receive()/receive_raw(): con muchos hilos ocupados, el hilo de latido puede quedarse
+        sin turno más de EXPIRE_S y el hub daría de baja al objeto. Costo por mensaje: una comparación de tiempo."""
+        if time.monotonic() >= self._next_beat:
+            self.beat()
 
     def move(self, sock: socket.socket, **fields) -> None:
         """Late desde `sock` con estos campos cambiados (el Subscriber que pasa a la red), ya mismo."""
@@ -185,14 +194,17 @@ class _HubLink:
             print(foreign_control_text(topic, who, f"{self.hub[0]}:{self.hub[1]}"), file=sys.stderr, flush=True)
 
     def _loop(self) -> None:
-        while not self._stop.wait(hp.BEAT_S):
-            self.beat()
-            if self._on_tick is not None:
-                time.sleep(0.05)          # que llegue la respuesta a este latido
-                try:
-                    self._on_tick()       # un Publisher lee aquí sus respuestas aunque no publique
-                except OSError:
-                    pass
+        # Espera hasta `_next_beat` y late solo si ya toca (la regla de maybe_beat): si publish()/receive() ya
+        # latieron en este periodo, no se manda otro. Un latido por periodo, como el núcleo de C++.
+        while not self._stop.wait(max(0.0, self._next_beat - time.monotonic())):
+            if time.monotonic() >= self._next_beat:
+                self.beat()
+                if self._on_tick is not None:
+                    time.sleep(0.05)          # que llegue la respuesta a este latido
+                    try:
+                        self._on_tick()       # un Publisher lee aquí sus respuestas aunque no publique
+                    except OSError:
+                        pass
             if self.last_reply is None and not self._warned and time.monotonic() - self.started > 2.0:
                 self._warned = True
                 self._on_warn(f"no hay un agmen hub en esta máquina ({hub_address()}): corre tu robot con "
@@ -452,6 +464,7 @@ class _PurePublisher(_NetSend):
                 self._drain()
                 dests = list(self.dests)
                 remote = self._remote
+            self._link.maybe_beat()
             if self._link.error:
                 raise wire.HubRejected(f"el hub rechazó publicar en '{self.topic}': {self._link.error}")
         else:
@@ -726,6 +739,9 @@ class _Receiver:
     def _recv(self, deadline: float | None, failed=None):
         """Siguiente paquete de DATOS, (bytes, "ip:puerto", conexión TCP o None), o None si venció
         `deadline`. Si select() falla, `failed` (None por omisión). Los de control se procesan aquí."""
+        link = self._link
+        if link is not None:
+            link.maybe_beat()   # (por si el hilo de latido no tiene turno)
         while True:
             if self._tcp is None and self._old_udp is None:   # un solo socket UDP: lo de siempre
                 got = self._recv_udp(self._sock, deadline)
@@ -1245,6 +1261,9 @@ class RawPublisher(_NetSend):
         # Todo el envío va con el candado: close() cierra los sockets con él, así que nunca los cierra
         # debajo de un sendto() en curso (lo vio ThreadSanitizer: close() contra sendto()). Un envío UDP
         # tarda microsegundos; quien llega con el RawPublisher ya cerrado recibe "ya se cerró".
+        link = self._link
+        if link is not None:
+            link.maybe_beat()   # fuera del candado: beat() toma el suyo (y no late tras el `bye`)
         with self._lock:
             if self._closed:
                 raise RuntimeError(_RAWPUB_CERRADO)

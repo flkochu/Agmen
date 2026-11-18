@@ -3835,6 +3835,13 @@ class TestCtrlCAlArrancar(E2EBase):
         def start_all_y_ctrl_c(launcher):
             lanzadores.append(launcher)
             original(launcher)
+            # start_all vuelve en cuanto hace Popen: el intérprete del nodo aún está importando 'site' y todavía no
+            # instala su manejador de SIGINT (con la máquina cargada tarda decenas de ms). Un SIGINT ahí lo mata el
+            # propio intérprete con un "Fatal Python error" ajeno a esta prueba. Se espera a que ya lata (el latido
+            # se escribe después de instalar el manejador): la ventana que se prueba, entre start_all y
+            # _wait_for_ctrl_c, sigue siendo la misma.
+            self.assertTrue(self.espera(lambda: all((self.marks / f"hb_{n}").exists() for n in ("ia", "cam")), 60),
+                            "los nodos de prueba no llegaron a latir")
             signal.raise_signal(signal.SIGINT)
 
         def matar_los_que_queden():   # si la prueba falla, que no queden nodos de este proceso

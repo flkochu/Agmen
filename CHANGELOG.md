@@ -451,8 +451,41 @@ Los objetos de Agmen en Python se pueden usar desde varios hilos a la vez
 - **Límites:** es para los objetos de Python. Un programa de C++ que haga
   `fork()` sigue como antes, y en Windows no hay `fork`. El hijo conserva un
   descriptor por cada socket heredado, apuntando a `/dev/null`.
+- **Valores no finitos (NaN, infinito) en un actuador** (seguridad). Antes, `[[mux]]`
+  dejaba pasar un comando con NaN o infinito, y `examples/tutorial/motor.cpp` lo
+  recortaba con `std::clamp`, que con NaN devuelve NaN: el freno de 0.5 s no actuaba
+  mientras siguieran llegando mensajes.
+  - `[[mux]]` descarta todo mensaje con un campo numérico no finito, de cualquier tipo
+    que pase por él. Avisa una vez por entrada (`[agmen] ⚠ mux '…': descarté un comando
+    de '…' con un valor no finito (campo=valor). Revisa ese nodo.`) y cuenta los
+    descartes en `no_finitos=` de su resumen. Para el actuador, ese origen es como si
+    no hubiera mandado: si era el dueño, el freno por silencio actúa.
+    Mientras no conoce el tipo (arrancó o se reinició después que el publicador, hasta
+    el siguiente anuncio, a lo más ~1 s), no reenvía ningún comando: lo avisa una vez
+    (`[agmen] ⚠ mux '…': todavía no conozco el tipo de los mensajes; …`) y los cuenta
+    en `sin_tipo=`.
+  - El motor del tutorial frena de inmediato ante un valor no finito, no usa ese valor
+    y lo dice una vez en stderr.
+  - No cambia ningún byte de la red.
 
 ### Corregido
+- **Latido del núcleo de Python puro**: un `Publisher` o un `Subscriber` ya no pierde su
+  registro en el hub cuando el programa tiene hilos muy ocupados. Antes, el hilo de
+  latido podía quedarse sin turno más de 3 s y el hub daba de baja al objeto hasta el
+  siguiente latido. Ahora también late al publicar y al recibir, como el núcleo de C++.
+  El periodo y los bytes no cambian.
+- **Memoria compartida al salir, núcleo puro**: un `Publisher` de imágenes que no se
+  cierra ya no deja sus bloques de memoria compartida ni su registro al terminar el
+  programa (salida normal, `sys.exit` o excepción). Con SIGTERM o SIGKILL sigue
+  quedando, como antes; la siguiente corrida los barre. Respeta `fork` y `os._exit`.
+- **Windows, cierre del hub**: al cerrar, el hilo del hub ya no lanza
+  `OSError: [WinError 10038]`. El hub cierra su socket desde su propio hilo
+  (`Hub.close()`).
+- **Windows, tablas entre computadoras**: ya no toman por propio un proceso ajeno cuando
+  Windows reutiliza un identificador de proceso.
+- **Pruebas**: una prueba de Ctrl+C mandaba la señal antes de que el nodo estuviera
+  listo; otra tolera el ruido del reloj de Windows; `test_cierre` vuelca las pilas de
+  los hilos si su Ctrl+C no termina. Ninguna prueba se omitió ni se desactivó.
 - **`cmd` con la ruta de un ejecutable** (`cmd = "../venv/bin/python nodo.py"`)
   se corre tal cual, sin seguir los enlaces simbólicos. Antes acababa en el
   Python del sistema y no en el del entorno virtual. `python` a secas sigue

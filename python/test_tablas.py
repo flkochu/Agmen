@@ -1455,5 +1455,37 @@ class TestSinPuente(TA.E2EBase):
                        '[web]\nenabled = false\n', "--sim")
 
 
+class TestLinajeWindows(unittest.TestCase):
+    """§9.2, rama de Windows de `Lineage.owns` (la cadena de padres), simulada en cualquier sistema. Caso visto en el
+    CI: un ancestro ya muerto cuyo pid Windows le dio después a un nodo hacía que `owns(ajeno)` diera True."""
+
+    def owns(self, parents, roots, pid):
+        with mock.patch.object(T, "os", SimpleNamespace(name="nt")), \
+                mock.patch.object(T, "_win_parents", lambda: parents):
+            return T.Lineage(roots).owns(pid)
+
+    def test_un_ancestro_muerto_con_el_pid_de_un_nodo_no_lo_hace_dueño(self):
+        parents = {
+            200: (100, 10),    # el que lanzó las pruebas: su padre (ya muerto) tenía el pid 100
+            100: (1, 500),     # el nodo: le tocó el pid 100 y nació mucho después (500) que su "hijo" 200
+            300: (200, 520),   # el ajeno: hijo del que lanzó las pruebas
+        }
+        self.assertIs(self.owns(parents, [100], 300), False)
+        self.assertIs(self.owns(parents, [100], 200), False)
+
+    def test_un_descendiente_de_verdad_si_es_suyo(self):
+        parents = {100: (1, 500), 110: (100, 510), 120: (110, 530), 300: (1, 520)}
+        self.assertIs(self.owns(parents, [100], 120), True)
+        self.assertIs(self.owns(parents, [100], 100), True)
+        self.assertIs(self.owns(parents, [100], 300), False)
+        self.assertIsNone(self.owns(parents, [100], 999))
+
+    def test_sin_el_nacimiento_del_hijo_no_corta_la_cadena(self):
+        # born = 0: no se pudo leer cuándo nació el hijo; la guarda no aplica (como antes del arreglo).
+        parents = {100: (1, 500), 110: (100, 0), 120: (110, 0)}
+        self.assertIs(self.owns(parents, [100], 120), True)
+        self.assertIs(self.owns(parents, [100], 110), True)
+
+
 if __name__ == "__main__":
     unittest.main()

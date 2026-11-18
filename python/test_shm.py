@@ -15,6 +15,7 @@ import io
 import multiprocessing
 import os
 import pickle
+import re
 import subprocess
 import sys
 import threading
@@ -803,6 +804,120 @@ class TestLimpieza(unittest.TestCase):
     def test_cpp(self):
         # Lo que deja C++ lo limpia Python: el mismo registro.
         self._muere_y_se_limpia("native")
+
+
+_SALE = """
+import os, sys, time
+sys.path.insert(0, {python!r})
+os.environ["AGMEN_BACKEND"] = "pure"
+import agmen
+from agmen import pubsub, wire, _shm
+from dataclasses import dataclass
+
+@dataclass
+class Img(wire.Message):
+    SCHEMA = "Img{{u32 w;u32 h;bytes data}}"
+    w: int
+    h: int
+    data: bytes
+
+def compartir():
+    sub = pubsub._PureSubscriber(Img, "127.0.0.1:0")
+    pub = pubsub._PurePublisher(Img, f"127.0.0.1:{{sub.port}}", topic="/img")
+    end = time.monotonic() + 3
+    while time.monotonic() < end:
+        pub.publish(Img(1, 0, b"x" * 1_000_000))
+        s = sub.receive(0.05)
+        if s is not None and s.envelope.flags & wire.FLAG_SHM:
+            return sub, pub
+    raise SystemExit("no llegó por memoria compartida")
+
+def mios(pid):
+    pre = f"agm{{pid & 0xFFFFFFFF:08x}}"
+    reg = [f for f in os.listdir(_shm._registry_dir()) if f.startswith(f"{{pid}}-")]
+    return [f for f in os.listdir("/dev/shm") if f.startswith(pre)], reg
+
+guardados = compartir()      # nadie los cierra
+print("PID", os.getpid(), flush=True)
+modo = sys.argv[1]
+if modo == "fork":
+    hijo = os.fork()
+    if hijo == 0:
+        otros = compartir()          # el hijo tiene los suyos (que sí limpia) y sale normal, sin close()
+        print("HIJO", os.getpid(), flush=True)
+        sys.exit(0)
+    _, st = os.waitpid(hijo, 0)
+    bloques, reg = mios(os.getpid())
+    print("PADRE_TRAS_HIJO", len(bloques), len(reg), os.waitstatus_to_exitcode(st), flush=True)
+elif modo == "exit":
+    sys.exit(3)
+elif modo == "raise":
+    raise RuntimeError("a propósito")
+"""
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "se mira /dev/shm (Linux)")
+class TestLimpiezaAlSalir(unittest.TestCase):
+    """Núcleo puro: al terminar el programa sin close() (salida normal, sys.exit, excepción) no quedan los bloques
+    ni el registro de ese proceso, como con el núcleo de C++. El hijo de un fork no borra lo del padre."""
+
+    def corre(self, modo):
+        code = _SALE.format(python=str(ROOT / "python"))
+        r = subprocess.run([sys.executable, "-c", code, modo], capture_output=True, text=True, timeout=60)
+        pids = [int(x) for x in re.findall(r"^(?:PID|HIJO) (\d+)$", r.stdout, re.M)]
+        self.assertTrue(pids, r.stdout + r.stderr)
+        for pid in pids:
+            pre = f"agm{pid & 0xFFFFFFFF:08x}"
+            bloques = [f for f in os.listdir("/dev/shm") if f.startswith(pre)]
+            d = _shm._registry_dir()
+            reg = [f for f in os.listdir(d) if f.startswith(f"{pid}-")] if os.path.isdir(d) else []
+            for f in bloques:   # (que una falla no deje basura)
+                _shm.unlink("/" + f)
+            for f in reg:
+                os.remove(os.path.join(d, f))
+            self.assertEqual((bloques, reg), ([], []), f"el proceso {pid} dejó esto al salir ({modo})")
+        return r
+
+    def test_salida_normal(self):
+        r = self.corre("normal")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_sys_exit(self):
+        r = self.corre("exit")
+        self.assertEqual(r.returncode, 3, r.stderr)
+
+    def test_excepcion(self):
+        r = self.corre("raise")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("RuntimeError: a propósito", r.stderr)
+
+    def test_fork_el_hijo_no_borra_lo_del_padre(self):
+        r = self.corre("fork")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        m = re.search(r"^PADRE_TRAS_HIJO (\d+) (\d+) (\d+)$", r.stdout, re.M)
+        self.assertIsNotNone(m, r.stdout + r.stderr)
+        bloques, reg, codigo = map(int, m.groups())
+        self.assertEqual(codigo, 0, r.stderr)
+        self.assertGreater(bloques, 0, "el hijo borró los bloques del padre")
+        self.assertEqual(reg, 1, "el hijo borró el registro del padre")
+
+    def test_un_pool_sin_close_no_queda_vivo(self):
+        # Lo que se guarda para limpiar al salir es el rastro (pid, nombres, registro), no el Pool: un Publisher
+        # soltado sin close() se libera, y aun así sus nombres se borran al salir.
+        import weakref
+        pool = _shm.Pool(0xA6E70009)
+        self.assertIsInstance(pool.write(1, BIG), _shm.Descriptor)
+        rastro, nombres = pool._rastro, set(pool._rastro.names)
+        self.assertTrue(nombres)
+        ref = weakref.ref(pool)
+        del pool
+        gc.collect()
+        self.assertIsNone(ref(), "el Pool sigue vivo sin close()")
+        self.assertIn(rastro, _shm._open_pools)
+        rastro.unlink_all()                              # lo que hace _clean_at_exit al salir
+        _shm._open_pools.discard(rastro)
+        for n in nombres:
+            self.assertFalse(os.path.exists("/dev/shm" + n), n)
 
 
 if __name__ == "__main__":
