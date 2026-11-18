@@ -256,22 +256,91 @@ print(f"errores={errors} imu={got['imu']} img={got['img']} invalidos={invalid}",
 """
 
 
-def _puertos_libres() -> int:
+def _puertos_libres(intentos: int = 200) -> int:
     """Un puerto p con UDP p y TCP p+1 libres ahora mismo. (Antes era fijo, 47991: cae en el rango de
     puertos que el sistema reparte a las conexiones salientes, y si otra conexión tenía el 47992 la prueba
-    fallaba con 'Address already in use'.)"""
+    fallaba con 'Address already in use'.)
+
+    Pide primero el TCP al sistema (q) y prueba UDP q-1: en Windows hay rangos reservados solo para TCP, y
+    pedir el UDP primero puede caer seguido en ellos. Los sockets de los intentos fallidos quedan abiertos
+    hasta terminar, para que el sistema no vuelva a entregar el mismo puerto."""
     import socket
-    for _ in range(50):
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u:
-            u.bind(("127.0.0.1", 0))
-            port = u.getsockname()[1]
+
+    def _err(e: OSError) -> str:
+        num = getattr(e, "winerror", None)
+        cod = f"winerror {num}" if num is not None else f"errno {e.errno}"
+        return f"{cod}: {e.strerror or e}"
+
+    abiertos: list[socket.socket] = []
+    fallas: list[str] = []
+    try:
+        for _ in range(intentos):
+            t = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            abiertos.append(t)
             try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as t:
-                    t.bind(("127.0.0.1", port + 1))
-            except OSError:
+                t.bind(("127.0.0.1", 0))
+            except OSError as e:
+                fallas.append(f"TCP 0: {_err(e)}")
                 continue
-            return port
-    raise RuntimeError("no encontré un par de puertos libres (UDP p y TCP p+1) en 127.0.0.1")
+            q = t.getsockname()[1]
+            if q - 1 < 1:
+                fallas.append(f"TCP {q}: no hay UDP {q - 1}")
+                continue
+            u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            abiertos.append(u)
+            try:
+                u.bind(("127.0.0.1", q - 1))
+            except OSError as e:
+                fallas.append(f"UDP {q - 1} (TCP {q}): {_err(e)}")
+                continue
+            return q - 1          # al salir se cierran todos, también este par
+    finally:
+        for s in abiertos:
+            s.close()
+    raise RuntimeError(f"no encontré un par de puertos libres (UDP p y TCP p+1) en 127.0.0.1 tras {intentos} "
+                       f"intentos. Los últimos {len(fallas[-10:])}: " + "; ".join(fallas[-10:]))
+
+
+class TestPuertosLibres(unittest.TestCase):
+    def test_cada_par_devuelto_se_puede_abrir(self):
+        import socket
+        for _ in range(20):
+            p = _puertos_libres()
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u, \
+                    socket.socket(socket.AF_INET, socket.SOCK_STREAM) as t:
+                u.bind(("127.0.0.1", p))
+                t.bind(("127.0.0.1", p + 1))
+
+    def test_si_no_encuentra_el_error_dice_cuantos_intentos_y_que_puertos_fallaron(self):
+        """Sin depender del sistema: un simulacro de socket da TCP 40001, 40002, ... y el UDP de al lado siempre
+        falla con 'Address already in use'."""
+        import socket
+
+        tcp = iter(range(40001, 40100))
+        abiertos = []
+
+        def falso(familia, tipo):
+            s = mock.MagicMock()
+            if tipo == socket.SOCK_STREAM:
+                s.getsockname.return_value = ("127.0.0.1", next(tcp))
+            else:
+                s.bind.side_effect = OSError(98, "Address already in use")
+            abiertos.append(s)
+            return s
+
+        with mock.patch.object(socket, "socket", side_effect=falso):
+            with self.assertRaises(RuntimeError) as ctx:
+                _puertos_libres(intentos=12)
+        msg = str(ctx.exception)
+        self.assertIn("tras 12 intentos", msg)
+        self.assertIn("Los últimos 10:", msg)
+        self.assertNotIn("UDP 40000 ", msg)                      # los dos primeros ya no caben en la lista
+        self.assertNotIn("UDP 40001 ", msg)
+        self.assertIn("UDP 40002 (TCP 40003): errno 98: Address already in use", msg)
+        self.assertIn("UDP 40011 (TCP 40012): errno 98: Address already in use", msg)
+        self.assertEqual(msg.count("errno 98"), 10)
+        self.assertEqual(len(abiertos), 24)
+        self.assertTrue(all(s.close.called for s in abiertos))  # no deja sockets abiertos
 
 
 class TestNodo(unittest.TestCase):

@@ -99,7 +99,9 @@ agmen run examples/tutorial/robot.toml
    un valor así nunca llega al motor. Y si el mux arranca o se reinicia después
    que el cerebro, hasta que llega el anuncio del tipo (a lo más ~1 s) no sabe
    qué bytes son números: no reenvía ningún comando, lo avisa una vez y los
-   cuenta en `sin_tipo=`.
+   cuenta en `sin_tipo=`. El tipo lo fija el primer anuncio que llega, nunca un
+   comando: si otra entrada anuncia o manda un tipo distinto, se descarta y el
+   aviso dice qué entrada es.
 
 ## 4. ¿Quién tiene el mando? Pregúntale al mux
 
