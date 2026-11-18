@@ -17,6 +17,10 @@ Nodo → hub
     sub   … machine addr [tcp]                 un Subscriber de OTRA computadora (modo red): vive en
                                                `machine` (un nombre de `peers`) y recibe en addr=ip:puerto
     pub   … machine                            un Publisher de OTRA computadora (modo red; sin `subs`)
+    pub/sub … [names=a,b,c]                    (RFC 0013 §3.4, D6 = d) los nombres de las articulaciones, en
+                                               orden, de quien trae su propia lista (una política, un puente);
+                                               va al final de la línea. Sin él, la línea de siempre. Ver
+                                               check_joint_names. Un hub anterior lo ignora (y no compara)
           [solo=id,id | solo=-]                (RFC 0011 §9.2, sesión de simulación) solo con machine: a qué
                                                Publisher de aquí se da como destino un sub de fuera (- = ninguno)
     red   peers=nombre@ip,nombre@ip            modo red (RFC 0011): las otras computadoras y la IP con
@@ -52,7 +56,8 @@ Hub → nodo
                                                puente lo dijo en `red` (caduca con el modo red)
           (luego varias líneas: topic ..., ep ..., stat ...; en modo red, también una `maq` por computadora de
           peers: `maq name ip reloj err [edad]` con la diferencia medida, o `maq name ip sin=<motivo> [edad]`
-          sin medir; quien lee `state` ignora las líneas y los campos que no conoce)
+          sin medir; quien lee `state` ignora las líneas y los campos que no conoce; una línea `ep` lleva al final
+          `names=…` si el endpoint declaró su lista, RFC 0013 D6: así la pasa el puente a otra computadora)
           si no cabe en un datagrama (RFC 0011 §9.1): varios, de como mucho 32 KiB, cada uno con una
           primera línea `parte i=<k> de=<m> n=<consulta>` y líneas enteras (una que sola no cabe va
           recortada, con cortado=1)
@@ -149,6 +154,120 @@ def check_topic(topic: str, allow_wildcard: bool = False) -> None:
 def is_topic(target: str) -> bool:
     """'/imu' es un topic; '127.0.0.1:7500' es una dirección."""
     return target.startswith("/")
+
+
+# --- Los nombres de las articulaciones (RFC 0013 §3.4, D6 = d) -------------------------------------------------
+# La única definición: la usan [[joints]] de robot.toml (agmen.run), names= de Publisher y Subscriber y el hub.
+# Solo letras ASCII, dígitos y los signos que usan MuJoCo y URDF en la práctica: todos están en _SAFE, así que la
+# lista viaja sin '%XX'. Sin espacios, comas, '=' ni controles. Empieza con letra, dígito o '_' (no con un signo:
+# "/", "." o "-" solos no nombran nada, y un "-" al principio parece una opción de línea de comandos).
+# Los dos topes son provisionales (se le presentan a Adán): JOINT_NAME_MAX caracteres por nombre y
+# JOINT_NAMES_MAX caracteres en todo el campo (los nombres separados por comas).
+JOINT_NAME_MAX = 64
+JOINT_NAMES_MAX = 8192
+JOINT_CHAR_RE = re.compile(r"[A-Za-z0-9_./-]")
+JOINT_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
+JOINT_NAME_HELP = ("Usa letras (sin acentos), dígitos, '_', '-', '.' o '/', y empieza con letra, dígito o '_', "
+                   "como en el modelo (MuJoCo o URDF), ej. \"FR_hip\" o \"brazo/codo.1\"")
+
+
+def joint_name_problem(name: str) -> str | None:
+    """Por qué un nombre de articulación no vale, en palabras ("tiene un espacio"); None si vale."""
+    if JOINT_NAME_RE.fullmatch(name):
+        if len(name) > JOINT_NAME_MAX:
+            return f"mide {len(name)} caracteres y el máximo es {JOINT_NAME_MAX}"
+        return None
+    if not name:
+        return "está vacío"
+    for c in name:
+        if not JOINT_CHAR_RE.fullmatch(c):
+            if c == " ":
+                return "tiene un espacio"
+            if c == ",":
+                return "tiene una coma"
+            if c == "=":
+                return "tiene un '='"
+            if ord(c) < 32 or ord(c) == 127:
+                return f"tiene un carácter de control ({ord(c):#04x})"
+            if not c.isprintable():
+                return f"tiene un carácter que no se ve (U+{ord(c):04X})"
+            return f"tiene '{c}'"
+    return f"empieza con '{name[0]}'; el primer carácter es una letra, un dígito o '_'"
+
+
+def _show_name(name: str) -> str:
+    """Un nombre que no vale, para un error: acotado y sin lo que no se ve."""
+    text = "".join(c if c.isprintable() else "?" for c in name[:JOINT_NAME_MAX])
+    return repr(text + ("…" if len(name) > JOINT_NAME_MAX else ""))
+
+
+def check_joint_names(names, what: str = "names") -> tuple[str, ...]:
+    """Una lista de nombres de articulación (de names= o de [[joints]]), revisada: no vacía, textos válidos, sin
+    repetir y dentro de los topes. Devuelve la tupla; ProtocolError (un ValueError) con el porqué si no sirve.
+    `what` es cómo se llama la lista en el mensaje."""
+    if isinstance(names, (str, bytes, bytearray)) or not hasattr(names, "__iter__"):
+        raise ProtocolError(f"{what} es una lista de nombres de articulación en orden, ej. "
+                            f"{what}=[\"cadera\", \"rodilla\"]; llegó {type(names).__name__}")
+    out = tuple(names)
+    if not out:
+        raise ProtocolError(f"{what} está vacía: pon los nombres de las articulaciones en orden, ej. "
+                            f"[\"cadera\", \"rodilla\"] (o no la pases)")
+    seen: dict[str, int] = {}
+    for k, n in enumerate(out):
+        if not isinstance(n, str):
+            raise ProtocolError(f"{what}[{k}] = {n!r:.80} no es un texto. Cada articulación es un nombre, ej. \"FR_hip\"")
+        why = joint_name_problem(n)
+        if why is not None:
+            raise ProtocolError(f"{what}[{k}] = {_show_name(n)} no es un nombre de articulación válido ({why}). "
+                                f"{JOINT_NAME_HELP}")
+        if n in seen:
+            raise ProtocolError(f"'{n}' está dos veces en {what} ({what}[{seen[n]}] y {what}[{k}]). Cada "
+                                f"articulación va una sola vez: quita una o corrige el nombre")
+        seen[n] = k
+    size = len(format_joint_names(out))
+    if size > JOINT_NAMES_MAX:
+        raise ProtocolError(f"{what} ocupa {size} caracteres (los {len(out)} nombres separados por comas) y el "
+                            f"máximo es {JOINT_NAMES_MAX}: usa nombres más cortos o reparte las articulaciones en "
+                            f"varios grupos (un topic por grupo)")
+    return out
+
+
+def format_joint_names(names) -> str:
+    """('FR_hip', 'FR_thigh') → 'FR_hip,FR_thigh': el valor del campo `names` (no necesita '%XX')."""
+    return ",".join(names)
+
+
+def parse_joint_names(text: str) -> tuple[str, ...]:
+    """El campo `names` como llegó (ya sin '%XX') → la tupla, revisada como check_joint_names. Una coma de más
+    ('a,,b', 'a,' o ',a') es un nombre vacío y no vale: aquí no se saltan los huecos (no es split_list)."""
+    if len(text) > JOINT_NAMES_MAX:
+        raise ProtocolError(f"names ocupa {len(text)} caracteres y el máximo es {JOINT_NAMES_MAX}")
+    if not text:
+        raise ProtocolError("names= vacío no vale: sin lista de nombres, no pongas el campo")
+    return check_joint_names(text.split(","))
+
+
+_POSITION_RE = re.compile(r"f32\[([1-9][0-9]{0,6})\] position")
+
+
+def schema_joint_count(text: str) -> int | None:
+    """Cuántas articulaciones dice un esquema: el N de su campo `f32[N] position` de primer nivel
+    ("agmen/1 JointState{f32[12] position;…}" → 12). None si no tiene ese campo (u otro texto)."""
+    head, brace, rest = text.partition("{")
+    if not brace or not rest.endswith("}"):
+        return None
+    depth, start, inner = 0, 0, rest[:-1]
+    for k, c in enumerate(inner + ";"):
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+        elif c == ";" and depth == 0:
+            m = _POSITION_RE.fullmatch(inner[start:k])
+            if m:
+                return int(m.group(1))
+            start = k + 1
+    return None
 
 
 # --- Modo red (RFC 0011 §3.5): el hub y otras computadoras ---------------------

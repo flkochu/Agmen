@@ -105,6 +105,10 @@ def cmd_info(args) -> int:
             extra = " (escucha todos los topics)" if e["topic"] == "*" else ""
             where = ("  · " + (HERE if not e.get("machine") else f"en {e['machine']}")) if remote else ""
             print(f"  {e['node']}  pid {e['pid']}  {e['addr']}  latió hace {e['age']} s{extra}{where}")
+            if e.get("names"):   # RFC 0013 D6: la lista de articulaciones que declaró (el hub ya la revisó)
+                names = e["names"].split(",")
+                shown = ", ".join(names) if len(names) <= 6 else f"{', '.join(names[:3])} … {names[-1]}"
+                print(f"    articulaciones ({len(names)}): {shown}")
     return 0
 
 

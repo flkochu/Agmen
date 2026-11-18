@@ -1336,8 +1336,11 @@ class TestJoints(unittest.TestCase):
         self.assertConfigError(MINIMO + joints(names=muchos, kp=1, kd=1),
                                f"names tiene {cmd + 1} articulaciones y un JointCommand cabe en un paquete UDP "
                                f"con hasta {cmd}", "varios [[joints]]")
-        self.load(MINIMO + joints(names=muchos, command=None, kp=None, kd=None))   # JointState sí las admite
-        self.load(MINIMO + joints(names=muchos[:cmd], kp=1, kd=1))
+        # JointState sí admite ese número, pero la lista no cabe en el campo `names` del hub (RFC 0013 D6): el tope
+        # de caracteres llega antes (con nombres como "j1234", unas 1550 articulaciones).
+        self.assertConfigError(MINIMO + joints(names=muchos, command=None, kp=None, kd=None),
+                               "names ocupa", "el máximo es 8192", "nombres más cortos", "varios grupos")
+        self.assertConfigError(MINIMO + joints(names=muchos[:cmd], kp=1, kd=1), "names ocupa")
         demasiados = [f"j{i}" for i in range(sc + 1)]
         self.assertConfigError(MINIMO + joints(names=demasiados, command=None, kp=None, kd=None),
                                f"un JointState cabe en un paquete UDP con hasta {sc}")
@@ -1410,9 +1413,14 @@ class TestJoints(unittest.TestCase):
 
     def test_miles_de_articulaciones_y_nombres_largos_cargan_rapido(self):
         t0 = time.monotonic()
-        j = self.load(MINIMO + joints(names=[f"j{i}" for i in range(3000)], kp=1, kd=1)).joints[0]
-        self.assertEqual(len(j.names), 3000)
-        self.assertEqual(self.load(MINIMO + joints(names=["a" * 20000], kp=1, kd=1)).joints[0].names, ("a" * 20000,))
+        j = self.load(MINIMO + joints(names=[f"j{i}" for i in range(1550)], kp=1, kd=1)).joints[0]
+        self.assertEqual(len(j.names), 1550)       # 8189 caracteres: cabe en el campo `names` del hub (8192)
+        self.assertEqual(self.load(MINIMO + joints(names=["a" * 64], kp=1, kd=1)).joints[0].names, ("a" * 64,))
+        # Más que eso no cabe en el registro del hub (RFC 0013 D6): un error claro, y rápido.
+        self.assertConfigError(MINIMO + joints(names=[f"j{i}" for i in range(3000)], kp=1, kd=1),
+                               "names ocupa 16889 caracteres", "el máximo es 8192")
+        self.assertConfigError(MINIMO + joints(names=["a" * 20000], kp=1, kd=1),
+                               "mide 20000 caracteres y el máximo es 64")
         self.assertLess(time.monotonic() - t0, 5)
 
     def test_el_mux_puede_publicar_en_el_command_del_grupo(self):

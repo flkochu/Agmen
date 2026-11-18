@@ -132,6 +132,9 @@ def check_endpoint(kind: str, d) -> dict:
     else:
         out["port"] = _int(d, "port", 1, 65535)
         out["tcp"] = _int(d, "tcp", 0, 65535)
+    if "names" in d:   # RFC 0013 D6: la lista de articulaciones que declaró, con la misma regla que el hub
+        names = _text(d, "names", hp.JOINT_NAMES_MAX)
+        out["names"] = hp.format_joint_names(hp.parse_joint_names(names))
     return out
 
 
@@ -140,16 +143,18 @@ def hub_line(name: str, ip: str, kind: str, d: dict, solo: list[str] | None = No
     lado ve en `ip` (kind "pubs" o "subs"). `solo` (§9.2, solo para "subs"): los ids de los Publisher de aquí a los
     que el hub lo da como destino ([] = a ninguno); None: sin el campo (a todos, como siempre)."""
     hid = f"{name}.{d['id']}"
+    # RFC 0013 D6: la lista de nombres, al final (sin ella, la línea de siempre), para que este hub también compare.
+    names = {"names": d["names"]} if d.get("names") is not None else {}
     if kind == "pubs":
         return hp.encode("pub", id=hid, node=d["node"], pid=d["pid"], topic=d["topic"], schema=d["schema"],
-                         type=d["type"], text=d["text"], machine=name)
+                         type=d["type"], text=d["text"], machine=name, **names)
     fields = dict(id=hid, node=d["node"], pid=d["pid"], topic=d["topic"], schema=d["schema"], type=d["type"],
                   machine=name, addr=f"{ip}:{d['port']}")
     if d["tcp"]:
         fields["tcp"] = d["tcp"]
     if solo is not None:
         fields["solo"] = ",".join(solo) or "-"
-    return hp.encode("sub", **fields)
+    return hp.encode("sub", **fields, **names)
 
 
 # --- §9.2: en simulación o reproducción, solo cruzan los nodos que arrancó el agente ---------------------------------
@@ -277,6 +282,8 @@ def local_table(msgs: list[tuple[str, dict[str, str]]], cut: list[str] | None = 
         topic = f.get("topic", "")
         t = topics.get(topic, {})
         base = {"id": f.get("id", ""), "node": f.get("node", ""), "pid": f.get("pid", ""), "topic": topic}
+        if "names" in f:   # RFC 0013 D6: la lista que declaró (la línea `ep` la trae al final)
+            base["names"] = f["names"]
         if f.get("kind") == "pub":
             if not t.get("schema"):
                 continue

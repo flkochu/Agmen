@@ -1138,6 +1138,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="topic esperado (de robot.toml); avisa si alguien usa otro parecido o de otro tipo")
     p.add_argument("--require", action="append", metavar="TOPIC",
                    help="topic obligatorio: avisa si nadie lo publica")
+    p.add_argument("--names", action="append", metavar="TOPIC=NOMBRE,NOMBRE,...",
+                   help="los nombres de las articulaciones de un topic, en orden (de [[joints]] en robot.toml): "
+                        "rechaza a quien declare otra lista")
+    p.add_argument("--require-names", action="append", metavar="TOPIC",
+                   help="quien publique en TOPIC debe declarar su lista de nombres (require_names de [[joints]])")
     p.add_argument("--robot", default="", metavar="NOMBRE",
                    help="el robot al que pertenece (lo pone agmen run: así otro agmen run sabe de quién es)")
     p.set_defaults(func=cmd_hub)

@@ -147,8 +147,8 @@ class MuxConfig:
 @dataclass
 class JointsConfig:
     """Un grupo [[joints]] de robot.toml (RFC 0013 §3.4, D6), ya revisado: los nombres y el orden de
-    las articulaciones van aquí una sola vez. Por ahora solo se lee y se muestra al arrancar; el hub
-    lo usará para comparar listas (D6 = d) en una tarea aparte."""
+    las articulaciones van aquí una sola vez. agmen run le pasa al hub la lista de cada topic del grupo
+    (--names) y require_names (--require-names): el hub la compara con la que declara cada nodo (D6 = d)."""
     name: str
     names: tuple[str, ...]                 # ESTE es el orden (en el robot, el simulador y la política)
     state: str = ""                        # topic de JointState<N>; vacío = el grupo no tiene estado
@@ -410,35 +410,11 @@ def _parse_machine(raw: dict, where: str, machines: list[MachineConfig]) -> str:
 
 
 # [[joints]] (RFC 0013 §3.4, D6). Un nombre de articulación viaja después en una línea de texto del hub
-# (la tarea de D6 = d): por eso solo letras ASCII, dígitos y los signos que usan MuJoCo y URDF en la
-# práctica. Sin espacios, comas, '=' ni caracteres de control. Empieza con letra, dígito o '_' (no con
-# un signo: "/", "." o "-" solos no nombran nada, y un "-" al principio parece una opción de línea de comandos).
+# (D6 = d, campo `names`): la regla y los topes son los de agmen.hubproto (una sola definición).
 JOINTS_KEYS = {"name", "state", "command", "kp", "kd", "names", "require_names", "profile"}
-_JOINT_CHAR = re.compile(r"[A-Za-z0-9_./-]")
-_JOINT_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
-_JOINT_NAME_HELP = ("Usa letras (sin acentos), dígitos, '_', '-', '.' o '/', y empieza con letra, dígito o '_', "
-                    "como en el modelo (MuJoCo o URDF), ej. \"FR_hip\" o \"brazo/codo.1\"")
 _JOINT_KIND = {"state": "JointState", "command": "JointCommand"}
 _F32_MAX = 3.4028234663852886e38   # el f32 finito más grande
 _GAIN_HELP = {"kp": "de posición (N·m/rad)", "kd": "de velocidad (N·m·s/rad)"}
-
-
-def _bad_char(name: str) -> str:
-    """Por qué un nombre de articulación no vale, en palabras."""
-    if not name:
-        return "está vacío"
-    for c in name:
-        if not _JOINT_CHAR.fullmatch(c):
-            if c == " ":
-                return "tiene un espacio"
-            if c == ",":
-                return "tiene una coma"
-            if c == "=":
-                return "tiene un '='"
-            if ord(c) < 32 or ord(c) == 127:
-                return f"tiene un carácter de control ({ord(c):#04x})"
-            return f"tiene '{c}'"
-    return f"empieza con '{name[0]}'; el primer carácter es una letra, un dígito o '_'"
 
 
 def _parse_gains(raw: dict, key: str, n: int, where: str) -> tuple[float, ...] | None:
@@ -571,18 +547,10 @@ def _parse_joints(data: dict, topics: list[TopicConfig]) -> list[JointsConfig]:
         if not isinstance(names, list) or not names:
             raise ConfigError(f"{where}: names es una lista no vacía de nombres de articulación, en orden, "
                               f"ej. names = [\"cadera\", \"rodilla\"]")
-        seen: dict[str, int] = {}
         for k, n in enumerate(names):
             if not isinstance(n, str):
                 raise ConfigError(f"{where}: names[{k}] = {n!r} no es un texto. Cada articulación es un nombre "
                                   f"entre comillas, ej. \"FR_hip\"")
-            if not _JOINT_NAME.fullmatch(n):
-                raise ConfigError(f"{where}: names[{k}] = {n!r} no es un nombre de articulación válido "
-                                  f"({_bad_char(n)}). {_JOINT_NAME_HELP}")
-            if n in seen:
-                raise ConfigError(f"{where}: '{n}' está dos veces en names (names[{seen[n]}] y names[{k}]). "
-                                  f"Cada articulación va una sola vez: quita una o corrige el nombre")
-            seen[n] = k
         for key in found:
             kind = _JOINT_KIND[key]
             top = max_joints(kind)
@@ -590,6 +558,12 @@ def _parse_joints(data: dict, topics: list[TopicConfig]) -> list[JointsConfig]:
                 raise ConfigError(f"{where}: names tiene {len(names)} articulaciones y un {kind} cabe en un paquete "
                                   f"UDP con hasta {top}. Reparte las articulaciones en varios [[joints]], cada uno "
                                   f"con sus topics")
+        # La misma revisión que hace el hub con la lista que declara un nodo (y los mismos topes): nombres
+        # válidos, sin repetir, de hasta hp.JOINT_NAME_MAX caracteres y hp.JOINT_NAMES_MAX en total.
+        try:
+            hp.check_joint_names(names)
+        except hp.ProtocolError as e:
+            raise ConfigError(f"{where}: {e}") from None
         for other in out:
             shared = _shared(profiles, other.profiles)
             if shared is None:
@@ -1044,6 +1018,11 @@ def _parse_clock(raw, nodes: list[NodeConfig], where: str = "[clock]",
     return ClockConfig(mode=mode, speed=float(speed), source=source, paused=bool(raw.get("paused", False)))
 
 
+# La línea de comandos del agmen hub, como mucho (Windows admite 32767 caracteres en CreateProcess): las listas de
+# [[joints]] van ahí (--names), y una que no cabe tiene que decirse antes de arrancar, no fallar al lanzar el hub.
+HUB_CMD_MAX = 30000
+
+
 def prepare_hub(config: RobotConfig, ping=None) -> tuple[RobotConfig, str]:
     """Agrega el nodo 'hub' al robot, salvo que ya haya un agmen hub vivo en
     esta máquina (entonces se reutiliza). Devuelve la config y qué se hizo."""
@@ -1054,7 +1033,9 @@ def prepare_hub(config: RobotConfig, ping=None) -> tuple[RobotConfig, str]:
     from .pubsub import hub_address
     alive = ping(hub_address())
     if alive is not None:
-        note = " (los [[topic]] de este robot.toml no se revisan)" if config.topics else ""   # ni sus [[joints]]
+        # Ese hub no conoce este robot.toml: ni sus [[topic]] ni las listas de sus [[joints]] (no compara nombres).
+        what = " y ".join(x for x, on in (("[[topic]]", config.topics), ("[[joints]]", config.joints)) if on)
+        note = f" (los {what} de este robot.toml no se revisan)" if what else ""
         return config, f"usando el agmen hub {alive} que ya corre en {hub_address()}{note}"
     args = ["-m", "agmen", "hub", "--listen", hub_address(), "--robot", config.name]
     for t in config.topics:
@@ -1069,6 +1050,21 @@ def prepare_hub(config: RobotConfig, ping=None) -> tuple[RobotConfig, str]:
             for key, kind in _JOINT_KIND.items():
                 if getattr(j, key):
                     args += ["--expect", f"{getattr(j, key)}={kind}"]
+    # D6 = d: la lista de cada [[joints]] para sus topics, SIEMPRE (haya o no [[topic]]): no es un --expect, así
+    # que no enciende el aviso de "no declarado" de los demás topics. require_names, para su command.
+    from . import hubproto as hp
+
+    for j in config.joints:
+        for key in _JOINT_KIND:
+            if getattr(j, key):
+                args += ["--names", f"{getattr(j, key)}={hp.format_joint_names(j.names)}"]
+        if j.require_names and j.command:
+            args += ["--require-names", j.command]
+    size = sum(len(a) + 1 for a in [sys.executable, *args])
+    if size > HUB_CMD_MAX:
+        raise ConfigError(f"los nombres de [[joints]] no caben en la línea de comandos del agmen hub: ocupan {size} "
+                          f"caracteres y el máximo es {HUB_CMD_MAX} (lo que admite Windows, con margen). Usa nombres "
+                          f"más cortos o menos grupos")
     hub_node = NodeConfig(name="hub", cmd=[sys.executable, *args], restart="always",
                           env={"PYTHONPATH": os.pathsep.join(
                               [str(Path(__file__).resolve().parent.parent),

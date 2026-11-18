@@ -40,10 +40,12 @@ from dataclasses import dataclass
 from . import _backend, _tcp, clock, wire
 from . import hubproto as hp
 from .pubsub import (
+    NATIVE_NAMES_TEXT,
     Publisher,
     _preload_numpy,
     Sample,
     Subscriber,
+    joint_names_for,
     _heredar,
     hub_address,
     node_name,
@@ -169,8 +171,8 @@ class _Invalid:
 
 
 class _Sub:
-    def __init__(self, msg_type, where: str, fn, queue: int, group: str) -> None:
-        self.sub = Subscriber(msg_type, where)
+    def __init__(self, msg_type, where: str, fn, queue: int, group: str, names=None) -> None:
+        self.sub = Subscriber(msg_type, where, names=names)
         self.fn = fn
         self.where = where
         self.queue = max(1, int(queue))
@@ -270,9 +272,10 @@ class _PureNode:
         _nodos.add(self)
 
     # --- armar el nodo ---
-    def publisher(self, msg_type, to: str) -> Publisher:
-        """Un publicador de este nodo (t_data = node.now() si no das otro)."""
-        p = Publisher(msg_type, to)
+    def publisher(self, msg_type, to: str, *, names=None) -> Publisher:
+        """Un publicador de este nodo (t_data = node.now() si no das otro). `names`: los nombres de
+        las articulaciones en el orden de los arreglos (RFC 0013 §3.4), que el hub compara con robot.toml."""
+        p = Publisher(msg_type, to, names=names)
         self._pubs.append(p)
         return p
 
@@ -299,13 +302,14 @@ class _PureNode:
 
         return add if fn is None else add(fn)
 
-    def on(self, msg_type, where: str, fn=None, *, queue: int = 1, group: Group | None = None):
+    def on(self, msg_type, where: str, fn=None, *, queue: int = 1, group: Group | None = None, names=None):
         """Llama a `fn(sample)` cuando llega un `msg_type` por `where` (topic o
-        dirección). queue = 1: el más reciente; queue = N: hasta N."""
+        dirección). queue = 1: el más reciente; queue = N: hasta N. `names`: como en
+        publisher()."""
         def add(f):
             self._check_not_running("on")
             g = (group or Group()).name
-            self._groups.setdefault(g, _GroupRt(g)).subs.append(_Sub(msg_type, where, f, queue, g))
+            self._groups.setdefault(g, _GroupRt(g)).subs.append(_Sub(msg_type, where, f, queue, g, names))
             return f
 
         return add if fn is None else add(fn)
@@ -617,9 +621,10 @@ class _NativeNode:
         _nodos.add(self)
 
     # --- armar el nodo ---
-    def publisher(self, msg_type, to: str) -> Publisher:
-        """Un publicador de este nodo (t_data = node.now() si no das otro)."""
-        p = Publisher(msg_type, to)
+    def publisher(self, msg_type, to: str, *, names=None) -> Publisher:
+        """Un publicador de este nodo (t_data = node.now() si no das otro). `names`: los nombres de
+        las articulaciones en el orden de los arreglos (RFC 0013 §3.4), que el hub compara con robot.toml."""
+        p = Publisher(msg_type, to, names=names)
         self._pubs.append(p)
         return p
 
@@ -645,13 +650,16 @@ class _NativeNode:
 
         return add if fn is None else add(fn)
 
-    def on(self, msg_type, where: str, fn=None, *, queue: int = 1, group: Group | None = None):
+    def on(self, msg_type, where: str, fn=None, *, queue: int = 1, group: Group | None = None, names=None):
         """Llama a `fn(sample)` cuando llega un `msg_type` por `where` (topic o
-        dirección). queue = 1: el más reciente; queue = N: hasta N."""
+        dirección). queue = 1: el más reciente; queue = N: hasta N. `names`: como en
+        publisher() (con este núcleo, todavía no: ver pubsub.NATIVE_NAMES_TEXT)."""
         def add(f):
             self._check_not_running("on")
             if hp.is_topic(where):
                 hp.check_topic(where)
+            if joint_names_for(msg_type, where, names, "Node.on") is not None:   # revisada igual que en Python puro
+                raise NotImplementedError(f"Node.on en '{where}': {NATIVE_NAMES_TEXT}")
             decode, envelope = msg_type.decode_payload, wire.Envelope
 
             def deliver(env, payload, sender):

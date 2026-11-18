@@ -11,6 +11,14 @@ la tabla en ~1 s.
 Topics esperados (de robot.toml, [[topic]]): el hub avisa si alguien usa un
 topic que no está declarado ("¿Quisiste decir /imu?"), si llega con otro tipo,
 y si un topic obligatorio se queda sin nadie que lo publique.
+
+Los nombres de las articulaciones (de robot.toml, [[joints]]; RFC 0013 §3.4, D6 = d):
+
+    agmen hub --names /patas/cmd=FR_hip,FR_thigh,FR_calf --require-names /patas/cmd
+
+Quien trae su propia lista la declara al registrarse (`names=`); el hub la compara
+con la de robot.toml y con la de los demás endpoints del topic, y rechaza la que
+no coincide. Ver Hub._check_names.
 """
 
 from __future__ import annotations
@@ -136,6 +144,7 @@ class Endpoint:
     src: tuple[str, int] = ("", 0)   # de dónde late (para un sub de fuera: el proceso que lo registra)
     local_since: float | None = None  # sub local sin net=1 en modo red: desde cuándo
     solo: frozenset[str] | None = None  # sub de fuera: solo se le da a estos Publisher locales (None: a todos; §9.2)
+    names: tuple[str, ...] | None = None  # la lista de articulaciones que declaró (RFC 0013 D6); None = ninguna
 
 
 def net_ip_from_env() -> str | None:
@@ -167,9 +176,52 @@ class Expected:
     required: bool = False
 
 
+@dataclass
+class JointNames:
+    """La lista de [[joints]] de robot.toml para un topic (RFC 0013 §3.4, D6 = d): --names y --require-names."""
+    topic: str
+    names: tuple[str, ...]
+    required: bool = False    # require_names: quien publique aquí debe declarar su lista
+
+
+NAMES_SHOWN = 2       # nombres que se muestran de cada lista en un rechazo, desde la primera diferencia
+NODE_SHOWN = 64       # caracteres del nombre de un nodo en los textos nuevos de D6
+
+
+def names_difference(a: tuple[str, ...], b: tuple[str, ...]) -> tuple[int, str, str]:
+    """Dos listas distintas → (k, lo de a, lo de b): k es la primera posición en que cambian (desde 0) y cada lado
+    muestra NAMES_SHOWN nombres desde ahí: ("FR_hip, FR_thigh…", "FL_hip, FL_thigh…"). Los nombres ya están
+    revisados (hp.check_joint_names): no traen controles y miden como mucho hp.JOINT_NAME_MAX."""
+    k = 0
+    while k < len(a) and k < len(b) and a[k] == b[k]:
+        k += 1
+
+    def show(x: tuple[str, ...]) -> str:
+        before = "…, " if k > 0 else ""
+        part = x[k:k + NAMES_SHOWN]
+        if not part:
+            return f"{before.rstrip(', ')} (ahí termina)" if before else "(nada)"
+        return before + ", ".join(part) + ("…" if k + NAMES_SHOWN < len(x) else "")
+
+    return k, show(a), show(b)
+
+
+def _where_differ(k: int, a: tuple[str, ...], b: tuple[str, ...], who_a: str, who_b: str) -> str:
+    """'cambian desde la articulación 3 de 12', o con largos distintos, cuántos declara cada uno."""
+    if len(a) == len(b):
+        return f"cambian desde la articulación {k + 1} de {len(a)}"
+    return f"cambian desde la articulación {k + 1}; {who_a} declara {len(a)} nombres y {who_b} {len(b)}"
+
+
+def _names_hint(names: tuple[str, ...]) -> str:
+    """'FR_hip, FR_thigh… (12 nombres)': para decir cuál es la lista de robot.toml en un aviso."""
+    more = "…" if len(names) > NAMES_SHOWN else ""
+    return f"{', '.join(names[:NAMES_SHOWN])}{more} ({len(names)} nombre{'' if len(names) == 1 else 's'})"
+
+
 class Hub:
     def __init__(self, listen: str = hp.DEFAULT_HUB, expected: list[Expected] | None = None,
-                 log=print, grace_s: float = 5.0, robot: str = "") -> None:
+                 log=print, grace_s: float = 5.0, robot: str = "", joints: list[JointNames] | None = None) -> None:
         host, port = listen.rsplit(":", 1)
         # Con AGMEN_NET_IP (solo pruebas), esa IP también es "esta computadora" (§7). Antes del socket.
         self.net_ip = net_ip_from_env()
@@ -190,6 +242,9 @@ class Hub:
         self.endpoints: dict[str, Endpoint] = {}
         self.stats: dict[tuple[str, str, str, str], tuple[dict[str, str], float]] = {}
         self.expected = {e.topic: e for e in (expected or [])}
+        # RFC 0013 D6 = d: topic → la lista de [[joints]]. Aparte de `expected`: no enciende el aviso de "no
+        # declarado" de los demás topics.
+        self.joints = {j.topic: j for j in (joints or [])}
         self.grace_s = grace_s
         self.started = time.monotonic()
         self._warned: set = set()
@@ -543,6 +598,7 @@ class Hub:
                                        f"{donde}) quiere usarlo con {theirs} (schema_id {schema}){shapes}. Un topic, "
                                        f"un tipo, también entre computadoras: usa otro nombre de topic o el "
                                        f"mismo esquema")
+        names = self._check_names(kind, f, topic, eid, node, machine)
         src = addr
         tcp = 0
         if kind == "sub":
@@ -560,6 +616,7 @@ class Hub:
             e = Endpoint(eid, kind, node, f.get("pid", ""), topic, schema, addr,
                          f.get("type", ""), tcp, f.get("text", ""))
             e.machine = machine
+            e.names = names
             self.endpoints[eid] = e
             what = "todos los topics" if topic == "*" else topic
             tipo = f" ({e.type})" if e.type else ""
@@ -569,6 +626,8 @@ class Hub:
             e.addr, e.topic, e.schema, e.tcp = addr, topic, schema, tcp
             e.type, e.text = f.get("type", e.type), f.get("text", e.text)
             e.machine = machine
+            e.names = names
+        self._names_warnings(e)
         e.last_seen = now
         e.src = src
         e.net = net
@@ -590,6 +649,70 @@ class Hub:
             self._send(ok, src if machine else addr)
             if kind == "sub" and is_new:
                 self._push_topic(topic)
+
+    # --- los nombres de las articulaciones (RFC 0013 §3.4, D6 = d) ---
+    @staticmethod
+    def _who_text(node: str, machine: str) -> str:
+        """Como _who, para los textos de D6: el nombre del nodo acotado y sin lo que no se ve (lo manda el nodo)."""
+        name = _cut(_clean(node), NODE_SHOWN)
+        return f"'{name}' (de la computadora '{machine}')" if machine else f"'{name}'"
+
+    def _check_names(self, kind: str, f: dict[str, str], topic: str, eid: str, node: str,
+                     machine: str) -> tuple[str, ...] | None:
+        """El campo `names` de un pub/sub: la lista revisada, o None si no la trae. Rechaza (ProtocolError, que
+        llega al nodo como `error`) una lista mal escrita, una distinta de la de robot.toml o de la de otro endpoint
+        del mismo topic, y un Publisher sin lista en un topic con require_names. Lo demás son avisos (más abajo)."""
+        who = self._who_text(node, machine)
+        exp = self.joints.get(topic)
+        if "names" not in f:
+            if kind == "pub" and exp is not None and exp.required:
+                raise hp.ProtocolError(f"'{topic}': {who} publica sin declarar su lista de nombres y robot.toml la "
+                                       f"exige (require_names = true en [[joints]]). Pasa names=[...] al crear el "
+                                       f"Publisher, en el orden de [[joints]]: {_names_hint(exp.names)}")
+            return None
+        try:
+            names = hp.parse_joint_names(f["names"])
+        except hp.ProtocolError as e:
+            raise hp.ProtocolError(f"'{topic}': la lista de nombres de {who} no vale: {e}") from None
+        if topic == "*":
+            raise hp.ProtocolError(f"{who} escucha todos los topics ('*') y declara una lista de nombres: la lista "
+                                   f"es de un topic. Quita names= o escucha un topic")
+        steps = "Las listas deben ser iguales y en el mismo orden"
+        if exp is not None and names != exp.names:
+            k, mine, theirs = names_difference(names, exp.names)
+            raise hp.ProtocolError(f"'{topic}': {who} declara {mine} y robot.toml dice {theirs} "
+                                   f"({_where_differ(k, names, exp.names, who, 'robot.toml')}). {steps}: pasa names= "
+                                   f"en el orden de [[joints]] de robot.toml, o corrige robot.toml si el que está mal "
+                                   f"es él")
+        other = next((e for e in self.endpoints.values()
+                      if e.id != eid and e.topic == topic and e.names is not None and e.names != names), None)
+        if other is not None:
+            k, mine, theirs = names_difference(names, other.names)
+            them = self._who_text(other.node, other.machine)
+            raise hp.ProtocolError(f"'{topic}': {who} declara {mine} y {them}, que ya está en el topic, declara "
+                                   f"{theirs} ({_where_differ(k, names, other.names, who, them)}). {steps}: un "
+                                   f"topic, una lista. Corrige la de uno de los dos (o declara el orden en [[joints]] "
+                                   f"de robot.toml)")
+        return names
+
+    def _names_warnings(self, e: Endpoint) -> None:
+        """Los avisos de D6 (una vez por endpoint): un Publisher sin lista en un topic de [[joints]], y un esquema
+        cuyo número de articulaciones no es el de robot.toml. Los Subscriber sin lista (echo, la grabadora), nunca."""
+        exp = self.joints.get(e.topic)
+        if exp is None or e.kind != "pub":
+            return
+        who = self._who_text(e.node, e.machine)
+        if e.names is None:
+            self._warn_once(("sin-names", e.id),
+                            f"{who} publica en '{e.topic}', un topic de [[joints]], sin declarar su lista de "
+                            f"nombres: no puedo revisar que use el orden de robot.toml ({_names_hint(exp.names)}). "
+                            f"Pasa names=[...] al crear el Publisher, en ese orden")
+        n = hp.schema_joint_count(e.text) if e.text else None
+        if n is not None and n != len(exp.names):
+            self._warn_once(("n-joints", e.id),
+                            f"'{e.topic}' trae {n} articulaciones y robot.toml nombra {len(exp.names)} ({who} "
+                            f"publica f32[{n}] en position): corrige names en [[joints]] de robot.toml o el número "
+                            f"del tipo que usa {who}")
 
     @staticmethod
     def _flag(f: dict[str, str], key: str) -> bool:
@@ -677,12 +800,14 @@ class Hub:
     # --- estado (para agmen topic list / info, node list) ---
     @staticmethod
     def _ep_extra(e: Endpoint) -> dict[str, str]:
-        """Campos de modo red de una línea `ep` (sin modo red no hay ninguno: los bytes de siempre)."""
+        """Campos de modo red de una línea `ep` (sin modo red no hay ninguno: los bytes de siempre) y, al final, la
+        lista de nombres que declaró (RFC 0013 D6; sin lista, nada: los bytes de siempre)."""
+        names = {"names": hp.format_joint_names(e.names)} if e.names is not None else {}
         if e.machine:
             if e.solo is not None:   # (§9.2, para depurar: a qué Publisher de aquí se da)
-                return {"machine": e.machine, "solo": ",".join(sorted(e.solo)) or "-"}
-            return {"machine": e.machine}
-        return {"net": "1"} if e.net else {}
+                return {"machine": e.machine, "solo": ",".join(sorted(e.solo)) or "-", **names}
+            return {"machine": e.machine, **names}
+        return {"net": "1", **names} if e.net else names
 
     def state_text(self) -> str:
         # Bloque 5 (§6.1): `modo` solo en modo red y si el puente lo dijo; sin modo red, la línea de siempre.
@@ -915,6 +1040,29 @@ def parse_expected(expect: list[str], require: list[str]) -> list[Expected]:
     return list(out.values())
 
 
+def parse_joint_names(names: list[str], require: list[str]) -> list[JointNames]:
+    """--names TOPIC=a,b,c (una vez por topic) y --require-names TOPIC → la lista para Hub(joints=...)."""
+    out: dict[str, JointNames] = {}
+    for item in names:
+        topic, sep, text = item.partition("=")
+        if not sep:
+            raise hp.ProtocolError(f"--names {item}: escríbelo como TOPIC=nombre,nombre,..., ej. "
+                                   f"--names /patas/cmd=FR_hip,FR_thigh")
+        hp.check_topic(topic)
+        if topic in out:
+            raise hp.ProtocolError(f"--names {topic} está dos veces: cada topic lleva una sola lista")
+        try:
+            out[topic] = JointNames(topic, hp.parse_joint_names(text))
+        except hp.ProtocolError as e:
+            raise hp.ProtocolError(f"--names {topic}: {e}") from None
+    for topic in require:
+        hp.check_topic(topic)
+        if topic not in out:
+            raise hp.ProtocolError(f"--require-names {topic}: ese topic no tiene lista (falta --names {topic}=...)")
+        out[topic].required = True
+    return list(out.values())
+
+
 def main(args) -> int:
     from . import ensure_utf8_output
     from .cli import _wait_for_ctrl_c
@@ -926,11 +1074,15 @@ def main(args) -> int:
 
     try:
         hub = Hub(args.listen, parse_expected(args.expect or [], args.require or []), log,
-                  robot=getattr(args, "robot", "") or "")
+                  robot=getattr(args, "robot", "") or "",
+                  joints=parse_joint_names(getattr(args, "names", None) or [], getattr(args, "require_names", None)
+                                           or []))
     except (OSError, hp.ProtocolError) as e:
         print(f"[hub] error: {e}", file=sys.stderr)
         return 2
     exp = f" · {len(hub.expected)} topics esperados" if hub.expected else ""
+    if hub.joints:
+        exp += f" · {len(hub.joints)} topics con lista de articulaciones"
     log(f"Agmen {__version__} · directorio de topics en {args.listen}{exp} · los datos van directo entre nodos")
     stop = threading.Event()
     worker = threading.Thread(target=hub.serve, args=(stop,), daemon=True)

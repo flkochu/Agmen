@@ -110,6 +110,34 @@ def node_name() -> str:
     return base if base and base not in ("-", "-c", "-m", "__main__") else f"python-{os.getpid()}"
 
 
+def joint_names_for(msg_type, where: str, names, who: str) -> tuple[str, ...] | None:
+    """names= de un Publisher o Subscriber (RFC 0013 §3.4, D6 = d), revisada al crear: una lista de nombres válidos,
+    sin repetir, dentro de los topes (hp.check_joint_names) y, si el esquema dice cuántas articulaciones son
+    (`f32[N] position`, como JointState[N] y JointCommand[N]), con N nombres. None si no se pasó."""
+    if names is None:
+        return None
+    if not hp.is_topic(where):
+        raise ValueError(f"{who}: names= va con un topic (la lista se le declara al hub, que la compara), y "
+                         f"'{where}' no es un topic. Usa un topic, ej. '/patas/cmd', o no pases names=")
+    try:
+        out = hp.check_joint_names(names)
+    except hp.ProtocolError as e:
+        bad_kind = isinstance(names, (str, bytes, bytearray)) or not hasattr(names, "__iter__")
+        raise (TypeError if bad_kind else ValueError)(f"{who} en '{where}': {e}") from None
+    n = hp.schema_joint_count(msg_type.SCHEMA_TEXT)
+    if n is not None and len(out) != n:
+        raise ValueError(f"{who} en '{where}': names tiene {len(out)} nombre{'' if len(out) == 1 else 's'} y "
+                         f"{msg_type.NAME} es de {n} articulaciones (f32[{n}] position): pasa un nombre por "
+                         f"articulación, en el orden de los arreglos")
+    return out
+
+
+# Con el núcleo de C++ (agmen._core), la lista todavía no llega al hub: el registro lo arma C++ y no lleva el campo.
+NATIVE_NAMES_TEXT = ("names= todavía no funciona con el núcleo de C++ de esta versión (agmen._core): la lista no "
+                     "llegaría al hub y no se compararía. Mientras, corre este nodo con Python puro: "
+                     "AGMEN_BACKEND=pure (en robot.toml, env = { AGMEN_BACKEND = \"pure\" } en su [[node]])")
+
+
 def _preload_numpy(msg_type) -> None:
     """Un tipo arrow importa NumPy al crear su Publisher o Subscriber, en el hilo que
     los crea, y no en la primera decodificación. Un tipo compact no (regla 6)."""
@@ -318,12 +346,26 @@ class _PurePublisher(_NetSend):
     _NOMBRE = "Publisher"   # el nombre en el error de un heredado (heredado_text)
 
     def __init__(self, msg_type, to: str, topic: str | None = None, *, source_id: int | None = None,
-                 node: str | None = None) -> None:
+                 node: str | None = None, names=None) -> None:
         """`to` = topic ("/cmd") o dirección ("127.0.0.1:7500"). Con dirección,
         `topic` es solo una etiqueta (default "/" + nombre del tipo). `source_id`:
         el de una grabación (agmen play); si no, uno al azar. `node`: su nombre en
-        el hub (si no, el del proceso)."""
+        el hub (si no, el del proceso). `names`: los nombres de las articulaciones en
+        el orden de los arreglos (RFC 0013 §3.4): el hub la compara con robot.toml."""
         _backend.notice_pure_once()
+        self.names = None
+        if names is not None:   # antes de abrir nada (RFC 0013 D6): una lista que no sirve no deja sockets abiertos
+            if hp.is_topic(to):
+                hp.check_topic(to)
+            self.names = joint_names_for(msg_type, to, names, "Publisher")
+            # Con la lista, el registro (que lleva también el texto del esquema) debe seguir cabiendo en un datagrama.
+            size = len(hp.encode("pub", id="0" * 16, node=node or node_name(), pid=os.getpid(), topic=to,
+                                 schema="0" * 16, type=msg_type.NAME, text=msg_type.SCHEMA_TEXT,
+                                 names=hp.format_joint_names(self.names)))
+            if size > wire.MAX_DATAGRAM:
+                raise ValueError(f"Publisher en '{to}': con names, el registro en el hub mide {size} bytes y en un "
+                                 f"datagrama caben {wire.MAX_DATAGRAM} (el esquema de {msg_type.NAME} es muy largo): "
+                                 f"usa nombres más cortos o un tipo más chico")
         self.type = msg_type
         self.to = to
         # Antes de cualquier hilo: el hub, la conexión TCP y los bloques de memoria
@@ -355,10 +397,11 @@ class _PurePublisher(_NetSend):
             self._sock.setblocking(False)
             self._lock = threading.Lock()
             self._link = None
-            self._link = _HubLink(self._sock, dict(
-                op="pub", id=f"{self.source_id:016x}", node=node or node_name(), pid=os.getpid(), topic=to,
-                schema=f"{msg_type.SCHEMA_ID:016x}", type=msg_type.NAME, text=msg_type.SCHEMA_TEXT),
-                on_tick=self._drain_locked)
+            beat = dict(op="pub", id=f"{self.source_id:016x}", node=node or node_name(), pid=os.getpid(), topic=to,
+                        schema=f"{msg_type.SCHEMA_ID:016x}", type=msg_type.NAME, text=msg_type.SCHEMA_TEXT)
+            if self.names is not None:   # al final; sin lista, la línea de siempre (RFC 0013 D6)
+                beat["names"] = hp.format_joint_names(self.names)
+            self._link = _HubLink(self._sock, beat, on_tick=self._drain_locked)
             # Espera breve a la primera respuesta del hub: si ya hay receptores,
             # el primer mensaje no se pierde por no saber a quién mandarlo.
             end = time.monotonic() + 0.1
@@ -583,7 +626,7 @@ class _Receiver:
     _NOMBRE = "Subscriber"
 
     def __init__(self, where: str, schema: str, type_name: str = "", tcp: bool = True, shm: bool = False,
-                 node: str | None = None) -> None:
+                 node: str | None = None, names: tuple[str, ...] | None = None) -> None:
         # El turno de recibir (como el del nativo): los receive() de varios hilos sobre el mismo objeto
         # se turnan y nunca leen a la vez los sockets ni lo que va llegando de cada conexión; close()
         # también lo espera. No es reentrante: un close() desde el mismo hilo que está recibiendo (un
@@ -622,10 +665,12 @@ class _Receiver:
             if tcp:
                 self._tcp = _tcp.Listener(("127.0.0.1", 0), shm=shm)
                 self._tcp.net_ip = self._net_ip
-            self._link = _HubLink(self._sock, dict(
-                op="sub", id=f"{wire.new_source_id():016x}", node=node or node_name(), pid=os.getpid(),
-                topic=where, schema=schema, type=type_name, port=port,
-                tcp=self._tcp.port if self._tcp is not None else ""))
+            beat = dict(op="sub", id=f"{wire.new_source_id():016x}", node=node or node_name(), pid=os.getpid(),
+                        topic=where, schema=schema, type=type_name, port=port,
+                        tcp=self._tcp.port if self._tcp is not None else "")
+            if names is not None:   # al final; sin lista, la línea de siempre (RFC 0013 D6)
+                beat["names"] = hp.format_joint_names(names)
+            self._link = _HubLink(self._sock, beat)
         else:
             self.topic = ""
             self.listen = where
@@ -987,14 +1032,18 @@ class _Receiver:
 
 
 class _PureSubscriber(_Receiver):
-    def __init__(self, msg_type, where: str) -> None:
-        """`where` = topic ("/cmd") o dirección donde escuchar ("127.0.0.1:7500")."""
+    def __init__(self, msg_type, where: str, *, names=None) -> None:
+        """`where` = topic ("/cmd") o dirección donde escuchar ("127.0.0.1:7500"). `names`: los nombres
+        de las articulaciones en el orden de los arreglos (RFC 0013 §3.4): el hub la compara con robot.toml."""
         _backend.notice_pure_once()
         self.type = msg_type
         self._clock_warned = False
         arrow = msg_type.LAYOUT.encoding == wire.ENC_ARROW
+        if hp.is_topic(where):
+            hp.check_topic(where)
+        self.names = joint_names_for(msg_type, where, names, "Subscriber")
         super().__init__(where, f"{msg_type.SCHEMA_ID:016x}", msg_type.NAME, tcp=arrow,
-                         shm=arrow and _shm.enabled())
+                         shm=arrow and _shm.enabled(), names=self.names)
         _preload_numpy(msg_type)   # tras validar el tipo y el topic: los errores de siempre, en su orden
         self._shm = _shm.Receiver(where) if arrow else None
 
@@ -1362,13 +1411,17 @@ _beats = _Beats()
 class _NativePublisher:
     _NOMBRE = "Publisher"
 
-    def __init__(self, msg_type, to: str, topic: str | None = None) -> None:
+    def __init__(self, msg_type, to: str, topic: str | None = None, *, names=None) -> None:
         """`to` = topic ("/cmd") o dirección ("127.0.0.1:7500"). Con dirección,
-        `topic` es solo una etiqueta (default "/" + nombre del tipo)."""
+        `topic` es solo una etiqueta (default "/" + nombre del tipo). `names`: ver
+        _PurePublisher (con este núcleo, todavía no: ver NATIVE_NAMES_TEXT)."""
         self.type = msg_type
         self.to = to
         if hp.is_topic(to):
             hp.check_topic(to)
+        if joint_names_for(msg_type, to, names, "Publisher") is not None:   # revisada igual que en Python puro
+            raise NotImplementedError(f"Publisher en '{to}': {NATIVE_NAMES_TEXT}")
+        self.names = None
         label = "" if hp.is_topic(to) else (topic if topic is not None else "/" + msg_type.NAME)
         layout = msg_type.LAYOUT
         self.arrow = layout.encoding == wire.ENC_ARROW
@@ -1454,16 +1507,20 @@ class _NativePublisher:
 class _NativeSubscriber:
     _NOMBRE = "Subscriber"
 
-    def __new__(cls, msg_type, where: str):
+    def __new__(cls, msg_type, where: str, *, names=None):
         if where == "*":   # todos los topics con un tipo: solo en Python puro (lo usan pocas herramientas)
-            return _PureSubscriber(msg_type, where)
+            return _PureSubscriber(msg_type, where, names=names)
         return super().__new__(cls)
 
-    def __init__(self, msg_type, where: str) -> None:
-        """`where` = topic ("/cmd") o dirección donde escuchar ("127.0.0.1:7500")."""
+    def __init__(self, msg_type, where: str, *, names=None) -> None:
+        """`where` = topic ("/cmd") o dirección donde escuchar ("127.0.0.1:7500"). `names`: ver
+        _PureSubscriber (con este núcleo, todavía no: ver NATIVE_NAMES_TEXT)."""
         self.type = msg_type
         if hp.is_topic(where):
             hp.check_topic(where)
+        if joint_names_for(msg_type, where, names, "Subscriber") is not None:   # revisada igual que en Python puro
+            raise NotImplementedError(f"Subscriber en '{where}': {NATIVE_NAMES_TEXT}")
+        self.names = None
         self.topic = where if hp.is_topic(where) else ""
         layout = msg_type.LAYOUT
         self._core = _backend.core.Subscriber(where, msg_type.NAME, msg_type.SCHEMA_TEXT, msg_type.SCHEMA_ID,
